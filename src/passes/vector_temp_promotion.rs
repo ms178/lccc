@@ -57,10 +57,8 @@ fn map_capacity(func: &IrFunction) -> usize {
 }
 
 fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
-    let mut allocas = FxHashMap::with_capacity_and_hasher(
-        (map_capacity(func) / 8).max(8),
-        Default::default(),
-    );
+    let mut allocas =
+        FxHashMap::with_capacity_and_hasher((map_capacity(func) / 8).max(8), Default::default());
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (instruction_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::Alloca {
@@ -134,8 +132,12 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
             };
         }
         // 128->256-bit widening extensions read a 128-bit source.
-        O::Pmovzxbw256 | O::Pmovzxbd256 | O::Pmovzxwd256
-        | O::Pmovsxbw256 | O::Pmovsxbd256 | O::Pmovsxwd256 => {
+        O::Pmovzxbw256
+        | O::Pmovzxbd256
+        | O::Pmovzxwd256
+        | O::Pmovsxbw256
+        | O::Pmovsxbd256
+        | O::Pmovsxwd256 => {
             return (index == 0).then_some(16);
         }
         _ => {}
@@ -143,79 +145,209 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
 
     let width = match op {
         // 128-bit stores and scalar extract/reduction consumers.
-        O::Storedqu | O::Storeldi128 | O::Movntdq | O::Movntpd
-        | O::Pmovmskb128 | O::Cvtsi128Si32 | O::Cvtsi128Si64
-        | O::HorizontalAddF64x2 | O::HorizontalAddI32x4
-        | O::Pabsb128 | O::Pabsw128 | O::Pabsd128
-        | O::Pmovzxbw128 | O::Pmovzxwd128 | O::Aesimc128 => {
+        O::Storedqu
+        | O::Storeldi128
+        | O::Movntdq
+        | O::Movntpd
+        | O::Pmovmskb128
+        | O::Cvtsi128Si32
+        | O::Cvtsi128Si64
+        | O::HorizontalAddF64x2
+        | O::HorizontalAddI32x4
+        | O::Pabsb128
+        | O::Pabsw128
+        | O::Pabsd128
+        | O::Pmovzxbw128
+        | O::Pmovzxwd128
+        | O::Aesimc128 => {
             return (index == 0).then_some(16);
         }
 
         // Unary 128-bit vector + immediate forms.
-        O::Aeskeygenassist128 | O::Pslldqi128 | O::Psrldqi128
-        | O::Psllqi128 | O::Psrlqi128 | O::Psllwi128 | O::Psrlwi128
-        | O::Psrawi128 | O::Psradi128 | O::Pslldi128 | O::Psrldi128
-        | O::Pshufd128 | O::Pshuflw128 | O::Pshufhw128
-        | O::Pextrw128 | O::Pextrd128 | O::Pextrb128 | O::Pextrq128
-        | O::Pinsrw128 | O::Pinsrd128 | O::Pinsrb128 | O::Pinsrq128 => {
+        O::Aeskeygenassist128
+        | O::Pslldqi128
+        | O::Psrldqi128
+        | O::Psllqi128
+        | O::Psrlqi128
+        | O::Psllwi128
+        | O::Psrlwi128
+        | O::Psrawi128
+        | O::Psradi128
+        | O::Pslldi128
+        | O::Psrldi128
+        | O::Pshufd128
+        | O::Pshuflw128
+        | O::Pshufhw128
+        | O::Pextrw128
+        | O::Pextrd128
+        | O::Pextrb128
+        | O::Pextrq128
+        | O::Pinsrw128
+        | O::Pinsrd128
+        | O::Pinsrb128
+        | O::Pinsrq128 => {
             return (index == 0).then_some(16);
         }
 
         // Binary 128-bit vector operations.  Operations with an immediate
         // have that immediate after the two vector operands.
-        O::Pcmpeqb128 | O::Pcmpeqd128 | O::Psubusb128 | O::Psubsb128
-        | O::Por128 | O::Pand128 | O::Pxor128
-        | O::AddPs128 | O::SubPs128 | O::MulPs128
-        | O::AddPd128 | O::SubPd128 | O::MulPd128
-        | O::Pmuludq128 | O::Pmuldq128 | O::Pmulld128
-        | O::Paddw128 | O::Psubw128 | O::Paddb128 | O::Psubb128
-        | O::Psubusw128 | O::Psadbw128 | O::Pmullw128
-        | O::Pmaddubsw128 | O::Phaddw128 | O::Phaddd128
-        | O::Pshufb128 | O::Palignr128 | O::Pmaxub128 | O::Pminub128
-        | O::Pblendw128 | O::Pclmulqdq128
-        | O::Aesenc128 | O::Aesenclast128 | O::Aesdec128 | O::Aesdeclast128
-        | O::Psllw128 | O::Psrlw128 | O::Pmulhw128 | O::Pmaddwd128
-        | O::Pcmpgtw128 | O::Pcmpgtb128 | O::Paddd128 | O::Psubd128
-        | O::Packssdw128 | O::Packsswb128 | O::Packuswb128
-        | O::Punpcklbw128 | O::Punpckhbw128 | O::Punpcklwd128 | O::Punpckhwd128
-        | O::Paddusb128 | O::Paddsb128 | O::Paddusw128 | O::Paddsw128
-        | O::Psubsw128 | O::Pandn128 | O::Pcmpeqw128 | O::Pcmpgtd128
-        | O::Pavgb128 | O::Pavgw128 | O::Pminsw128 | O::Pmaxsw128
-        | O::Pmulhuw128 | O::Paddq128 | O::Psubq128
-        | O::Punpckldq128 | O::Punpckhdq128 | O::Punpcklqdq128
-        | O::Punpckhqdq128 | O::AddF64x2 | O::MulF64x2 | O::AddI32x4 => 16,
+        O::Pcmpeqb128
+        | O::Pcmpeqd128
+        | O::Psubusb128
+        | O::Psubsb128
+        | O::Por128
+        | O::Pand128
+        | O::Pxor128
+        | O::AddPs128
+        | O::SubPs128
+        | O::MulPs128
+        | O::AddPd128
+        | O::SubPd128
+        | O::MulPd128
+        | O::Pmuludq128
+        | O::Pmuldq128
+        | O::Pmulld128
+        | O::Paddw128
+        | O::Psubw128
+        | O::Paddb128
+        | O::Psubb128
+        | O::Psubusw128
+        | O::Psadbw128
+        | O::Pmullw128
+        | O::Pmaddubsw128
+        | O::Phaddw128
+        | O::Phaddd128
+        | O::Pshufb128
+        | O::Palignr128
+        | O::Pmaxub128
+        | O::Pminub128
+        | O::Pblendw128
+        | O::Pclmulqdq128
+        | O::Aesenc128
+        | O::Aesenclast128
+        | O::Aesdec128
+        | O::Aesdeclast128
+        | O::Psllw128
+        | O::Psrlw128
+        | O::Pmulhw128
+        | O::Pmaddwd128
+        | O::Pcmpgtw128
+        | O::Pcmpgtb128
+        | O::Paddd128
+        | O::Psubd128
+        | O::Packssdw128
+        | O::Packsswb128
+        | O::Packuswb128
+        | O::Punpcklbw128
+        | O::Punpckhbw128
+        | O::Punpcklwd128
+        | O::Punpckhwd128
+        | O::Paddusb128
+        | O::Paddsb128
+        | O::Paddusw128
+        | O::Paddsw128
+        | O::Psubsw128
+        | O::Pandn128
+        | O::Pcmpeqw128
+        | O::Pcmpgtd128
+        | O::Pavgb128
+        | O::Pavgw128
+        | O::Pminsw128
+        | O::Pmaxsw128
+        | O::Pmulhuw128
+        | O::Paddq128
+        | O::Psubq128
+        | O::Punpckldq128
+        | O::Punpckhdq128
+        | O::Punpcklqdq128
+        | O::Punpckhqdq128
+        | O::AddF64x2
+        | O::MulF64x2
+        | O::AddI32x4 => 16,
 
         // PBLENDVB consumes state, true value and mask as vectors.
         O::Pblendvb128 => return (index < 3).then_some(16),
 
         // 256-bit stores and unary consumers.
-        O::Storeu256 | O::Store256 | O::StoreuPs256 | O::StoreuPd256
-        | O::Pmovmskb256 | O::HorizontalAddF64x4 | O::HorizontalAddI32x8
-        | O::Pabsb256 | O::Pabsw256 | O::Pabsd256
-        | O::Psllidi256 | O::Psrlidi256 | O::Psllwi256 | O::Psrlwi256
-        | O::Pshufd256 | O::Pslldqi256 | O::Psrldqi256
-        | O::Psllqi256 | O::Psrlqi256 | O::Psrawi256 | O::Psradi256
-        | O::Permute4x64 | O::Extracti128 => {
+        O::Storeu256
+        | O::Store256
+        | O::StoreuPs256
+        | O::StoreuPd256
+        | O::Pmovmskb256
+        | O::HorizontalAddF64x4
+        | O::HorizontalAddI32x8
+        | O::Pabsb256
+        | O::Pabsw256
+        | O::Pabsd256
+        | O::Psllidi256
+        | O::Psrlidi256
+        | O::Psllwi256
+        | O::Psrlwi256
+        | O::Pshufd256
+        | O::Pslldqi256
+        | O::Psrldqi256
+        | O::Psllqi256
+        | O::Psrlqi256
+        | O::Psrawi256
+        | O::Psradi256
+        | O::Permute4x64
+        | O::Extracti128 => {
             return (index == 0).then_some(32);
         }
 
         // Binary 256-bit vector operations.
-        O::Paddb256 | O::Paddw256 | O::Paddd256
-        | O::Psubb256 | O::Psubw256 | O::Psubusw256
-        | O::Psadbw256 | O::Pmaddubsw256 | O::Pmaddwd256
-        | O::Pcmpeqb256 | O::Pcmpgtb256 | O::Pshufb256
-        | O::Pmaxub256 | O::Pminub256 | O::Pxor256 | O::Por256 | O::Pand256
-        | O::Pmulld256 | O::Psubd256 | O::Paddq256 | O::Psubq256
-        | O::Pandn256 | O::Pcmpeqd256 | O::Pcmpeqq256
-        | O::Pcmpgtd256 | O::Pcmpgtq256
-        | O::AddPs256 | O::SubPs256 | O::MulPs256
-        | O::AddPd256 | O::SubPd256 | O::MulPd256
-        | O::Punpcklbw256 | O::Punpckhbw256 | O::Punpcklwd256
-        | O::Punpckhwd256 | O::Punpckldq256 | O::Punpckhdq256
-        | O::Punpcklqdq256 | O::Punpckhqdq256
-        | O::Pmullw256 | O::Pmulhw256 | O::Pminsd256 | O::Pmaxsd256
-        | O::Packssdw256 | O::Packuswb256 | O::Phaddw256 | O::Phaddd256
-        | O::Pmuludq256 | O::AddF64x4 | O::MulF64x4 | O::AddI32x8 => 32,
+        O::Paddb256
+        | O::Paddw256
+        | O::Paddd256
+        | O::Psubb256
+        | O::Psubw256
+        | O::Psubusw256
+        | O::Psadbw256
+        | O::Pmaddubsw256
+        | O::Pmaddwd256
+        | O::Pcmpeqb256
+        | O::Pcmpgtb256
+        | O::Pshufb256
+        | O::Pmaxub256
+        | O::Pminub256
+        | O::Pxor256
+        | O::Por256
+        | O::Pand256
+        | O::Pmulld256
+        | O::Psubd256
+        | O::Paddq256
+        | O::Psubq256
+        | O::Pandn256
+        | O::Pcmpeqd256
+        | O::Pcmpeqq256
+        | O::Pcmpgtd256
+        | O::Pcmpgtq256
+        | O::AddPs256
+        | O::SubPs256
+        | O::MulPs256
+        | O::AddPd256
+        | O::SubPd256
+        | O::MulPd256
+        | O::Punpcklbw256
+        | O::Punpckhbw256
+        | O::Punpcklwd256
+        | O::Punpckhwd256
+        | O::Punpckldq256
+        | O::Punpckhdq256
+        | O::Punpcklqdq256
+        | O::Punpckhqdq256
+        | O::Pmullw256
+        | O::Pmulhw256
+        | O::Pminsd256
+        | O::Pmaxsd256
+        | O::Packssdw256
+        | O::Packuswb256
+        | O::Phaddw256
+        | O::Phaddd256
+        | O::Pmuludq256
+        | O::AddF64x4
+        | O::MulF64x4
+        | O::AddI32x8 => 32,
 
         // Two vector operands followed by an immediate/control operand.
         O::Permute2x128 => 32,
@@ -277,9 +409,7 @@ fn intrinsic_dest_required_alignment(
     // Compiler-created vector result homes are emitted through unaligned-safe
     // stores.  Exact width also rejects partial/RMW operations accidentally
     // listed by a broad intrinsic family query.
-    if has_result
-        && op.vector_result_width().map(|width| width as usize) == Some(alloca_size)
-    {
+    if has_result && op.vector_result_width().map(|width| width as usize) == Some(alloca_size) {
         return Some(0);
     }
 
@@ -363,9 +493,7 @@ fn add_alias_edge(graph: &mut FxHashMap<u32, Vec<u32>>, source: u32, dest: u32) 
 
 /// Build exact pointer-preserving and conservative address-influence graphs.
 /// The latter is only used to block store motion, never to prove no-alias.
-fn build_alias_graphs(
-    func: &IrFunction,
-) -> (FxHashMap<u32, Vec<u32>>, FxHashMap<u32, Vec<u32>>) {
+fn build_alias_graphs(func: &IrFunction) -> (FxHashMap<u32, Vec<u32>>, FxHashMap<u32, Vec<u32>>) {
     let capacity = (map_capacity(func) / 4).max(8);
     let mut exact = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
     let mut conservative = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
@@ -481,15 +609,14 @@ fn analyze_destination(
                 // The alloca address is stored as data and may subsequently be
                 // recovered under an unrelated SSA ID.
                 Instruction::Store { val, .. } => escaped |= operand_is_alias(val, &aliases),
-                Instruction::AtomicStore { val, .. }
-                | Instruction::AtomicRmw { val, .. } => {
+                Instruction::AtomicStore { val, .. } | Instruction::AtomicRmw { val, .. } => {
                     escaped |= operand_is_alias(val, &aliases)
                 }
                 Instruction::AtomicCmpxchg {
                     expected, desired, ..
                 } => {
-                    escaped |= operand_is_alias(expected, &aliases)
-                        || operand_is_alias(desired, &aliases)
+                    escaped |=
+                        operand_is_alias(expected, &aliases) || operand_is_alias(desired, &aliases)
                 }
                 Instruction::Call { .. }
                 | Instruction::CallIndirect { .. }
@@ -546,7 +673,9 @@ fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
     }
     removed.sort_unstable();
     removed.dedup();
-    debug_assert!(removed.last().is_none_or(|&index| index < block.instructions.len()));
+    debug_assert!(removed
+        .last()
+        .is_none_or(|&index| index < block.instructions.len()));
 
     let instruction_count = block.instructions.len();
     let spans_in_lockstep = block.source_spans.len() == instruction_count;
@@ -664,9 +793,9 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                         continue;
                     }
 
-                    let facts = destination_facts.entry(dest.0).or_insert_with(|| {
-                        analyze_destination(func, dest.0, &conservative_graph)
-                    });
+                    let facts = destination_facts
+                        .entry(dest.0)
+                        .or_insert_with(|| analyze_destination(func, dest.0, &conservative_graph));
                     if destination_unobserved_between(
                         &block.instructions,
                         producer + 1,
@@ -727,8 +856,14 @@ enum PointerRoot {
 }
 
 enum RootRule {
-    Unary { dest: u32, source: u32 },
-    Merge { dest: u32, sources: Vec<u32> },
+    Unary {
+        dest: u32,
+        source: u32,
+    },
+    Merge {
+        dest: u32,
+        sources: Vec<u32>,
+    },
     Offset {
         dest: u32,
         lhs: Option<u32>,
@@ -826,7 +961,10 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                         dest.0,
                         PointerRoot::Param {
                             index: *param_idx,
-                            noalias: func.params.get(*param_idx).is_some_and(|param| param.noalias),
+                            noalias: func
+                                .params
+                                .get(*param_idx)
+                                .is_some_and(|param| param.noalias),
                         },
                     );
                 }
@@ -847,26 +985,25 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                     source: source.0,
                 }),
                 Instruction::BinOp {
-                    dest,
-                    op,
-                    lhs,
-                    rhs,
-                    ..
+                    dest, op, lhs, rhs, ..
                 } if matches!(
                     op,
                     crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub
-                ) => rules.push(RootRule::Offset {
-                    dest: dest.0,
-                    lhs: match lhs {
-                        Operand::Value(value) => Some(value.0),
-                        Operand::Const(_) => None,
-                    },
-                    rhs: match rhs {
-                        Operand::Value(value) => Some(value.0),
-                        Operand::Const(_) => None,
-                    },
-                    subtract: matches!(op, crate::ir::reexports::IrBinOp::Sub),
-                }),
+                ) =>
+                {
+                    rules.push(RootRule::Offset {
+                        dest: dest.0,
+                        lhs: match lhs {
+                            Operand::Value(value) => Some(value.0),
+                            Operand::Const(_) => None,
+                        },
+                        rhs: match rhs {
+                            Operand::Value(value) => Some(value.0),
+                            Operand::Const(_) => None,
+                        },
+                        subtract: matches!(op, crate::ir::reexports::IrBinOp::Sub),
+                    })
+                }
                 Instruction::Select {
                     dest,
                     true_val: Operand::Value(lhs),
@@ -881,7 +1018,10 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
                     dest,
                     incoming,
                     ty: IrType::Ptr,
-                } if incoming.iter().all(|(op, _)| matches!(op, Operand::Value(_))) => {
+                } if incoming
+                    .iter()
+                    .all(|(op, _)| matches!(op, Operand::Value(_))) =>
+                {
                     rules.push(RootRule::Merge {
                         dest: dest.0,
                         sources: incoming
@@ -980,7 +1120,10 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
         FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
     for (rule_idx, sources) in rule_sources.iter().enumerate() {
         for &source in sources {
-            dependents.entry(source).or_insert_with(Vec::new).push(rule_idx);
+            dependents
+                .entry(source)
+                .or_insert_with(Vec::new)
+                .push(rule_idx);
         }
     }
 
@@ -1048,10 +1191,8 @@ fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
     for &id in &component {
         component_sizes[id] += 1;
     }
-    let mut recurrence_derived = FxHashSet::with_capacity_and_hasher(
-        rules.len().min(32),
-        Default::default(),
-    );
+    let mut recurrence_derived =
+        FxHashSet::with_capacity_and_hasher(rules.len().min(32), Default::default());
     let mut recurrence_work = Vec::new();
     for (dense_index, successors) in edges.iter().enumerate() {
         let id = component[dense_index];
@@ -1085,16 +1226,14 @@ fn roots_proven_distinct(lhs: PointerRoot, rhs: PointerRoot) -> bool {
     }
     match (lhs, rhs) {
         (PointerRoot::Alloca(_), _) | (_, PointerRoot::Alloca(_)) => true,
-        (
-            PointerRoot::Param { noalias: lhs, .. },
-            PointerRoot::Param { noalias: rhs, .. },
-        ) => lhs || rhs,
+        (PointerRoot::Param { noalias: lhs, .. }, PointerRoot::Param { noalias: rhs, .. }) => {
+            lhs || rhs
+        }
         (PointerRoot::Param { noalias, .. }, PointerRoot::Global)
         | (PointerRoot::Global, PointerRoot::Param { noalias, .. }) => noalias,
         (PointerRoot::Global, PointerRoot::Global) => false,
     }
 }
-
 
 struct LocalAliasFacts {
     /// Vector-sized allocas whose address cannot be recovered through memory or
@@ -1121,31 +1260,26 @@ fn local_alias_facts(
         }
     }
 
-    let escape_value = |value: u32,
-                        nonescaping: &mut FxHashSet<u32>,
-                        owners: &FxHashMap<u32, Vec<u32>>| {
-        if let Some(roots) = owners.get(&value) {
-            for root in roots {
-                nonescaping.remove(root);
+    let escape_value =
+        |value: u32, nonescaping: &mut FxHashSet<u32>, owners: &FxHashMap<u32, Vec<u32>>| {
+            if let Some(roots) = owners.get(&value) {
+                for root in roots {
+                    nonescaping.remove(root);
+                }
             }
-        }
-    };
-    let escape_operand = |operand: &Operand,
-                          nonescaping: &mut FxHashSet<u32>,
-                          owners: &FxHashMap<u32, Vec<u32>>| {
-        if let Operand::Value(value) = operand {
-            escape_value(value.0, nonescaping, owners);
-        }
-    };
+        };
+    let escape_operand =
+        |operand: &Operand, nonescaping: &mut FxHashSet<u32>, owners: &FxHashMap<u32, Vec<u32>>| {
+            if let Operand::Value(value) = operand {
+                escape_value(value.0, nonescaping, owners);
+            }
+        };
 
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Store { val, .. } => {
-                    escape_operand(val, &mut nonescaping, &owners)
-                }
-                Instruction::AtomicStore { val, .. }
-                | Instruction::AtomicRmw { val, .. } => {
+                Instruction::Store { val, .. } => escape_operand(val, &mut nonescaping, &owners),
+                Instruction::AtomicStore { val, .. } | Instruction::AtomicRmw { val, .. } => {
                     escape_operand(val, &mut nonescaping, &owners)
                 }
                 Instruction::AtomicCmpxchg {
@@ -1157,15 +1291,15 @@ fn local_alias_facts(
                 Instruction::Call { .. }
                 | Instruction::CallIndirect { .. }
                 | Instruction::InlineAsm { .. }
-                | Instruction::StackRestore { .. } => inst.for_each_used_value(|value| {
-                    escape_value(value, &mut nonescaping, &owners)
-                }),
+                | Instruction::StackRestore { .. } => {
+                    inst.for_each_used_value(|value| escape_value(value, &mut nonescaping, &owners))
+                }
                 _ => {}
             }
         }
-        block.terminator.for_each_used_value(|value| {
-            escape_value(value, &mut nonescaping, &owners)
-        });
+        block
+            .terminator
+            .for_each_used_value(|value| escape_value(value, &mut nonescaping, &owners));
     }
     LocalAliasFacts {
         nonescaping,
@@ -1197,16 +1331,12 @@ fn write_may_clobber(
 ) -> bool {
     let target_root = roots.get(&target.0).copied();
     match (target_root, write_root) {
-        (Some(target_root), Some(write_root)) => {
-            !roots_proven_distinct(target_root, write_root)
-        }
+        (Some(target_root), Some(write_root)) => !roots_proven_distinct(target_root, write_root),
         (Some(target_root), None) => match target_root {
-            PointerRoot::Alloca(root) if local_aliases.nonescaping.contains(&root) => {
-                local_aliases
-                    .owners
-                    .get(&pointer.0)
-                    .is_some_and(|owners| owners.contains(&root))
-            }
+            PointerRoot::Alloca(root) if local_aliases.nonescaping.contains(&root) => local_aliases
+                .owners
+                .get(&pointer.0)
+                .is_some_and(|owners| owners.contains(&root)),
             _ => true,
         },
         // The target has no derivable root: fail closed.
@@ -1301,9 +1431,7 @@ fn invalidate_for_memory_effects(
             ..
         } => invalidate_for_value_write(available, *pointer, roots, local_aliases),
         Instruction::Intrinsic {
-            op,
-            dest_ptr: None,
-            ..
+            op, dest_ptr: None, ..
         } => {
             // An intrinsic with no destination pointer either only reads
             // memory (pure) or produces a register-resident vector result and
@@ -1445,8 +1573,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                     dest_ptr: Some(destination),
                     args,
                     ..
-                } => direct_vector_load_width(*op)
-                    .map(|width| (*op, *destination, args, width)),
+                } => direct_vector_load_width(*op).map(|width| (*op, *destination, args, width)),
                 _ => None,
             };
 
@@ -1477,12 +1604,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                         available.remove(&value.0);
                     }
                 }
-                invalidate_for_value_write(
-                    &mut available,
-                    destination,
-                    &roots,
-                    &local_aliases,
-                );
+                invalidate_for_value_write(&mut available, destination, &roots, &local_aliases);
 
                 if let Some(source) = effective_source {
                     if args.len() == 1
@@ -1560,10 +1682,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
         return 0;
     }
 
-    let mut forwarded_loads = FxHashSet::with_capacity_and_hasher(
-        patch_count,
-        Default::default(),
-    );
+    let mut forwarded_loads = FxHashSet::with_capacity_and_hasher(patch_count, Default::default());
     for (block, patches) in func.blocks.iter_mut().zip(&plans) {
         for patch in patches {
             let Some(Instruction::Intrinsic { args, .. }) =
@@ -1584,10 +1703,8 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
     // Remove only loads which actually supplied a forwarded operand and whose
     // destination slot has no remaining reference.  Counting after patching is
     // important; direct-load dest_ptr is a write, not a read.
-    let mut forwarded_slots = FxHashSet::with_capacity_and_hasher(
-        forwarded_loads.len(),
-        Default::default(),
-    );
+    let mut forwarded_slots =
+        FxHashSet::with_capacity_and_hasher(forwarded_loads.len(), Default::default());
     for &(block_idx, instruction_idx) in &forwarded_loads {
         if let Instruction::Intrinsic {
             dest_ptr: Some(destination),
@@ -1616,14 +1733,10 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
     }
 
     let load_results: FxHashSet<u32> = load_result_slots.values().flatten().copied().collect();
-    let mut remaining = FxHashMap::with_capacity_and_hasher(
-        forwarded_slots.len(),
-        Default::default(),
-    );
-    let mut remaining_results = FxHashMap::with_capacity_and_hasher(
-        load_results.len(),
-        Default::default(),
-    );
+    let mut remaining =
+        FxHashMap::with_capacity_and_hasher(forwarded_slots.len(), Default::default());
+    let mut remaining_results =
+        FxHashMap::with_capacity_and_hasher(load_results.len(), Default::default());
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -1682,16 +1795,14 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
             continue;
         };
         let result_dead = match (dest, load_result_slots.get(&destination.0)) {
-            (Some(reg), Some(Some(_))) => {
-                remaining_results.get(&reg.0).copied().unwrap_or(0) == 0
-            }
+            (Some(reg), Some(Some(_))) => remaining_results.get(&reg.0).copied().unwrap_or(0) == 0,
             _ => true,
         };
         let removable = direct_vector_load_width(*op).is_some()
             && args.len() == 1
-            && allocas.get(&destination.0).is_some_and(|info| {
-                !info.volatile && !info.semantic_volatile
-            })
+            && allocas
+                .get(&destination.0)
+                .is_some_and(|info| !info.volatile && !info.semantic_volatile)
             && remaining.get(&destination.0).copied().unwrap_or(0) == 0
             && result_dead;
         if removable {
@@ -1705,11 +1816,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
     patch_count
 }
 
-fn remove_alias_owners(
-    value: u32,
-    owners: &FxHashMap<u32, Vec<u32>>,
-    safe: &mut FxHashSet<u32>,
-) {
+fn remove_alias_owners(value: u32, owners: &FxHashMap<u32, Vec<u32>>, safe: &mut FxHashSet<u32>) {
     if let Some(roots) = owners.get(&value) {
         for root in roots {
             safe.remove(root);
@@ -1752,10 +1859,7 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
                 ..
             } = inst
             {
-                if (*size == 16 || *size == 32)
-                    && *align > 16
-                    && !*volatile
-                    && !*semantic_volatile
+                if (*size == 16 || *size == 32) && *align > 16 && !*volatile && !*semantic_volatile
                 {
                     sizes.insert(dest.0, *size);
                     required_align.insert(dest.0, 0usize);
@@ -1773,10 +1877,8 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
     // the unsafe single-root assumption used by many lightweight analyses.
     let (exact_graph, _) = build_alias_graphs(func);
     let candidates: Vec<u32> = safe.iter().copied().collect();
-    let mut owners: FxHashMap<u32, Vec<u32>> = FxHashMap::with_capacity_and_hasher(
-        candidates.len() * 2,
-        Default::default(),
-    );
+    let mut owners: FxHashMap<u32, Vec<u32>> =
+        FxHashMap::with_capacity_and_hasher(candidates.len() * 2, Default::default());
     for root in candidates {
         for alias in alias_closure(root, &exact_graph) {
             owners.entry(alias).or_default().push(root);
@@ -1897,14 +1999,14 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
 
                 // Everything not explicitly proven alignment-insensitive fails
                 // closed, including atomics, calls, asm and pointer arithmetic.
-                _ => inst.for_each_used_value(|value| {
-                    remove_alias_owners(value, &owners, &mut safe)
-                }),
+                _ => {
+                    inst.for_each_used_value(|value| remove_alias_owners(value, &owners, &mut safe))
+                }
             }
         }
-        block.terminator.for_each_used_value(|value| {
-            remove_alias_owners(value, &owners, &mut safe)
-        });
+        block
+            .terminator
+            .for_each_used_value(|value| remove_alias_owners(value, &owners, &mut safe));
     }
 
     if safe.is_empty() {
@@ -1932,9 +2034,7 @@ mod tests {
     use super::*;
     use crate::common::source::Span;
     use crate::common::types::AddressSpace;
-    use crate::ir::reexports::{
-        AtomicOrdering, BlockId, IrBinOp, IrConst, IrParam, Terminator,
-    };
+    use crate::ir::reexports::{AtomicOrdering, BlockId, IrBinOp, IrConst, IrParam, Terminator};
 
     fn block(label: u32, instructions: Vec<Instruction>) -> BasicBlock {
         BasicBlock {
@@ -1983,27 +2083,54 @@ mod tests {
         assert_eq!(direct_vector_load_width(IntrinsicOp::Load256), Some(32));
         assert_eq!(direct_vector_load_width(IntrinsicOp::Loadldi128), None);
         assert_eq!(direct_vector_load_width(IntrinsicOp::LoadF64x4), None);
-        assert_eq!(direct_vector_load_width(IntrinsicOp::MaskLoaduEpi8_256), None);
+        assert_eq!(
+            direct_vector_load_width(IntrinsicOp::MaskLoaduEpi8_256),
+            None
+        );
     }
 
     #[test]
     fn intrinsic_signature_distinguishes_vector_and_scalar_arguments() {
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 0), Some(32));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 1), Some(32));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pinsrd128, 0), Some(16));
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 0),
+            Some(32)
+        );
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 1),
+            Some(32)
+        );
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Pinsrd128, 0),
+            Some(16)
+        );
         assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pinsrd128, 1), None);
         assert_eq!(pointer_vector_arg_width(IntrinsicOp::SetEpi32_256, 0), None);
         assert_eq!(pointer_vector_arg_width(IntrinsicOp::FmaF64x4, 0), None);
         assert_eq!(pointer_vector_arg_width(IntrinsicOp::FmaF64x4, 1), Some(32));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 0), Some(32));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 1), Some(16));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Insert128to256, 2), None);
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Insert128to256, 0),
+            Some(32)
+        );
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Insert128to256, 1),
+            Some(16)
+        );
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Insert128to256, 2),
+            None
+        );
     }
 
     #[test]
     fn widening_extension_reads_a_128_bit_source() {
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovzxbw256, 0), Some(16));
-        assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovsxwd256, 0), Some(16));
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Pmovzxbw256, 0),
+            Some(16)
+        );
+        assert_eq!(
+            pointer_vector_arg_width(IntrinsicOp::Pmovsxwd256, 0),
+            Some(16)
+        );
         assert_eq!(pointer_vector_arg_width(IntrinsicOp::Pmovzxbw256, 1), None);
     }
 
@@ -2060,7 +2187,10 @@ mod tests {
         assert_eq!(function.blocks[1].source_spans.len(), 1);
         assert!(matches!(
             function.blocks[1].instructions[0],
-            Instruction::Intrinsic { dest_ptr: Some(Value(1)), .. }
+            Instruction::Intrinsic {
+                dest_ptr: Some(Value(1)),
+                ..
+            }
         ));
     }
 
@@ -2282,7 +2412,8 @@ mod tests {
             is_f128_sse: false,
             riscv_float_class: None,
         };
-        let mut function = IrFunction::new("const_src_param".into(), IrType::I32, vec![param], false);
+        let mut function =
+            IrFunction::new("const_src_param".into(), IrType::I32, vec![param], false);
         function.blocks = vec![block(
             0,
             vec![
@@ -2314,8 +2445,7 @@ mod tests {
             ],
         )];
         assert_eq!(fuse_in_function(&mut function), 0);
-        let Instruction::Intrinsic { args, .. } =
-            function.blocks[0].instructions.last().unwrap()
+        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
@@ -2360,8 +2490,7 @@ mod tests {
             )],
         );
         assert_eq!(fuse_in_function(&mut function), 1);
-        let Instruction::Intrinsic { args, .. } =
-            function.blocks[0].instructions.last().unwrap()
+        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
@@ -2383,7 +2512,12 @@ mod tests {
                 vec![
                     alloca(1, 32, 32), // load slot / variable
                     alloca(6, 32, 32), // consumer result slot
-                    intrinsic(Some(3), IntrinsicOp::Loadu256, Some(1), vec![Operand::Value(Value(2))]),
+                    intrinsic(
+                        Some(3),
+                        IntrinsicOp::Loadu256,
+                        Some(1),
+                        vec![Operand::Value(Value(2))],
+                    ),
                     intrinsic(Some(4), IntrinsicOp::Setzero256, Some(1), vec![]),
                     intrinsic(
                         Some(5),
@@ -2395,8 +2529,7 @@ mod tests {
             )],
         );
         fuse_in_function(&mut function);
-        let Instruction::Intrinsic { args, .. } =
-            function.blocks[0].instructions.last().unwrap()
+        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
@@ -2418,7 +2551,12 @@ mod tests {
                 vec![
                     alloca(1, 32, 32),
                     alloca(6, 32, 32),
-                    intrinsic(Some(3), IntrinsicOp::Loadu256, Some(1), vec![Operand::Value(Value(2))]),
+                    intrinsic(
+                        Some(3),
+                        IntrinsicOp::Loadu256,
+                        Some(1),
+                        vec![Operand::Value(Value(2))],
+                    ),
                     intrinsic(
                         None,
                         IntrinsicOp::VecStoreI64x2,
@@ -2439,8 +2577,7 @@ mod tests {
             )],
         );
         fuse_in_function(&mut function);
-        let Instruction::Intrinsic { args, .. } =
-            function.blocks[0].instructions.last().unwrap()
+        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
         else {
             panic!("expected consumer");
         };
@@ -2531,7 +2668,8 @@ mod tests {
             )],
         );
         assert_eq!(fuse_in_function(&mut function), 1);
-        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap() else {
+        let Instruction::Intrinsic { args, .. } = function.blocks[0].instructions.last().unwrap()
+        else {
             panic!("expected consumer");
         };
         assert!(matches!(args[0], Operand::Value(Value(18))));
@@ -2636,7 +2774,10 @@ mod tests {
         assert_eq!(function.blocks[0].instructions.len(), 3);
         assert!(!function.blocks[0].instructions.iter().any(|inst| matches!(
             inst,
-            Instruction::Intrinsic { op: IntrinsicOp::Loaddqu, .. }
+            Instruction::Intrinsic {
+                op: IntrinsicOp::Loaddqu,
+                ..
+            }
         )));
         assert!(matches!(
             &function.blocks[0].instructions[2],
@@ -2925,7 +3066,10 @@ mod tests {
         ));
         assert_eq!(
             pointer_root_analysis(&function).roots.get(&3),
-            Some(&PointerRoot::Param { index: 0, noalias: false })
+            Some(&PointerRoot::Param {
+                index: 0,
+                noalias: false
+            })
         );
     }
 

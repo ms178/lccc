@@ -117,7 +117,10 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
         let raw =
             loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
         let loops_now = loop_analysis::merge_loops_by_header(raw);
-        let mut tiny: Vec<_> = loops_now.into_iter().filter(|lp| matches!(lp.body.len(), 2 | 3)).collect();
+        let mut tiny: Vec<_> = loops_now
+            .into_iter()
+            .filter(|lp| matches!(lp.body.len(), 2 | 3))
+            .collect();
         tiny.sort_by_key(|lp| lp.header);
         let mut did = false;
         for lp in &tiny {
@@ -444,7 +447,9 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
                     Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
                 }
             }
-            Instruction::Store { .. } | Instruction::Load { .. } | Instruction::GetElementPtr { .. } => {
+            Instruction::Store { .. }
+            | Instruction::Load { .. }
+            | Instruction::GetElementPtr { .. } => {
                 other_arith = true;
             }
             _ => {}
@@ -490,8 +495,15 @@ fn try_complete_unroll_two_block(
     if iv_step != 1 {
         return false;
     }
-    let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, exit_cond_positive)) =
-        find_exit_condition(func, header, &lp.body, iv_phi)
+    let Some((
+        exit_target,
+        body_entry,
+        cmp_op,
+        _cmp_ty,
+        exit_limit,
+        _iv_is_lhs,
+        exit_cond_positive,
+    )) = find_exit_condition(func, header, &lp.body, iv_phi)
     else {
         return false;
     };
@@ -501,7 +513,9 @@ fn try_complete_unroll_two_block(
     let work_blocks: Vec<usize> = if body_entry == latch_label {
         vec![latch]
     } else {
-        let Some(bi) = func.blocks.iter().position(|b| b.label == body_entry) else { return false; };
+        let Some(bi) = func.blocks.iter().position(|b| b.label == body_entry) else {
+            return false;
+        };
         // body must be in the loop and branch to latch
         if !lp.body.contains(&bi) {
             return false;
@@ -583,12 +597,24 @@ fn try_complete_unroll_two_block(
         for &wbi in &work_blocks {
             for inst in &func.blocks[wbi].instructions {
                 match inst {
-                    Instruction::BinOp { ty: IrType::F32, .. }
-                    | Instruction::Load { ty: IrType::F32, .. }
-                    | Instruction::Store { ty: IrType::F32, .. } => has_f32 = true,
-                    Instruction::BinOp { ty: IrType::F64, .. }
-                    | Instruction::Load { ty: IrType::F64, .. }
-                    | Instruction::Store { ty: IrType::F64, .. } => has_f64 = true,
+                    Instruction::BinOp {
+                        ty: IrType::F32, ..
+                    }
+                    | Instruction::Load {
+                        ty: IrType::F32, ..
+                    }
+                    | Instruction::Store {
+                        ty: IrType::F32, ..
+                    } => has_f32 = true,
+                    Instruction::BinOp {
+                        ty: IrType::F64, ..
+                    }
+                    | Instruction::Load {
+                        ty: IrType::F64, ..
+                    }
+                    | Instruction::Store {
+                        ty: IrType::F64, ..
+                    } => has_f64 = true,
                     _ => {}
                 }
             }
@@ -1502,7 +1528,9 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         }
 
         // Inline assembly.
-        Instruction::InlineAsm { outputs, inputs, .. } => {
+        Instruction::InlineAsm {
+            outputs, inputs, ..
+        } => {
             for (_, ptr, _) in outputs {
                 replace_val(ptr, map);
             }
@@ -1628,7 +1656,8 @@ mod tests {
                     offset: Operand::Const(IrConst::I32(0)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { volatile: false,
+                Instruction::Store {
+                    volatile: false,
                     val: Operand::Const(IrConst::I32(0)),
                     ptr: Value(4),
                     ty: IrType::I32,
@@ -1716,7 +1745,10 @@ mod tests {
             }
         }
         let n = unroll_loops(&mut func);
-        assert_eq!(n, 1, "IV-indexed GEP loop should be unrolled (per-clone remap)");
+        assert_eq!(
+            n, 1,
+            "IV-indexed GEP loop should be unrolled (per-clone remap)"
+        );
     }
 
     #[test]
@@ -1726,12 +1758,15 @@ mod tests {
         // stay narrow and the widened uses can interact incorrectly with
         // later passes (observed in the SQLite amalgamation).
         let mut func = make_counting_loop(100);
-        func.blocks[2].instructions.insert(0, Instruction::Cast {
-            dest: Value(90),
-            src: Operand::Value(Value(1)),
-            from_ty: IrType::I32,
-            to_ty: IrType::I64,
-        });
+        func.blocks[2].instructions.insert(
+            0,
+            Instruction::Cast {
+                dest: Value(90),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+        );
         let n = unroll_loops(&mut func);
         if crate::common::types::target_is_32bit() {
             assert_eq!(n, 1, "32-bit targets have no widening hazard");
@@ -1761,7 +1796,8 @@ mod tests {
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: vec![],
-            ret_is_f128_sse: false,},
+                ret_is_f128_sse: false,
+            },
         });
         let n = unroll_loops(&mut func);
         assert_eq!(n, 0, "loop with call should not be unrolled");

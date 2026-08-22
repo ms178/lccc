@@ -10,15 +10,15 @@
 //! static ET_EXEC image with no dynamic sections; relocation types are the
 //! static x86-64 set (PC32/PLT32/32/32S/64 and TLS LE forms).
 
-use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
+use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::elf::*;
 use crate::backend::linker_common::{
     self,
     linker_script::{
-        self, LinkerScript, SectionsItem, SecItem, OutputSecDef, Assignment,
-        AssignOp, EvalCtx, EvalError, SortKind, glob_match, eval_expr,
+        self, eval_expr, glob_match, AssignOp, Assignment, EvalCtx, EvalError, LinkerScript,
+        OutputSecDef, SecItem, SectionsItem, SortKind,
     },
 };
 
@@ -69,8 +69,12 @@ fn script_expr_home(
             }
         }
         Expr::AddrOf(name) | Expr::LoadAddrOf(name) => ScriptExprHome::Section(name.clone()),
-        Expr::Absolute(_) | Expr::Num(_) | Expr::SizeOf(_) | Expr::AlignOf(_)
-        | Expr::DefinedSym(_) | Expr::SegmentStart(_, _) => ScriptExprHome::Absolute,
+        Expr::Absolute(_)
+        | Expr::Num(_)
+        | Expr::SizeOf(_)
+        | Expr::AlignOf(_)
+        | Expr::DefinedSym(_)
+        | Expr::SegmentStart(_, _) => ScriptExprHome::Absolute,
         Expr::Align1(_) => dot_home
             .map(|name| ScriptExprHome::Section(name.to_string()))
             .unwrap_or(ScriptExprHome::Unresolved),
@@ -119,13 +123,21 @@ fn script_expr_home(
             } else {
                 let yes = recurse(yes);
                 let no = recurse(no);
-                if yes == no { yes } else { ScriptExprHome::Absolute }
+                if yes == no {
+                    yes
+                } else {
+                    ScriptExprHome::Absolute
+                }
             }
         }
         Expr::Min(yes, no) | Expr::Max(yes, no) => {
             let yes = recurse(yes);
             let no = recurse(no);
-            if yes == no { yes } else { ScriptExprHome::Absolute }
+            if yes == no {
+                yes
+            } else {
+                ScriptExprHome::Absolute
+            }
         }
         Expr::Assert(value, _) => recurse(value),
         Expr::Neg(_) | Expr::Not(_) => ScriptExprHome::Absolute,
@@ -140,9 +152,14 @@ fn expr_contains_absolute(expr: &linker_script::Expr) -> bool {
     use linker_script::Expr;
     match expr {
         Expr::Absolute(_) => true,
-        Expr::SegmentStart(_, value) | Expr::Neg(value) | Expr::Not(value)
-        | Expr::Align1(value) | Expr::Assert(value, _) => expr_contains_absolute(value),
-        Expr::Bin(_, lhs, rhs) | Expr::Align2(lhs, rhs) | Expr::Min(lhs, rhs)
+        Expr::SegmentStart(_, value)
+        | Expr::Neg(value)
+        | Expr::Not(value)
+        | Expr::Align1(value)
+        | Expr::Assert(value, _) => expr_contains_absolute(value),
+        Expr::Bin(_, lhs, rhs)
+        | Expr::Align2(lhs, rhs)
+        | Expr::Min(lhs, rhs)
         | Expr::Max(lhs, rhs) => expr_contains_absolute(lhs) || expr_contains_absolute(rhs),
         Expr::Ternary(cond, yes, no) => {
             if let Some(value) = linker_script::eval_const(cond) {
@@ -187,7 +204,10 @@ fn script_value_form(
                 ScriptValueForm::Unknown
             }
         }
-        Expr::Num(_) | Expr::SizeOf(_) | Expr::AlignOf(_) | Expr::DefinedSym(_)
+        Expr::Num(_)
+        | Expr::SizeOf(_)
+        | Expr::AlignOf(_)
+        | Expr::DefinedSym(_)
         | Expr::SegmentStart(_, _) => ScriptValueForm::Offset,
         Expr::Absolute(_) => ScriptValueForm::Address,
         Expr::Align2(value, _) => recurse(value),
@@ -200,19 +220,13 @@ fn script_value_form(
                     | (ScriptValueForm::Offset, ScriptValueForm::Address) => {
                         ScriptValueForm::Address
                     }
-                    (ScriptValueForm::Offset, ScriptValueForm::Offset) => {
-                        ScriptValueForm::Offset
-                    }
+                    (ScriptValueForm::Offset, ScriptValueForm::Offset) => ScriptValueForm::Offset,
                     _ => ScriptValueForm::Unknown,
                 },
                 BinOp::Sub => match (left, right) {
-                    (ScriptValueForm::Address, ScriptValueForm::Offset) => {
-                        ScriptValueForm::Address
-                    }
+                    (ScriptValueForm::Address, ScriptValueForm::Offset) => ScriptValueForm::Address,
                     (ScriptValueForm::Address, ScriptValueForm::Address)
-                    | (ScriptValueForm::Offset, ScriptValueForm::Offset) => {
-                        ScriptValueForm::Offset
-                    }
+                    | (ScriptValueForm::Offset, ScriptValueForm::Offset) => ScriptValueForm::Offset,
                     _ => ScriptValueForm::Unknown,
                 },
                 _ => ScriptValueForm::Offset,
@@ -224,13 +238,21 @@ fn script_value_form(
             } else {
                 let yes = recurse(yes);
                 let no = recurse(no);
-                if yes == no { yes } else { ScriptValueForm::Unknown }
+                if yes == no {
+                    yes
+                } else {
+                    ScriptValueForm::Unknown
+                }
             }
         }
         Expr::Min(yes, no) | Expr::Max(yes, no) => {
             let yes = recurse(yes);
             let no = recurse(no);
-            if yes == no { yes } else { ScriptValueForm::Unknown }
+            if yes == no {
+                yes
+            } else {
+                ScriptValueForm::Unknown
+            }
         }
         Expr::Assert(value, _) => recurse(value),
         Expr::Neg(_) | Expr::Not(_) => ScriptValueForm::Offset,
@@ -245,11 +267,15 @@ fn expr_references_sizeof(expr: &linker_script::Expr, section: &str) -> bool {
     use linker_script::Expr;
     match expr {
         Expr::SizeOf(name) => name == section,
-        Expr::SegmentStart(_, value) | Expr::Neg(value) | Expr::Not(value)
-        | Expr::Align1(value) | Expr::Absolute(value) | Expr::Assert(value, _) => {
-            expr_references_sizeof(value, section)
-        }
-        Expr::Bin(_, lhs, rhs) | Expr::Align2(lhs, rhs) | Expr::Min(lhs, rhs)
+        Expr::SegmentStart(_, value)
+        | Expr::Neg(value)
+        | Expr::Not(value)
+        | Expr::Align1(value)
+        | Expr::Absolute(value)
+        | Expr::Assert(value, _) => expr_references_sizeof(value, section),
+        Expr::Bin(_, lhs, rhs)
+        | Expr::Align2(lhs, rhs)
+        | Expr::Min(lhs, rhs)
         | Expr::Max(lhs, rhs) => {
             expr_references_sizeof(lhs, section) || expr_references_sizeof(rhs, section)
         }
@@ -264,19 +290,34 @@ fn expr_references_sizeof(expr: &linker_script::Expr, section: &str) -> bool {
 
 impl ScriptMachine {
     fn ehdr_size(self) -> u64 {
-        match self { Self::X86_64 => 64, Self::I386 => 52 }
+        match self {
+            Self::X86_64 => 64,
+            Self::I386 => 52,
+        }
     }
     fn phdr_size(self) -> u64 {
-        match self { Self::X86_64 => 56, Self::I386 => 32 }
+        match self {
+            Self::X86_64 => 56,
+            Self::I386 => 32,
+        }
     }
     fn shdr_size(self) -> u64 {
-        match self { Self::X86_64 => 64, Self::I386 => 40 }
+        match self {
+            Self::X86_64 => 64,
+            Self::I386 => 40,
+        }
     }
     fn sym_size(self) -> usize {
-        match self { Self::X86_64 => 24, Self::I386 => 16 }
+        match self {
+            Self::X86_64 => 24,
+            Self::I386 => 16,
+        }
     }
     fn rel_size(self) -> usize {
-        match self { Self::X86_64 => 24, Self::I386 => 8 }
+        match self {
+            Self::X86_64 => 24,
+            Self::I386 => 8,
+        }
     }
 }
 
@@ -289,10 +330,11 @@ impl ScriptMachine {
 /// header, and the entry point then lands in header bytes -- observed as an
 /// immediate SIGILL.
 fn script_header_size_with(
-    script: &LinkerScript, extra_phdrs: usize, machine: ScriptMachine,
+    script: &LinkerScript,
+    extra_phdrs: usize,
+    machine: ScriptMachine,
 ) -> u64 {
-    machine.ehdr_size()
-        + machine.phdr_size() * (script.phdrs.len().max(1) + extra_phdrs) as u64
+    machine.ehdr_size() + machine.phdr_size() * (script.phdrs.len().max(1) + extra_phdrs) as u64
 }
 
 /// Synthetic dynamic-link information required by an ET_DYN linker-script
@@ -332,16 +374,18 @@ fn build_sysv_hash(names: &[String]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + (buckets + chains.len()) * 4);
     push_u32(&mut out, buckets as u32);
     push_u32(&mut out, chains.len() as u32);
-    for value in heads { push_u32(&mut out, value); }
-    for value in chains { push_u32(&mut out, value); }
+    for value in heads {
+        push_u32(&mut out, value);
+    }
+    for value in chains {
+        push_u32(&mut out, value);
+    }
     out
 }
 
 /// Build a GNU hash table and return the required dynsym order. GNU hash
 /// requires all symbols belonging to a bucket to be contiguous.
-fn build_gnu_hash(
-    mut names: Vec<String>, machine: ScriptMachine,
-) -> (Vec<u8>, Vec<String>) {
+fn build_gnu_hash(mut names: Vec<String>, machine: ScriptMachine) -> (Vec<u8>, Vec<String>) {
     // Bucket count: a power of two near the symbol count, so chains stay
     // short. GNU ld uses a load factor around 1 symbol per bucket for exactly
     // this reason -- every ld.so lookup walks a chain, so an undersized table
@@ -355,20 +399,28 @@ fn build_gnu_hash(
     // Decorate once: `sort_by_key(... name.clone())` allocated and copied a
     // String on every comparator invocation (O(n log n) heap traffic), then
     // hashed every name again.  Hash once and compare borrowed names.
-    let mut hashed: Vec<(String, u32)> = names.drain(..)
+    let mut hashed: Vec<(String, u32)> = names
+        .drain(..)
         .map(|name| {
             let hash = linker_common::gnu_hash(name.as_bytes());
             (name, hash)
-        }).collect();
+        })
+        .collect();
     hashed.sort_unstable_by(|(a_name, a_hash), (b_name, b_hash)| {
-        (a_hash % nbuckets as u32).cmp(&(b_hash % nbuckets as u32))
+        (a_hash % nbuckets as u32)
+            .cmp(&(b_hash % nbuckets as u32))
             .then(a_hash.cmp(b_hash))
             .then(a_name.cmp(b_name))
     });
     let (names, hashes): (Vec<String>, Vec<u32>) = hashed.into_iter().unzip();
-    let word_bits = if machine == ScriptMachine::X86_64 { 64usize } else { 32usize };
+    let word_bits = if machine == ScriptMachine::X86_64 {
+        64usize
+    } else {
+        32usize
+    };
     let bloom_size = ((names.len() + word_bits - 1) / word_bits)
-        .next_power_of_two().max(1);
+        .next_power_of_two()
+        .max(1);
     let bloom_shift = 6u32;
     // Store bloom words in u64 while building; ELF32 serialises their low 32
     // bits as Elf32_Addr words.
@@ -382,9 +434,11 @@ fn build_gnu_hash(
     let mut chains = vec![0u32; names.len()];
     for (i, &hash) in hashes.iter().enumerate() {
         let bucket = hash as usize % nbuckets;
-        if buckets[bucket] == 0 { buckets[bucket] = (i + 1) as u32; }
-        let last = i + 1 == hashes.len()
-            || hashes[i + 1] % nbuckets as u32 != hash % nbuckets as u32;
+        if buckets[bucket] == 0 {
+            buckets[bucket] = (i + 1) as u32;
+        }
+        let last =
+            i + 1 == hashes.len() || hashes[i + 1] % nbuckets as u32 != hash % nbuckets as u32;
         chains[i] = (hash & !1) | u32::from(last);
     }
     let mut out = Vec::new();
@@ -399,14 +453,23 @@ fn build_gnu_hash(
             push_u32(&mut out, value as u32);
         }
     }
-    for value in buckets { push_u32(&mut out, value); }
-    for value in chains { push_u32(&mut out, value); }
+    for value in buckets {
+        push_u32(&mut out, value);
+    }
+    for value in chains {
+        push_u32(&mut out, value);
+    }
     (out, names)
 }
 
 fn push_verdef(
-    buf: &mut Vec<u8>, index: u16, flags: u16, name: &str, name_off: u32,
-    parent_off: Option<u32>, next: u32,
+    buf: &mut Vec<u8>,
+    index: u16,
+    flags: u16,
+    name: &str,
+    name_off: u32,
+    parent_off: Option<u32>,
+    next: u32,
 ) {
     // Elf{32,64}_Verdef is class-independent: a 20-byte header followed by
     // one Verdaux for the node name and, for inherited nodes, one for the
@@ -427,13 +490,31 @@ fn push_verdef(
     }
 }
 
-fn synthetic_section(name: &str, sh_type: u32, flags: u64,
-                     align: u64, entsize: u64, data: Vec<u8>) -> (linker_common::Elf64Section, Vec<u8>) {
+fn synthetic_section(
+    name: &str,
+    sh_type: u32,
+    flags: u64,
+    align: u64,
+    entsize: u64,
+    data: Vec<u8>,
+) -> (linker_common::Elf64Section, Vec<u8>) {
     let size = data.len() as u64;
-    (linker_common::Elf64Section {
-        name_idx: 0, name: name.into(), sh_type, flags, addr: 0, offset: 0,
-        size, link: 0, info: 0, addralign: align, entsize,
-    }, data)
+    (
+        linker_common::Elf64Section {
+            name_idx: 0,
+            name: name.into(),
+            sh_type,
+            flags,
+            addr: 0,
+            offset: 0,
+            size,
+            link: 0,
+            info: 0,
+            addralign: align,
+            entsize,
+        },
+        data,
+    )
 }
 
 fn make_script_dynamic_object(
@@ -449,8 +530,12 @@ fn make_script_dynamic_object(
     // 32-bit vDSO has LINUX_2.6 and LINUX_2.5; emitting only the first made the
     // latter's syscall symbols claim the wrong ABI even though they remained
     // findable by name.
-    let mut named_nodes: Vec<(usize, &linker_common::VersionNode)> = version.nodes
-        .iter().enumerate().filter(|(_, node)| !node.name.is_empty()).collect();
+    let mut named_nodes: Vec<(usize, &linker_common::VersionNode)> = version
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !node.name.is_empty())
+        .collect();
     if named_nodes.is_empty() && !version.version_name.is_empty() {
         // Compatibility with a hand-constructed/legacy VersionScript whose
         // first-node fields are populated but `nodes` is empty.
@@ -461,8 +546,11 @@ fn make_script_dynamic_object(
             export_candidates.push(node.name.clone());
         }
     }
-    if named_nodes.is_empty() && !version.version_name.is_empty()
-        && !export_candidates.iter().any(|name| name == &version.version_name)
+    if named_nodes.is_empty()
+        && !version.version_name.is_empty()
+        && !export_candidates
+            .iter()
+            .any(|name| name == &version.version_name)
     {
         export_candidates.push(version.version_name.clone());
     }
@@ -505,7 +593,9 @@ fn make_script_dynamic_object(
         node_versions.insert(*node_index, ordinal as u16 + 2);
     }
     let mut version_symbols: FxHashSet<String> = FxHashSet::default();
-    for (_, node) in &named_nodes { version_symbols.insert(node.name.clone()); }
+    for (_, node) in &named_nodes {
+        version_symbols.insert(node.name.clone());
+    }
     if named_nodes.is_empty() && !version.version_name.is_empty() {
         version_symbols.insert(version.version_name.clone());
     }
@@ -513,7 +603,9 @@ fn make_script_dynamic_object(
     let mut versym = Vec::with_capacity((exports.len() + 1) * 2);
     versym.extend_from_slice(&0u16.to_le_bytes());
     for name in &exports {
-        let index = if let Some((ordinal, _)) = named_nodes.iter().enumerate()
+        let index = if let Some((ordinal, _)) = named_nodes
+            .iter()
+            .enumerate()
             .find(|(_, (_, node))| node.name == *name)
         {
             ordinal as u16 + 2
@@ -533,22 +625,44 @@ fn make_script_dynamic_object(
     } else {
         let node_count = named_nodes.len().max(1);
         // VER_FLG_BASE = 1. The base entry always has one Verdaux.
-        push_verdef(&mut verdef, 1, 1, base_name, base_off, None,
-                    if node_count > 0 { 28 } else { 0 });
+        push_verdef(
+            &mut verdef,
+            1,
+            1,
+            base_name,
+            base_off,
+            None,
+            if node_count > 0 { 28 } else { 0 },
+        );
         if named_nodes.is_empty() {
-            let off = *dynstr_offsets.get(&version.version_name)
+            let off = *dynstr_offsets
+                .get(&version.version_name)
                 .expect("legacy version symbol was inserted");
             push_verdef(&mut verdef, 2, 0, &version.version_name, off, None, 0);
         } else {
             for (ordinal, (_, node)) in named_nodes.iter().enumerate() {
-                let name_off = *dynstr_offsets.get(&node.name)
+                let name_off = *dynstr_offsets
+                    .get(&node.name)
                     .expect("version symbol was inserted");
-                let parent_off = node.parent.as_ref().and_then(|parent|
-                    dynstr_offsets.get(parent).copied());
+                let parent_off = node
+                    .parent
+                    .as_ref()
+                    .and_then(|parent| dynstr_offsets.get(parent).copied());
                 let entry_len = if parent_off.is_some() { 36 } else { 28 };
-                let next = if ordinal + 1 == named_nodes.len() { 0 } else { entry_len };
-                push_verdef(&mut verdef, ordinal as u16 + 2, 0, &node.name,
-                            name_off, parent_off, next);
+                let next = if ordinal + 1 == named_nodes.len() {
+                    0
+                } else {
+                    entry_len
+                };
+                push_verdef(
+                    &mut verdef,
+                    ordinal as u16 + 2,
+                    0,
+                    &node.name,
+                    name_off,
+                    parent_off,
+                    next,
+                );
             }
         }
         1 + node_count as u64
@@ -556,23 +670,58 @@ fn make_script_dynamic_object(
 
     // Fixed tags plus optional SONAME and symbolic binding. Values that depend
     // on layout are patched after sections receive final virtual addresses.
-    let dynamic_entries = 10usize + usize::from(soname.is_some())
-        + if bsymbolic { 2 } else { 0 };
-    let dynamic = vec![0u8; dynamic_entries * if machine == ScriptMachine::X86_64 { 16 } else { 8 }];
-    let word_align = if machine == ScriptMachine::X86_64 { 8 } else { 4 };
+    let dynamic_entries = 10usize + usize::from(soname.is_some()) + if bsymbolic { 2 } else { 0 };
+    let dynamic = vec![
+        0u8;
+        dynamic_entries
+            * if machine == ScriptMachine::X86_64 {
+                16
+            } else {
+                8
+            }
+    ];
+    let word_align = if machine == ScriptMachine::X86_64 {
+        8
+    } else {
+        4
+    };
 
     let mut sections = Vec::new();
     let mut section_data = Vec::new();
     let pairs = [
         synthetic_section("", SHT_NULL_, 0, 0, 0, Vec::new()),
         synthetic_section(".hash", 5, SHF_ALLOC_, 4, 4, sysv_hash),
-        synthetic_section(".gnu.hash", 0x6fff_fff6, SHF_ALLOC_, word_align, 0, gnu_hash),
-        synthetic_section(".dynsym", 11, SHF_ALLOC_, word_align, dynsym_size as u64, dynsym),
+        synthetic_section(
+            ".gnu.hash",
+            0x6fff_fff6,
+            SHF_ALLOC_,
+            word_align,
+            0,
+            gnu_hash,
+        ),
+        synthetic_section(
+            ".dynsym",
+            11,
+            SHF_ALLOC_,
+            word_align,
+            dynsym_size as u64,
+            dynsym,
+        ),
         synthetic_section(".dynstr", SHT_STRTAB_, SHF_ALLOC_, 1, 0, dynstr),
         synthetic_section(".gnu.version", 0x6fff_ffff, SHF_ALLOC_, 2, 2, versym),
         synthetic_section(".gnu.version_d", 0x6fff_fffd, SHF_ALLOC_, 4, 0, verdef),
-        synthetic_section(".dynamic", 6, SHF_ALLOC_ | SHF_WRITE_, word_align,
-                          if machine == ScriptMachine::X86_64 { 16 } else { 8 }, dynamic),
+        synthetic_section(
+            ".dynamic",
+            6,
+            SHF_ALLOC_ | SHF_WRITE_,
+            word_align,
+            if machine == ScriptMachine::X86_64 {
+                16
+            } else {
+                8
+            },
+            dynamic,
+        ),
     ];
     for (section, data) in pairs {
         sections.push(section);
@@ -580,13 +729,19 @@ fn make_script_dynamic_object(
     }
     let section_count = sections.len();
     let object = Object {
-        sections, symbols: Vec::new(), section_data,
+        sections,
+        symbols: Vec::new(),
+        section_data,
         relocations: vec![Vec::new(); section_count],
         source_name: "<script-dynamic>".into(),
     };
     let plan = ScriptDynamic {
-        object_index, exports, name_offsets, version_symbols,
-        soname_offset, verdef_count,
+        object_index,
+        exports,
+        name_offsets,
+        version_symbols,
+        soname_offset,
+        verdef_count,
     };
     (object, plan)
 }
@@ -632,8 +787,17 @@ pub fn link_with_script(
     max_page_size: u64,
 ) -> Result<(), String> {
     link_with_script_machine(
-        objects, script_src, output_path, emit_symtab, is_pie, emit_relocs,
-        soname, bsymbolic, max_page_size, ScriptMachine::X86_64)
+        objects,
+        script_src,
+        output_path,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        soname,
+        bsymbolic,
+        max_page_size,
+        ScriptMachine::X86_64,
+    )
 }
 
 /// ELF32/i386 counterpart used by Linux's real-mode `setup.elf`.  Input
@@ -651,8 +815,17 @@ pub fn link_with_script_i386(
     max_page_size: u64,
 ) -> Result<(), String> {
     link_with_script_machine(
-        objects, script_src, output_path, emit_symtab, is_pie, emit_relocs,
-        soname, bsymbolic, max_page_size, ScriptMachine::I386)
+        objects,
+        script_src,
+        output_path,
+        emit_symtab,
+        is_pie,
+        emit_relocs,
+        soname,
+        bsymbolic,
+        max_page_size,
+        ScriptMachine::I386,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -677,15 +850,21 @@ fn link_with_script_machine(
     let mut def_syms: FxHashMap<String, (usize, u16, u64, u64, u8)> = FxHashMap::default();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_local() { continue; }
-            if sym.is_undefined() || sym.shndx == SHN_COMMON { continue; }
+            if sym.name.is_empty() || sym.is_local() {
+                continue;
+            }
+            if sym.is_undefined() || sym.shndx == SHN_COMMON {
+                continue;
+            }
             let replace = match def_syms.get(sym.name.as_str()) {
                 None => true,
                 Some(&(_, _, _, _, info)) => (info >> 4) == STB_WEAK && sym.is_global(),
             };
             if replace {
-                def_syms.insert(sym.name.to_string(),
-                    (oi, sym.shndx, sym.value, sym.size, sym.info));
+                def_syms.insert(
+                    sym.name.to_string(),
+                    (oi, sym.shndx, sym.value, sym.size, sym.info),
+                );
             }
         }
     }
@@ -696,7 +875,9 @@ fn link_with_script_machine(
     let mut hidden_object_syms: FxHashSet<String> = FxHashSet::default();
     for obj in objects.iter() {
         for sym in &obj.symbols {
-            if sym.name.is_empty() || sym.is_undefined() { continue; }
+            if sym.name.is_empty() || sym.is_undefined() {
+                continue;
+            }
             // STV_HIDDEN = 2, STV_INTERNAL = 1, STV_PROTECTED = 3 (still exported).
             let vis = sym.visibility();
             if vis == 1 || vis == 2 {
@@ -710,8 +891,11 @@ fn link_with_script_machine(
     // script's ordinary `*(.dynsym)` / `*(.dynamic)` rules decide placement,
     // exactly as they do in GNU ld.
     let embedded_version = linker_common::VersionScript::parse_text(script_src);
-    let wants_dynamic = is_pie && script.sections.iter().any(|item|
-        matches!(item, SectionsItem::Output(def) if def.name == ".dynamic"));
+    let wants_dynamic = is_pie
+        && script
+            .sections
+            .iter()
+            .any(|item| matches!(item, SectionsItem::Output(def) if def.name == ".dynamic"));
     let mut owned_objects: Option<Vec<Object>> = None;
     let mut script_dynamic: Option<ScriptDynamic> = None;
     if wants_dynamic {
@@ -722,7 +906,8 @@ fn link_with_script_machine(
             // version script second; doing it the other way round exports the
             // vDSO's internal helpers and every -fvisibility=hidden symbol in
             // a script-linked shared object.
-            let mut exports: Vec<String> = def_syms.iter()
+            let mut exports: Vec<String> = def_syms
+                .iter()
                 .filter(|(name, _)| version.matches_global(name))
                 .filter(|(name, _)| !hidden_object_syms.contains(name.as_str()))
                 .map(|(name, _)| name.clone())
@@ -731,12 +916,21 @@ fn link_with_script_machine(
             let mut all = objects.to_vec();
             let object_index = all.len();
             let output_base_name = soname.map(str::to_owned).unwrap_or_else(|| {
-                std::path::Path::new(output_path).file_name()
-                    .and_then(|name| name.to_str()).unwrap_or("a.out").to_owned()
+                std::path::Path::new(output_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("a.out")
+                    .to_owned()
             });
             let (dynamic_object, plan) = make_script_dynamic_object(
-                object_index, exports, version, soname, &output_base_name,
-                bsymbolic, machine);
+                object_index,
+                exports,
+                version,
+                soname,
+                &output_base_name,
+                bsymbolic,
+                machine,
+            );
             all.push(dynamic_object);
             owned_objects = Some(all);
             script_dynamic = Some(plan);
@@ -752,19 +946,29 @@ fn link_with_script_machine(
             // Ordinary object string/symbol/relocation tables are linker
             // metadata rather than input sections.  An allocated string table
             // is different: .dynstr must participate in script matching.
-            if matches!(sec.sh_type, SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_)
-                || (sec.sh_type == SHT_STRTAB_ && sec.flags & SHF_ALLOC_ == 0)
-            { continue; }
-            if sec.size == 0 && sec.name.is_empty() { continue; }
+            if matches!(
+                sec.sh_type,
+                SHT_NULL_ | SHT_SYMTAB_ | SHT_RELA_ | SHT_REL_ | SHT_GROUP_
+            ) || (sec.sh_type == SHT_STRTAB_ && sec.flags & SHF_ALLOC_ == 0)
+            {
+                continue;
+            }
+            if sec.size == 0 && sec.name.is_empty() {
+                continue;
+            }
             unassigned.push((oi, si));
         }
     }
 
     // Output section definitions in script order.
-    let out_defs: Vec<&OutputSecDef> = script.sections.iter().filter_map(|it| match it {
-        SectionsItem::Output(o) => Some(o),
-        _ => None,
-    }).collect();
+    let out_defs: Vec<&OutputSecDef> = script
+        .sections
+        .iter()
+        .filter_map(|it| match it {
+            SectionsItem::Output(o) => Some(o),
+            _ => None,
+        })
+        .collect();
 
     // For each (output def, item order), record which input sections match.
     // First-match-wins across the whole script.
@@ -776,7 +980,9 @@ fn link_with_script_machine(
         for (ii, item) in def.items.iter().enumerate() {
             let SecItem::Input(spec) = item else { continue };
             for &(oi, si) in unassigned.iter() {
-                if assigned.contains_key(&(oi, si)) || discard.contains(&(oi, si)) { continue; }
+                if assigned.contains_key(&(oi, si)) || discard.contains(&(oi, si)) {
+                    continue;
+                }
                 let name = &objects[oi].sections[si].name;
                 if spec.patterns.iter().any(|p| glob_match(p, name)) {
                     if def.name == "/DISCARD/" {
@@ -797,7 +1003,9 @@ fn link_with_script_machine(
     // (we still emit .symtab/.strtab/.shstrtab ourselves).
     let mut orphans: Vec<(usize, usize)> = Vec::new();
     for &(oi, si) in unassigned.iter() {
-        if assigned.contains_key(&(oi, si)) || discard.contains(&(oi, si)) { continue; }
+        if assigned.contains_key(&(oi, si)) || discard.contains(&(oi, si)) {
+            continue;
+        }
         let sec = &objects[oi].sections[si];
         if sec.flags & SHF_ALLOC_ != 0 && sec.size > 0 {
             orphans.push((oi, si));
@@ -815,12 +1023,15 @@ fn link_with_script_machine(
     // header table. Predict it from the inputs, since output sections do not
     // exist yet: any allocated SHF_TLS input section will produce one unless
     // the script already declares PT_TLS.
-    let will_add_tls_phdr = objects.iter().any(|o| o.sections.iter()
-            .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0
-                       && sec.size > 0))
-        && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
-    symbols.insert("__SIZEOF_HEADERS".into(),
-                   script_header_size_with(&script, usize::from(will_add_tls_phdr), machine));
+    let will_add_tls_phdr = objects.iter().any(|o| {
+        o.sections
+            .iter()
+            .any(|sec| (sec.flags & SHF_TLS_) != 0 && (sec.flags & SHF_ALLOC_) != 0 && sec.size > 0)
+    }) && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
+    symbols.insert(
+        "__SIZEOF_HEADERS".into(),
+        script_header_size_with(&script, usize::from(will_add_tls_phdr), machine),
+    );
     // Script symbols carry expression relocatability, not merely a numeric
     // value or syntactic assignment scope.  In particular, a SECTIONS-scope
     // `end = .` remains relative to the current output section, while section
@@ -847,7 +1058,10 @@ fn link_with_script_machine(
         let empty_syms: FxHashMap<String, u64> = FxHashMap::default();
         let empty_secs: FxHashMap<String, (u64, u64, u64, u64)> = FxHashMap::default();
         let ctx = linker_script::EvalCtx {
-            dot: 0, symbols: &empty_syms, sections: &empty_secs, segment_starts: None,
+            dot: 0,
+            symbols: &empty_syms,
+            sections: &empty_secs,
+            segment_starts: None,
         };
         let origin = linker_script::eval_expr(&r.origin, &ctx)
             .map_err(|_| format!("MEMORY region '{}': ORIGIN is not a constant", r.name))?;
@@ -887,9 +1101,13 @@ fn link_with_script_machine(
         def_syms: &FxHashMap<String, (usize, u16, u64, u64, u8)>,
         placed_map: &FxHashMap<(usize, usize), u64>,
     ) -> Option<u64> {
-        if let Some(&v) = symbols.get(name) { return Some(v); }
+        if let Some(&v) = symbols.get(name) {
+            return Some(v);
+        }
         if let Some(&(oi, shndx, value, _, _)) = def_syms.get(name) {
-            if shndx == SHN_ABS { return Some(value); }
+            if shndx == SHN_ABS {
+                return Some(value);
+            }
             if let Some(&base) = placed_map.get(&(oi, shndx as usize)) {
                 return Some(base + value);
             }
@@ -907,7 +1125,12 @@ fn link_with_script_machine(
         placed_map: &FxHashMap<(usize, usize), u64>,
     ) -> Result<u64, String> {
         // Fast path: try direct eval; on undefined symbol, augment.
-        let ctx = EvalCtx { dot, symbols, sections: sections_meta, segment_starts: None };
+        let ctx = EvalCtx {
+            dot,
+            symbols,
+            sections: sections_meta,
+            segment_starts: None,
+        };
         match eval_expr(e, &ctx) {
             Ok(v) => Ok(v),
             Err(EvalError::UndefinedSymbol(n)) => {
@@ -918,17 +1141,28 @@ fn link_with_script_machine(
                     // may still hit more undefined symbols; recurse via loop
                     let mut aug2 = aug;
                     loop {
-                        let ctx2 = EvalCtx { dot, symbols: &aug2, sections: sections_meta, segment_starts: None };
+                        let ctx2 = EvalCtx {
+                            dot,
+                            symbols: &aug2,
+                            sections: sections_meta,
+                            segment_starts: None,
+                        };
                         match eval_expr(e, &ctx2) {
                             Ok(v) => return Ok(v),
                             Err(EvalError::UndefinedSymbol(n2)) => {
                                 match lookup_sym(&n2, &aug2, def_syms, placed_map) {
-                                    Some(v2) => { aug2.insert(n2, v2); }
+                                    Some(v2) => {
+                                        aug2.insert(n2, v2);
+                                    }
                                     None => return Err(n2),
                                 }
                             }
-                            Err(EvalError::UnknownSection(s)) => return Err(format!("section {}", s)),
-                            Err(EvalError::AssertFailed(m)) => return Err(format!("ASSERT failed: {}", m)),
+                            Err(EvalError::UnknownSection(s)) => {
+                                return Err(format!("section {}", s))
+                            }
+                            Err(EvalError::AssertFailed(m)) => {
+                                return Err(format!("ASSERT failed: {}", m))
+                            }
                         }
                     }
                 } else {
@@ -949,10 +1183,21 @@ fn link_with_script_machine(
                     &sym_home,
                     &absolute_script_syms,
                 );
-                match eval_full(&a.expr, dot, &symbols, &sections_meta, &def_syms, &placed_map) {
+                match eval_full(
+                    &a.expr,
+                    dot,
+                    &symbols,
+                    &sections_meta,
+                    &def_syms,
+                    &placed_map,
+                ) {
                     Ok(v) => {
                         if a.symbol == "." {
-                            dot = if a.op == AssignOp::Add { dot.wrapping_add(v) } else { v };
+                            dot = if a.op == AssignOp::Add {
+                                dot.wrapping_add(v)
+                            } else {
+                                v
+                            };
                             if a.op == AssignOp::Set {
                                 dot_home = match expr_home {
                                     ScriptExprHome::Section(home) => Some(home),
@@ -962,8 +1207,13 @@ fn link_with_script_machine(
                         } else {
                             let nv = if a.op == AssignOp::Add {
                                 symbols.get(&a.symbol).copied().unwrap_or(0).wrapping_add(v)
-                            } else { v };
-                            if !(a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol))) {
+                            } else {
+                                v
+                            };
+                            if !(a.provide
+                                && (symbols.contains_key(&a.symbol)
+                                    || def_syms.contains_key(&a.symbol)))
+                            {
                                 symbols.insert(a.symbol.clone(), nv);
                                 sym_home.remove(&a.symbol);
                                 absolute_script_syms.remove(&a.symbol);
@@ -976,7 +1226,9 @@ fn link_with_script_machine(
                                     }
                                     ScriptExprHome::Unresolved => {}
                                 }
-                                if a.hidden { hidden_syms.insert(a.symbol.clone()); }
+                                if a.hidden {
+                                    hidden_syms.insert(a.symbol.clone());
+                                }
                             }
                         }
                     }
@@ -985,15 +1237,23 @@ fn link_with_script_machine(
             }
             SectionsItem::Assert(e, msg) => {
                 // Defer asserts until after layout (sections sized).
-                deferred.push((Assignment {
-                    symbol: "__assert__".into(), op: AssignOp::Set,
-                    expr: linker_script::Expr::Assert(Box::new(e.clone()), msg.clone()),
-                    provide: false,
-                    hidden: false,
-                }, dot, dot_home.clone(), false));
+                deferred.push((
+                    Assignment {
+                        symbol: "__assert__".into(),
+                        op: AssignOp::Set,
+                        expr: linker_script::Expr::Assert(Box::new(e.clone()), msg.clone()),
+                        provide: false,
+                        hidden: false,
+                    },
+                    dot,
+                    dot_home.clone(),
+                    false,
+                ));
             }
             SectionsItem::Output(def) => {
-                if def.name == "/DISCARD/" { continue; }
+                if def.name == "/DISCARD/" {
+                    continue;
+                }
                 let di = out_defs.iter().position(|d| std::ptr::eq(*d, def)).unwrap();
 
                 // Non-alloc convention: explicit address 0 (debug sections) or (INFO).
@@ -1010,15 +1270,26 @@ fn link_with_script_machine(
                     eval_full(ae, dot, &symbols, &sections_meta, &def_syms, &placed_map)
                         .map_err(|e| format!("cannot evaluate address of {}: {}", def.name, e))?
                 } else if let Some(ref rname) = def.region {
-                    *region_cursor.get(rname.as_str()).ok_or_else(|| format!(
-                        "linker script: section {} assigned to undefined MEMORY region '{}'",
-                        def.name, rname))?
+                    *region_cursor.get(rname.as_str()).ok_or_else(|| {
+                        format!(
+                            "linker script: section {} assigned to undefined MEMORY region '{}'",
+                            def.name, rname
+                        )
+                    })?
                 } else {
                     dot
                 };
                 if let Some(ref al) = def.align {
-                    let a = eval_full(al, sec_start, &symbols, &sections_meta, &def_syms, &placed_map)
-                        .unwrap_or(1).max(1);
+                    let a = eval_full(
+                        al,
+                        sec_start,
+                        &symbols,
+                        &sections_meta,
+                        &def_syms,
+                        &placed_map,
+                    )
+                    .unwrap_or(1)
+                    .max(1);
                     sec_start = (sec_start + a - 1) & !(a - 1);
                 } else if def.address.is_none() {
                     // GNU ld aligns the OUTPUT section start to the largest
@@ -1027,10 +1298,12 @@ fn link_with_script_machine(
                     // .text can start at an unaligned dot (observed as a
                     // 0x35-byte skew vs GNU ld on the kernel decompressor).
                     let di_self = di;
-                    let max_in_align = unassigned.iter()
+                    let max_in_align = unassigned
+                        .iter()
                         .filter(|k| assigned.get(k) == Some(&di_self))
                         .map(|&(oi, si)| objects[oi].sections[si].addralign.max(1))
-                        .max().unwrap_or(1);
+                        .max()
+                        .unwrap_or(1);
                     if max_in_align > 1 {
                         sec_start = (sec_start + max_in_align - 1) & !(max_in_align - 1);
                     }
@@ -1055,10 +1328,21 @@ fn link_with_script_machine(
                                 deferred.push((a.clone(), cur, Some(def.name.clone()), true));
                                 continue;
                             }
-                            match eval_full(&a.expr, cur, &symbols, &sections_meta, &def_syms, &placed_map) {
+                            match eval_full(
+                                &a.expr,
+                                cur,
+                                &symbols,
+                                &sections_meta,
+                                &def_syms,
+                                &placed_map,
+                            ) {
                                 Ok(v) => {
                                     if a.symbol == "." {
-                                        let nv = if a.op == AssignOp::Add { cur.wrapping_add(v) } else { v };
+                                        let nv = if a.op == AssignOp::Add {
+                                            cur.wrapping_add(v)
+                                        } else {
+                                            v
+                                        };
                                         if nv < cur && a.op == AssignOp::Set {
                                             // moving dot backwards is an error in ld; clamp
                                             cur = nv.max(sec_start);
@@ -1078,9 +1362,18 @@ fn link_with_script_machine(
                                             v
                                         };
                                         let nv = if a.op == AssignOp::Add {
-                                            symbols.get(&a.symbol).copied().unwrap_or(0).wrapping_add(v)
-                                        } else { v };
-                                        if !(a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol))) {
+                                            symbols
+                                                .get(&a.symbol)
+                                                .copied()
+                                                .unwrap_or(0)
+                                                .wrapping_add(v)
+                                        } else {
+                                            v
+                                        };
+                                        if !(a.provide
+                                            && (symbols.contains_key(&a.symbol)
+                                                || def_syms.contains_key(&a.symbol)))
+                                        {
                                             symbols.insert(a.symbol.clone(), nv);
                                             sym_home.remove(&a.symbol);
                                             absolute_script_syms.remove(&a.symbol);
@@ -1089,20 +1382,33 @@ fn link_with_script_machine(
                                             } else {
                                                 sym_home.insert(a.symbol.clone(), def.name.clone());
                                             }
-                                            if a.hidden { hidden_syms.insert(a.symbol.clone()); }
+                                            if a.hidden {
+                                                hidden_syms.insert(a.symbol.clone());
+                                            }
                                         }
                                     }
                                 }
-                                Err(_) => deferred.push((a.clone(), cur, Some(def.name.clone()), true)),
+                                Err(_) => {
+                                    deferred.push((a.clone(), cur, Some(def.name.clone()), true))
+                                }
                             }
                         }
                         SecItem::Assert(e, msg) => {
-                            deferred.push((Assignment {
-                                symbol: "__assert__".into(), op: AssignOp::Set,
-                                expr: linker_script::Expr::Assert(Box::new(e.clone()), msg.clone()),
-                                provide: false,
-                                hidden: false,
-                            }, cur, Some(def.name.clone()), true));
+                            deferred.push((
+                                Assignment {
+                                    symbol: "__assert__".into(),
+                                    op: AssignOp::Set,
+                                    expr: linker_script::Expr::Assert(
+                                        Box::new(e.clone()),
+                                        msg.clone(),
+                                    ),
+                                    provide: false,
+                                    hidden: false,
+                                },
+                                cur,
+                                Some(def.name.clone()),
+                                true,
+                            ));
                         }
                         SecItem::Data { width, expr } => {
                             // Data directives are byte-packed: unlike input
@@ -1112,29 +1418,40 @@ fn link_with_script_machine(
                             // the layout/deferred-assignment fixed point.
                             data_commands.push((cur - sec_start, *width, expr.clone()));
                             cur = cur.checked_add(*width as u64).ok_or_else(|| {
-                                format!("linker script: data directive in {} overflows address space", def.name)
+                                format!(
+                                    "linker script: data directive in {} overflows address space",
+                                    def.name
+                                )
                             })?;
                             any_progbits = true;
-                            if is_alloc { flags |= SHF_ALLOC_; }
+                            if is_alloc {
+                                flags |= SHF_ALLOC_;
+                            }
                         }
                         SecItem::Constructors => { /* ELF: no-op */ }
                         SecItem::Input(spec) => {
                             // Collect matching inputs assigned to (di, ii).
-                            let mut ins: Vec<(usize, usize)> = unassigned.iter()
-                                .filter(|k| assigned.get(k) == Some(&di)
-                                    && assigned_item.get(k) == Some(&ii))
-                                .copied().collect();
+                            let mut ins: Vec<(usize, usize)> = unassigned
+                                .iter()
+                                .filter(|k| {
+                                    assigned.get(k) == Some(&di)
+                                        && assigned_item.get(k) == Some(&ii)
+                                })
+                                .copied()
+                                .collect();
                             match spec.sort {
                                 SortKind::ByName | SortKind::ByInitPriority => {
                                     ins.sort_by(|a, b| {
-                                        objects[a.0].sections[a.1].name
+                                        objects[a.0].sections[a.1]
+                                            .name
                                             .cmp(&objects[b.0].sections[b.1].name)
                                             .then(a.cmp(b))
                                     });
                                 }
                                 SortKind::ByAlignment => {
                                     ins.sort_by(|a, b| {
-                                        objects[b.0].sections[b.1].addralign
+                                        objects[b.0].sections[b.1]
+                                            .addralign
                                             .cmp(&objects[a.0].sections[a.1].addralign)
                                             .then(a.cmp(b))
                                     });
@@ -1150,14 +1467,28 @@ fn link_with_script_machine(
                                 cur = (cur + a - 1) & !(a - 1);
                                 placed_map.insert((oi, si), cur);
                                 placed_owner.insert((oi, si), out_secs.len());
-                                placed.push(Placed { obj_idx: oi, sec_idx: si, vaddr: cur, size: sec.size });
+                                placed.push(Placed {
+                                    obj_idx: oi,
+                                    sec_idx: si,
+                                    vaddr: cur,
+                                    size: sec.size,
+                                });
                                 cur += sec.size;
-                                if a > max_align { max_align = a; }
-                                if sec.sh_type == SHT_PROGBITS_ { any_progbits = true; }
-                                if sec.sh_type != SHT_NOBITS_ && sec.sh_type != SHT_PROGBITS_ && sh_type == SHT_PROGBITS_ && !any_progbits {
+                                if a > max_align {
+                                    max_align = a;
+                                }
+                                if sec.sh_type == SHT_PROGBITS_ {
+                                    any_progbits = true;
+                                }
+                                if sec.sh_type != SHT_NOBITS_
+                                    && sec.sh_type != SHT_PROGBITS_
+                                    && sh_type == SHT_PROGBITS_
+                                    && !any_progbits
+                                {
                                     sh_type = sec.sh_type;
                                 }
-                                flags |= sec.flags & (SHF_WRITE_ | SHF_ALLOC_ | SHF_EXECINSTR_ | SHF_TLS_);
+                                flags |= sec.flags
+                                    & (SHF_WRITE_ | SHF_ALLOC_ | SHF_EXECINSTR_ | SHF_TLS_);
                             }
                         }
                     }
@@ -1165,10 +1496,14 @@ fn link_with_script_machine(
 
                 if std::env::var("LCCC_LD_MAP").is_ok() {
                     for p in &placed {
-                        eprintln!("MAP {} 0x{:x} 0x{:x} {}({})",
-                            def.name, p.vaddr, p.size,
+                        eprintln!(
+                            "MAP {} 0x{:x} 0x{:x} {}({})",
+                            def.name,
+                            p.vaddr,
+                            p.size,
                             objects[p.obj_idx].source_name,
-                            objects[p.obj_idx].sections[p.sec_idx].name);
+                            objects[p.obj_idx].sections[p.sec_idx].name
+                        );
                     }
                 }
 
@@ -1176,23 +1511,38 @@ fn link_with_script_machine(
                 // NOBITS only if ALL inputs are NOBITS and there was no ". += N" gap
                 // requiring file content. Kernel .bss/.brk are file-backed zeros in
                 // GNU ld only when fill is demanded; standard behavior: keep NOBITS.
-                let nobits = placed.iter().all(|p|
-                    objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_)
+                let nobits = placed
+                    .iter()
+                    .all(|p| objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_)
                     && def.fill.is_none()
-                    && (def.name.starts_with(".bss") || def.name.starts_with(".brk")
-                        || placed.iter().len() > 0 && placed.iter().all(|p|
-                            objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_)
-                        && !placed.is_empty());
-                let nobits = nobits && !placed.is_empty() || (placed.is_empty()
-                    && (def.name.starts_with(".bss") || def.name.starts_with(".brk")) && size > 0);
+                    && (def.name.starts_with(".bss")
+                        || def.name.starts_with(".brk")
+                        || placed.iter().len() > 0
+                            && placed.iter().all(|p| {
+                                objects[p.obj_idx].sections[p.sec_idx].sh_type == SHT_NOBITS_
+                            })
+                            && !placed.is_empty());
+                let nobits = nobits && !placed.is_empty()
+                    || (placed.is_empty()
+                        && (def.name.starts_with(".bss") || def.name.starts_with(".brk"))
+                        && size > 0);
 
-                if is_alloc { flags |= SHF_ALLOC_; }
+                if is_alloc {
+                    flags |= SHF_ALLOC_;
+                }
 
                 let lma = if let Some(ref at) = def.at_lma {
                     // AT() may reference ADDR(this-section): publish addr first.
                     sections_meta.insert(def.name.clone(), (sec_start, size, max_align, sec_start));
-                    eval_full(at, sec_start, &symbols, &sections_meta, &def_syms, &placed_map)
-                        .map_err(|e| format!("cannot evaluate AT() of {}: {}", def.name, e))?
+                    eval_full(
+                        at,
+                        sec_start,
+                        &symbols,
+                        &sections_meta,
+                        &def_syms,
+                        &placed_map,
+                    )
+                    .map_err(|e| format!("cannot evaluate AT() of {}: {}", def.name, e))?
                 } else {
                     sec_start
                 };
@@ -1209,7 +1559,14 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "linker script: section {} overflows MEMORY region '{}' by \
                                  {} bytes (region {:#x}..{:#x}, section {:#x}..{:#x})",
-                                def.name, rname, end - limit, origin, limit, sec_start, end));
+                                def.name,
+                                rname,
+                                end - limit,
+                                origin,
+                                limit,
+                                sec_start,
+                                end
+                            ));
                         }
                     }
                     region_cursor.insert(rname.to_string(), end);
@@ -1222,7 +1579,12 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "linker script: load image of {} overflows MEMORY region \
                                  '{}' by {} bytes (region {:#x}..{:#x})",
-                                def.name, rname, lend - limit, origin, limit));
+                                def.name,
+                                rname,
+                                lend - limit,
+                                origin,
+                                limit
+                            ));
                         }
                     }
                 }
@@ -1265,12 +1627,24 @@ fn link_with_script_machine(
             dot_home = Some(sec.name.clone());
             sections_meta.insert(sec.name.clone(), (start, sec.size, a, start));
             out_secs.push(OutSec {
-                name: sec.name.clone(), vaddr: start, lma: start, size: sec.size,
-                align: a, sh_type: sec.sh_type, flags: sec.flags & !SHF_GROUP_,
-                file_offset: 0, is_alloc: true,
+                name: sec.name.clone(),
+                vaddr: start,
+                lma: start,
+                size: sec.size,
+                align: a,
+                sh_type: sec.sh_type,
+                flags: sec.flags & !SHF_GROUP_,
+                file_offset: 0,
+                is_alloc: true,
                 nobits: sec.sh_type == SHT_NOBITS_,
-                phdrs: Vec::new(), fill: None,
-                placed: vec![Placed { obj_idx: oi, sec_idx: si, vaddr: start, size: sec.size }],
+                phdrs: Vec::new(),
+                fill: None,
+                placed: vec![Placed {
+                    obj_idx: oi,
+                    sec_idx: si,
+                    vaddr: start,
+                    size: sec.size,
+                }],
                 data_commands: Vec::new(),
             });
         }
@@ -1283,18 +1657,28 @@ fn link_with_script_machine(
         made_progress = false;
         let mut still: Vec<(Assignment, u64, Option<String>, bool)> = Vec::new();
         for (a, adot, adot_home, in_output_body) in pending.into_iter() {
-            match eval_full(&a.expr, adot, &symbols, &sections_meta, &def_syms, &placed_map) {
+            match eval_full(
+                &a.expr,
+                adot,
+                &symbols,
+                &sections_meta,
+                &def_syms,
+                &placed_map,
+            ) {
                 Ok(v) => {
                     made_progress = true;
-                    if a.symbol == "__assert__" || a.symbol == "." { continue; }
-                    if a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol)) { continue; }
+                    if a.symbol == "__assert__" || a.symbol == "." {
+                        continue;
+                    }
+                    if a.provide
+                        && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol))
+                    {
+                        continue;
+                    }
                     let v = if in_output_body
                         && !expr_contains_absolute(&a.expr)
-                        && script_value_form(
-                            &a.expr,
-                            &sym_home,
-                            &absolute_script_syms,
-                        ) == ScriptValueForm::Offset
+                        && script_value_form(&a.expr, &sym_home, &absolute_script_syms)
+                            == ScriptValueForm::Offset
                     {
                         adot_home
                             .as_ref()
@@ -1306,7 +1690,9 @@ fn link_with_script_machine(
                     };
                     let nv = if a.op == AssignOp::Add {
                         symbols.get(&a.symbol).copied().unwrap_or(0).wrapping_add(v)
-                    } else { v };
+                    } else {
+                        v
+                    };
                     symbols.insert(a.symbol.clone(), nv);
                     sym_home.remove(&a.symbol);
                     absolute_script_syms.remove(&a.symbol);
@@ -1332,7 +1718,9 @@ fn link_with_script_machine(
                         }
                         ScriptExprHome::Unresolved => {}
                     }
-                    if a.hidden { hidden_syms.insert(a.symbol.clone()); }
+                    if a.hidden {
+                        hidden_syms.insert(a.symbol.clone());
+                    }
                 }
                 Err(_) => still.push((a, adot, adot_home, in_output_body)),
             }
@@ -1341,9 +1729,20 @@ fn link_with_script_machine(
     }
     // Evaluate top-level assigns/asserts (PROVIDE etc.) the same way.
     for a in &script.top_assigns {
-        if let Ok(v) = eval_full(&a.expr, dot, &symbols, &sections_meta, &def_syms, &placed_map) {
-            if a.symbol == "." { continue; }
-            if a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol)) { continue; }
+        if let Ok(v) = eval_full(
+            &a.expr,
+            dot,
+            &symbols,
+            &sections_meta,
+            &def_syms,
+            &placed_map,
+        ) {
+            if a.symbol == "." {
+                continue;
+            }
+            if a.provide && (symbols.contains_key(&a.symbol) || def_syms.contains_key(&a.symbol)) {
+                continue;
+            }
             symbols.insert(a.symbol.clone(), v);
             sym_home.remove(&a.symbol);
             absolute_script_syms.remove(&a.symbol);
@@ -1361,7 +1760,9 @@ fn link_with_script_machine(
                 }
                 ScriptExprHome::Unresolved => {}
             }
-            if a.hidden { hidden_syms.insert(a.symbol.clone()); }
+            if a.hidden {
+                hidden_syms.insert(a.symbol.clone());
+            }
         }
     }
     for (e, msg) in &script.top_asserts {
@@ -1371,7 +1772,14 @@ fn link_with_script_machine(
     }
     for (a, adot, _, _) in &pending {
         // Remaining failures: asserts get reported, plain assigns error out.
-        match eval_full(&a.expr, *adot, &symbols, &sections_meta, &def_syms, &placed_map) {
+        match eval_full(
+            &a.expr,
+            *adot,
+            &symbols,
+            &sections_meta,
+            &def_syms,
+            &placed_map,
+        ) {
             Ok(_) => {}
             Err(e) => {
                 if a.symbol == "__assert__" {
@@ -1380,7 +1788,9 @@ fn link_with_script_machine(
                 // PROVIDE of an unresolvable symbol that nothing references is OK.
                 if !a.provide {
                     return Err(format!(
-                        "linker script: cannot resolve assignment {} = ... ({})", a.symbol, e));
+                        "linker script: cannot resolve assignment {} = ... ({})",
+                        a.symbol, e
+                    ));
                 }
             }
         }
@@ -1405,19 +1815,33 @@ fn link_with_script_machine(
         }
         if !sym.name.is_empty() {
             if sym.is_local() {
-                if sym.shndx == SHN_ABS { return Some(sym.value); }
-                return placed_map.get(&(oi, sym.shndx as usize)).map(|b| b + sym.value);
+                if sym.shndx == SHN_ABS {
+                    return Some(sym.value);
+                }
+                return placed_map
+                    .get(&(oi, sym.shndx as usize))
+                    .map(|b| b + sym.value);
             }
-            if let Some(&v) = symbols.get(sym.name.as_str()) { return Some(v); }
+            if let Some(&v) = symbols.get(sym.name.as_str()) {
+                return Some(v);
+            }
             if let Some(&(doi, shndx, value, _, _)) = def_syms.get(sym.name.as_str()) {
-                if shndx == SHN_ABS { return Some(value); }
+                if shndx == SHN_ABS {
+                    return Some(value);
+                }
                 return placed_map.get(&(doi, shndx as usize)).map(|b| b + value);
             }
-            if sym.is_weak() { return Some(0); }
+            if sym.is_weak() {
+                return Some(0);
+            }
             return None;
         }
-        if sym.shndx == SHN_ABS { return Some(sym.value); }
-        placed_map.get(&(oi, sym.shndx as usize)).map(|b| b + sym.value)
+        if sym.shndx == SHN_ABS {
+            return Some(sym.value);
+        }
+        placed_map
+            .get(&(oi, sym.shndx as usize))
+            .map(|b| b + sym.value)
     };
 
     // ── File layout ──
@@ -1444,18 +1868,25 @@ fn link_with_script_machine(
     // the relocations are correct and the program still misbehaves.
     //
     // This must agree with `will_add_tls_phdr` above, which fed SIZEOF_HEADERS.
-    let needs_tls_phdr = out_secs.iter().any(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
+    let needs_tls_phdr = out_secs
+        .iter()
+        .any(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
         && !script.phdrs.iter().any(|d| d.ptype == PT_TLS_);
-    debug_assert_eq!(needs_tls_phdr, will_add_tls_phdr,
-        "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong");
+    debug_assert_eq!(
+        needs_tls_phdr, will_add_tls_phdr,
+        "PT_TLS prediction disagreed with the final layout; SIZEOF_HEADERS would be wrong"
+    );
     let n_phdrs = declared_phdrs.len().max(1) + usize::from(needs_tls_phdr);
-    let mut file_off = script_header_size_with(
-        &script, usize::from(needs_tls_phdr), machine);
+    let mut file_off = script_header_size_with(&script, usize::from(needs_tls_phdr), machine);
 
     // Assign file offsets: alloc PROGBITS sections in vaddr order get offsets
     // congruent to their LMA modulo the requested maximum page size. The
     // kernel proper uses 2 MiB; its vDSO explicitly requests 4 KiB.
-    let page = if max_page_size.is_power_of_two() { max_page_size } else { 0x200000 };
+    let page = if max_page_size.is_power_of_two() {
+        max_page_size
+    } else {
+        0x200000
+    };
     let mut order: Vec<usize> = (0..out_secs.len()).collect();
     order.sort_by_key(|&i| (!out_secs[i].is_alloc, out_secs[i].lma));
 
@@ -1465,7 +1896,8 @@ fn link_with_script_machine(
         // congruent page offsets is insufficient: a VMA gap larger than one
         // page then maps later bytes at the wrong address (and objcopy loses
         // the gap).  Preserve the complete LMA delta for the synthetic LOAD.
-        let min_lma = out_secs.iter()
+        let min_lma = out_secs
+            .iter()
             .filter(|os| os.is_alloc && os.size > 0)
             .map(|os| os.lma)
             .min()
@@ -1505,12 +1937,18 @@ fn link_with_script_machine(
     // alloc offset while writing none of their bytes produced section headers
     // extending past EOF and made pahole/nm reject the image. Pack them after
     // the load image at their own alignment, without page congruence.
-    for os in out_secs.iter_mut().filter(|os| !os.is_alloc && !os.nobits && os.size > 0) {
+    for os in out_secs
+        .iter_mut()
+        .filter(|os| !os.is_alloc && !os.nobits && os.size > 0)
+    {
         let align = os.align.max(1);
-        file_off = file_off.checked_add(align - 1)
-            .ok_or("non-allocated section file offset overflows")? & !(align - 1);
+        file_off = file_off
+            .checked_add(align - 1)
+            .ok_or("non-allocated section file offset overflows")?
+            & !(align - 1);
         os.file_offset = file_off;
-        file_off = file_off.checked_add(os.size)
+        file_off = file_off
+            .checked_add(os.size)
             .ok_or("non-allocated section size overflows output")?;
     }
     // NOBITS and empty sections point at the current file offset (no data).
@@ -1525,12 +1963,19 @@ fn link_with_script_machine(
 
     // Fill patterns + section data
     for os in &out_secs {
-        if os.nobits || os.size == 0 { continue; }
+        if os.nobits || os.size == 0 {
+            continue;
+        }
         let base = os.file_offset as usize;
         if let Some(fill) = os.fill {
             // GNU ld uses the fill value as a (big-endian) byte pattern; the
             // kernel's 0xcccccccc means "fill gaps with int3".
-            let b = [(fill >> 24) as u8, (fill >> 16) as u8, (fill >> 8) as u8, fill as u8];
+            let b = [
+                (fill >> 24) as u8,
+                (fill >> 16) as u8,
+                (fill >> 8) as u8,
+                fill as u8,
+            ];
             let pat: &[u8] = if fill <= 0xff { &b[3..] } else { &b[..] };
             for k in 0..os.size as usize {
                 out[base + k] = pat[k % pat.len()];
@@ -1538,7 +1983,9 @@ fn link_with_script_machine(
         }
         for p in &os.placed {
             let data = &objects[p.obj_idx].section_data[p.sec_idx];
-            if data.is_empty() { continue; }
+            if data.is_empty() {
+                continue;
+            }
             let off = base + (p.vaddr - os.vaddr) as usize;
             let end = off + data.len();
             if end <= out.len() {
@@ -1547,19 +1994,37 @@ fn link_with_script_machine(
         }
         for (offset, width, expr) in &os.data_commands {
             let command_vaddr = os.vaddr + *offset;
-            let value = eval_full(expr, command_vaddr, &symbols, &sections_meta,
-                                  &def_syms, &placed_map)
-                .map_err(|e| format!(
+            let value = eval_full(
+                expr,
+                command_vaddr,
+                &symbols,
+                &sections_meta,
+                &def_syms,
+                &placed_map,
+            )
+            .map_err(|e| {
+                format!(
                     "cannot evaluate {}-byte data directive in {} at {:#x}: {}",
-                    width, os.name, command_vaddr, e))?;
+                    width, os.name, command_vaddr, e
+                )
+            })?;
             let off = base.checked_add(*offset as usize).ok_or_else(|| {
-                format!("linker script: data directive offset overflows in {}", os.name)
+                format!(
+                    "linker script: data directive offset overflows in {}",
+                    os.name
+                )
             })?;
             let end = off.checked_add(*width as usize).ok_or_else(|| {
-                format!("linker script: data directive width overflows in {}", os.name)
+                format!(
+                    "linker script: data directive width overflows in {}",
+                    os.name
+                )
             })?;
             if end > out.len() {
-                return Err(format!("linker script: data directive in {} falls outside output", os.name));
+                return Err(format!(
+                    "linker script: data directive in {} falls outside output",
+                    os.name
+                ));
             }
             let bytes = value.to_le_bytes();
             out[off..end].copy_from_slice(&bytes[..*width as usize]);
@@ -1589,14 +2054,17 @@ fn link_with_script_machine(
     /// Returns `Err(<opcode bytes>)` when the form is not one of the above,
     /// so the caller can produce a precise diagnostic instead of emitting a
     /// silently corrupt image.
-    fn relax_gotpcrel(
-        out: &mut [u8], fp: usize, s: u64, a: i64, p: u64,
-    ) -> Result<(), String> {
+    fn relax_gotpcrel(out: &mut [u8], fp: usize, s: u64, a: i64, p: u64) -> Result<(), String> {
         // Displacement for a rewritten PC-relative operand. The instruction
         // length is unchanged by every rewrite below, so `p` still names the
         // end of the 4-byte field.
         let pcrel = s as i64 + a - p as i64;
-        let describe = |o: &[u8]| o.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(" ");
+        let describe = |o: &[u8]| {
+            o.iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
 
         if fp < 2 || fp + 4 > out.len() {
             return Err("<truncated>".to_string());
@@ -1687,11 +2155,18 @@ fn link_with_script_machine(
     let (tls_addr, tls_mem_size) = {
         let mut lo = u64::MAX;
         let mut hi = 0u64;
-        for os in out_secs.iter().filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc) {
+        for os in out_secs
+            .iter()
+            .filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
+        {
             lo = lo.min(os.vaddr);
             hi = hi.max(os.vaddr + os.size);
         }
-        if lo == u64::MAX { (0u64, 0u64) } else { (lo, hi - lo) }
+        if lo == u64::MAX {
+            (0u64, 0u64)
+        } else {
+            (lo, hi - lo)
+        }
     };
 
     // ── Relocation helpers ──
@@ -1700,9 +2175,11 @@ fn link_with_script_machine(
     // gets silently corrupted: the truncated value points somewhere plausible
     // and the failure surfaces much later as a wild jump. Diagnose instead.
     fn reloc_range_err(kind: &str, v: i64, sym: &str, src: &str) -> String {
-        format!("script link: {} against '{}' in {} does not fit: value {:#x} \
+        format!(
+            "script link: {} against '{}' in {} does not fit: value {:#x} \
                  is out of range (image too large or wrong load address?)",
-                kind, sym, src, v)
+            kind, sym, src, v
+        )
     }
     fn check_pcrel32(v: i64, sym: &str, src: &str) -> Result<(), String> {
         if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
@@ -1722,16 +2199,26 @@ fn link_with_script_machine(
     let mut undefined: Vec<String> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, relas) in obj.relocations.iter().enumerate() {
-            if relas.is_empty() { continue; }
-            let Some(&sec_vaddr) = placed_map.get(&(oi, si)) else { continue };
-            let Some(&owner) = placed_owner.get(&(oi, si)) else { continue };
+            if relas.is_empty() {
+                continue;
+            }
+            let Some(&sec_vaddr) = placed_map.get(&(oi, si)) else {
+                continue;
+            };
+            let Some(&owner) = placed_owner.get(&(oi, si)) else {
+                continue;
+            };
             let os = &out_secs[owner];
-            if os.nobits { continue; }
+            if os.nobits {
+                continue;
+            }
             let sec_foff = os.file_offset + (sec_vaddr - os.vaddr);
 
             for rela in relas {
                 let sidx = rela.sym_idx as usize;
-                if sidx >= obj.symbols.len() { continue; }
+                if sidx >= obj.symbols.len() {
+                    continue;
+                }
                 {
                     let fp_chk = (sec_foff + rela.offset) as usize;
                     if tls_consumed.iter().any(|&(a, b)| fp_chk >= a && fp_chk < b) {
@@ -1753,17 +2240,27 @@ fn link_with_script_machine(
                         if sym.is_local() || sym.sym_type() == STT_SECTION {
                             discard.contains(&(oi, sym.shndx as usize))
                         } else {
-                            def_syms.get(sym.name.as_str()).is_some_and(
-                                |&(doi, shndx, _, _, _)|
-                                    discard.contains(&(doi, shndx as usize)))
+                            def_syms
+                                .get(sym.name.as_str())
+                                .is_some_and(|&(doi, shndx, _, _, _)| {
+                                    discard.contains(&(doi, shndx as usize))
+                                })
                         }
-                    } => 0,
+                    } =>
+                    {
+                        0
+                    }
                     None => {
                         let unresolved = if sym.name.is_empty() {
-                            let section = obj.sections.get(sym.shndx as usize)
-                                .map(|sec| sec.name.as_str()).unwrap_or("<invalid>");
-                            format!("<section {} '{}' in {}>",
-                                    sym.shndx, section, obj.source_name)
+                            let section = obj
+                                .sections
+                                .get(sym.shndx as usize)
+                                .map(|sec| sec.name.as_str())
+                                .unwrap_or("<invalid>");
+                            format!(
+                                "<section {} '{}' in {}>",
+                                sym.shndx, section, obj.source_name
+                            )
                         } else {
                             sym.name.to_string()
                         };
@@ -1780,8 +2277,12 @@ fn link_with_script_machine(
                         R_386_NONE => {}
                         R_386_32 => {
                             if !(i32::MIN as i64..=u32::MAX as i64).contains(&absolute) {
-                                return Err(reloc_range_err("R_386_32", absolute,
-                                                           &sym.name, &obj.source_name));
+                                return Err(reloc_range_err(
+                                    "R_386_32",
+                                    absolute,
+                                    &sym.name,
+                                    &obj.source_name,
+                                ));
                             }
                             w32(&mut out, fp, absolute as u32);
                         }
@@ -1790,21 +2291,29 @@ fn link_with_script_machine(
                             w32(&mut out, fp, relative as u32);
                         }
                         R_386_GOTPC => {
-                            let got = symbols.get("_GLOBAL_OFFSET_TABLE_").copied()
+                            let got = symbols
+                                .get("_GLOBAL_OFFSET_TABLE_")
+                                .copied()
                                 .ok_or("R_386_GOTPC requires _GLOBAL_OFFSET_TABLE_")?;
                             let value = got as i64 + a - p as i64;
                             check_pcrel32(value, &sym.name, &obj.source_name)?;
                             w32(&mut out, fp, value as u32);
                         }
                         R_386_GOTOFF => {
-                            let got = symbols.get("_GLOBAL_OFFSET_TABLE_").copied()
+                            let got = symbols
+                                .get("_GLOBAL_OFFSET_TABLE_")
+                                .copied()
                                 .ok_or("R_386_GOTOFF requires _GLOBAL_OFFSET_TABLE_")?;
                             w32(&mut out, fp, (s as i64 + a - got as i64) as u32);
                         }
                         R_386_16 => {
                             if !(0..=u16::MAX as i64).contains(&absolute) {
-                                return Err(reloc_range_err("R_386_16", absolute,
-                                                           &sym.name, &obj.source_name));
+                                return Err(reloc_range_err(
+                                    "R_386_16",
+                                    absolute,
+                                    &sym.name,
+                                    &obj.source_name,
+                                ));
                             }
                             w16(&mut out, fp, absolute as u16);
                         }
@@ -1820,15 +2329,23 @@ fn link_with_script_machine(
                         }
                         R_386_8 => {
                             if !(0..=u8::MAX as i64).contains(&absolute) {
-                                return Err(reloc_range_err("R_386_8", absolute,
-                                                           &sym.name, &obj.source_name));
+                                return Err(reloc_range_err(
+                                    "R_386_8",
+                                    absolute,
+                                    &sym.name,
+                                    &obj.source_name,
+                                ));
                             }
                             out[fp] = absolute as u8;
                         }
                         R_386_PC8 => {
                             if !(i8::MIN as i64..=i8::MAX as i64).contains(&relative) {
-                                return Err(reloc_range_err("R_386_PC8", relative,
-                                                           &sym.name, &obj.source_name));
+                                return Err(reloc_range_err(
+                                    "R_386_PC8",
+                                    relative,
+                                    &sym.name,
+                                    &obj.source_name,
+                                ));
                             }
                             out[fp] = relative as u8;
                         }
@@ -1836,7 +2353,8 @@ fn link_with_script_machine(
                         other => {
                             return Err(format!(
                                 "script link: unsupported i386 relocation type {} for '{}' in {}",
-                                other, sym.name, obj.source_name));
+                                other, sym.name, obj.source_name
+                            ));
                         }
                     }
                     continue;
@@ -1853,24 +2371,38 @@ fn link_with_script_machine(
                     R_X86_64_32 => {
                         let v = s as i64 + a;
                         if !(0..=u32::MAX as i64).contains(&v) {
-                            return Err(reloc_range_err("R_X86_64_32", v, &sym.name, &obj.source_name));
+                            return Err(reloc_range_err(
+                                "R_X86_64_32",
+                                v,
+                                &sym.name,
+                                &obj.source_name,
+                            ));
                         }
                         w32(&mut out, fp, v as u32)
                     }
                     R_X86_64_32S => {
                         let v = s as i64 + a;
                         if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-                            return Err(reloc_range_err("R_X86_64_32S", v, &sym.name, &obj.source_name));
+                            return Err(reloc_range_err(
+                                "R_X86_64_32S",
+                                v,
+                                &sym.name,
+                                &obj.source_name,
+                            ));
                         }
                         w32(&mut out, fp, v as u32)
                     }
                     R_X86_64_16 => w16(&mut out, fp, (s as i64 + a) as u16),
                     R_X86_64_PC16 => w16(&mut out, fp, (s as i64 + a - p as i64) as u16),
                     R_X86_64_8 => {
-                        if fp < out.len() { out[fp] = (s as i64 + a) as u8; }
+                        if fp < out.len() {
+                            out[fp] = (s as i64 + a) as u8;
+                        }
                     }
                     R_X86_64_PC8 => {
-                        if fp < out.len() { out[fp] = (s as i64 + a - p as i64) as u8; }
+                        if fp < out.len() {
+                            out[fp] = (s as i64 + a - p as i64) as u8;
+                        }
                     }
                     R_X86_64_PC64 => w64(&mut out, fp, (s as i64 + a - p as i64) as u64),
                     // Symbol size, not address: used by some hand-written asm
@@ -1903,7 +2435,8 @@ fn link_with_script_machine(
                                      (opcode bytes {}); a -T link has no GOT, and \
                                      pointing the load at the symbol would read its \
                                      bytes instead of its address",
-                                    sym.name, obj.source_name, op));
+                                    sym.name, obj.source_name, op
+                                ));
                             }
                         }
                     }
@@ -1937,30 +2470,41 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "script link: TLS relocation against '{}' in {} but the \
                                  script places no SHF_TLS section (add .tdata/.tbss)",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         }
                         // Canonical GD sequence, 16 bytes spanning [fp-4, fp+12):
                         //   66 48 8d 3d <disp32>   data16 lea sym@tlsgd(%rip),%rdi
                         //   66 66 48 e8 <disp32>   data16 data16 rex.W call __tls_get_addr
-                        let st = fp.checked_sub(4).filter(|&st|
+                        let st = fp.checked_sub(4).filter(|&st| {
                             st + 16 <= out.len()
-                            && out[st] == 0x66 && out[st + 1] == 0x48
-                            && out[st + 2] == 0x8d && out[st + 3] == 0x3d
-                            && out[fp + 4] == 0x66 && out[fp + 5] == 0x66
-                            && out[fp + 6] == 0x48 && out[fp + 7] == 0xe8);
+                                && out[st] == 0x66
+                                && out[st + 1] == 0x48
+                                && out[st + 2] == 0x8d
+                                && out[st + 3] == 0x3d
+                                && out[fp + 4] == 0x66
+                                && out[fp + 5] == 0x66
+                                && out[fp + 6] == 0x48
+                                && out[fp + 7] == 0xe8
+                        });
                         let Some(st) = st else {
                             return Err(format!(
                                 "script link: TLSGD relaxation failed for '{}' in {}: \
                                  unrecognised code sequence",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         };
                         // GD -> LE:
                         //   64 48 8b 04 25 00000000   mov %fs:0,%rax
                         //   48 8d 80 <tpoff32>        lea tpoff(%rax),%rax
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         if !(i32::MIN as i64..=i32::MAX as i64).contains(&tpoff) {
-                            return Err(reloc_range_err("TLSGD->LE offset", tpoff,
-                                                       &sym.name, &obj.source_name));
+                            return Err(reloc_range_err(
+                                "TLSGD->LE offset",
+                                tpoff,
+                                &sym.name,
+                                &obj.source_name,
+                            ));
                         }
                         out[st..st + 9]
                             .copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
@@ -1976,24 +2520,31 @@ fn link_with_script_machine(
                         //   e8 <disp32>         call __tls_get_addr
                         // becomes a 12-byte `mov %fs:0,%rax`, after which the
                         // accompanying DTPOFF32 values are TP-relative.
-                        let st = fp.checked_sub(3).filter(|&st|
+                        let st = fp.checked_sub(3).filter(|&st| {
                             st + 12 <= out.len()
-                            && out[st] == 0x48 && out[st + 1] == 0x8d
-                            && out[st + 2] == 0x3d && out[fp + 4] == 0xe8);
+                                && out[st] == 0x48
+                                && out[st + 1] == 0x8d
+                                && out[st + 2] == 0x3d
+                                && out[fp + 4] == 0xe8
+                        });
                         let Some(st) = st else {
                             return Err(format!(
                                 "script link: TLSLD relaxation failed in {}: \
                                  unrecognised code sequence",
-                                obj.source_name));
+                                obj.source_name
+                            ));
                         };
-                        out[st..st + 12].copy_from_slice(
-                            &[0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+                        out[st..st + 12].copy_from_slice(&[
+                            0x66, 0x66, 0x66, 0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0,
+                        ]);
                         tls_consumed.push((fp + 4, fp + 9));
                     }
                     // TLSDESC: `lea sym@tlsdesc(%rip),%rax` -> `mov $tpoff,%rax`,
                     // and the indirect call through the descriptor becomes a nop.
                     R_X86_64_GOTPC32_TLSDESC => {
-                        if fp >= 3 && out[fp - 3] == 0x48 && out[fp - 2] == 0x8d
+                        if fp >= 3
+                            && out[fp - 3] == 0x48
+                            && out[fp - 2] == 0x8d
                             && out[fp - 1] == 0x05
                         {
                             let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
@@ -2004,7 +2555,8 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "script link: TLSDESC relaxation failed for '{}' in {}: \
                                  unrecognised code sequence",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         }
                     }
                     R_X86_64_TLSDESC_CALL => {
@@ -2030,7 +2582,8 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "script link: GOTTPOFF relaxation failed for '{}' in {}: \
                                  unrecognised code sequence",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         }
                     }
                     R_X86_64_TPOFF32 => {
@@ -2038,14 +2591,19 @@ fn link_with_script_machine(
                             return Err(format!(
                                 "script link: TLS relocation against '{}' in {} but the \
                                  script places no SHF_TLS section (add .tdata/.tbss)",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         }
                         // %fs:0 is the end of the block: offsets are negative.
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
                         let v = tpoff + a;
                         if !(i32::MIN as i64..=i32::MAX as i64).contains(&v) {
-                            return Err(reloc_range_err("R_X86_64_TPOFF32", v,
-                                                       &sym.name, &obj.source_name));
+                            return Err(reloc_range_err(
+                                "R_X86_64_TPOFF32",
+                                v,
+                                &sym.name,
+                                &obj.source_name,
+                            ));
                         }
                         w32(&mut out, fp, v as u32);
                     }
@@ -2073,7 +2631,8 @@ fn link_with_script_machine(
                     other => {
                         return Err(format!(
                             "script link: unsupported relocation type {} for '{}' in {}",
-                            other, sym.name, obj.source_name));
+                            other, sym.name, obj.source_name
+                        ));
                     }
                 }
             }
@@ -2085,20 +2644,33 @@ fn link_with_script_machine(
     }
 
     // ── ELF + program headers ──
-    let entry = script.entry.as_ref()
+    let entry = script
+        .entry
+        .as_ref()
         .and_then(|e| {
             symbols.get(e).copied().or_else(|| {
                 def_syms.get(e).and_then(|&(oi, shndx, value, _, _)| {
-                    if shndx == SHN_ABS { Some(value) }
-                    else { placed_map.get(&(oi, shndx as usize)).map(|b| b + value) }
+                    if shndx == SHN_ABS {
+                        Some(value)
+                    } else {
+                        placed_map.get(&(oi, shndx as usize)).map(|b| b + value)
+                    }
                 })
             })
         })
         // A shared object without an explicit ENTRY has no process entry
         // point.  Choosing its first allocated section would incorrectly make
         // the ELF hash table look executable (and differs from GNU ld).
-        .unwrap_or_else(|| if is_pie { 0 } else {
-            out_secs.iter().find(|o| o.is_alloc).map(|o| o.vaddr).unwrap_or(0)
+        .unwrap_or_else(|| {
+            if is_pie {
+                0
+            } else {
+                out_secs
+                    .iter()
+                    .find(|o| o.is_alloc)
+                    .map(|o| o.vaddr)
+                    .unwrap_or(0)
+            }
         });
 
     out[0..4].copy_from_slice(&ELF_MAGIC);
@@ -2120,7 +2692,9 @@ fn link_with_script_machine(
         }
         ScriptMachine::I386 => {
             if entry > u32::MAX as u64 {
-                return Err(format!("ELF32 entry point {entry:#x} does not fit in 32 bits"));
+                return Err(format!(
+                    "ELF32 entry point {entry:#x} does not fit in 32 bits"
+                ));
             }
             out[4] = crate::backend::elf::ELFCLASS32;
             w16(&mut out, 18, crate::backend::elf::EM_386);
@@ -2137,14 +2711,20 @@ fn link_with_script_machine(
     // Program headers: for each declared phdr, span the sections assigned to it.
     let mut ph_off = machine.ehdr_size() as usize;
     for decl in &declared_phdrs {
-        let mut min_v = u64::MAX; let mut max_v = 0u64;
-        let mut min_f = u64::MAX; let mut max_f = 0u64;
+        let mut min_v = u64::MAX;
+        let mut max_v = 0u64;
+        let mut min_f = u64::MAX;
+        let mut max_f = 0u64;
         let mut max_mem = 0u64;
         let mut min_lma = u64::MAX;
         let mut segment_align = 1u64;
         for (i, os) in out_secs.iter().enumerate() {
-            if !os.is_alloc || os.size == 0 { continue; }
-            if !sec_phdrs[i].contains(&decl.name) { continue; }
+            if !os.is_alloc || os.size == 0 {
+                continue;
+            }
+            if !sec_phdrs[i].contains(&decl.name) {
+                continue;
+            }
             segment_align = segment_align.max(os.align);
             min_v = min_v.min(os.vaddr);
             max_mem = max_mem.max(os.vaddr + os.size);
@@ -2157,12 +2737,27 @@ fn link_with_script_machine(
         }
         if min_v == u64::MAX {
             // Empty phdr
-            write_script_phdr(machine, &mut out, ph_off, decl.ptype,
-                decl.flags.unwrap_or(0) as u32, 0, 0, 0, 0, 0, 8)?;
+            write_script_phdr(
+                machine,
+                &mut out,
+                ph_off,
+                decl.ptype,
+                decl.flags.unwrap_or(0) as u32,
+                0,
+                0,
+                0,
+                0,
+                0,
+                8,
+            )?;
             ph_off += machine.phdr_size() as usize;
             continue;
         }
-        if min_f == u64::MAX { min_f = 0; max_f = 0; max_v = min_v; }
+        if min_f == u64::MAX {
+            min_f = 0;
+            max_f = 0;
+            max_v = min_v;
+        }
         // FILEHDR/PHDRS make the ELF/program headers part of this segment.
         // Linux's vDSO verifier requires its sole PT_LOAD to begin exactly at
         // file offset and virtual address zero.
@@ -2184,10 +2779,16 @@ fn link_with_script_machine(
             PT_LOAD_ => 5,
             _ => 4,
         }) as u32;
-        let align = if decl.ptype == PT_LOAD_ { page } else { segment_align };
+        let align = if decl.ptype == PT_LOAD_ {
+            page
+        } else {
+            segment_align
+        };
         // p_paddr = LMA
-        write_script_phdr(machine, &mut out, ph_off, decl.ptype, flags,
-                          min_f, min_v, min_lma, filesz, memsz, align)?;
+        write_script_phdr(
+            machine, &mut out, ph_off, decl.ptype, flags, min_f, min_v, min_lma, filesz, memsz,
+            align,
+        )?;
         ph_off += machine.phdr_size() as usize;
         let _ = max_v;
     }
@@ -2200,33 +2801,81 @@ fn link_with_script_machine(
         // file image and produce `filesz > memsz`, which readelf rejects and
         // loaders treat as corrupt.
         let alloc = |o: &&OutSec| o.is_alloc && o.size > 0;
-        let min_v = out_secs.iter().filter(alloc).map(|o| o.lma).min().unwrap_or(0);
-        let max_m = out_secs.iter().filter(alloc)
-            .map(|o| o.lma + o.size).max().unwrap_or(0);
-        let min_f = out_secs.iter().filter(|o| alloc(o) && !o.nobits)
-            .map(|o| o.file_offset).min().unwrap_or(0);
-        let max_f = out_secs.iter().filter(|o| alloc(o) && !o.nobits)
-            .map(|o| o.file_offset + o.size).max().unwrap_or(0);
+        let min_v = out_secs
+            .iter()
+            .filter(alloc)
+            .map(|o| o.lma)
+            .min()
+            .unwrap_or(0);
+        let max_m = out_secs
+            .iter()
+            .filter(alloc)
+            .map(|o| o.lma + o.size)
+            .max()
+            .unwrap_or(0);
+        let min_f = out_secs
+            .iter()
+            .filter(|o| alloc(o) && !o.nobits)
+            .map(|o| o.file_offset)
+            .min()
+            .unwrap_or(0);
+        let max_f = out_secs
+            .iter()
+            .filter(|o| alloc(o) && !o.nobits)
+            .map(|o| o.file_offset + o.size)
+            .max()
+            .unwrap_or(0);
         let filesz = max_f.saturating_sub(min_f);
         let memsz = (max_m.saturating_sub(min_v)).max(filesz);
-        write_script_phdr(machine, &mut out, machine.ehdr_size() as usize,
-                          PT_LOAD_, 7, min_f, min_v, min_v,
-                          filesz, memsz, page)?;
+        write_script_phdr(
+            machine,
+            &mut out,
+            machine.ehdr_size() as usize,
+            PT_LOAD_,
+            7,
+            min_f,
+            min_v,
+            min_v,
+            filesz,
+            memsz,
+            page,
+        )?;
         ph_off = (machine.ehdr_size() + machine.phdr_size()) as usize;
     }
     if needs_tls_phdr {
         // p_filesz covers .tdata only (.tbss is NOBITS); p_memsz covers both.
-        let tls: Vec<&OutSec> = out_secs.iter()
-            .filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc).collect();
+        let tls: Vec<&OutSec> = out_secs
+            .iter()
+            .filter(|o| (o.flags & SHF_TLS_) != 0 && o.is_alloc)
+            .collect();
         let vlo = tls.iter().map(|o| o.vaddr).min().unwrap_or(0);
         let vhi = tls.iter().map(|o| o.vaddr + o.size).max().unwrap_or(0);
-        let flo = tls.iter().filter(|o| !o.nobits)
-            .map(|o| o.file_offset).min().unwrap_or(0);
-        let fhi = tls.iter().filter(|o| !o.nobits)
-            .map(|o| o.file_offset + o.size).max().unwrap_or(flo);
+        let flo = tls
+            .iter()
+            .filter(|o| !o.nobits)
+            .map(|o| o.file_offset)
+            .min()
+            .unwrap_or(0);
+        let fhi = tls
+            .iter()
+            .filter(|o| !o.nobits)
+            .map(|o| o.file_offset + o.size)
+            .max()
+            .unwrap_or(flo);
         let talign = tls.iter().map(|o| o.align).max().unwrap_or(1).max(1);
-        write_script_phdr(machine, &mut out, ph_off, PT_TLS_, 4 /* PF_R */,
-                          flo, vlo, vlo, fhi - flo, vhi - vlo, talign)?;
+        write_script_phdr(
+            machine,
+            &mut out,
+            ph_off,
+            PT_TLS_,
+            4, /* PF_R */
+            flo,
+            vlo,
+            vlo,
+            fhi - flo,
+            vhi - vlo,
+            talign,
+        )?;
     }
 
     // ── Section headers (+ optional symtab) ──
@@ -2288,18 +2937,19 @@ fn link_with_script_machine(
         // .dynsym: null entry followed by the GNU-hash bucket order.
         if let Some(base) = synthetic_file_offset(3) {
             for (i, name) in plan.exports.iter().enumerate() {
-                let (value, size, info, shndx) = if let Some(&(oi, shndx, value, size, info))
-                    = def_syms.get(name)
-                {
-                    let value = if shndx == SHN_ABS { value } else {
-                        placed_map.get(&(oi, shndx as usize)).copied().unwrap_or(0) + value
+                let (value, size, info, shndx) =
+                    if let Some(&(oi, shndx, value, size, info)) = def_syms.get(name) {
+                        let value = if shndx == SHN_ABS {
+                            value
+                        } else {
+                            placed_map.get(&(oi, shndx as usize)).copied().unwrap_or(0) + value
+                        };
+                        (value, size, info, find_shndx(value))
+                    } else if plan.version_symbols.contains(name) {
+                        (0, 0, (STB_GLOBAL << 4) | STT_OBJECT, SHN_ABS)
+                    } else {
+                        continue;
                     };
-                    (value, size, info, find_shndx(value))
-                } else if plan.version_symbols.contains(name) {
-                    (0, 0, (STB_GLOBAL << 4) | STT_OBJECT, SHN_ABS)
-                } else {
-                    continue;
-                };
                 let off = base + (i + 1) * machine.sym_size();
                 match machine {
                     ScriptMachine::X86_64 => {
@@ -2325,9 +2975,8 @@ fn link_with_script_machine(
             }
         }
 
-        let section_addr = |name: &str| -> u64 {
-            sections_meta.get(name).map(|meta| meta.0).unwrap_or(0)
-        };
+        let section_addr =
+            |name: &str| -> u64 { sections_meta.get(name).map(|meta| meta.0).unwrap_or(0) };
         if let Some(mut off) = synthetic_file_offset(7) {
             let mut emit = |tag: i64, value: u64| -> Result<(), String> {
                 match machine {
@@ -2358,8 +3007,14 @@ fn link_with_script_machine(
             emit(DT_GNU_HASH, section_addr(".gnu.hash"))?;
             emit(DT_STRTAB, section_addr(".dynstr"))?;
             emit(DT_SYMTAB, section_addr(".dynsym"))?;
-            emit(DT_STRSZ, out_secs.iter().find(|s| s.name == ".dynstr")
-                .map(|s| s.size).unwrap_or(0))?;
+            emit(
+                DT_STRSZ,
+                out_secs
+                    .iter()
+                    .find(|s| s.name == ".dynstr")
+                    .map(|s| s.size)
+                    .unwrap_or(0),
+            )?;
             emit(DT_SYMENT, machine.sym_size() as u64)?;
             emit(DT_VERSYM, section_addr(".gnu.version"))?;
             emit(DT_VERDEF, section_addr(".gnu.version_d"))?;
@@ -2375,17 +3030,32 @@ fn link_with_script_machine(
     let mut out_sec_sym_index: FxHashMap<usize, u32> = FxHashMap::default();
 
     // STV_* visibility lives in st_other in both ELF classes.
-    fn add_sym_vis(machine: ScriptMachine, name: &str, value: u64, size: u64,
-                   info: u8, other: u8, shndx: u16,
-                   symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>) -> Result<(), String> {
+    fn add_sym_vis(
+        machine: ScriptMachine,
+        name: &str,
+        value: u64,
+        size: u64,
+        info: u8,
+        other: u8,
+        shndx: u16,
+        symtab: &mut Vec<[u8; 24]>,
+        strtab: &mut Vec<u8>,
+    ) -> Result<(), String> {
         let noff = push_strtab_name(strtab, name.as_bytes());
-        symtab.push(script_sym_entry(machine, noff, info, other, shndx, value, size)?);
+        symtab.push(script_sym_entry(
+            machine, noff, info, other, shndx, value, size,
+        )?);
         Ok(())
     }
 
     if emit_symtab {
-        let add_sym = |name: &str, value: u64, size: u64, info: u8, shndx: u16,
-                       symtab: &mut Vec<[u8;24]>, strtab: &mut Vec<u8>| {
+        let add_sym = |name: &str,
+                       value: u64,
+                       size: u64,
+                       info: u8,
+                       shndx: u16,
+                       symtab: &mut Vec<[u8; 24]>,
+                       strtab: &mut Vec<u8>| {
             add_sym_vis(machine, name, value, size, info, 0, shndx, symtab, strtab)
         };
 
@@ -2398,26 +3068,47 @@ fn link_with_script_machine(
         if emit_relocs {
             for (h, &i) in hdr_secs.iter().enumerate() {
                 out_sec_sym_index.insert(i, symtab.len() as u32);
-                add_sym("", out_secs[i].vaddr, 0,
-                        // STB_LOCAL = 0, so the binding nibble is zero.
-                        STT_SECTION,
-                        (h + 1) as u16, &mut symtab, &mut strtab)?;
+                add_sym(
+                    "",
+                    out_secs[i].vaddr,
+                    0,
+                    // STB_LOCAL = 0, so the binding nibble is zero.
+                    STT_SECTION,
+                    (h + 1) as u16,
+                    &mut symtab,
+                    &mut strtab,
+                )?;
             }
         }
 
         // Locals first (ELF requirement).
         for (oi, obj) in objects.iter().enumerate() {
             for (sidx, sym) in obj.symbols.iter().enumerate() {
-                if !sym.is_local() || sym.name.is_empty() { continue; }
-                if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
-                if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON { continue; }
-                let Some(&base) = placed_map.get(&(oi, sym.shndx as usize)) else { continue };
+                if !sym.is_local() || sym.name.is_empty() {
+                    continue;
+                }
+                if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+                    continue;
+                }
+                if sym.shndx == SHN_UNDEF || sym.shndx == SHN_ABS || sym.shndx == SHN_COMMON {
+                    continue;
+                }
+                let Some(&base) = placed_map.get(&(oi, sym.shndx as usize)) else {
+                    continue;
+                };
                 let v = base + sym.value;
                 // --emit-relocs: remember where this input symbol landed in the
                 // output .symtab so retained relocations can point at it.
                 local_sym_index.insert((oi, sidx), symtab.len() as u32);
-                add_sym(&sym.name, v, sym.size, sym.info, find_shndx(v),
-                        &mut symtab, &mut strtab)?;
+                add_sym(
+                    &sym.name,
+                    v,
+                    sym.size,
+                    sym.info,
+                    find_shndx(v),
+                    &mut symtab,
+                    &mut strtab,
+                )?;
             }
         }
         n_local_syms = symtab.len();
@@ -2426,13 +3117,19 @@ fn link_with_script_machine(
         names.sort();
         for name in names {
             let &(oi, shndx, value, size, info) = def_syms.get(name).unwrap();
-            let v = if shndx == SHN_ABS { value } else {
+            let v = if shndx == SHN_ABS {
+                value
+            } else {
                 match placed_map.get(&(oi, shndx as usize)) {
                     Some(&b) => b + value,
                     None => continue,
                 }
             };
-            let sx = if shndx == SHN_ABS { SHN_ABS } else { find_shndx(v) };
+            let sx = if shndx == SHN_ABS {
+                SHN_ABS
+            } else {
+                find_shndx(v)
+            };
             global_sym_index.insert(name.clone(), symtab.len() as u32);
             add_sym(name, v, size, info, sx, &mut symtab, &mut strtab)?;
         }
@@ -2440,25 +3137,42 @@ fn link_with_script_machine(
         let mut snames: Vec<&String> = symbols.keys().collect();
         snames.sort();
         // hdr index by section name for home attribution
-        let hdr_by_name: FxHashMap<&str, u16> = hdr_secs.iter().enumerate()
+        let hdr_by_name: FxHashMap<&str, u16> = hdr_secs
+            .iter()
+            .enumerate()
             .map(|(h, &i)| (out_secs[i].name.as_str(), (h + 1) as u16))
             .collect();
         for name in snames {
-            if def_syms.contains_key(name) { continue; }
+            if def_syms.contains_key(name) {
+                continue;
+            }
             let v = symbols[name];
             let sx = if absolute_script_syms.contains(name.as_str()) {
                 SHN_ABS
             } else {
-                sym_home.get(name)
+                sym_home
+                    .get(name)
                     .and_then(|h| hdr_by_name.get(h.as_str()).copied())
                     .unwrap_or_else(|| find_shndx(v))
             };
             // STV_HIDDEN = 2. A hidden symbol keeps GLOBAL binding in .symtab
             // (so debuggers still see it) but is excluded from .dynsym.
-            let vis = if hidden_syms.contains(name.as_str()) { 2u8 } else { 0u8 };
-            add_sym_vis(machine, name, v, 0,
-                        (STB_GLOBAL << 4) | STT_NOTYPE_, vis, sx,
-                        &mut symtab, &mut strtab)?;
+            let vis = if hidden_syms.contains(name.as_str()) {
+                2u8
+            } else {
+                0u8
+            };
+            add_sym_vis(
+                machine,
+                name,
+                v,
+                0,
+                (STB_GLOBAL << 4) | STT_NOTYPE_,
+                vis,
+                sx,
+                &mut symtab,
+                &mut strtab,
+            )?;
         }
     } else {
         n_local_syms = 1;
@@ -2501,14 +3215,26 @@ fn link_with_script_machine(
         let mut by_target: FxHashMap<usize, Vec<[u8; 24]>> = FxHashMap::default();
         for (oi, obj) in objects.iter().enumerate() {
             for (si, relas) in obj.relocations.iter().enumerate() {
-                if relas.is_empty() { continue; }
-                let Some(&sec_vaddr) = placed_map.get(&(oi, si)) else { continue };
-                let Some(&owner) = placed_owner.get(&(oi, si)) else { continue };
-                if !out_secs[owner].is_alloc { continue; }
+                if relas.is_empty() {
+                    continue;
+                }
+                let Some(&sec_vaddr) = placed_map.get(&(oi, si)) else {
+                    continue;
+                };
+                let Some(&owner) = placed_owner.get(&(oi, si)) else {
+                    continue;
+                };
+                if !out_secs[owner].is_alloc {
+                    continue;
+                }
                 for rela in relas {
-                    if rela.rela_type == R_X86_64_NONE { continue; }
+                    if rela.rela_type == R_X86_64_NONE {
+                        continue;
+                    }
                     let sidx = rela.sym_idx as usize;
-                    let Some(sym) = obj.symbols.get(sidx) else { continue };
+                    let Some(sym) = obj.symbols.get(sidx) else {
+                        continue;
+                    };
 
                     // Map the input symbol to its output .symtab index.
                     let (out_sym, extra_addend) = if sym.is_local() {
@@ -2524,9 +3250,8 @@ fn link_with_script_machine(
                                 let secsym = out_sec_sym_index.get(&owner).copied();
                                 match secsym {
                                     Some(ix) => {
-                                        let delta = sec_vaddr
-                                            .wrapping_sub(out_secs[owner].vaddr)
-                                            as i64;
+                                        let delta =
+                                            sec_vaddr.wrapping_sub(out_secs[owner].vaddr) as i64;
                                         (ix, delta)
                                     }
                                     // No section symbol available (symtab
@@ -2555,7 +3280,8 @@ fn link_with_script_machine(
                             e[16..24].copy_from_slice(&r_addend.to_le_bytes());
                         }
                         ScriptMachine::I386 => {
-                            if r_offset > u32::MAX as u64 || out_sym > 0x00ff_ffff
+                            if r_offset > u32::MAX as u64
+                                || out_sym > 0x00ff_ffff
                                 || rela.rela_type > 0xff
                             {
                                 return Err("ELF32 retained relocation fields overflow".into());
@@ -2586,18 +3312,30 @@ fn link_with_script_machine(
     }
 
     // Append symtab/strtab/shstrtab data at the class-specific natural width.
-    let table_align = if machine == ScriptMachine::X86_64 { 8 } else { 4 };
-    while out.len() % table_align != 0 { out.push(0); }
+    let table_align = if machine == ScriptMachine::X86_64 {
+        8
+    } else {
+        4
+    };
+    while out.len() % table_align != 0 {
+        out.push(0);
+    }
     let symtab_off = out.len() as u64;
-    for e in &symtab { out.extend_from_slice(&e[..machine.sym_size()]); }
+    for e in &symtab {
+        out.extend_from_slice(&e[..machine.sym_size()]);
+    }
     let strtab_off = out.len() as u64;
     out.extend_from_slice(&strtab);
 
     let mut rela_offsets: Vec<u64> = Vec::with_capacity(retained.len());
     for rr in &retained {
-        while out.len() % table_align != 0 { out.push(0); }
+        while out.len() % table_align != 0 {
+            out.push(0);
+        }
         rela_offsets.push(out.len() as u64);
-        for e in &rr.entries { out.extend_from_slice(&e[..machine.rel_size()]); }
+        for e in &rr.entries {
+            out.extend_from_slice(&e[..machine.rel_size()]);
+        }
     }
 
     // section header name offsets
@@ -2607,9 +3345,14 @@ fn link_with_script_machine(
         name_offs.push(shname(&mut shstrtab, &n));
     }
     // ELF64 retains RELA; i386 retains the architecture's native REL form.
-    let rela_names: Vec<u32> = retained.iter()
+    let rela_names: Vec<u32> = retained
+        .iter()
         .map(|rr| {
-            let prefix = if machine == ScriptMachine::X86_64 { ".rela" } else { ".rel" };
+            let prefix = if machine == ScriptMachine::X86_64 {
+                ".rela"
+            } else {
+                ".rel"
+            };
             let n = format!("{}{}", prefix, out_secs[rr.target].name);
             shname(&mut shstrtab, &n)
         })
@@ -2618,40 +3361,72 @@ fn link_with_script_machine(
     let strtab_name = shname(&mut shstrtab, ".strtab");
     let shstrtab_name = shname(&mut shstrtab, ".shstrtab");
 
-    while out.len() % table_align != 0 { out.push(0); }
+    while out.len() % table_align != 0 {
+        out.push(0);
+    }
     let shstrtab_off = out.len() as u64;
     out.extend_from_slice(&shstrtab);
 
-    while out.len() % table_align != 0 { out.push(0); }
+    while out.len() % table_align != 0 {
+        out.push(0);
+    }
     let shoff = out.len() as u64;
 
     // NULL
     write_script_shdr(machine, &mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)?;
-    let dynamic_header_index: FxHashMap<&str, u32> = hdr_secs.iter().enumerate()
+    let dynamic_header_index: FxHashMap<&str, u32> = hdr_secs
+        .iter()
+        .enumerate()
         .map(|(h, &i)| (out_secs[i].name.as_str(), (h + 1) as u32))
         .collect();
     for (h, &i) in hdr_secs.iter().enumerate() {
         let os = &out_secs[i];
         let link = match os.name.as_str() {
-            ".hash" | ".gnu.hash" | ".gnu.version" =>
-                dynamic_header_index.get(".dynsym").copied().unwrap_or(0),
-            ".dynsym" | ".dynamic" | ".gnu.version_d" =>
-                dynamic_header_index.get(".dynstr").copied().unwrap_or(0),
+            ".hash" | ".gnu.hash" | ".gnu.version" => {
+                dynamic_header_index.get(".dynsym").copied().unwrap_or(0)
+            }
+            ".dynsym" | ".dynamic" | ".gnu.version_d" => {
+                dynamic_header_index.get(".dynstr").copied().unwrap_or(0)
+            }
             _ => 0,
         };
         let info = if os.name == ".gnu.version_d" {
-            script_dynamic.as_ref().map(|p| p.verdef_count as u32).unwrap_or(0)
-        } else if os.name == ".dynsym" { 1 } else { 0 };
+            script_dynamic
+                .as_ref()
+                .map(|p| p.verdef_count as u32)
+                .unwrap_or(0)
+        } else if os.name == ".dynsym" {
+            1
+        } else {
+            0
+        };
         let entsize = match os.name.as_str() {
             ".hash" => 4,
             ".dynsym" => machine.sym_size() as u64,
             ".gnu.version" => 2,
-            ".dynamic" => if machine == ScriptMachine::X86_64 { 16 } else { 8 },
+            ".dynamic" => {
+                if machine == ScriptMachine::X86_64 {
+                    16
+                } else {
+                    8
+                }
+            }
             _ => 0,
         };
-        write_script_shdr(machine, &mut out, name_offs[h], os.sh_type, os.flags,
-                          os.vaddr, os.file_offset, os.size, link, info,
-                          os.align.max(1), entsize)?;
+        write_script_shdr(
+            machine,
+            &mut out,
+            name_offs[h],
+            os.sh_type,
+            os.flags,
+            os.vaddr,
+            os.file_offset,
+            os.size,
+            link,
+            info,
+            os.align.max(1),
+            entsize,
+        )?;
     }
     let n_hdrs = 1 + hdr_secs.len();
     // Header index layout from here on:
@@ -2664,26 +3439,77 @@ fn link_with_script_machine(
 
     // Map an out_secs index to its section-header index.
     let hdr_index_of = |target: usize| -> u32 {
-        hdr_secs.iter().position(|&i| i == target).map(|p| p as u32 + 1).unwrap_or(0)
+        hdr_secs
+            .iter()
+            .position(|&i| i == target)
+            .map(|p| p as u32 + 1)
+            .unwrap_or(0)
     };
     for (k, rr) in retained.iter().enumerate() {
         // sh_link = .symtab, sh_info = section these relocations apply to.
-        let rel_type = if machine == ScriptMachine::X86_64 { SHT_RELA_ } else { SHT_REL_ };
-        write_script_shdr(machine, &mut out, rela_names[k], rel_type, 0, 0,
-                          rela_offsets[k],
-                          (rr.entries.len() * machine.rel_size()) as u64,
-                          symtab_idx as u32, hdr_index_of(rr.target),
-                          table_align as u64, machine.rel_size() as u64)?;
+        let rel_type = if machine == ScriptMachine::X86_64 {
+            SHT_RELA_
+        } else {
+            SHT_REL_
+        };
+        write_script_shdr(
+            machine,
+            &mut out,
+            rela_names[k],
+            rel_type,
+            0,
+            0,
+            rela_offsets[k],
+            (rr.entries.len() * machine.rel_size()) as u64,
+            symtab_idx as u32,
+            hdr_index_of(rr.target),
+            table_align as u64,
+            machine.rel_size() as u64,
+        )?;
     }
 
-    write_script_shdr(machine, &mut out, symtab_name, SHT_SYMTAB_, 0, 0,
-                      symtab_off, (symtab.len() * machine.sym_size()) as u64,
-                      strtab_idx as u32, n_local_syms as u32,
-                      table_align as u64, machine.sym_size() as u64)?;
-    write_script_shdr(machine, &mut out, strtab_name, SHT_STRTAB_, 0, 0,
-                      strtab_off, strtab.len() as u64, 0, 0, 1, 0)?;
-    write_script_shdr(machine, &mut out, shstrtab_name, SHT_STRTAB_, 0, 0,
-                      shstrtab_off, shstrtab.len() as u64, 0, 0, 1, 0)?;
+    write_script_shdr(
+        machine,
+        &mut out,
+        symtab_name,
+        SHT_SYMTAB_,
+        0,
+        0,
+        symtab_off,
+        (symtab.len() * machine.sym_size()) as u64,
+        strtab_idx as u32,
+        n_local_syms as u32,
+        table_align as u64,
+        machine.sym_size() as u64,
+    )?;
+    write_script_shdr(
+        machine,
+        &mut out,
+        strtab_name,
+        SHT_STRTAB_,
+        0,
+        0,
+        strtab_off,
+        strtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    )?;
+    write_script_shdr(
+        machine,
+        &mut out,
+        shstrtab_name,
+        SHT_STRTAB_,
+        0,
+        0,
+        shstrtab_off,
+        shstrtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    )?;
 
     let sh_count = (n_hdrs + retained.len() + 3) as u16;
     match machine {
@@ -2707,15 +3533,22 @@ fn link_with_script_machine(
     // placed like any input. Fill the header now and hash the COMPLETE
     // image with a zeroed descriptor, then patch the digest in.
     {
-        let bid = objects.iter().enumerate()
+        let bid = objects
+            .iter()
+            .enumerate()
             .filter(|(_, o)| o.source_name == "<build-id>")
-            .flat_map(|(oi, o)| o.sections.iter().enumerate()
-                .filter(|(_, sec)| sec.name == ".note.gnu.build-id")
-                .map(move |(si, _)| (oi, si)))
+            .flat_map(|(oi, o)| {
+                o.sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sec)| sec.name == ".note.gnu.build-id")
+                    .map(move |(si, _)| (oi, si))
+            })
             .next();
         if let Some((oi, si)) = bid {
             if let (Some(&vaddr), Some(&owner)) =
-                (placed_map.get(&(oi, si)), placed_owner.get(&(oi, si))) {
+                (placed_map.get(&(oi, si)), placed_owner.get(&(oi, si)))
+            {
                 let os = &out_secs[owner];
                 if !os.nobits && os.is_alloc {
                     let foff = (os.file_offset + (vaddr - os.vaddr)) as usize;
@@ -2740,8 +3573,17 @@ fn link_with_script_machine(
 
 #[allow(clippy::too_many_arguments)]
 fn write_script_phdr(
-    machine: ScriptMachine, out: &mut [u8], off: usize, ptype: u32, flags: u32,
-    offset: u64, vaddr: u64, paddr: u64, filesz: u64, memsz: u64, align: u64,
+    machine: ScriptMachine,
+    out: &mut [u8],
+    off: usize,
+    ptype: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    paddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
 ) -> Result<(), String> {
     match machine {
         ScriptMachine::X86_64 => {
@@ -2757,7 +3599,9 @@ fn write_script_phdr(
         ScriptMachine::I386 => {
             let values = [offset, vaddr, paddr, filesz, memsz, align];
             if values.iter().any(|&value| value > u32::MAX as u64) {
-                return Err(format!("ELF32 program header field does not fit in 32 bits: {values:x?}"));
+                return Err(format!(
+                    "ELF32 program header field does not fit in 32 bits: {values:x?}"
+                ));
             }
             w32(out, off, ptype);
             w32(out, off + 4, offset as u32);
@@ -2773,8 +3617,13 @@ fn write_script_phdr(
 }
 
 fn script_sym_entry(
-    machine: ScriptMachine, name: u32, info: u8, other: u8, shndx: u16,
-    value: u64, size: u64,
+    machine: ScriptMachine,
+    name: u32,
+    info: u8,
+    other: u8,
+    shndx: u16,
+    value: u64,
+    size: u64,
 ) -> Result<[u8; 24], String> {
     if machine == ScriptMachine::X86_64 {
         return Ok(elf64_sym_entry(name, info, other, shndx, value, size));
@@ -2798,19 +3647,30 @@ fn script_sym_entry(
 
 #[allow(clippy::too_many_arguments)]
 fn write_script_shdr(
-    machine: ScriptMachine, out: &mut Vec<u8>, name: u32, sh_type: u32,
-    flags: u64, addr: u64, offset: u64, size: u64, link: u32, info: u32,
-    addralign: u64, entsize: u64,
+    machine: ScriptMachine,
+    out: &mut Vec<u8>,
+    name: u32,
+    sh_type: u32,
+    flags: u64,
+    addr: u64,
+    offset: u64,
+    size: u64,
+    link: u32,
+    info: u32,
+    addralign: u64,
+    entsize: u64,
 ) -> Result<(), String> {
     if machine == ScriptMachine::X86_64 {
         linker_common::write_elf64_shdr(
-            out, name, sh_type, flags, addr, offset, size, link, info,
-            addralign, entsize);
+            out, name, sh_type, flags, addr, offset, size, link, info, addralign, entsize,
+        );
         return Ok(());
     }
     let values = [flags, addr, offset, size, addralign, entsize];
     if values.iter().any(|&value| value > u32::MAX as u64) {
-        return Err(format!("ELF32 section header field does not fit in 32 bits: {values:x?}"));
+        return Err(format!(
+            "ELF32 section header field does not fit in 32 bits: {values:x?}"
+        ));
     }
     out.extend_from_slice(&name.to_le_bytes());
     out.extend_from_slice(&sh_type.to_le_bytes());

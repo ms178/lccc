@@ -5,19 +5,11 @@
 //! and emitting the dispatch chain (Switch terminator for exact cases, if-else chain
 //! for GNU case ranges).
 
-use crate::frontend::parser::ast::{Expr, Stmt};
-use crate::ir::reexports::{
-    BlockId,
-    Instruction,
-    IrCmpOp,
-    IrConst,
-    Operand,
-    Terminator,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType};
-use super::lower::Lowerer;
 use super::definitions::SwitchFrame;
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, IrType};
+use crate::frontend::parser::ast::{Expr, Stmt};
+use crate::ir::reexports::{BlockId, Instruction, IrCmpOp, IrConst, Operand, Terminator, Value};
 
 impl Lowerer {
     pub(super) fn lower_switch_stmt(&mut self, expr: &Expr, body: &Stmt) {
@@ -40,8 +32,21 @@ impl Lowerer {
         // Store switch value in an alloca for dispatch chain reloading
         let switch_alloca = self.fresh_value();
         let switch_size = switch_expr_ty.size();
-        self.emit(Instruction::Alloca { dest: switch_alloca, ty: switch_expr_ty, size: switch_size, align: 0, volatile: false, semantic_volatile: false });
-        self.emit(Instruction::Store { volatile: false, val, ptr: switch_alloca, ty: switch_expr_ty, seg_override: AddressSpace::Default });
+        self.emit(Instruction::Alloca {
+            dest: switch_alloca,
+            ty: switch_expr_ty,
+            size: switch_size,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr: switch_alloca,
+            ty: switch_expr_ty,
+            seg_override: AddressSpace::Default,
+        });
 
         let dispatch_label = self.fresh_label();
         let end_label = self.fresh_label();
@@ -67,14 +72,30 @@ impl Lowerer {
         // Pop switch context and emit dispatch chain
         let switch_frame = self.func_mut().switch_stack.pop();
         self.func_mut().break_labels.pop();
-        let cases = switch_frame.as_ref().map(|f| f.cases.clone()).unwrap_or_default();
-        let case_ranges = switch_frame.as_ref().map(|f| f.case_ranges.clone()).unwrap_or_default();
+        let cases = switch_frame
+            .as_ref()
+            .map(|f| f.cases.clone())
+            .unwrap_or_default();
+        let case_ranges = switch_frame
+            .as_ref()
+            .map(|f| f.case_ranges.clone())
+            .unwrap_or_default();
         let default_label = switch_frame.as_ref().and_then(|f| f.default_label);
 
-        let expr_type = switch_frame.as_ref().map(|f| f.expr_type).unwrap_or(IrType::I32);
+        let expr_type = switch_frame
+            .as_ref()
+            .map(|f| f.expr_type)
+            .unwrap_or(IrType::I32);
         let fallback = default_label.unwrap_or(end_label);
         self.start_block(dispatch_label);
-        self.emit_switch_dispatch(&val, switch_alloca, &cases, &case_ranges, fallback, expr_type);
+        self.emit_switch_dispatch(
+            &val,
+            switch_alloca,
+            &cases,
+            &case_ranges,
+            fallback,
+            expr_type,
+        );
         self.start_block(end_label);
     }
 
@@ -98,18 +119,23 @@ impl Lowerer {
         if let Operand::Const(c) = val {
             if let Some(switch_int) = self.const_to_i64(c) {
                 let is_unsigned = switch_ty.is_unsigned();
-                let target = cases.iter()
+                let target = cases
+                    .iter()
                     .find(|(cv, _)| *cv == switch_int)
                     .map(|(_, label)| *label)
-                    .or_else(|| case_ranges.iter()
-                        .find(|(low, high, _)| {
-                            if is_unsigned {
-                                (switch_int as u64) >= (*low as u64) && (switch_int as u64) <= (*high as u64)
-                            } else {
-                                switch_int >= *low && switch_int <= *high
-                            }
-                        })
-                        .map(|(_, _, label)| *label))
+                    .or_else(|| {
+                        case_ranges
+                            .iter()
+                            .find(|(low, high, _)| {
+                                if is_unsigned {
+                                    (switch_int as u64) >= (*low as u64)
+                                        && (switch_int as u64) <= (*high as u64)
+                                } else {
+                                    switch_int >= *low && switch_int <= *high
+                                }
+                            })
+                            .map(|(_, _, label)| *label)
+                    })
                     .unwrap_or(fallback);
                 self.terminate(Terminator::Branch(target));
                 return;
@@ -126,7 +152,13 @@ impl Lowerer {
         if !cases.is_empty() && case_ranges.is_empty() {
             // Load the switch value once and use Switch terminator
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: switch_alloca,
+                ty: switch_ty,
+                seg_override: AddressSpace::Default,
+            });
             self.terminate(Terminator::Switch {
                 val: Operand::Value(loaded),
                 cases: cases.to_vec(),
@@ -139,9 +171,19 @@ impl Lowerer {
         // Mixed case: handle non-range cases with Switch if any, range cases with if-else.
         if !cases.is_empty() {
             // Switch terminator for the simple cases, with fallthrough to range checks
-            let range_check_block = if !case_ranges.is_empty() { self.fresh_label() } else { fallback };
+            let range_check_block = if !case_ranges.is_empty() {
+                self.fresh_label()
+            } else {
+                fallback
+            };
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: switch_alloca,
+                ty: switch_ty,
+                seg_override: AddressSpace::Default,
+            });
             self.terminate(Terminator::Switch {
                 val: Operand::Value(loaded),
                 cases: cases.to_vec(),
@@ -156,15 +198,39 @@ impl Lowerer {
         // Emit range checks: val >= low && val <= high
         // Use unsigned comparisons when the switch expression type is unsigned
         let is_unsigned = switch_ty.is_unsigned();
-        let ge_op = if is_unsigned { IrCmpOp::Uge } else { IrCmpOp::Sge };
-        let le_op = if is_unsigned { IrCmpOp::Ule } else { IrCmpOp::Sle };
+        let ge_op = if is_unsigned {
+            IrCmpOp::Uge
+        } else {
+            IrCmpOp::Sge
+        };
+        let le_op = if is_unsigned {
+            IrCmpOp::Ule
+        } else {
+            IrCmpOp::Sle
+        };
         let range_count = case_ranges.len();
         let make_case_const = |v: i64| -> IrConst { IrConst::from_i64(v, switch_ty) };
         for (ri, (low, high, range_label)) in case_ranges.iter().enumerate() {
             let loaded = self.fresh_value();
-            self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: switch_alloca, ty: switch_ty, seg_override: AddressSpace::Default });
-            let ge_result = self.emit_cmp_val(ge_op, Operand::Value(loaded), Operand::Const(make_case_const(*low)), switch_ty);
-            let le_result = self.emit_cmp_val(le_op, Operand::Value(loaded), Operand::Const(make_case_const(*high)), switch_ty);
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: loaded,
+                ptr: switch_alloca,
+                ty: switch_ty,
+                seg_override: AddressSpace::Default,
+            });
+            let ge_result = self.emit_cmp_val(
+                ge_op,
+                Operand::Value(loaded),
+                Operand::Const(make_case_const(*low)),
+                switch_ty,
+            );
+            let le_result = self.emit_cmp_val(
+                le_op,
+                Operand::Value(loaded),
+                Operand::Const(make_case_const(*high)),
+                switch_ty,
+            );
             let and_result = self.fresh_value();
             self.emit(Instruction::BinOp {
                 dest: and_result,
@@ -174,7 +240,11 @@ impl Lowerer {
                 ty: IrType::I32,
             });
 
-            let next_check = if ri + 1 < range_count { self.fresh_label() } else { fallback };
+            let next_check = if ri + 1 < range_count {
+                self.fresh_label()
+            } else {
+                fallback
+            };
             self.terminate(Terminator::CondBranch {
                 cond: Operand::Value(and_result),
                 true_label: *range_label,
@@ -188,7 +258,8 @@ impl Lowerer {
 
     /// Evaluate a case constant and truncate to the switch expression type.
     pub(super) fn eval_case_constant(&mut self, expr: &Expr) -> i64 {
-        let mut val = self.eval_const_expr(expr)
+        let mut val = self
+            .eval_const_expr(expr)
             .and_then(|c| self.const_to_i64(&c))
             .unwrap_or(0);
         if let Some(switch_ty) = self.func_mut().switch_stack.last().map(|f| &f.expr_type) {

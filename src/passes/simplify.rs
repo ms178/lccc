@@ -63,15 +63,7 @@
 
 use crate::common::types::IrType;
 use crate::ir::reexports::{
-    Instruction,
-    IntrinsicOp,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    IrModule,
-    IrUnaryOp,
-    Operand,
+    Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand,
     Value,
 };
 
@@ -113,35 +105,84 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                 _ => {}
             }
             match inst {
-                Instruction::Cast { dest, src, from_ty, to_ty } => {
-                    set_def(&mut cast_defs, dest.0, CastDef {
-                        src: *src, from_ty: *from_ty, to_ty: *to_ty,
-                    });
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    set_def(
+                        &mut cast_defs,
+                        dest.0,
+                        CastDef {
+                            src: *src,
+                            from_ty: *from_ty,
+                            to_ty: *to_ty,
+                        },
+                    );
                 }
-                Instruction::GetElementPtr { dest, base, offset, .. } => {
-                    set_def(&mut gep_defs, dest.0, GepDef {
-                        base: *base, offset: *offset,
-                    });
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => {
+                    set_def(
+                        &mut gep_defs,
+                        dest.0,
+                        GepDef {
+                            base: *base,
+                            offset: *offset,
+                        },
+                    );
                 }
-                Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-                    set_def(&mut cmp_defs, dest.0, CmpDef {
-                        op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
-                    });
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    set_def(
+                        &mut cmp_defs,
+                        dest.0,
+                        CmpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        },
+                    );
                     let id = dest.0 as usize;
                     if id < is_boolean.len() {
                         is_boolean[id] = true;
                     }
                 }
-                Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
                     // Track all binary definitions. Constant reassociation needs
                     // the constant-operand subset, but canonical BitTest
                     // recognition must see variable-index shifts such as
                     // `(base >> index) & 1`.
-                    set_def(&mut binop_defs, dest.0, BinOpDef {
-                        op: *op, lhs: *lhs, rhs: *rhs, ty: *ty,
-                    });
+                    set_def(
+                        &mut binop_defs,
+                        dest.0,
+                        BinOpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        },
+                    );
                 }
-                Instruction::UnaryOp { dest, op: IrUnaryOp::Neg, src, .. } => {
+                Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src,
+                    ..
+                } => {
                     set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                 }
                 _ => {}
@@ -155,21 +196,35 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     // cases, but those are rare in practice.
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+            if let Instruction::BinOp {
+                dest, op, lhs, rhs, ..
+            } = inst
+            {
                 if matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor)
-                    && operand_is_boolean(lhs, &is_boolean) && operand_is_boolean(rhs, &is_boolean) {
-                        let id = dest.0 as usize;
-                        if id < is_boolean.len() {
-                            is_boolean[id] = true;
-                        }
+                    && operand_is_boolean(lhs, &is_boolean)
+                    && operand_is_boolean(rhs, &is_boolean)
+                {
+                    let id = dest.0 as usize;
+                    if id < is_boolean.len() {
+                        is_boolean[id] = true;
                     }
+                }
             }
         }
     }
 
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
-            if let Some(simplified) = try_simplify_with_types(inst, &cast_defs, &gep_defs, &cmp_defs, &binop_defs, &neg_defs, &is_boolean, &value_types) {
+            if let Some(simplified) = try_simplify_with_types(
+                inst,
+                &cast_defs,
+                &gep_defs,
+                &cmp_defs,
+                &binop_defs,
+                &neg_defs,
+                &is_boolean,
+                &value_types,
+            ) {
                 *inst = simplified;
                 total += 1;
             }
@@ -251,30 +306,59 @@ fn try_simplify_with_types(
     value_types: &[Option<IrType>],
 ) -> Option<Instruction> {
     match inst {
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs)
-        }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
-            simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types)
-        }
-        Instruction::GetElementPtr { dest, base, offset, ty } => {
-            simplify_gep(*dest, *base, offset, *ty, gep_defs)
-        }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean)
-        }
-        Instruction::Select { dest, cond, true_val, false_val, .. } => {
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs),
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types),
+        Instruction::GetElementPtr {
+            dest,
+            base,
+            offset,
+            ty,
+        } => simplify_gep(*dest, *base, offset, *ty, gep_defs),
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean),
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             // select cond, x, x => x (both arms are the same)
             if same_operand(true_val, false_val) {
-                return Some(Instruction::Copy { dest: *dest, src: *true_val });
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: *true_val,
+                });
             }
             // select Const(0), a, b => b (constant false condition)
             // select Const(nonzero), a, b => a (constant true condition)
             if let Operand::Const(c) = cond {
                 if c.is_zero() {
-                    return Some(Instruction::Copy { dest: *dest, src: *false_val });
+                    return Some(Instruction::Copy {
+                        dest: *dest,
+                        src: *false_val,
+                    });
                 } else {
-                    return Some(Instruction::Copy { dest: *dest, src: *true_val });
+                    return Some(Instruction::Copy {
+                        dest: *dest,
+                        src: *true_val,
+                    });
                 }
             }
             None
@@ -300,8 +384,16 @@ fn try_simplify(
     neg_defs: &[Option<NegDef>],
     is_boolean: &[bool],
 ) -> Option<Instruction> {
-    try_simplify_with_types(inst, cast_defs, gep_defs, cmp_defs, binop_defs,
-                            neg_defs, is_boolean, &[])
+    try_simplify_with_types(
+        inst,
+        cast_defs,
+        gep_defs,
+        cmp_defs,
+        binop_defs,
+        neg_defs,
+        is_boolean,
+        &[],
+    )
 }
 
 /// Simplify a Cast instruction.
@@ -362,10 +454,14 @@ fn simplify_cast(
                 // The size guard (inner_from.size() <= from_ty.size()) ensures the
                 // first cast was a widening, not a narrowing (which loses bits).
                 if inner_from == to_ty
-                    && inner_from.is_integer() && from_ty.is_integer()
+                    && inner_from.is_integer()
+                    && from_ty.is_integer()
                     && inner_from.size() <= from_ty.size()
                 {
-                    return Some(Instruction::Copy { dest, src: inner_src });
+                    return Some(Instruction::Copy {
+                        dest,
+                        src: inner_src,
+                    });
                 }
 
                 // Double widen: Cast(Cast(x, A->B), B->C) where A < B < C (all ints)
@@ -484,7 +580,11 @@ fn fold_i128_cast(v128: i128, from_ty: IrType, to_ty: IrType) -> Option<IrConst>
             }
         }
         IrType::F64 => {
-            let fv = if from_ty.is_unsigned() { (v128 as u128) as f64 } else { v128 as f64 };
+            let fv = if from_ty.is_unsigned() {
+                (v128 as u128) as f64
+            } else {
+                v128 as f64
+            };
             IrConst::F64(fv)
         }
         IrType::F128 => {
@@ -520,8 +620,16 @@ fn fold_int_cast(val: i64, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
                 IrConst::I128(val as i128)
             }
         }
-        IrType::F32 => IrConst::F32(if from_ty.is_unsigned() { val as u64 as f32 } else { val as f32 }),
-        IrType::F64 => IrConst::F64(if from_ty.is_unsigned() { val as u64 as f64 } else { val as f64 }),
+        IrType::F32 => IrConst::F32(if from_ty.is_unsigned() {
+            val as u64 as f32
+        } else {
+            val as f32
+        }),
+        IrType::F64 => IrConst::F64(if from_ty.is_unsigned() {
+            val as u64 as f64
+        } else {
+            val as f64
+        }),
         IrType::F128 => {
             // Use direct integer-to-x87 conversion for full 64-bit precision
             if from_ty.is_unsigned() {
@@ -644,10 +752,7 @@ fn simplify_cmp(
     if let Some(const_i64) = const_i64 {
         if let Some(Some(cdef)) = cast_defs.get(val.0 as usize) {
             let narrow_ty = cdef.from_ty;
-            if cdef.to_ty == ty
-                && narrow_ty.is_integer()
-                && narrow_ty.size() < ty.size()
-            {
+            if cdef.to_ty == ty && narrow_ty.is_integer() && narrow_ty.size() < ty.size() {
                 let bits = narrow_ty.size() * 8;
                 let fits = if narrow_ty.is_unsigned() {
                     const_i64 >= 0 && (const_i64 as u64) <= (1u64 << bits) - 1
@@ -685,7 +790,11 @@ fn simplify_cmp(
     let val_is_boolean = idx < is_boolean.len() && is_boolean[idx];
 
     // If the value is from a Cmp, we can do precise inversion
-    let inner_cmp = if let Some(Some(cdef)) = cmp_defs.get(idx) { Some(cdef) } else { None };
+    let inner_cmp = if let Some(Some(cdef)) = cmp_defs.get(idx) {
+        Some(cdef)
+    } else {
+        None
+    };
 
     if val_is_boolean {
         match effective_op {
@@ -700,8 +809,8 @@ fn simplify_cmp(
                         // !(NaN <= x) should be true (since NaN <= x is false),
                         // but (NaN > x) is also false. Only Eq<->Ne inversion
                         // is safe for floats since both handle NaN consistently.
-                        let is_float_ordered = ic.ty.is_float()
-                            && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
+                        let is_float_ordered =
+                            ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
                         if !is_float_ordered {
                             return Some(Instruction::Cmp {
                                 dest,
@@ -739,8 +848,8 @@ fn simplify_cmp(
                     if let Some(ic) = inner_cmp {
                         // Skip inversion for float ordered comparisons (NaN safety).
                         // See the Eq/is_zero_const case above for the full explanation.
-                        let is_float_ordered = ic.ty.is_float()
-                            && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
+                        let is_float_ordered =
+                            ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne);
                         if !is_float_ordered {
                             return Some(Instruction::Cmp {
                                 dest,
@@ -781,7 +890,8 @@ fn simplify_cmp(
             // Cmp(Ule, x, 0) => Cmp(Eq, x, 0) (unsigned x <= 0 means x == 0)
             IrCmpOp::Ule => {
                 return Some(Instruction::Cmp {
-                    dest, op: IrCmpOp::Eq,
+                    dest,
+                    op: IrCmpOp::Eq,
                     lhs: Operand::Value(*val),
                     rhs: Operand::Const(*cval),
                     ty,
@@ -790,7 +900,8 @@ fn simplify_cmp(
             // Cmp(Ugt, x, 0) => Cmp(Ne, x, 0) (unsigned x > 0 means x != 0)
             IrCmpOp::Ugt => {
                 return Some(Instruction::Cmp {
-                    dest, op: IrCmpOp::Ne,
+                    dest,
+                    op: IrCmpOp::Ne,
                     lhs: Operand::Value(*val),
                     rhs: Operand::Const(*cval),
                     ty,
@@ -831,7 +942,10 @@ fn simplify_gep(
     gep_defs: &[Option<GepDef>],
 ) -> Option<Instruction> {
     if is_zero(offset) {
-        return Some(Instruction::Copy { dest, src: Operand::Value(base) });
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Value(base),
+        });
     }
 
     // GEP chain folding: GEP(GEP(inner_base, c1), c2) => GEP(inner_base, c1 + c2)
@@ -882,7 +996,12 @@ fn const_power_of_two(op: &Operand) -> Option<u32> {
 
 /// Try to strength-reduce a multiply by a power of 2 on either side.
 /// Returns the shift instruction if successful.
-fn try_mul_power_of_two(dest: Value, val: &Operand, pow2: &Operand, ty: IrType) -> Option<Instruction> {
+fn try_mul_power_of_two(
+    dest: Value,
+    val: &Operand,
+    pow2: &Operand,
+    ty: IrType,
+) -> Option<Instruction> {
     let shift = const_power_of_two(pow2)?;
     if shift == 1 {
         // x * 2 => x + x
@@ -962,7 +1081,11 @@ fn simplify_binop(
                 // x - (neg y) => x + y (eliminate negation)
                 if let Some(neg_src) = get_neg_def(rhs, neg_defs) {
                     return Some(Instruction::BinOp {
-                        dest, op: IrBinOp::Add, lhs: *lhs, rhs: neg_src, ty,
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs: *lhs,
+                        rhs: neg_src,
+                        ty,
                     });
                 }
             }
@@ -997,12 +1120,18 @@ fn simplify_binop(
             if !is_float {
                 if is_neg_one(rhs, ty) {
                     return Some(Instruction::UnaryOp {
-                        dest, op: IrUnaryOp::Neg, src: *lhs, ty,
+                        dest,
+                        op: IrUnaryOp::Neg,
+                        src: *lhs,
+                        ty,
                     });
                 }
                 if is_neg_one(lhs, ty) {
                     return Some(Instruction::UnaryOp {
-                        dest, op: IrUnaryOp::Neg, src: *rhs, ty,
+                        dest,
+                        op: IrUnaryOp::Neg,
+                        src: *rhs,
+                        ty,
                     });
                 }
             }
@@ -1099,9 +1228,16 @@ fn simplify_binop(
                 // change the isolated low bit.
                 let peeled = match candidate {
                     Operand::Value(v) => match cast_defs.get(v.0 as usize).copied().flatten() {
-                        Some(CastDef { from_ty, to_ty, src })
-                            if from_ty.is_integer() && to_ty.is_integer()
-                                && from_ty.size() == to_ty.size() => src,
+                        Some(CastDef {
+                            from_ty,
+                            to_ty,
+                            src,
+                        }) if from_ty.is_integer()
+                            && to_ty.is_integer()
+                            && from_ty.size() == to_ty.size() =>
+                        {
+                            src
+                        }
                         _ => *candidate,
                     },
                     _ => *candidate,
@@ -1121,8 +1257,15 @@ fn simplify_binop(
                         // `(u64 >> i) & 1` at -m32. Keep the shift+and form
                         // there; the pair shift lowering handles it correctly.
                         let native_ok = !crate::common::types::target_is_32bit()
-                            || matches!(bt_ty, IrType::I8 | IrType::U8 | IrType::I16
-                                | IrType::U16 | IrType::I32 | IrType::U32);
+                            || matches!(
+                                bt_ty,
+                                IrType::I8
+                                    | IrType::U8
+                                    | IrType::I16
+                                    | IrType::U16
+                                    | IrType::I32
+                                    | IrType::U32
+                            );
                         if native_ok && !bt_ty.is_128bit() {
                             return Some(Instruction::BinOp {
                                 dest,
@@ -1136,7 +1279,9 @@ fn simplify_binop(
                 }
             }
             // Reassociation: (x & C1) & C2 => x & (C1 & C2)
-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs) {
+            if let Some(inst) =
+                try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs)
+            {
                 return Some(inst);
             }
         }
@@ -1161,7 +1306,8 @@ fn simplify_binop(
                 return Some(Instruction::Copy { dest, src: *lhs });
             }
             // Reassociation: (x | C1) | C2 => x | (C1 | C2)
-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs) {
+            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs)
+            {
                 return Some(inst);
             }
         }
@@ -1182,7 +1328,9 @@ fn simplify_binop(
                 });
             }
             // Reassociation: (x ^ C1) ^ C2 => x ^ (C1 ^ C2)
-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs) {
+            if let Some(inst) =
+                try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs)
+            {
                 return Some(inst);
             }
         }
@@ -1223,7 +1371,11 @@ fn simplify_binop(
     // loading the constant into a register first).
     if op.is_commutative() && matches!(lhs, Operand::Const(_)) && matches!(rhs, Operand::Value(_)) {
         return Some(Instruction::BinOp {
-            dest, op, lhs: *rhs, rhs: *lhs, ty,
+            dest,
+            op,
+            lhs: *rhs,
+            rhs: *lhs,
+            ty,
         });
     }
 
@@ -1376,7 +1528,9 @@ fn try_reassociate_add(
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
-    if matches!(ty, IrType::I128 | IrType::U128) { return None; }
+    if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
     // Pattern: (x + C1) + C2 or (x - C1) + C2
     if let Operand::Const(c2) = rhs {
         let c2_val = c2.to_i64()?;
@@ -1392,7 +1546,8 @@ fn try_reassociate_add(
                                 return Some(Instruction::Copy { dest, src: def.lhs });
                             }
                             return Some(Instruction::BinOp {
-                                dest, op: IrBinOp::Add,
+                                dest,
+                                op: IrBinOp::Add,
                                 lhs: def.lhs,
                                 rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                                 ty,
@@ -1406,7 +1561,8 @@ fn try_reassociate_add(
                                 return Some(Instruction::Copy { dest, src: def.rhs });
                             }
                             return Some(Instruction::BinOp {
-                                dest, op: IrBinOp::Add,
+                                dest,
+                                op: IrBinOp::Add,
                                 lhs: def.rhs,
                                 rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                                 ty,
@@ -1422,7 +1578,8 @@ fn try_reassociate_add(
                                 return Some(Instruction::Copy { dest, src: def.lhs });
                             }
                             return Some(Instruction::BinOp {
-                                dest, op: IrBinOp::Add,
+                                dest,
+                                op: IrBinOp::Add,
                                 lhs: def.lhs,
                                 rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                                 ty,
@@ -1446,7 +1603,8 @@ fn try_reassociate_add(
                         return Some(Instruction::Copy { dest, src: def.lhs });
                     }
                     return Some(Instruction::BinOp {
-                        dest, op: IrBinOp::Add,
+                        dest,
+                        op: IrBinOp::Add,
                         lhs: def.lhs,
                         rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                         ty,
@@ -1459,7 +1617,8 @@ fn try_reassociate_add(
                         return Some(Instruction::Copy { dest, src: def.rhs });
                     }
                     return Some(Instruction::BinOp {
-                        dest, op: IrBinOp::Add,
+                        dest,
+                        op: IrBinOp::Add,
                         lhs: def.rhs,
                         rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                         ty,
@@ -1482,7 +1641,9 @@ fn try_reassociate_sub(
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
-    if matches!(ty, IrType::I128 | IrType::U128) { return None; }
+    if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
     let c2_val = match rhs {
         Operand::Const(c) => c.to_i64()?,
         _ => return None,
@@ -1501,7 +1662,8 @@ fn try_reassociate_sub(
                     return Some(Instruction::Copy { dest, src: def.lhs });
                 }
                 return Some(Instruction::BinOp {
-                    dest, op: IrBinOp::Add,
+                    dest,
+                    op: IrBinOp::Add,
                     lhs: def.lhs,
                     rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                     ty,
@@ -1515,7 +1677,8 @@ fn try_reassociate_sub(
                     return Some(Instruction::Copy { dest, src: def.rhs });
                 }
                 return Some(Instruction::BinOp {
-                    dest, op: IrBinOp::Add,
+                    dest,
+                    op: IrBinOp::Add,
                     lhs: def.rhs,
                     rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                     ty,
@@ -1531,7 +1694,8 @@ fn try_reassociate_sub(
                     return Some(Instruction::Copy { dest, src: def.lhs });
                 }
                 return Some(Instruction::BinOp {
-                    dest, op: IrBinOp::Sub,
+                    dest,
+                    op: IrBinOp::Sub,
                     lhs: def.lhs,
                     rhs: Operand::Const(IrConst::from_i64(combined, ty)),
                     ty,
@@ -1554,7 +1718,9 @@ fn try_reassociate_bitwise(
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
-    if matches!(ty, IrType::I128 | IrType::U128) { return None; }
+    if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
     // Pattern: (x op C1) op C2
     let c2_val = match rhs {
         Operand::Const(c) => c.to_i64()?,
@@ -1588,7 +1754,10 @@ fn try_reassociate_bitwise(
         _ => false,
     };
     if is_identity {
-        return Some(Instruction::Copy { dest, src: non_const_operand });
+        return Some(Instruction::Copy {
+            dest,
+            src: non_const_operand,
+        });
     }
 
     // Check if combined result is annihilator
@@ -1605,7 +1774,8 @@ fn try_reassociate_bitwise(
     }
 
     Some(Instruction::BinOp {
-        dest, op,
+        dest,
+        op,
         lhs: non_const_operand,
         rhs: Operand::Const(IrConst::from_i64(combined, ty)),
         ty,
@@ -1623,12 +1793,16 @@ fn try_reassociate_shift(
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
-    if matches!(ty, IrType::I128 | IrType::U128) { return None; }
+    if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
     let c2_val = match rhs {
         Operand::Const(c) => c.to_i64()?,
         _ => return None,
     };
-    if c2_val < 0 { return None; }
+    if c2_val < 0 {
+        return None;
+    }
     let def = get_binop_def(lhs, binop_defs)?;
     // Must be the same shift operation
     if def.op != op || def.ty != ty {
@@ -1639,7 +1813,9 @@ fn try_reassociate_shift(
         Operand::Const(c) => c.to_i64()?,
         _ => return None,
     };
-    if c1_val < 0 { return None; }
+    if c1_val < 0 {
+        return None;
+    }
 
     let combined = c1_val + c2_val;
     let bit_width = (ty.size() * 8) as i64;
@@ -1658,7 +1834,8 @@ fn try_reassociate_shift(
     }
 
     Some(Instruction::BinOp {
-        dest, op,
+        dest,
+        op,
         lhs: def.lhs,
         rhs: Operand::Const(IrConst::from_i64(combined, ty)),
         ty,
@@ -1677,7 +1854,9 @@ fn try_reassociate_mul(
     binop_defs: &[Option<BinOpDef>],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
-    if matches!(ty, IrType::I128 | IrType::U128) { return None; }
+    if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
 
     // Helper: try pattern (expr * C1) * C2 where expr is on one side and C2 on the other.
     let try_pattern = |expr_side: &Operand, const_side: &Operand| -> Option<Instruction> {
@@ -1705,10 +1884,14 @@ fn try_reassociate_mul(
             });
         }
         if combined == 1 || ty.truncate_i64(combined) == ty.truncate_i64(1) {
-            return Some(Instruction::Copy { dest, src: non_const });
+            return Some(Instruction::Copy {
+                dest,
+                src: non_const,
+            });
         }
         Some(Instruction::BinOp {
-            dest, op: IrBinOp::Mul,
+            dest,
+            op: IrBinOp::Mul,
             lhs: non_const,
             rhs: Operand::Const(IrConst::from_i64(combined, ty)),
             ty,
@@ -1766,7 +1949,9 @@ fn simplify_math_call(
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
-            if args.len() != 1 { return None; }
+            if args.len() != 1 {
+                return None;
+            }
             return Some(Instruction::Intrinsic {
                 dest: Some(dest),
                 op: intrinsic_op,
@@ -1779,7 +1964,9 @@ fn simplify_math_call(
     // Binary intrinsic table (copysignf128/copysignl -> inline bit ops).
     for &(name, intrinsic_op) in BINARY_INTRINSICS {
         if func == name {
-            if args.len() != 2 { return None; }
+            if args.len() != 2 {
+                return None;
+            }
             return Some(Instruction::Intrinsic {
                 dest: Some(dest),
                 op: intrinsic_op,
@@ -1791,7 +1978,9 @@ fn simplify_math_call(
 
     // pow/powf with constant exponent
     if func == "pow" || func == "powf" {
-        if args.len() != 2 { return None; }
+        if args.len() != 2 {
+            return None;
+        }
         let exp = match &args[1] {
             Operand::Const(IrConst::F64(v)) => *v,
             Operand::Const(IrConst::F32(v)) => *v as f64,
@@ -1802,7 +1991,10 @@ fn simplify_math_call(
 
         if exp == 0.0 {
             // pow(x, 0.0) => 1.0 (C11 7.12.7.4: pow(x,+-0) returns 1 for all x, even NaN)
-            return Some(Instruction::Copy { dest, src: Operand::Const(float_const(return_type, 1.0)) });
+            return Some(Instruction::Copy {
+                dest,
+                src: Operand::Const(float_const(return_type, 1.0)),
+            });
         }
         if exp == 1.0 {
             // pow(x, 1.0) => x
@@ -1810,7 +2002,13 @@ fn simplify_math_call(
         }
         if exp == 2.0 {
             // pow(x, 2.0) => x * x
-            return Some(Instruction::BinOp { dest, op: IrBinOp::Mul, lhs: base, rhs: base, ty: return_type });
+            return Some(Instruction::BinOp {
+                dest,
+                op: IrBinOp::Mul,
+                lhs: base,
+                rhs: base,
+                ty: return_type,
+            });
         }
         if exp == -1.0 {
             // pow(x, -1.0) => 1.0 / x
@@ -1824,7 +2022,11 @@ fn simplify_math_call(
         }
         if exp == 0.5 {
             // pow(x, 0.5) => sqrt(x)
-            let sqrt_op = if return_type == IrType::F32 { IntrinsicOp::SqrtF32 } else { IntrinsicOp::SqrtF64 };
+            let sqrt_op = if return_type == IrType::F32 {
+                IntrinsicOp::SqrtF32
+            } else {
+                IntrinsicOp::SqrtF64
+            };
             return Some(Instruction::Intrinsic {
                 dest: Some(dest),
                 op: sqrt_op,
@@ -1851,7 +2053,13 @@ mod tests {
 
     /// Create a BinOp instruction with standard test values.
     fn binop(op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
-        Instruction::BinOp { dest: Value(0), op, lhs, rhs, ty }
+        Instruction::BinOp {
+            dest: Value(0),
+            op,
+            lhs,
+            rhs,
+            ty,
+        }
     }
 
     /// Create a BinOp with Value(1) as lhs and the given const rhs.
@@ -1862,7 +2070,8 @@ mod tests {
     /// Create a BinOp with both operands being Value(1).
     fn binop_self(op: IrBinOp, ty: IrType) -> Instruction {
         Instruction::BinOp {
-            dest: Value(2), op,
+            dest: Value(2),
+            op,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Value(Value(1)),
             ty,
@@ -1872,7 +2081,10 @@ mod tests {
     /// Assert result is a Copy of the given value id.
     fn assert_copy_value(result: &Instruction, expected_id: u32) {
         match result {
-            Instruction::Copy { src: Operand::Value(v), .. } => assert_eq!(v.0, expected_id),
+            Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } => assert_eq!(v.0, expected_id),
             _ => panic!("Expected Copy of Value({}), got {:?}", expected_id, result),
         }
     }
@@ -1880,7 +2092,10 @@ mod tests {
     /// Assert result is a Copy of the given constant.
     fn assert_copy_const_i32(result: &Instruction, expected: i32) {
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::I32(v)), .. } => assert_eq!(*v, expected),
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(v)),
+                ..
+            } => assert_eq!(*v, expected),
             _ => panic!("Expected Copy with I32({}), got {:?}", expected, result),
         }
     }
@@ -1888,7 +2103,10 @@ mod tests {
     /// Assert result is a Copy of I8 constant (used for boolean results).
     fn assert_copy_bool(result: &Instruction, expected: i8) {
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::I8(v)), .. } => assert_eq!(*v, expected),
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I8(v)),
+                ..
+            } => assert_eq!(*v, expected),
             _ => panic!("Expected Copy with I8({}), got {:?}", expected, result),
         }
     }
@@ -1911,7 +2129,8 @@ mod tests {
                 is_sret: false,
                 is_fastcall: false,
                 ret_eightbyte_classes: Vec::new(),
-            ret_is_f128_sse: false,},
+                ret_is_f128_sse: false,
+            },
         }
     }
 
@@ -1919,19 +2138,22 @@ mod tests {
 
     #[test]
     fn test_add_zero() {
-        let result = simplify_default(&binop_val_const(IrBinOp::Add, IrConst::I32(0), IrType::I32)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Add, IrConst::I32(0), IrType::I32)).unwrap();
         assert_copy_value(&result, 1);
     }
 
     #[test]
     fn test_mul_zero() {
-        let result = simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(0), IrType::I32)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(0), IrType::I32)).unwrap();
         assert_copy_const_i32(&result, 0);
     }
 
     #[test]
     fn test_mul_one() {
-        let result = simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(1), IrType::I32)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(1), IrType::I32)).unwrap();
         assert_copy_value(&result, 1);
     }
 
@@ -1956,7 +2178,12 @@ mod tests {
     #[test]
     fn test_no_simplify() {
         // x + y (non-trivial) should not simplify
-        let inst = binop(IrBinOp::Add, Operand::Value(Value(0)), Operand::Value(Value(1)), IrType::I32);
+        let inst = binop(
+            IrBinOp::Add,
+            Operand::Value(Value(0)),
+            Operand::Value(Value(1)),
+            IrType::I32,
+        );
         assert!(simplify_default(&inst).is_none());
     }
 
@@ -1965,9 +2192,14 @@ mod tests {
     #[test]
     fn test_mul_power_of_two_to_shift() {
         // x * 4 => x << 2
-        let result = simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(4), IrType::I64)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(4), IrType::I64)).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(IrConst::I64(2)), .. } => {}
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                rhs: Operand::Const(IrConst::I64(2)),
+                ..
+            } => {}
             _ => panic!("Expected Shl by 2, got {:?}", result),
         }
     }
@@ -1975,9 +2207,15 @@ mod tests {
     #[test]
     fn test_mul_two_to_add() {
         // x * 2 => x + x
-        let result = simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(2), IrType::I64)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(2), IrType::I64)).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } => {
                 assert_eq!(a.0, 1);
                 assert_eq!(b.0, 1);
             }
@@ -1988,9 +2226,14 @@ mod tests {
     #[test]
     fn test_mul_power_of_two_i32() {
         // x * 8 => x << 3 (I32)
-        let result = simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(8), IrType::I32)).unwrap();
+        let result =
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I32(8), IrType::I32)).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(IrConst::I32(3)), .. } => {}
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                rhs: Operand::Const(IrConst::I32(3)),
+                ..
+            } => {}
             _ => panic!("Expected Shl by 3, got {:?}", result),
         }
     }
@@ -1998,13 +2241,19 @@ mod tests {
     #[test]
     fn test_mul_non_power_of_two_no_change() {
         // x * 3 should NOT be simplified to shift
-        assert!(simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(3), IrType::I64)).is_none());
+        assert!(
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(3), IrType::I64))
+                .is_none()
+        );
     }
 
     #[test]
     fn test_mul_float_no_strength_reduction() {
         // x * 2.0 should NOT be simplified (float type)
-        assert!(simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(2), IrType::F64)).is_none());
+        assert!(
+            simplify_default(&binop_val_const(IrBinOp::Mul, IrConst::I64(2), IrType::F64))
+                .is_none()
+        );
     }
 
     #[test]
@@ -2013,7 +2262,11 @@ mod tests {
         let inst = binop_val_const(IrBinOp::UDiv, IrConst::I64(8), IrType::U64);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::LShr, rhs: Operand::Const(IrConst::I64(3)), .. } => {}
+            Instruction::BinOp {
+                op: IrBinOp::LShr,
+                rhs: Operand::Const(IrConst::I64(3)),
+                ..
+            } => {}
             _ => panic!("Expected LShr by 3, got {:?}", result),
         }
     }
@@ -2024,7 +2277,11 @@ mod tests {
         let inst = binop_val_const(IrBinOp::URem, IrConst::I64(8), IrType::U64);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::And, rhs: Operand::Const(IrConst::I64(7)), .. } => {}
+            Instruction::BinOp {
+                op: IrBinOp::And,
+                rhs: Operand::Const(IrConst::I64(7)),
+                ..
+            } => {}
             _ => panic!("Expected And with 7, got {:?}", result),
         }
     }
@@ -2073,7 +2330,10 @@ mod tests {
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::I64(42)), .. } => {}
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I64(42)),
+                ..
+            } => {}
             _ => panic!("Expected Copy with I64(42)"),
         }
     }
@@ -2130,7 +2390,11 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &gep_defs, &[], &[], &[], &[]).unwrap();
         match result {
-            Instruction::GetElementPtr { base, offset: Operand::Const(IrConst::I64(12)), .. } => {
+            Instruction::GetElementPtr {
+                base,
+                offset: Operand::Const(IrConst::I64(12)),
+                ..
+            } => {
                 assert_eq!(base.0, 0, "Should use original base");
             }
             _ => panic!("Expected GEP with combined offset 12, got {:?}", result),
@@ -2236,7 +2500,11 @@ mod tests {
         let inst = make_call("sqrt", vec![Operand::Value(Value(1))], IrType::F64);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Intrinsic { op: IntrinsicOp::SqrtF64, args, .. } => {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::SqrtF64,
+                args,
+                ..
+            } => {
                 assert_eq!(args.len(), 1);
             }
             _ => panic!("Expected SqrtF64 intrinsic, got {:?}", result),
@@ -2248,7 +2516,11 @@ mod tests {
         let inst = make_call("sqrtf", vec![Operand::Value(Value(1))], IrType::F32);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Intrinsic { op: IntrinsicOp::SqrtF32, args, .. } => {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::SqrtF32,
+                args,
+                ..
+            } => {
                 assert_eq!(args.len(), 1);
             }
             _ => panic!("Expected SqrtF32 intrinsic, got {:?}", result),
@@ -2260,7 +2532,11 @@ mod tests {
         let inst = make_call("fabs", vec![Operand::Value(Value(1))], IrType::F64);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Intrinsic { op: IntrinsicOp::FabsF64, args, .. } => {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::FabsF64,
+                args,
+                ..
+            } => {
                 assert_eq!(args.len(), 1);
             }
             _ => panic!("Expected FabsF64 intrinsic, got {:?}", result),
@@ -2272,7 +2548,11 @@ mod tests {
         let inst = make_call("fabsf", vec![Operand::Value(Value(1))], IrType::F32);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Intrinsic { op: IntrinsicOp::FabsF32, args, .. } => {
+            Instruction::Intrinsic {
+                op: IntrinsicOp::FabsF32,
+                args,
+                ..
+            } => {
                 assert_eq!(args.len(), 1);
             }
             _ => panic!("Expected FabsF32 intrinsic, got {:?}", result),
@@ -2281,36 +2561,47 @@ mod tests {
 
     #[test]
     fn test_pow_x_zero() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(0.0)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(0.0))],
+            IrType::F64,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::F64(v)), .. } => assert_eq!(v, 1.0),
+            Instruction::Copy {
+                src: Operand::Const(IrConst::F64(v)),
+                ..
+            } => assert_eq!(v, 1.0),
             _ => panic!("Expected Copy with 1.0, got {:?}", result),
         }
     }
 
     #[test]
     fn test_pow_x_one() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(1.0)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(1.0))],
+            IrType::F64,
+        );
         let result = simplify_default(&inst).unwrap();
         assert_copy_value(&result, 1);
     }
 
     #[test]
     fn test_pow_x_two() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(2.0)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(2.0))],
+            IrType::F64,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } => {
                 assert_eq!(a.0, 1);
                 assert_eq!(b.0, 1);
             }
@@ -2320,13 +2611,18 @@ mod tests {
 
     #[test]
     fn test_pow_x_neg_one() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(-1.0)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(-1.0))],
+            IrType::F64,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::SDiv, lhs: Operand::Const(IrConst::F64(v)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::SDiv,
+                lhs: Operand::Const(IrConst::F64(v)),
+                ..
+            } => {
                 assert_eq!(v, 1.0);
             }
             _ => panic!("Expected 1.0/x, got {:?}", result),
@@ -2335,23 +2631,28 @@ mod tests {
 
     #[test]
     fn test_pow_x_half() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(0.5)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(0.5))],
+            IrType::F64,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Intrinsic { op: IntrinsicOp::SqrtF64, .. } => {}
+            Instruction::Intrinsic {
+                op: IntrinsicOp::SqrtF64,
+                ..
+            } => {}
             _ => panic!("Expected SqrtF64 intrinsic, got {:?}", result),
         }
     }
 
     #[test]
     fn test_pow_non_special_exponent() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F64(3.0)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F64(3.0))],
+            IrType::F64,
+        );
         assert!(simplify_default(&inst).is_none());
     }
 
@@ -2370,22 +2671,28 @@ mod tests {
 
     #[test]
     fn test_pow_variable_exponent_no_simplify() {
-        let inst = make_call("pow", vec![
-            Operand::Value(Value(1)),
-            Operand::Value(Value(2)),
-        ], IrType::F64);
+        let inst = make_call(
+            "pow",
+            vec![Operand::Value(Value(1)), Operand::Value(Value(2))],
+            IrType::F64,
+        );
         assert!(simplify_default(&inst).is_none());
     }
 
     #[test]
     fn test_powf_x_two_f32() {
-        let inst = make_call("powf", vec![
-            Operand::Value(Value(1)),
-            Operand::Const(IrConst::F32(2.0)),
-        ], IrType::F32);
+        let inst = make_call(
+            "powf",
+            vec![Operand::Value(Value(1)), Operand::Const(IrConst::F32(2.0))],
+            IrType::F32,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Mul, ty: IrType::F32, .. } => {}
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                ty: IrType::F32,
+                ..
+            } => {}
             _ => panic!("Expected F32 Mul, got {:?}", result),
         }
     }
@@ -2396,8 +2703,10 @@ mod tests {
     fn test_cmp_self_eq() {
         // Cmp(Eq, x, x) => 1 (always true)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Eq,
-            lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(1)),
+            dest: Value(2),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
         let result = simplify_default(&inst).unwrap();
@@ -2408,8 +2717,10 @@ mod tests {
     fn test_cmp_self_ne() {
         // Cmp(Ne, x, x) => 0 (always false)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ne,
-            lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(1)),
+            dest: Value(2),
+            op: IrCmpOp::Ne,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
             ty: IrType::I64,
         };
         let result = simplify_default(&inst).unwrap();
@@ -2420,8 +2731,10 @@ mod tests {
     fn test_cmp_self_sle() {
         // Cmp(Sle, x, x) => 1 (always true)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Sle,
-            lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(1)),
+            dest: Value(2),
+            op: IrCmpOp::Sle,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
         let result = simplify_default(&inst).unwrap();
@@ -2432,8 +2745,10 @@ mod tests {
     fn test_cmp_self_slt() {
         // Cmp(Slt, x, x) => 0 (always false)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Slt,
-            lhs: Operand::Value(Value(1)), rhs: Operand::Value(Value(1)),
+            dest: Value(2),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
         let result = simplify_default(&inst).unwrap();
@@ -2454,7 +2769,8 @@ mod tests {
         booleans[1] = true;
 
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ne,
+            dest: Value(2),
+            op: IrCmpOp::Ne,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
@@ -2477,14 +2793,20 @@ mod tests {
         booleans[1] = true;
 
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Eq,
+            dest: Value(2),
+            op: IrCmpOp::Eq,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
         };
         let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Sge, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Sge,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } => {
                 assert_eq!(a.0, 10);
                 assert_eq!(b.0, 11);
             }
@@ -2506,7 +2828,8 @@ mod tests {
         booleans[1] = true;
 
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Eq,
+            dest: Value(2),
+            op: IrCmpOp::Eq,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(1)),
             ty: IrType::I64,
@@ -2529,14 +2852,20 @@ mod tests {
         booleans[1] = true;
 
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ne,
+            dest: Value(2),
+            op: IrCmpOp::Ne,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(1)),
             ty: IrType::I64,
         };
         let result = try_simplify(&inst, &[], &[], &cmp_defs, &[], &[], &booleans).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Eq,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } => {
                 assert_eq!(a.0, 10);
                 assert_eq!(b.0, 11);
             }
@@ -2551,7 +2880,8 @@ mod tests {
         booleans[3] = true; // Value(3) = And(cmp1, cmp2) is boolean
 
         let inst = Instruction::Cmp {
-            dest: Value(4), op: IrCmpOp::Ne,
+            dest: Value(4),
+            op: IrCmpOp::Ne,
             lhs: Operand::Value(Value(3)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
@@ -2564,7 +2894,8 @@ mod tests {
     fn test_cmp_ult_zero_always_false() {
         // Cmp(Ult, x, 0) is always false (nothing is < 0 unsigned)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ult,
+            dest: Value(2),
+            op: IrCmpOp::Ult,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::U64,
@@ -2577,7 +2908,8 @@ mod tests {
     fn test_cmp_uge_zero_always_true() {
         // Cmp(Uge, x, 0) is always true (everything is >= 0 unsigned)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Uge,
+            dest: Value(2),
+            op: IrCmpOp::Uge,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::U64,
@@ -2590,7 +2922,8 @@ mod tests {
     fn test_cmp_no_simplify_non_boolean() {
         // Cmp(Ne, non_cmp_value, 0) should NOT simplify (value could be any integer)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ne,
+            dest: Value(2),
+            op: IrCmpOp::Ne,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::I64,
@@ -2622,7 +2955,10 @@ mod tests {
         let inst = binop_val_const(IrBinOp::Or, IrConst::I32(-1), IrType::I32);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(c), .. } => {
+            Instruction::Copy {
+                src: Operand::Const(c),
+                ..
+            } => {
                 assert_eq!(c.to_i64(), Some(-1i32 as i64));
             }
             _ => panic!("Expected Copy with all-ones, got {:?}", result),
@@ -2635,7 +2971,10 @@ mod tests {
         let inst = binop_val_const(IrBinOp::Or, IrConst::I64(-1), IrType::I64);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::I64(-1)), .. } => {}
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I64(-1)),
+                ..
+            } => {}
             _ => panic!("Expected Copy with I64(-1), got {:?}", result),
         }
     }
@@ -2658,7 +2997,10 @@ mod tests {
 
     #[test]
     fn test_is_all_ones_not_float() {
-        assert!(!is_all_ones(&Operand::Const(IrConst::F64(-1.0)), IrType::F64));
+        assert!(!is_all_ones(
+            &Operand::Const(IrConst::F64(-1.0)),
+            IrType::F64
+        ));
     }
 
     // === Select simplification tests ===
@@ -2726,7 +3068,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(30)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(30)),
+                ..
+            } => {
                 assert_eq!(v.0, 0);
             }
             _ => panic!("Expected Add(V0, 30), got {:?}", result),
@@ -2773,7 +3120,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Sub, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(30)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(30)),
+                ..
+            } => {
                 assert_eq!(v.0, 0);
             }
             _ => panic!("Expected Sub(V0, 30), got {:?}", result),
@@ -2799,7 +3151,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(0x0F)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(0x0F)),
+                ..
+            } => {
                 assert_eq!(v.0, 0);
             }
             _ => panic!("Expected And(V0, 0x0F), got {:?}", result),
@@ -2846,7 +3203,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(5)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ..
+            } => {
                 assert_eq!(v.0, 0);
             }
             _ => panic!("Expected Shl(V0, 5), got {:?}", result),
@@ -2882,7 +3244,12 @@ mod tests {
         let inst = binop_val_const(IrBinOp::Mul, IrConst::I32(-1), IrType::I32);
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::UnaryOp { op: IrUnaryOp::Neg, src: Operand::Value(v), ty: IrType::I32, .. } => {
+            Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                src: Operand::Value(v),
+                ty: IrType::I32,
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected UnaryOp::Neg, got {:?}", result),
@@ -2892,10 +3259,20 @@ mod tests {
     #[test]
     fn test_mul_neg_one_lhs() {
         // (-1) * x => neg(x)
-        let inst = binop(IrBinOp::Mul, Operand::Const(IrConst::I64(-1)), Operand::Value(Value(1)), IrType::I64);
+        let inst = binop(
+            IrBinOp::Mul,
+            Operand::Const(IrConst::I64(-1)),
+            Operand::Value(Value(1)),
+            IrType::I64,
+        );
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::UnaryOp { op: IrUnaryOp::Neg, src: Operand::Value(v), ty: IrType::I64, .. } => {
+            Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                src: Operand::Value(v),
+                ty: IrType::I64,
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected UnaryOp::Neg, got {:?}", result),
@@ -2931,7 +3308,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(15)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(15)),
+                ..
+            } => {
                 assert_eq!(v.0, 0, "Should use original non-const operand");
             }
             _ => panic!("Expected Mul(V0, 15), got {:?}", result),
@@ -2966,7 +3348,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Mul, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(15)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I64(15)),
+                ..
+            } => {
                 assert_eq!(v.0, 0);
             }
             _ => panic!("Expected Mul(V0, 15), got {:?}", result),
@@ -2979,7 +3366,9 @@ mod tests {
     fn test_sub_neg_to_add() {
         // x - (neg y) => x + y
         let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
-        neg_defs[2] = Some(NegDef { src: Operand::Value(Value(1)) });
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
         let inst = Instruction::BinOp {
             dest: Value(3),
             op: IrBinOp::Sub,
@@ -2989,7 +3378,12 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &[], &neg_defs, &[]).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(a), rhs: Operand::Value(b), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ..
+            } => {
                 assert_eq!(a.0, 0, "lhs should be original lhs");
                 assert_eq!(b.0, 1, "rhs should be negation source");
             }
@@ -3001,7 +3395,9 @@ mod tests {
     fn test_sub_neg_float_not_simplified() {
         // Float x - (neg y) should NOT be simplified (IEEE 754 concerns)
         let mut neg_defs: Vec<Option<NegDef>> = vec![None; 4];
-        neg_defs[2] = Some(NegDef { src: Operand::Value(Value(1)) });
+        neg_defs[2] = Some(NegDef {
+            src: Operand::Value(Value(1)),
+        });
         let inst = Instruction::BinOp {
             dest: Value(3),
             op: IrBinOp::Sub,
@@ -3019,14 +3415,20 @@ mod tests {
     fn test_cmp_ule_zero() {
         // Cmp(Ule, x, 0) => Cmp(Eq, x, 0)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ule,
+            dest: Value(2),
+            op: IrCmpOp::Ule,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I32(0)),
             ty: IrType::U32,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(0)), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Eq,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected Cmp(Eq, V1, 0), got {:?}", result),
@@ -3037,14 +3439,20 @@ mod tests {
     fn test_cmp_ugt_zero() {
         // Cmp(Ugt, x, 0) => Cmp(Ne, x, 0)
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Ugt,
+            dest: Value(2),
+            op: IrCmpOp::Ugt,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I64(0)),
             ty: IrType::U64,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Ne, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(0)), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected Cmp(Ne, V1, 0), got {:?}", result),
@@ -3057,14 +3465,20 @@ mod tests {
     fn test_cmp_canonicalize_const_lhs_slt() {
         // Cmp(Slt, Const(5), Value(1)) => Cmp(Sgt, Value(1), Const(5))
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Slt,
+            dest: Value(2),
+            op: IrCmpOp::Slt,
             lhs: Operand::Const(IrConst::I32(5)),
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Sgt, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(5)), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected Cmp(Sgt, V1, I32(5)), got {:?}", result),
@@ -3076,14 +3490,20 @@ mod tests {
         // Cmp(Eq, Const(42), Value(1)) => Cmp(Eq, Value(1), Const(42))
         // Eq is symmetric so swap_cmp_op returns Eq
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Eq,
+            dest: Value(2),
+            op: IrCmpOp::Eq,
             lhs: Operand::Const(IrConst::I64(42)),
             rhs: Operand::Value(Value(1)),
             ty: IrType::I64,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::Cmp { op: IrCmpOp::Eq, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(42)), .. } => {
+            Instruction::Cmp {
+                op: IrCmpOp::Eq,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I64(42)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected Cmp(Eq, V1, I64(42)), got {:?}", result),
@@ -3094,7 +3514,8 @@ mod tests {
     fn test_cmp_no_canonicalize_already_canonical() {
         // Cmp(Slt, Value(1), Const(5)) - already canonical, no change
         let inst = Instruction::Cmp {
-            dest: Value(2), op: IrCmpOp::Slt,
+            dest: Value(2),
+            op: IrCmpOp::Slt,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I32(5)),
             ty: IrType::I32,
@@ -3106,20 +3527,25 @@ mod tests {
     fn test_binop_canonicalize_commutative_add() {
         // BinOp(Add, Const(10), Value(1)) => BinOp(Add, Value(1), Const(10))
         let inst = Instruction::BinOp {
-            dest: Value(2), op: IrBinOp::Add,
+            dest: Value(2),
+            op: IrBinOp::Add,
             lhs: Operand::Const(IrConst::I32(10)),
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::Add, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I32(10)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(10)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected BinOp(Add, V1, I32(10)), got {:?}", result),
         }
     }
-
 
     #[test]
     fn bit_test_canonicalizes_variable_shift_and_one() {
@@ -3138,12 +3564,24 @@ mod tests {
             ty: IrType::I32,
         };
         let got = simplify_binop(
-            Value(4), IrBinOp::And,
-            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
-            IrType::I32, &[], &binops, &[],
-        ).unwrap();
+            Value(4),
+            IrBinOp::And,
+            &Operand::Value(Value(2)),
+            &Operand::Const(IrConst::I64(1)),
+            IrType::I32,
+            &[],
+            &binops,
+            &[],
+        )
+        .unwrap();
         match got {
-            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::BitTest,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
                 assert!(matches!(lhs, Operand::Value(Value(1))));
                 assert!(matches!(rhs, Operand::Value(Value(3))));
                 assert_eq!(ty, IrType::I32);
@@ -3168,12 +3606,24 @@ mod tests {
             to_ty: IrType::U32,
         });
         let got = simplify_binop(
-            Value(4), IrBinOp::And,
-            &Operand::Value(Value(2)), &Operand::Const(IrConst::I64(1)),
-            IrType::U32, &casts, &binops, &[],
-        ).unwrap();
+            Value(4),
+            IrBinOp::And,
+            &Operand::Value(Value(2)),
+            &Operand::Const(IrConst::I64(1)),
+            IrType::U32,
+            &casts,
+            &binops,
+            &[],
+        )
+        .unwrap();
         match got {
-            Instruction::BinOp { op: IrBinOp::BitTest, lhs, rhs, ty, .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::BitTest,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
                 assert!(matches!(lhs, Operand::Value(Value(1))));
                 assert!(matches!(rhs, Operand::Value(Value(3))));
                 assert_eq!(ty, IrType::I32);
@@ -3192,24 +3642,38 @@ mod tests {
             ty: IrType::I32,
         };
         let got = simplify_binop(
-            Value(4), IrBinOp::BitTest,
-            &Operand::Value(Value(1)), &Operand::Const(IrConst::I32(0)),
-            IrType::I32, &[], &[], &[],
-        ).unwrap();
-        assert!(matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)));
+            Value(4),
+            IrBinOp::BitTest,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I32(0)),
+            IrType::I32,
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0))
+        );
     }
     #[test]
     fn test_binop_canonicalize_commutative_and() {
         // BinOp(And, Const(0xFF), Value(1)) => BinOp(And, Value(1), Const(0xFF))
         let inst = Instruction::BinOp {
-            dest: Value(2), op: IrBinOp::And,
+            dest: Value(2),
+            op: IrBinOp::And,
             lhs: Operand::Const(IrConst::I64(0xFF)),
             rhs: Operand::Value(Value(1)),
             ty: IrType::I64,
         };
         let result = simplify_default(&inst).unwrap();
         match result {
-            Instruction::BinOp { op: IrBinOp::And, lhs: Operand::Value(v), rhs: Operand::Const(IrConst::I64(0xFF)), .. } => {
+            Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I64(0xFF)),
+                ..
+            } => {
                 assert_eq!(v.0, 1);
             }
             _ => panic!("Expected BinOp(And, V1, I64(0xFF)), got {:?}", result),
@@ -3220,7 +3684,8 @@ mod tests {
     fn test_binop_no_canonicalize_non_commutative() {
         // BinOp(Sub, Const(10), Value(1)) - Sub is NOT commutative, should NOT swap
         let inst = Instruction::BinOp {
-            dest: Value(2), op: IrBinOp::Sub,
+            dest: Value(2),
+            op: IrBinOp::Sub,
             lhs: Operand::Const(IrConst::I32(10)),
             rhs: Operand::Value(Value(1)),
             ty: IrType::I32,
@@ -3233,7 +3698,8 @@ mod tests {
     fn test_binop_no_canonicalize_already_canonical() {
         // BinOp(Add, Value(1), Const(10)) - already canonical, no change
         let inst = Instruction::BinOp {
-            dest: Value(2), op: IrBinOp::Add,
+            dest: Value(2),
+            op: IrBinOp::Add,
             lhs: Operand::Value(Value(1)),
             rhs: Operand::Const(IrConst::I32(10)),
             ty: IrType::I32,

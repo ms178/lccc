@@ -676,102 +676,101 @@ fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
             // regress hot paths — see inline_pgo::inline_decisions_active).
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 if crate::pgo::inline_pgo::inline_decisions_active() {
-                let caller_name = module.functions[func_idx].name.clone();
-                // Per-call-site hotness. Derive block counts for the
-                // CURRENT caller CFG from the h0-keyed profile (the CFG may
-                // have changed since training; derive handles drift
-                // gracefully) so the decision sees the count of the block
-                // containing each call (LLVM isHotCallSite/BFI).
-                let caller_fn = &module.functions[func_idx];
-                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-                if let Some(fp) = caller_fp.as_mut() {
-                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
-                }
-                // For each call site, check if PGO says to force inline or deny
-                let mut filtered = Vec::with_capacity(16);
-                for site in call_sites {
-                    if let Some(callee) = callee_map.get(&site.callee_name) {
-                        // Get callee name
-                        let callee_name = &site.callee_name;
-                        let site_cnt = caller_fp
-                            .as_ref()
-                            .map(|fp| {
-                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
-                                fp.block_count(lbl)
-                            })
-                            .unwrap_or(0);
-                        // Check PGO inline decision
-                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                            &module.functions[func_idx],
-                            &{
-                                // Reconstruct IrFunction for callee from callee_map data
-                                // callee_map stores blocks, we need to create a dummy IrFunction
-                                let mut dummy = crate::ir::reexports::IrFunction {
-                                    name: callee_name.clone(),
-                                    return_type: crate::common::types::IrType::I32,
-                                    params: vec![],
-                                    blocks: callee.blocks.clone(),
-                                    is_variadic: false,
-                                    is_declaration: false,
-                                    is_static: false,
-                                    is_inline: false,
-                                    is_always_inline: false,
-                                    is_noinline: false,
-                                    next_value_id: 0,
-                                    next_label: 0,
-                                    section: None,
-                                    visibility: None,
-                                    is_weak: false,
-                                    is_used: false,
-                                    has_inlined_calls: false,
-                                    param_alloca_values: vec![],
-                                    uses_sret: false,
-                                    is_fastcall: false,
-                                    is_naked: false,
-                                    global_init_label_blocks: vec![],
-                                    ret_eightbyte_classes: vec![],
-                                    ret_is_f128_sse: false,
-                                    is_gnu_inline_def: false,
-                                    loop_promoted_f64_values: Vec::new(),
-                                };
-                                dummy
-                            },
-                            site_cnt,
-                            Some(profile),
-                        ) {
-                            if force {
-                                let mut s2 = site;
-                                s2.pgo_force = true;
-                                filtered.push(s2);
-                                continue;
-                            } else {
-                                continue;
-                            } // deny
-                        }
-                        // Also check threshold multiplier
-                        let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
-                            &caller_name,
-                            callee_name,
-                            profile,
-                        );
-                        if mult < 0.4 {
-                            // Cold: skip unless tiny
-                            let inst_count: usize =
-                                callee.blocks.iter().map(|b| b.instructions.len()).sum();
-                            if inst_count > 5 {
-                                continue;
+                    let caller_name = module.functions[func_idx].name.clone();
+                    // Per-call-site hotness. Derive block counts for the
+                    // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                    // have changed since training; derive handles drift
+                    // gracefully) so the decision sees the count of the block
+                    // containing each call (LLVM isHotCallSite/BFI).
+                    let caller_fn = &module.functions[func_idx];
+                    let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                    if let Some(fp) = caller_fp.as_mut() {
+                        crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                    }
+                    // For each call site, check if PGO says to force inline or deny
+                    let mut filtered = Vec::with_capacity(16);
+                    for site in call_sites {
+                        if let Some(callee) = callee_map.get(&site.callee_name) {
+                            // Get callee name
+                            let callee_name = &site.callee_name;
+                            let site_cnt = caller_fp
+                                .as_ref()
+                                .map(|fp| {
+                                    let lbl =
+                                        module.functions[func_idx].blocks[site.block_idx].label;
+                                    fp.block_count(lbl)
+                                })
+                                .unwrap_or(0);
+                            // Check PGO inline decision
+                            if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
+                                &module.functions[func_idx],
+                                &{
+                                    // Reconstruct IrFunction for callee from callee_map data
+                                    // callee_map stores blocks, we need to create a dummy IrFunction
+                                    let mut dummy = crate::ir::reexports::IrFunction {
+                                        name: callee_name.clone(),
+                                        return_type: crate::common::types::IrType::I32,
+                                        params: vec![],
+                                        blocks: callee.blocks.clone(),
+                                        is_variadic: false,
+                                        is_declaration: false,
+                                        is_static: false,
+                                        is_inline: false,
+                                        is_always_inline: false,
+                                        is_noinline: false,
+                                        next_value_id: 0,
+                                        next_label: 0,
+                                        section: None,
+                                        visibility: None,
+                                        is_weak: false,
+                                        is_used: false,
+                                        has_inlined_calls: false,
+                                        param_alloca_values: vec![],
+                                        uses_sret: false,
+                                        is_fastcall: false,
+                                        is_naked: false,
+                                        global_init_label_blocks: vec![],
+                                        ret_eightbyte_classes: vec![],
+                                        ret_is_f128_sse: false,
+                                        is_gnu_inline_def: false,
+                                        loop_promoted_f64_values: Vec::new(),
+                                    };
+                                    dummy
+                                },
+                                site_cnt,
+                                Some(profile),
+                            ) {
+                                if force {
+                                    let mut s2 = site;
+                                    s2.pgo_force = true;
+                                    filtered.push(s2);
+                                    continue;
+                                } else {
+                                    continue;
+                                } // deny
+                            }
+                            // Also check threshold multiplier
+                            let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                                &caller_name,
+                                callee_name,
+                                profile,
+                            );
+                            if mult < 0.4 {
+                                // Cold: skip unless tiny
+                                let inst_count: usize =
+                                    callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                                if inst_count > 5 {
+                                    continue;
+                                }
                             }
                         }
+                        filtered.push(site);
                     }
-                    filtered.push(site);
-                }
-                call_sites = filtered;
+                    call_sites = filtered;
                 } // end inline_decisions_active
             }
             if size_optimized && !size_inlined_large_callees.is_empty() {
-                call_sites.retain(|site| {
-                    !size_inlined_large_callees.contains(&site.callee_name)
-                });
+                call_sites.retain(|site| !size_inlined_large_callees.contains(&site.callee_name));
             }
             if call_sites.is_empty() {
                 break;
@@ -784,10 +783,17 @@ fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
             // callees into a caller that already has loops.
             let needs_loop_info = size_optimized
                 || caller_too_large
-                || call_sites.iter().any(|s| callee_map[&s.callee_name].has_loops);
+                || call_sites
+                    .iter()
+                    .any(|s| callee_map[&s.callee_name].has_loops);
             let loop_blocks: FxHashSet<usize> = if needs_loop_info {
                 let cfg = crate::ir::analysis::CfgAnalysis::build(&module.functions[func_idx]);
-                let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+                let loops = loop_analysis::find_natural_loops(
+                    cfg.num_blocks,
+                    &cfg.preds,
+                    &cfg.succs,
+                    &cfg.idom,
+                );
                 let mut s = FxHashSet::default();
                 for lp in &loops {
                     s.extend(lp.body.iter().copied());
@@ -935,96 +941,97 @@ fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
             // regress hot paths — see inline_pgo::inline_decisions_active).
             if let Some(profile) = crate::pgo::get_pgo_profile() {
                 if crate::pgo::inline_pgo::inline_decisions_active() {
-                let caller_name = module.functions[func_idx].name.clone();
-                // Per-call-site hotness. Derive block counts for the
-                // CURRENT caller CFG from the h0-keyed profile (the CFG may
-                // have changed since training; derive handles drift
-                // gracefully) so the decision sees the count of the block
-                // containing each call (LLVM isHotCallSite/BFI).
-                let caller_fn = &module.functions[func_idx];
-                let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
-                if let Some(fp) = caller_fp.as_mut() {
-                    crate::pgo::profile::derive_block_counts(caller_fn, fp);
-                }
-                // For each call site, check if PGO says to force inline or deny
-                let mut filtered = Vec::with_capacity(16);
-                for site in call_sites {
-                    if let Some(callee) = callee_map.get(&site.callee_name) {
-                        // Get callee name
-                        let callee_name = &site.callee_name;
-                        let site_cnt = caller_fp
-                            .as_ref()
-                            .map(|fp| {
-                                let lbl = module.functions[func_idx].blocks[site.block_idx].label;
-                                fp.block_count(lbl)
-                            })
-                            .unwrap_or(0);
-                        // Check PGO inline decision
-                        if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
-                            &module.functions[func_idx],
-                            &{
-                                // Reconstruct IrFunction for callee from callee_map data
-                                // callee_map stores blocks, we need to create a dummy IrFunction
-                                let mut dummy = crate::ir::reexports::IrFunction {
-                                    name: callee_name.clone(),
-                                    return_type: crate::common::types::IrType::I32,
-                                    params: vec![],
-                                    blocks: callee.blocks.clone(),
-                                    is_variadic: false,
-                                    is_declaration: false,
-                                    is_static: false,
-                                    is_inline: false,
-                                    is_always_inline: false,
-                                    is_noinline: false,
-                                    next_value_id: 0,
-                                    next_label: 0,
-                                    section: None,
-                                    visibility: None,
-                                    is_weak: false,
-                                    is_used: false,
-                                    has_inlined_calls: false,
-                                    param_alloca_values: vec![],
-                                    uses_sret: false,
-                                    is_fastcall: false,
-                                    is_naked: false,
-                                    global_init_label_blocks: vec![],
-                                    ret_eightbyte_classes: vec![],
-                                    ret_is_f128_sse: false,
-                                    is_gnu_inline_def: false,
-                                    loop_promoted_f64_values: Vec::new(),
-                                };
-                                dummy
-                            },
-                            site_cnt,
-                            Some(profile),
-                        ) {
-                            if force {
-                                let mut s2 = site;
-                                s2.pgo_force = true;
-                                filtered.push(s2);
-                                continue;
-                            } else {
-                                continue;
-                            } // deny
-                        }
-                        // Also check threshold multiplier
-                        let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
-                            &caller_name,
-                            callee_name,
-                            profile,
-                        );
-                        if mult < 0.4 {
-                            // Cold: skip unless tiny
-                            let inst_count: usize =
-                                callee.blocks.iter().map(|b| b.instructions.len()).sum();
-                            if inst_count > 5 {
-                                continue;
+                    let caller_name = module.functions[func_idx].name.clone();
+                    // Per-call-site hotness. Derive block counts for the
+                    // CURRENT caller CFG from the h0-keyed profile (the CFG may
+                    // have changed since training; derive handles drift
+                    // gracefully) so the decision sees the count of the block
+                    // containing each call (LLVM isHotCallSite/BFI).
+                    let caller_fn = &module.functions[func_idx];
+                    let mut caller_fp = crate::pgo::prepass_profile(&caller_name);
+                    if let Some(fp) = caller_fp.as_mut() {
+                        crate::pgo::profile::derive_block_counts(caller_fn, fp);
+                    }
+                    // For each call site, check if PGO says to force inline or deny
+                    let mut filtered = Vec::with_capacity(16);
+                    for site in call_sites {
+                        if let Some(callee) = callee_map.get(&site.callee_name) {
+                            // Get callee name
+                            let callee_name = &site.callee_name;
+                            let site_cnt = caller_fp
+                                .as_ref()
+                                .map(|fp| {
+                                    let lbl =
+                                        module.functions[func_idx].blocks[site.block_idx].label;
+                                    fp.block_count(lbl)
+                                })
+                                .unwrap_or(0);
+                            // Check PGO inline decision
+                            if let Some(force) = crate::pgo::inline_pgo::should_inline_site(
+                                &module.functions[func_idx],
+                                &{
+                                    // Reconstruct IrFunction for callee from callee_map data
+                                    // callee_map stores blocks, we need to create a dummy IrFunction
+                                    let mut dummy = crate::ir::reexports::IrFunction {
+                                        name: callee_name.clone(),
+                                        return_type: crate::common::types::IrType::I32,
+                                        params: vec![],
+                                        blocks: callee.blocks.clone(),
+                                        is_variadic: false,
+                                        is_declaration: false,
+                                        is_static: false,
+                                        is_inline: false,
+                                        is_always_inline: false,
+                                        is_noinline: false,
+                                        next_value_id: 0,
+                                        next_label: 0,
+                                        section: None,
+                                        visibility: None,
+                                        is_weak: false,
+                                        is_used: false,
+                                        has_inlined_calls: false,
+                                        param_alloca_values: vec![],
+                                        uses_sret: false,
+                                        is_fastcall: false,
+                                        is_naked: false,
+                                        global_init_label_blocks: vec![],
+                                        ret_eightbyte_classes: vec![],
+                                        ret_is_f128_sse: false,
+                                        is_gnu_inline_def: false,
+                                        loop_promoted_f64_values: Vec::new(),
+                                    };
+                                    dummy
+                                },
+                                site_cnt,
+                                Some(profile),
+                            ) {
+                                if force {
+                                    let mut s2 = site;
+                                    s2.pgo_force = true;
+                                    filtered.push(s2);
+                                    continue;
+                                } else {
+                                    continue;
+                                } // deny
+                            }
+                            // Also check threshold multiplier
+                            let mult = crate::pgo::inline_pgo::inline_threshold_multiplier(
+                                &caller_name,
+                                callee_name,
+                                profile,
+                            );
+                            if mult < 0.4 {
+                                // Cold: skip unless tiny
+                                let inst_count: usize =
+                                    callee.blocks.iter().map(|b| b.instructions.len()).sum();
+                                if inst_count > 5 {
+                                    continue;
+                                }
                             }
                         }
+                        filtered.push(site);
                     }
-                    filtered.push(site);
-                }
-                call_sites = filtered;
+                    call_sites = filtered;
                 } // end inline_decisions_active
             }
             if call_sites.is_empty() {
@@ -1630,7 +1637,9 @@ fn fits_normal_inline_limits(
 ) -> bool {
     let inst_ok = inst_count <= MAX_INLINE_INSTRUCTIONS
         || (is_static && !is_inline && inst_count <= MAX_MEDIUM_STATIC_INLINE_INSTRUCTIONS)
-        || (is_static && is_inline && has_vector_intrinsics
+        || (is_static
+            && is_inline
+            && has_vector_intrinsics
             && inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS);
     let block_ok = if is_static && is_inline && has_vector_intrinsics {
         block_count <= MAX_VECTOR_STATIC_INLINE_BLOCKS
@@ -1755,7 +1764,10 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
     for f in &module.functions {
         for block in &f.blocks {
             for inst in &block.instructions {
-                if let Instruction::Call { func: callee_name, .. } = inst {
+                if let Instruction::Call {
+                    func: callee_name, ..
+                } = inst
+                {
                     *call_site_counts.entry(callee_name.clone()).or_insert(0) += 1;
                 }
             }
@@ -1883,8 +1895,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // value anywhere (function-pointer table, alias, constructor, asm
         // template or "i"-constraint symbol); otherwise the outlined body
         // survives and the exemption must not apply.
-        let has_single_call_site =
-            call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
+        let has_single_call_site = call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
         let survives_via_reference = has_single_call_site
             && function_referenced_as_value(&func.name, &value_referenced, &asm_templates);
         let fits_single_call_site_static = func.is_static
@@ -1975,8 +1986,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // Single-call-site statics were already size-checked above against
         // their own limits; treat them as fitting normal limits so they are
         // inlinable into ordinary callers (not just section-attributed ones).
-        let exceeds_normal =
-            !is_always_inline && !fits_normal && !fits_single_call_site_static;
+        let exceeds_normal = !is_always_inline && !fits_normal && !fits_single_call_site_static;
         if is_always_inline {
             if !fits_relaxed {
                 continue;
@@ -2117,8 +2127,7 @@ fn is_mandatory_first_pass_callee(data: &CalleeData) -> bool {
     };
     let is_static_inline_eligible = data.is_static_inline
         && (inst_count <= MAX_INLINE_INSTRUCTIONS
-            || (data.has_vector_intrinsics
-                && inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS))
+            || (data.has_vector_intrinsics && inst_count <= MAX_VECTOR_STATIC_INLINE_INSTRUCTIONS))
         && data.blocks.len()
             <= if data.has_vector_intrinsics {
                 MAX_VECTOR_STATIC_INLINE_BLOCKS
@@ -2183,13 +2192,19 @@ fn func_has_vector_intrinsics(func: &IrFunction) -> bool {
                     || name.ends_with("128")
                     || name.starts_with("VecLoad")
                     || name.starts_with("Loaddqu")
-                    || matches!(op,
-                        IntrinsicOp::Loadu256 | IntrinsicOp::Load256
-                        | IntrinsicOp::Storeu256 | IntrinsicOp::Store256
-                        | IntrinsicOp::Pmovmskb256
-                        | IntrinsicOp::Broadcast128to256 | IntrinsicOp::Zext128to256
-                        | IntrinsicOp::Cast256to128 | IntrinsicOp::Insert128to256
-                        | IntrinsicOp::Pmovmskb128)
+                    || matches!(
+                        op,
+                        IntrinsicOp::Loadu256
+                            | IntrinsicOp::Load256
+                            | IntrinsicOp::Storeu256
+                            | IntrinsicOp::Store256
+                            | IntrinsicOp::Pmovmskb256
+                            | IntrinsicOp::Broadcast128to256
+                            | IntrinsicOp::Zext128to256
+                            | IntrinsicOp::Cast256to128
+                            | IntrinsicOp::Insert128to256
+                            | IntrinsicOp::Pmovmskb128
+                    )
             } else {
                 false
             }
@@ -2252,13 +2267,15 @@ fn find_inline_call_sites(
 /// parameters the inliner can replace every `Load(home)` with the call
 /// argument directly, eliminating the store-into-alloca + load round-trip from
 /// inlined code (smaller, faster, and immune to memory-forwarding interactions).
-fn param_substitutable(
-    callee: &CalleeData,
-    param_idx: usize,
-    home: Value,
-) -> bool {
+fn param_substitutable(callee: &CalleeData, param_idx: usize, home: Value) -> bool {
     // Struct-by-value parameters use the memcpy path; never substitute.
-    if callee.param_struct_sizes.get(param_idx).copied().flatten().is_some() {
+    if callee
+        .param_struct_sizes
+        .get(param_idx)
+        .copied()
+        .flatten()
+        .is_some()
+    {
         return false;
     }
     let mut home_volatile = false;
@@ -2266,10 +2283,18 @@ fn param_substitutable(
     for block in &callee.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Alloca { dest, volatile: true, .. } if *dest == home => {
+                Instruction::Alloca {
+                    dest,
+                    volatile: true,
+                    ..
+                } if *dest == home => {
                     home_volatile = true;
                 }
-                Instruction::ParamRef { dest, param_idx: pi, .. } if *pi == param_idx => {
+                Instruction::ParamRef {
+                    dest,
+                    param_idx: pi,
+                    ..
+                } if *pi == param_idx => {
                     paramref_dest = Some(*dest);
                 }
                 _ => {}
@@ -2297,7 +2322,8 @@ fn param_substitutable(
                 // The initial ParamRef store is the one the inliner removes.
                 Instruction::Store { val, ptr, .. } => {
                     if *ptr == home {
-                        let is_initial = matches!(val, Operand::Value(v) if Some(*v) == paramref_dest);
+                        let is_initial =
+                            matches!(val, Operand::Value(v) if Some(*v) == paramref_dest);
                         if !is_initial {
                             return false; // modified after init
                         }
@@ -2320,7 +2346,6 @@ fn param_substitutable(
     }
     true
 }
-
 
 /// IR type of a caller-side operand; needed to substitute call args at the
 /// parameter width (a raw Copy at the arg's own width would corrupt
@@ -2457,7 +2482,12 @@ fn inline_call_site(
         crate::common::fx_hash::FxHashSet::default();
     for block in &inlined_blocks {
         for inst in &block.instructions {
-            if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+            if let Instruction::ParamRef {
+                dest,
+                param_idx,
+                ty,
+            } = inst
+            {
                 paramref_records.push((*dest, *param_idx, *ty));
                 paramref_params.insert(*param_idx);
             }
@@ -2469,7 +2499,11 @@ fn inline_call_site(
     // CCC_SSA_PARAM_SKIP=callee1,callee2 disables substitution for named
     // callees; CCC_SSA_PARAM_LOG=1 traces substitutions (diagnostics).
     let ssa_skip: crate::common::fx_hash::FxHashSet<String> = std::env::var("CCC_SSA_PARAM_SKIP")
-        .unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
     let ssa_log = std::env::var("CCC_SSA_PARAM_LOG").is_ok();
     let substitutable: Vec<bool> = (0..param_alloca_info.len())
         .map(|i| {
@@ -2563,7 +2597,8 @@ fn inline_call_site(
                 let store_ty = param_alloca_info[i].1;
                 entry_block.instructions.insert(
                     insert_pos,
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: site.args[i],
                         ptr: param_alloca_info[i].0,
                         ty: store_ty,
@@ -2603,7 +2638,8 @@ fn inline_call_site(
                 paramref_next_value += 1;
                 entry_block.instructions.insert(
                     materialize_pos,
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: v,
                         ptr: home,
                         ty: home_ty,
@@ -2651,10 +2687,7 @@ fn inline_call_site(
             if paramref_debug {
                 eprintln!(
                     "[INLINE_PARAMREF] {} param{} remapped v{} -> {:?}",
-                    site.callee_name,
-                    param_idx,
-                    paramref_dest.0,
-                    replacement
+                    site.callee_name, param_idx, paramref_dest.0, replacement
                 );
             }
             paramref_subst.insert(paramref_dest.0, replacement);
@@ -2676,7 +2709,8 @@ fn inline_call_site(
         let old_spans = std::mem::take(&mut block.source_spans);
         let mut new_insts = Vec::with_capacity(block.instructions.len());
         let mut new_spans = Vec::with_capacity(16);
-        let mut paramref_dests: crate::common::fx_hash::FxHashSet<u32> = crate::common::fx_hash::FxHashSet::default();
+        let mut paramref_dests: crate::common::fx_hash::FxHashSet<u32> =
+            crate::common::fx_hash::FxHashSet::default();
         for (idx, inst) in block.instructions.drain(..).enumerate() {
             if let Instruction::ParamRef { dest, .. } = &inst {
                 paramref_dests.insert(dest.0);
@@ -2705,7 +2739,10 @@ fn inline_call_site(
             if let Instruction::Load { dest, ptr, ty, .. } = &inst {
                 if let Some(&(arg, at)) = home_subst.get(&ptr.0) {
                     if at == *ty {
-                        new_insts.push(Instruction::Copy { dest: *dest, src: arg });
+                        new_insts.push(Instruction::Copy {
+                            dest: *dest,
+                            src: arg,
+                        });
                     } else {
                         new_insts.push(Instruction::Cast {
                             dest: *dest,
@@ -2749,9 +2786,7 @@ fn inline_call_site(
                         if paramref_debug {
                             eprintln!(
                                 "[INLINE_PARAMREF] {} direct v{} -> v{}",
-                                site.callee_name,
-                                value.0,
-                                replacement.0
+                                site.callee_name, value.0, replacement.0
                             );
                         }
                         *value = *replacement;
@@ -2884,10 +2919,7 @@ fn inline_call_site(
     }
 
     // Update caller's next_value_id to account for the new values
-    let new_next_value_id = std::cmp::max(
-        value_offset + callee.next_value_id,
-        paramref_next_value,
-    );
+    let new_next_value_id = std::cmp::max(value_offset + callee.next_value_id, paramref_next_value);
     caller.next_value_id = std::cmp::max(new_next_value_id, caller.next_value_id);
     if debug_inline_detail {
         eprintln!(
@@ -2958,7 +2990,11 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
 /// Remap all values and block references in an instruction.
 fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
     match inst {
-        Instruction::PgoCounterInc { name, offset, atomic } => Instruction::PgoCounterInc {
+        Instruction::PgoCounterInc {
+            name,
+            offset,
+            atomic,
+        } => Instruction::PgoCounterInc {
             name: name.clone(),
             offset: *offset,
             atomic: *atomic,
@@ -3519,7 +3555,6 @@ fn format_terminator(term: &Terminator) -> String {
         Terminator::Unreachable => "unreachable".to_string(),
     }
 }
-
 
 #[cfg(test)]
 mod inline_limit_tests {

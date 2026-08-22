@@ -106,21 +106,44 @@ impl SymStr {
         if b.len() <= INLINE_CAP {
             let mut bytes = [0u8; INLINE_CAP];
             bytes[..b.len()].copy_from_slice(b);
-            SymStr { data: SymData { inline: InlineRepr { bytes, tag: b.len() as u8 } } }
+            SymStr {
+                data: SymData {
+                    inline: InlineRepr {
+                        bytes,
+                        tag: b.len() as u8,
+                    },
+                },
+            }
         } else {
             let boxed: Box<str> = s.into();
             let len = boxed.len();
             let raw = Box::into_raw(boxed) as *mut u8;
             // SAFETY: `Box::into_raw` never returns null.
             let ptr = unsafe { std::ptr::NonNull::new_unchecked(raw) };
-            SymStr { data: SymData { heap: HeapRepr { ptr, len, _pad: [0; 7], tag: HEAP_TAG } } }
+            SymStr {
+                data: SymData {
+                    heap: HeapRepr {
+                        ptr,
+                        len,
+                        _pad: [0; 7],
+                        tag: HEAP_TAG,
+                    },
+                },
+            }
         }
     }
 
     /// The empty name. `const` so it can initialise statics cheaply.
     #[inline]
     pub const fn empty() -> Self {
-        SymStr { data: SymData { inline: InlineRepr { bytes: [0u8; INLINE_CAP], tag: 0 } } }
+        SymStr {
+            data: SymData {
+                inline: InlineRepr {
+                    bytes: [0u8; INLINE_CAP],
+                    tag: 0,
+                },
+            },
+        }
     }
 
     /// Read the discriminant. Always legal: byte 23 is initialised in both
@@ -236,41 +259,57 @@ impl Deref for SymStr {
 
 impl AsRef<str> for SymStr {
     #[inline]
-    fn as_ref(&self) -> &str { self.as_str() }
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
 }
 
 /// Lets `FxHashMap<SymStr, _>` be probed with a plain `&str`, which keeps every
 /// existing `map.get(name_str)` call site working unchanged.
 impl Borrow<str> for SymStr {
     #[inline]
-    fn borrow(&self) -> &str { self.as_str() }
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
 }
 
 impl PartialEq for SymStr {
     #[inline]
-    fn eq(&self, other: &Self) -> bool { self.as_str() == other.as_str() }
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
 }
 impl Eq for SymStr {}
 
 impl PartialEq<str> for SymStr {
     #[inline]
-    fn eq(&self, other: &str) -> bool { self.as_str() == other }
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
 }
 impl PartialEq<&str> for SymStr {
     #[inline]
-    fn eq(&self, other: &&str) -> bool { self.as_str() == *other }
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
 }
 impl PartialEq<String> for SymStr {
     #[inline]
-    fn eq(&self, other: &String) -> bool { self.as_str() == other.as_str() }
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
 }
 impl PartialEq<SymStr> for str {
     #[inline]
-    fn eq(&self, other: &SymStr) -> bool { self == other.as_str() }
+    fn eq(&self, other: &SymStr) -> bool {
+        self == other.as_str()
+    }
 }
 impl PartialEq<SymStr> for String {
     #[inline]
-    fn eq(&self, other: &SymStr) -> bool { self.as_str() == other.as_str() }
+    fn eq(&self, other: &SymStr) -> bool {
+        self.as_str() == other.as_str()
+    }
 }
 
 impl PartialOrd for SymStr {
@@ -307,15 +346,21 @@ impl fmt::Display for SymStr {
 
 impl From<&str> for SymStr {
     #[inline]
-    fn from(s: &str) -> Self { SymStr::new(s) }
+    fn from(s: &str) -> Self {
+        SymStr::new(s)
+    }
 }
 impl From<String> for SymStr {
     #[inline]
-    fn from(s: String) -> Self { SymStr::new(&s) }
+    fn from(s: String) -> Self {
+        SymStr::new(&s)
+    }
 }
 impl From<&SymStr> for String {
     #[inline]
-    fn from(s: &SymStr) -> String { s.as_str().to_owned() }
+    fn from(s: &SymStr) -> String {
+        s.as_str().to_owned()
+    }
 }
 
 // SAFETY: `SymStr` owns its data exclusively (inline bytes or a uniquely-owned
@@ -369,7 +414,10 @@ mod tests {
         assert!(SymStr::new(&"x".repeat(INLINE_CAP)).is_inline());
         assert!(!SymStr::new(&"x".repeat(INLINE_CAP + 1)).is_inline());
         assert_eq!(SymStr::new(&"x".repeat(INLINE_CAP)).len(), INLINE_CAP);
-        assert_eq!(SymStr::new(&"x".repeat(INLINE_CAP + 1)).len(), INLINE_CAP + 1);
+        assert_eq!(
+            SymStr::new(&"x".repeat(INLINE_CAP + 1)).len(),
+            INLINE_CAP + 1
+        );
     }
 
     /// `Borrow<str>` is only sound if the hashes agree; a mismatch would make
@@ -377,10 +425,17 @@ mod tests {
     /// as mysterious "undefined symbol" errors rather than a crash.
     #[test]
     fn hashes_like_str_in_both_storage_classes() {
-        for s in ["", "main", "g_sym_19999",
-                  "a_very_long_mangled_symbol_name_that_will_not_fit_inline"] {
-            assert_eq!(hash_of(&SymStr::new(s)), hash_of(&s),
-                       "hash mismatch for {s:?}");
+        for s in [
+            "",
+            "main",
+            "g_sym_19999",
+            "a_very_long_mangled_symbol_name_that_will_not_fit_inline",
+        ] {
+            assert_eq!(
+                hash_of(&SymStr::new(s)),
+                hash_of(&s),
+                "hash mismatch for {s:?}"
+            );
         }
     }
 
@@ -389,19 +444,39 @@ mod tests {
         use crate::common::fx_hash::FxHashMap;
         let mut m: FxHashMap<SymStr, u32> = FxHashMap::default();
         m.insert(SymStr::new("short"), 1);
-        m.insert(SymStr::new("a_long_symbol_name_exceeding_the_inline_capacity"), 2);
+        m.insert(
+            SymStr::new("a_long_symbol_name_exceeding_the_inline_capacity"),
+            2,
+        );
         assert_eq!(m.get("short"), Some(&1));
-        assert_eq!(m.get("a_long_symbol_name_exceeding_the_inline_capacity"), Some(&2));
+        assert_eq!(
+            m.get("a_long_symbol_name_exceeding_the_inline_capacity"),
+            Some(&2)
+        );
         assert_eq!(m.get("absent"), None);
     }
 
     #[test]
     fn ordering_matches_str() {
-        let mut v: Vec<SymStr> = ["b", "a", "aa", "", "z_long_name_over_the_inline_limit_xxxxxxxx"]
-            .iter().map(|s| SymStr::new(s)).collect();
+        let mut v: Vec<SymStr> = [
+            "b",
+            "a",
+            "aa",
+            "",
+            "z_long_name_over_the_inline_limit_xxxxxxxx",
+        ]
+        .iter()
+        .map(|s| SymStr::new(s))
+        .collect();
         v.sort();
         let got: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
-        let mut want = ["b", "a", "aa", "", "z_long_name_over_the_inline_limit_xxxxxxxx"];
+        let mut want = [
+            "b",
+            "a",
+            "aa",
+            "",
+            "z_long_name_over_the_inline_limit_xxxxxxxx",
+        ];
         want.sort();
         assert_eq!(got, want);
     }
@@ -436,10 +511,13 @@ mod tests {
             let src: String = "s".repeat(n);
             let got = SymStr::new(&src).to_string();
             assert_eq!(got, src, "len {n} content");
-            assert_eq!(got.capacity(), n,
-                       "len {n}: capacity {} != len {n}; to_string() regressed to \
+            assert_eq!(
+                got.capacity(),
+                n,
+                "len {n}: capacity {} != len {n}; to_string() regressed to \
                         the Display-based blanket impl and is growing the buffer",
-                       got.capacity());
+                got.capacity()
+            );
         }
     }
 

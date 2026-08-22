@@ -19,18 +19,18 @@
 //! - `emit` - Phase 10: executable layout and ELF32 emission
 //! - `link` - Orchestration: `link_builtin` and `link_shared` entry points
 
-#[allow(dead_code)] // ELF constants defined for completeness; not all used yet
-mod types;
-mod parse;
 mod dynsym;
-mod reloc;
+mod emit;
 mod gnu_hash;
 mod input;
-mod sections;
-mod symbols;
-mod shared;
-mod emit;
 mod link;
+mod parse;
+mod reloc;
+mod sections;
+mod shared;
+mod symbols;
+#[allow(dead_code)] // ELF constants defined for completeness; not all used yet
+mod types;
 
 use crate::backend::linker_common;
 
@@ -40,10 +40,18 @@ use crate::backend::linker_common;
 struct DynStrTab(linker_common::DynStrTab);
 
 impl DynStrTab {
-    fn new() -> Self { Self(linker_common::DynStrTab::new()) }
-    fn add(&mut self, s: &str) -> u32 { self.0.add(s) as u32 }
-    fn get_offset(&self, s: &str) -> u32 { self.0.get_offset(s) as u32 }
-    fn as_bytes(&self) -> &[u8] { self.0.as_bytes() }
+    fn new() -> Self {
+        Self(linker_common::DynStrTab::new())
+    }
+    fn add(&mut self, s: &str) -> u32 {
+        self.0.add(s) as u32
+    }
+    fn get_offset(&self, s: &str) -> u32 {
+        self.0.get_offset(s) as u32
+    }
+    fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -67,22 +75,27 @@ pub fn load_inputs_for_script(
     let mut direct: Vec<InputObject> = Vec::new();
     let mut archive_pool: Vec<InputObject> = Vec::new();
     for (path, whole_archive) in input_paths {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("cannot read {}: {}", path, e))?;
+        let data = std::fs::read(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
         if data.len() >= 8 && &data[..8] == b"!<arch>\n" {
             for (name, member) in parse_archive(&data, path)? {
                 let source = format!("{}({})", path, name);
                 if let Ok(object) = parse_elf32(&member, &source) {
-                    if *whole_archive { direct.push(object); }
-                    else { archive_pool.push(object); }
+                    if *whole_archive {
+                        direct.push(object);
+                    } else {
+                        archive_pool.push(object);
+                    }
                 }
             }
         } else if crate::backend::elf::is_thin_archive(&data) {
             for (name, member) in parse_thin_archive_i686(&data, path)? {
                 let source = format!("{}({})", path, name);
                 if let Ok(object) = parse_elf32(&member, &source) {
-                    if *whole_archive { direct.push(object); }
-                    else { archive_pool.push(object); }
+                    if *whole_archive {
+                        direct.push(object);
+                    } else {
+                        archive_pool.push(object);
+                    }
                 }
             }
         } else {
@@ -91,54 +104,71 @@ pub fn load_inputs_for_script(
     }
     input::resolve_archive_members(&mut direct, &mut archive_pool, &[]);
 
-    Ok(direct.into_iter().map(|object| {
-        let InputObject { sections, symbols, filename } = object;
-        let mut out_sections = Vec::with_capacity(sections.len());
-        let mut section_data = Vec::with_capacity(sections.len());
-        let mut relocations = Vec::with_capacity(sections.len());
-        for section in sections {
-            let size = section.data.len() as u64;
-            out_sections.push(linker_common::Elf64Section {
-                name_idx: 0,
-                name: section.name,
-                sh_type: section.sh_type,
-                flags: section.flags as u64,
-                addr: 0,
-                offset: 0,
-                size,
-                link: section.link,
-                info: section.info,
-                addralign: section.align as u64,
-                entsize: section.entsize as u64,
-            });
-            if section.sh_type == SHT_NOBITS || section.data.is_empty() {
-                section_data.push(linker_common::SectionData::empty());
-            } else {
-                section_data.push(linker_common::SectionData::owned(section.data));
+    Ok(direct
+        .into_iter()
+        .map(|object| {
+            let InputObject {
+                sections,
+                symbols,
+                filename,
+            } = object;
+            let mut out_sections = Vec::with_capacity(sections.len());
+            let mut section_data = Vec::with_capacity(sections.len());
+            let mut relocations = Vec::with_capacity(sections.len());
+            for section in sections {
+                let size = section.data.len() as u64;
+                out_sections.push(linker_common::Elf64Section {
+                    name_idx: 0,
+                    name: section.name,
+                    sh_type: section.sh_type,
+                    flags: section.flags as u64,
+                    addr: 0,
+                    offset: 0,
+                    size,
+                    link: section.link,
+                    info: section.info,
+                    addralign: section.align as u64,
+                    entsize: section.entsize as u64,
+                });
+                if section.sh_type == SHT_NOBITS || section.data.is_empty() {
+                    section_data.push(linker_common::SectionData::empty());
+                } else {
+                    section_data.push(linker_common::SectionData::owned(section.data));
+                }
+                relocations.push(
+                    section
+                        .relocations
+                        .into_iter()
+                        .map(
+                            |(offset, rela_type, sym_idx, addend)| linker_common::Elf64Rela {
+                                offset: offset as u64,
+                                sym_idx,
+                                rela_type,
+                                addend: addend as i64,
+                            },
+                        )
+                        .collect(),
+                );
             }
-            relocations.push(section.relocations.into_iter().map(
-                |(offset, rela_type, sym_idx, addend)| linker_common::Elf64Rela {
-                    offset: offset as u64,
-                    sym_idx,
-                    rela_type,
-                    addend: addend as i64,
-                }).collect());
-        }
-        let symbols = symbols.into_iter().map(|symbol| linker_common::Elf64Symbol {
-            name_idx: 0,
-            name: linker_common::SymStr::new(&symbol.name),
-            info: (symbol.binding << 4) | symbol.sym_type,
-            other: symbol.visibility,
-            shndx: symbol.section_index,
-            value: symbol.value as u64,
-            size: symbol.size as u64,
-        }).collect();
-        linker_common::Elf64Object {
-            sections: out_sections,
-            symbols,
-            section_data,
-            relocations,
-            source_name: filename,
-        }
-    }).collect())
+            let symbols = symbols
+                .into_iter()
+                .map(|symbol| linker_common::Elf64Symbol {
+                    name_idx: 0,
+                    name: linker_common::SymStr::new(&symbol.name),
+                    info: (symbol.binding << 4) | symbol.sym_type,
+                    other: symbol.visibility,
+                    shndx: symbol.section_index,
+                    value: symbol.value as u64,
+                    size: symbol.size as u64,
+                })
+                .collect();
+            linker_common::Elf64Object {
+                sections: out_sections,
+                symbols,
+                section_data,
+                relocations,
+                source_name: filename,
+            }
+        })
+        .collect())
 }

@@ -4,18 +4,11 @@
 //! extracted from expr_types.rs for maintainability. Includes sizeof_expr, alignof_expr,
 //! preferred_alignof_expr, and their helper functions.
 
-use crate::frontend::parser::ast::{
-    BinOp,
-    Expr,
-    Initializer,
-    TypeSpecifier,
-    UnaryOp,
-};
-use crate::common::types::{CType, IrType};
 use super::lower::Lowerer;
+use crate::common::types::{CType, IrType};
+use crate::frontend::parser::ast::{BinOp, Expr, Initializer, TypeSpecifier, UnaryOp};
 
 impl Lowerer {
-
     /// Get the sizeof for an identifier expression.
     fn sizeof_identifier(&self, name: &str) -> usize {
         if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
@@ -147,12 +140,15 @@ impl Lowerer {
         }
         // Fallback for member access bases (e.g., p->c[0] or x.arr[0])
         match base {
-            Expr::MemberAccess(base_expr, field_name, _) | Expr::PointerMemberAccess(base_expr, field_name, _) => {
+            Expr::MemberAccess(base_expr, field_name, _)
+            | Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 let is_ptr = matches!(base, Expr::PointerMemberAccess(..));
                 if let Some(ctype) = self.resolve_field_ctype(base_expr, field_name, is_ptr) {
                     match &ctype {
                         CType::Array(elem_ty, _) => return self.resolve_ctype_size(elem_ty).max(1),
-                        CType::Pointer(pointee, _) => return self.resolve_ctype_size(pointee).max(1),
+                        CType::Pointer(pointee, _) => {
+                            return self.resolve_ctype_size(pointee).max(1)
+                        }
                         _ => {}
                     }
                 }
@@ -184,15 +180,28 @@ impl Lowerer {
     fn sizeof_binop(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> usize {
         match op {
             // Comparison/logical: result is int
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le
-            | BinOp::Gt | BinOp::Ge | BinOp::LogicalAnd | BinOp::LogicalOr => 4,
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::LogicalAnd
+            | BinOp::LogicalOr => 4,
             // Pointer subtraction: result is ptrdiff_t
-            BinOp::Sub if self.sizeof_operand_is_pointer_like(lhs)
-                && self.sizeof_operand_is_pointer_like(rhs) => crate::common::types::target_ptr_size(),
+            BinOp::Sub
+                if self.sizeof_operand_is_pointer_like(lhs)
+                    && self.sizeof_operand_is_pointer_like(rhs) =>
+            {
+                crate::common::types::target_ptr_size()
+            }
             // Pointer arithmetic (ptr + int, int + ptr, ptr - int): result is pointer
             BinOp::Add | BinOp::Sub
                 if self.sizeof_operand_is_pointer_like(lhs)
-                || self.sizeof_operand_is_pointer_like(rhs) => crate::common::types::target_ptr_size(),
+                    || self.sizeof_operand_is_pointer_like(rhs) =>
+            {
+                crate::common::types::target_ptr_size()
+            }
             // Shift operators: result type is promoted left operand
             BinOp::Shl | BinOp::Shr => {
                 self.sizeof_expr(lhs).max(4) // integer promotion of left operand only
@@ -242,7 +251,11 @@ impl Lowerer {
             // Long literal: on ILP32, long is 4 bytes unless value overflows to long long (8 bytes)
             Expr::LongLiteral(val, _) => {
                 if crate::common::types::target_is_32bit() {
-                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { 4 } else { 8 }
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        4
+                    } else {
+                        8
+                    }
                 } else {
                     8 // LP64: long is always 8 bytes
                 }
@@ -250,7 +263,11 @@ impl Lowerer {
             // Unsigned long literal: on ILP32, unsigned long is 4 bytes unless value overflows
             Expr::ULongLiteral(val, _) => {
                 if crate::common::types::target_is_32bit() {
-                    if *val <= u32::MAX as u64 { 4 } else { 8 }
+                    if *val <= u32::MAX as u64 {
+                        4
+                    } else {
+                        8
+                    }
                 } else {
                     8 // LP64: unsigned long is always 8 bytes
                 }
@@ -262,7 +279,13 @@ impl Lowerer {
             // Float literal with f suffix: type float (4 bytes)
             Expr::FloatLiteralF32(_, _) => 4,
             // Float literal with L suffix: type long double (16 on LP64, 12 on ILP32)
-            Expr::FloatLiteralLongDouble(_, _, _) => if crate::common::types::target_is_32bit() { 12 } else { 16 },
+            Expr::FloatLiteralLongDouble(_, _, _) => {
+                if crate::common::types::target_is_32bit() {
+                    12
+                } else {
+                    16
+                }
+            }
             // Char literal: type int in C (4 bytes)
             Expr::CharLiteral(_, _) => 4,
             // String literal: array of char, size = length + 1 (null terminator)
@@ -273,28 +296,23 @@ impl Lowerer {
             Expr::Char16StringLiteral(s, _) => (s.chars().count() + 1) * 2,
 
             // Variable: look up its alloc_size or type
-            Expr::Identifier(name, _) => {
-                self.sizeof_identifier(name)
-            }
+            Expr::Identifier(name, _) => self.sizeof_identifier(name),
 
             // Dereference: element type size
-            Expr::Deref(inner, _) => {
-                self.sizeof_deref(inner)
-            }
+            Expr::Deref(inner, _) => self.sizeof_deref(inner),
 
             // Array subscript: element type size
-            Expr::ArraySubscript(base, index, _) => {
-                self.sizeof_subscript(base, index)
-            }
+            Expr::ArraySubscript(base, index, _) => self.sizeof_subscript(base, index),
 
             // sizeof(sizeof(...)) or sizeof(_Alignof(...)) -> size_t
-            Expr::Sizeof(_, _) | Expr::Alignof(_, _) | Expr::AlignofExpr(_, _)
-            | Expr::GnuAlignof(_, _) | Expr::GnuAlignofExpr(_, _) => crate::common::types::target_ptr_size(),
+            Expr::Sizeof(_, _)
+            | Expr::Alignof(_, _)
+            | Expr::AlignofExpr(_, _)
+            | Expr::GnuAlignof(_, _)
+            | Expr::GnuAlignofExpr(_, _) => crate::common::types::target_ptr_size(),
 
             // Cast: size of the target type
-            Expr::Cast(target_type, _, _) => {
-                self.sizeof_type(target_type)
-            }
+            Expr::Cast(target_type, _, _) => self.sizeof_type(target_type),
 
             // Member access: member field size (use CType for accurate array/struct sizes)
             Expr::MemberAccess(base_expr, field_name, _) => {
@@ -327,9 +345,7 @@ impl Lowerer {
             Expr::PostfixOp(_, inner, _) => self.sizeof_expr(inner),
 
             // Binary operations
-            Expr::BinaryOp(op, lhs, rhs, _) => {
-                self.sizeof_binop(op, lhs, rhs)
-            }
+            Expr::BinaryOp(op, lhs, rhs, _) => self.sizeof_binop(op, lhs, rhs),
 
             // Conditional: use composite type for accurate sizeof
             Expr::Conditional(_, then_e, else_e, _) => {
@@ -350,14 +366,10 @@ impl Lowerer {
             }
 
             // Assignment: type of the left-hand side
-            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
-                self.sizeof_expr(lhs)
-            }
+            Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.sizeof_expr(lhs),
 
             // Comma: type of the right expression
-            Expr::Comma(_, rhs, _) => {
-                self.sizeof_expr(rhs)
-            }
+            Expr::Comma(_, rhs, _) => self.sizeof_expr(rhs),
 
             // Function call: use the actual return type
             Expr::FunctionCall(_, _, _) => {
@@ -394,18 +406,15 @@ impl Lowerer {
                     (CType::Array(ref elem_ct, None), Initializer::Expr(init_expr)) => {
                         let elem_size = self.ctype_size(elem_ct).max(1);
                         match (elem_ct.as_ref(), init_expr) {
-                            (
-                                CType::Char | CType::UChar,
-                                Expr::StringLiteral(s, _),
-                            ) => elem_size * (s.chars().count() + 1),
-                            (
-                                CType::Int | CType::UInt,
-                                Expr::WideStringLiteral(s, _),
-                            ) => elem_size * (s.chars().count() + 1),
-                            (
-                                CType::Short | CType::UShort,
-                                Expr::Char16StringLiteral(s, _),
-                            ) => elem_size * (s.chars().count() + 1),
+                            (CType::Char | CType::UChar, Expr::StringLiteral(s, _)) => {
+                                elem_size * (s.chars().count() + 1)
+                            }
+                            (CType::Int | CType::UInt, Expr::WideStringLiteral(s, _)) => {
+                                elem_size * (s.chars().count() + 1)
+                            }
+                            (CType::Short | CType::UShort, Expr::Char16StringLiteral(s, _)) => {
+                                elem_size * (s.chars().count() + 1)
+                            }
                             _ => self.sizeof_type(ts),
                         }
                     }
@@ -415,7 +424,8 @@ impl Lowerer {
 
             // _Generic selection: resolve the matching association and compute its size
             Expr::GenericSelection(controlling, associations, _) => {
-                if let Some(ctype) = self.resolve_generic_selection_ctype(controlling, associations) {
+                if let Some(ctype) = self.resolve_generic_selection_ctype(controlling, associations)
+                {
                     self.ctype_size(&ctype)
                 } else {
                     // Fallback to IrType-based sizing
@@ -475,7 +485,7 @@ impl Lowerer {
             1 => 1,
             2 => 2,
             4 => 4,
-            16 => 16,  // __int128
+            16 => 16, // __int128
             // On ILP32, 8-byte types (double, long long) are typically aligned to 4
             8 if ptr_sz == 4 => 4,
             _ => ptr_sz,
@@ -513,7 +523,7 @@ impl Lowerer {
             1 => 1,
             2 => 2,
             4 => 4,
-            8 => 8,  // preferred alignment for 8-byte types on i686
+            8 => 8, // preferred alignment for 8-byte types on i686
             16 => 16,
             _ => target_ptr_size(),
         }

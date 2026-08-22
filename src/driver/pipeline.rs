@@ -1542,8 +1542,12 @@ impl Driver {
             if std::env::var("CCC_LOOP_SPLIT").is_ok() {
                 for func in &mut module.functions {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
-                        if n > 0 { did_split = true; }
+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
+                            func, max_splits,
+                        );
+                        if n > 0 {
+                            did_split = true;
+                        }
                     }
                 }
             }
@@ -1556,8 +1560,12 @@ impl Driver {
             if std::env::var("CCC_LOOP_SPLIT").is_ok() {
                 for func in &mut module.functions {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(func, max_splits);
-                        if n > 0 { did_split = true; }
+                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
+                            func, max_splits,
+                        );
+                        if n > 0 {
+                            did_split = true;
+                        }
                     }
                 }
             }
@@ -1636,8 +1644,8 @@ impl Driver {
         // CRITICAL FIX: Renumber all block labels to ensure global uniqueness across all functions
         // This fixes a bug where optimization passes can create duplicate labels
         {
-            use crate::ir::instruction::BlockId;
             use crate::common::fx_hash::FxHashMap;
+            use crate::ir::instruction::BlockId;
             let mut next_global_label = 0u32;
             // The renumber map also translates the promoted-hot block
             // labels recorded by the value-profiling promotion pass (which
@@ -1790,8 +1798,7 @@ impl Driver {
         }
         if std::env::var_os("LCCC_NO_SCHEDULE").is_none()
             && std::env::var_os("LCCC_SCHEDULE").is_some()
-        {
-        }
+        {}
 
         // Debug: dump IR labels before codegen
         if std::env::var("LCCC_DUMP_PRECG").is_ok() {
@@ -1811,7 +1818,9 @@ impl Driver {
         // TEMP: full IR dump
         if std::env::var("LCCC_DUMP_IR").is_ok() {
             for func in &module.functions {
-                if func.is_declaration { continue; }
+                if func.is_declaration {
+                    continue;
+                }
                 eprintln!("=== IR {} ===", func.name);
                 for (bi, b) in func.blocks.iter().enumerate() {
                     eprintln!("  block {} (label {}):", bi, b.label.0);
@@ -1847,7 +1856,11 @@ impl Driver {
             // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
             // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so
             // section alignment keeps following GNU as semantics.
-            function_alignment: if self.opt_level >= 1 && self.opt_level <= 3 { 16 } else { 0 },
+            function_alignment: if self.opt_level >= 1 && self.opt_level <= 3 {
+                16
+            } else {
+                0
+            },
             skip_rax_setup: self.skip_rax_setup,
             no_sse: self.no_sse,
             general_regs_only: self.general_regs_only,

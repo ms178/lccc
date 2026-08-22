@@ -1,8 +1,8 @@
 //! ArmCodegen: return operations.
 
-use crate::ir::reexports::{IrConst, Operand, Value};
-use crate::common::types::IrType;
 use super::emit::ArmCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {

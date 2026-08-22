@@ -10,39 +10,73 @@
 // Each module adds methods to the Parser struct via `impl Parser` blocks.
 // Methods are pub(super) so they can be called across modules within the parser.
 
+use super::ast::*;
 use crate::common::error::DiagnosticEngine;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::{Token, TokenKind};
-use super::ast::*;
 use std::sync::OnceLock;
 
 /// GCC __attribute__((mode(...))) integer mode specifier.
 /// Controls the bit-width of an integer type regardless of the base type keyword.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ModeKind {
-    QI,  // 8-bit (quarter integer)
-    HI,  // 16-bit (half integer)
-    SI,  // 32-bit (single integer)
-    DI,  // 64-bit (double integer)
-    TI,  // 128-bit (tetra integer)
+    QI, // 8-bit (quarter integer)
+    HI, // 16-bit (half integer)
+    SI, // 32-bit (single integer)
+    DI, // 64-bit (double integer)
+    TI, // 128-bit (tetra integer)
 }
 
 impl ModeKind {
     /// Apply mode to a type specifier, preserving signedness.
     pub(super) fn apply(self, ts: TypeSpecifier) -> TypeSpecifier {
-        let is_unsigned = matches!(ts,
-            TypeSpecifier::UnsignedInt | TypeSpecifier::UnsignedLong
-            | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Unsigned
-            | TypeSpecifier::UnsignedChar | TypeSpecifier::UnsignedShort
+        let is_unsigned = matches!(
+            ts,
+            TypeSpecifier::UnsignedInt
+                | TypeSpecifier::UnsignedLong
+                | TypeSpecifier::UnsignedLongLong
+                | TypeSpecifier::Unsigned
+                | TypeSpecifier::UnsignedChar
+                | TypeSpecifier::UnsignedShort
         );
         match self {
-            ModeKind::QI => if is_unsigned { TypeSpecifier::UnsignedChar } else { TypeSpecifier::Char },
-            ModeKind::HI => if is_unsigned { TypeSpecifier::UnsignedShort } else { TypeSpecifier::Short },
-            ModeKind::SI => if is_unsigned { TypeSpecifier::UnsignedInt } else { TypeSpecifier::Int },
-            ModeKind::DI => if is_unsigned { TypeSpecifier::UnsignedLongLong } else { TypeSpecifier::LongLong },
-            ModeKind::TI => if is_unsigned { TypeSpecifier::UnsignedInt128 } else { TypeSpecifier::Int128 },
+            ModeKind::QI => {
+                if is_unsigned {
+                    TypeSpecifier::UnsignedChar
+                } else {
+                    TypeSpecifier::Char
+                }
+            }
+            ModeKind::HI => {
+                if is_unsigned {
+                    TypeSpecifier::UnsignedShort
+                } else {
+                    TypeSpecifier::Short
+                }
+            }
+            ModeKind::SI => {
+                if is_unsigned {
+                    TypeSpecifier::UnsignedInt
+                } else {
+                    TypeSpecifier::Int
+                }
+            }
+            ModeKind::DI => {
+                if is_unsigned {
+                    TypeSpecifier::UnsignedLongLong
+                } else {
+                    TypeSpecifier::LongLong
+                }
+            }
+            ModeKind::TI => {
+                if is_unsigned {
+                    TypeSpecifier::UnsignedInt128
+                } else {
+                    TypeSpecifier::Int128
+                }
+            }
         }
     }
 }
@@ -55,47 +89,47 @@ impl ModeKind {
 pub(super) mod parsed_attr_flag {
     // --- Storage-class specifiers ---
     /// `typedef` keyword encountered.
-    pub const TYPEDEF: u32          = 1 << 0;
+    pub const TYPEDEF: u32 = 1 << 0;
     /// `static` keyword encountered.
-    pub const STATIC: u32           = 1 << 1;
+    pub const STATIC: u32 = 1 << 1;
     /// `extern` keyword encountered.
-    pub const EXTERN: u32           = 1 << 2;
+    pub const EXTERN: u32 = 1 << 2;
     /// `_Thread_local` or `__thread` encountered.
-    pub const THREAD_LOCAL: u32     = 1 << 3;
+    pub const THREAD_LOCAL: u32 = 1 << 3;
     /// `inline` keyword encountered.
-    pub const INLINE: u32           = 1 << 4;
+    pub const INLINE: u32 = 1 << 4;
 
     // --- Type qualifiers ---
     /// `const` qualifier encountered.
-    pub const CONST: u32            = 1 << 5;
+    pub const CONST: u32 = 1 << 5;
     /// `volatile` qualifier encountered.
-    pub const VOLATILE: u32         = 1 << 6;
+    pub const VOLATILE: u32 = 1 << 6;
 
     // --- GCC function attributes ---
     /// `__attribute__((constructor))` encountered.
-    pub const CONSTRUCTOR: u32      = 1 << 7;
+    pub const CONSTRUCTOR: u32 = 1 << 7;
     /// `__attribute__((destructor))` encountered.
-    pub const DESTRUCTOR: u32       = 1 << 8;
+    pub const DESTRUCTOR: u32 = 1 << 8;
     /// `__attribute__((weak))` encountered.
-    pub const WEAK: u32             = 1 << 9;
+    pub const WEAK: u32 = 1 << 9;
     /// `__attribute__((used))` encountered.
-    pub const USED: u32             = 1 << 10;
+    pub const USED: u32 = 1 << 10;
     /// `__attribute__((gnu_inline))` encountered.
-    pub const GNU_INLINE: u32       = 1 << 11;
+    pub const GNU_INLINE: u32 = 1 << 11;
     /// `__attribute__((always_inline))` encountered.
-    pub const ALWAYS_INLINE: u32    = 1 << 12;
+    pub const ALWAYS_INLINE: u32 = 1 << 12;
     /// `__attribute__((noinline))` encountered.
-    pub const NOINLINE: u32         = 1 << 13;
+    pub const NOINLINE: u32 = 1 << 13;
     /// `__attribute__((noreturn))` or `_Noreturn` encountered.
-    pub const NORETURN: u32         = 1 << 14;
+    pub const NORETURN: u32 = 1 << 14;
     /// `__attribute__((error("...")))` encountered.
-    pub const ERROR_ATTR: u32       = 1 << 15;
+    pub const ERROR_ATTR: u32 = 1 << 15;
     /// `__attribute__((transparent_union))` encountered.
     pub const TRANSPARENT_UNION: u32 = 1 << 16;
     /// `__attribute__((fastcall))` encountered (i386 fastcall calling convention).
-    pub const FASTCALL: u32         = 1 << 17;
+    pub const FASTCALL: u32 = 1 << 17;
     /// `__attribute__((naked))` encountered — emit no prologue/epilogue.
-    pub const NAKED: u32            = 1 << 18;
+    pub const NAKED: u32 = 1 << 18;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -144,55 +178,172 @@ pub(super) struct ParsedDeclAttrs {
     pub parsed_alignment_sizeof_type: Option<TypeSpecifier>,
 }
 
-
 impl ParsedDeclAttrs {
     // --- flag getters ---
 
-    #[inline] pub fn parsing_typedef(&self) -> bool          { self.flags & parsed_attr_flag::TYPEDEF != 0 }
-    #[inline] pub fn parsing_static(&self) -> bool           { self.flags & parsed_attr_flag::STATIC != 0 }
-    #[inline] pub fn parsing_extern(&self) -> bool           { self.flags & parsed_attr_flag::EXTERN != 0 }
-    #[inline] pub fn parsing_thread_local(&self) -> bool     { self.flags & parsed_attr_flag::THREAD_LOCAL != 0 }
-    #[inline] pub fn parsing_inline(&self) -> bool           { self.flags & parsed_attr_flag::INLINE != 0 }
-    #[inline] pub fn parsing_const(&self) -> bool            { self.flags & parsed_attr_flag::CONST != 0 }
-    #[inline] pub fn parsing_volatile(&self) -> bool         { self.flags & parsed_attr_flag::VOLATILE != 0 }
-    #[inline] pub fn parsing_constructor(&self) -> bool      { self.flags & parsed_attr_flag::CONSTRUCTOR != 0 }
-    #[inline] pub fn parsing_destructor(&self) -> bool       { self.flags & parsed_attr_flag::DESTRUCTOR != 0 }
-    #[inline] pub fn parsing_weak(&self) -> bool             { self.flags & parsed_attr_flag::WEAK != 0 }
-    #[inline] pub fn parsing_used(&self) -> bool             { self.flags & parsed_attr_flag::USED != 0 }
-    #[inline] pub fn parsing_gnu_inline(&self) -> bool       { self.flags & parsed_attr_flag::GNU_INLINE != 0 }
-    #[inline] pub fn parsing_always_inline(&self) -> bool    { self.flags & parsed_attr_flag::ALWAYS_INLINE != 0 }
-    #[inline] pub fn parsing_noinline(&self) -> bool         { self.flags & parsed_attr_flag::NOINLINE != 0 }
-    #[inline] pub fn parsing_noreturn(&self) -> bool         { self.flags & parsed_attr_flag::NORETURN != 0 }
-    #[inline] pub fn parsing_error_attr(&self) -> bool       { self.flags & parsed_attr_flag::ERROR_ATTR != 0 }
-    #[inline] pub fn parsing_transparent_union(&self) -> bool { self.flags & parsed_attr_flag::TRANSPARENT_UNION != 0 }
-    #[inline] pub fn parsing_fastcall(&self) -> bool         { self.flags & parsed_attr_flag::FASTCALL != 0 }
-    #[inline] pub fn parsing_naked(&self) -> bool            { self.flags & parsed_attr_flag::NAKED != 0 }
+    #[inline]
+    pub fn parsing_typedef(&self) -> bool {
+        self.flags & parsed_attr_flag::TYPEDEF != 0
+    }
+    #[inline]
+    pub fn parsing_static(&self) -> bool {
+        self.flags & parsed_attr_flag::STATIC != 0
+    }
+    #[inline]
+    pub fn parsing_extern(&self) -> bool {
+        self.flags & parsed_attr_flag::EXTERN != 0
+    }
+    #[inline]
+    pub fn parsing_thread_local(&self) -> bool {
+        self.flags & parsed_attr_flag::THREAD_LOCAL != 0
+    }
+    #[inline]
+    pub fn parsing_inline(&self) -> bool {
+        self.flags & parsed_attr_flag::INLINE != 0
+    }
+    #[inline]
+    pub fn parsing_const(&self) -> bool {
+        self.flags & parsed_attr_flag::CONST != 0
+    }
+    #[inline]
+    pub fn parsing_volatile(&self) -> bool {
+        self.flags & parsed_attr_flag::VOLATILE != 0
+    }
+    #[inline]
+    pub fn parsing_constructor(&self) -> bool {
+        self.flags & parsed_attr_flag::CONSTRUCTOR != 0
+    }
+    #[inline]
+    pub fn parsing_destructor(&self) -> bool {
+        self.flags & parsed_attr_flag::DESTRUCTOR != 0
+    }
+    #[inline]
+    pub fn parsing_weak(&self) -> bool {
+        self.flags & parsed_attr_flag::WEAK != 0
+    }
+    #[inline]
+    pub fn parsing_used(&self) -> bool {
+        self.flags & parsed_attr_flag::USED != 0
+    }
+    #[inline]
+    pub fn parsing_gnu_inline(&self) -> bool {
+        self.flags & parsed_attr_flag::GNU_INLINE != 0
+    }
+    #[inline]
+    pub fn parsing_always_inline(&self) -> bool {
+        self.flags & parsed_attr_flag::ALWAYS_INLINE != 0
+    }
+    #[inline]
+    pub fn parsing_noinline(&self) -> bool {
+        self.flags & parsed_attr_flag::NOINLINE != 0
+    }
+    #[inline]
+    pub fn parsing_noreturn(&self) -> bool {
+        self.flags & parsed_attr_flag::NORETURN != 0
+    }
+    #[inline]
+    pub fn parsing_error_attr(&self) -> bool {
+        self.flags & parsed_attr_flag::ERROR_ATTR != 0
+    }
+    #[inline]
+    pub fn parsing_transparent_union(&self) -> bool {
+        self.flags & parsed_attr_flag::TRANSPARENT_UNION != 0
+    }
+    #[inline]
+    pub fn parsing_fastcall(&self) -> bool {
+        self.flags & parsed_attr_flag::FASTCALL != 0
+    }
+    #[inline]
+    pub fn parsing_naked(&self) -> bool {
+        self.flags & parsed_attr_flag::NAKED != 0
+    }
 
     // --- flag setters ---
 
-    #[inline] pub fn set_typedef(&mut self, v: bool)          { self.set_flag(parsed_attr_flag::TYPEDEF, v) }
-    #[inline] pub fn set_static(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::STATIC, v) }
-    #[inline] pub fn set_extern(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::EXTERN, v) }
-    #[inline] pub fn set_thread_local(&mut self, v: bool)     { self.set_flag(parsed_attr_flag::THREAD_LOCAL, v) }
-    #[inline] pub fn set_inline(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::INLINE, v) }
-    #[inline] pub fn set_const(&mut self, v: bool)            { self.set_flag(parsed_attr_flag::CONST, v) }
-    #[inline] pub fn set_volatile(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::VOLATILE, v) }
-    #[inline] pub fn set_constructor(&mut self, v: bool)      { self.set_flag(parsed_attr_flag::CONSTRUCTOR, v) }
-    #[inline] pub fn set_destructor(&mut self, v: bool)       { self.set_flag(parsed_attr_flag::DESTRUCTOR, v) }
-    #[inline] pub fn set_weak(&mut self, v: bool)             { self.set_flag(parsed_attr_flag::WEAK, v) }
-    #[inline] pub fn set_used(&mut self, v: bool)             { self.set_flag(parsed_attr_flag::USED, v) }
-    #[inline] pub fn set_gnu_inline(&mut self, v: bool)       { self.set_flag(parsed_attr_flag::GNU_INLINE, v) }
-    #[inline] pub fn set_always_inline(&mut self, v: bool)    { self.set_flag(parsed_attr_flag::ALWAYS_INLINE, v) }
-    #[inline] pub fn set_noinline(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::NOINLINE, v) }
-    #[inline] pub fn set_noreturn(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::NORETURN, v) }
-    #[inline] pub fn set_error_attr(&mut self, v: bool)       { self.set_flag(parsed_attr_flag::ERROR_ATTR, v) }
-    #[inline] pub fn set_transparent_union(&mut self, v: bool) { self.set_flag(parsed_attr_flag::TRANSPARENT_UNION, v) }
-    #[inline] pub fn set_fastcall(&mut self, v: bool)         { self.set_flag(parsed_attr_flag::FASTCALL, v) }
-    #[inline] pub fn set_naked(&mut self, v: bool)           { self.set_flag(parsed_attr_flag::NAKED, v) }
+    #[inline]
+    pub fn set_typedef(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::TYPEDEF, v)
+    }
+    #[inline]
+    pub fn set_static(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::STATIC, v)
+    }
+    #[inline]
+    pub fn set_extern(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::EXTERN, v)
+    }
+    #[inline]
+    pub fn set_thread_local(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::THREAD_LOCAL, v)
+    }
+    #[inline]
+    pub fn set_inline(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::INLINE, v)
+    }
+    #[inline]
+    pub fn set_const(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::CONST, v)
+    }
+    #[inline]
+    pub fn set_volatile(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::VOLATILE, v)
+    }
+    #[inline]
+    pub fn set_constructor(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::CONSTRUCTOR, v)
+    }
+    #[inline]
+    pub fn set_destructor(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::DESTRUCTOR, v)
+    }
+    #[inline]
+    pub fn set_weak(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::WEAK, v)
+    }
+    #[inline]
+    pub fn set_used(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::USED, v)
+    }
+    #[inline]
+    pub fn set_gnu_inline(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::GNU_INLINE, v)
+    }
+    #[inline]
+    pub fn set_always_inline(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::ALWAYS_INLINE, v)
+    }
+    #[inline]
+    pub fn set_noinline(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NOINLINE, v)
+    }
+    #[inline]
+    pub fn set_noreturn(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NORETURN, v)
+    }
+    #[inline]
+    pub fn set_error_attr(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::ERROR_ATTR, v)
+    }
+    #[inline]
+    pub fn set_transparent_union(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::TRANSPARENT_UNION, v)
+    }
+    #[inline]
+    pub fn set_fastcall(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::FASTCALL, v)
+    }
+    #[inline]
+    pub fn set_naked(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NAKED, v)
+    }
 
     #[inline]
     fn set_flag(&mut self, mask: u32, v: bool) {
-        if v { self.flags |= mask; } else { self.flags &= !mask; }
+        if v {
+            self.flags |= mask;
+        } else {
+            self.flags &= !mask;
+        }
     }
 
     /// Save the packed boolean flags for later restoration.
@@ -230,7 +381,10 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_noinline", &self.parsing_noinline())
             .field("parsing_noreturn", &self.parsing_noreturn())
             .field("parsing_error_attr", &self.parsing_error_attr())
-            .field("parsing_transparent_union", &self.parsing_transparent_union())
+            .field(
+                "parsing_transparent_union",
+                &self.parsing_transparent_union(),
+            )
             .field("parsing_fastcall", &self.parsing_fastcall())
             .field("parsing_alias_target", &self.parsing_alias_target)
             .field("parsing_visibility", &self.parsing_visibility)
@@ -240,7 +394,10 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_ext_vector_nelem", &self.parsing_ext_vector_nelem)
             .field("parsed_alignas", &self.parsed_alignas)
             .field("parsed_alignas_type", &self.parsed_alignas_type)
-            .field("parsed_alignment_sizeof_type", &self.parsed_alignment_sizeof_type)
+            .field(
+                "parsed_alignment_sizeof_type",
+                &self.parsed_alignment_sizeof_type,
+            )
             .finish()
     }
 }
@@ -329,12 +486,19 @@ impl Parser {
     pub(super) fn sync_to(&mut self, stop: &[TokenKind]) {
         while !matches!(self.peek(), TokenKind::Eof) {
             let k = self.peek();
-            if stop.iter().any(|s| std::mem::discriminant(k) == std::mem::discriminant(s)) {
+            if stop
+                .iter()
+                .any(|s| std::mem::discriminant(k) == std::mem::discriminant(s))
+            {
                 return;
             }
-            if matches!(k,
-                TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
-                | TokenKind::RParen | TokenKind::RBracket
+            if matches!(
+                k,
+                TokenKind::Semicolon
+                    | TokenKind::RBrace
+                    | TokenKind::Eof
+                    | TokenKind::RParen
+                    | TokenKind::RBracket
             ) {
                 return;
             }
@@ -359,55 +523,119 @@ impl Parser {
     fn builtin_typedefs() -> FxHashSet<String> {
         [
             // <stddef.h>
-            "size_t", "ssize_t", "ptrdiff_t", "wchar_t", "wint_t",
+            "size_t",
+            "ssize_t",
+            "ptrdiff_t",
+            "wchar_t",
+            "wint_t",
             // <stdint.h>
-            "int8_t", "int16_t", "int32_t", "int64_t",
-            "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-            "intptr_t", "uintptr_t",
-            "intmax_t", "uintmax_t",
-            "int_least8_t", "int_least16_t", "int_least32_t", "int_least64_t",
-            "uint_least8_t", "uint_least16_t", "uint_least32_t", "uint_least64_t",
-            "int_fast8_t", "int_fast16_t", "int_fast32_t", "int_fast64_t",
-            "uint_fast8_t", "uint_fast16_t", "uint_fast32_t", "uint_fast64_t",
+            "int8_t",
+            "int16_t",
+            "int32_t",
+            "int64_t",
+            "uint8_t",
+            "uint16_t",
+            "uint32_t",
+            "uint64_t",
+            "intptr_t",
+            "uintptr_t",
+            "intmax_t",
+            "uintmax_t",
+            "int_least8_t",
+            "int_least16_t",
+            "int_least32_t",
+            "int_least64_t",
+            "uint_least8_t",
+            "uint_least16_t",
+            "uint_least32_t",
+            "uint_least64_t",
+            "int_fast8_t",
+            "int_fast16_t",
+            "int_fast32_t",
+            "int_fast64_t",
+            "uint_fast8_t",
+            "uint_fast16_t",
+            "uint_fast32_t",
+            "uint_fast64_t",
             // <stdio.h>
-            "FILE", "fpos_t",
+            "FILE",
+            "fpos_t",
             // <signal.h>
             "sig_atomic_t",
             // <time.h>
-            "time_t", "clock_t", "timer_t", "clockid_t",
+            "time_t",
+            "clock_t",
+            "timer_t",
+            "clockid_t",
             // <sys/types.h>
-            "off_t", "pid_t", "uid_t", "gid_t", "mode_t", "dev_t", "ino_t",
-            "nlink_t", "blksize_t", "blkcnt_t",
+            "off_t",
+            "pid_t",
+            "uid_t",
+            "gid_t",
+            "mode_t",
+            "dev_t",
+            "ino_t",
+            "nlink_t",
+            "blksize_t",
+            "blkcnt_t",
             // GNU/glibc common types
-            "ulong", "ushort", "uint",
-            "__u8", "__u16", "__u32", "__u64",
-            "__s8", "__s16", "__s32", "__s64",
+            "ulong",
+            "ushort",
+            "uint",
+            "__u8",
+            "__u16",
+            "__u32",
+            "__u64",
+            "__s8",
+            "__s16",
+            "__s32",
+            "__s64",
             // <stdarg.h>
-            "va_list", "__builtin_va_list", "__gnuc_va_list",
+            "va_list",
+            "__builtin_va_list",
+            "__gnuc_va_list",
             // <locale.h>
             "locale_t",
             // <pthread.h>
-            "pthread_t", "pthread_mutex_t", "pthread_cond_t",
-            "pthread_key_t", "pthread_attr_t", "pthread_once_t",
-            "pthread_mutexattr_t", "pthread_condattr_t",
+            "pthread_t",
+            "pthread_mutex_t",
+            "pthread_cond_t",
+            "pthread_key_t",
+            "pthread_attr_t",
+            "pthread_once_t",
+            "pthread_mutexattr_t",
+            "pthread_condattr_t",
             // <setjmp.h>
-            "jmp_buf", "sigjmp_buf",
+            "jmp_buf",
+            "sigjmp_buf",
             // <dirent.h>
             "DIR",
             // GCC builtin NEON vector types (AArch64).
             // These are compiler-internal types used by bits/math-vector.h when
             // __GNUC_PREREQ(9, 0). They only appear in typedef/function declarations
             // behind #ifdef __aarch64__ guards, so listing them unconditionally is safe.
-            "__Float32x4_t", "__Float64x2_t",
+            "__Float32x4_t",
+            "__Float64x2_t",
             // GCC builtin SVE scalable vector types (AArch64).
             // Used by bits/math-vector.h when __GNUC_PREREQ(10, 0).
             // SVE types are runtime-sized in real GCC, but we model them as fixed
             // 16-byte vectors for parsing (the functions using these are never called).
-            "__SVFloat32_t", "__SVFloat64_t", "__SVBool_t",
-            "__SVInt8_t", "__SVInt16_t", "__SVInt32_t", "__SVInt64_t",
-            "__SVUint8_t", "__SVUint16_t", "__SVUint32_t", "__SVUint64_t",
+            "__SVFloat32_t",
+            "__SVFloat64_t",
+            "__SVBool_t",
+            "__SVInt8_t",
+            "__SVInt16_t",
+            "__SVInt32_t",
+            "__SVInt64_t",
+            "__SVUint8_t",
+            "__SVUint16_t",
+            "__SVUint32_t",
+            "__SVUint64_t",
             "__SVFloat16_t",
-        ].iter().map(|s| s.to_string()).collect()
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
     pub fn parse(&mut self) -> TranslationUnit {
@@ -477,7 +705,10 @@ impl Parser {
             span
         } else {
             let span = self.peek_span();
-            self.emit_error(format!("expected {} before {}", expected, self.peek()), span);
+            self.emit_error(
+                format!("expected {} before {}", expected, self.peek()),
+                span,
+            );
             if matches!(expected, TokenKind::Semicolon) {
                 self.sync_after_error();
             }
@@ -499,9 +730,12 @@ impl Parser {
             span
         } else {
             let span = self.peek_span();
-            let diag = crate::common::error::Diagnostic::error(
-                format!("expected {} {} before {}", expected, context, self.peek())
-            )
+            let diag = crate::common::error::Diagnostic::error(format!(
+                "expected {} {} before {}",
+                expected,
+                context,
+                self.peek()
+            ))
             .with_span(span)
             .with_fix_hint(format!("insert {}", expected));
             self.error_count += 1;
@@ -530,15 +764,16 @@ impl Parser {
                 TokenKind::RBracket => "'['",
                 _ => "'?'",
             };
-            let diag = crate::common::error::Diagnostic::error(
-                format!("expected {} before {}", expected, self.peek())
-            )
+            let diag = crate::common::error::Diagnostic::error(format!(
+                "expected {} before {}",
+                expected,
+                self.peek()
+            ))
             .with_span(span)
             .with_fix_hint(format!("insert {}", expected))
             .with_note(
-                crate::common::error::Diagnostic::note(
-                    format!("to match this {}", open_tok)
-                ).with_span(open_span)
+                crate::common::error::Diagnostic::note(format!("to match this {}", open_tok))
+                    .with_span(open_span),
             );
             self.error_count += 1;
             self.diagnostics.emit(&diag);
@@ -556,9 +791,12 @@ impl Parser {
             span
         } else {
             let span = self.peek_span();
-            let diag = crate::common::error::Diagnostic::error(
-                format!("expected {} {} before {}", expected, context, self.peek())
-            )
+            let diag = crate::common::error::Diagnostic::error(format!(
+                "expected {} {} before {}",
+                expected,
+                context,
+                self.peek()
+            ))
             .with_span(span)
             .with_fix_hint(format!("insert {}", expected));
             self.error_count += 1;
@@ -593,18 +831,46 @@ impl Parser {
 
     pub(super) fn is_type_specifier(&self) -> bool {
         match self.peek() {
-            TokenKind::Void | TokenKind::Char | TokenKind::Short | TokenKind::Int |
-            TokenKind::Long | TokenKind::Float | TokenKind::Double | TokenKind::Signed |
-            TokenKind::Unsigned | TokenKind::Struct | TokenKind::Union | TokenKind::Enum |
-            TokenKind::Const | TokenKind::Volatile | TokenKind::Static | TokenKind::Extern |
-            TokenKind::Register | TokenKind::Typedef | TokenKind::Inline | TokenKind::Bool |
-            TokenKind::Typeof | TokenKind::Attribute | TokenKind::Extension |
-            TokenKind::Noreturn | TokenKind::Restrict | TokenKind::Complex |
-            TokenKind::Atomic | TokenKind::Auto | TokenKind::AutoType | TokenKind::Alignas |
-            TokenKind::Builtin | TokenKind::Int128 | TokenKind::UInt128 |
-            TokenKind::Float128 |
-            TokenKind::ThreadLocal | TokenKind::SegGs | TokenKind::SegFs => true,
-            TokenKind::Identifier(name) => self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name),
+            TokenKind::Void
+            | TokenKind::Char
+            | TokenKind::Short
+            | TokenKind::Int
+            | TokenKind::Long
+            | TokenKind::Float
+            | TokenKind::Double
+            | TokenKind::Signed
+            | TokenKind::Unsigned
+            | TokenKind::Struct
+            | TokenKind::Union
+            | TokenKind::Enum
+            | TokenKind::Const
+            | TokenKind::Volatile
+            | TokenKind::Static
+            | TokenKind::Extern
+            | TokenKind::Register
+            | TokenKind::Typedef
+            | TokenKind::Inline
+            | TokenKind::Bool
+            | TokenKind::Typeof
+            | TokenKind::Attribute
+            | TokenKind::Extension
+            | TokenKind::Noreturn
+            | TokenKind::Restrict
+            | TokenKind::Complex
+            | TokenKind::Atomic
+            | TokenKind::Auto
+            | TokenKind::AutoType
+            | TokenKind::Alignas
+            | TokenKind::Builtin
+            | TokenKind::Int128
+            | TokenKind::UInt128
+            | TokenKind::Float128
+            | TokenKind::ThreadLocal
+            | TokenKind::SegGs
+            | TokenKind::SegFs => true,
+            TokenKind::Identifier(name) => {
+                self.typedefs.contains(name) && !self.shadowed_typedefs.contains(name)
+            }
             _ => false,
         }
     }
@@ -641,8 +907,11 @@ impl Parser {
     /// We skip these qualifiers since they only affect optimization hints and
     /// don't change the type semantics (array params decay to pointers).
     pub(super) fn skip_array_qualifiers(&mut self) {
-        while let TokenKind::Static | TokenKind::Const | TokenKind::Volatile
-            | TokenKind::Restrict | TokenKind::Atomic = self.peek()
+        while let TokenKind::Static
+        | TokenKind::Const
+        | TokenKind::Volatile
+        | TokenKind::Restrict
+        | TokenKind::Atomic = self.peek()
         {
             self.advance();
         }
@@ -679,7 +948,8 @@ impl Parser {
     pub(super) fn skip_gcc_extensions(&mut self) {
         let (_, aligned, _, _) = self.parse_gcc_attributes();
         if let Some(a) = aligned {
-            self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+            self.attrs.parsed_alignas =
+                Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
         }
     }
 
@@ -694,16 +964,16 @@ impl Parser {
                 break;
             }
             // Two-token lookahead: require `[[` (C23 attribute), not a lone `[`.
-            let next_is_lb = self.pos + 1 < self.tokens.len()
-                && matches!(self.peek_nth(1), TokenKind::LBracket);
+            let next_is_lb =
+                self.pos + 1 < self.tokens.len() && matches!(self.peek_nth(1), TokenKind::LBracket);
             if !next_is_lb {
                 break;
             }
             self.advance(); // first '['
             self.advance(); // second '['
-            // Consume until the matching ']]' pair (respecting nesting of '[' ']'
-            // inside attribute args, e.g. [[gnu::aligned(8)]]). When depth hits
-            // zero at a ']', consume that ']' and its partner ']', then stop.
+                            // Consume until the matching ']]' pair (respecting nesting of '[' ']'
+                            // inside attribute args, e.g. [[gnu::aligned(8)]]). When depth hits
+                            // zero at a ']', consume that ']' and its partner ']', then stop.
             let mut depth = 1usize;
             while self.pos < self.tokens.len() {
                 match self.tokens[self.pos].kind {
@@ -736,7 +1006,9 @@ impl Parser {
         let mut is_common = false;
         loop {
             match self.peek() {
-                TokenKind::Extension => { self.advance(); }
+                TokenKind::Extension => {
+                    self.advance();
+                }
                 TokenKind::Attribute => {
                     self.advance();
                     if matches!(self.peek(), TokenKind::LParen) {
@@ -744,9 +1016,14 @@ impl Parser {
                         if matches!(self.peek(), TokenKind::LParen) {
                             self.advance(); // inner (
                             self.parse_gcc_attribute_list(
-                                &mut is_packed, &mut aligned, &mut mode_kind, &mut is_common,
+                                &mut is_packed,
+                                &mut aligned,
+                                &mut mode_kind,
+                                &mut is_common,
                             );
-                            if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+                            if matches!(self.peek(), TokenKind::RParen) {
+                                self.advance();
+                            }
                         } else {
                             // Single-paren form
                             while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
@@ -758,7 +1035,9 @@ impl Parser {
                                 self.advance();
                             }
                         }
-                        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+                        if matches!(self.peek(), TokenKind::RParen) {
+                            self.advance();
+                        }
                     }
                 }
                 _ => break,
@@ -768,49 +1047,87 @@ impl Parser {
     }
 
     /// Parse the comma-separated attribute list inside __attribute__((...)).
-    fn parse_gcc_attribute_list(&mut self, is_packed: &mut bool, aligned: &mut Option<usize>,
-                                mode_kind: &mut Option<ModeKind>, is_common: &mut bool) {
+    fn parse_gcc_attribute_list(
+        &mut self,
+        is_packed: &mut bool,
+        aligned: &mut Option<usize>,
+        mode_kind: &mut Option<ModeKind>,
+        is_common: &mut bool,
+    ) {
         loop {
             match self.peek() {
-                TokenKind::Comma => { self.advance(); }
+                TokenKind::Comma => {
+                    self.advance();
+                }
                 TokenKind::RParen | TokenKind::Eof => break,
                 TokenKind::Noreturn => {
                     self.attrs.set_noreturn(true);
                     self.advance();
                 }
                 TokenKind::Identifier(name) => {
-                    self.dispatch_gcc_attribute(&name.clone(), is_packed, aligned, mode_kind, is_common);
+                    self.dispatch_gcc_attribute(
+                        &name.clone(),
+                        is_packed,
+                        aligned,
+                        mode_kind,
+                        is_common,
+                    );
                 }
-                _ => { self.advance(); }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
 
     /// Dispatch a single GCC attribute by name.
-    fn dispatch_gcc_attribute(&mut self, name: &str, is_packed: &mut bool,
-                              aligned: &mut Option<usize>, mode_kind: &mut Option<ModeKind>,
-                              is_common: &mut bool) {
+    fn dispatch_gcc_attribute(
+        &mut self,
+        name: &str,
+        is_packed: &mut bool,
+        aligned: &mut Option<usize>,
+        mode_kind: &mut Option<ModeKind>,
+        is_common: &mut bool,
+    ) {
         match name {
             "constructor" | "__constructor__" => {
                 self.attrs.set_constructor(true);
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
             }
             "destructor" | "__destructor__" => {
                 self.attrs.set_destructor(true);
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
             }
-            "packed" | "__packed__" => { *is_packed = true; self.advance(); }
+            "packed" | "__packed__" => {
+                *is_packed = true;
+                self.advance();
+            }
             "aligned" | "__aligned__" => {
                 self.advance();
                 if matches!(self.peek(), TokenKind::LParen) {
-                    if let Some(align) = self.parse_alignment_expr() { *aligned = Some(align); }
+                    if let Some(align) = self.parse_alignment_expr() {
+                        *aligned = Some(align);
+                    }
                 }
             }
-            "common" | "__common__" => { *is_common = true; self.advance(); }
-            "transparent_union" | "__transparent_union__" => { self.attrs.set_transparent_union(true); self.advance(); }
-            "weak" | "__weak__" => { self.attrs.set_weak(true); self.advance(); }
+            "common" | "__common__" => {
+                *is_common = true;
+                self.advance();
+            }
+            "transparent_union" | "__transparent_union__" => {
+                self.attrs.set_transparent_union(true);
+                self.advance();
+            }
+            "weak" | "__weak__" => {
+                self.attrs.set_weak(true);
+                self.advance();
+            }
             "alias" | "__alias__" => {
                 self.advance();
                 self.attrs.parsing_alias_target = self.parse_string_attr_arg();
@@ -837,17 +1154,50 @@ impl Parser {
                 self.advance();
                 self.skip_optional_paren_arg();
             }
-            "noreturn" => { self.attrs.set_noreturn(true); self.advance(); }
-            "gnu_inline" | "__gnu_inline__" => { self.attrs.set_gnu_inline(true); self.advance(); }
-            "always_inline" | "__always_inline__" => { self.attrs.set_always_inline(true); self.advance(); }
-            "noinline" | "__noinline__" => { self.attrs.set_noinline(true); self.advance(); }
-            "cleanup" | "__cleanup__" => { self.advance(); self.parse_cleanup_attr(); }
-            "mode" | "__mode__" => { self.advance(); self.parse_mode_attr(mode_kind); }
-            "vector_size" | "__vector_size__" => { self.advance(); self.parse_vector_size_attr(); }
-            "ext_vector_type" | "__ext_vector_type__" => { self.advance(); self.parse_ext_vector_type_attr(); }
-            "used" | "__used__" => { self.attrs.set_used(true); self.advance(); }
-            "fastcall" | "__fastcall__" => { self.attrs.set_fastcall(true); self.advance(); }
-            "naked" | "__naked__" => { self.attrs.set_naked(true); self.advance(); }
+            "noreturn" => {
+                self.attrs.set_noreturn(true);
+                self.advance();
+            }
+            "gnu_inline" | "__gnu_inline__" => {
+                self.attrs.set_gnu_inline(true);
+                self.advance();
+            }
+            "always_inline" | "__always_inline__" => {
+                self.attrs.set_always_inline(true);
+                self.advance();
+            }
+            "noinline" | "__noinline__" => {
+                self.attrs.set_noinline(true);
+                self.advance();
+            }
+            "cleanup" | "__cleanup__" => {
+                self.advance();
+                self.parse_cleanup_attr();
+            }
+            "mode" | "__mode__" => {
+                self.advance();
+                self.parse_mode_attr(mode_kind);
+            }
+            "vector_size" | "__vector_size__" => {
+                self.advance();
+                self.parse_vector_size_attr();
+            }
+            "ext_vector_type" | "__ext_vector_type__" => {
+                self.advance();
+                self.parse_ext_vector_type_attr();
+            }
+            "used" | "__used__" => {
+                self.attrs.set_used(true);
+                self.advance();
+            }
+            "fastcall" | "__fastcall__" => {
+                self.attrs.set_fastcall(true);
+                self.advance();
+            }
+            "naked" | "__naked__" => {
+                self.attrs.set_naked(true);
+                self.advance();
+            }
             "optimize" | "__optimize__" => {
                 self.advance();
                 // Recognize optimize("omit-frame-pointer") as equivalent to naked.
@@ -869,10 +1219,15 @@ impl Parser {
                     self.attrs.set_naked(true);
                 }
             }
-            "address_space" | "__address_space__" => { self.advance(); self.parse_address_space_attr(); }
+            "address_space" | "__address_space__" => {
+                self.advance();
+                self.parse_address_space_attr();
+            }
             _ => {
                 self.advance();
-                if matches!(self.peek(), TokenKind::LParen) { self.skip_balanced_parens(); }
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
             }
         }
     }
@@ -880,41 +1235,59 @@ impl Parser {
     /// Parse a parenthesized string argument: ("string1" "string2"...).
     /// Returns Some(concatenated) if non-empty, None otherwise.
     fn parse_string_attr_arg(&mut self) -> Option<String> {
-        if !matches!(self.peek(), TokenKind::LParen) { return None; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return None;
+        }
         self.advance(); // consume (
         let mut result = String::with_capacity(64);
         while let TokenKind::StringLiteral(s) = self.peek() {
             result.push_str(s);
             self.advance();
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
-        if result.is_empty() { None } else { Some(result) }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
     }
 
     /// Skip an optional parenthesized argument (consuming everything inside).
     fn skip_optional_paren_arg(&mut self) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
             self.advance();
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Parse cleanup(func_name) attribute.
     fn parse_cleanup_attr(&mut self) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         if let TokenKind::Identifier(func_name) = self.peek() {
             self.attrs.parsing_cleanup_fn = Some(func_name.clone());
             self.advance();
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Parse mode(QI|HI|SI|DI|TI|word|pointer) attribute.
     fn parse_mode_attr(&mut self, mode_kind: &mut Option<ModeKind>) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         if let TokenKind::Identifier(mode_name) = self.peek() {
             let is_32bit = crate::common::types::target_is_32bit();
@@ -928,61 +1301,108 @@ impl Parser {
                         let span = self.peek_span();
                         self.emit_error("TI mode is not supported on 32-bit targets", span);
                         *mode_kind
+                    } else {
+                        Some(ModeKind::TI)
                     }
-                    else { Some(ModeKind::TI) }
                 }
                 "word" | "__word__" | "pointer" | "__pointer__" => {
-                    if is_32bit { Some(ModeKind::SI) } else { Some(ModeKind::DI) }
+                    if is_32bit {
+                        Some(ModeKind::SI)
+                    } else {
+                        Some(ModeKind::DI)
+                    }
                 }
                 _ => *mode_kind,
             };
         }
-        while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) { self.advance(); }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
+            self.advance();
+        }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Parse vector_size(expr) attribute.
     fn parse_vector_size_attr(&mut self) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         let expr = self.parse_assignment_expr();
-        let enums = if self.enum_constants.is_empty() { None } else { Some(&self.enum_constants) };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+        let enums = if self.enum_constants.is_empty() {
+            None
+        } else {
+            Some(&self.enum_constants)
+        };
+        let tag_aligns = if self.struct_tag_alignments.is_empty() {
+            None
+        } else {
+            Some(&self.struct_tag_alignments)
+        };
         if let Some(size) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
             self.attrs.parsing_vector_size = Some(size as usize);
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Parse ext_vector_type(N) attribute (Clang-style vector type).
     /// Stores the element count N; the total size is computed in lowering as N * sizeof(elem).
     fn parse_ext_vector_type_attr(&mut self) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         let expr = self.parse_assignment_expr();
-        let enums = if self.enum_constants.is_empty() { None } else { Some(&self.enum_constants) };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+        let enums = if self.enum_constants.is_empty() {
+            None
+        } else {
+            Some(&self.enum_constants)
+        };
+        let tag_aligns = if self.struct_tag_alignments.is_empty() {
+            None
+        } else {
+            Some(&self.struct_tag_alignments)
+        };
         if let Some(nelem) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
             self.attrs.parsing_ext_vector_nelem = Some(nelem as usize);
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Parse address_space(__seg_gs|__seg_fs) attribute.
     fn parse_address_space_attr(&mut self) {
-        if !matches!(self.peek(), TokenKind::LParen) { return; }
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return;
+        }
         self.advance();
         match self.peek() {
-            TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-            TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
-            _ => { self.advance(); }
+            TokenKind::SegGs => {
+                self.advance();
+                self.attrs.parsing_address_space = AddressSpace::SegGs;
+            }
+            TokenKind::SegFs => {
+                self.advance();
+                self.attrs.parsing_address_space = AddressSpace::SegFs;
+            }
+            _ => {
+                self.advance();
+            }
         }
-        if matches!(self.peek(), TokenKind::RParen) { self.advance(); }
+        if matches!(self.peek(), TokenKind::RParen) {
+            self.advance();
+        }
     }
 
     /// Skip __asm__("..."), __attribute__(...), and __extension__ after declarators.
     /// Returns (mode_kind, aligned_value, asm_register).
-    pub(super) fn skip_asm_and_attributes(&mut self) -> (Option<ModeKind>, Option<usize>, Option<String>) {
+    pub(super) fn skip_asm_and_attributes(
+        &mut self,
+    ) -> (Option<ModeKind>, Option<usize>, Option<String>) {
         let (_, _, mk, _, aligned, asm_reg) = self.parse_asm_and_attributes();
         (mk, aligned, asm_reg)
     }
@@ -990,7 +1410,16 @@ impl Parser {
     /// Parse __asm__("..."), __attribute__(...), and __extension__ after declarators.
     /// Returns (is_constructor, is_destructor, mode_kind, is_common, aligned_value, asm_register).
     /// The asm_register captures the register name from `register var __asm__("regname")`.
-    pub(super) fn parse_asm_and_attributes(&mut self) -> (bool, bool, Option<ModeKind>, bool, Option<usize>, Option<String>) {
+    pub(super) fn parse_asm_and_attributes(
+        &mut self,
+    ) -> (
+        bool,
+        bool,
+        Option<ModeKind>,
+        bool,
+        Option<usize>,
+        Option<String>,
+    ) {
         let mut is_constructor = false;
         let mut is_destructor = false;
         let mut mode_kind: Option<ModeKind> = None;
@@ -1015,8 +1444,12 @@ impl Parser {
                     if let Some(a) = attr_aligned {
                         aligned = Some(aligned.map_or(a, |prev| prev.max(a)));
                     }
-                    if self.attrs.parsing_constructor() { is_constructor = true; }
-                    if self.attrs.parsing_destructor() { is_destructor = true; }
+                    if self.attrs.parsing_constructor() {
+                        is_constructor = true;
+                    }
+                    if self.attrs.parsing_destructor() {
+                        is_destructor = true;
+                    }
                 }
                 TokenKind::Extension => {
                     self.advance();
@@ -1024,7 +1457,14 @@ impl Parser {
                 _ => break,
             }
         }
-        (is_constructor, is_destructor, mode_kind, has_common, aligned, asm_register)
+        (
+            is_constructor,
+            is_destructor,
+            mode_kind,
+            has_common,
+            aligned,
+            asm_register,
+        )
     }
 
     /// Try to extract a label/register name from __asm__("name") on a declaration.
@@ -1038,7 +1478,7 @@ impl Parser {
         // Save position so we can fall back
         let saved_pos = self.pos;
         self.advance(); // consume '('
-        // Concatenate adjacent string literals: __asm__("" "name") -> "name"
+                        // Concatenate adjacent string literals: __asm__("" "name") -> "name"
         let mut combined = String::new();
         let mut found_string = false;
         while let TokenKind::StringLiteral(s) = self.peek() {
@@ -1167,14 +1607,21 @@ impl Parser {
         let mut depth = 0i32;
         loop {
             match self.peek() {
-                TokenKind::LParen => { depth += 1; self.advance(); }
+                TokenKind::LParen => {
+                    depth += 1;
+                    self.advance();
+                }
                 TokenKind::RParen => {
                     depth -= 1;
                     self.advance();
-                    if depth <= 0 { break; }
+                    if depth <= 0 {
+                        break;
+                    }
                 }
                 TokenKind::Eof => break,
-                _ => { self.advance(); }
+                _ => {
+                    self.advance();
+                }
             }
         }
     }
@@ -1185,7 +1632,7 @@ impl Parser {
     pub(super) fn skip_label_attributes(&mut self) {
         while matches!(self.peek(), TokenKind::Attribute) {
             self.advance(); // consume __attribute__
-            // Expect __attribute__((...)) — two levels of parens
+                            // Expect __attribute__((...)) — two levels of parens
             if matches!(self.peek(), TokenKind::LParen) {
                 self.skip_balanced_parens();
             }
@@ -1214,8 +1661,16 @@ impl Parser {
                 self.attrs.parsed_alignment_sizeof_type = Some(ts.clone());
             }
         }
-        let enums = if self.enum_constants.is_empty() { None } else { Some(&self.enum_constants) };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+        let enums = if self.enum_constants.is_empty() {
+            None
+        } else {
+            Some(&self.enum_constants)
+        };
+        let tag_aligns = if self.struct_tag_alignments.is_empty() {
+            None
+        } else {
+            Some(&self.struct_tag_alignments)
+        };
         Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns).map(|v| v as usize)
     }
 
@@ -1235,10 +1690,14 @@ impl Parser {
                 let result_type = self.parse_abstract_declarator_suffix(ts);
                 if matches!(self.peek(), TokenKind::RParen) {
                     self.advance(); // consume )
-                    // Save the type specifier so the lowerer can resolve typedefs
-                    // and compute accurate alignment (parser can't resolve typedefs).
+                                    // Save the type specifier so the lowerer can resolve typedefs
+                                    // and compute accurate alignment (parser can't resolve typedefs).
                     self.attrs.parsed_alignas_type = Some(result_type.clone());
-                    let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+                    let tag_aligns = if self.struct_tag_alignments.is_empty() {
+                        None
+                    } else {
+                        Some(&self.struct_tag_alignments)
+                    };
                     return Some(Self::alignof_type_spec(&result_type, tag_aligns));
                 }
             }
@@ -1251,8 +1710,16 @@ impl Parser {
         if matches!(self.peek(), TokenKind::RParen) {
             self.advance();
         }
-        let enums = if self.enum_constants.is_empty() { None } else { Some(&self.enum_constants) };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() { None } else { Some(&self.struct_tag_alignments) };
+        let enums = if self.enum_constants.is_empty() {
+            None
+        } else {
+            Some(&self.enum_constants)
+        };
+        let tag_aligns = if self.struct_tag_alignments.is_empty() {
+            None
+        } else {
+            Some(&self.struct_tag_alignments)
+        };
         Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns).map(|v| v as usize)
     }
 
@@ -1264,15 +1731,20 @@ impl Parser {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         match ts {
-            TypeSpecifier::Void | TypeSpecifier::Bool
-            | TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
+            TypeSpecifier::Void
+            | TypeSpecifier::Bool
+            | TypeSpecifier::Char
+            | TypeSpecifier::UnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned
             | TypeSpecifier::Float => Some(4),
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => Some(ptr_sz),
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong
-            | TypeSpecifier::Double => Some(8),
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
+                Some(8)
+            }
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => Some(ptr_sz),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
@@ -1294,16 +1766,17 @@ impl Parser {
     /// Check if a type specifier is an unsigned type.
     /// Used by the parser-level constant evaluator for cast truncation.
     pub(super) fn is_unsigned_type_spec(ts: &TypeSpecifier) -> bool {
-        matches!(ts,
+        matches!(
+            ts,
             TypeSpecifier::UnsignedChar
-            | TypeSpecifier::UnsignedShort
-            | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Unsigned
-            | TypeSpecifier::UnsignedLong
-            | TypeSpecifier::UnsignedLongLong
-            | TypeSpecifier::UnsignedInt128
-            | TypeSpecifier::Bool
-            | TypeSpecifier::Pointer(_, _)
+                | TypeSpecifier::UnsignedShort
+                | TypeSpecifier::UnsignedInt
+                | TypeSpecifier::Unsigned
+                | TypeSpecifier::UnsignedLong
+                | TypeSpecifier::UnsignedLongLong
+                | TypeSpecifier::UnsignedInt128
+                | TypeSpecifier::Bool
+                | TypeSpecifier::Pointer(_, _)
         )
     }
 
@@ -1319,27 +1792,56 @@ impl Parser {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         match ts {
-            TypeSpecifier::Void | TypeSpecifier::Bool
-            | TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
+            TypeSpecifier::Void
+            | TypeSpecifier::Bool
+            | TypeSpecifier::Char
+            | TypeSpecifier::UnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned
             | TypeSpecifier::Float => 4,
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => ptr_sz,
             // On i686 (ILP32), long long and double are aligned to 4 bytes per i386 SysV ABI
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong
-            | TypeSpecifier::Double => if ptr_sz == 4 { 4 } else { 8 },
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    8
+                }
+            }
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             // On i686, long double is 80-bit x87 but aligned to 4 bytes
-            TypeSpecifier::LongDouble => if ptr_sz == 4 { 4 } else { 16 },
+            TypeSpecifier::LongDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    16
+                }
+            }
             TypeSpecifier::ComplexFloat => 4,
-            TypeSpecifier::ComplexDouble => if ptr_sz == 4 { 4 } else { 8 },
-            TypeSpecifier::ComplexLongDouble => if ptr_sz == 4 { 4 } else { 16 },
+            TypeSpecifier::ComplexDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    8
+                }
+            }
+            TypeSpecifier::ComplexLongDouble => {
+                if ptr_sz == 4 {
+                    4
+                } else {
+                    16
+                }
+            }
             TypeSpecifier::Array(elem, _) => Self::alignof_type_spec(elem, tag_aligns),
             TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned)
             | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned) => {
-                if *is_packed { return 1; }
+                if *is_packed {
+                    return 1;
+                }
                 // Explicit struct/union-level __attribute__((aligned(N))) overrides
                 let mut align = struct_aligned.unwrap_or(0);
                 // Compute max alignment from fields if available
@@ -1361,7 +1863,11 @@ impl Parser {
                     }
                 }
                 // Fallback for empty struct/union or tag-only (no fields available)
-                if align == 0 { ptr_sz } else { align }
+                if align == 0 {
+                    ptr_sz
+                } else {
+                    align
+                }
             }
             TypeSpecifier::Enum(_, _, _) => 4,
             TypeSpecifier::TypedefName(_) => ptr_sz, // conservative default
@@ -1385,8 +1891,7 @@ impl Parser {
         }
         // On i686: long long and double have preferred alignment of 8
         match ts {
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong
-            | TypeSpecifier::Double => 8,
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => 8,
             TypeSpecifier::ComplexDouble => 8,
             TypeSpecifier::Array(elem, _) => Self::preferred_alignof_type_spec(elem, tag_aligns),
             _ => Self::alignof_type_spec(ts, tag_aligns),

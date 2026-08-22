@@ -8,11 +8,11 @@
 //! - `emit_exec`: executable emission (static and dynamic)
 //! - `emit_shared`: shared library (.so) emission
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::section_order;
 use super::{input, sections, symbols};
 use crate::backend::linker_common;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 // ── Public entry point: executable linking ───────────────────────────────
 
@@ -79,22 +79,33 @@ pub fn link_builtin(
     let mut actual_needed_libs: Vec<String> = Vec::new();
     if !is_static {
         input::discover_shared_lib_symbols(
-            &needed_libs, &lib_search_paths, &mut input_objs,
-            &mut defined_syms, &mut undefined_syms,
-            &mut shared_lib_syms, &mut actual_needed_libs,
+            &needed_libs,
+            &lib_search_paths,
+            &mut input_objs,
+            &mut defined_syms,
+            &mut undefined_syms,
+            &mut shared_lib_syms,
+            &mut actual_needed_libs,
         );
     }
 
     // Treat symbols available from shared libs as "defined" for archive resolution
-    let shared_defined: FxHashSet<String> = shared_lib_syms.keys()
+    let shared_defined: FxHashSet<String> = shared_lib_syms
+        .keys()
         .filter(|s| undefined_syms.contains(*s))
         .cloned()
         .collect();
-    for s in &shared_defined { undefined_syms.remove(s); }
+    for s in &shared_defined {
+        undefined_syms.remove(s);
+    }
 
     input::resolve_archives(
-        &inline_archive_paths, &needed_libs, &lib_search_paths,
-        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+        &inline_archive_paths,
+        &needed_libs,
+        &lib_search_paths,
+        &mut input_objs,
+        &mut defined_syms,
+        &mut undefined_syms,
         &shared_lib_syms,
     );
 
@@ -114,11 +125,17 @@ pub fn link_builtin(
 
     let mut sec_mapping: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     for r in &input_sec_refs {
-        sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
+        sec_mapping.insert(
+            (r.obj_idx, r.sec_idx),
+            (r.merged_sec_idx, r.offset_in_merged),
+        );
     }
 
     let mut global_syms = symbols::build_global_symbols(
-        &input_objs, &sec_mapping, &mut merged_sections, &mut merged_map,
+        &input_objs,
+        &sec_mapping,
+        &mut merged_sections,
+        &mut merged_map,
     );
 
     let (plt_symbols, copy_symbols) = if !is_static {
@@ -194,10 +211,20 @@ pub fn link_shared(
     while i < args.len() {
         let arg = args[i];
         if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { path };
+            let p = if path.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                path
+            };
             extra_lib_paths.push(p.to_string());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
+            let l = if lib.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                lib
+            };
             libs_to_load.push(l.to_string());
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -213,7 +240,9 @@ pub fn link_shared(
                 }
             }
         } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" { i += 1; }
+            if arg == "-o" {
+                i += 1;
+            }
         } else if !arg.starts_with('-') && std::path::Path::new(arg).exists() {
             extra_object_files.push(arg.to_string());
         }
@@ -231,12 +260,18 @@ pub fn link_shared(
     all_lib_paths.extend(lib_path_strings.iter().cloned());
 
     input::load_shared_lib_inputs(
-        object_files, &extra_object_files,
-        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+        object_files,
+        &extra_object_files,
+        &mut input_objs,
+        &mut defined_syms,
+        &mut undefined_syms,
     )?;
     input::resolve_shared_lib_deps(
-        &libs_to_load, &all_lib_paths,
-        &mut input_objs, &mut defined_syms, &mut undefined_syms,
+        &libs_to_load,
+        &all_lib_paths,
+        &mut input_objs,
+        &mut defined_syms,
+        &mut undefined_syms,
         &mut needed_sonames,
     )?;
 
@@ -253,11 +288,17 @@ pub fn link_shared(
 
     let mut sec_mapping: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
     for r in &input_sec_refs {
-        sec_mapping.insert((r.obj_idx, r.sec_idx), (r.merged_sec_idx, r.offset_in_merged));
+        sec_mapping.insert(
+            (r.obj_idx, r.sec_idx),
+            (r.merged_sec_idx, r.offset_in_merged),
+        );
     }
 
     let mut global_syms = symbols::build_global_symbols(
-        &input_objs, &sec_mapping, &mut merged_sections, &mut merged_map,
+        &input_objs,
+        &sec_mapping,
+        &mut merged_sections,
+        &mut merged_map,
     );
 
     // Identify GOT entries needed

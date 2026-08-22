@@ -80,7 +80,6 @@ impl ColorMode {
     }
 }
 
-
 /// Categories of warnings, matching GCC's -W<name> flag names.
 ///
 /// Each variant corresponds to a `-W<name>` flag. For example,
@@ -660,20 +659,28 @@ impl DiagnosticEngine {
             let suffix = if is_last { ":" } else { "," };
             if i == 0 {
                 if self.use_color {
-                    eprintln!("\x1b[1mIn file included from {}:{}{}\x1b[0m",
-                        origin.file, origin.line, suffix);
+                    eprintln!(
+                        "\x1b[1mIn file included from {}:{}{}\x1b[0m",
+                        origin.file, origin.line, suffix
+                    );
                 } else {
-                    eprintln!("In file included from {}:{}{}",
-                        origin.file, origin.line, suffix);
+                    eprintln!(
+                        "In file included from {}:{}{}",
+                        origin.file, origin.line, suffix
+                    );
                 }
             } else {
                 // "                 from " aligns with "In file included from "
                 if self.use_color {
-                    eprintln!("\x1b[1m                 from {}:{}{}\x1b[0m",
-                        origin.file, origin.line, suffix);
+                    eprintln!(
+                        "\x1b[1m                 from {}:{}{}\x1b[0m",
+                        origin.file, origin.line, suffix
+                    );
                 } else {
-                    eprintln!("                 from {}:{}{}",
-                        origin.file, origin.line, suffix);
+                    eprintln!(
+                        "                 from {}:{}{}",
+                        origin.file, origin.line, suffix
+                    );
                 }
             }
         }
@@ -706,20 +713,26 @@ impl DiagnosticEngine {
             if let Some(span) = diag.span {
                 if let Some(ref sm) = self.source_manager {
                     let loc = sm.resolve_span(span);
-                    let _ = write!(msg, "\x1b[1m{}:{}:{}: \x1b[0m",
-                        loc.file, loc.line, loc.column);
+                    let _ = write!(
+                        msg,
+                        "\x1b[1m{}:{}:{}: \x1b[0m",
+                        loc.file, loc.line, loc.column
+                    );
                 }
             } else if let Some(ref loc) = diag.explicit_location {
                 let _ = write!(msg, "\x1b[1m{} \x1b[0m", loc);
             }
             // Severity label in its color, message in bold white
             let (sev_color, sev_text) = match diag.severity {
-                Severity::Error => ("\x1b[1;31m", "error"),     // bold red
+                Severity::Error => ("\x1b[1;31m", "error"), // bold red
                 Severity::Warning => ("\x1b[1;35m", "warning"), // bold magenta
-                Severity::Note => ("\x1b[1;36m", "note"),       // bold cyan
+                Severity::Note => ("\x1b[1;36m", "note"),   // bold cyan
             };
-            let _ = write!(msg, "{}{}\x1b[0m: \x1b[1m{}\x1b[0m",
-                sev_color, sev_text, diag.message);
+            let _ = write!(
+                msg,
+                "{}{}\x1b[0m: \x1b[1m{}\x1b[0m",
+                sev_color, sev_text, diag.message
+            );
         } else {
             // Plain text output
             if let Some(span) = diag.span {
@@ -793,7 +806,8 @@ impl DiagnosticEngine {
         // Filter out predefined/builtin macros that are expanded ubiquitously
         // and would produce noise in diagnostics. Only show user-defined macros
         // that are likely relevant to the error.
-        let interesting: Vec<&str> = macro_names.iter()
+        let interesting: Vec<&str> = macro_names
+            .iter()
             .filter(|name| !is_uninteresting_macro(name))
             .map(|s| s.as_str())
             .collect();
@@ -812,8 +826,10 @@ impl DiagnosticEngine {
                 eprintln!("\x1b[1m{}:{}:{}: \x1b[0m\x1b[1;36mnote:\x1b[0m \x1b[1min expansion of macro '{}'\x1b[0m",
                     loc.file, loc.line, loc.column, name);
             } else {
-                eprintln!("{}:{}:{}: note: in expansion of macro '{}'",
-                    loc.file, loc.line, loc.column, name);
+                eprintln!(
+                    "{}:{}:{}: note: in expansion of macro '{}'",
+                    loc.file, loc.line, loc.column, name
+                );
             }
         }
     }
@@ -885,19 +901,54 @@ fn is_uninteresting_macro(name: &str) -> bool {
         return true;
     }
     // Common standard library macros that are uninteresting
-    matches!(name, "NULL" | "EOF" | "CHAR_BIT" | "CHAR_MAX" | "CHAR_MIN" |
-        "INT_MAX" | "INT_MIN" | "UINT_MAX" | "LONG_MAX" | "LONG_MIN" |
-        "ULONG_MAX" | "LLONG_MAX" | "LLONG_MIN" | "ULLONG_MAX" |
-        "SIZE_MAX" | "PTRDIFF_MAX" | "PTRDIFF_MIN" |
-        "true" | "false" | "bool" |
-        "INT8_MAX" | "INT16_MAX" | "INT32_MAX" | "INT64_MAX" |
-        "UINT8_MAX" | "UINT16_MAX" | "UINT32_MAX" | "UINT64_MAX" |
-        "INT8_MIN" | "INT16_MIN" | "INT32_MIN" | "INT64_MIN" |
-        "WCHAR_MAX" | "WCHAR_MIN" |
-        "INTPTR_MAX" | "INTPTR_MIN" | "UINTPTR_MAX" |
-        "SSIZE_MAX" | "PATH_MAX" |
-        "SEEK_SET" | "SEEK_CUR" | "SEEK_END" |
-        "STDIN_FILENO" | "STDOUT_FILENO" | "STDERR_FILENO" |
-        "EXIT_SUCCESS" | "EXIT_FAILURE"
+    matches!(
+        name,
+        "NULL"
+            | "EOF"
+            | "CHAR_BIT"
+            | "CHAR_MAX"
+            | "CHAR_MIN"
+            | "INT_MAX"
+            | "INT_MIN"
+            | "UINT_MAX"
+            | "LONG_MAX"
+            | "LONG_MIN"
+            | "ULONG_MAX"
+            | "LLONG_MAX"
+            | "LLONG_MIN"
+            | "ULLONG_MAX"
+            | "SIZE_MAX"
+            | "PTRDIFF_MAX"
+            | "PTRDIFF_MIN"
+            | "true"
+            | "false"
+            | "bool"
+            | "INT8_MAX"
+            | "INT16_MAX"
+            | "INT32_MAX"
+            | "INT64_MAX"
+            | "UINT8_MAX"
+            | "UINT16_MAX"
+            | "UINT32_MAX"
+            | "UINT64_MAX"
+            | "INT8_MIN"
+            | "INT16_MIN"
+            | "INT32_MIN"
+            | "INT64_MIN"
+            | "WCHAR_MAX"
+            | "WCHAR_MIN"
+            | "INTPTR_MAX"
+            | "INTPTR_MIN"
+            | "UINTPTR_MAX"
+            | "SSIZE_MAX"
+            | "PATH_MAX"
+            | "SEEK_SET"
+            | "SEEK_CUR"
+            | "SEEK_END"
+            | "STDIN_FILENO"
+            | "STDOUT_FILENO"
+            | "STDERR_FILENO"
+            | "EXIT_SUCCESS"
+            | "EXIT_FAILURE"
     )
 }

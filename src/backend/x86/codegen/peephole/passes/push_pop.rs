@@ -50,7 +50,10 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
             if infos[j].is_push() {
                 break;
             }
-            if matches!(infos[j].kind, LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret) {
+            if matches!(
+                infos[j].kind,
+                LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+            ) {
                 break;
             }
         }
@@ -63,10 +66,14 @@ pub(super) fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]
 /// This catches instructions like pushfq, popfq, pushfl, popfl, etc. that
 /// read/write stack memory without being classified as Push/Pop.
 fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
-    if info.is_nop() { return false; }
+    if info.is_nop() {
+        return false;
+    }
     let s = info.trimmed(line);
     let b = s.as_bytes();
-    if b.is_empty() { return false; }
+    if b.is_empty() {
+        return false;
+    }
     // pushfq, pushfl, pushf, popfq, popfl, popf -- these modify %rsp and
     // read/write the stack, making it unsafe to eliminate surrounding push/pop
     if b[0] == b'p' && (s.starts_with("pushf") || s.starts_with("popf")) {
@@ -93,9 +100,16 @@ fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
 #[inline]
 fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
     match info.kind {
-        LineKind::StoreRbp { .. } | LineKind::Cmp | LineKind::Nop | LineKind::Empty
-        | LineKind::Label | LineKind::Directive | LineKind::Jmp | LineKind::JmpIndirect
-        | LineKind::CondJmp | LineKind::SelfMove => false,
+        LineKind::StoreRbp { .. }
+        | LineKind::Cmp
+        | LineKind::Nop
+        | LineKind::Empty
+        | LineKind::Label
+        | LineKind::Directive
+        | LineKind::Jmp
+        | LineKind::JmpIndirect
+        | LineKind::CondJmp
+        | LineKind::SelfMove => false,
         LineKind::LoadRbp { reg, .. } => reg == reg_id,
         LineKind::Pop { reg } => reg == reg_id,
         LineKind::Push { .. } => false, // push reads, doesn't modify the source reg
@@ -118,7 +132,10 @@ fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
     }
 }
 
-pub(super) fn eliminate_binop_push_pop_pattern(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+pub(super) fn eliminate_binop_push_pop_pattern(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
     let mut changed = false;
     let len = store.len();
 
@@ -126,13 +143,19 @@ pub(super) fn eliminate_binop_push_pop_pattern(store: &mut LineStore, infos: &mu
     while i + 3 < len {
         let push_reg_id = match infos[i].kind {
             LineKind::Push { reg } if reg != REG_NONE => reg,
-            _ => { i += 1; continue; }
+            _ => {
+                i += 1;
+                continue;
+            }
         };
 
         let push_line = infos[i].trimmed(store.get(i));
         let push_reg = match push_line.strip_prefix("pushq ") {
             Some(r) => r.trim(),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Find next 3 non-NOP lines
@@ -149,19 +172,27 @@ pub(super) fn eliminate_binop_push_pop_pattern(store: &mut LineStore, infos: &mu
                     // Check no stack-modifying instructions between push and pop
                     let mut stack_safe = true;
                     for k in (i + 1)..=pop_idx {
-                        if !infos[k].is_nop() && instruction_modifies_stack(store.get(k), &infos[k]) {
+                        if !infos[k].is_nop() && instruction_modifies_stack(store.get(k), &infos[k])
+                        {
                             stack_safe = false;
                             break;
                         }
                     }
-                    if !stack_safe { i += 1; continue; }
+                    if !stack_safe {
+                        i += 1;
+                        continue;
+                    }
 
                     let load_line = infos[load_idx].trimmed(store.get(load_idx));
                     let move_line = infos[move_idx].trimmed(store.get(move_idx));
 
                     if let Some(move_target) = parse_reg_to_reg_move(move_line, push_reg) {
-                        if instruction_writes_to(load_line, push_reg) && can_redirect_instruction(load_line) {
-                            if let Some(new_load) = replace_dest_register(load_line, push_reg, move_target) {
+                        if instruction_writes_to(load_line, push_reg)
+                            && can_redirect_instruction(load_line)
+                        {
+                            if let Some(new_load) =
+                                replace_dest_register(load_line, push_reg, move_target)
+                            {
                                 mark_nop(&mut infos[i]);
                                 let new_text = format!("    {}", new_load);
                                 replace_line(store, &mut infos[load_idx], load_idx, new_text);

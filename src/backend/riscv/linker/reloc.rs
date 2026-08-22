@@ -7,25 +7,19 @@
 //! Shared between executable and shared library linking, with context-specific
 //! behavior controlled by `RelocContext`.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::elf_read::*;
 use super::relocations::{
-    GlobalSym, MergedSection,
-    R_RISCV_32, R_RISCV_64, R_RISCV_BRANCH, R_RISCV_JAL, R_RISCV_CALL_PLT,
-    R_RISCV_GOT_HI20, R_RISCV_TLS_GOT_HI20, R_RISCV_TLS_GD_HI20,
-    R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I, R_RISCV_PCREL_LO12_S,
-    R_RISCV_HI20, R_RISCV_LO12_I, R_RISCV_LO12_S,
-    R_RISCV_TPREL_HI20, R_RISCV_TPREL_LO12_I, R_RISCV_TPREL_LO12_S,
-    R_RISCV_TPREL_ADD,
-    R_RISCV_ADD8, R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64,
-    R_RISCV_SUB8, R_RISCV_SUB16, R_RISCV_SUB32, R_RISCV_SUB64,
-    R_RISCV_ALIGN, R_RISCV_RVC_BRANCH, R_RISCV_RVC_JUMP, R_RISCV_RELAX,
-    R_RISCV_SET6, R_RISCV_SUB6, R_RISCV_SET8, R_RISCV_SET16, R_RISCV_SET32,
-    R_RISCV_32_PCREL, R_RISCV_SET_ULEB128, R_RISCV_SUB_ULEB128,
-    patch_u_type, patch_i_type, patch_s_type, patch_b_type, patch_j_type,
-    patch_cb_type, patch_cj_type,
-    resolve_symbol_value, got_sym_key,
+    got_sym_key, patch_b_type, patch_cb_type, patch_cj_type, patch_i_type, patch_j_type,
+    patch_s_type, patch_u_type, resolve_symbol_value, GlobalSym, MergedSection, R_RISCV_32,
+    R_RISCV_32_PCREL, R_RISCV_64, R_RISCV_ADD16, R_RISCV_ADD32, R_RISCV_ADD64, R_RISCV_ADD8,
+    R_RISCV_ALIGN, R_RISCV_BRANCH, R_RISCV_CALL_PLT, R_RISCV_GOT_HI20, R_RISCV_HI20, R_RISCV_JAL,
+    R_RISCV_LO12_I, R_RISCV_LO12_S, R_RISCV_PCREL_HI20, R_RISCV_PCREL_LO12_I, R_RISCV_PCREL_LO12_S,
+    R_RISCV_RELAX, R_RISCV_RVC_BRANCH, R_RISCV_RVC_JUMP, R_RISCV_SET16, R_RISCV_SET32,
+    R_RISCV_SET6, R_RISCV_SET8, R_RISCV_SET_ULEB128, R_RISCV_SUB16, R_RISCV_SUB32, R_RISCV_SUB6,
+    R_RISCV_SUB64, R_RISCV_SUB8, R_RISCV_SUB_ULEB128, R_RISCV_TLS_GD_HI20, R_RISCV_TLS_GOT_HI20,
+    R_RISCV_TPREL_ADD, R_RISCV_TPREL_HI20, R_RISCV_TPREL_LO12_I, R_RISCV_TPREL_LO12_S,
 };
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// Context for relocation application, providing all the resolved addresses
 /// and symbol tables needed to patch instructions.
@@ -89,18 +83,28 @@ pub fn apply_relocations(
                 let sym = &obj.symbols[sym_idx];
 
                 // Resolve symbol value
-                let s = resolve_sym_value(
-                    sym, sym_idx, obj_idx, obj, ctx,
-                );
+                let s = resolve_sym_value(sym, sym_idx, obj_idx, obj, ctx);
 
                 let a = reloc.addend;
                 let data = &mut merged_sections[merged_idx].data;
                 let off = offset as usize;
 
                 apply_one_reloc(
-                    reloc.rela_type, data, off, s, a, p,
-                    sym, sym_idx, obj_idx, obj, sec_idx, sec_offset,
-                    obj_name, ctx, &mut result,
+                    reloc.rela_type,
+                    data,
+                    off,
+                    s,
+                    a,
+                    p,
+                    sym,
+                    sym_idx,
+                    obj_idx,
+                    obj,
+                    sec_idx,
+                    sec_offset,
+                    obj_name,
+                    ctx,
+                    &mut result,
                 )?;
             }
         }
@@ -135,7 +139,8 @@ fn resolve_sym_value(
             0
         }
     } else {
-        ctx.local_sym_vaddrs.get(obj_idx)
+        ctx.local_sym_vaddrs
+            .get(obj_idx)
             .and_then(|v| v.get(sym_idx))
             .copied()
             .unwrap_or(0)
@@ -223,7 +228,12 @@ fn apply_one_reloc(
                 patch_i_type(data, off, tprel & 0xFFF);
             } else {
                 let hi_val = find_hi20_value_for_reloc(
-                    obj, obj_idx, sec_idx, ctx, auipc_addr as u64, sec_offset,
+                    obj,
+                    obj_idx,
+                    sec_idx,
+                    ctx,
+                    auipc_addr as u64,
+                    sec_offset,
                 );
                 patch_i_type(data, off, hi_val as u32);
             }
@@ -235,7 +245,12 @@ fn apply_one_reloc(
                 patch_s_type(data, off, tprel & 0xFFF);
             } else {
                 let hi_val = find_hi20_value_for_reloc(
-                    obj, obj_idx, sec_idx, ctx, auipc_addr as u64, sec_offset,
+                    obj,
+                    obj_idx,
+                    sec_idx,
+                    ctx,
+                    auipc_addr as u64,
+                    sec_offset,
                 );
                 patch_s_type(data, off, hi_val as u32);
             }
@@ -260,7 +275,8 @@ fn apply_one_reloc(
                     if let Some(&plt_addr) = ctx.plt_sym_addrs.get(sym.name.as_str()) {
                         plt_addr as i64
                     } else {
-                        ctx.global_syms.get(sym.name.as_str())
+                        ctx.global_syms
+                            .get(sym.name.as_str())
                             .map(|gs| gs.value as i64)
                             .unwrap_or(s as i64)
                     }
@@ -467,16 +483,34 @@ fn find_hi20_value_for_reloc(
 ) -> i64 {
     if ctx.collect_relatives {
         super::relocations::find_hi20_value_shared(
-            obj, obj_idx, sec_idx, ctx.sec_mapping, ctx.section_vaddrs,
-            ctx.local_sym_vaddrs, ctx.global_syms, auipc_addr,
-            sec_offset, ctx.got_vaddr, ctx.got_symbols,
+            obj,
+            obj_idx,
+            sec_idx,
+            ctx.sec_mapping,
+            ctx.section_vaddrs,
+            ctx.local_sym_vaddrs,
+            ctx.global_syms,
+            auipc_addr,
+            sec_offset,
+            ctx.got_vaddr,
+            ctx.got_symbols,
         )
     } else {
         super::relocations::find_hi20_value(
-            obj, obj_idx, sec_idx, ctx.sec_mapping, ctx.section_vaddrs,
-            ctx.local_sym_vaddrs, ctx.global_syms, auipc_addr,
-            sec_offset, ctx.got_vaddr, ctx.got_symbols, ctx.got_plt_vaddr,
-            ctx.gd_tls_relax_info, ctx.tls_vaddr,
+            obj,
+            obj_idx,
+            sec_idx,
+            ctx.sec_mapping,
+            ctx.section_vaddrs,
+            ctx.local_sym_vaddrs,
+            ctx.global_syms,
+            auipc_addr,
+            sec_offset,
+            ctx.got_vaddr,
+            ctx.got_symbols,
+            ctx.got_plt_vaddr,
+            ctx.gd_tls_relax_info,
+            ctx.tls_vaddr,
         )
     }
 }
@@ -486,7 +520,9 @@ fn apply_set_uleb128(data: &mut [u8], off: usize, val: u64) {
     let mut v = val;
     let mut i = off;
     loop {
-        if i >= data.len() { break; }
+        if i >= data.len() {
+            break;
+        }
         let byte = (v & 0x7F) as u8;
         v >>= 7;
         if v != 0 {
@@ -506,10 +542,14 @@ fn apply_sub_uleb128(data: &mut [u8], off: usize, sub_val: u64) {
     let mut shift = 0;
     let mut i = off;
     loop {
-        if i >= data.len() { break; }
+        if i >= data.len() {
+            break;
+        }
         let byte = data[i];
         cur |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 { break; }
+        if byte & 0x80 == 0 {
+            break;
+        }
         shift += 7;
         i += 1;
     }
@@ -518,7 +558,9 @@ fn apply_sub_uleb128(data: &mut [u8], off: usize, sub_val: u64) {
     let mut v = val;
     let mut j = off;
     loop {
-        if j >= data.len() { break; }
+        if j >= data.len() {
+            break;
+        }
         let byte = (v & 0x7F) as u8;
         v >>= 7;
         if v != 0 {
@@ -547,7 +589,9 @@ pub fn collect_gd_tls_relax_info(
 ) {
     for (obj_idx, (_, obj)) in input_objs.iter().enumerate() {
         for (sec_idx, relocs) in obj.relocations.iter().enumerate() {
-            if relocs.is_empty() { continue; }
+            if relocs.is_empty() {
+                continue;
+            }
             let (merged_idx, sec_offset) = match sec_mapping.get(&(obj_idx, sec_idx)) {
                 Some(&v) => v,
                 None => continue,
@@ -560,8 +604,14 @@ pub fn collect_gd_tls_relax_info(
                     let auipc_vaddr = ms_vaddr + offset;
                     let sym = &obj.symbols[reloc.sym_idx as usize];
                     let sym_val = resolve_symbol_value(
-                        sym, reloc.sym_idx as usize, obj, obj_idx,
-                        sec_mapping, section_vaddrs, local_sym_vaddrs, global_syms,
+                        sym,
+                        reloc.sym_idx as usize,
+                        obj,
+                        obj_idx,
+                        sec_mapping,
+                        section_vaddrs,
+                        local_sym_vaddrs,
+                        global_syms,
                     );
                     gd_tls_relax_info.insert(auipc_vaddr, (sym_val, reloc.addend));
 

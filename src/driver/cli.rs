@@ -10,7 +10,7 @@
 //! ignored (matching GCC's behavior for unrecognized `-f` and `-m` flags),
 //! which is critical for build system compatibility.
 
-use super::pipeline::{Driver, CompileMode, CliDefine};
+use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 
@@ -28,7 +28,11 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
             (None, None) => return std::cmp::Ordering::Equal,
             (None, Some(_)) => return std::cmp::Ordering::Less,
             (Some(_), None) => return std::cmp::Ordering::Greater,
-            (Some(x), Some(y)) => match x.parse::<u64>().unwrap_or(0).cmp(&y.parse::<u64>().unwrap_or(0)) {
+            (Some(x), Some(y)) => match x
+                .parse::<u64>()
+                .unwrap_or(0)
+                .cmp(&y.parse::<u64>().unwrap_or(0))
+            {
                 std::cmp::Ordering::Equal => continue,
                 ord => return ord,
             },
@@ -38,58 +42,144 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 impl Driver {
     fn enable_x86_avx_profile(&mut self) {
-        self.no_sse=false; self.enable_avx=true; self.enable_sse4_2=true;
-        self.enable_sse4_1=true; self.enable_ssse3=true; self.enable_sse3=true;
+        self.no_sse = false;
+        self.enable_avx = true;
+        self.enable_sse4_2 = true;
+        self.enable_sse4_1 = true;
+        self.enable_ssse3 = true;
+        self.enable_sse3 = true;
     }
-    fn enable_x86_avx2_profile(&mut self) { self.enable_x86_avx_profile(); self.enable_avx2=true; }
+    fn enable_x86_avx2_profile(&mut self) {
+        self.enable_x86_avx_profile();
+        self.enable_avx2 = true;
+    }
     fn enable_x86_v3_profile(&mut self) {
-        self.enable_x86_avx2_profile(); self.enable_f16c=true; self.enable_fma=true;
-        self.enable_bmi=true; self.enable_bmi2=true; self.enable_lzcnt=true; self.enable_movbe=true;
+        self.enable_x86_avx2_profile();
+        self.enable_f16c = true;
+        self.enable_fma = true;
+        self.enable_bmi = true;
+        self.enable_bmi2 = true;
+        self.enable_lzcnt = true;
+        self.enable_movbe = true;
     }
     fn enable_x86_haswell_profile(&mut self) {
-        self.enable_x86_v3_profile(); self.enable_aes=true; self.enable_pclmul=true; self.enable_rdrnd=true;
+        self.enable_x86_v3_profile();
+        self.enable_aes = true;
+        self.enable_pclmul = true;
+        self.enable_rdrnd = true;
     }
     fn enable_x86_avx512_profile(&mut self) {
-        self.enable_x86_v3_profile(); self.enable_avx512f=true; self.enable_avx512cd=true;
-        self.enable_avx512dq=true; self.enable_avx512bw=true; self.enable_avx512vl=true;
+        self.enable_x86_v3_profile();
+        self.enable_avx512f = true;
+        self.enable_avx512cd = true;
+        self.enable_avx512dq = true;
+        self.enable_avx512bw = true;
+        self.enable_avx512vl = true;
     }
     fn enable_x86_avx512_cpu_profile(&mut self) {
-        self.enable_x86_avx512_profile(); self.enable_aes=true; self.enable_pclmul=true; self.enable_rdrnd=true;
+        self.enable_x86_avx512_profile();
+        self.enable_aes = true;
+        self.enable_pclmul = true;
+        self.enable_rdrnd = true;
     }
-    fn enable_x86_cascadelake_profile(&mut self) { self.enable_x86_avx512_cpu_profile(); self.enable_avx512vnni=true; }
-    fn enable_x86_cooperlake_profile(&mut self) { self.enable_x86_cascadelake_profile(); self.enable_avx512bf16=true; }
+    fn enable_x86_cascadelake_profile(&mut self) {
+        self.enable_x86_avx512_cpu_profile();
+        self.enable_avx512vnni = true;
+    }
+    fn enable_x86_cooperlake_profile(&mut self) {
+        self.enable_x86_cascadelake_profile();
+        self.enable_avx512bf16 = true;
+    }
     fn enable_x86_icelake_profile(&mut self) {
-        self.enable_x86_cascadelake_profile(); self.enable_avx512ifma=true; self.enable_avx512vbmi=true;
-        self.enable_avx512vbmi2=true; self.enable_avx512bitalg=true; self.enable_avx512vpopcntdq=true;
-        self.enable_gfni=true; self.enable_vaes=true; self.enable_vpclmulqdq=true;
+        self.enable_x86_cascadelake_profile();
+        self.enable_avx512ifma = true;
+        self.enable_avx512vbmi = true;
+        self.enable_avx512vbmi2 = true;
+        self.enable_avx512bitalg = true;
+        self.enable_avx512vpopcntdq = true;
+        self.enable_gfni = true;
+        self.enable_vaes = true;
+        self.enable_vpclmulqdq = true;
     }
-    fn enable_x86_sapphirerapids_profile(&mut self) { self.enable_x86_icelake_profile(); self.enable_avx512bf16=true; self.enable_avx512fp16=true; }
+    fn enable_x86_sapphirerapids_profile(&mut self) {
+        self.enable_x86_icelake_profile();
+        self.enable_avx512bf16 = true;
+        self.enable_avx512fp16 = true;
+    }
     fn enable_x86_knl_profile(&mut self) {
-        self.enable_x86_v3_profile(); self.enable_pclmul=true; self.enable_rdrnd=true;
-        self.enable_avx512f=true; self.enable_avx512cd=true; self.enable_avx512er=true; self.enable_avx512pf=true;
+        self.enable_x86_v3_profile();
+        self.enable_pclmul = true;
+        self.enable_rdrnd = true;
+        self.enable_avx512f = true;
+        self.enable_avx512cd = true;
+        self.enable_avx512er = true;
+        self.enable_avx512pf = true;
     }
-    fn enable_x86_znver3_profile(&mut self) { self.enable_x86_haswell_profile(); self.enable_vaes=true; self.enable_vpclmulqdq=true; }
-    fn enable_x86_znver4_profile(&mut self) { self.enable_x86_icelake_profile(); self.enable_avx512bf16=true; }
-    fn enable_x86_znver5_profile(&mut self) { self.enable_x86_znver4_profile(); self.enable_avxvnni=true; self.enable_avx512vp2intersect=true; }
-    fn enable_x86_nehalem_profile(&mut self) { self.no_sse=false; self.enable_sse3=true; self.enable_ssse3=true; self.enable_sse4_1=true; self.enable_sse4_2=true; }
-    fn enable_x86_westmere_profile(&mut self) { self.enable_x86_nehalem_profile(); self.enable_aes=true; self.enable_pclmul=true; }
-    fn enable_x86_sandybridge_profile(&mut self) { self.enable_x86_westmere_profile(); self.enable_x86_avx_profile(); }
-    fn enable_x86_ivybridge_profile(&mut self) { self.enable_x86_sandybridge_profile(); self.enable_f16c=true; self.enable_rdrnd=true; }
-    fn enable_x86_silvermont_profile(&mut self) { self.enable_x86_nehalem_profile(); self.enable_pclmul=true; self.enable_movbe=true; self.enable_rdrnd=true; }
-    fn enable_x86_goldmont_profile(&mut self) { self.enable_x86_silvermont_profile(); self.enable_aes=true; }
+    fn enable_x86_znver3_profile(&mut self) {
+        self.enable_x86_haswell_profile();
+        self.enable_vaes = true;
+        self.enable_vpclmulqdq = true;
+    }
+    fn enable_x86_znver4_profile(&mut self) {
+        self.enable_x86_icelake_profile();
+        self.enable_avx512bf16 = true;
+    }
+    fn enable_x86_znver5_profile(&mut self) {
+        self.enable_x86_znver4_profile();
+        self.enable_avxvnni = true;
+        self.enable_avx512vp2intersect = true;
+    }
+    fn enable_x86_nehalem_profile(&mut self) {
+        self.no_sse = false;
+        self.enable_sse3 = true;
+        self.enable_ssse3 = true;
+        self.enable_sse4_1 = true;
+        self.enable_sse4_2 = true;
+    }
+    fn enable_x86_westmere_profile(&mut self) {
+        self.enable_x86_nehalem_profile();
+        self.enable_aes = true;
+        self.enable_pclmul = true;
+    }
+    fn enable_x86_sandybridge_profile(&mut self) {
+        self.enable_x86_westmere_profile();
+        self.enable_x86_avx_profile();
+    }
+    fn enable_x86_ivybridge_profile(&mut self) {
+        self.enable_x86_sandybridge_profile();
+        self.enable_f16c = true;
+        self.enable_rdrnd = true;
+    }
+    fn enable_x86_silvermont_profile(&mut self) {
+        self.enable_x86_nehalem_profile();
+        self.enable_pclmul = true;
+        self.enable_movbe = true;
+        self.enable_rdrnd = true;
+    }
+    fn enable_x86_goldmont_profile(&mut self) {
+        self.enable_x86_silvermont_profile();
+        self.enable_aes = true;
+    }
     fn enable_x86_alderlake_profile(&mut self) {
-        self.enable_x86_haswell_profile(); self.enable_avxvnni=true; self.enable_gfni=true;
-        self.enable_vaes=true; self.enable_vpclmulqdq=true;
+        self.enable_x86_haswell_profile();
+        self.enable_avxvnni = true;
+        self.enable_gfni = true;
+        self.enable_vaes = true;
+        self.enable_vpclmulqdq = true;
     }
     fn enable_x86_arrowlake_profile(&mut self) {
-        self.enable_x86_alderlake_profile(); self.enable_avxifma=true; self.enable_avxneconvert=true;
-        self.enable_avxvnniint8=true; self.enable_cmpccxadd=true;
+        self.enable_x86_alderlake_profile();
+        self.enable_avxifma = true;
+        self.enable_avxneconvert = true;
+        self.enable_avxvnniint8 = true;
+        self.enable_cmpccxadd = true;
     }
 
     /// Parse GCC-compatible command-line arguments and populate driver fields.
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
-    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {        // Detect target from binary name (argv[0])
+    pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
+        // Detect target from binary name (argv[0])
         let binary_name = std::path::Path::new(&args[0])
             .file_name()
             .and_then(|n| n.to_str())
@@ -123,7 +213,8 @@ impl Driver {
         // GCC understands all the same flags we accept, so forwarding them directly
         // preserves ordering semantics (e.g., -fcf-protection=none after =branch).
         if self.code16gcc {
-            self.raw_args = args[1..].iter()
+            self.raw_args = args[1..]
+                .iter()
                 .filter(|a| !self.input_files.contains(a))
                 .cloned()
                 .collect();
@@ -133,7 +224,10 @@ impl Driver {
         // Build systems like Meson run `compiler -Wl,--version` without source files
         // to detect the linker type. Invoke our linker driver (GCC) directly.
         if self.input_files.is_empty()
-            && self.linker_ordered_items.iter().any(|a| a.contains("--version"))
+            && self
+                .linker_ordered_items
+                .iter()
+                .any(|a| a.contains("--version"))
         {
             Self::run_linker_version_query(&self.target, &self.linker_ordered_items);
             return Ok(true);
@@ -189,7 +283,12 @@ impl Driver {
                                     .filter_map(|e| e.ok())
                                     .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                                     .map(|e| e.file_name().to_string_lossy().to_string())
-                                    .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                                    .filter(|n| {
+                                        n.chars()
+                                            .next()
+                                            .map(|c| c.is_ascii_digit())
+                                            .unwrap_or(false)
+                                    })
                                     .collect();
                                 // Numeric version order: newest GCC dir first.
                                 vers.sort_by(|a, b| cmp_version(b, a));
@@ -200,8 +299,12 @@ impl Driver {
                         }
                         search_dirs.push(format!("{}/usr/lib/", sroot));
                     }
-                    let triples = ["x86_64-linux-gnu", "x86_64-pc-linux-gnu",
-                                   "x86_64-redhat-linux", "x86_64-linux"];
+                    let triples = [
+                        "x86_64-linux-gnu",
+                        "x86_64-pc-linux-gnu",
+                        "x86_64-redhat-linux",
+                        "x86_64-linux",
+                    ];
                     let mut printed = false;
                     for dir in &search_dirs {
                         let a = format!("{}libgcc.a", dir);
@@ -232,7 +335,9 @@ impl Driver {
                                     break;
                                 }
                             }
-                            if printed { break; }
+                            if printed {
+                                break;
+                            }
                         }
                     }
                     if !printed {
@@ -240,12 +345,16 @@ impl Driver {
                     }
                     return Ok(true);
                 }
-                _ if arg.starts_with("-print-file-name=") || arg.starts_with("--print-file-name=") => {
+                _ if arg.starts_with("-print-file-name=")
+                    || arg.starts_with("--print-file-name=") =>
+                {
                     // glibc link rules: `${CC} --print-file-name=crtbeginS.o`.
                     let name = arg.trim_start_matches('-').trim_start_matches('-');
                     let name = name.strip_prefix("print-file-name=").unwrap_or(name);
                     if name == "include" {
-                        if let Some(bundled) = crate::frontend::preprocessor::Preprocessor::bundled_include_dir() {
+                        if let Some(bundled) =
+                            crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
+                        {
                             println!("{}", bundled.display());
                             return Ok(true);
                         }
@@ -260,7 +369,12 @@ impl Driver {
                                     .filter_map(|e| e.ok())
                                     .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
                                     .map(|e| e.file_name().to_string_lossy().to_string())
-                                    .filter(|n| n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                                    .filter(|n| {
+                                        n.chars()
+                                            .next()
+                                            .map(|c| c.is_ascii_digit())
+                                            .unwrap_or(false)
+                                    })
                                     .collect();
                                 vers.sort();
                                 vers.reverse();
@@ -293,7 +407,9 @@ impl Driver {
                     // Meson detects GCC by checking for "Free Software Foundation"
                     // in the --version output. We claim GCC 14.2.0 compatibility
                     // (matching our __GNUC__/__GNUC_MINOR__/__GNUC_PATCHLEVEL__).
-                    println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
+                    println!(
+                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+                    );
                     println!("GCC is maintained by the Free Software Foundation, Inc.");
                     println!("This program is a fork of CCC (written by Claude Opus 4.6);");
                     println!("It is not intended for production use.");
@@ -316,7 +432,9 @@ impl Driver {
                     return Ok(true);
                 }
                 "-v" if args.len() == 2 => {
-                    println!("lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0");
+                    println!(
+                        "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+                    );
                     // GCC-style line so configure scripts that grep `-v` output
                     // for "gcc" (e.g. zlib-ng's compiler detection) classify the
                     // driver as GCC-compatible and enable the -fPIC/-std paths.
@@ -344,7 +462,9 @@ impl Driver {
                     // our intrinsic headers (arm_neon.h, emmintrin.h, etc.) instead
                     // of the host GCC's headers which use incompatible builtins.
                     if name == "include" {
-                        if let Some(bundled) = crate::frontend::preprocessor::Preprocessor::bundled_include_dir() {
+                        if let Some(bundled) =
+                            crate::frontend::preprocessor::Preprocessor::bundled_include_dir()
+                        {
                             println!("{}", bundled.display());
                             return Ok(true);
                         }
@@ -542,7 +662,8 @@ impl Driver {
                 "-e" => {
                     i += 1;
                     if i < args.len() {
-                        self.linker_ordered_items.push(format!("-Wl,-e,{}", args[i]));
+                        self.linker_ordered_items
+                            .push(format!("-Wl,-e,{}", args[i]));
                     }
                 }
                 // Export-dynamic family. MUST be matched before the greedy
@@ -551,10 +672,12 @@ impl Driver {
                 // dropping the export request and setting a garbage entry
                 // symbol (the binary then exports no dynamic symbols).
                 "-export-dynamic" | "--export-dynamic" => {
-                    self.linker_ordered_items.push("-Wl,--export-dynamic".to_string());
+                    self.linker_ordered_items
+                        .push("-Wl,--export-dynamic".to_string());
                 }
                 arg if arg.len() > 2 && arg.starts_with("-e") && !arg.starts_with("-E") => {
-                    self.linker_ordered_items.push(format!("-Wl,-e,{}", &arg[2..]));
+                    self.linker_ordered_items
+                        .push(format!("-Wl,-e,{}", &arg[2..]));
                 }
 
                 // Assembler pass-through: -Wa,flag1,flag2,...
@@ -689,8 +812,10 @@ impl Driver {
                     // Note: an EXPLICIT -fgnu89-inline / -fno-gnu89-inline overrides
                     // any -std= (matching GCC: -std= only sets the default model).
                     if self.gnu89_inline_explicit.is_none() {
-                        self.gnu89_inline = matches!(std_value, "gnu89" | "c89" | "gnu90" | "c90"
-                            | "iso9899:1990" | "iso9899:199409");
+                        self.gnu89_inline = matches!(
+                            std_value,
+                            "gnu89" | "c89" | "gnu90" | "c90" | "iso9899:1990" | "iso9899:199409"
+                        );
                     }
                 }
 
@@ -765,13 +890,34 @@ impl Driver {
                 // after RET/indirect JMP). Not implemented; silently ignoring
                 // would strip a requested mitigation.
                 s if s.starts_with("-mharden-sls=") && s != "-mharden-sls=none" => {
-                    return Err("ccc: error: -mharden-sls straight-line-speculation hardening \
-                                not supported; disable CONFIG_MITIGATION_SLS".to_string());
+                    return Err(
+                        "ccc: error: -mharden-sls straight-line-speculation hardening \
+                                not supported; disable CONFIG_MITIGATION_SLS"
+                            .to_string(),
+                    );
                 }
                 "-mharden-sls=none" => {}
-                "-mno-avx2" => { self.enable_avx2=false; self.enable_avxvnni=false; self.enable_avxvnniint8=false; self.enable_avxvnniint16=false; }
-                "-mno-avx" => { self.enable_avx=false; self.enable_avx2=false; self.enable_avxvnni=false; self.enable_vaes=false; self.enable_vpclmulqdq=false; }
-                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => { self.enable_sse3=false; self.enable_ssse3=false; self.enable_sse4_1=false; self.enable_sse4_2=false; self.enable_avx=false; self.enable_avx2=false; }
+                "-mno-avx2" => {
+                    self.enable_avx2 = false;
+                    self.enable_avxvnni = false;
+                    self.enable_avxvnniint8 = false;
+                    self.enable_avxvnniint16 = false;
+                }
+                "-mno-avx" => {
+                    self.enable_avx = false;
+                    self.enable_avx2 = false;
+                    self.enable_avxvnni = false;
+                    self.enable_vaes = false;
+                    self.enable_vpclmulqdq = false;
+                }
+                "-mno-sse3" | "-mno-ssse3" | "-mno-sse4" | "-mno-sse4.1" | "-mno-sse4.2" => {
+                    self.enable_sse3 = false;
+                    self.enable_ssse3 = false;
+                    self.enable_sse4_1 = false;
+                    self.enable_sse4_2 = false;
+                    self.enable_avx = false;
+                    self.enable_avx2 = false;
+                }
                 // Positive SIMD feature flags: define corresponding macros.
                 // -mavx2 implies -mavx implies -msse4.2 implies -msse4.1 implies
                 // -mssse3 implies -msse3 (matching GCC's implication chain).
@@ -805,7 +951,10 @@ impl Driver {
                 "-mavxvnni" => self.enable_avxvnni = true,
                 "-mavxifma" => self.enable_avxifma = true,
                 "-mavxneconvert" => self.enable_avxneconvert = true,
-                "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256" | "-mavx10.2-512" => return Err("AVX10 code generation is not implemented".to_string()),
+                "-mavx10.1" | "-mavx10.1-256" | "-mavx10.1-512" | "-mavx10.2" | "-mavx10.2-256"
+                | "-mavx10.2-512" => {
+                    return Err("AVX10 code generation is not implemented".to_string())
+                }
                 "-mgfni" => self.enable_gfni = true,
                 "-mavxvnniint8" => self.enable_avxvnniint8 = true,
                 "-mavxvnniint16" => self.enable_avxvnniint16 = true,
@@ -851,7 +1000,8 @@ impl Driver {
                 "-mno-avx10.2" => self.enable_avx10_2 = false,
                 "-mno-gfni" => self.enable_gfni = false,
                 "-mno-vaes" => self.enable_vaes = false,
-                "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt" | "-mno-xsavec" => {},
+                "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
+                | "-mno-xsavec" => {}
                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
                 "-mavx2" => self.enable_x86_avx2_profile(),
                 "-mavx" => {
@@ -886,7 +1036,8 @@ impl Driver {
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mgeneral-regs-only" => self.general_regs_only = true,
                 "-mcmodel=kernel" => self.code_model_kernel = true,
-                "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany" | "-mcmodel=large" => {
+                "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
+                | "-mcmodel=large" => {
                     self.code_model_kernel = false;
                 }
                 arg if arg.starts_with("-mabi=") => {
@@ -906,11 +1057,13 @@ impl Driver {
                             // are honored independently. Real-mode setup code
                             // executes on the boot CPU — a physical x86-64
                             // machine — so the i686 baseline is sound there.
-                            "i386" | "i486" | "i586" | "i686"
-                            | "pentium" | "pentiumpro" | "pentium-mmx" => {
+                            "i386" | "i486" | "i586" | "i686" | "pentium" | "pentiumpro"
+                            | "pentium-mmx" => {
                                 if self.target != Target::I686 {
                                     return Err(format!(
-                                        "-march={} is only valid with -m32/-m16 (i686 target)", march));
+                                        "-march={} is only valid with -m32/-m16 (i686 target)",
+                                        march
+                                    ));
                                 }
                             }
                             "nehalem" => self.enable_x86_nehalem_profile(),
@@ -919,24 +1072,45 @@ impl Driver {
                             "ivybridge" => self.enable_x86_ivybridge_profile(),
                             "silvermont" => self.enable_x86_silvermont_profile(),
                             "goldmont" => self.enable_x86_goldmont_profile(),
-                            "x86-64-v2" => { self.enable_x86_nehalem_profile(); }
+                            "x86-64-v2" => {
+                                self.enable_x86_nehalem_profile();
+                            }
                             "x86-64-v3" => self.enable_x86_v3_profile(),
-                            "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => self.enable_x86_haswell_profile(),
+                            "haswell" | "broadwell" | "skylake" | "znver1" | "znver2" => {
+                                self.enable_x86_haswell_profile()
+                            }
                             "znver3" => self.enable_x86_znver3_profile(),
                             "znver4" => self.enable_x86_znver4_profile(),
                             "znver5" => self.enable_x86_znver5_profile(),
-                            "alderlake" | "raptorlake" | "raptor-lake" => self.enable_x86_alderlake_profile(),
+                            "alderlake" | "raptorlake" | "raptor-lake" => {
+                                self.enable_x86_alderlake_profile()
+                            }
                             "arrowlake" => self.enable_x86_arrowlake_profile(),
-                            "arrowlake-s" | "lunarlake" | "wildcatlake" => { self.enable_x86_arrowlake_profile(); self.enable_avxvnniint16=true; }
+                            "arrowlake-s" | "lunarlake" | "wildcatlake" => {
+                                self.enable_x86_arrowlake_profile();
+                                self.enable_avxvnniint16 = true;
+                            }
                             "x86-64-v4" => self.enable_x86_avx512_profile(),
                             "skylake-avx512" => self.enable_x86_avx512_cpu_profile(),
                             "cascadelake" => self.enable_x86_cascadelake_profile(),
                             "cooperlake" => self.enable_x86_cooperlake_profile(),
-                            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => self.enable_x86_icelake_profile(),
-                            "sapphirerapids" | "graniterapids" | "graniterapids-d" => self.enable_x86_sapphirerapids_profile(),
+                            "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => {
+                                self.enable_x86_icelake_profile()
+                            }
+                            "sapphirerapids" | "graniterapids" | "graniterapids-d" => {
+                                self.enable_x86_sapphirerapids_profile()
+                            }
                             "knl" => self.enable_x86_knl_profile(),
-                            "knm" => { self.enable_x86_knl_profile(); self.enable_avx512vpopcntdq=true; }
-                            "novalake" | "diamondrapids" => return Err(format!("-march={} requires unimplemented AVX10/APX lowering", march)),
+                            "knm" => {
+                                self.enable_x86_knl_profile();
+                                self.enable_avx512vpopcntdq = true;
+                            }
+                            "novalake" | "diamondrapids" => {
+                                return Err(format!(
+                                    "-march={} requires unimplemented AVX10/APX lowering",
+                                    march
+                                ))
+                            }
                             "native" => {
                                 // Detect the HOST CPU's features. Only
                                 // meaningful when the compiler itself runs on
@@ -946,21 +1120,51 @@ impl Driver {
                                 #[cfg(target_arch = "x86_64")]
                                 {
                                     self.no_sse = false;
-                                    if std::arch::is_x86_feature_detected!("sse3") { self.enable_sse3 = true; }
-                                    if std::arch::is_x86_feature_detected!("ssse3") { self.enable_ssse3 = true; }
-                                    if std::arch::is_x86_feature_detected!("sse4.1") { self.enable_sse4_1 = true; }
-                                    if std::arch::is_x86_feature_detected!("sse4.2") { self.enable_sse4_2 = true; }
-                                    if std::arch::is_x86_feature_detected!("avx") { self.enable_avx = true; }
-                                    if std::arch::is_x86_feature_detected!("avx2") { self.enable_avx2 = true; }
-                                    if std::arch::is_x86_feature_detected!("fma") { self.enable_fma = true; }
-                                    if std::arch::is_x86_feature_detected!("bmi1") { self.enable_bmi = true; }
-                                    if std::arch::is_x86_feature_detected!("bmi2") { self.enable_bmi2 = true; }
-                                    if std::arch::is_x86_feature_detected!("lzcnt") { self.enable_lzcnt = true; }
-                                    if std::arch::is_x86_feature_detected!("movbe") { self.enable_movbe = true; }
-                                    if std::arch::is_x86_feature_detected!("aes") { self.enable_aes = true; }
-                                    if std::arch::is_x86_feature_detected!("pclmulqdq") { self.enable_pclmul = true; }
-                                    if std::arch::is_x86_feature_detected!("f16c") { self.enable_f16c = true; }
-                                    if std::arch::is_x86_feature_detected!("avx512f") { self.enable_x86_avx512_profile(); }
+                                    if std::arch::is_x86_feature_detected!("sse3") {
+                                        self.enable_sse3 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("ssse3") {
+                                        self.enable_ssse3 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("sse4.1") {
+                                        self.enable_sse4_1 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("sse4.2") {
+                                        self.enable_sse4_2 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("avx") {
+                                        self.enable_avx = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("avx2") {
+                                        self.enable_avx2 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("fma") {
+                                        self.enable_fma = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("bmi1") {
+                                        self.enable_bmi = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("bmi2") {
+                                        self.enable_bmi2 = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("lzcnt") {
+                                        self.enable_lzcnt = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("movbe") {
+                                        self.enable_movbe = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("aes") {
+                                        self.enable_aes = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("pclmulqdq") {
+                                        self.enable_pclmul = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("f16c") {
+                                        self.enable_f16c = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("avx512f") {
+                                        self.enable_x86_avx512_profile();
+                                    }
                                 }
                                 #[cfg(not(target_arch = "x86_64"))]
                                 {
@@ -969,7 +1173,13 @@ impl Driver {
                             }
                             _ => return Err(format!("unsupported x86 -march={}", march)),
                         },
-                        _ => return Err(format!("-march={} is not implemented for target {}", march, self.target.triple())),
+                        _ => {
+                            return Err(format!(
+                                "-march={} is not implemented for target {}",
+                                march,
+                                self.target.triple()
+                            ))
+                        }
                     }
                 }
                 arg if arg.starts_with("-mtune=") => {
@@ -981,8 +1191,14 @@ impl Driver {
                             // stored but otherwise ignored – matching GCC's permissive
                             // handling and ensuring configure scripts never abort.
                             self.x86_tune = Some(tune.to_string());
-                        },
-                        _ => return Err(format!("-mtune={} is not implemented for target {}", tune, self.target.triple())),
+                        }
+                        _ => {
+                            return Err(format!(
+                                "-mtune={} is not implemented for target {}",
+                                tune,
+                                self.target.triple()
+                            ))
+                        }
                     }
                 }
                 "-mlittle-endian" => {
@@ -1020,14 +1236,18 @@ impl Driver {
                 arg if arg.starts_with("-mpreferred-stack-boundary=")
                     || arg.starts_with("-mstack-alignment=") =>
                 {
-                    let (val, log2) = if let Some(v) = arg.strip_prefix("-mpreferred-stack-boundary=") {
-                        (v, true)
-                    } else {
-                        (&arg["-mstack-alignment=".len()..], false)
-                    };
-                    let n: u32 = val.parse().map_err(|_| format!("invalid argument to {}", arg))?;
+                    let (val, log2) =
+                        if let Some(v) = arg.strip_prefix("-mpreferred-stack-boundary=") {
+                            (v, true)
+                        } else {
+                            (&arg["-mstack-alignment=".len()..], false)
+                        };
+                    let n: u32 = val
+                        .parse()
+                        .map_err(|_| format!("invalid argument to {}", arg))?;
                     let bytes = if log2 {
-                        1u32.checked_shl(n).ok_or_else(|| format!("invalid argument to {}", arg))?
+                        1u32.checked_shl(n)
+                            .ok_or_else(|| format!("invalid argument to {}", arg))?
                     } else {
                         n
                     };
@@ -1055,7 +1275,9 @@ impl Driver {
                 arg if arg.starts_with("-mno-") => {
                     if std::env::var("LCCC_STRICT_MFLAGS").is_ok() {
                         return Err(format!(
-                            "unsupported machine option {}; LCCC_STRICT_MFLAGS is set", arg));
+                            "unsupported machine option {}; LCCC_STRICT_MFLAGS is set",
+                            arg
+                        ));
                     }
                 }
                 arg if arg.starts_with("-m") => {
@@ -1066,12 +1288,20 @@ impl Driver {
                 "-fprofile-generate" => self.pgo_generate = Some(".".to_string()),
                 arg if arg.starts_with("-fprofile-generate=") => {
                     let path = arg["-fprofile-generate=".len()..].to_string();
-                    self.pgo_generate = Some(if path.is_empty() { ".".to_string() } else { path });
+                    self.pgo_generate = Some(if path.is_empty() {
+                        ".".to_string()
+                    } else {
+                        path
+                    });
                 }
                 "-fprofile-use" => self.pgo_use = Some(".".to_string()),
                 arg if arg.starts_with("-fprofile-use=") => {
                     let path = arg["-fprofile-use=".len()..].to_string();
-                    self.pgo_use = Some(if path.is_empty() { ".".to_string() } else { path });
+                    self.pgo_use = Some(if path.is_empty() {
+                        ".".to_string()
+                    } else {
+                        path
+                    });
                 }
                 "-fprofile-arcs" => self.pgo_generate = Some(".".to_string()),
                 "-ftest-coverage" => self.pgo_generate = Some(".".to_string()),
@@ -1085,19 +1315,28 @@ impl Driver {
                         _ => "single".to_string(),
                     });
                 }
-                "-fbranch-probabilities" => self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string())),
+                "-fbranch-probabilities" => {
+                    self.pgo_use = Some(self.pgo_use.clone().unwrap_or_else(|| ".".to_string()))
+                }
                 arg if arg.starts_with("-fprofile-dir=") => {
                     let path = arg["-fprofile-dir=".len()..].to_string();
-                    if self.pgo_generate.is_some() { self.pgo_generate = Some(path.clone()); }
-                    if self.pgo_use.is_some() { self.pgo_use = Some(path); }
+                    if self.pgo_generate.is_some() {
+                        self.pgo_generate = Some(path.clone());
+                    }
+                    if self.pgo_use.is_some() {
+                        self.pgo_use = Some(path);
+                    }
                 }
                 "-fauto-profile" => self.pgo_use = Some(".".to_string()),
                 arg if arg.starts_with("-fauto-profile=") => {
                     let path = arg["-fauto-profile=".len()..].to_string();
                     self.pgo_use = Some(path);
                 }
-                "-fno-profile-arcs" | "-fno-test-coverage" | "-fno-branch-probabilities" | "-fno-auto-profile" => {},
-                arg if arg.starts_with("-fno-profile") => {},
+                "-fno-profile-arcs"
+                | "-fno-test-coverage"
+                | "-fno-branch-probabilities"
+                | "-fno-auto-profile" => {}
+                arg if arg.starts_with("-fno-profile") => {}
 
                 // Feature flags. Full PIC and PIE have different x86-64 data
                 // relocation rules, so preserve the last explicit mode rather
@@ -1114,18 +1353,26 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
-                "-fcf-protection=branch" | "-fcf-protection=full" => self.cf_protection_branch = true,
+                "-fcf-protection=branch" | "-fcf-protection=full" => {
+                    self.cf_protection_branch = true
+                }
                 "-fcf-protection=none" => self.cf_protection_branch = false,
                 arg if arg.starts_with("-fpatchable-function-entry=") => {
                     let val = &arg["-fpatchable-function-entry=".len()..];
                     let parts: Vec<&str> = val.split(',').collect();
                     let total: u32 = parts[0].parse().unwrap_or(0);
-                    let before: u32 = if parts.len() > 1 { parts[1].parse().unwrap_or(0) } else { 0 };
+                    let before: u32 = if parts.len() > 1 {
+                        parts[1].parse().unwrap_or(0)
+                    } else {
+                        0
+                    };
                     self.patchable_function_entry = Some((total, before));
                 }
                 "-fomit-frame-pointer" => self.omit_frame_pointer = true,
                 "-fno-omit-frame-pointer" => self.omit_frame_pointer = false,
-                "-fno-asynchronous-unwind-tables" | "-fno-unwind-tables" => self.no_unwind_tables = true,
+                "-fno-asynchronous-unwind-tables" | "-fno-unwind-tables" => {
+                    self.no_unwind_tables = true
+                }
                 "-fasynchronous-unwind-tables" | "-funwind-tables" => self.no_unwind_tables = false,
                 "-fno-jump-tables" => self.no_jump_tables = true,
                 "-ffunction-sections" => self.function_sections = true,
@@ -1209,7 +1456,9 @@ impl Driver {
                 a @ ("-pg" | "-mfentry" | "-mrecord-mcount" | "-mnop-mcount") => {
                     return Err(format!(
                         "{}: LCCC does not implement function-entry instrumentation \
-                         (no __fentry__/mcount call is emitted)", a));
+                         (no __fentry__/mcount call is emitted)",
+                        a
+                    ));
                 }
                 // Stack-protector request. LCCC does NOT emit canaries, so
                 // silently accepting these would hand the caller a binary it
@@ -1222,12 +1471,16 @@ impl Driver {
                 | "-fstack-protector-explicit") => {
                     return Err(format!(
                         "{}: LCCC does not implement stack-protector canaries; \
-                         build with -fno-stack-protector", a));
+                         build with -fno-stack-protector",
+                        a
+                    ));
                 }
                 arg if arg.starts_with("-mstack-protector-guard") => {
                     return Err(format!(
                         "{}: LCCC does not implement stack-protector canaries; \
-                         build with -fno-stack-protector", arg));
+                         build with -fno-stack-protector",
+                        arg
+                    ));
                 }
                 arg if arg.starts_with("-f") => {}
 
@@ -1404,8 +1657,14 @@ mod cli_tests {
     #[test]
     fn mno_feature_flags_are_accepted() {
         for f in [
-            "-mno-sse4a", "-mno-3dnowa", "-mno-avx512vbmi2", "-mno-tbm",
-            "-mno-xop", "-mno-fma4", "-mno-rtm", "-mno-hle",
+            "-mno-sse4a",
+            "-mno-3dnowa",
+            "-mno-avx512vbmi2",
+            "-mno-tbm",
+            "-mno-xop",
+            "-mno-fma4",
+            "-mno-rtm",
+            "-mno-hle",
         ] {
             assert!(try_flag(f).is_ok(), "{} must be accepted", f);
         }
@@ -1448,15 +1707,23 @@ mod cli_tests {
     #[test]
     fn unimplemented_hardening_is_refused_not_ignored() {
         for f in [
-            "-fstack-protector", "-fstack-protector-all",
-            "-fstack-protector-strong", "-fstack-protector-explicit",
+            "-fstack-protector",
+            "-fstack-protector-all",
+            "-fstack-protector-strong",
+            "-fstack-protector-explicit",
             "-mstack-protector-guard=global",
             "-mstack-protector-guard-reg=gs",
             "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
-            "-pg", "-mfentry", "-mrecord-mcount", "-mnop-mcount",
+            "-pg",
+            "-mfentry",
+            "-mrecord-mcount",
+            "-mnop-mcount",
         ] {
-            assert!(try_flag(f).is_err(),
-                    "{} must be refused, not silently ignored", f);
+            assert!(
+                try_flag(f).is_err(),
+                "{} must be refused, not silently ignored",
+                f
+            );
         }
         // The opposite request is exactly what LCCC already does.
         assert!(try_flag("-fno-stack-protector").is_ok());
@@ -1469,7 +1736,9 @@ mod cli_tests {
         assert!(try_flag("-mskip-rax-setup").is_ok());
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "-mskip-rax-setup", "-mno-sse", "x.c"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert!(d.parse_cli_args(&args).is_ok());
     }
 
@@ -1478,38 +1747,57 @@ mod cli_tests {
         let mut strict = Driver::new();
         let strict_args = vec!["lccc".to_string(), "-O3".to_string(), "x.c".to_string()];
         strict.parse_cli_args(&strict_args).unwrap();
-        assert!(!strict.fp_reassoc, "-O3 alone must preserve FP reduction order");
+        assert!(
+            !strict.fp_reassoc,
+            "-O3 alone must preserve FP reduction order"
+        );
 
         let mut fast = Driver::new();
-        let fast_args = vec!["lccc".to_string(), "-ffast-math".to_string(), "x.c".to_string()];
+        let fast_args = vec![
+            "lccc".to_string(),
+            "-ffast-math".to_string(),
+            "x.c".to_string(),
+        ];
         fast.parse_cli_args(&fast_args).unwrap();
         assert!(fast.fp_reassoc);
         assert!(fast.fast_math);
 
         let mut associative = Driver::new();
         let associative_args = vec![
-            "lccc".to_string(), "-fassociative-math".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-fassociative-math".to_string(),
+            "x.c".to_string(),
         ];
         associative.parse_cli_args(&associative_args).unwrap();
         assert!(associative.fp_reassoc);
-        assert!(!associative.fast_math, "individual flags must not define __FAST_MATH__");
+        assert!(
+            !associative.fast_math,
+            "individual flags must not define __FAST_MATH__"
+        );
 
         let mut disabled = Driver::new();
         let disabled_args = vec![
-            "lccc".to_string(), "-ffast-math".to_string(),
-            "-fno-associative-math".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-ffast-math".to_string(),
+            "-fno-associative-math".to_string(),
+            "x.c".to_string(),
         ];
         disabled.parse_cli_args(&disabled_args).unwrap();
         assert!(!disabled.fp_reassoc);
-        assert!(disabled.fast_math, "GCC keeps __FAST_MATH__ for this option sequence");
+        assert!(
+            disabled.fast_math,
+            "GCC keeps __FAST_MATH__ for this option sequence"
+        );
     }
 
     #[test]
     fn fp_contract_is_independent_and_last_option_wins() {
         let mut explicit = Driver::new();
         let args = vec![
-            "lccc".to_string(), "-fassociative-math".to_string(),
-            "-ffp-contract=fast".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-fassociative-math".to_string(),
+            "-ffp-contract=fast".to_string(),
+            "x.c".to_string(),
         ];
         explicit.parse_cli_args(&args).unwrap();
         assert!(explicit.fp_reassoc);
@@ -1517,17 +1805,24 @@ mod cli_tests {
 
         let mut disabled = Driver::new();
         let args = vec![
-            "lccc".to_string(), "-ffast-math".to_string(),
-            "-ffp-contract=off".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-ffast-math".to_string(),
+            "-ffp-contract=off".to_string(),
+            "x.c".to_string(),
         ];
         disabled.parse_cli_args(&args).unwrap();
-        assert!(disabled.fp_reassoc, "contract-off must not disable reassociation");
+        assert!(
+            disabled.fp_reassoc,
+            "contract-off must not disable reassociation"
+        );
         assert!(!disabled.fp_contract_fast);
 
         let mut reen = Driver::new();
         let args = vec![
-            "lccc".to_string(), "-ffp-contract=off".to_string(),
-            "-ffp-contract=fast".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-ffp-contract=off".to_string(),
+            "-ffp-contract=fast".to_string(),
+            "x.c".to_string(),
         ];
         reen.parse_cli_args(&args).unwrap();
         assert!(reen.fp_contract_fast);
@@ -1536,25 +1831,38 @@ mod cli_tests {
         let mut dflt = Driver::new();
         let args = vec!["lccc".to_string(), "x.c".to_string()];
         dflt.parse_cli_args(&args).unwrap();
-        assert!(dflt.fp_contract_fast, "gnu-C default must contract (GCC parity)");
+        assert!(
+            dflt.fp_contract_fast,
+            "gnu-C default must contract (GCC parity)"
+        );
 
         // Explicit contract flag is sticky against later -ffast-math
         // (GCC opts_set semantics), in BOTH orders.
         let mut sticky = Driver::new();
         let args = vec![
-            "lccc".to_string(), "-ffp-contract=off".to_string(),
-            "-ffast-math".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-ffp-contract=off".to_string(),
+            "-ffast-math".to_string(),
+            "x.c".to_string(),
         ];
         sticky.parse_cli_args(&args).unwrap();
-        assert!(!sticky.fp_contract_fast, "explicit off survives -ffast-math");
+        assert!(
+            !sticky.fp_contract_fast,
+            "explicit off survives -ffast-math"
+        );
 
         // -fno-fast-math restores the default (fast), it does not force off.
         let mut nfm = Driver::new();
         let args = vec![
-            "lccc".to_string(), "-fno-fast-math".to_string(), "x.c".to_string(),
+            "lccc".to_string(),
+            "-fno-fast-math".to_string(),
+            "x.c".to_string(),
         ];
         nfm.parse_cli_args(&args).unwrap();
-        assert!(nfm.fp_contract_fast, "-fno-fast-math keeps the fast default");
+        assert!(
+            nfm.fp_contract_fast,
+            "-fno-fast-math keeps the fast default"
+        );
     }
 
     #[test]
@@ -1567,7 +1875,12 @@ mod cli_tests {
         assert!(cmp_version("10.2.0", "11.4.0") == std::cmp::Ordering::Less);
         assert!(cmp_version("4.9", "4.10") == std::cmp::Ordering::Less);
         // Newest-first sort used by -print-libgcc-file-name.
-        let mut v = vec!["10.2.0".to_string(), "9.5.0".to_string(), "16.1.1".to_string(), "12".to_string()];
+        let mut v = vec![
+            "10.2.0".to_string(),
+            "9.5.0".to_string(),
+            "16.1.1".to_string(),
+            "12".to_string(),
+        ];
         v.sort_by(|a, b| cmp_version(b, a));
         assert_eq!(v, vec!["16.1.1", "12", "10.2.0", "9.5.0"]);
     }
@@ -1576,18 +1889,35 @@ mod cli_tests {
     fn export_dynamic_is_not_swallowed_by_entry_matcher() {
         let mut d = Driver::new();
         let args: Vec<String> = ["lccc", "-export-dynamic", "x.c"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         d.parse_cli_args(&args).ok();
-        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"),
-            "linker items: {:?}", d.linker_ordered_items);
-        assert!(!d.linker_ordered_items.iter().any(|i| i.starts_with("-Wl,-e,")),
-            "must not be parsed as an entry-point flag: {:?}", d.linker_ordered_items);
+        assert!(
+            d.linker_ordered_items
+                .iter()
+                .any(|i| i == "-Wl,--export-dynamic"),
+            "linker items: {:?}",
+            d.linker_ordered_items
+        );
+        assert!(
+            !d.linker_ordered_items
+                .iter()
+                .any(|i| i.starts_with("-Wl,-e,")),
+            "must not be parsed as an entry-point flag: {:?}",
+            d.linker_ordered_items
+        );
         // --export-dynamic long form too.
         let mut d2 = Driver::new();
         let args2: Vec<String> = ["lccc", "--export-dynamic", "x.c"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         d2.parse_cli_args(&args2).ok();
-        assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,--export-dynamic"));
+        assert!(d2
+            .linker_ordered_items
+            .iter()
+            .any(|i| i == "-Wl,--export-dynamic"));
     }
 
     #[test]
@@ -1595,12 +1925,20 @@ mod cli_tests {
         // -e SYMBOL must keep mapping to -Wl,-e,SYMBOL.
         let mut d = Driver::new();
         let args: Vec<String> = ["lccc", "-e", "__libc_main", "x.c"]
-            .iter().map(|s| s.to_string()).collect();
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         d.parse_cli_args(&args).ok();
-        assert!(d.linker_ordered_items.iter().any(|i| i == "-Wl,-e,__libc_main"));
+        assert!(d
+            .linker_ordered_items
+            .iter()
+            .any(|i| i == "-Wl,-e,__libc_main"));
         // -eSYMBOL compact form.
         let mut d2 = Driver::new();
-        let args2: Vec<String> = ["lccc", "-emain", "x.c"].iter().map(|s| s.to_string()).collect();
+        let args2: Vec<String> = ["lccc", "-emain", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         d2.parse_cli_args(&args2).ok();
         assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
     }

@@ -19,19 +19,15 @@
 //!   undefined, largest COMMON wins, duplicate strong definitions error.
 //! * Local symbols (including STT_FILE) are all preserved, values rebased.
 
-use crate::backend::elf::{push_strtab_name, elf64_sym_entry};
+use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_REL, EM_X86_64,
-    SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_RELA, SHT_REL,
-    SHT_NOBITS, SHT_GROUP,
-    STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_SECTION, STT_FILE,
-    SHN_UNDEF, SHN_ABS, SHN_COMMON,
-    read_u32, w16, w32, w64,
+    read_u32, w16, w32, w64, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, EM_X86_64, ET_REL, SHN_ABS,
+    SHN_COMMON, SHN_UNDEF, SHT_GROUP, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL, SHT_RELA,
+    SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_SECTION,
 };
-use crate::backend::linker_common::{Elf64Object, write_elf64_shdr};
+use crate::backend::linker_common::{write_elf64_shdr, Elf64Object};
 
 /// One merged output section under construction.
 struct RelOutSec {
@@ -45,31 +41,40 @@ struct RelOutSec {
     inputs: Vec<(usize, usize, u64)>,
 }
 
-pub fn link_relocatable(
-    objects: &[Elf64Object],
-    output_path: &str,
-) -> Result<(), String> {
+pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<(), String> {
     // ── 1. COMDAT group deduplication ──────────────────────────────────
     // dead: input sections dropped because their group lost.
     let mut dead: FxHashSet<(usize, usize)> = FxHashSet::default();
     let mut group_signatures: FxHashSet<String> = FxHashSet::default();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.sh_type != SHT_GROUP { continue; }
+            if sec.sh_type != SHT_GROUP {
+                continue;
+            }
             let data = &obj.section_data[si];
-            if data.len() < 4 { continue; }
+            if data.len() < 4 {
+                continue;
+            }
             let flags = read_u32(data, 0);
-            if flags & 1 == 0 { continue; } // not GRP_COMDAT
-            // Signature symbol: symtab entry sec.info
+            if flags & 1 == 0 {
+                continue;
+            } // not GRP_COMDAT
+              // Signature symbol: symtab entry sec.info
             let sig_idx = sec.info as usize;
-            let sig = obj.symbols.get(sig_idx)
+            let sig = obj
+                .symbols
+                .get(sig_idx)
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
-            if sig.is_empty() { continue; }
+            if sig.is_empty() {
+                continue;
+            }
             let is_dup = !group_signatures.insert(sig.to_string());
             if is_dup {
                 for k in (4..data.len()).step_by(4) {
-                    if k + 4 > data.len() { break; }
+                    if k + 4 > data.len() {
+                        break;
+                    }
                     let member = read_u32(data, k) as usize;
                     if member < obj.sections.len() {
                         dead.insert((oi, member));
@@ -87,12 +92,18 @@ pub fn link_relocatable(
 
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            if matches!(sec.sh_type,
-                SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_RELA | SHT_REL | SHT_GROUP) {
+            if matches!(
+                sec.sh_type,
+                SHT_NULL | SHT_SYMTAB | SHT_STRTAB | SHT_RELA | SHT_REL | SHT_GROUP
+            ) {
                 continue;
             }
-            if sec.name.is_empty() { continue; }
-            if dead.contains(&(oi, si)) { continue; }
+            if sec.name.is_empty() {
+                continue;
+            }
+            if dead.contains(&(oi, si)) {
+                continue;
+            }
 
             let idx = match out_by_name.get(&sec.name) {
                 Some(&i) => i,
@@ -114,10 +125,16 @@ pub fn link_relocatable(
             let os = &mut out_secs[idx];
             // Flags are OR'd; PROGBITS wins over NOBITS if mixed (GNU rule).
             os.flags |= sec.flags;
-            if sec.sh_type == SHT_PROGBITS { os.sh_type = SHT_PROGBITS; }
-            if sec.entsize != os.entsize { os.entsize = 0; } // mixed entsize: clear
+            if sec.sh_type == SHT_PROGBITS {
+                os.sh_type = SHT_PROGBITS;
+            }
+            if sec.entsize != os.entsize {
+                os.entsize = 0;
+            } // mixed entsize: clear
             let a = sec.addralign.max(1);
-            if a > os.align { os.align = a; }
+            if a > os.align {
+                os.align = a;
+            }
             let off = (os.size + a - 1) & !(a - 1);
             os.inputs.push((oi, si, off));
             os.size = off + sec.size;
@@ -165,7 +182,9 @@ pub fn link_relocatable(
     for (oi, obj) in objects.iter().enumerate() {
         let mut remap: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
         for (yi, sym) in obj.symbols.iter().enumerate() {
-            if !sym.is_local() { continue; }
+            if !sym.is_local() {
+                continue;
+            }
             if sym.sym_type() == STT_SECTION {
                 // Redirect to the output section symbol with addend rebase.
                 if let Some(&(out_i, off)) = sec_map.get(&(oi, sym.shndx as usize)) {
@@ -177,15 +196,21 @@ pub fn link_relocatable(
                 let new_idx = (out_syms.len() + 1) as u32;
                 remap.insert(yi as u32, (new_idx, 0));
                 out_syms.push(OutSym {
-                    name: sym.name.to_string(), info: sym.info, other: sym.other,
-                    shndx_kind: SymShndx::Abs, value: 0, size: 0,
+                    name: sym.name.to_string(),
+                    info: sym.info,
+                    other: sym.other,
+                    shndx_kind: SymShndx::Abs,
+                    value: 0,
+                    size: 0,
                 });
                 continue;
             }
             // Skip locals defined in dead (COMDAT-loser) sections; any
             // reloc that still points at them is a malformed input.
-            if sym.shndx != SHN_UNDEF && sym.shndx != SHN_ABS
-                && dead.contains(&(oi, sym.shndx as usize)) {
+            if sym.shndx != SHN_UNDEF
+                && sym.shndx != SHN_ABS
+                && dead.contains(&(oi, sym.shndx as usize))
+            {
                 continue;
             }
             let (shndx_kind, value) = if sym.shndx == SHN_ABS {
@@ -200,8 +225,12 @@ pub fn link_relocatable(
             let new_idx = (out_syms.len() + 1) as u32;
             remap.insert(yi as u32, (new_idx, 0));
             out_syms.push(OutSym {
-                name: sym.name.to_string(), info: sym.info, other: sym.other,
-                shndx_kind, value, size: sym.size,
+                name: sym.name.to_string(),
+                info: sym.info,
+                other: sym.other,
+                shndx_kind,
+                value,
+                size: sym.size,
             });
         }
         remaps.push(remap);
@@ -213,12 +242,17 @@ pub fn link_relocatable(
     let mut global_idx: FxHashMap<String, usize> = FxHashMap::default();
     for (oi, obj) in objects.iter().enumerate() {
         for (yi, sym) in obj.symbols.iter().enumerate() {
-            if sym.is_local() || sym.name.is_empty() { continue; }
-            if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
+            if sym.is_local() || sym.name.is_empty() {
+                continue;
+            }
+            if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+                continue;
+            }
 
             // Definitions inside dead COMDAT sections become non-definitions
             // (their surviving twin provides the symbol).
-            let in_dead = sym.shndx != SHN_UNDEF && sym.shndx != SHN_ABS
+            let in_dead = sym.shndx != SHN_UNDEF
+                && sym.shndx != SHN_ABS
                 && sym.shndx != SHN_COMMON
                 && dead.contains(&(oi, sym.shndx as usize));
 
@@ -243,36 +277,51 @@ pub fn link_relocatable(
                     global_idx.insert(sym.name.to_string(), idx);
                     remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
                     out_syms.push(OutSym {
-                        name: sym.name.to_string(), info: sym.info, other: sym.other,
-                        shndx_kind, value, size: sym.size,
+                        name: sym.name.to_string(),
+                        info: sym.info,
+                        other: sym.other,
+                        shndx_kind,
+                        value,
+                        size: sym.size,
                     });
                 }
                 Some(&idx) => {
                     remaps[oi].insert(yi as u32, ((idx + 1) as u32, 0));
                     let existing = &mut out_syms[idx];
-                    let e_defined = !matches!(existing.shndx_kind,
-                        SymShndx::Undef | SymShndx::Common);
+                    let e_defined =
+                        !matches!(existing.shndx_kind, SymShndx::Undef | SymShndx::Common);
                     let e_weak = existing.info >> 4 == STB_WEAK;
                     let e_common = matches!(existing.shndx_kind, SymShndx::Common);
                     if is_defined {
                         if !e_defined || (e_weak && sym.is_global()) {
                             *existing = OutSym {
-                                name: sym.name.to_string(), info: sym.info, other: sym.other,
-                                shndx_kind, value, size: sym.size,
+                                name: sym.name.to_string(),
+                                info: sym.info,
+                                other: sym.other,
+                                shndx_kind,
+                                value,
+                                size: sym.size,
                             };
                         } else if e_defined && !e_weak && sym.is_global() {
                             return Err(format!(
                                 "-r: multiple definition of '{}' (duplicate in {})",
-                                sym.name, obj.source_name));
+                                sym.name, obj.source_name
+                            ));
                         }
                     } else if is_common {
                         if e_common && sym.size > existing.size {
                             existing.size = sym.size;
-                            if sym.value > existing.value { existing.value = sym.value; }
+                            if sym.value > existing.value {
+                                existing.value = sym.value;
+                            }
                         } else if !e_defined && !e_common {
                             *existing = OutSym {
-                                name: sym.name.to_string(), info: sym.info, other: sym.other,
-                                shndx_kind: SymShndx::Common, value, size: sym.size,
+                                name: sym.name.to_string(),
+                                info: sym.info,
+                                other: sym.other,
+                                shndx_kind: SymShndx::Common,
+                                value,
+                                size: sym.size,
                             };
                         }
                     }
@@ -293,7 +342,11 @@ pub fn link_relocatable(
         // Executable sections: fill alignment gaps with NOP (0x90), matching
         // GNU ld. Zero bytes between functions break instruction-stream
         // consumers (objtool: "can't find starting instruction").
-        let fill: u8 = if os.flags & SHF_EXECINSTR != 0 { 0x90 } else { 0x00 };
+        let fill: u8 = if os.flags & SHF_EXECINSTR != 0 {
+            0x90
+        } else {
+            0x00
+        };
         let mut data = vec![fill; os.size as usize];
         for &(oi, si, off) in &os.inputs {
             let sd = &objects[oi].section_data[si];
@@ -310,8 +363,12 @@ pub fn link_relocatable(
     let mut rela_datas: Vec<Vec<u8>> = vec![Vec::new(); n_out];
     for (oi, obj) in objects.iter().enumerate() {
         for (si, relas) in obj.relocations.iter().enumerate() {
-            if relas.is_empty() { continue; }
-            let Some(&(out_i, base_off)) = sec_map.get(&(oi, si)) else { continue };
+            if relas.is_empty() {
+                continue;
+            }
+            let Some(&(out_i, base_off)) = sec_map.get(&(oi, si)) else {
+                continue;
+            };
             let rd = &mut rela_datas[out_i];
             rd.reserve(relas.len() * 24);
             for rela in relas {
@@ -332,7 +389,8 @@ pub fn link_relocatable(
                             None => {
                                 return Err(format!(
                                     "-r: relocation against dropped symbol in {}",
-                                    obj.source_name));
+                                    obj.source_name
+                                ));
                             }
                         }
                     }
@@ -372,7 +430,9 @@ pub fn link_relocatable(
     let mut strtab: Vec<u8> = vec![0];
     let mut str_off: FxHashMap<String, u32> = FxHashMap::default();
     for s in &out_syms {
-        let noff: u32 = if s.name.is_empty() { 0 } else {
+        let noff: u32 = if s.name.is_empty() {
+            0
+        } else {
             *str_off.entry(s.name.clone()).or_insert_with(|| {
                 let o = push_strtab_name(&mut strtab, s.name.as_bytes());
                 o
@@ -396,11 +456,20 @@ pub fn link_relocatable(
         t.push(0);
         o
     };
-    let sec_name_offs: Vec<u32> = out_secs.iter()
-        .map(|os| shstr(&mut shstrtab, &os.name)).collect();
-    let rela_name_offs: Vec<u32> = out_secs.iter().enumerate()
-        .map(|(i, os)| if rela_datas[i].is_empty() { 0 }
-             else { shstr(&mut shstrtab, &format!(".rela{}", os.name)) })
+    let sec_name_offs: Vec<u32> = out_secs
+        .iter()
+        .map(|os| shstr(&mut shstrtab, &os.name))
+        .collect();
+    let rela_name_offs: Vec<u32> = out_secs
+        .iter()
+        .enumerate()
+        .map(|(i, os)| {
+            if rela_datas[i].is_empty() {
+                0
+            } else {
+                shstr(&mut shstrtab, &format!(".rela{}", os.name))
+            }
+        })
         .collect();
     let symtab_name = shstr(&mut shstrtab, ".symtab");
     let strtab_name = shstr(&mut shstrtab, ".strtab");
@@ -412,7 +481,9 @@ pub fn link_relocatable(
     let mut sec_offsets: Vec<u64> = vec![0; n_out];
     for i in 0..n_out {
         let a = out_secs[i].align.max(1) as usize;
-        while out.len() % a != 0 { out.push(0); }
+        while out.len() % a != 0 {
+            out.push(0);
+        }
         sec_offsets[i] = out.len() as u64;
         if out_secs[i].sh_type != SHT_NOBITS {
             out.extend_from_slice(&sec_datas[i]);
@@ -420,56 +491,121 @@ pub fn link_relocatable(
     }
     let mut rela_offsets: Vec<u64> = vec![0; n_out];
     for i in 0..n_out {
-        if rela_datas[i].is_empty() { continue; }
-        while out.len() % 8 != 0 { out.push(0); }
+        if rela_datas[i].is_empty() {
+            continue;
+        }
+        while out.len() % 8 != 0 {
+            out.push(0);
+        }
         rela_offsets[i] = out.len() as u64;
         out.extend_from_slice(&rela_datas[i]);
     }
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
     let symtab_off = out.len() as u64;
     out.extend_from_slice(&symtab_data);
     let strtab_off = out.len() as u64;
     out.extend_from_slice(&strtab);
     let shstrtab_off = out.len() as u64;
     out.extend_from_slice(&shstrtab);
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
     let shoff = out.len() as u64;
 
     // Section headers.
     write_elf64_shdr(&mut out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     for i in 0..n_out {
         let os = &out_secs[i];
-        write_elf64_shdr(&mut out, sec_name_offs[i], os.sh_type, os.flags,
-            0, sec_offsets[i], os.size, 0, 0, os.align.max(1), os.entsize);
+        write_elf64_shdr(
+            &mut out,
+            sec_name_offs[i],
+            os.sh_type,
+            os.flags,
+            0,
+            sec_offsets[i],
+            os.size,
+            0,
+            0,
+            os.align.max(1),
+            os.entsize,
+        );
     }
     for i in 0..n_out {
-        if rela_datas[i].is_empty() { continue; }
-        write_elf64_shdr(&mut out, rela_name_offs[i], SHT_RELA, 0x40, // SHF_INFO_LINK
-            0, rela_offsets[i], rela_datas[i].len() as u64,
-            symtab_idx as u32, (i + 1) as u32, 8, 24);
+        if rela_datas[i].is_empty() {
+            continue;
+        }
+        write_elf64_shdr(
+            &mut out,
+            rela_name_offs[i],
+            SHT_RELA,
+            0x40, // SHF_INFO_LINK
+            0,
+            rela_offsets[i],
+            rela_datas[i].len() as u64,
+            symtab_idx as u32,
+            (i + 1) as u32,
+            8,
+            24,
+        );
     }
-    write_elf64_shdr(&mut out, symtab_name, SHT_SYMTAB, 0,
-        0, symtab_off, symtab_data.len() as u64,
-        strtab_idx as u32, n_local as u32, 8, 24);
-    write_elf64_shdr(&mut out, strtab_name, SHT_STRTAB, 0,
-        0, strtab_off, strtab.len() as u64, 0, 0, 1, 0);
-    write_elf64_shdr(&mut out, shstrtab_name, SHT_STRTAB, 0,
-        0, shstrtab_off, shstrtab.len() as u64, 0, 0, 1, 0);
+    write_elf64_shdr(
+        &mut out,
+        symtab_name,
+        SHT_SYMTAB,
+        0,
+        0,
+        symtab_off,
+        symtab_data.len() as u64,
+        strtab_idx as u32,
+        n_local as u32,
+        8,
+        24,
+    );
+    write_elf64_shdr(
+        &mut out,
+        strtab_name,
+        SHT_STRTAB,
+        0,
+        0,
+        strtab_off,
+        strtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
+    write_elf64_shdr(
+        &mut out,
+        shstrtab_name,
+        SHT_STRTAB,
+        0,
+        0,
+        shstrtab_off,
+        shstrtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
 
     // ELF header.
     out[0..4].copy_from_slice(&ELF_MAGIC);
-    out[4] = ELFCLASS64; out[5] = ELFDATA2LSB; out[6] = 1;
+    out[4] = ELFCLASS64;
+    out[5] = ELFDATA2LSB;
+    out[6] = 1;
     w16(&mut out, 16, ET_REL);
     w16(&mut out, 18, EM_X86_64);
     w32(&mut out, 20, 1);
-    w64(&mut out, 24, 0);       // e_entry
-    w64(&mut out, 32, 0);       // e_phoff
+    w64(&mut out, 24, 0); // e_entry
+    w64(&mut out, 32, 0); // e_phoff
     w64(&mut out, 40, shoff);
     w32(&mut out, 48, 0);
-    w16(&mut out, 52, 64);      // e_ehsize
-    w16(&mut out, 54, 0);       // e_phentsize
-    w16(&mut out, 56, 0);       // e_phnum
-    w16(&mut out, 58, 64);      // e_shentsize
+    w16(&mut out, 52, 64); // e_ehsize
+    w16(&mut out, 54, 0); // e_phentsize
+    w16(&mut out, 56, 0); // e_phnum
+    w16(&mut out, 58, 64); // e_shentsize
     w16(&mut out, 60, sh_count as u16);
     w16(&mut out, 62, shstrtab_idx as u16);
 

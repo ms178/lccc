@@ -15,37 +15,22 @@
 //! This pass does NOT reject programs with type errors (yet); it collects
 //! information for the lowerer. Full type checking is TODO.
 
+use super::const_eval::{ConstMap, SemaConstEval};
+use super::type_context::{FunctionTypedefInfo, TypeContext};
 use crate::common::error::DiagnosticEngine;
 use crate::common::source::Span;
 use crate::common::symbol_table::{Symbol, SymbolTable};
 use crate::common::type_builder;
 use crate::common::types::{AddressSpace, CType, FunctionType, StructLayout};
 use crate::frontend::parser::ast::{
-    BinOp,
-    BlockItem,
-    CompoundStmt,
-    Declaration,
-    DerivedDeclarator,
-    Designator,
-    EnumVariant,
-    Expr,
-    ExprId,
-    ExternalDecl,
-    ForInit,
-    FunctionDef,
-    Initializer,
-    SizeofArg,
-    Stmt,
-    StructFieldDecl,
-    TranslationUnit,
-    TypeSpecifier,
+    BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
+    ExprId, ExternalDecl, ForInit, FunctionDef, Initializer, SizeofArg, Stmt, StructFieldDecl,
+    TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::builtins;
-use super::type_context::{TypeContext, FunctionTypedefInfo};
-use super::const_eval::{SemaConstEval, ConstMap};
 
-use std::cell::RefCell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
 
 /// Outcome of a case segment in a switch statement for -Wreturn-type analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,14 +193,21 @@ impl SemanticAnalyzer {
         // Must happen at file scope before pushing the function body scope.
         self.collect_enum_constants_from_type_spec(&func.return_type);
 
-        let params: Vec<(CType, Option<String>)> = func.params.iter().map(|p| {
-            let ty = self.type_spec_to_ctype(&p.type_spec);
-            (ty, p.name.clone())
-        }).collect();
+        let params: Vec<(CType, Option<String>)> = func
+            .params
+            .iter()
+            .map(|p| {
+                let ty = self.type_spec_to_ctype(&p.type_spec);
+                (ty, p.name.clone())
+            })
+            .collect();
 
         // Preserve noreturn from a prior declaration (e.g., the prototype may have
         // __attribute__((noreturn)) even if the definition doesn't repeat it).
-        let prior_noreturn = self.result.functions.get(&func.name)
+        let prior_noreturn = self
+            .result
+            .functions
+            .get(&func.name)
             .is_some_and(|fi| fi.is_noreturn);
         let func_info = FunctionInfo {
             return_type: return_type.clone(),
@@ -323,22 +315,33 @@ impl SemanticAnalyzer {
                     continue;
                 }
                 // Check for function typedef (e.g., typedef int func_t(int, int);)
-                let has_func_derived = declarator.derived.iter().any(|d|
-                    matches!(d, DerivedDeclarator::Function(_, _)));
-                let has_fptr_derived = declarator.derived.iter().any(|d|
-                    matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+                let has_func_derived = declarator
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+                let has_fptr_derived = declarator
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
 
                 if has_func_derived && !has_fptr_derived {
                     // Function typedef like: typedef int func_t(int x);
-                    if let Some(DerivedDeclarator::Function(params, variadic)) =
-                        declarator.derived.iter().find(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+                    if let Some(DerivedDeclarator::Function(params, variadic)) = declarator
+                        .derived
+                        .iter()
+                        .find(|d| matches!(d, DerivedDeclarator::Function(_, _)))
                     {
-                        let ptr_count = declarator.derived.iter()
+                        let ptr_count = declarator
+                            .derived
+                            .iter()
                             .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
                             .count();
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ptr_count {
-                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                            return_type = TypeSpecifier::Pointer(
+                                Box::new(return_type),
+                                AddressSpace::Default,
+                            );
                         }
                         self.result.type_context.function_typedefs.insert(
                             declarator.name.clone(),
@@ -353,18 +356,28 @@ impl SemanticAnalyzer {
 
                 // Function pointer typedef (e.g., typedef void *(*lua_Alloc)(void *, ...))
                 if has_fptr_derived {
-                    if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) = declarator.derived.iter().find(|d|
-                        matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
+                    if let Some(DerivedDeclarator::FunctionPointer(params, variadic)) = declarator
+                        .derived
+                        .iter()
+                        .find(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
                     {
-                        let ptr_count = declarator.derived.iter()
+                        let ptr_count = declarator
+                            .derived
+                            .iter()
                             .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
                             .count();
                         let ret_ptr_count = if ptr_count > 0 { ptr_count - 1 } else { 0 };
                         let mut return_type = decl.type_spec.clone();
                         for _ in 0..ret_ptr_count {
-                            return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                            return_type = TypeSpecifier::Pointer(
+                                Box::new(return_type),
+                                AddressSpace::Default,
+                            );
                         }
-                        self.result.type_context.func_ptr_typedefs.insert(declarator.name.clone());
+                        self.result
+                            .type_context
+                            .func_ptr_typedefs
+                            .insert(declarator.name.clone());
                         self.result.type_context.func_ptr_typedef_info.insert(
                             declarator.name.clone(),
                             FunctionTypedefInfo {
@@ -382,9 +395,16 @@ impl SemanticAnalyzer {
                 let resolved_ctype = if declarator.derived.is_empty() {
                     base_type.clone()
                 } else {
-                    type_builder::build_full_ctype_with_base(self, base_type.clone(), &declarator.derived)
+                    type_builder::build_full_ctype_with_base(
+                        self,
+                        base_type.clone(),
+                        &declarator.derived,
+                    )
                 };
-                self.result.type_context.typedefs.insert(declarator.name.clone(), resolved_ctype);
+                self.result
+                    .type_context
+                    .typedefs
+                    .insert(declarator.name.clone(), resolved_ctype);
 
                 // Preserve alignment override from __attribute__((aligned(N))) on the typedef.
                 // E.g. typedef struct S aligned_S __attribute__((aligned(32)));
@@ -397,7 +417,8 @@ impl SemanticAnalyzer {
                     let mut align = decl.alignment;
                     if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
                         let ctype = self.type_spec_to_ctype(sizeof_ts);
-                        let real_sizeof = ctype.size_ctx(&*self.result.type_context.borrow_struct_layouts());
+                        let real_sizeof =
+                            ctype.size_ctx(&*self.result.type_context.borrow_struct_layouts());
                         align = Some(align.map_or(real_sizeof, |a| a.max(real_sizeof)));
                     }
                     align.or_else(|| {
@@ -409,7 +430,10 @@ impl SemanticAnalyzer {
                     })
                 };
                 if let Some(align) = effective_alignment {
-                    self.result.type_context.typedef_alignments.insert(declarator.name.clone(), align);
+                    self.result
+                        .type_context
+                        .typedef_alignments
+                        .insert(declarator.name.clone(), align);
                 }
             }
             return; // typedefs don't declare variables
@@ -423,7 +447,11 @@ impl SemanticAnalyzer {
                 // type. This is critical for anonymous structs: re-resolving the type
                 // spec would call next_anon_struct_id() again and produce a different
                 // key for each declarator, breaking pointer-array compatibility checks.
-                type_builder::build_full_ctype_with_base(self, base_type.clone(), &init_decl.derived)
+                type_builder::build_full_ctype_with_base(
+                    self,
+                    base_type.clone(),
+                    &init_decl.derived,
+                )
             };
 
             // Resolve incomplete array sizes from initializers (e.g., int arr[] = {1,2,3})
@@ -452,7 +480,9 @@ impl SemanticAnalyzer {
                             is_defined: false,
                             is_noreturn: true,
                         };
-                        self.result.functions.insert(init_decl.name.clone(), func_info);
+                        self.result
+                            .functions
+                            .insert(init_decl.name.clone(), func_info);
                     }
                 } else if !self.result.functions.contains_key(&init_decl.name) {
                     let func_info = FunctionInfo {
@@ -462,7 +492,9 @@ impl SemanticAnalyzer {
                         is_defined: false,
                         is_noreturn: false,
                     };
-                    self.result.functions.insert(init_decl.name.clone(), func_info);
+                    self.result
+                        .functions
+                        .insert(init_decl.name.clone(), func_info);
                 }
             }
 
@@ -498,7 +530,11 @@ impl SemanticAnalyzer {
             let explicit_alignment = if let Some(ref alignas_ts) = decl.alignas_type {
                 let ct = self.type_spec_to_ctype(alignas_ts);
                 let a = ct.align_ctx(&*self.result.type_context.borrow_struct_layouts());
-                if a > 0 { Some(a) } else { None }
+                if a > 0 {
+                    Some(a)
+                } else {
+                    None
+                }
             } else {
                 decl.alignment
             };
@@ -522,7 +558,9 @@ impl SemanticAnalyzer {
                 self.analyze_initializer(init);
                 // Check for invalid pointer <-> float conversions in scalar initializers
                 if let Initializer::Expr(init_expr) = init {
-                    let var_ty = self.symbol_table.lookup(&init_decl.name)
+                    let var_ty = self
+                        .symbol_table
+                        .lookup(&init_decl.name)
                         .map(|s| s.ty.clone());
                     if let Some(var_ty) = var_ty {
                         let checker = super::type_checker::ExprTypeChecker {
@@ -533,7 +571,9 @@ impl SemanticAnalyzer {
                         };
                         if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
-                                &init_ty, &var_ty, init_expr.span(),
+                                &init_ty,
+                                &var_ty,
+                                init_expr.span(),
                             );
                         }
                     }
@@ -585,8 +625,7 @@ impl SemanticAnalyzer {
                 let mut max_idx = 0usize;
                 let mut current_idx = 0usize;
                 let mut fields_consumed = 0usize;
-                let has_any_designator = items.iter()
-                    .any(|item| !item.designators.is_empty());
+                let has_any_designator = items.iter().any(|item| !item.designators.is_empty());
 
                 for item in items {
                     // If this item has an array index designator, jump to that index
@@ -615,7 +654,9 @@ impl SemanticAnalyzer {
                     }
                     // Only advance if this item doesn't have a field designator
                     // (field designators target fields within the same struct element)
-                    let has_field_designator = item.designators.iter()
+                    let has_field_designator = item
+                        .designators
+                        .iter()
                         .any(|d| matches!(d, Designator::Field(_)));
                     if !has_field_designator {
                         if flat_scalars_per_elem > 1 && !has_any_designator {
@@ -640,10 +681,9 @@ impl SemanticAnalyzer {
                 }
 
                 // Count partial struct element at the end
-                if flat_scalars_per_elem > 1 && fields_consumed > 0
-                    && current_idx >= max_idx {
-                        max_idx = current_idx + 1;
-                    }
+                if flat_scalars_per_elem > 1 && fields_consumed > 0 && current_idx >= max_idx {
+                    max_idx = current_idx + 1;
+                }
 
                 if has_any_designator {
                     Some(max_idx)
@@ -676,9 +716,7 @@ impl SemanticAnalyzer {
     /// Scalar types = 1, arrays = element_count * per_element, structs = sum of fields.
     fn flat_scalar_count_for_type(&self, ty: &CType) -> usize {
         match ty {
-            CType::Array(elem_ty, Some(size)) => {
-                *size * self.flat_scalar_count_for_type(elem_ty)
-            }
+            CType::Array(elem_ty, Some(size)) => *size * self.flat_scalar_count_for_type(elem_ty),
             CType::Array(_, None) => 0, // unsized arrays contribute 0 scalars
             CType::Struct(key) | CType::Union(key) => {
                 let layouts = self.result.type_context.borrow_struct_layouts();
@@ -687,12 +725,16 @@ impl SemanticAnalyzer {
                         return 0;
                     }
                     if layout.is_union {
-                        layout.fields.iter()
+                        layout
+                            .fields
+                            .iter()
                             .map(|f| self.flat_scalar_count_for_type(&f.ty))
                             .max()
                             .unwrap_or(1)
                     } else {
-                        layout.fields.iter()
+                        layout
+                            .fields
+                            .iter()
                             .map(|f| self.flat_scalar_count_for_type(&f.ty))
                             .sum()
                     }
@@ -709,12 +751,20 @@ impl SemanticAnalyzer {
     /// constant expression evaluator for enum values, sizeof, etc.
     fn eval_designator_index(&self, expr: &Expr) -> Option<usize> {
         match expr {
-            Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n as usize),
-            Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => Some(*n as usize),
+            Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => {
+                Some(*n as usize)
+            }
+            Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => {
+                Some(*n as usize)
+            }
             Expr::CharLiteral(n, _) => Some(*n as usize),
             _ => {
                 let val = self.eval_const_expr(expr)?;
-                if val >= 0 { Some(val as usize) } else { None }
+                if val >= 0 {
+                    Some(val as usize)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -738,7 +788,9 @@ impl SemanticAnalyzer {
             // function bodies are properly removed when the scope exits.
             // At global scope the scope stack is empty, so insert_enum_scoped
             // behaves identically to a direct insert.
-            self.result.type_context.insert_enum_scoped(variant.name.clone(), self.enum_counter);
+            self.result
+                .type_context
+                .insert_enum_scoped(variant.name.clone(), self.enum_counter);
             // GCC extension: enum constants that don't fit in int are promoted
             let sym_ty = super::type_checker::enum_constant_type(self.enum_counter);
             self.symbol_table.declare(Symbol {
@@ -825,11 +877,13 @@ impl SemanticAnalyzer {
                 self.analyze_expr(expr);
                 if let Some(expected) = self.current_return_type.clone() {
                     if matches!(expected, CType::Void) {
-                        self.diagnostics.borrow_mut().error(
-                            "return with a value, in function returning void", *span);
+                        self.diagnostics
+                            .borrow_mut()
+                            .error("return with a value, in function returning void", *span);
                     } else {
                         let checker = super::type_checker::ExprTypeChecker {
-                            symbols: &self.symbol_table, types: &self.result.type_context,
+                            symbols: &self.symbol_table,
+                            types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
                         };
@@ -840,9 +894,15 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::Return(None, span) => {
-                if self.current_return_type.as_ref().is_some_and(|t| !matches!(t, CType::Void)) {
+                if self
+                    .current_return_type
+                    .as_ref()
+                    .is_some_and(|t| !matches!(t, CType::Void))
+                {
                     self.diagnostics.borrow_mut().error(
-                        "return with no value, in function returning non-void", *span);
+                        "return with no value, in function returning non-void",
+                        *span,
+                    );
                 }
             }
             Stmt::If(cond, then_br, else_br, _) => {
@@ -893,11 +953,16 @@ impl SemanticAnalyzer {
                 if let Some(ctype) = self.result.expr_types.get(&expr.id()) {
                     if !ctype.is_integer() {
                         let diag = crate::common::error::Diagnostic::error(
-                            "switch quantity is not an integer"
-                        ).with_span(expr.span())
-                         .with_note(crate::common::error::Diagnostic::note(
-                            format!("expression has type '{}'", ctype)
-                         ).with_span(expr.span()));
+                            "switch quantity is not an integer",
+                        )
+                        .with_span(expr.span())
+                        .with_note(
+                            crate::common::error::Diagnostic::note(format!(
+                                "expression has type '{}'",
+                                ctype
+                            ))
+                            .with_span(expr.span()),
+                        );
                         self.diagnostics.borrow_mut().emit(&diag);
                     }
                 }
@@ -925,7 +990,9 @@ impl SemanticAnalyzer {
             Stmt::GotoIndirect(expr, _) => {
                 self.analyze_expr(expr);
             }
-            Stmt::InlineAsm { outputs, inputs, .. } => {
+            Stmt::InlineAsm {
+                outputs, inputs, ..
+            } => {
                 for out in outputs {
                     self.analyze_expr(&out.expr);
                 }
@@ -1237,7 +1304,10 @@ impl SemanticAnalyzer {
 
     /// Check if a statement is a case/default label.
     fn is_case_label(&self, stmt: &Stmt) -> bool {
-        matches!(stmt, Stmt::Case(_, _, _) | Stmt::CaseRange(_, _, _, _) | Stmt::Default(_, _))
+        matches!(
+            stmt,
+            Stmt::Case(_, _, _) | Stmt::CaseRange(_, _, _, _) | Stmt::Default(_, _)
+        )
     }
 
     /// Check if any item in a switch body contains a `default` label.
@@ -1337,9 +1407,12 @@ impl SemanticAnalyzer {
             // Cast to another type preserves truthiness
             Expr::Cast(_, inner, _) => self.try_eval_constant_bool(inner),
             // Enum constants (e.g., kernel's `true` defined as `enum { false = 0, true = 1 }`)
-            Expr::Identifier(name, _) => {
-                self.result.type_context.enum_constants.get(name).map(|&val| val != 0)
-            }
+            Expr::Identifier(name, _) => self
+                .result
+                .type_context
+                .enum_constants
+                .get(name)
+                .map(|&val| val != 0),
             _ => None,
         }
     }
@@ -1354,13 +1427,13 @@ impl SemanticAnalyzer {
                     && !self.result.type_context.enum_constants.contains_key(name)
                     && !builtins::is_builtin(name)
                     && !self.result.functions.contains_key(name)
-                    && name != "__func__" && name != "__FUNCTION__"
+                    && name != "__func__"
+                    && name != "__FUNCTION__"
                     && name != "__PRETTY_FUNCTION__"
                 {
-                    self.diagnostics.borrow_mut().error(
-                        format!("'{}' undeclared", name),
-                        *span,
-                    );
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(format!("'{}' undeclared", name), *span);
                 }
             }
             Expr::FunctionCall(callee, args, _) => {
@@ -1395,26 +1468,40 @@ impl SemanticAnalyzer {
                 // permissive because sema also carries legacy `f()` and fallback
                 // libc declarations with unspecified arguments.
                 let direct = if let Expr::Identifier(name, _) = callee.as_ref() {
-                    self.result.functions.get(name).filter(|fi| !fi.params.is_empty())
+                    self.result
+                        .functions
+                        .get(name)
+                        .filter(|fi| !fi.params.is_empty())
                         .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
-                } else { None };
+                } else {
+                    None
+                };
                 if let Some((name, params, variadic)) = direct {
                     self.check_call_arguments(&name, args, &params, variadic, expr.span());
-                } else if !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name)) {
+                } else if !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
+                {
                     let checker = super::type_checker::ExprTypeChecker {
-                        symbols: &self.symbol_table, types: &self.result.type_context,
+                        symbols: &self.symbol_table,
+                        types: &self.result.type_context,
                         functions: &self.result.functions,
                         expr_types: Some(&self.result.expr_types),
                     };
                     let signature = match checker.infer_expr_ctype(callee) {
                         Some(CType::Function(ft)) if !ft.params.is_empty() => Some(*ft),
                         Some(CType::Pointer(inner, _)) => match *inner {
-                            CType::Function(ft) if !ft.params.is_empty() => Some(*ft), _ => None,
+                            CType::Function(ft) if !ft.params.is_empty() => Some(*ft),
+                            _ => None,
                         },
                         _ => None,
                     };
                     if let Some(ft) = signature {
-                        self.check_call_arguments("function pointer", args, &ft.params, ft.variadic, expr.span());
+                        self.check_call_arguments(
+                            "function pointer",
+                            args,
+                            &ft.params,
+                            ft.variadic,
+                            expr.span(),
+                        );
                     }
                 }
             }
@@ -1443,10 +1530,9 @@ impl SemanticAnalyzer {
                     functions: &self.result.functions,
                     expr_types: Some(&self.result.expr_types),
                 };
-                if let (Some(lhs_ty), Some(rhs_ty)) = (
-                    checker.infer_expr_ctype(lhs),
-                    checker.infer_expr_ctype(rhs),
-                ) {
+                if let (Some(lhs_ty), Some(rhs_ty)) =
+                    (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
+                {
                     self.check_assignment_compatibility(&rhs_ty, &lhs_ty, *span);
                 }
             }
@@ -1593,7 +1679,13 @@ impl SemanticAnalyzer {
     /// Check that a struct/union member access refers to an existing field.
     /// Emits an error if the base type is a known struct/union with a complete layout
     /// and the field name is not found.
-    fn check_member_exists(&self, base_expr: &Expr, field_name: &str, span: Span, is_pointer: bool) {
+    fn check_member_exists(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        span: Span,
+        is_pointer: bool,
+    ) {
         let checker = super::type_checker::ExprTypeChecker {
             symbols: &self.symbol_table,
             types: &self.result.type_context,
@@ -1625,7 +1717,11 @@ impl SemanticAnalyzer {
         // If the struct tag has been redefined in an inner scope, the current layout
         // in the map may not match the layout the variable was actually declared with.
         // Skip the check to avoid false positives (codegen uses layout snapshots).
-        if self.result.type_context.is_struct_key_shadowed(key.as_ref()) {
+        if self
+            .result
+            .type_context
+            .is_struct_key_shadowed(key.as_ref())
+        {
             return;
         }
 
@@ -1699,18 +1795,41 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn check_call_arguments(&self, name: &str, args: &[Expr], params: &[(CType, Option<String>)], variadic: bool, span: Span) {
+    fn check_call_arguments(
+        &self,
+        name: &str,
+        args: &[Expr],
+        params: &[(CType, Option<String>)],
+        variadic: bool,
+        span: Span,
+    ) {
         let expected = params.len();
         if args.len() < expected {
             self.diagnostics.borrow_mut().error(
-                format!("too few arguments to function '{}' (expected {}, have {})", name, expected, args.len()), span);
+                format!(
+                    "too few arguments to function '{}' (expected {}, have {})",
+                    name,
+                    expected,
+                    args.len()
+                ),
+                span,
+            );
         } else if !variadic && args.len() > expected {
             self.diagnostics.borrow_mut().error(
-                format!("too many arguments to function '{}' (expected {}, have {})", name, expected, args.len()), span);
+                format!(
+                    "too many arguments to function '{}' (expected {}, have {})",
+                    name,
+                    expected,
+                    args.len()
+                ),
+                span,
+            );
         }
         let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table, types: &self.result.type_context,
-            functions: &self.result.functions, expr_types: Some(&self.result.expr_types),
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
         };
         for (arg, (param_ty, _)) in args.iter().zip(params) {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -1722,20 +1841,36 @@ impl SemanticAnalyzer {
     fn check_assignment_compatibility(&self, from_ty: &CType, to_ty: &CType, span: Span) {
         self.check_pointer_float_conversion(from_ty, to_ty, span);
         let incompatible = match (from_ty, to_ty) {
-            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) =>
-                a != b && !a.starts_with("__anon_") && !b.starts_with("__anon_"),
-            (CType::Struct(_), _) | (CType::Union(_), _) | (_, CType::Struct(_)) | (_, CType::Union(_)) => true,
+            (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => {
+                a != b && !a.starts_with("__anon_") && !b.starts_with("__anon_")
+            }
+            (CType::Struct(_), _)
+            | (CType::Union(_), _)
+            | (_, CType::Struct(_))
+            | (_, CType::Union(_)) => true,
             _ => false,
         };
         if incompatible {
             self.diagnostics.borrow_mut().error(
-                format!("incompatible types (have '{}' but expected '{}')", from_ty, to_ty), span);
+                format!(
+                    "incompatible types (have '{}' but expected '{}')",
+                    from_ty, to_ty
+                ),
+                span,
+            );
         }
         if let (CType::Pointer(from, _), CType::Pointer(to, _)) = (from_ty, to_ty) {
-            if !matches!(from.as_ref(), CType::Void) && !matches!(to.as_ref(), CType::Void)
-                && !Self::pointee_types_compatible(from, to) {
+            if !matches!(from.as_ref(), CType::Void)
+                && !matches!(to.as_ref(), CType::Void)
+                && !Self::pointee_types_compatible(from, to)
+            {
                 self.diagnostics.borrow_mut().error(
-                    format!("incompatible pointer types (have '{}' but expected '{}')", from_ty, to_ty), span);
+                    format!(
+                        "incompatible pointer types (have '{}' but expected '{}')",
+                        from_ty, to_ty
+                    ),
+                    span,
+                );
             }
         }
     }
@@ -1773,9 +1908,7 @@ impl SemanticAnalyzer {
                 Self::pointee_types_compatible(pa, pb)
             }
             // Arrays: compare element types
-            (CType::Array(ea, _), CType::Array(eb, _)) => {
-                Self::pointee_types_compatible(ea, eb)
-            }
+            (CType::Array(ea, _), CType::Array(eb, _)) => Self::pointee_types_compatible(ea, eb),
             // Function types: just check broad compatibility
             (CType::Function(_), CType::Function(_)) => {
                 // Simplification: treat all function pointers as compatible
@@ -1824,10 +1957,9 @@ impl SemanticAnalyzer {
             TypeSpecifier::Union(Some(tag), None, _, _, _) => {
                 let key = format!("union.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
-                    self.diagnostics.borrow_mut().error(
-                        format!("storage size of 'union {}' isn't known", tag),
-                        span,
-                    );
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(format!("storage size of 'union {}' isn't known", tag), span);
                 }
             }
             // Pointers to incomplete types are fine - sizeof gives pointer size
@@ -1851,38 +1983,45 @@ impl SemanticAnalyzer {
         self.resolve_type_spec_to_ctype(spec)
     }
 
-    fn convert_struct_fields(&self, fields: &[StructFieldDecl]) -> Vec<crate::common::types::StructField> {
-        fields.iter().map(|f| {
-            let ty = if f.derived.is_empty() {
-                self.type_spec_to_ctype(&f.type_spec)
-            } else {
-                // Delegate to shared build_full_ctype for correct inside-out type construction
-                type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
-            };
-            let name = f.name.clone().unwrap_or_default();
-            let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                self.eval_const_expr(bw).map(|v| v as u32)
-            });
-            // Merge per-field alignment with typedef alignment.
-            // If the field's type is a typedef with __aligned__, that alignment
-            // must be applied even when the field itself has no explicit alignment.
-            let field_alignment = {
-                let mut align = f.alignment;
-                // Check if the field type is a typedef with an alignment override
-                let typedef_align = self.resolve_typedef_alignment(&f.type_spec);
-                if let Some(ta) = typedef_align {
-                    align = Some(align.map_or(ta, |a| a.max(ta)));
+    fn convert_struct_fields(
+        &self,
+        fields: &[StructFieldDecl],
+    ) -> Vec<crate::common::types::StructField> {
+        fields
+            .iter()
+            .map(|f| {
+                let ty = if f.derived.is_empty() {
+                    self.type_spec_to_ctype(&f.type_spec)
+                } else {
+                    // Delegate to shared build_full_ctype for correct inside-out type construction
+                    type_builder::build_full_ctype(self, &f.type_spec, &f.derived)
+                };
+                let name = f.name.clone().unwrap_or_default();
+                let bit_width = f
+                    .bit_width
+                    .as_ref()
+                    .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32));
+                // Merge per-field alignment with typedef alignment.
+                // If the field's type is a typedef with __aligned__, that alignment
+                // must be applied even when the field itself has no explicit alignment.
+                let field_alignment = {
+                    let mut align = f.alignment;
+                    // Check if the field type is a typedef with an alignment override
+                    let typedef_align = self.resolve_typedef_alignment(&f.type_spec);
+                    if let Some(ta) = typedef_align {
+                        align = Some(align.map_or(ta, |a| a.max(ta)));
+                    }
+                    align
+                };
+                crate::common::types::StructField {
+                    name,
+                    ty,
+                    bit_width,
+                    alignment: field_alignment,
+                    is_packed: f.is_packed,
                 }
-                align
-            };
-            crate::common::types::StructField {
-                name,
-                ty,
-                bit_width,
-                alignment: field_alignment,
-                is_packed: f.is_packed,
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     /// Resolve the alignment override carried by a typedef, if any.
@@ -1891,7 +2030,11 @@ impl SemanticAnalyzer {
     /// a typedef name or the typedef has no alignment attribute.
     fn resolve_typedef_alignment(&self, ts: &TypeSpecifier) -> Option<usize> {
         if let TypeSpecifier::TypedefName(name) = ts {
-            self.result.type_context.typedef_alignments.get(name).copied()
+            self.result
+                .type_context
+                .typedef_alignments
+                .get(name)
+                .copied()
         } else {
             None
         }
@@ -1929,19 +2072,47 @@ impl SemanticAnalyzer {
             ("puts", CType::Int, false),
             ("putchar", CType::Int, false),
             ("getchar", CType::Int, false),
-            ("malloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("calloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("realloc", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
+            (
+                "malloc",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
+            (
+                "calloc",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
+            (
+                "realloc",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
             ("free", CType::Void, false),
             ("exit", CType::Void, false),
             ("abort", CType::Void, false),
-            ("memcpy", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("memmove", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
-            ("memset", CType::Pointer(Box::new(CType::Void), AddressSpace::Default), false),
+            (
+                "memcpy",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
+            (
+                "memmove",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
+            (
+                "memset",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+                false,
+            ),
             ("memcmp", CType::Int, false),
             ("strlen", CType::ULong, false),
             ("strcmp", CType::Int, false),
-            ("strcpy", CType::Pointer(Box::new(CType::Char), AddressSpace::Default), false),
+            (
+                "strcpy",
+                CType::Pointer(Box::new(CType::Char), AddressSpace::Default),
+                false,
+            ),
             ("atoi", CType::Int, false),
             ("atol", CType::Long, false),
             ("abs", CType::Int, false),
@@ -1988,7 +2159,10 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         struct_aligned: Option<usize>,
     ) -> CType {
         let prefix = if is_union { "union" } else { "struct" };
-        let struct_fields = fields.as_ref().map(|f| self.convert_struct_fields(f)).unwrap_or_default();
+        let struct_fields = fields
+            .as_ref()
+            .map(|f| self.convert_struct_fields(f))
+            .unwrap_or_default();
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
         let key = if let Some(tag) = name {
             format!("{}.{}", prefix, tag)
@@ -2005,10 +2179,16 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         }
         if !struct_fields.is_empty() {
             let mut layout = if is_union {
-                StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.result.type_context.borrow_struct_layouts())
+                StructLayout::for_union_with_packing(
+                    &struct_fields,
+                    max_field_align,
+                    &*self.result.type_context.borrow_struct_layouts(),
+                )
             } else {
                 StructLayout::for_struct_with_packing(
-                    &struct_fields, max_field_align, &*self.result.type_context.borrow_struct_layouts()
+                    &struct_fields,
+                    max_field_align,
+                    &*self.result.type_context.borrow_struct_layouts(),
                 )
             };
             if let Some(a) = struct_aligned {
@@ -2018,8 +2198,16 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                     layout.size = (layout.size + mask) & !mask;
                 }
             }
-            self.result.type_context.insert_struct_layout_scoped_from_ref(&key, layout);
-        } else if self.result.type_context.borrow_struct_layouts().get(&key).is_none() {
+            self.result
+                .type_context
+                .insert_struct_layout_scoped_from_ref(&key, layout);
+        } else if self
+            .result
+            .type_context
+            .borrow_struct_layouts()
+            .get(&key)
+            .is_none()
+        {
             let align = struct_aligned.unwrap_or(1);
             let layout = StructLayout {
                 fields: Vec::new(),
@@ -2028,16 +2216,29 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 is_union,
                 is_transparent_union: false,
             };
-            self.result.type_context.insert_struct_layout_scoped_from_ref(&key, layout);
+            self.result
+                .type_context
+                .insert_struct_layout_scoped_from_ref(&key, layout);
         }
-        if is_union { CType::Union(key.into()) } else { CType::Struct(key.into()) }
+        if is_union {
+            CType::Union(key.into())
+        } else {
+            CType::Struct(key.into())
+        }
     }
 
-    fn resolve_enum(&self, name: &Option<String>, variants: &Option<Vec<EnumVariant>>, is_packed: bool) -> CType {
+    fn resolve_enum(
+        &self,
+        name: &Option<String>,
+        variants: &Option<Vec<EnumVariant>>,
+        is_packed: bool,
+    ) -> CType {
         // Check if this is a forward reference to a previously-defined packed enum
-        let effective_packed = is_packed || name.as_ref()
-            .and_then(|n| self.result.type_context.packed_enum_types.get(n))
-            .is_some();
+        let effective_packed = is_packed
+            || name
+                .as_ref()
+                .and_then(|n| self.result.type_context.packed_enum_types.get(n))
+                .is_some();
         // Sema preserves enum identity for diagnostics. Variant processing is
         // done separately via process_enum_variants (requires &mut self).
         // We carry variant values so packed_size() can compute the correct size.
@@ -2088,10 +2289,9 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 // C standard requires array sizes to be positive (constraint violation).
                 // Critical for autoconf AC_CHECK_SIZEOF which uses negative array sizes
                 // as compile-time assertions to detect type sizes during cross-compilation.
-                self.diagnostics.borrow_mut().error(
-                    "size of array is negative",
-                    expr.span(),
-                );
+                self.diagnostics
+                    .borrow_mut()
+                    .error("size of array is negative", expr.span());
                 None
             } else {
                 Some(v as usize)

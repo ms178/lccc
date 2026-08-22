@@ -4,9 +4,9 @@
 //! sys/types.h, etc.) and registers known libc math function signatures
 //! for correct calling convention.
 
-use crate::common::types::{AddressSpace, IrType, CType};
-use super::lower::Lowerer;
 use super::definitions::FuncSig;
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
 
 impl Lowerer {
     /// Pre-populate typedef mappings for builtin/standard types.
@@ -20,8 +20,16 @@ impl Lowerer {
         let long_s = CType::Long;
         let long_u = CType::ULong;
         // Types that are always 64-bit regardless of target
-        let i64_type = if is_32bit { CType::LongLong } else { CType::Long };
-        let u64_type = if is_32bit { CType::ULongLong } else { CType::ULong };
+        let i64_type = if is_32bit {
+            CType::LongLong
+        } else {
+            CType::Long
+        };
+        let u64_type = if is_32bit {
+            CType::ULongLong
+        } else {
+            CType::ULong
+        };
         // size_t: unsigned long on LP64, unsigned int on ILP32
         let size_type = if is_32bit { CType::UInt } else { CType::ULong };
         let ssize_type = if is_32bit { CType::Int } else { CType::Long };
@@ -75,7 +83,10 @@ impl Lowerer {
             // <time.h>
             ("time_t", long_s.clone()),
             ("clock_t", long_s.clone()),
-            ("timer_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "timer_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("clockid_t", CType::Int),
             // <sys/types.h>
             ("off_t", long_s.clone()),
@@ -101,24 +112,54 @@ impl Lowerer {
             ("__s32", CType::Int),
             ("__s64", i64_type),
             // <locale.h>
-            ("locale_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "locale_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <pthread.h> - opaque types, treat as unsigned long or pointer
             ("pthread_t", size_type),
-            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_mutex_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "pthread_cond_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("pthread_key_t", CType::UInt),
-            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_attr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("pthread_once_t", CType::Int),
-            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_mutexattr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "pthread_condattr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <setjmp.h>
-            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "jmp_buf",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "sigjmp_buf",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <stdio.h>
-            ("FILE", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "FILE",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("fpos_t", ssize_type),
             // <dirent.h>
-            ("DIR", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "DIR",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
         ];
         for (name, ct) in builtins {
             self.types.typedefs.insert(name.to_string(), ct.clone());
@@ -143,9 +184,15 @@ impl Lowerer {
                 CType::Pointer(Box::new(CType::Char), AddressSpace::Default)
             }
         };
-        self.types.typedefs.insert("va_list".to_string(), va_list_type.clone());
-        self.types.typedefs.insert("__builtin_va_list".to_string(), va_list_type.clone());
-        self.types.typedefs.insert("__gnuc_va_list".to_string(), va_list_type);
+        self.types
+            .typedefs
+            .insert("va_list".to_string(), va_list_type.clone());
+        self.types
+            .typedefs
+            .insert("__builtin_va_list".to_string(), va_list_type.clone());
+        self.types
+            .typedefs
+            .insert("__gnuc_va_list".to_string(), va_list_type);
         // POSIX internal names
         let posix_extras: &[(&str, CType)] = &[
             ("__u_char", CType::UChar),
@@ -163,10 +210,22 @@ impl Lowerer {
             self.types.typedefs.insert(name.to_string(), ct.clone());
         }
         // __int64_t/__uint64_t: must be LongLong on ILP32, Long on LP64
-        let int64_ct = if is_32bit { CType::LongLong } else { CType::Long };
-        let uint64_ct = if is_32bit { CType::ULongLong } else { CType::ULong };
-        self.types.typedefs.insert("__int64_t".to_string(), int64_ct);
-        self.types.typedefs.insert("__uint64_t".to_string(), uint64_ct);
+        let int64_ct = if is_32bit {
+            CType::LongLong
+        } else {
+            CType::Long
+        };
+        let uint64_ct = if is_32bit {
+            CType::ULongLong
+        } else {
+            CType::ULong
+        };
+        self.types
+            .typedefs
+            .insert("__int64_t".to_string(), int64_ct);
+        self.types
+            .typedefs
+            .insert("__uint64_t".to_string(), uint64_ct);
 
         // GCC builtin NEON and SVE vector types for AArch64.
         // These appear in bits/math-vector.h (included transitively from <math.h>)
@@ -177,44 +236,78 @@ impl Lowerer {
         // functions are never called from compiled code, fixed sizes suffice.
         if matches!(self.target, crate::backend::Target::Aarch64) {
             // NEON types (128-bit fixed-width SIMD)
-            self.types.typedefs.insert("__Float32x4_t".to_string(),
-                CType::Vector(Box::new(CType::Float), 16));
-            self.types.typedefs.insert("__Float64x2_t".to_string(),
-                CType::Vector(Box::new(CType::Double), 16));
+            self.types.typedefs.insert(
+                "__Float32x4_t".to_string(),
+                CType::Vector(Box::new(CType::Float), 16),
+            );
+            self.types.typedefs.insert(
+                "__Float64x2_t".to_string(),
+                CType::Vector(Box::new(CType::Double), 16),
+            );
             // SVE float vector types (model as 128-bit vectors)
-            self.types.typedefs.insert("__SVFloat32_t".to_string(),
-                CType::Vector(Box::new(CType::Float), 16));
-            self.types.typedefs.insert("__SVFloat64_t".to_string(),
-                CType::Vector(Box::new(CType::Double), 16));
-            self.types.typedefs.insert("__SVFloat16_t".to_string(),
-                CType::Vector(Box::new(CType::Short), 16));
+            self.types.typedefs.insert(
+                "__SVFloat32_t".to_string(),
+                CType::Vector(Box::new(CType::Float), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVFloat64_t".to_string(),
+                CType::Vector(Box::new(CType::Double), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVFloat16_t".to_string(),
+                CType::Vector(Box::new(CType::Short), 16),
+            );
             // SVE integer vector types
-            self.types.typedefs.insert("__SVInt8_t".to_string(),
-                CType::Vector(Box::new(CType::Char), 16));
-            self.types.typedefs.insert("__SVInt16_t".to_string(),
-                CType::Vector(Box::new(CType::Short), 16));
-            self.types.typedefs.insert("__SVInt32_t".to_string(),
-                CType::Vector(Box::new(CType::Int), 16));
-            self.types.typedefs.insert("__SVInt64_t".to_string(),
-                CType::Vector(Box::new(CType::Long), 16));
-            self.types.typedefs.insert("__SVUint8_t".to_string(),
-                CType::Vector(Box::new(CType::UChar), 16));
-            self.types.typedefs.insert("__SVUint16_t".to_string(),
-                CType::Vector(Box::new(CType::UShort), 16));
-            self.types.typedefs.insert("__SVUint32_t".to_string(),
-                CType::Vector(Box::new(CType::UInt), 16));
-            self.types.typedefs.insert("__SVUint64_t".to_string(),
-                CType::Vector(Box::new(CType::ULong), 16));
+            self.types.typedefs.insert(
+                "__SVInt8_t".to_string(),
+                CType::Vector(Box::new(CType::Char), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVInt16_t".to_string(),
+                CType::Vector(Box::new(CType::Short), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVInt32_t".to_string(),
+                CType::Vector(Box::new(CType::Int), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVInt64_t".to_string(),
+                CType::Vector(Box::new(CType::Long), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVUint8_t".to_string(),
+                CType::Vector(Box::new(CType::UChar), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVUint16_t".to_string(),
+                CType::Vector(Box::new(CType::UShort), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVUint32_t".to_string(),
+                CType::Vector(Box::new(CType::UInt), 16),
+            );
+            self.types.typedefs.insert(
+                "__SVUint64_t".to_string(),
+                CType::Vector(Box::new(CType::ULong), 16),
+            );
             // SVE predicate type (model as 16-byte unsigned char vector)
-            self.types.typedefs.insert("__SVBool_t".to_string(),
-                CType::Vector(Box::new(CType::UChar), 16));
+            self.types.typedefs.insert(
+                "__SVBool_t".to_string(),
+                CType::Vector(Box::new(CType::UChar), 16),
+            );
         }
     }
 
     /// Seed known libc math function signatures for correct calling convention.
     /// Without these, calls like atanf(1) would pass integer args in %rdi instead of %xmm0.
     /// Helper to insert a builtin function signature into func_meta.
-    fn insert_builtin_sig(&mut self, name: &str, return_type: IrType, param_types: Vec<IrType>, param_ctypes: Vec<CType>) {
+    fn insert_builtin_sig(
+        &mut self,
+        name: &str,
+        return_type: IrType,
+        param_types: Vec<IrType>,
+        param_ctypes: Vec<CType>,
+    ) {
         let mut sig = FuncSig::for_ptr(return_type, param_types);
         sig.param_ctypes = param_ctypes;
         self.func_meta.sigs.insert(name.to_string(), sig);
@@ -224,33 +317,107 @@ impl Lowerer {
         use IrType::*;
         // float func(float) - single-precision math
         let f_f: &[&str] = &[
-            "sinf", "cosf", "tanf", "asinf", "acosf", "atanf",
-            "sinhf", "coshf", "tanhf", "asinhf", "acoshf", "atanhf",
-            "expf", "exp2f", "expm1f", "logf", "log2f", "log10f", "log1pf",
-            "sqrtf", "cbrtf", "fabsf", "ceilf", "floorf", "roundf", "truncf",
-            "rintf", "nearbyintf", "erff", "erfcf", "tgammaf", "lgammaf",
+            "sinf",
+            "cosf",
+            "tanf",
+            "asinf",
+            "acosf",
+            "atanf",
+            "sinhf",
+            "coshf",
+            "tanhf",
+            "asinhf",
+            "acoshf",
+            "atanhf",
+            "expf",
+            "exp2f",
+            "expm1f",
+            "logf",
+            "log2f",
+            "log10f",
+            "log1pf",
+            "sqrtf",
+            "cbrtf",
+            "fabsf",
+            "ceilf",
+            "floorf",
+            "roundf",
+            "truncf",
+            "rintf",
+            "nearbyintf",
+            "erff",
+            "erfcf",
+            "tgammaf",
+            "lgammaf",
         ];
         for name in f_f {
             self.insert_builtin_sig(name, F32, vec![F32], Vec::new());
         }
         // double func(double) - double-precision math
         let d_d: &[&str] = &[
-            "sin", "cos", "tan", "asin", "acos", "atan",
-            "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-            "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
-            "sqrt", "cbrt", "fabs", "ceil", "floor", "round", "trunc",
-            "rint", "nearbyint", "erf", "erfc", "tgamma", "lgamma",
+            "sin",
+            "cos",
+            "tan",
+            "asin",
+            "acos",
+            "atan",
+            "sinh",
+            "cosh",
+            "tanh",
+            "asinh",
+            "acosh",
+            "atanh",
+            "exp",
+            "exp2",
+            "expm1",
+            "log",
+            "log2",
+            "log10",
+            "log1p",
+            "sqrt",
+            "cbrt",
+            "fabs",
+            "ceil",
+            "floor",
+            "round",
+            "trunc",
+            "rint",
+            "nearbyint",
+            "erf",
+            "erfc",
+            "tgamma",
+            "lgamma",
         ];
         for name in d_d {
             self.insert_builtin_sig(name, F64, vec![F64], Vec::new());
         }
         // float func(float, float) - two-arg single-precision
-        let f_ff: &[&str] = &["atan2f", "powf", "fmodf", "remainderf", "copysignf", "fminf", "fmaxf", "fdimf", "hypotf"];
+        let f_ff: &[&str] = &[
+            "atan2f",
+            "powf",
+            "fmodf",
+            "remainderf",
+            "copysignf",
+            "fminf",
+            "fmaxf",
+            "fdimf",
+            "hypotf",
+        ];
         for name in f_ff {
             self.insert_builtin_sig(name, F32, vec![F32, F32], Vec::new());
         }
         // double func(double, double) - two-arg double-precision
-        let d_dd: &[&str] = &["atan2", "pow", "fmod", "remainder", "copysign", "fmin", "fmax", "fdim", "hypot"];
+        let d_dd: &[&str] = &[
+            "atan2",
+            "pow",
+            "fmod",
+            "remainder",
+            "copysign",
+            "fmin",
+            "fmax",
+            "fdim",
+            "hypot",
+        ];
         for name in d_dd {
             self.insert_builtin_sig(name, F64, vec![F64, F64], Vec::new());
         }
@@ -275,30 +442,46 @@ impl Lowerer {
         self.insert_builtin_sig("cimagf", F32, Vec::new(), vec![CType::ComplexFloat]);
         // Functions returning _Complex double (real in xmm0, imag in xmm1):
         let cd_cd: &[&str] = &[
-            "csqrt", "cexp", "clog", "csin", "ccos", "ctan",
-            "casin", "cacos", "catan", "csinh", "ccosh", "ctanh",
-            "casinh", "cacosh", "catanh", "conj",
+            "csqrt", "cexp", "clog", "csin", "ccos", "ctan", "casin", "cacos", "catan", "csinh",
+            "ccosh", "ctanh", "casinh", "cacosh", "catanh", "conj",
         ];
         for name in cd_cd {
             self.insert_builtin_sig(name, F64, Vec::new(), vec![CType::ComplexDouble]);
-            self.types.func_return_ctypes.insert(name.to_string(), CType::ComplexDouble);
+            self.types
+                .func_return_ctypes
+                .insert(name.to_string(), CType::ComplexDouble);
         }
 
         // Functions returning _Complex float (packed two F32 in I64):
         let cf_cf: &[&str] = &[
-            "csqrtf", "cexpf", "clogf", "csinf", "ccosf", "ctanf",
-            "casinf", "cacosf", "catanf", "csinhf", "ccoshf", "ctanhf",
-            "casinhf", "cacoshf", "catanhf", "conjf",
+            "csqrtf", "cexpf", "clogf", "csinf", "ccosf", "ctanf", "casinf", "cacosf", "catanf",
+            "csinhf", "ccoshf", "ctanhf", "casinhf", "cacoshf", "catanhf", "conjf",
         ];
         for name in cf_cf {
             self.insert_builtin_sig(name, F64, Vec::new(), vec![CType::ComplexFloat]);
-            self.types.func_return_ctypes.insert(name.to_string(), CType::ComplexFloat);
+            self.types
+                .func_return_ctypes
+                .insert(name.to_string(), CType::ComplexFloat);
         }
 
         // cpow/cpowf take two complex args
-        self.insert_builtin_sig("cpow", F64, Vec::new(), vec![CType::ComplexDouble, CType::ComplexDouble]);
-        self.types.func_return_ctypes.insert("cpow".to_string(), CType::ComplexDouble);
-        self.insert_builtin_sig("cpowf", F64, Vec::new(), vec![CType::ComplexFloat, CType::ComplexFloat]);
-        self.types.func_return_ctypes.insert("cpowf".to_string(), CType::ComplexFloat);
+        self.insert_builtin_sig(
+            "cpow",
+            F64,
+            Vec::new(),
+            vec![CType::ComplexDouble, CType::ComplexDouble],
+        );
+        self.types
+            .func_return_ctypes
+            .insert("cpow".to_string(), CType::ComplexDouble);
+        self.insert_builtin_sig(
+            "cpowf",
+            F64,
+            Vec::new(),
+            vec![CType::ComplexFloat, CType::ComplexFloat],
+        );
+        self.types
+            .func_return_ctypes
+            .insert("cpowf".to_string(), CType::ComplexFloat);
     }
 }

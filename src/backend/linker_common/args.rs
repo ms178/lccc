@@ -104,8 +104,8 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     result.z_relro = true; // RELRO is on by default, like GNU ld/mold
     let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
     let mut pending_rpath = false; // for -Wl,-rpath -Wl,/path two-arg form
-    // Positional state: --whole-archive applies to archives that FOLLOW it,
-    // until --no-whole-archive turns it back off.
+                                   // Positional state: --whole-archive applies to archives that FOLLOW it,
+                                   // until --no-whole-archive turns it back off.
     let mut whole_archive = false;
     // GNU ld defaults to --no-as-needed; gcc's driver passes --as-needed
     // explicitly when it wants it.
@@ -137,13 +137,26 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if arg == "-static" {
             result.is_static = true;
         } else if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { path };
+            let p = if path.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                path
+            };
             result.extra_lib_paths.push(p.to_string());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
+            let l = if lib.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                lib
+            };
             result.libs_to_load.push(l.to_string());
             result.inputs.push(InputItem {
-                name: l.to_string(), is_lib: true, whole_archive, as_needed,
+                name: l.to_string(),
+                is_lib: true,
+                whole_archive,
+                as_needed,
             });
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -177,7 +190,10 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if let Some(lib) = part.strip_prefix("-l") {
                     result.libs_to_load.push(lib.to_string());
                     result.inputs.push(InputItem {
-                        name: lib.to_string(), is_lib: true, whole_archive, as_needed,
+                        name: lib.to_string(),
+                        is_lib: true,
+                        whole_archive,
+                        as_needed,
                     });
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     if let Some(eq_pos) = defsym_arg.find('=') {
@@ -216,8 +232,7 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if let Some(v) = part.strip_prefix("--icf=") {
                     // Unknown values disable ICF rather than erroring, which
                     // matches how gold/lld treat --icf=none.
-                    result.icf = crate::backend::x86::linker::parse_icf_mode(v)
-                        .map(str::to_string);
+                    result.icf = crate::backend::x86::linker::parse_icf_mode(v).map(str::to_string);
                 } else if part == "--no-icf" {
                     result.icf = None;
                 } else if part == "--gc-sections" {
@@ -267,12 +282,14 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 } else if let Some(sym) = part.strip_prefix("-e") {
                     // -e<sym> joined form (only if it looks like a symbol, not
                     // another flag such as -export-dynamic which is handled above)
-                    if !sym.is_empty() && !sym.starts_with('-')
-                        && !part.starts_with("-enable") && !part.starts_with("-export") {
+                    if !sym.is_empty()
+                        && !sym.starts_with('-')
+                        && !part.starts_with("-enable")
+                        && !part.starts_with("-export")
+                    {
                         result.entry_symbol = Some(sym.to_string());
                     }
-                }
-                else if let Some(sn) = part.strip_prefix("-soname=") {
+                } else if let Some(sn) = part.strip_prefix("-soname=") {
                     result.soname = Some(sn.to_string());
                 } else if part == "-soname" && j + 1 < parts.len() {
                     j += 1;
@@ -312,7 +329,10 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             result.extra_object_files.push(arg.to_string());
             result.inputs.push(InputItem {
-                name: arg.to_string(), is_lib: false, whole_archive, as_needed,
+                name: arg.to_string(),
+                is_lib: false,
+                whole_archive,
+                as_needed,
             });
         }
         i += 1;
@@ -333,26 +353,48 @@ mod map_arg_tests {
     /// or a build system using the separated form. All four must work.
     #[test]
     fn map_path_is_recognised_in_every_spelling() {
-        assert_eq!(parse_linker_args(&args(&["-Map=out.map"])).map_path.as_deref(),
-                   Some("out.map"));
-        assert_eq!(parse_linker_args(&args(&["-Map", "out.map"])).map_path.as_deref(),
-                   Some("out.map"));
-        assert_eq!(parse_linker_args(&args(&["-Wl,-Map=out.map"])).map_path.as_deref(),
-                   Some("out.map"));
-        assert_eq!(parse_linker_args(&args(&["-Wl,-Map,out.map"])).map_path.as_deref(),
-                   Some("out.map"));
+        assert_eq!(
+            parse_linker_args(&args(&["-Map=out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Map", "out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-Map=out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
+        assert_eq!(
+            parse_linker_args(&args(&["-Wl,-Map,out.map"]))
+                .map_path
+                .as_deref(),
+            Some("out.map")
+        );
     }
 
     #[test]
     fn map_path_absent_by_default() {
-        assert!(parse_linker_args(&args(&["-static", "a.o"])).map_path.is_none());
+        assert!(parse_linker_args(&args(&["-static", "a.o"]))
+            .map_path
+            .is_none());
     }
 
     /// A path containing '=' (legal) must survive intact.
     #[test]
     fn map_path_with_equals_in_filename() {
-        assert_eq!(parse_linker_args(&args(&["-Map=/tmp/a=b.map"])).map_path.as_deref(),
-                   Some("/tmp/a=b.map"));
+        assert_eq!(
+            parse_linker_args(&args(&["-Map=/tmp/a=b.map"]))
+                .map_path
+                .as_deref(),
+            Some("/tmp/a=b.map")
+        );
     }
 }
 
@@ -382,15 +424,17 @@ pub fn exclude_libs_matches(exclude: &[String], source_name: &str) -> bool {
         return false;
     }
     // Archive members are recorded as "path/to/libfoo.a(member.o)".
-    let Some(paren) = source_name.find('(') else { return false };
+    let Some(paren) = source_name.find('(') else {
+        return false;
+    };
     if !source_name.ends_with(')') {
         return false;
     }
     let archive = &source_name[..paren];
     let base = archive.rsplit('/').next().unwrap_or(archive);
-    exclude.iter().any(|e| {
-        e.eq_ignore_ascii_case("ALL") || e == base || e == archive
-    })
+    exclude
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case("ALL") || e == base || e == archive)
 }
 
 #[cfg(test)]
@@ -413,8 +457,7 @@ mod ordered_input_tests {
         // rerun instead of investigate.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let uniq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let td = std::env::temp_dir()
-            .join(format!("lccc_args_{}_{}", std::process::id(), uniq));
+        let td = std::env::temp_dir().join(format!("lccc_args_{}_{}", std::process::id(), uniq));
         std::fs::create_dir_all(&td).unwrap();
         for n in names {
             std::fs::write(td.join(n), b"").unwrap();
@@ -440,18 +483,28 @@ mod ordered_input_tests {
                 "--no-whole-archive",
                 &p("c.a"),
             ]));
-            let got: Vec<(String, bool)> = r.inputs.iter()
-                .map(|i| (
-                    std::path::Path::new(&i.name)
-                        .file_name().unwrap().to_string_lossy().to_string(),
-                    i.whole_archive,
-                ))
+            let got: Vec<(String, bool)> = r
+                .inputs
+                .iter()
+                .map(|i| {
+                    (
+                        std::path::Path::new(&i.name)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                        i.whole_archive,
+                    )
+                })
                 .collect();
-            assert_eq!(got, vec![
-                ("a.a".to_string(), false),
-                ("b.a".to_string(), true),
-                ("c.a".to_string(), false),
-            ]);
+            assert_eq!(
+                got,
+                vec![
+                    ("a.a".to_string(), false),
+                    ("b.a".to_string(), true),
+                    ("c.a".to_string(), false),
+                ]
+            );
         });
     }
 
@@ -478,22 +531,30 @@ mod ordered_input_tests {
     fn inputs_preserve_command_line_order() {
         with_files(&["first.o", "second.o"], |d| {
             let p = |n: &str| d.join(n).to_string_lossy().to_string();
-            let r = parse_linker_args(&args(&[
-                &p("first.o"), "-lm", &p("second.o"), "-lpthread",
-            ]));
-            let got: Vec<(String, bool)> = r.inputs.iter()
-                .map(|i| (
-                    std::path::Path::new(&i.name)
-                        .file_name().unwrap().to_string_lossy().to_string(),
-                    i.is_lib,
-                ))
+            let r = parse_linker_args(&args(&[&p("first.o"), "-lm", &p("second.o"), "-lpthread"]));
+            let got: Vec<(String, bool)> = r
+                .inputs
+                .iter()
+                .map(|i| {
+                    (
+                        std::path::Path::new(&i.name)
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                        i.is_lib,
+                    )
+                })
                 .collect();
-            assert_eq!(got, vec![
-                ("first.o".to_string(), false),
-                ("m".to_string(), true),
-                ("second.o".to_string(), false),
-                ("pthread".to_string(), true),
-            ]);
+            assert_eq!(
+                got,
+                vec![
+                    ("first.o".to_string(), false),
+                    ("m".to_string(), true),
+                    ("second.o".to_string(), false),
+                    ("pthread".to_string(), true),
+                ]
+            );
         });
     }
 

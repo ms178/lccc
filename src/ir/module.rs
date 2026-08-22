@@ -1,3 +1,5 @@
+use super::constants::IrConst;
+use super::instruction::{BasicBlock, Value};
 /// IR module, function, and global variable definitions.
 ///
 /// `IrModule` is the top-level compilation unit containing functions, globals,
@@ -5,8 +7,6 @@
 /// function with its parameter list, basic blocks, and ABI metadata.
 /// `IrGlobal` defines a global variable with its initializer and linkage.
 use crate::common::types::IrType;
-use super::constants::IrConst;
-use super::instruction::{BasicBlock, Value};
 
 /// A compilation unit in the IR.
 #[derive(Debug)]
@@ -179,7 +179,7 @@ pub struct IrFunction {
     pub is_variadic: bool,
     pub is_declaration: bool, // true if no body (extern)
     pub is_static: bool,      // true if declared with `static` linkage
-    pub is_inline: bool,      // true if declared with `inline` (used to skip patchable function entries)
+    pub is_inline: bool, // true if declared with `inline` (used to skip patchable function entries)
     /// True when __attribute__((always_inline)) is present.
     /// These functions must always be inlined at call sites.
     pub is_always_inline: bool,

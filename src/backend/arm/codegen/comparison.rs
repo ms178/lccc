@@ -1,11 +1,21 @@
 //! ArmCodegen: comparison operations.
 
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
+use super::emit::{
+    arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
+    is_arm_fp_phys, ArmCodegen,
+};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32, is_arm_fp_phys};
+use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
 impl ArmCodegen {
-    pub(super) fn emit_float_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_float_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F32 {
             let l = self.float_operand_reg(lhs, ty, "s0");
             let r = self.float_operand_reg(rhs, ty, "s1");
@@ -27,11 +37,24 @@ impl ArmCodegen {
         self.store_x0_to(dest);
     }
 
-    pub(super) fn emit_f128_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand) {
+    pub(super) fn emit_f128_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
         crate::backend::f128_softfloat::f128_cmp(self, dest, op, lhs, rhs);
     }
 
-    pub(super) fn emit_int_cmp_impl(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_int_cmp_impl(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         self.emit_int_cmp_insn(lhs, rhs, ty);
         let cond = arm_int_cond_code(op);
         self.state.emit_fmt(format_args!("    cset x0, {}", cond));
@@ -53,9 +76,15 @@ impl ArmCodegen {
             // less-than shapes so unordered compares stay false), so branching
             // on flags is identical to branching on the materialized boolean.
             let (l, r) = if ty == IrType::F32 {
-                (self.float_operand_reg(lhs, ty, "s0"), self.float_operand_reg(rhs, ty, "s1"))
+                (
+                    self.float_operand_reg(lhs, ty, "s0"),
+                    self.float_operand_reg(rhs, ty, "s1"),
+                )
             } else {
-                (self.float_operand_reg(lhs, ty, "d0"), self.float_operand_reg(rhs, ty, "d1"))
+                (
+                    self.float_operand_reg(lhs, ty, "d0"),
+                    self.float_operand_reg(rhs, ty, "d1"),
+                )
             };
             self.state.emit_fmt(format_args!("    fcmp {}, {}", l, r));
             let cond = match op {
@@ -68,7 +97,8 @@ impl ArmCodegen {
             };
             let inv_cc = arm_invert_cond_code(cond);
             let skip = self.state.fresh_label("skip");
-            self.state.emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
+            self.state
+                .emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
             self.state.emit_fmt(format_args!("    b {}", true_label));
             self.state.emit_fmt(format_args!("{}:", skip));
             self.state.emit_fmt(format_args!("    b {}", false_label));
@@ -79,14 +109,22 @@ impl ArmCodegen {
         let cc = arm_int_cond_code(op);
         let inv_cc = arm_invert_cond_code(cc);
         let skip = self.state.fresh_label("skip");
-        self.state.emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
+        self.state
+            .emit_fmt(format_args!("    b.{} {}", inv_cc, skip));
         self.state.emit_fmt(format_args!("    b {}", true_label));
         self.state.emit_fmt(format_args!("{}:", skip));
         self.state.emit_fmt(format_args!("    b {}", false_label));
         self.state.reg_cache.invalidate_all();
     }
 
-    pub(super) fn emit_select_impl(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) {
+    pub(super) fn emit_select_impl(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) {
         // Register-direct Select (levkropp 8a052b9a, adapted onto the current
         // fused-select helper). Staging every arm through x0/x1/x2 added ~5
         // moves per if-converted diamond. Reuse `select_arm_reg` so the
@@ -98,7 +136,12 @@ impl ArmCodegen {
         // the X register on A64, so a 64-bit `cmp Rn, #0` is width-correct.
         match cond {
             Operand::Value(v) => {
-                if let Some(phys) = self.reg_assignments.get(&v.0).copied().filter(|r| !is_arm_fp_phys(*r)) {
+                if let Some(phys) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| !is_arm_fp_phys(*r))
+                {
                     let c = callee_saved_name(phys);
                     self.state.emit_fmt(format_args!("    cmp {}, #0", c));
                 } else {
@@ -112,10 +155,16 @@ impl ArmCodegen {
             }
         }
         if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-            let d = if use_32bit { callee_saved_name_32(dp) } else { callee_saved_name(dp) };
-            self.state.emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t_name, f_name));
+            let d = if use_32bit {
+                callee_saved_name_32(dp)
+            } else {
+                callee_saved_name(dp)
+            };
+            self.state
+                .emit_fmt(format_args!("    csel {}, {}, {}, ne", d, t_name, f_name));
         } else {
-            self.state.emit_fmt(format_args!("    csel x0, {}, {}, ne", t_name, f_name));
+            self.state
+                .emit_fmt(format_args!("    csel x0, {}, {}, ne", t_name, f_name));
             self.store_x0_to(dest);
         }
         self.state.reg_cache.invalidate_acc();
@@ -147,10 +196,18 @@ impl ArmCodegen {
         let t_name = self.select_arm_reg(true_val, "x2", use_32bit);
 
         if let Some(dp) = self.dest_reg(dest).filter(|r| !is_arm_fp_phys(*r)) {
-            let d = if use_32bit { callee_saved_name_32(dp) } else { callee_saved_name(dp) };
-            self.state.emit_fmt(format_args!("    csel {}, {}, {}, {}", d, t_name, f_name, cc));
+            let d = if use_32bit {
+                callee_saved_name_32(dp)
+            } else {
+                callee_saved_name(dp)
+            };
+            self.state.emit_fmt(format_args!(
+                "    csel {}, {}, {}, {}",
+                d, t_name, f_name, cc
+            ));
         } else {
-            self.state.emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
+            self.state
+                .emit_fmt(format_args!("    csel x0, {}, {}, {}", t_name, f_name, cc));
             self.store_x0_to(dest);
         }
         self.state.reg_cache.invalidate_acc();
@@ -162,17 +219,27 @@ impl ArmCodegen {
         if let Operand::Value(v) = op {
             if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                 if !is_arm_fp_phys(phys) {
-                    return (if use_32bit { callee_saved_name_32(phys) } else { callee_saved_name(phys) }).to_string();
+                    return (if use_32bit {
+                        callee_saved_name_32(phys)
+                    } else {
+                        callee_saved_name(phys)
+                    })
+                    .to_string();
                 }
             }
         }
         // Width must match on BOTH sides of the mov: `mov w2, x0` is not a
         // valid A64 form (operand mismatch at assembly time — huft_build
         // repro). 32-bit selects copy w0 into a w-scratch.
-        let scratch = if use_32bit { scratch_x.replacen('x', "w", 1) } else { scratch_x.to_string() };
+        let scratch = if use_32bit {
+            scratch_x.replacen('x', "w", 1)
+        } else {
+            scratch_x.to_string()
+        };
         let src = if use_32bit { "w0" } else { "x0" };
         self.operand_to_x0(op);
-        self.state.emit_fmt(format_args!("    mov {}, {}", scratch, src));
+        self.state
+            .emit_fmt(format_args!("    mov {}, {}", scratch, src));
         scratch
     }
 }

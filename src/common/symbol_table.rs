@@ -1,5 +1,5 @@
-use crate::common::types::CType;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::types::CType;
 
 /// Information about a declared symbol.
 #[derive(Debug, Clone)]
@@ -19,7 +19,9 @@ struct Scope {
 
 impl Scope {
     fn new() -> Self {
-        Self { symbols: FxHashMap::default() }
+        Self {
+            symbols: FxHashMap::default(),
+        }
     }
 }
 
@@ -31,7 +33,9 @@ pub struct SymbolTable {
 
 impl SymbolTable {
     pub fn new() -> Self {
-        Self { scopes: vec![Scope::new()] }
+        Self {
+            scopes: vec![Scope::new()],
+        }
     }
 
     pub fn push_scope(&mut self) {
@@ -56,7 +60,6 @@ impl SymbolTable {
         }
         None
     }
-
 }
 
 impl Default for SymbolTable {

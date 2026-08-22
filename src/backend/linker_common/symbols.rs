@@ -4,7 +4,7 @@
 //! shared across x86 and ARM 64-bit linkers. Also defines the set of
 //! linker-provided symbols and `__start_`/`__stop_` resolution logic.
 
-use super::types::{Elf64Symbol, DynSymbol};
+use super::types::{DynSymbol, Elf64Symbol};
 
 /// Reference to one input section placed within an output section.
 pub struct InputSection {
@@ -61,33 +61,58 @@ pub trait GlobalSymbolOps: Clone {
 /// to avoid false "undefined symbol" errors and unnecessary shared library lookups.
 pub const LINKER_DEFINED_SYMBOLS: &[&str] = &[
     "_GLOBAL_OFFSET_TABLE_",
-    "__bss_start", "__bss_start__", "__BSS_END__",
-    "_edata", "edata", "_end", "end", "__end", "__end__",
-    "_etext", "etext",
-    "__ehdr_start", "__executable_start",
+    "__bss_start",
+    "__bss_start__",
+    "__BSS_END__",
+    "_edata",
+    "edata",
+    "_end",
+    "end",
+    "__end",
+    "__end__",
+    "_etext",
+    "etext",
+    "__ehdr_start",
+    "__executable_start",
     // Note: _start is intentionally excluded -- it comes from crt1.o, not the linker.
     // Suppressing it here would mask missing-CRT errors.
-    "__dso_handle", "_DYNAMIC",
-    "__data_start", "data_start", "__DATA_BEGIN__",
+    "__dso_handle",
+    "_DYNAMIC",
+    "__data_start",
+    "data_start",
+    "__DATA_BEGIN__",
     "__SDATA_BEGIN__",
-    "__init_array_start", "__init_array_end",
-    "__fini_array_start", "__fini_array_end",
-    "__preinit_array_start", "__preinit_array_end",
-    "__rela_iplt_start", "__rela_iplt_end",
-    "__rel_iplt_start", "__rel_iplt_end",
-    "__global_pointer$",  // RISC-V
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+    "__preinit_array_start",
+    "__preinit_array_end",
+    "__rela_iplt_start",
+    "__rela_iplt_end",
+    "__rel_iplt_start",
+    "__rel_iplt_end",
+    "__global_pointer$", // RISC-V
     "_IO_stdin_used",
-    "_init", "_fini",
-    "___tls_get_addr",    // i686 TLS
-    "__tls_get_addr",     // x86-64 TLS
+    "_init",
+    "_fini",
+    "___tls_get_addr", // i686 TLS
+    "__tls_get_addr",  // x86-64 TLS
     // Exception handling / unwinding (often weak, but may appear undefined)
-    "_ITM_registerTMCloneTable", "_ITM_deregisterTMCloneTable",
-    "__gcc_personality_v0", "_Unwind_Resume", "_Unwind_ForcedUnwind", "_Unwind_GetCFA",
-    "__pthread_initialize_minimal", "_dl_rtld_map",
+    "_ITM_registerTMCloneTable",
+    "_ITM_deregisterTMCloneTable",
+    "__gcc_personality_v0",
+    "_Unwind_Resume",
+    "_Unwind_ForcedUnwind",
+    "_Unwind_GetCFA",
+    "__pthread_initialize_minimal",
+    "_dl_rtld_map",
     "__GNU_EH_FRAME_HDR",
     "__getauxval",
     // Dynamic linker debug interface (provided by ld-linux*.so at runtime)
-    "_r_debug", "_dl_debug_state", "_dl_mcount",
+    "_r_debug",
+    "_dl_debug_state",
+    "_dl_mcount",
 ];
 
 /// Check whether a symbol name is one that the linker provides during layout.
@@ -105,7 +130,10 @@ pub fn is_linker_defined_symbol(name: &str) -> bool {
     // Note: GNU ld only resolves these when section X actually exists, but we
     // accept the pattern here to suppress "undefined symbol" errors early.
     // Actual resolution (in each backend) is guarded by section existence.
-    if let Some(suffix) = name.strip_prefix("__start_").or_else(|| name.strip_prefix("__stop_")) {
+    if let Some(suffix) = name
+        .strip_prefix("__start_")
+        .or_else(|| name.strip_prefix("__stop_"))
+    {
         return is_valid_c_identifier_for_section(suffix);
     }
     false
@@ -133,9 +161,7 @@ pub fn is_valid_c_identifier_for_section(s: &str) -> bool {
 /// start, `__stop_X` gets the address of the section's end (start + size).
 ///
 /// Returns a vector of (name, address) pairs for all resolved symbols.
-pub fn resolve_start_stop_symbols(
-    output_sections: &[OutputSection],
-) -> Vec<(String, u64)> {
+pub fn resolve_start_stop_symbols(output_sections: &[OutputSection]) -> Vec<(String, u64)> {
     let mut result = Vec::new();
     for sec in output_sections {
         if is_valid_c_identifier_for_section(&sec.name) {

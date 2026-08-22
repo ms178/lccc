@@ -10,18 +10,13 @@
 //! - The 64-bit data directive (`.quad` vs `.xword` vs `.dword`)
 //! - Extra assembler/linker flags
 
+use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
+use crate::common::types::IrType;
+use crate::ir::reexports::{GlobalInit, IrConst, IrGlobal, IrModule};
 #[cfg(any(feature = "gcc_assembler", feature = "gcc_linker"))]
 use std::process::Command;
 #[cfg(any(feature = "gcc_assembler", feature = "gcc_linker"))]
 use std::sync::Once;
-use crate::ir::reexports::{
-    GlobalInit,
-    IrConst,
-    IrGlobal,
-    IrModule,
-};
-use crate::common::types::IrType;
-use crate::backend::elf::{EM_386, EM_X86_64, EM_AARCH64, EM_RISCV};
 
 /// Print a one-time warning when using a GCC-backed assembler.
 ///
@@ -32,7 +27,10 @@ use crate::backend::elf::{EM_386, EM_X86_64, EM_AARCH64, EM_RISCV};
 fn warn_gcc_assembler(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!("WARNING: Using GCC-backed assembler ({}) [gcc_assembler feature enabled]", command);
+        eprintln!(
+            "WARNING: Using GCC-backed assembler ({}) [gcc_assembler feature enabled]",
+            command
+        );
     });
 }
 
@@ -44,7 +42,10 @@ fn warn_gcc_assembler(command: &str) {
 fn warn_gcc_linker(command: &str) {
     static WARN_ONCE: Once = Once::new();
     WARN_ONCE.call_once(|| {
-        eprintln!("WARNING: Using GCC-backed linker ({}) [gcc_linker feature enabled]", command);
+        eprintln!(
+            "WARNING: Using GCC-backed linker ({}) [gcc_linker feature enabled]",
+            command
+        );
     });
 }
 
@@ -81,7 +82,12 @@ pub struct LinkerConfig {
 /// The `extra_dynamic_args` are appended after the config's static extra_args,
 /// allowing runtime overrides (e.g., -mabi=lp64 from CLI flags).
 #[cfg(feature = "gcc_assembler")]
-pub fn assemble_with_extra(config: &AssemblerConfig, asm_text: &str, output_path: &str, extra_dynamic_args: &[String]) -> Result<(), String> {
+pub fn assemble_with_extra(
+    config: &AssemblerConfig,
+    asm_text: &str,
+    output_path: &str,
+    extra_dynamic_args: &[String],
+) -> Result<(), String> {
     use crate::common::temp_files::TempFile;
 
     warn_gcc_assembler(config.command);
@@ -107,7 +113,8 @@ pub fn assemble_with_extra(config: &AssemblerConfig, asm_text: &str, output_path
     cmd.args(extra_dynamic_args);
     cmd.args(["-c", "-o", output_path, asm_file.to_str()]);
 
-    let result = cmd.output()
+    let result = cmd
+        .output()
         .map_err(|e| format!("Failed to run assembler ({}): {}", config.command, e))?;
 
     if !result.status.success() {
@@ -121,11 +128,11 @@ pub fn assemble_with_extra(config: &AssemblerConfig, asm_text: &str, output_path
 /// Map an ELF e_machine value to a human-readable architecture name.
 fn elf_machine_name(em: u16) -> &'static str {
     match em {
-        EM_386     => "i386",
-        40         => "ARM",
-        EM_X86_64  => "x86-64",
+        EM_386 => "i386",
+        40 => "ARM",
+        EM_X86_64 => "x86-64",
         EM_AARCH64 => "aarch64",
-        EM_RISCV   => "RISC-V",
+        EM_RISCV => "RISC-V",
         _ => "unknown",
     }
 }
@@ -149,7 +156,9 @@ fn validate_object_architectures(
         }
         // Read the ELF header: first 20 bytes contain e_ident (16) + e_type (2) + e_machine (2)
         let mut buf = [0u8; 20];
-        let Ok(mut f) = std::fs::File::open(path) else { continue };
+        let Ok(mut f) = std::fs::File::open(path) else {
+            continue;
+        };
         let Ok(n) = f.read(&mut buf) else { continue };
         if n < 20 {
             continue;
@@ -180,7 +189,12 @@ fn validate_object_architectures(
         arch_name, expected_machine
     );
     for (path, em) in &mismatched {
-        msg.push_str(&format!("  {} ({}; e_machine={})\n", path, elf_machine_name(*em), em));
+        msg.push_str(&format!(
+            "  {} ({}; e_machine={})\n",
+            path,
+            elf_machine_name(*em),
+            em
+        ));
     }
     msg.push_str("Hint: these look like stale objects from a previous build. Try running 'make clean' before rebuilding.");
     Err(msg)
@@ -191,10 +205,18 @@ fn validate_object_architectures(
 /// When the `gcc_linker` Cargo feature is enabled, uses GCC as the linker
 /// driver (with a warning). When disabled (default), uses the built-in native
 /// linker for all supported architectures.
-pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path: &str, user_args: &[String]) -> Result<(), String> {
+pub fn link_with_args(
+    config: &LinkerConfig,
+    object_files: &[&str],
+    output_path: &str,
+    user_args: &[String],
+) -> Result<(), String> {
     // Validate that all input .o files match the target architecture.
     validate_object_architectures(
-        object_files.iter().copied().chain(user_args.iter().map(|s| s.as_str())),
+        object_files
+            .iter()
+            .copied()
+            .chain(user_args.iter().map(|s| s.as_str())),
         config.expected_elf_machine,
         config.arch_name,
     )?;
@@ -208,8 +230,15 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
     // When gcc_linker feature is enabled, use GCC for ALL linking
     #[cfg(feature = "gcc_linker")]
     {
-        link_with_gcc(config, object_files, output_path, user_args,
-                            is_shared, is_nostdlib, is_relocatable)
+        link_with_gcc(
+            config,
+            object_files,
+            output_path,
+            user_args,
+            is_shared,
+            is_nostdlib,
+            is_relocatable,
+        )
     }
 
     // Default (gcc_linker disabled): use the built-in native linker
@@ -224,26 +253,31 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
                     inputs.push((f.to_string(), false));
                 }
                 for a in user_args {
-                    if !a.starts_with('-') && std::path::Path::new(a).exists()
-                        && (a.ends_with(".o") || a.ends_with(".a")) {
+                    if !a.starts_with('-')
+                        && std::path::Path::new(a).exists()
+                        && (a.ends_with(".o") || a.ends_with(".a"))
+                    {
                         inputs.push((a.clone(), false));
                     }
                 }
                 let mut objects = Vec::new();
                 crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects)?;
                 return crate::backend::x86::linker::emit_rel::link_relocatable(
-                    &objects, output_path);
+                    &objects,
+                    output_path,
+                );
             }
             return Err("Relocatable linking (-r) requires the gcc_linker feature. \
-                       Rebuild with: cargo build --features gcc_linker".to_string());
+                       Rebuild with: cargo build --features gcc_linker"
+                .to_string());
         }
 
         // Look up the architecture config by ELF machine number
         let arch = match config.expected_elf_machine {
-            EM_X86_64  => &DIRECT_LD_X86_64,
+            EM_X86_64 => &DIRECT_LD_X86_64,
             EM_AARCH64 => &DIRECT_LD_AARCH64,
-            EM_RISCV   => &DIRECT_LD_RISCV64,
-            EM_386     => &DIRECT_LD_I686,
+            EM_RISCV => &DIRECT_LD_RISCV64,
+            EM_386 => &DIRECT_LD_I686,
             _ => {
                 return Err(format!(
                     "No built-in linker for ELF machine {} ({}). \
@@ -253,7 +287,15 @@ pub fn link_with_args(config: &LinkerConfig, object_files: &[&str], output_path:
             }
         };
 
-        link_builtin_native(arch, object_files, output_path, user_args, is_nostdlib, is_static, is_shared)
+        link_builtin_native(
+            arch,
+            object_files,
+            output_path,
+            user_args,
+            is_nostdlib,
+            is_static,
+            is_shared,
+        )
     }
 }
 
@@ -299,7 +341,8 @@ fn link_with_gcc(
         cmd.arg("-lm");
     }
 
-    let result = cmd.output()
+    let result = cmd
+        .output()
         .map_err(|e| format!("Failed to run linker ({}): {}", ld_command, e))?;
 
     if !result.stdout.is_empty() {
@@ -412,10 +455,7 @@ const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
         "/usr/lib/riscv64-linux-gnu",
         "/lib/riscv64-linux-gnu",
     ],
-    system_lib_dirs: &[
-        "/lib/riscv64-linux-gnu",
-        "/usr/lib/riscv64-linux-gnu",
-    ],
+    system_lib_dirs: &["/lib/riscv64-linux-gnu", "/usr/lib/riscv64-linux-gnu"],
     extra_ld_flags: &[],
     extra_skip_flags: &[],
     crti_from_gcc_dir: true,
@@ -645,7 +685,12 @@ fn resolve_builtin_link_setup(
     let mut lib_paths: Vec<String> = user_lib_paths;
     lib_paths.extend(system_lib_paths);
 
-    BuiltinLinkSetup { crt_before, crt_after, lib_paths, needed_libs }
+    BuiltinLinkSetup {
+        crt_before,
+        crt_after,
+        lib_paths,
+        needed_libs,
+    }
 }
 
 /// Add architecture-specific extra libraries after "gcc" in the needed libs list.
@@ -664,7 +709,11 @@ fn add_arch_extra_libs(setup: &mut BuiltinLinkSetup, elf_machine: u16, is_static
     // Find the "gcc" entry and insert the extra lib after it
     if let Some(pos) = setup.needed_libs.iter().position(|l| l == "gcc") {
         // i686 always needs gcc_eh; others use gcc_eh for static, gcc_s for dynamic
-        let extra = if elf_machine == EM_386 || is_static { "gcc_eh" } else { "gcc_s" };
+        let extra = if elf_machine == EM_386 || is_static {
+            "gcc_eh"
+        } else {
+            "gcc_s"
+        };
         setup.needed_libs.insert(pos + 1, extra.to_string());
     }
 }
@@ -712,7 +761,7 @@ fn link_builtin_native(
     is_static: bool,
     is_shared: bool,
 ) -> Result<(), String> {
-    use crate::backend::{x86, i686, arm, riscv};
+    use crate::backend::{arm, i686, riscv, x86};
 
     if is_shared {
         // Shared libraries: no CRT objects, lib paths only
@@ -722,12 +771,27 @@ fn link_builtin_native(
             EM_X86_64 => {
                 // x86-64 shared linker also takes implicit libs (gcc for runtime helpers)
                 let implicit_libs: Vec<&str> = if is_nostdlib { vec![] } else { vec!["gcc"] };
-                x86::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths, &implicit_libs)
+                x86::linker::link_shared(
+                    object_files,
+                    output_path,
+                    user_args,
+                    &refs.lib_paths,
+                    &implicit_libs,
+                )
             }
-            EM_AARCH64 => arm::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths),
-            EM_RISCV => riscv::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths),
-            EM_386 => i686::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths),
-            _ => Err(format!("No shared library linker for {} (elf_machine={})", arch.arch_name, arch.elf_machine)),
+            EM_AARCH64 => {
+                arm::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
+            }
+            EM_RISCV => {
+                riscv::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
+            }
+            EM_386 => {
+                i686::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
+            }
+            _ => Err(format!(
+                "No shared library linker for {} (elf_machine={})",
+                arch.arch_name, arch.elf_machine
+            )),
         };
     }
 
@@ -737,23 +801,46 @@ fn link_builtin_native(
 
     match arch.elf_machine {
         EM_X86_64 => x86::linker::link_builtin(
-            object_files, output_path, user_args,
-            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+            object_files,
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
         ),
         EM_386 => i686::linker::link_builtin(
-            object_files, output_path, user_args,
-            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+            object_files,
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
         ),
         EM_AARCH64 => arm::linker::link_builtin(
-            object_files, output_path, user_args,
-            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+            object_files,
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
             is_static,
         ),
         EM_RISCV => riscv::linker::link_builtin(
-            object_files, output_path, user_args,
-            &refs.lib_paths, &refs.needed_libs, &refs.crt_before, &refs.crt_after,
+            object_files,
+            output_path,
+            user_args,
+            &refs.lib_paths,
+            &refs.needed_libs,
+            &refs.crt_before,
+            &refs.crt_after,
         ),
-        _ => Err(format!("No built-in linker for {} (elf_machine={})", arch.arch_name, arch.elf_machine)),
+        _ => Err(format!(
+            "No built-in linker for {} (elf_machine={})",
+            arch.arch_name, arch.elf_machine
+        )),
     }
 }
 
@@ -786,7 +873,11 @@ fn write_i64_fast(buf: &mut String, val: i64) {
     let mut tmp = [0u8; 20]; // i64 max is 19 digits + sign
     let negative = val < 0;
     // Work with absolute value using wrapping to handle i64::MIN correctly
-    let mut v = if negative { (val as u64).wrapping_neg() } else { val as u64 };
+    let mut v = if negative {
+        (val as u64).wrapping_neg()
+    } else {
+        val as u64
+    };
     let mut pos = 20;
     while v > 0 {
         pos -= 1;
@@ -1149,10 +1240,10 @@ macro_rules! emit {
 /// x86 uses `.quad`, AArch64 uses `.xword`, RISC-V uses `.dword`.
 #[derive(Clone, Copy)]
 pub enum PtrDirective {
-    Quad,   // x86-64
-    Long,   // i686 (32-bit)
-    Xword,  // AArch64
-    Dword,  // RISC-V 64
+    Quad,  // x86-64
+    Long,  // i686 (32-bit)
+    Xword, // AArch64
+    Dword, // RISC-V 64
 }
 
 impl PtrDirective {
@@ -1192,11 +1283,18 @@ impl PtrDirective {
     /// On x86-64, `.align N` means N bytes. On ARM and RISC-V, `.align N` means 2^N bytes,
     /// so we must emit log2(N) instead.
     pub fn align_arg(self, bytes: usize) -> usize {
-        debug_assert!(bytes == 0 || bytes.is_power_of_two(), "alignment must be power of 2");
+        debug_assert!(
+            bytes == 0 || bytes.is_power_of_two(),
+            "alignment must be power of 2"
+        );
         match self {
             PtrDirective::Quad | PtrDirective::Long => bytes,
             PtrDirective::Xword | PtrDirective::Dword => {
-                if bytes <= 1 { 0 } else { bytes.trailing_zeros() as usize }
+                if bytes <= 1 {
+                    0
+                } else {
+                    bytes.trailing_zeros() as usize
+                }
             }
         }
     }
@@ -1209,10 +1307,17 @@ impl PtrDirective {
 /// write those relocations at load time; keeping them in `.rodata` makes GNU ld
 /// create DT_TEXTREL and can fail hardened builds.  `.data.rel.ro` is writable
 /// during relocation and becomes read-only under RELRO.
-pub fn emit_data_sections(out: &mut AsmOutput, module: &IrModule, ptr_dir: PtrDirective, pic_mode: bool) {
+pub fn emit_data_sections(
+    out: &mut AsmOutput,
+    module: &IrModule,
+    ptr_dir: PtrDirective,
+    pic_mode: bool,
+) {
     // String literals in .rodata
-    if !module.string_literals.is_empty() || !module.wide_string_literals.is_empty()
-       || !module.char16_string_literals.is_empty() {
+    if !module.string_literals.is_empty()
+        || !module.wide_string_literals.is_empty()
+        || !module.char16_string_literals.is_empty()
+    {
         out.emit(".section .rodata");
         for (label, value) in &module.string_literals {
             out.emit_fmt(format_args!("{}:", label));
@@ -1263,7 +1368,10 @@ fn effective_align(g: &IrGlobal) -> usize {
 /// Emit a zero-initialized global variable (used in .bss, .tbss, and custom section zero-init).
 fn emit_zero_global(out: &mut AsmOutput, g: &IrGlobal, obj_type: &str, ptr_dir: PtrDirective) {
     emit_symbol_directives(out, g);
-    out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(effective_align(g))));
+    out.emit_fmt(format_args!(
+        ".align {}",
+        ptr_dir.align_arg(effective_align(g))
+    ));
     out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
     out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
     out.emit_fmt(format_args!("{}:", g.name));
@@ -1332,7 +1440,11 @@ fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
     let is_zero = matches!(g.init, GlobalInit::Zero);
     let has_nonzero_init = !is_zero && g.size > 0;
     if g.is_thread_local {
-        return if has_nonzero_init { GlobalSection::Tdata } else { GlobalSection::Tbss };
+        return if has_nonzero_init {
+            GlobalSection::Tdata
+        } else {
+            GlobalSection::Tbss
+        };
     }
     if has_nonzero_init {
         return if g.is_const {
@@ -1359,7 +1471,10 @@ fn classify_global(g: &IrGlobal, pic_mode: bool) -> GlobalSection {
 /// .rodata, .tdata, .data, .comm, .tbss, .bss.
 fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective, pic_mode: bool) {
     // Phase 1: classify every global into its target section.
-    let classified: Vec<GlobalSection> = globals.iter().map(|g| classify_global(g, pic_mode)).collect();
+    let classified: Vec<GlobalSection> = globals
+        .iter()
+        .map(|g| classify_global(g, pic_mode))
+        .collect();
 
     // Phase 2: emit each section group in order.
 
@@ -1390,7 +1505,11 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         // "aw" (writable) otherwise. GCC uses the const qualification of the
         // variable to determine section flags, not just the section name.
         // This matters for kernel sections like .modinfo which contain const data.
-        let flags = if g.is_const || section_name.contains("rodata") { "a" } else { "aw" };
+        let flags = if g.is_const || section_name.contains("rodata") {
+            "a"
+        } else {
+            "aw"
+        };
         // Sections starting with ".bss" are NOBITS (no file space, BSS semantics).
         // A zero-initialized writable global in any custom section is also NOBITS:
         // it costs no file space and is zero-filled at load time (used by PGO
@@ -1401,7 +1520,10 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         } else {
             "@progbits"
         };
-        out.emit_fmt(format_args!(".section {},\"{}\",{}", section_name, flags, section_type));
+        out.emit_fmt(format_args!(
+            ".section {},\"{}\",{}",
+            section_name, flags, section_type
+        ));
         if matches!(g.init, GlobalInit::Zero) || g.size == 0 {
             emit_zero_global(out, g, "@object", ptr_dir);
         } else {
@@ -1411,38 +1533,85 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
     }
 
     // .rodata: const-qualified initialized globals with no runtime relocations.
-    emit_section_group(out, globals, &classified, &GlobalSection::Rodata,
-        ".section .rodata", false, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Rodata,
+        ".section .rodata",
+        false,
+        ptr_dir,
+    );
 
     // .data.rel.ro: const-qualified globals that need runtime relocation in
     // PIC/PIE mode.  GNU ld places this in RELRO, eliminating DT_TEXTREL.
-    emit_section_group(out, globals, &classified, &GlobalSection::DataRelRo,
-        ".section .data.rel.ro,\"aw\",@progbits", false, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::DataRelRo,
+        ".section .data.rel.ro,\"aw\",@progbits",
+        false,
+        ptr_dir,
+    );
 
     // .tdata: thread-local initialized globals
-    emit_section_group(out, globals, &classified, &GlobalSection::Tdata,
-        ".section .tdata,\"awT\",@progbits", false, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Tdata,
+        ".section .tdata,\"awT\",@progbits",
+        false,
+        ptr_dir,
+    );
 
     // .data: non-const initialized globals
-    emit_section_group(out, globals, &classified, &GlobalSection::Data,
-        ".section .data", false, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Data,
+        ".section .data",
+        false,
+        ptr_dir,
+    );
 
     // .comm: zero-initialized common globals (weak linkage, linker merges duplicates).
     // .comm alignment is always in bytes on all platforms, unlike .align.
     for (g, sect) in globals.iter().zip(&classified) {
         if matches!(sect, GlobalSection::Common) {
-            out.emit_fmt(format_args!(".comm {},{},{}", g.name, g.size, effective_align(g)));
+            out.emit_fmt(format_args!(
+                ".comm {},{},{}",
+                g.name,
+                g.size,
+                effective_align(g)
+            ));
         }
     }
 
     // .tbss: thread-local zero-initialized globals
-    emit_section_group(out, globals, &classified, &GlobalSection::Tbss,
-        ".section .tbss,\"awT\",@nobits", true, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Tbss,
+        ".section .tbss,\"awT\",@nobits",
+        true,
+        ptr_dir,
+    );
 
     // .bss: non-TLS zero-initialized globals (includes zero-size globals with
     // empty initializers like `Type arr[0] = {}` to avoid address overlap).
-    emit_section_group(out, globals, &classified, &GlobalSection::Bss,
-        ".section .bss", true, ptr_dir);
+    emit_section_group(
+        out,
+        globals,
+        &classified,
+        &GlobalSection::Bss,
+        ".section .bss",
+        true,
+        ptr_dir,
+    );
 }
 
 /// Emit all globals matching `target` section, with a section header on first match.
@@ -1466,7 +1635,11 @@ fn emit_section_group(
             emitted_header = true;
         }
         if is_zero {
-            let obj_type = if g.is_thread_local { "@tls_object" } else { "@object" };
+            let obj_type = if g.is_thread_local {
+                "@tls_object"
+            } else {
+                "@object"
+            };
             emit_zero_global(out, g, obj_type, ptr_dir);
         } else {
             emit_global_def(out, g, ptr_dir);
@@ -1509,8 +1682,15 @@ fn emit_symbol_directives(out: &mut AsmOutput, g: &IrGlobal) {
 /// Emit a single global variable definition.
 fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
     emit_symbol_directives(out, g);
-    out.emit_fmt(format_args!(".align {}", ptr_dir.align_arg(effective_align(g))));
-    let obj_type = if g.is_thread_local { "@tls_object" } else { "@object" };
+    out.emit_fmt(format_args!(
+        ".align {}",
+        ptr_dir.align_arg(effective_align(g))
+    ));
+    let obj_type = if g.is_thread_local {
+        "@tls_object"
+    } else {
+        "@object"
+    };
     out.emit_fmt(format_args!(".type {}, {}", g.name, obj_type));
     out.emit_fmt(format_args!(".size {}, {}", g.name, g.size));
     out.emit_fmt(format_args!("{}:", g.name));
@@ -1525,7 +1705,13 @@ fn emit_global_def(out: &mut AsmOutput, g: &IrGlobal, ptr_dir: PtrDirective) {
 /// `fallback_ty` is the declared element type of the enclosing global/array, used to
 /// widen narrow constants (e.g., IrConst::I32(0) in a pointer array emits .quad 0).
 /// `total_size` is the declared size of the enclosing global for padding calculations.
-fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, total_size: usize, ptr_dir: PtrDirective) {
+fn emit_init_data(
+    out: &mut AsmOutput,
+    init: &GlobalInit,
+    fallback_ty: IrType,
+    total_size: usize,
+    ptr_dir: PtrDirective,
+) {
     match init {
         GlobalInit::Zero => {
             out.emit_fmt(format_args!("    .zero {}", total_size));
@@ -1576,7 +1762,10 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
                 // NUL terminator fits: use .asciz (emits string + NUL)
                 out.emit_fmt(format_args!("    .asciz \"{}\"", escape_string(s)));
                 if total_size > string_bytes_with_nul {
-                    out.emit_fmt(format_args!("    .zero {}", total_size - string_bytes_with_nul));
+                    out.emit_fmt(format_args!(
+                        "    .zero {}",
+                        total_size - string_bytes_with_nul
+                    ));
                 }
             } else {
                 // NUL terminator doesn't fit (C11 6.7.9 p14): truncate to array size.
@@ -1604,7 +1793,12 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
         }
         GlobalInit::GlobalAddrOffset(label, offset) => {
             if *offset >= 0 {
-                out.emit_fmt(format_args!("    {} {}+{}", ptr_dir.as_str(), label, offset));
+                out.emit_fmt(format_args!(
+                    "    {} {}+{}",
+                    ptr_dir.as_str(),
+                    label,
+                    offset
+                ));
             } else {
                 out.emit_fmt(format_args!("    {} {}{}", ptr_dir.as_str(), label, offset));
             }
@@ -1628,7 +1822,12 @@ fn emit_init_data(out: &mut AsmOutput, init: &GlobalInit, fallback_ty: IrType, t
 /// Most variants delegate to the shared emit_init_data. Scalar elements use the
 /// constant's natural type rather than the enclosing global's type, since compound
 /// elements may have heterogeneous types (e.g., struct with int and pointer fields).
-fn emit_compound_element(out: &mut AsmOutput, elem: &GlobalInit, fallback_ty: IrType, ptr_dir: PtrDirective) {
+fn emit_compound_element(
+    out: &mut AsmOutput,
+    elem: &GlobalInit,
+    fallback_ty: IrType,
+    ptr_dir: PtrDirective,
+) {
     match elem {
         GlobalInit::Scalar(c) => {
             // In compound initializers, each element may have a different type.
@@ -1762,7 +1961,10 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
         }
         IrConst::Zero => {
             let size = ty.size();
-            out.emit_fmt(format_args!("    .zero {}", if size == 0 { 4 } else { size }));
+            out.emit_fmt(format_args!(
+                "    .zero {}",
+                if size == 0 { 4 } else { size }
+            ));
         }
     }
 }
@@ -1861,4 +2063,3 @@ pub fn escape_string(s: &str) -> String {
     }
     result
 }
-

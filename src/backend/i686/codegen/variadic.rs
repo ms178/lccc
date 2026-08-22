@@ -1,13 +1,18 @@
 //! I686Codegen: variadic argument operations (va_arg, va_start, va_copy).
 
-use crate::ir::reexports::Value;
-use crate::common::types::IrType;
-use crate::backend::generation::is_i128_type;
-use crate::emit;
 use super::emit::I686Codegen;
+use crate::backend::generation::is_i128_type;
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::Value;
 
 impl I686Codegen {
-    pub(super) fn emit_va_arg_impl(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
+    pub(super) fn emit_va_arg_impl(
+        &mut self,
+        dest: &Value,
+        va_list_ptr: &Value,
+        result_ty: IrType,
+    ) {
         self.load_va_list_addr_to_edx(va_list_ptr);
         self.state.emit("    movl (%edx), %ecx");
 
@@ -65,7 +70,13 @@ impl I686Codegen {
         self.state.emit("    movl %eax, (%edx)");
     }
 
-    pub(super) fn emit_va_arg_struct_impl(&mut self, _dest_ptr: &Value, _va_list_ptr: &Value, _size: usize, _align: usize) {
+    pub(super) fn emit_va_arg_struct_impl(
+        &mut self,
+        _dest_ptr: &Value,
+        _va_list_ptr: &Value,
+        _size: usize,
+        _align: usize,
+    ) {
         panic!("VaArgStruct should not be emitted for i686 target");
     }
 }

@@ -6,11 +6,13 @@
 //! Pre-colored registers (MachReg::Phys) are used for x86 constraints like
 //! division (rax:rdx) and shifts (rcx/%cl).
 
-use crate::ir::reexports::{IrBinOp, IrCmpOp, IrUnaryOp, Operand, Value, IrConst, Instruction, Terminator, BlockId};
-use crate::common::types::{IrType, AddressSpace};
+use super::machinst::*;
 use crate::backend::regalloc::PhysReg;
 use crate::common::fx_hash::FxHashMap;
-use super::machinst::*;
+use crate::common::types::{AddressSpace, IrType};
+use crate::ir::reexports::{
+    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator, Value,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -79,8 +81,13 @@ fn const_as_imm32(op: &Operand) -> Option<i64> {
 
 /// Emit a move from an IR Operand to a register, using physical registers
 /// for values already allocated by the main register allocator.
-fn emit_mov_operand_r(op: &Operand, dst: MachReg, size: OpSize,
-                      ra: &FxHashMap<u32, PhysReg>, out: &mut Vec<MachInst>) {
+fn emit_mov_operand_r(
+    op: &Operand,
+    dst: MachReg,
+    size: OpSize,
+    ra: &FxHashMap<u32, PhysReg>,
+    out: &mut Vec<MachInst>,
+) {
     match op {
         Operand::Value(v) => {
             let src_reg = value_to_reg(v, ra);
@@ -110,8 +117,14 @@ fn emit_mov_operand(op: &Operand, dst: MachReg, size: OpSize, out: &mut Vec<Mach
 
 /// Emit an ALU instruction with an IR Operand as source.
 /// For large immediates that don't fit in i32, materialize to rax first.
-fn emit_alu_operand_r(op: AluOp, src: &Operand, dst: MachReg, size: OpSize,
-                      ra: &FxHashMap<u32, PhysReg>, out: &mut Vec<MachInst>) {
+fn emit_alu_operand_r(
+    op: AluOp,
+    src: &Operand,
+    dst: MachReg,
+    size: OpSize,
+    ra: &FxHashMap<u32, PhysReg>,
+    out: &mut Vec<MachInst>,
+) {
     let src_op = lower_operand_with_regs(src, ra);
     // x86 ALU instructions only support i32 immediates. For larger values,
     // materialize to the scratch register (rax) first.
@@ -131,7 +144,12 @@ fn emit_alu_operand_r(op: AluOp, src: &Operand, dst: MachReg, size: OpSize,
             return;
         }
     }
-    out.push(MachInst::Alu { op, src: src_op, dst, size });
+    out.push(MachInst::Alu {
+        op,
+        src: src_op,
+        dst,
+        size,
+    });
 }
 
 /// Map IrBinOp to AluOp for simple two-address operations.
@@ -161,9 +179,9 @@ fn binop_to_shift(op: IrBinOp) -> Option<ShiftOp> {
 /// Returns the scale (2, 4, or 8) for the LEA index.
 fn lea_scale_for_mul(imm: i64) -> Option<u8> {
     match imm {
-        3 => Some(2),  // lea (%r, %r, 2), %r  → r * 3
-        5 => Some(4),  // lea (%r, %r, 4), %r  → r * 5
-        9 => Some(8),  // lea (%r, %r, 8), %r  → r * 9
+        3 => Some(2), // lea (%r, %r, 2), %r  → r * 3
+        5 => Some(4), // lea (%r, %r, 4), %r  → r * 5
+        9 => Some(8), // lea (%r, %r, 8), %r  → r * 9
         _ => None,
     }
 }
@@ -231,7 +249,10 @@ pub fn lower_binop(
                 if let Some(scale) = lea_scale_for_mul(imm) {
                     emit_mov_operand_r(lhs, dst, size, ra, out);
                     out.push(MachInst::Lea {
-                        base: dst, index: Some((dst, scale)), offset: 0, dst,
+                        base: dst,
+                        index: Some((dst, scale)),
+                        offset: 0,
+                        dst,
                     });
                     return;
                 }
@@ -243,7 +264,12 @@ pub fn lower_binop(
                             dst
                         }
                     };
-                    out.push(MachInst::Imul3 { imm, src, dst, size });
+                    out.push(MachInst::Imul3 {
+                        imm,
+                        src,
+                        dst,
+                        size,
+                    });
                     return;
                 }
             }
@@ -259,12 +285,18 @@ pub fn lower_binop(
         if let Some(imm) = const_as_imm32(rhs) {
             let mask = if size == OpSize::S32 { 31 } else { 63 };
             out.push(MachInst::Shift {
-                op: shift_op, amount: MachOperand::Imm(imm & mask), dst, size,
+                op: shift_op,
+                amount: MachOperand::Imm(imm & mask),
+                dst,
+                size,
             });
         } else {
             emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
             out.push(MachInst::Shift {
-                op: shift_op, amount: MachOperand::Reg(MachReg::Phys(RCX)), dst, size,
+                op: shift_op,
+                amount: MachOperand::Reg(MachReg::Phys(RCX)),
+                dst,
+                size,
             });
         }
         return;
@@ -287,11 +319,16 @@ pub fn lower_binop(
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
-            out.push(MachInst::Div { divisor: divisor_op, signed: true, size });
+            out.push(MachInst::Div {
+                divisor: divisor_op,
+                signed: true,
+                size,
+            });
             let result_phys = if op == IrBinOp::SDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
                 src: MachOperand::Reg(MachReg::Phys(result_phys)),
-                dst: MachOperand::Reg(dst), size,
+                dst: MachOperand::Reg(dst),
+                size,
             });
         }
         IrBinOp::UDiv | IrBinOp::URem => {
@@ -306,11 +343,16 @@ pub fn lower_binop(
                 });
                 divisor_op = MachOperand::Reg(MachReg::Phys(RCX));
             }
-            out.push(MachInst::Div { divisor: divisor_op, signed: false, size });
+            out.push(MachInst::Div {
+                divisor: divisor_op,
+                signed: false,
+                size,
+            });
             let result_phys = if op == IrBinOp::UDiv { RAX } else { RDX };
             out.push(MachInst::Mov {
                 src: MachOperand::Reg(MachReg::Phys(result_phys)),
-                dst: MachOperand::Reg(dst), size,
+                dst: MachOperand::Reg(dst),
+                size,
             });
         }
         _ => unreachable!("unhandled binop: {:?}", op),
@@ -421,9 +463,18 @@ pub fn lower_cmp(
             rhs_op = MachOperand::Reg(MachReg::Phys(RCX));
         }
     }
-    out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
+    out.push(MachInst::Cmp {
+        lhs: lhs_op,
+        rhs: rhs_op,
+        size,
+    });
     out.push(MachInst::SetCC { cc, dst });
-    out.push(MachInst::Movzx { src: MachOperand::Reg(dst), dst, from_size: OpSize::S8, to_size: OpSize::S32 });
+    out.push(MachInst::Movzx {
+        src: MachOperand::Reg(dst),
+        dst,
+        from_size: OpSize::S8,
+        to_size: OpSize::S32,
+    });
 }
 
 /// Lower a fused Cmp + CondBranch (no boolean materialization).
@@ -440,9 +491,18 @@ pub fn lower_cmp_branch(
     let cc = cmp_to_cc(op);
     let lhs_op = lower_operand(lhs);
     let rhs_op = lower_operand(rhs);
-    out.push(MachInst::Cmp { lhs: lhs_op, rhs: rhs_op, size });
-    out.push(MachInst::Jcc { cc, target: format!(".LBB{}", true_block.0) });
-    out.push(MachInst::Jmp { target: format!(".LBB{}", false_block.0) });
+    out.push(MachInst::Cmp {
+        lhs: lhs_op,
+        rhs: rhs_op,
+        size,
+    });
+    out.push(MachInst::Jcc {
+        cc,
+        target: format!(".LBB{}", true_block.0),
+    });
+    out.push(MachInst::Jmp {
+        target: format!(".LBB{}", false_block.0),
+    });
 }
 
 // ── Cast ─────────────────────────────────────────────────────────────────
@@ -480,9 +540,19 @@ pub fn lower_cast(
     // unsignedness here zero-extended negative SQLite VDBE values and caused
     // PRAGMA integrity_check to produce no result row.
     if from_ty.is_unsigned() {
-        out.push(MachInst::Movzx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
+        out.push(MachInst::Movzx {
+            src: MachOperand::Reg(src_reg),
+            dst,
+            from_size,
+            to_size,
+        });
     } else {
-        out.push(MachInst::Movsx { src: MachOperand::Reg(src_reg), dst, from_size, to_size });
+        out.push(MachInst::Movsx {
+            src: MachOperand::Reg(src_reg),
+            dst,
+            from_size,
+            to_size,
+        });
     }
 }
 
@@ -532,11 +602,16 @@ pub fn lower_select(
     emit_mov_operand_r(false_val, dst, size, ra, out);
     emit_mov_operand_r(true_val, MachReg::Phys(RAX), size, ra, out);
     let cond_op = lower_operand_with_regs(cond, ra);
-    out.push(MachInst::Test { lhs: cond_op.clone(), rhs: cond_op, size: OpSize::S64 });
+    out.push(MachInst::Test {
+        lhs: cond_op.clone(),
+        rhs: cond_op,
+        size: OpSize::S64,
+    });
     out.push(MachInst::Cmov {
         cc: CondCode::Ne,
         src: MachOperand::Reg(MachReg::Phys(RAX)),
-        dst, size,
+        dst,
+        size,
     });
 }
 
@@ -563,7 +638,12 @@ pub fn lower_gep(
                 });
             }
         } else {
-            out.push(MachInst::Lea { base: base_reg, index: None, offset: imm, dst });
+            out.push(MachInst::Lea {
+                base: base_reg,
+                index: None,
+                offset: imm,
+                dst,
+            });
         }
         return;
     }
@@ -606,9 +686,18 @@ pub fn lower_cond_branch(
     out: &mut Vec<MachInst>,
 ) {
     let cond_op = lower_operand(cond);
-    out.push(MachInst::Test { lhs: cond_op.clone(), rhs: cond_op, size: OpSize::S64 });
-    out.push(MachInst::Jcc { cc: CondCode::Ne, target: format!(".LBB{}", true_block.0) });
-    out.push(MachInst::Jmp { target: format!(".LBB{}", false_block.0) });
+    out.push(MachInst::Test {
+        lhs: cond_op.clone(),
+        rhs: cond_op,
+        size: OpSize::S64,
+    });
+    out.push(MachInst::Jcc {
+        cc: CondCode::Ne,
+        target: format!(".LBB{}", true_block.0),
+    });
+    out.push(MachInst::Jmp {
+        target: format!(".LBB{}", false_block.0),
+    });
 }
 
 // ── Block-level lowering (integration entry point) ───────────────────────
@@ -623,13 +712,15 @@ pub fn can_lower(inst: &Instruction) -> bool {
         Instruction::Copy { .. } => true,
         Instruction::Cmp { ty, .. } => !ty.is_float() && !ty.is_128bit(),
         Instruction::Cast { from_ty, to_ty, .. } => {
-            !from_ty.is_float() && !to_ty.is_float()
-            && !from_ty.is_128bit() && !to_ty.is_128bit()
-            && !from_ty.is_long_double() && !to_ty.is_long_double()
+            !from_ty.is_float()
+                && !to_ty.is_float()
+                && !from_ty.is_128bit()
+                && !to_ty.is_128bit()
+                && !from_ty.is_long_double()
+                && !to_ty.is_long_double()
         }
         Instruction::UnaryOp { op, ty, .. } => {
-            !ty.is_float() && !ty.is_128bit()
-            && matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not)
+            !ty.is_float() && !ty.is_128bit() && matches!(op, IrUnaryOp::Neg | IrUnaryOp::Not)
         }
         Instruction::Select { ty, .. } => !ty.is_float() && !ty.is_128bit(),
         Instruction::GetElementPtr { .. } => true,
@@ -669,22 +760,46 @@ pub fn lower_instruction_ctx(
 
     let ra = reg_assignments;
     match inst {
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => {
-            if ty.is_float() || ty.is_128bit() { return false; }
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            if ty.is_float() || ty.is_128bit() {
+                return false;
+            }
             // BitTest is lowered by the text path, which uses BT plus
             // register/stack-aware SETCC materialization and keeps the i32
             // result zero-extended. MachInst currently has no BT opcode.
-            if *op == IrBinOp::BitTest { return false; }
+            if *op == IrBinOp::BitTest {
+                return false;
+            }
             // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex
             // register sub-register interactions that need special handling.
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+                return false;
+            }
             lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
             true
         }
-        Instruction::Load { dest, ptr, ty, seg_override , ..} => {
-            if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
-            if *seg_override != AddressSpace::Default { return false; }
+        Instruction::Load {
+            dest,
+            ptr,
+            ty,
+            seg_override,
+            ..
+        } => {
+            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
+                return false;
+            }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+                return false;
+            }
+            if *seg_override != AddressSpace::Default {
+                return false;
+            }
             let size = OpSize::from_ir_type(*ty);
             let dst = value_to_reg(dest, ra);
             // Alloca: load directly from stack slot
@@ -699,7 +814,10 @@ pub fn lower_instruction_ctx(
             // Pointer in register: load via memory operand
             if let Some(&phys) = ra.get(&ptr.0) {
                 out.push(MachInst::Mov {
-                    src: MachOperand::Mem { base: MachReg::Phys(phys), offset: 0 },
+                    src: MachOperand::Mem {
+                        base: MachReg::Phys(phys),
+                        offset: 0,
+                    },
                     dst: MachOperand::Reg(dst),
                     size,
                 });
@@ -713,16 +831,31 @@ pub fn lower_instruction_ctx(
                 size: OpSize::S64,
             });
             out.push(MachInst::Mov {
-                src: MachOperand::Mem { base: MachReg::Phys(RCX), offset: 0 },
+                src: MachOperand::Mem {
+                    base: MachReg::Phys(RCX),
+                    offset: 0,
+                },
                 dst: MachOperand::Reg(dst),
                 size,
             });
             true
         }
-        Instruction::Store { val, ptr, ty, seg_override , ..} => {
-            if ty.is_float() || ty.is_128bit() || ty.is_long_double() { return false; }
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
-            if *seg_override != AddressSpace::Default { return false; }
+        Instruction::Store {
+            val,
+            ptr,
+            ty,
+            seg_override,
+            ..
+        } => {
+            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
+                return false;
+            }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+                return false;
+            }
+            if *seg_override != AddressSpace::Default {
+                return false;
+            }
             let size = OpSize::from_ir_type(*ty);
             let src = lower_operand_with_regs(val, ra);
             // Alloca: store directly to stack slot
@@ -738,7 +871,10 @@ pub fn lower_instruction_ctx(
             if let Some(&phys) = ra.get(&ptr.0) {
                 out.push(MachInst::Mov {
                     src,
-                    dst: MachOperand::Mem { base: MachReg::Phys(phys), offset: 0 },
+                    dst: MachOperand::Mem {
+                        base: MachReg::Phys(phys),
+                        offset: 0,
+                    },
                     size,
                 });
                 return true;
@@ -752,7 +888,10 @@ pub fn lower_instruction_ctx(
             });
             out.push(MachInst::Mov {
                 src,
-                dst: MachOperand::Mem { base: MachReg::Phys(RCX), offset: 0 },
+                dst: MachOperand::Mem {
+                    base: MachReg::Phys(RCX),
+                    offset: 0,
+                },
                 size,
             });
             true
@@ -761,38 +900,79 @@ pub fn lower_instruction_ctx(
             lower_copy(dest, src, ra, out);
             true
         }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
-            if ty.is_float() || ty.is_128bit() { return false; }
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
+            if ty.is_float() || ty.is_128bit() {
+                return false;
+            }
             // Dest must have a register for SetCC (writes to 8-bit register).
             // Stack-only dests are rejected by try_lower_machinst.
-            if !ra.contains_key(&dest.0) { return false; }
+            if !ra.contains_key(&dest.0) {
+                return false;
+            }
             lower_cmp(dest, *op, lhs, rhs, *ty, ra, out);
             true
         }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
-            if from_ty.is_float() || to_ty.is_float() { return false; }
-            if from_ty.is_128bit() || to_ty.is_128bit() { return false; }
-            if from_ty.is_long_double() || to_ty.is_long_double() { return false; }
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => {
+            if from_ty.is_float() || to_ty.is_float() {
+                return false;
+            }
+            if from_ty.is_128bit() || to_ty.is_128bit() {
+                return false;
+            }
+            if from_ty.is_long_double() || to_ty.is_long_double() {
+                return false;
+            }
             // Dest must have a register for Movsx/Movzx.
-            if !ra.contains_key(&dest.0) { return false; }
+            if !ra.contains_key(&dest.0) {
+                return false;
+            }
             lower_cast(dest, src, *from_ty, *to_ty, ra, out);
             true
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
-            if ty.is_float() || ty.is_128bit() { return false; }
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) { return false; }
+            if ty.is_float() || ty.is_128bit() {
+                return false;
+            }
+            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+                return false;
+            }
             lower_unaryop(dest, *op, src, *ty, ra, out)
         }
-        Instruction::Select { dest, cond, true_val, false_val, ty } => {
-            if ty.is_float() || ty.is_128bit() { return false; }
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ty,
+        } => {
+            if ty.is_float() || ty.is_128bit() {
+                return false;
+            }
             // cmov doesn't exist for 8-bit operands — fall back
-            if matches!(ty, IrType::I8 | IrType::U8) { return false; }
+            if matches!(ty, IrType::I8 | IrType::U8) {
+                return false;
+            }
             lower_select(dest, cond, true_val, false_val, *ty, ra, out);
             true
         }
-        Instruction::GetElementPtr { dest, base, offset, .. } => {
+        Instruction::GetElementPtr {
+            dest, base, offset, ..
+        } => {
             // Only non-alloca base with register (alloca GEP needs leaq)
-            if !ra.contains_key(&base.0) { return false; }
+            if !ra.contains_key(&base.0) {
+                return false;
+            }
             lower_gep(dest, base, offset, ra, out);
             true
         }

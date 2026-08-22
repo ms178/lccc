@@ -11,11 +11,11 @@
 //! - Scalar: scalar result in a GPR dest (mask compares, movemask, extracts...).
 //! - PtrStore: first arg is the destination pointer (masked stores, stores).
 
+use super::lower::Lowerer;
+use crate::common::types::IrType;
 use crate::frontend::parser::ast::Expr;
 use crate::frontend::sema::builtins::BuiltinIntrinsic;
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrConst, Operand};
-use crate::common::types::IrType;
-use super::lower::Lowerer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LcccSimdClass {
@@ -30,8 +30,8 @@ pub(super) enum LcccSimdClass {
 pub(super) fn lccc_simd_lookup(
     mnemonic: &str,
 ) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
-    use LcccSimdClass::*;
     use IntrinsicOp::*;
+    use LcccSimdClass::*;
     // (class, op, has_imm, nargs): nargs = real operands after the leading
     // dummy/imm argument. The immediate (if any) arrives as the FIRST call
     // argument; lowering re-appends it as the LAST intrinsic operand so all

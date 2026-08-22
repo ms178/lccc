@@ -152,10 +152,20 @@ fn evaluate_constant_calls(module: &mut IrModule) -> usize {
         }
         for (block_idx, block) in caller.blocks.iter().enumerate() {
             for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                let Instruction::Call { func: callee, info } = inst else { continue; };
-                let Some(dest) = info.dest else { continue; };
-                let Some(&callee_idx) = function_indices.get(callee) else { continue; };
-                if info.args.iter().any(|arg| !matches!(arg, Operand::Const(_))) {
+                let Instruction::Call { func: callee, info } = inst else {
+                    continue;
+                };
+                let Some(dest) = info.dest else {
+                    continue;
+                };
+                let Some(&callee_idx) = function_indices.get(callee) else {
+                    continue;
+                };
+                if info
+                    .args
+                    .iter()
+                    .any(|arg| !matches!(arg, Operand::Const(_)))
+                {
                     continue;
                 }
                 let args: Vec<IrConst> = info
@@ -181,10 +191,7 @@ fn evaluate_constant_calls(module: &mut IrModule) -> usize {
                 ) {
                     replacements.push((caller_idx, block_idx, inst_idx, result));
                     if std::env::var("CCC_DEBUG_IPCP_EVAL").is_ok() {
-                        eprintln!(
-                            "[IPCP-EVAL] {} -> {} = {:?}",
-                            callee, dest.0, result
-                        );
+                        eprintln!("[IPCP-EVAL] {} -> {} = {:?}", callee, dest.0, result);
                     }
                 }
             }
@@ -203,7 +210,10 @@ fn evaluate_constant_calls(module: &mut IrModule) -> usize {
         {
             if let Some(dest) = info.dest {
                 module.functions[caller_idx].blocks[block_idx].instructions[inst_idx] =
-                    Instruction::Copy { dest, src: Operand::Const(result) };
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Const(result),
+                    };
                 changes += 1;
             }
         }
@@ -234,7 +244,11 @@ fn eval_const_function(
 
     let result = (|| {
         let func = module.functions.get(function_idx)?;
-        if func.is_declaration || func.is_variadic || func.is_weak || func.params.len() != args.len() {
+        if func.is_declaration
+            || func.is_variadic
+            || func.is_weak
+            || func.params.len() != args.len()
+        {
             return None;
         }
         let label_to_idx: FxHashMap<u32, usize> = func
@@ -251,27 +265,42 @@ fn eval_const_function(
             let block = func.blocks.get(current_idx)?;
             let mut first_non_phi = 0usize;
             while first_non_phi < block.instructions.len() {
-                let Instruction::Phi { dest, incoming, .. } = &block.instructions[first_non_phi] else { break; };
+                let Instruction::Phi { dest, incoming, .. } = &block.instructions[first_non_phi]
+                else {
+                    break;
+                };
                 let pred = predecessor?;
-                let op = incoming.iter().find(|(_, label)| label.0 == pred).map(|(op, _)| op)?;
+                let op = incoming
+                    .iter()
+                    .find(|(_, label)| label.0 == pred)
+                    .map(|(op, _)| op)?;
                 values.insert(dest.0, eval_const_operand(op, &values)?);
                 first_non_phi += 1;
             }
             for inst in block.instructions.iter().skip(first_non_phi) {
-                if *budget == 0 { return None; }
+                if *budget == 0 {
+                    return None;
+                }
                 *budget -= 1;
                 match inst {
                     // Residual allocas are harmless when mem2reg has removed
                     // every load/store use; keep them as no-ops in the pure
                     // evaluator.
-                    Instruction::Alloca { .. } => {},
-                    Instruction::ParamRef { dest, param_idx, .. } => {
+                    Instruction::Alloca { .. } => {}
+                    Instruction::ParamRef {
+                        dest, param_idx, ..
+                    } => {
                         values.insert(dest.0, *args.get(*param_idx)?);
                     }
                     Instruction::Copy { dest, src } => {
                         values.insert(dest.0, eval_const_operand(src, &values)?);
                     }
-                    Instruction::Cast { dest, src, from_ty, to_ty } => {
+                    Instruction::Cast {
+                        dest,
+                        src,
+                        from_ty,
+                        to_ty,
+                    } => {
                         let value = eval_const_operand(src, &values)?;
                         values.insert(dest.0, value.coerce_to_with_src(*to_ty, Some(*from_ty)));
                     }
@@ -280,9 +309,15 @@ fn eval_const_function(
                         let result = match op {
                             crate::ir::reexports::IrUnaryOp::Neg => value.checked_neg()?,
                             crate::ir::reexports::IrUnaryOp::Not => !value,
-                            crate::ir::reexports::IrUnaryOp::Clz => (value as u64).leading_zeros() as i64,
-                            crate::ir::reexports::IrUnaryOp::Ctz => (value as u64).trailing_zeros() as i64,
-                            crate::ir::reexports::IrUnaryOp::Popcount => (value as u64).count_ones() as i64,
+                            crate::ir::reexports::IrUnaryOp::Clz => {
+                                (value as u64).leading_zeros() as i64
+                            }
+                            crate::ir::reexports::IrUnaryOp::Ctz => {
+                                (value as u64).trailing_zeros() as i64
+                            }
+                            crate::ir::reexports::IrUnaryOp::Popcount => {
+                                (value as u64).count_ones() as i64
+                            }
                             crate::ir::reexports::IrUnaryOp::Bswap => match *ty {
                                 IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
                                 _ => value.swap_bytes(),
@@ -297,18 +332,35 @@ fn eval_const_function(
                         };
                         values.insert(dest.0, IrConst::from_i64(result, *ty));
                     }
-                    Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+                    Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
                         let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
                         let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
                         let result = op.eval_i64(lhs, rhs)?;
                         values.insert(dest.0, IrConst::from_i64(result, *ty));
                     }
-                    Instruction::Cmp { dest, op, lhs, rhs, .. } => {
+                    Instruction::Cmp {
+                        dest, op, lhs, rhs, ..
+                    } => {
                         let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
                         let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
-                        values.insert(dest.0, IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }));
+                        values.insert(
+                            dest.0,
+                            IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }),
+                        );
                     }
-                    Instruction::Select { dest, cond, true_val, false_val, .. } => {
+                    Instruction::Select {
+                        dest,
+                        cond,
+                        true_val,
+                        false_val,
+                        ..
+                    } => {
                         let cond = eval_const_operand(cond, &values)?.to_i64()?;
                         let selected = if cond != 0 { true_val } else { false_val };
                         values.insert(dest.0, eval_const_operand(selected, &values)?);
@@ -340,7 +392,9 @@ fn eval_const_function(
                 }
             }
 
-            if *budget == 0 { return None; }
+            if *budget == 0 {
+                return None;
+            }
             *budget -= 1;
             match &block.terminator {
                 Terminator::Return(Some(op)) => return eval_const_operand(op, &values),
@@ -349,21 +403,33 @@ fn eval_const_function(
                     predecessor = Some(block.label.0);
                     current_idx = *label_to_idx.get(&label.0)?;
                 }
-                Terminator::CondBranch { cond, true_label, false_label } => {
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
                     let cond = eval_const_operand(cond, &values)?.to_i64()?;
                     predecessor = Some(block.label.0);
                     let label = if cond != 0 { true_label } else { false_label };
                     current_idx = *label_to_idx.get(&label.0)?;
                 }
-                Terminator::Switch { val, cases, default, .. } => {
+                Terminator::Switch {
+                    val,
+                    cases,
+                    default,
+                    ..
+                } => {
                     let value = eval_const_operand(val, &values)?.to_i64()?;
                     predecessor = Some(block.label.0);
-                    let label = cases.iter().find(|(case, _)| *case == value).map(|(_, label)| label).unwrap_or(default);
+                    let label = cases
+                        .iter()
+                        .find(|(case, _)| *case == value)
+                        .map(|(_, label)| label)
+                        .unwrap_or(default);
                     current_idx = *label_to_idx.get(&label.0)?;
                 }
                 Terminator::IndirectBranch { .. } => return None,
             }
-
         }
     })();
 

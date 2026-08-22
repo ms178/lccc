@@ -11,10 +11,10 @@
 //! Derived from levkropp/lccc (Aug 19, 2026 commits), re-fitted to this
 //! tree's engine (defs map, target-aware `byte_size`, checked arithmetic).
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{IrFunction, Value};
 use super::loop_analysis;
 use super::loop_memory_promote as lmp;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::reexports::{IrFunction, Value};
 
 pub(crate) use super::loop_memory_promote::LinForm;
 
@@ -45,10 +45,15 @@ impl LoopFrames {
             }
         }
         let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
-            cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom,
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
         ));
-        let mut frames: Vec<(usize, FxHashSet<usize>)> =
-            loops.iter().map(|lp| (lp.header, lp.body.clone())).collect();
+        let mut frames: Vec<(usize, FxHashSet<usize>)> = loops
+            .iter()
+            .map(|lp| (lp.header, lp.body.clone()))
+            .collect();
         // Innermost first: with ascending body size, the first frame claiming
         // a block is the smallest containing loop.
         frames.sort_by_key(|(_, body)| body.len());
@@ -60,7 +65,11 @@ impl LoopFrames {
                 }
             }
         }
-        LoopFrames { def_block, frames, block_frame }
+        LoopFrames {
+            def_block,
+            frames,
+            block_frame,
+        }
     }
 }
 
@@ -112,25 +121,50 @@ pub(crate) fn forms_disjoint(
     if !same_frame && (load.march != 0 || store.march != 0) {
         return false;
     }
-    let Some(d) = store.konst.checked_sub(load.konst) else { return false; };
-    let Some(dm) = store.march.checked_sub(load.march) else { return false; };
+    let Some(d) = store.konst.checked_sub(load.konst) else {
+        return false;
+    };
+    let Some(dm) = store.march.checked_sub(load.march) else {
+        return false;
+    };
     if dm == 0 {
-        let a = load.konst.checked_add(load_sz).is_some_and(|end| store.konst >= end);
-        let b = store.konst.checked_add(store_sz).is_some_and(|end| load.konst >= end);
+        let a = load
+            .konst
+            .checked_add(load_sz)
+            .is_some_and(|end| store.konst >= end);
+        let b = store
+            .konst
+            .checked_add(store_sz)
+            .is_some_and(|end| load.konst >= end);
         return a || b;
     }
-    if dm > 0 { d >= load_sz } else { d.checked_add(store_sz).is_some_and(|end| end <= 0) }
+    if dm > 0 {
+        d >= load_sz
+    } else {
+        d.checked_add(store_sz).is_some_and(|end| end <= 0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn form(konst: i64, march: i64) -> LinForm {
-        LinForm { root: 1, syms: vec![], konst, march }
+        LinForm {
+            root: 1,
+            syms: vec![],
+            konst,
+            march,
+        }
     }
     #[test]
     fn overflow_fails_closed() {
-        assert!(!forms_disjoint(&form(i64::MIN, 0), 8, &form(i64::MAX, 0), 8, true));
+        assert!(!forms_disjoint(
+            &form(i64::MIN, 0),
+            8,
+            &form(i64::MAX, 0),
+            8,
+            true
+        ));
     }
     #[test]
     fn separated_forms_prove() {

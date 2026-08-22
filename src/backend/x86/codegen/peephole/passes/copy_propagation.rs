@@ -170,10 +170,7 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                 let dest = get_dest_reg(&infos[i]);
                 for reg in 0..16u8 {
                     let src = copy_src[reg as usize];
-                    if src != REG_NONE
-                        && src == dest
-                        && infos[i].reg_refs & (1u16 << reg) != 0
-                    {
+                    if src != REG_NONE && src == dest && infos[i].reg_refs & (1u16 << reg) != 0 {
                         if try_propagate_into(store, infos, i, src, reg) {
                             changed = true;
                         }

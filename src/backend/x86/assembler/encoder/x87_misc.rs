@@ -17,9 +17,9 @@ impl super::InstructionEncoder {
             self.bytes.push(0x66);
         }
         // Determine which bt variant
-        let base = &mnemonic[..mnemonic.len()-1]; // strip size suffix
+        let base = &mnemonic[..mnemonic.len() - 1]; // strip size suffix
         let (reg_opcode, imm_ext) = match base {
-            "bt"  => (0xA3u8, 4u8),
+            "bt" => (0xA3u8, 4u8),
             "bts" => (0xAB, 5),
             "btr" => (0xB3, 6),
             "btc" => (0xBB, 7),
@@ -87,7 +87,12 @@ impl super::InstructionEncoder {
 
     // ---- x87 FPU encoding ----
 
-    pub(crate) fn encode_x87_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_x87_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("x87 mem op requires 1 operand".to_string());
         }
@@ -109,7 +114,12 @@ impl super::InstructionEncoder {
     /// distinct opcodes; they are `fwait` followed by the corresponding no-wait
     /// instruction.  The prefix is a separate instruction, so any segment/REX
     /// prefixes for the x87 memory instruction must be emitted after 0x9B.
-    pub(crate) fn encode_x87_wait_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_x87_wait_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         self.bytes.push(0x9B);
         self.encode_x87_mem(ops, opcode, ext)
     }
@@ -212,8 +222,13 @@ impl super::InstructionEncoder {
     ///
     /// `fst %st(N)` is DD D0+N and `fstp %st(N)` is DD D8+N -- adjacent rows of
     /// the same opcode block, so the two differ only in the base byte.
-    pub(crate) fn encode_x87_st_reg(&mut self, ops: &[Operand], name: &str,
-                                    opcode: u8, base: u8) -> Result<(), String> {
+    pub(crate) fn encode_x87_st_reg(
+        &mut self,
+        ops: &[Operand],
+        name: &str,
+        opcode: u8,
+        base: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 operand", name));
         }
@@ -254,7 +269,13 @@ impl super::InstructionEncoder {
     }
 
     /// Encode x87 instructions whose ModR/M byte is formed from ST(i).
-    pub(crate) fn encode_x87_st_i(&mut self, ops: &[Operand], opcode: &[u8], base: u8, name: &str) -> Result<(), String> {
+    pub(crate) fn encode_x87_st_i(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        base: u8,
+        name: &str,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 st register operand", name));
         }
@@ -301,7 +322,12 @@ impl super::InstructionEncoder {
 
     /// Encode a sized x87 memory compare: fcoms/fcoml (opcode D8/DC, /2) and
     /// fcomps/fcompl (D8/DC, /3). AT&T suffixes: s=m32, l=m64.
-    pub(crate) fn encode_fcom_mem(&mut self, ops: &[Operand], opcode: u8, ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_fcom_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: u8,
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("sized fcom requires 1 memory operand".to_string());
         }
@@ -345,7 +371,12 @@ impl super::InstructionEncoder {
 
     // ---- Bit scan (BSF/BSR) ----
 
-    pub(crate) fn encode_bit_scan(&mut self, ops: &[Operand], mnemonic: &str, opcode2: u8) -> Result<(), String> {
+    pub(crate) fn encode_bit_scan(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+        opcode2: u8,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -354,7 +385,9 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_rr(size, &dst.name, &src.name);
                 self.bytes.extend_from_slice(&[0x0F, opcode2]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -362,7 +395,9 @@ impl super::InstructionEncoder {
             }
             (Operand::Memory(mem), Operand::Register(dst)) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.emit_rex_rm(size, &dst.name, mem);
                 self.bytes.extend_from_slice(&[0x0F, opcode2]);
                 self.encode_modrm_mem(dst_num, mem)
@@ -370,7 +405,6 @@ impl super::InstructionEncoder {
             _ => Err(format!("unsupported {} operands", mnemonic)),
         }
     }
-
 
     // ---- Segment register moves ----
 
@@ -433,7 +467,9 @@ impl super::InstructionEncoder {
         }
         match (&ops[0], &ops[1]) {
             // movq %mm, %mm
-            (Operand::Register(src), Operand::Register(dst)) if is_mmx(&src.name) && is_mmx(&dst.name) => {
+            (Operand::Register(src), Operand::Register(dst))
+                if is_mmx(&src.name) && is_mmx(&dst.name) =>
+            {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.extend_from_slice(&[0x0F, 0x6F]);
@@ -455,7 +491,9 @@ impl super::InstructionEncoder {
                 self.encode_modrm_mem(src_num, mem)
             }
             // movq %gp64, %mm -> 0F 6E (with REX.W)
-            (Operand::Register(src), Operand::Register(dst)) if !is_mmx(&src.name) && is_mmx(&dst.name) => {
+            (Operand::Register(src), Operand::Register(dst))
+                if !is_mmx(&src.name) && is_mmx(&dst.name) =>
+            {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let b = needs_rex_ext(&src.name);
@@ -465,7 +503,9 @@ impl super::InstructionEncoder {
                 Ok(())
             }
             // movq %mm, %gp64 -> 0F 7E (with REX.W)
-            (Operand::Register(src), Operand::Register(dst)) if is_mmx(&src.name) && !is_mmx(&dst.name) => {
+            (Operand::Register(src), Operand::Register(dst))
+                if is_mmx(&src.name) && !is_mmx(&dst.name) =>
+            {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 let b = needs_rex_ext(&dst.name);
@@ -485,28 +525,56 @@ impl super::InstructionEncoder {
             return Err("mov requires 2 operands".to_string());
         }
         // Check for segment registers
-        if ops.iter().any(|op| matches!(op, Operand::Register(r) if is_segment_reg(&r.name))) {
+        if ops
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_segment_reg(&r.name)))
+        {
             return self.encode_mov_seg(ops);
         }
         // Check for control registers
-        if ops.iter().any(|op| matches!(op, Operand::Register(r) if is_control_reg(&r.name))) {
+        if ops
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_control_reg(&r.name)))
+        {
             return self.encode_mov_cr(ops);
         }
         // Check for debug registers
-        if ops.iter().any(|op| matches!(op, Operand::Register(r) if is_debug_reg(&r.name))) {
+        if ops
+            .iter()
+            .any(|op| matches!(op, Operand::Register(r) if is_debug_reg(&r.name)))
+        {
             return self.encode_mov_dr(ops);
         }
         let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
         self.encode_mov(ops, size)
     }
 
-    pub(crate) fn encode_suffixless_alu(&mut self, ops: &[Operand], alu_op: u8) -> Result<(), String> {
+    pub(crate) fn encode_suffixless_alu(
+        &mut self,
+        ops: &[Operand],
+        alu_op: u8,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("ALU op requires 2 operands".to_string());
         }
         let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
-        let suffix = match size { 1 => "b", 2 => "w", 4 => "l", _ => "q" };
-        let op_name = match alu_op { 0 => "add", 1 => "or", 2 => "adc", 3 => "sbb", 4 => "and", 5 => "sub", 6 => "xor", 7 => "cmp", _ => "?" };
+        let suffix = match size {
+            1 => "b",
+            2 => "w",
+            4 => "l",
+            _ => "q",
+        };
+        let op_name = match alu_op {
+            0 => "add",
+            1 => "or",
+            2 => "adc",
+            3 => "sbb",
+            4 => "and",
+            5 => "sub",
+            6 => "xor",
+            7 => "cmp",
+            _ => "?",
+        };
         let mnemonic = format!("{}{}", op_name, suffix);
         self.encode_alu(ops, &mnemonic, alu_op)
     }
@@ -516,12 +584,21 @@ impl super::InstructionEncoder {
             return Err("test requires 2 operands".to_string());
         }
         let size = infer_operand_size_from_pair(&ops[0], &ops[1]);
-        let suffix = match size { 1 => "b", 2 => "w", 4 => "l", _ => "q" };
+        let suffix = match size {
+            1 => "b",
+            2 => "w",
+            4 => "l",
+            _ => "q",
+        };
         let mnemonic = format!("test{}", suffix);
         self.encode_test(ops, &mnemonic)
     }
 
-    pub(crate) fn encode_suffixless_shift(&mut self, ops: &[Operand], shift_op: u8) -> Result<(), String> {
+    pub(crate) fn encode_suffixless_shift(
+        &mut self,
+        ops: &[Operand],
+        shift_op: u8,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("shift requires 2 operands".to_string());
         }
@@ -530,13 +607,31 @@ impl super::InstructionEncoder {
             Operand::Register(r) => infer_reg_size(&r.name),
             _ => 8,
         };
-        let op_name = match shift_op { 4 => "shl", 5 => "shr", 7 => "sar", 0 => "rol", 1 => "ror", 2 => "rcl", 3 => "rcr", _ => "?" };
-        let suffix = match size { 1 => "b", 2 => "w", 4 => "l", _ => "q" };
+        let op_name = match shift_op {
+            4 => "shl",
+            5 => "shr",
+            7 => "sar",
+            0 => "rol",
+            1 => "ror",
+            2 => "rcl",
+            3 => "rcr",
+            _ => "?",
+        };
+        let suffix = match size {
+            1 => "b",
+            2 => "w",
+            4 => "l",
+            _ => "q",
+        };
         let mnemonic = format!("{}{}", op_name, suffix);
         self.encode_shift(ops, &mnemonic, shift_op)
     }
 
-    pub(crate) fn encode_suffixless_unary(&mut self, ops: &[Operand], op_ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_suffixless_unary(
+        &mut self,
+        ops: &[Operand],
+        op_ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("unary op requires 1 operand".to_string());
         }
@@ -544,8 +639,9 @@ impl super::InstructionEncoder {
             Operand::Register(r) => infer_reg_size(&r.name),
             _ => 8,
         };
-        if size == 2 { self.bytes.push(0x66); }
+        if size == 2 {
+            self.bytes.push(0x66);
+        }
         self.encode_unary_rm(ops, op_ext, size)
     }
-
 }

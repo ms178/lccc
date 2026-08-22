@@ -777,7 +777,9 @@ fn allocstats_enabled() -> bool {
 fn evict_mode() -> i32 {
     static MODE: OnceLock<Option<i32>> = OnceLock::new();
     let parsed = *MODE.get_or_init(|| {
-        std::env::var("CCC_EVICT_MODE").ok().and_then(|s| s.parse().ok())
+        std::env::var("CCC_EVICT_MODE")
+            .ok()
+            .and_then(|s| s.parse().ok())
     });
     parsed.unwrap_or(3)
 }
@@ -876,12 +878,7 @@ fn collect_range_metadata(func: &IrFunction, loop_depth: &[u32]) -> RangeMetadat
     meta
 }
 
-fn record_instruction_uses(
-    inst: &Instruction,
-    point: u32,
-    bdepth: u32,
-    meta: &mut RangeMetadata,
-) {
+fn record_instruction_uses(inst: &Instruction, point: u32, bdepth: u32, meta: &mut RangeMetadata) {
     // Same visitors as liveness: Intrinsic args, InlineAsm inputs, atomic
     // pointers, SetReturnF*Second, Phi incoming (Phi is an *instruction*
     // in this IR, not a terminator).
@@ -901,12 +898,7 @@ fn record_instruction_uses(
 /// IndirectBranch, Switch); Branch and Unreachable carry none. Phi
 /// incoming values are **not** terminator operands — they live on
 /// `Instruction::Phi` and are recorded above.
-fn record_terminator_uses(
-    term: &Terminator,
-    point: u32,
-    bdepth: u32,
-    meta: &mut RangeMetadata,
-) {
+fn record_terminator_uses(term: &Terminator, point: u32, bdepth: u32, meta: &mut RangeMetadata) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
             record_use(v.0, point, bdepth, meta);
@@ -1204,8 +1196,7 @@ mod tests {
 
     #[test]
     fn test_linear_scan_no_registers() {
-        let mut allocator =
-            LinearScanAllocator::new(vec![lr(1, 0, 10, vec![0, 10], 1)], vec![]);
+        let mut allocator = LinearScanAllocator::new(vec![lr(1, 0, 10, vec![0, 10], 1)], vec![]);
         allocator.run();
         assert!(allocator.spill_slots.contains_key(&1));
         assert!(allocator.assignments.is_empty());
@@ -1213,10 +1204,7 @@ mod tests {
 
     #[test]
     fn test_run_is_idempotent_and_sorts() {
-        let ranges = vec![
-            lr(2, 20, 30, vec![20, 30], 1),
-            lr(1, 0, 10, vec![0, 10], 1),
-        ];
+        let ranges = vec![lr(2, 20, 30, vec![20, 30], 1), lr(1, 0, 10, vec![0, 10], 1)];
         let mut allocator = LinearScanAllocator::new(ranges, vec![PhysReg(0)]);
         allocator.run();
         assert_eq!(allocator.assignments.len(), 2);
@@ -1250,10 +1238,9 @@ mod tests {
         let mut allocator = LinearScanAllocator::new(vec![a, b, c], vec![PhysReg(0)]);
         allocator.run();
         assert!(allocator.assignments.contains_key(&2));
-        if let (Some(&rb), Some(&rc)) = (
-            allocator.assignments.get(&2),
-            allocator.assignments.get(&3),
-        ) {
+        if let (Some(&rb), Some(&rc)) =
+            (allocator.assignments.get(&2), allocator.assignments.get(&3))
+        {
             panic!(
                 "B and overlapping C both assigned (regs {} and {})",
                 rb.0, rc.0
@@ -1300,8 +1287,6 @@ mod tests {
             "mode 2 has no next-use window: cheapest (A) wins"
         );
     }
-
-
 
     #[test]
     fn test_select_evict_victim_same_point_use_is_not_dead() {
@@ -1354,7 +1339,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_next_use_after_binary_search() {
         let range = lr(1, 0, 50, vec![0, 10, 20, 40, 50], 5);
@@ -1395,6 +1379,9 @@ mod tests {
         let victim = lr(2, 0, 50, vec![0, 10, 30, 50], 3);
         assert_eq!(incoming.uses.len(), 3);
         assert_eq!(LinearScanAllocator::future_uses(&victim, incoming.start), 2);
-        assert_eq!(LinearScanAllocator::future_uses(&incoming, incoming.start), 2);
+        assert_eq!(
+            LinearScanAllocator::future_uses(&incoming, incoming.start),
+            2
+        );
     }
 }

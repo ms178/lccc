@@ -5,14 +5,9 @@
 //! These include designator inspection, field resolution, anonymous member
 //! drilling, and init item classification utilities.
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::common::types::{CType, StructLayout, StructLayoutProvider, RcLayout};
 use crate::common::fx_hash::FxHashMap;
+use crate::common::types::{CType, RcLayout, StructLayout, StructLayoutProvider};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
 
 /// Extract the field name from the first designator of an initializer item.
 /// Returns `None` if the item has no designators or the first is not a Field.
@@ -27,8 +22,7 @@ pub(super) fn first_field_designator(item: &InitializerItem) -> Option<&str> {
 /// (i.e., has 2+ designators with the first being a Field).
 /// Used to detect patterns like `.field.subfield = val`.
 pub(super) fn has_nested_field_designator(item: &InitializerItem) -> bool {
-    item.designators.len() > 1
-        && matches!(item.designators.first(), Some(Designator::Field(_)))
+    item.designators.len() > 1 && matches!(item.designators.first(), Some(Designator::Field(_)))
 }
 
 /// Check if a field is an anonymous struct/union member being targeted by a
@@ -58,7 +52,8 @@ pub(super) fn has_array_field_designators(items: &[InitializerItem]) -> bool {
 /// including through binary operations and casts (e.g., `"str" + N`).
 pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
     match expr {
-        Expr::StringLiteral(_, _) | Expr::WideStringLiteral(_, _)
+        Expr::StringLiteral(_, _)
+        | Expr::WideStringLiteral(_, _)
         | Expr::Char16StringLiteral(_, _) => true,
         Expr::BinaryOp(_, lhs, rhs, _) => {
             expr_contains_string_literal(lhs) || expr_contains_string_literal(rhs)
@@ -73,9 +68,7 @@ pub(super) fn expr_contains_string_literal(expr: &Expr) -> bool {
 pub(super) fn init_contains_string_literal(item: &InitializerItem) -> bool {
     match &item.init {
         Initializer::Expr(expr) => expr_contains_string_literal(expr),
-        Initializer::List(sub_items) => {
-            sub_items.iter().any(init_contains_string_literal)
-        }
+        Initializer::List(sub_items) => sub_items.iter().any(init_contains_string_literal),
     }
 }
 
@@ -97,9 +90,9 @@ pub(super) fn init_contains_addr_expr(
                 expr_might_be_addr(expr, enum_constants)
             }
         }
-        Initializer::List(sub_items) => {
-            sub_items.iter().any(|sub| init_contains_addr_expr(sub, is_multidim_char_array, enum_constants))
-        }
+        Initializer::List(sub_items) => sub_items
+            .iter()
+            .any(|sub| init_contains_addr_expr(sub, is_multidim_char_array, enum_constants)),
     }
 }
 
@@ -125,7 +118,9 @@ fn expr_might_be_addr(expr: &Expr, enum_constants: &FxHashMap<String, i64>) -> b
         // Cast of an address expression
         Expr::Cast(_, inner, _) => expr_might_be_addr(inner, enum_constants),
         // Binary ops on addresses (e.g., &x + offset, arr + n)
-        Expr::BinaryOp(_, lhs, rhs, _) => expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants),
+        Expr::BinaryOp(_, lhs, rhs, _) => {
+            expr_might_be_addr(lhs, enum_constants) || expr_might_be_addr(rhs, enum_constants)
+        }
         // Compound literals may contain addresses
         Expr::CompoundLiteral(_, _, _) => true,
         _ => false,
@@ -139,7 +134,10 @@ pub(super) fn type_has_pointer_elements(ty: &CType, ctx: &dyn StructLayoutProvid
         CType::Array(inner, _) => type_has_pointer_elements(inner, ctx),
         CType::Struct(key) | CType::Union(key) => {
             if let Some(layout) = ctx.get_struct_layout(key) {
-                layout.fields.iter().any(|f| type_has_pointer_elements(&f.ty, ctx))
+                layout
+                    .fields
+                    .iter()
+                    .any(|f| type_has_pointer_elements(&f.ty, ctx))
             } else {
                 false
             }
@@ -158,9 +156,7 @@ pub(super) fn type_has_pointer_elements(ty: &CType, ctx: &dyn StructLayoutProvid
 /// array-of-structs field without braces.
 pub(super) fn count_flat_init_scalars(ty: &CType, ctx: &dyn StructLayoutProvider) -> usize {
     match ty {
-        CType::Array(inner, Some(size)) => {
-            size * count_flat_init_scalars(inner, ctx)
-        }
+        CType::Array(inner, Some(size)) => size * count_flat_init_scalars(inner, ctx),
         CType::Struct(key) | CType::Union(key) => {
             if let Some(layout) = ctx.get_struct_layout(key) {
                 if layout.is_union {
@@ -171,7 +167,9 @@ pub(super) fn count_flat_init_scalars(ty: &CType, ctx: &dyn StructLayoutProvider
                         1
                     }
                 } else {
-                    layout.fields.iter()
+                    layout
+                        .fields
+                        .iter()
                         .filter(|f| f.bit_width != Some(0)) // skip zero-width bitfields
                         .map(|f| count_flat_init_scalars(&f.ty, ctx))
                         .sum::<usize>()
@@ -189,16 +187,23 @@ pub(super) fn count_flat_init_scalars(ty: &CType, ctx: &dyn StructLayoutProvider
 /// Used throughout global initialization for padding and zero-fill.
 pub(super) fn push_zero_bytes(elements: &mut Vec<crate::ir::reexports::GlobalInit>, count: usize) {
     for _ in 0..count {
-        elements.push(crate::ir::reexports::GlobalInit::Scalar(crate::ir::reexports::IrConst::I8(0)));
+        elements.push(crate::ir::reexports::GlobalInit::Scalar(
+            crate::ir::reexports::IrConst::I8(0),
+        ));
     }
 }
 
 /// Convert a byte buffer to GlobalInit elements by pushing each byte as I8.
 /// This is the standard bytes-to-compound conversion used throughout the
 /// compound initialization path when a sub-structure has no address fields.
-pub(super) fn push_bytes_as_elements(elements: &mut Vec<crate::ir::reexports::GlobalInit>, bytes: &[u8]) {
+pub(super) fn push_bytes_as_elements(
+    elements: &mut Vec<crate::ir::reexports::GlobalInit>,
+    bytes: &[u8],
+) {
     for &b in bytes {
-        elements.push(crate::ir::reexports::GlobalInit::Scalar(crate::ir::reexports::IrConst::I8(b as i8)));
+        elements.push(crate::ir::reexports::GlobalInit::Scalar(
+            crate::ir::reexports::IrConst::I8(b as i8),
+        ));
     }
 }
 
@@ -206,15 +211,25 @@ pub(super) fn push_bytes_as_elements(elements: &mut Vec<crate::ir::reexports::Gl
 /// Pushes each character as I8, followed by padding zeros up to `field_size`.
 /// Characters are mapped via `char as u8` (the internal string representation uses
 /// chars in U+0000..U+00FF to represent raw byte values from C string literals).
-pub(super) fn push_string_as_elements(elements: &mut Vec<crate::ir::reexports::GlobalInit>, s: &str, field_size: usize) {
+pub(super) fn push_string_as_elements(
+    elements: &mut Vec<crate::ir::reexports::GlobalInit>,
+    s: &str,
+    field_size: usize,
+) {
     let s_chars: Vec<u8> = s.chars().map(|c| c as u8).collect();
     for (i, &b) in s_chars.iter().enumerate() {
-        if i >= field_size { break; }
-        elements.push(crate::ir::reexports::GlobalInit::Scalar(crate::ir::reexports::IrConst::I8(b as i8)));
+        if i >= field_size {
+            break;
+        }
+        elements.push(crate::ir::reexports::GlobalInit::Scalar(
+            crate::ir::reexports::IrConst::I8(b as i8),
+        ));
     }
     // null terminator + remaining zero fill
     for _ in s_chars.len()..field_size {
-        elements.push(crate::ir::reexports::GlobalInit::Scalar(crate::ir::reexports::IrConst::I8(0)));
+        elements.push(crate::ir::reexports::GlobalInit::Scalar(
+            crate::ir::reexports::IrConst::I8(0),
+        ));
     }
 }
 

@@ -41,7 +41,12 @@ pub trait TypeConvertContext {
     /// Resolve an enum type to its CType.
     /// Sema: returns CType::Enum with name info.
     /// Lowering: returns CType::Int (enums are ints at IR level).
-    fn resolve_enum(&self, name: &Option<String>, variants: &Option<Vec<EnumVariant>>, is_packed: bool) -> CType;
+    fn resolve_enum(
+        &self,
+        name: &Option<String>,
+        variants: &Option<Vec<EnumVariant>>,
+        is_packed: bool,
+    ) -> CType;
 
     /// Resolve typeof(expr) to a CType.
     /// Sema: returns CType::Int (doesn't have full expr type resolution yet).
@@ -83,34 +88,46 @@ pub trait TypeConvertContext {
             TypeSpecifier::ComplexLongDouble => CType::ComplexLongDouble,
 
             // === Compound types (shared logic) ===
-            TypeSpecifier::Pointer(inner, addr_space) => {
-                CType::Pointer(Box::new(self.resolve_type_spec_to_ctype(inner)), *addr_space)
-            }
+            TypeSpecifier::Pointer(inner, addr_space) => CType::Pointer(
+                Box::new(self.resolve_type_spec_to_ctype(inner)),
+                *addr_space,
+            ),
             TypeSpecifier::Array(elem, size_expr) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(elem);
-                let size = size_expr.as_ref().and_then(|e| self.eval_const_expr_as_usize(e));
+                let size = size_expr
+                    .as_ref()
+                    .and_then(|e| self.eval_const_expr_as_usize(e));
                 CType::Array(Box::new(elem_ctype), size)
             }
             TypeSpecifier::FunctionPointer(return_type, params, variadic) => {
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
-                let param_ctypes: Vec<(CType, Option<String>)> = params.iter().map(|p| {
-                    let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
-                    (ty, p.name.clone())
-                }).collect();
-                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
-                    return_type: ret_ctype,
-                    params: param_ctypes,
-                    variadic: *variadic,
-                }))), AddressSpace::Default)
+                let param_ctypes: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
+                        (ty, p.name.clone())
+                    })
+                    .collect();
+                CType::Pointer(
+                    Box::new(CType::Function(Box::new(FunctionType {
+                        return_type: ret_ctype,
+                        params: param_ctypes,
+                        variadic: *variadic,
+                    }))),
+                    AddressSpace::Default,
+                )
             }
             TypeSpecifier::BareFunction(return_type, params, variadic) => {
                 // Bare function type (no pointer wrapper) — produced by typeof on
                 // function names. Resolves to CType::Function, NOT Pointer(Function).
                 let ret_ctype = self.resolve_type_spec_to_ctype(return_type);
-                let param_ctypes: Vec<(CType, Option<String>)> = params.iter().map(|p| {
-                    let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
-                    (ty, p.name.clone())
-                }).collect();
+                let param_ctypes: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
+                        (ty, p.name.clone())
+                    })
+                    .collect();
                 CType::Function(Box::new(FunctionType {
                     return_type: ret_ctype,
                     params: param_ctypes,
@@ -122,13 +139,27 @@ pub trait TypeConvertContext {
 
             // === Divergent cases (delegated to implementors) ===
             TypeSpecifier::TypedefName(name) => self.resolve_typedef(name),
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned) => {
-                self.resolve_struct_or_union(name, fields, false, *is_packed, *pragma_pack, *struct_aligned)
+            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned) => self
+                .resolve_struct_or_union(
+                    name,
+                    fields,
+                    false,
+                    *is_packed,
+                    *pragma_pack,
+                    *struct_aligned,
+                ),
+            TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => self
+                .resolve_struct_or_union(
+                    name,
+                    fields,
+                    true,
+                    *is_packed,
+                    *pragma_pack,
+                    *struct_aligned,
+                ),
+            TypeSpecifier::Enum(name, variants, is_packed) => {
+                self.resolve_enum(name, variants, *is_packed)
             }
-            TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => {
-                self.resolve_struct_or_union(name, fields, true, *is_packed, *pragma_pack, *struct_aligned)
-            }
-            TypeSpecifier::Enum(name, variants, is_packed) => self.resolve_enum(name, variants, *is_packed),
             TypeSpecifier::Typeof(expr) => self.resolve_typeof_expr(expr),
             TypeSpecifier::Vector(inner, total_bytes) => {
                 let elem_ctype = self.resolve_type_spec_to_ctype(inner);
@@ -152,10 +183,10 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
         // Look for Pointer followed by FunctionPointer
         if matches!(&derived[i], DerivedDeclarator::Pointer)
             && i + 1 < derived.len()
-                && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
-            {
-                return Some(i);
-            }
+            && matches!(&derived[i + 1], DerivedDeclarator::FunctionPointer(_, _))
+        {
+            return Some(i);
+        }
         // Standalone FunctionPointer
         if matches!(&derived[i], DerivedDeclarator::FunctionPointer(_, _)) {
             return Some(i);
@@ -250,7 +281,9 @@ pub fn build_full_ctype_with_base(
                         let (params, variadic) = match &derived[i + 1] {
                             DerivedDeclarator::FunctionPointer(p, v)
                             | DerivedDeclarator::Function(p, v) => (p, *v),
-                            _ => unreachable!("expected FunctionPointer/Function declarator after Pointer"),
+                            _ => unreachable!(
+                                "expected FunctionPointer/Function declarator after Pointer"
+                            ),
                         };
                         let param_types = convert_param_decls_to_ctypes(ctx, params);
                         let func_type = CType::Function(Box::new(FunctionType {
@@ -327,9 +360,7 @@ pub fn build_full_ctype_with_base(
                 DerivedDeclarator::Array(_) => {
                     // Collect consecutive array dimensions
                     let start = i;
-                    while i < derived.len()
-                        && matches!(&derived[i], DerivedDeclarator::Array(_))
-                    {
+                    while i < derived.len() && matches!(&derived[i], DerivedDeclarator::Array(_)) {
                         i += 1;
                     }
                     // Apply in reverse: innermost (rightmost) dimension wraps first

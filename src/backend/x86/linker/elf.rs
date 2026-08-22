@@ -6,23 +6,16 @@
 // Re-export shared ELF constants for mod.rs and the emitter functions.
 // Archive/linker-script functions are now called via linker_common.
 pub use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_EXEC, ET_DYN, EM_X86_64,
-    SHT_PROGBITS, SHT_NOBITS, SHT_STRTAB, SHT_RELA,
-    SHT_DYNAMIC, SHT_DYNSYM, SHT_SYMTAB,
-    SHT_INIT_ARRAY, SHT_FINI_ARRAY, SHT_PREINIT_ARRAY, SHT_GNU_HASH, SHT_GNU_VERSYM, SHT_GNU_VERNEED, SHT_GNU_VERDEF,
-    SHF_WRITE, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS,
-    STB_GLOBAL, STB_WEAK,
-    STT_OBJECT, STT_FUNC, STT_SECTION, STT_TLS, STT_GNU_IFUNC,
-    SHN_UNDEF, SHN_ABS, SHN_COMMON,
-    PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_PHDR, PT_TLS, PT_GNU_STACK, PT_GNU_RELRO, PT_GNU_EH_FRAME,
-    PF_X, PF_W, PF_R,
-    DT_NULL, DT_NEEDED, DT_PLTRELSZ, DT_PLTGOT, DT_HASH, DT_STRTAB,
-    DT_SYMTAB, DT_RELA, DT_RELASZ, DT_RELAENT, DT_STRSZ, DT_SYMENT,
-    DT_JMPREL, DT_PLTREL, DT_GNU_HASH,
-    is_thin_archive,
-    parse_linker_script_entries, LinkerScriptEntry,
-    LinkerSymbolAddresses, get_standard_linker_symbols,
-    w16, w32, w64, write_bytes, wphdr,
+    get_standard_linker_symbols, is_thin_archive, parse_linker_script_entries, w16, w32, w64,
+    wphdr, write_bytes, LinkerScriptEntry, LinkerSymbolAddresses, DT_GNU_HASH, DT_HASH, DT_JMPREL,
+    DT_NEEDED, DT_NULL, DT_PLTGOT, DT_PLTREL, DT_PLTRELSZ, DT_RELA, DT_RELAENT, DT_RELASZ,
+    DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC, EM_X86_64,
+    ET_DYN, ET_EXEC, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK,
+    PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHF_ALLOC, SHF_EXECINSTR, SHF_TLS, SHF_WRITE, SHN_ABS,
+    SHN_COMMON, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM, SHT_FINI_ARRAY, SHT_GNU_HASH, SHT_GNU_VERDEF,
+    SHT_GNU_VERNEED, SHT_GNU_VERSYM, SHT_INIT_ARRAY, SHT_NOBITS, SHT_PREINIT_ARRAY, SHT_PROGBITS,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_OBJECT,
+    STT_SECTION, STT_TLS,
 };
 
 use crate::backend::linker_common;
@@ -64,12 +57,9 @@ pub const R_X86_64_SIZE64: u32 = 33;
 
 // DT_* constants now in shared module - re-export them
 pub use crate::backend::elf::{
-    DT_DEBUG, DT_INIT_ARRAY, DT_FINI_ARRAY,
-    DT_INIT_ARRAYSZ, DT_FINI_ARRAYSZ,
-    DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ,
-    DT_SONAME, DT_RPATH, DT_RUNPATH, DT_RELACOUNT,
-    DT_FLAGS, DT_FLAGS_1, DF_1_NOW,
-    DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM, DT_VERDEF, DT_VERDEFNUM,
+    DF_1_NOW, DT_DEBUG, DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_FLAGS, DT_FLAGS_1, DT_INIT_ARRAY,
+    DT_INIT_ARRAYSZ, DT_PREINIT_ARRAY, DT_PREINIT_ARRAYSZ, DT_RELACOUNT, DT_RPATH, DT_RUNPATH,
+    DT_SONAME, DT_VERDEF, DT_VERDEFNUM, DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM,
 };
 
 pub const DF_BIND_NOW: i64 = 0x8;
@@ -93,7 +83,10 @@ pub fn parse_object(data: &[u8], source_name: &str) -> Result<ElfObject, String>
 /// Parse an object that lives inside an already-shared buffer, so section
 /// contents become windows into it instead of copies. See `secdata.rs`.
 pub fn parse_object_shared(
-    buf: &std::sync::Arc<[u8]>, base: usize, size: usize, source_name: &str,
+    buf: &std::sync::Arc<[u8]>,
+    base: usize,
+    size: usize,
+    source_name: &str,
 ) -> Result<ElfObject, String> {
     linker_common::parse_elf64_object_at(buf, base, size, source_name, EM_X86_64)
 }

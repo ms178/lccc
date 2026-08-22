@@ -1,9 +1,9 @@
 //! RiscvCodegen: 128-bit integer operations.
 
-use crate::ir::reexports::{IrCmpOp, Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::StackSlot;
 use super::emit::RiscvCodegen;
+use crate::backend::state::StackSlot;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
 impl RiscvCodegen {
     // ---- i128 acc pair primitives ----
@@ -199,13 +199,17 @@ impl RiscvCodegen {
             self.state.emit("    mv t1, t3");
             self.state.emit("    li t0, 0");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    slli t1, t3, {}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    slli t1, t3, {}", amount - 64));
             self.state.emit("    li t0, 0");
         } else {
-            self.state.emit_fmt(format_args!("    slli t1, t4, {}", amount));
-            self.state.emit_fmt(format_args!("    srli t2, t3, {}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    slli t1, t4, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    srli t2, t3, {}", 64 - amount));
             self.state.emit("    or t1, t1, t2");
-            self.state.emit_fmt(format_args!("    slli t0, t3, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    slli t0, t3, {}", amount));
         }
     }
 
@@ -218,13 +222,17 @@ impl RiscvCodegen {
             self.state.emit("    mv t0, t4");
             self.state.emit("    li t1, 0");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    srli t0, t4, {}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    srli t0, t4, {}", amount - 64));
             self.state.emit("    li t1, 0");
         } else {
-            self.state.emit_fmt(format_args!("    srli t0, t3, {}", amount));
-            self.state.emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    srli t0, t3, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
             self.state.emit("    or t0, t0, t2");
-            self.state.emit_fmt(format_args!("    srli t1, t4, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    srli t1, t4, {}", amount));
         }
     }
 
@@ -237,17 +245,26 @@ impl RiscvCodegen {
             self.state.emit("    mv t0, t4");
             self.state.emit("    srai t1, t4, 63");
         } else if amount > 64 {
-            self.state.emit_fmt(format_args!("    srai t0, t4, {}", amount - 64));
+            self.state
+                .emit_fmt(format_args!("    srai t0, t4, {}", amount - 64));
             self.state.emit("    srai t1, t4, 63");
         } else {
-            self.state.emit_fmt(format_args!("    srli t0, t3, {}", amount));
-            self.state.emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
+            self.state
+                .emit_fmt(format_args!("    srli t0, t3, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    slli t2, t4, {}", 64 - amount));
             self.state.emit("    or t0, t0, t2");
-            self.state.emit_fmt(format_args!("    srai t1, t4, {}", amount));
+            self.state
+                .emit_fmt(format_args!("    srai t1, t4, {}", amount));
         }
     }
 
-    pub(super) fn emit_i128_divrem_call_impl(&mut self, func_name: &str, lhs: &Operand, rhs: &Operand) {
+    pub(super) fn emit_i128_divrem_call_impl(
+        &mut self,
+        func_name: &str,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
         self.operand_to_t0_t1(lhs);
         self.state.emit("    mv a0, t0");
         self.state.emit("    mv a1, t1");
@@ -263,13 +280,18 @@ impl RiscvCodegen {
         self.store_t0_t1_to(dest);
     }
 
-    pub(super) fn emit_i128_to_float_call_impl(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) {
+    pub(super) fn emit_i128_to_float_call_impl(
+        &mut self,
+        src: &Operand,
+        from_signed: bool,
+        to_ty: IrType,
+    ) {
         self.operand_to_t0_t1(src);
         self.state.emit("    mv a0, t0");
         self.state.emit("    mv a1, t1");
         let func_name = match (from_signed, to_ty) {
-            (true, IrType::F64)  => "__floattidf",
-            (true, IrType::F32)  => "__floattisf",
+            (true, IrType::F64) => "__floattidf",
+            (true, IrType::F32) => "__floattisf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
             _ => panic!("unsupported i128-to-float conversion: {:?}", to_ty),
@@ -283,7 +305,12 @@ impl RiscvCodegen {
         }
     }
 
-    pub(super) fn emit_float_to_i128_call_impl(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) {
+    pub(super) fn emit_float_to_i128_call_impl(
+        &mut self,
+        src: &Operand,
+        to_signed: bool,
+        from_ty: IrType,
+    ) {
         self.operand_to_t0(src);
         if from_ty == IrType::F32 {
             self.state.emit("    fmv.w.x fa0, t0");
@@ -291,8 +318,8 @@ impl RiscvCodegen {
             self.state.emit("    fmv.d.x fa0, t0");
         }
         let func_name = match (to_signed, from_ty) {
-            (true, IrType::F64)  => "__fixdfti",
-            (true, IrType::F32)  => "__fixsfti",
+            (true, IrType::F64) => "__fixdfti",
+            (true, IrType::F32) => "__fixsfti",
             (false, IrType::F64) => "__fixunsdfti",
             (false, IrType::F32) => "__fixunssfti",
             _ => panic!("unsupported float-to-i128 conversion: {:?}", from_ty),
@@ -320,7 +347,8 @@ impl RiscvCodegen {
         let hi_differ = self.state.fresh_label("cmp128_hi_diff");
         let hi_equal = self.state.fresh_label("cmp128_hi_eq");
         let done = self.state.fresh_label("cmp128_done");
-        self.state.emit_fmt(format_args!("    bne t4, t6, {}", hi_differ));
+        self.state
+            .emit_fmt(format_args!("    bne t4, t6, {}", hi_differ));
         self.state.emit_fmt(format_args!("    j {}", hi_equal));
         self.state.emit_fmt(format_args!("{}:", hi_differ));
         match op {

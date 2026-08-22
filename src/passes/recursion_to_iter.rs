@@ -40,8 +40,7 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             if let Instruction::Call { func: f, info } = inst {
-                if f == &func_name && !info.is_sret && !info.is_variadic
-                    && info.num_fixed_args == 1
+                if f == &func_name && !info.is_sret && !info.is_variadic && info.num_fixed_args == 1
                 {
                     if let Some(dest) = info.dest {
                         calls.push(CallSite {
@@ -72,7 +71,14 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     let mut combine_add: Option<(Value, usize)> = None;
 
     for (inst_idx, inst) in call_block.instructions.iter().enumerate() {
-        if let Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: _ } = inst {
+        if let Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
             let lhs_is_call = match lhs {
                 Operand::Value(v) => v.0 == calls[0].dest.0 || v.0 == calls[1].dest.0,
                 _ => false,
@@ -107,7 +113,12 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     let mut param_val = None;
     let mut param_ty = IrType::I32;
     for inst in &func.blocks[0].instructions {
-        if let Instruction::ParamRef { dest, param_idx: 0, ty } = inst {
+        if let Instruction::ParamRef {
+            dest,
+            param_idx: 0,
+            ty,
+        } = inst
+        {
             param_val = Some(*dest);
             param_ty = *ty;
         }
@@ -127,7 +138,11 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     };
 
     // Ensure decrements are 1 and 2 (or 2 and 1) — standard Fibonacci pattern
-    let (small_dec, large_dec) = if dec1 < dec2 { (dec1, dec2) } else { (dec2, dec1) };
+    let (small_dec, large_dec) = if dec1 < dec2 {
+        (dec1, dec2)
+    } else {
+        (dec2, dec1)
+    };
     if small_dec != 1 || large_dec != 2 {
         return 0; // Only handle fib(n-1) + fib(n-2) pattern
     }
@@ -139,18 +154,30 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     let mut base_threshold = 1i64; // default: n <= 1
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
-        if block_idx == call_block_idx { continue; }
+        if block_idx == call_block_idx {
+            continue;
+        }
         if let Terminator::Return(Some(_)) = &block.terminator {
             // This could be the base case
             base_case_block = Some(block_idx);
 
             // Try to find the comparison that leads here
             for other_block in &func.blocks {
-                if let Terminator::CondBranch { true_label, false_label, .. } = &other_block.terminator {
+                if let Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } = &other_block.terminator
+                {
                     if true_label.0 as usize == block_idx || false_label.0 as usize == block_idx {
                         // Check comparison for n <= constant
                         for inst in &other_block.instructions {
-                            if let Instruction::Cmp { op: IrCmpOp::Sle | IrCmpOp::Slt, rhs: Operand::Const(c), .. } = inst {
+                            if let Instruction::Cmp {
+                                op: IrCmpOp::Sle | IrCmpOp::Slt,
+                                rhs: Operand::Const(c),
+                                ..
+                            } = inst
+                            {
                                 if let Some(v) = c.to_i64() {
                                     base_threshold = v;
                                 }
@@ -173,22 +200,28 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     // ── 5. Transform: replace function body with iterative loop ────────────
     let debug = std::env::var("LCCC_DEBUG_RECURSION").is_ok();
     if debug {
-        eprintln!("[REC→ITER] Detected binary recursion in '{}': f(n) = f(n-{}) + f(n-{}), base: n <= {}",
-            func_name, small_dec, large_dec, base_threshold);
+        eprintln!(
+            "[REC→ITER] Detected binary recursion in '{}': f(n) = f(n-{}) + f(n-{}), base: n <= {}",
+            func_name, small_dec, large_dec, base_threshold
+        );
     }
 
     // Allocate fresh values
     let mut next_id = func.next_value_id;
-    let alloc = |next: &mut u32| -> Value { let v = Value(*next); *next += 1; v };
+    let alloc = |next: &mut u32| -> Value {
+        let v = Value(*next);
+        *next += 1;
+        v
+    };
 
-    let n_ext = alloc(&mut next_id);         // sign-extended n
-    let base_cmp = alloc(&mut next_id);      // n <= 1 comparison
-    let loop_i = alloc(&mut next_id);        // loop counter phi
-    let loop_a = alloc(&mut next_id);        // accumulator a phi
-    let loop_b = alloc(&mut next_id);        // accumulator b phi
-    let loop_cmp = alloc(&mut next_id);      // i <= n comparison
-    let loop_t = alloc(&mut next_id);        // t = a + b
-    let loop_i_next = alloc(&mut next_id);   // i + 1
+    let n_ext = alloc(&mut next_id); // sign-extended n
+    let base_cmp = alloc(&mut next_id); // n <= 1 comparison
+    let loop_i = alloc(&mut next_id); // loop counter phi
+    let loop_a = alloc(&mut next_id); // accumulator a phi
+    let loop_b = alloc(&mut next_id); // accumulator b phi
+    let loop_cmp = alloc(&mut next_id); // i <= n comparison
+    let loop_t = alloc(&mut next_id); // t = a + b
+    let loop_i_next = alloc(&mut next_id); // i + 1
 
     // Allocate fresh block labels
     let max_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
@@ -200,28 +233,45 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     let entry_label = func.blocks[0].label;
 
     // Determine the canonical types
-    let idx_ty = if ret_ty == IrType::I64 { IrType::I64 } else { param_ty };
+    let idx_ty = if ret_ty == IrType::I64 {
+        IrType::I64
+    } else {
+        param_ty
+    };
     let is_i32_param = matches!(param_ty, IrType::I32 | IrType::U32);
 
     // Replace entire function body
     func.blocks.clear();
 
     // Entry block: cast param, check base case
-    let mut entry_insts = vec![
-        Instruction::ParamRef { dest: param_val, param_idx: 0, ty: param_ty },
-    ];
+    let mut entry_insts = vec![Instruction::ParamRef {
+        dest: param_val,
+        param_idx: 0,
+        ty: param_ty,
+    }];
     if is_i32_param && ret_ty == IrType::I64 {
         // Sign-extend i32 param to i64 for the return type
         entry_insts.push(Instruction::Cast {
-            dest: n_ext, src: Operand::Value(param_val),
-            from_ty: param_ty, to_ty: IrType::I64,
+            dest: n_ext,
+            src: Operand::Value(param_val),
+            from_ty: param_ty,
+            to_ty: IrType::I64,
         });
     }
-    let n_val = if is_i32_param && ret_ty == IrType::I64 { n_ext } else { param_val };
+    let n_val = if is_i32_param && ret_ty == IrType::I64 {
+        n_ext
+    } else {
+        param_val
+    };
     entry_insts.push(Instruction::Cmp {
-        dest: base_cmp, op: IrCmpOp::Sle,
+        dest: base_cmp,
+        op: IrCmpOp::Sle,
         lhs: Operand::Value(n_val),
-        rhs: Operand::Const(if ret_ty == IrType::I64 { IrConst::I64(base_threshold) } else { IrConst::I32(base_threshold as i32) }),
+        rhs: Operand::Const(if ret_ty == IrType::I64 {
+            IrConst::I64(base_threshold)
+        } else {
+            IrConst::I32(base_threshold as i32)
+        }),
         ty: ret_ty,
     });
 
@@ -253,36 +303,52 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     });
 
     // Loop header: phi nodes + exit check
-    let zero_const = if ret_ty == IrType::I64 { IrConst::I64(0) } else { IrConst::I32(0) };
-    let one_const = if ret_ty == IrType::I64 { IrConst::I64(1) } else { IrConst::I32(1) };
-    let two_const = if ret_ty == IrType::I64 { IrConst::I64(2) } else { IrConst::I32(2) };
+    let zero_const = if ret_ty == IrType::I64 {
+        IrConst::I64(0)
+    } else {
+        IrConst::I32(0)
+    };
+    let one_const = if ret_ty == IrType::I64 {
+        IrConst::I64(1)
+    } else {
+        IrConst::I32(1)
+    };
+    let two_const = if ret_ty == IrType::I64 {
+        IrConst::I64(2)
+    } else {
+        IrConst::I32(2)
+    };
 
     func.blocks.push(BasicBlock {
         label: header_label,
         instructions: vec![
             Instruction::Phi {
-                dest: loop_i, ty: ret_ty,
+                dest: loop_i,
+                ty: ret_ty,
                 incoming: vec![
                     (Operand::Const(two_const.clone()), preheader_label),
                     (Operand::Value(loop_i_next), body_label),
                 ],
             },
             Instruction::Phi {
-                dest: loop_a, ty: ret_ty,
+                dest: loop_a,
+                ty: ret_ty,
                 incoming: vec![
                     (Operand::Const(zero_const), preheader_label),
                     (Operand::Value(loop_b), body_label),
                 ],
             },
             Instruction::Phi {
-                dest: loop_b, ty: ret_ty,
+                dest: loop_b,
+                ty: ret_ty,
                 incoming: vec![
                     (Operand::Const(one_const.clone()), preheader_label),
                     (Operand::Value(loop_t), body_label),
                 ],
             },
             Instruction::Cmp {
-                dest: loop_cmp, op: IrCmpOp::Sle,
+                dest: loop_cmp,
+                op: IrCmpOp::Sle,
                 lhs: Operand::Value(loop_i),
                 rhs: Operand::Value(n_val),
                 ty: ret_ty,
@@ -301,13 +367,17 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
         label: body_label,
         instructions: vec![
             Instruction::BinOp {
-                dest: loop_t, op: IrBinOp::Add,
-                lhs: Operand::Value(loop_a), rhs: Operand::Value(loop_b),
+                dest: loop_t,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(loop_a),
+                rhs: Operand::Value(loop_b),
                 ty: ret_ty,
             },
             Instruction::BinOp {
-                dest: loop_i_next, op: IrBinOp::Add,
-                lhs: Operand::Value(loop_i), rhs: Operand::Const(one_const),
+                dest: loop_i_next,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(loop_i),
+                rhs: Operand::Const(one_const),
                 ty: ret_ty,
             },
         ],
@@ -327,7 +397,11 @@ pub(crate) fn recursion_to_iteration(func: &mut IrFunction) -> usize {
     func.next_label = max_label + 6;
 
     if debug {
-        eprintln!("[REC→ITER] Transformed '{}' to iterative loop with {} blocks", func_name, func.blocks.len());
+        eprintln!(
+            "[REC→ITER] Transformed '{}' to iterative loop with {} blocks",
+            func_name,
+            func.blocks.len()
+        );
     }
 
     1
@@ -343,11 +417,7 @@ struct CallSite {
 
 /// Trace an operand back to find `param - constant`, returning the constant.
 /// Handles chains like: Cast(Sub(Cast(param), const)) or Sub(param, const).
-fn trace_param_decrement(
-    func: &IrFunction,
-    arg: &Operand,
-    param_val: Value,
-) -> Option<i64> {
+fn trace_param_decrement(func: &IrFunction, arg: &Operand, param_val: Value) -> Option<i64> {
     let val = match arg {
         Operand::Value(v) => *v,
         _ => return None,
@@ -358,38 +428,56 @@ fn trace_param_decrement(
         for inst in &block.instructions {
             match inst {
                 // Direct: Sub(param, const)
-                Instruction::BinOp { dest, op: IrBinOp::Sub, lhs: Operand::Value(l), rhs: Operand::Const(c), .. }
-                    if *dest == val =>
-                {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(l),
+                    rhs: Operand::Const(c),
+                    ..
+                } if *dest == val => {
                     if *l == param_val {
                         return c.to_i64();
                     }
                     // Maybe lhs is a cast of param
                     if let Some(src) = find_cast_source(func, *l) {
-                        if src == param_val { return c.to_i64(); }
+                        if src == param_val {
+                            return c.to_i64();
+                        }
                     }
                 }
                 // Sub result is then cast
-                Instruction::Cast { dest, src: Operand::Value(sub_val), .. }
-                    if *dest == val =>
-                {
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Value(sub_val),
+                    ..
+                } if *dest == val => {
                     return trace_param_decrement(func, &Operand::Value(*sub_val), param_val);
                 }
                 // Copy of a sub
-                Instruction::Copy { dest, src: Operand::Value(copy_src) }
-                    if *dest == val =>
-                {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(copy_src),
+                } if *dest == val => {
                     return trace_param_decrement(func, &Operand::Value(*copy_src), param_val);
                 }
                 // Add with negative constant (n + (-1) == n - 1)
-                Instruction::BinOp { dest, op: IrBinOp::Add, lhs: Operand::Value(l), rhs: Operand::Const(c), .. }
-                    if *dest == val =>
-                {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(l),
+                    rhs: Operand::Const(c),
+                    ..
+                } if *dest == val => {
                     if let Some(v) = c.to_i64() {
                         if v < 0 {
-                            let actual_param = if *l == param_val { true }
-                                else { find_cast_source(func, *l) == Some(param_val) };
-                            if actual_param { return Some(-v); }
+                            let actual_param = if *l == param_val {
+                                true
+                            } else {
+                                find_cast_source(func, *l) == Some(param_val)
+                            };
+                            if actual_param {
+                                return Some(-v);
+                            }
                         }
                     }
                 }
@@ -404,11 +492,24 @@ fn trace_param_decrement(
 fn find_cast_source(func: &IrFunction, val: Value) -> Option<Value> {
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Cast { dest, src: Operand::Value(s), .. } = inst {
-                if *dest == val { return Some(*s); }
+            if let Instruction::Cast {
+                dest,
+                src: Operand::Value(s),
+                ..
+            } = inst
+            {
+                if *dest == val {
+                    return Some(*s);
+                }
             }
-            if let Instruction::Copy { dest, src: Operand::Value(s) } = inst {
-                if *dest == val { return Some(*s); }
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(s),
+            } = inst
+            {
+                if *dest == val {
+                    return Some(*s);
+                }
             }
         }
     }
@@ -433,7 +534,8 @@ mod tests {
     fn make_fib_func() -> IrFunction {
         let params = vec![IrParam {
             ty: IrType::I32,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -451,13 +553,20 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
                 Instruction::Cast {
-                    dest: Value(1), src: Operand::Value(Value(0)),
-                    from_ty: IrType::I32, to_ty: IrType::I64,
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
                 },
                 Instruction::Cmp {
-                    dest: Value(2), op: IrCmpOp::Sle,
+                    dest: Value(2),
+                    op: IrCmpOp::Sle,
                     lhs: Operand::Value(Value(1)),
                     rhs: Operand::Const(IrConst::I64(1)),
                     ty: IrType::I64,
@@ -492,14 +601,17 @@ mod tests {
             label: BlockId(2),
             instructions: vec![
                 Instruction::BinOp {
-                    dest: Value(3), op: IrBinOp::Sub,
+                    dest: Value(3),
+                    op: IrBinOp::Sub,
                     lhs: Operand::Value(Value(0)),
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
                 },
                 Instruction::Cast {
-                    dest: Value(4), src: Operand::Value(Value(3)),
-                    from_ty: IrType::I32, to_ty: IrType::I64,
+                    dest: Value(4),
+                    src: Operand::Value(Value(3)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
                 },
                 Instruction::Call {
                     func: "fib".to_string(),
@@ -518,17 +630,21 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,},
+                        ret_is_f128_sse: false,
+                    },
                 },
                 Instruction::BinOp {
-                    dest: Value(7), op: IrBinOp::Sub,
+                    dest: Value(7),
+                    op: IrBinOp::Sub,
                     lhs: Operand::Value(Value(0)),
                     rhs: Operand::Const(IrConst::I32(2)),
                     ty: IrType::I32,
                 },
                 Instruction::Cast {
-                    dest: Value(8), src: Operand::Value(Value(7)),
-                    from_ty: IrType::I32, to_ty: IrType::I64,
+                    dest: Value(8),
+                    src: Operand::Value(Value(7)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
                 },
                 Instruction::Call {
                     func: "fib".to_string(),
@@ -547,10 +663,12 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,},
+                        ret_is_f128_sse: false,
+                    },
                 },
                 Instruction::BinOp {
-                    dest: Value(11), op: IrBinOp::Add,
+                    dest: Value(11),
+                    op: IrBinOp::Add,
                     lhs: Operand::Value(Value(6)),
                     rhs: Operand::Value(Value(10)),
                     ty: IrType::I64,
@@ -570,7 +688,11 @@ mod tests {
         let transformed = recursion_to_iteration(&mut func);
         assert_eq!(transformed, 1, "should transform Fibonacci pattern");
         // After transformation: entry, base, preheader, header, body, exit = 6 blocks
-        assert_eq!(func.blocks.len(), 6, "iterative version should have 6 blocks");
+        assert_eq!(
+            func.blocks.len(),
+            6,
+            "iterative version should have 6 blocks"
+        );
     }
 
     #[test]
@@ -578,11 +700,16 @@ mod tests {
         let mut func = make_fib_func();
         recursion_to_iteration(&mut func);
         // The transformed function should contain zero Call instructions
-        let call_count: usize = func.blocks.iter()
+        let call_count: usize = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter(|inst| matches!(inst, Instruction::Call { .. }))
             .count();
-        assert_eq!(call_count, 0, "iterative version should have no recursive calls");
+        assert_eq!(
+            call_count, 0,
+            "iterative version should have no recursive calls"
+        );
     }
 
     #[test]
@@ -590,11 +717,16 @@ mod tests {
         let mut func = make_fib_func();
         recursion_to_iteration(&mut func);
         // The loop header should have phi nodes for the accumulators
-        let phi_count: usize = func.blocks.iter()
+        let phi_count: usize = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter(|inst| matches!(inst, Instruction::Phi { .. }))
             .count();
-        assert!(phi_count >= 3, "should have phi nodes for i, a, b (got {phi_count})");
+        assert!(
+            phi_count >= 3,
+            "should have phi nodes for i, a, b (got {phi_count})"
+        );
     }
 
     #[test]
@@ -607,7 +739,10 @@ mod tests {
                 func.blocks.iter().position(|bb| bb.label == *target)
                     .map_or(false, |pos| pos < func.blocks.iter().position(|bb| bb.label == b.label).unwrap()))
         });
-        assert!(has_back_edge, "iterative version should have a loop back-edge");
+        assert!(
+            has_back_edge,
+            "iterative version should have a loop back-edge"
+        );
     }
 
     #[test]
@@ -615,7 +750,8 @@ mod tests {
         // A function with only one recursive call (not binary recursion)
         let params = vec![IrParam {
             ty: IrType::I32,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -628,9 +764,14 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I32 },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
                 Instruction::Cmp {
-                    dest: Value(1), op: IrCmpOp::Sle,
+                    dest: Value(1),
+                    op: IrCmpOp::Sle,
                     lhs: Operand::Value(Value(0)),
                     rhs: Operand::Const(IrConst::I32(1)),
                     ty: IrType::I32,
@@ -652,40 +793,43 @@ mod tests {
         // Only one recursive call — should not match
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::Call {
-                    func: "factorial".to_string(),
-                    info: CallInfo {
-                        dest: Some(Value(3)),
-                        args: vec![Operand::Value(Value(0))],
-                        arg_types: vec![IrType::I32],
-                        return_type: IrType::I64,
-                        is_variadic: false,
-                        num_fixed_args: 1,
-                        struct_arg_sizes: vec![],
-                        struct_arg_aligns: vec![],
-                        struct_arg_classes: Vec::new(),
-                        struct_arg_riscv_float_classes: Vec::new(),
-                        struct_arg_is_f128_sse: Vec::new(),
-                        is_sret: false,
-                        is_fastcall: false,
-                        ret_eightbyte_classes: Vec::new(),
-                    ret_is_f128_sse: false,},
+            instructions: vec![Instruction::Call {
+                func: "factorial".to_string(),
+                info: CallInfo {
+                    dest: Some(Value(3)),
+                    args: vec![Operand::Value(Value(0))],
+                    arg_types: vec![IrType::I32],
+                    return_type: IrType::I64,
+                    is_variadic: false,
+                    num_fixed_args: 1,
+                    struct_arg_sizes: vec![],
+                    struct_arg_aligns: vec![],
+                    struct_arg_classes: Vec::new(),
+                    struct_arg_riscv_float_classes: Vec::new(),
+                    struct_arg_is_f128_sse: Vec::new(),
+                    is_sret: false,
+                    is_fastcall: false,
+                    ret_eightbyte_classes: Vec::new(),
+                    ret_is_f128_sse: false,
                 },
-            ],
+            }],
             terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
             source_spans: Vec::new(),
         });
 
         let transformed = recursion_to_iteration(&mut func);
-        assert_eq!(transformed, 0, "single-recursive function should not be transformed");
+        assert_eq!(
+            transformed, 0,
+            "single-recursive function should not be transformed"
+        );
     }
 
     #[test]
     fn test_variadic_not_transformed() {
         let params = vec![IrParam {
             ty: IrType::I32,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -696,7 +840,10 @@ mod tests {
         func.next_label = 3;
         // Don't even need blocks — variadic check happens first
         let transformed = recursion_to_iteration(&mut func);
-        assert_eq!(transformed, 0, "variadic functions should not be transformed");
+        assert_eq!(
+            transformed, 0,
+            "variadic functions should not be transformed"
+        );
     }
 
     #[test]
@@ -705,7 +852,8 @@ mod tests {
         let params = vec![
             IrParam {
                 ty: IrType::I32,
-                noalias: false, struct_size: None,
+                noalias: false,
+                struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
@@ -713,7 +861,8 @@ mod tests {
             },
             IrParam {
                 ty: IrType::I32,
-                noalias: false, struct_size: None,
+                noalias: false,
+                struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
@@ -730,14 +879,18 @@ mod tests {
             source_spans: Vec::new(),
         });
         let transformed = recursion_to_iteration(&mut func);
-        assert_eq!(transformed, 0, "multi-param functions should not be transformed");
+        assert_eq!(
+            transformed, 0,
+            "multi-param functions should not be transformed"
+        );
     }
 
     #[test]
     fn test_declaration_not_transformed() {
         let params = vec![IrParam {
             ty: IrType::I32,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,

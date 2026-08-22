@@ -844,7 +844,8 @@ fn build_outlined_function(
         .iter()
         .map(|_| IrParam {
             ty: IrType::Ptr,
-            noalias: false, struct_size: None,
+            noalias: false,
+            struct_size: None,
             struct_align: None,
             struct_eightbyte_classes: Vec::new(),
             riscv_float_class: None,
@@ -914,7 +915,11 @@ fn remap_instruction(
     };
 
     match inst {
-        Instruction::PgoCounterInc { name, offset, atomic } => Instruction::PgoCounterInc {
+        Instruction::PgoCounterInc {
+            name,
+            offset,
+            atomic,
+        } => Instruction::PgoCounterInc {
             name: name.clone(),
             offset: *offset,
             atomic: *atomic,

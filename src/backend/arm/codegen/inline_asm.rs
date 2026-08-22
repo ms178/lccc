@@ -5,11 +5,11 @@
 //! w/x/s/d/q modifiers for ARM targets. It also contains helpers for
 //! atomic exclusive access instructions (ldxr/stxr) and atomic RMW operations.
 
-use std::fmt::Write;
-use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp};
-use crate::common::types::IrType;
-use crate::backend::state::CodegenState;
 use super::emit::ArmCodegen;
+use crate::backend::state::CodegenState;
+use crate::common::types::IrType;
+use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp};
+use std::fmt::Write;
 
 impl ArmCodegen {
     pub(super) fn substitute_asm_operands_static(
@@ -36,12 +36,19 @@ impl ArmCodegen {
                 // 'c' = raw constant (no # prefix), used in ARM inline asm
                 // 'a' = memory address reference [reg], used for prfm/prefetch
                 let mut modifier = None;
-                if chars[i] == 'w' || chars[i] == 'x' || chars[i] == 'h' || chars[i] == 'b'
-                    || chars[i] == 's' || chars[i] == 'd' || chars[i] == 'q'
-                    || chars[i] == 'c' || chars[i] == 'a'
+                if chars[i] == 'w'
+                    || chars[i] == 'x'
+                    || chars[i] == 'h'
+                    || chars[i] == 'b'
+                    || chars[i] == 's'
+                    || chars[i] == 'd'
+                    || chars[i] == 'q'
+                    || chars[i] == 'c'
+                    || chars[i] == 'a'
                 {
                     // Check if next char is digit or [, meaning this is a modifier
-                    if i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[') {
+                    if i + 1 < chars.len() && (chars[i + 1].is_ascii_digit() || chars[i + 1] == '[')
+                    {
                         modifier = Some(chars[i]);
                         i += 1;
                     }
@@ -55,7 +62,9 @@ impl ArmCodegen {
                         i += 1;
                     }
                     let name: String = chars[name_start..i].iter().collect();
-                    if i < chars.len() { i += 1; } // skip ]
+                    if i < chars.len() {
+                        i += 1;
+                    } // skip ]
 
                     // Look up by name in operands
                     let mut found = false;
@@ -63,7 +72,11 @@ impl ArmCodegen {
                         if let Some(ref n) = op_name {
                             if n == &name {
                                 result.push_str(&Self::format_operand_static(
-                                    idx, modifier, op_regs, op_imm_values, op_imm_symbols,
+                                    idx,
+                                    modifier,
+                                    op_regs,
+                                    op_imm_values,
+                                    op_imm_symbols,
                                 ));
                                 found = true;
                                 break;
@@ -73,7 +86,9 @@ impl ArmCodegen {
                     if !found {
                         // Fallback: emit raw
                         result.push('%');
-                        if let Some(m) = modifier { result.push(m); }
+                        if let Some(m) = modifier {
+                            result.push(m);
+                        }
                         result.push('[');
                         result.push_str(&name);
                         result.push(']');
@@ -95,7 +110,11 @@ impl ArmCodegen {
                     };
                     if internal_idx < op_regs.len() {
                         result.push_str(&Self::format_operand_static(
-                            internal_idx, modifier, op_regs, op_imm_values, op_imm_symbols,
+                            internal_idx,
+                            modifier,
+                            op_regs,
+                            op_imm_values,
+                            op_imm_symbols,
                         ));
                     } else {
                         let _ = write!(result, "x{}", num);
@@ -103,7 +122,9 @@ impl ArmCodegen {
                 } else {
                     // Not a recognized pattern, emit as-is
                     result.push('%');
-                    if let Some(m) = modifier { result.push(m); }
+                    if let Some(m) = modifier {
+                        result.push(m);
+                    }
                     result.push(chars[i]);
                     i += 1;
                 }
@@ -167,16 +188,23 @@ impl ArmCodegen {
         };
         // Extract the register number from any register form (x, w, d, s, q, v)
         let reg_num = || -> Option<&str> {
-            if reg.starts_with('x') || reg.starts_with('w') || reg.starts_with('d')
-                || reg.starts_with('s') || reg.starts_with('q') || reg.starts_with('v') {
+            if reg.starts_with('x')
+                || reg.starts_with('w')
+                || reg.starts_with('d')
+                || reg.starts_with('s')
+                || reg.starts_with('q')
+                || reg.starts_with('v')
+            {
                 Some(&reg[1..])
             } else {
                 None
             }
         };
         // Check if this is a FP/SIMD register (d, s, q, v prefix)
-        let is_fp_reg = reg.starts_with('d') || reg.starts_with('s')
-            || reg.starts_with('q') || reg.starts_with('v');
+        let is_fp_reg = reg.starts_with('d')
+            || reg.starts_with('s')
+            || reg.starts_with('q')
+            || reg.starts_with('v');
         match modifier {
             Some('w') => {
                 // Convert to w-register (32-bit GP)
@@ -269,7 +297,8 @@ impl ArmCodegen {
     /// Convert a FP/SIMD register name to its s-register counterpart (same register number).
     /// e.g., "d16" -> "s16", "v16" -> "s16"
     pub(super) fn fp_to_s_reg(reg: &str) -> String {
-        if let Some(rest) = reg.strip_prefix('d')
+        if let Some(rest) = reg
+            .strip_prefix('d')
             .or_else(|| reg.strip_prefix('v'))
             .or_else(|| reg.strip_prefix('s'))
             .or_else(|| reg.strip_prefix('q'))
@@ -283,7 +312,8 @@ impl ArmCodegen {
     /// Convert a FP/SIMD register name to its d-register counterpart (same register number).
     /// e.g., "v16" -> "d16", "s16" -> "d16"
     pub(super) fn fp_to_d_reg(reg: &str) -> String {
-        if let Some(rest) = reg.strip_prefix('v')
+        if let Some(rest) = reg
+            .strip_prefix('v')
             .or_else(|| reg.strip_prefix('d'))
             .or_else(|| reg.strip_prefix('s'))
             .or_else(|| reg.strip_prefix('q'))
@@ -297,7 +327,8 @@ impl ArmCodegen {
     /// Convert a FP/SIMD register name to its q-register counterpart (same register number).
     /// e.g., "v16" -> "q16", "d16" -> "q16"
     pub(super) fn fp_to_q_reg(reg: &str) -> String {
-        if let Some(rest) = reg.strip_prefix('v')
+        if let Some(rest) = reg
+            .strip_prefix('v')
             .or_else(|| reg.strip_prefix('d'))
             .or_else(|| reg.strip_prefix('s'))
             .or_else(|| reg.strip_prefix('q'))
@@ -314,9 +345,18 @@ impl ArmCodegen {
     /// - Acquire: ldaxr/stxr (acquire on load)
     /// - Release: ldxr/stlxr (release on store)
     /// - AcqRel/SeqCst: ldaxr/stlxr (acquire on load, release on store)
-    pub(super) fn exclusive_instrs(ty: IrType, ordering: AtomicOrdering) -> (&'static str, &'static str, &'static str) {
-        let need_acquire = matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
-        let need_release = matches!(ordering, AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst);
+    pub(super) fn exclusive_instrs(
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) -> (&'static str, &'static str, &'static str) {
+        let need_acquire = matches!(
+            ordering,
+            AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+        );
+        let need_release = matches!(
+            ordering,
+            AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+        );
         match ty {
             IrType::I8 | IrType::U8 => (
                 if need_acquire { "ldaxrb" } else { "ldxrb" },
@@ -342,15 +382,39 @@ impl ArmCodegen {
     }
 
     /// Emit the arithmetic operation for an atomic RMW.
-    pub(super) fn emit_atomic_op_arm(state: &mut CodegenState, op: AtomicRmwOp, dest_reg: &str, old_reg: &str, val_reg: &str) {
+    pub(super) fn emit_atomic_op_arm(
+        state: &mut CodegenState,
+        op: AtomicRmwOp,
+        dest_reg: &str,
+        old_reg: &str,
+        val_reg: &str,
+    ) {
         match op {
-            AtomicRmwOp::Add => state.emit_fmt(format_args!("    add {}, {}, {}", dest_reg, old_reg, val_reg)),
-            AtomicRmwOp::Sub => state.emit_fmt(format_args!("    sub {}, {}, {}", dest_reg, old_reg, val_reg)),
-            AtomicRmwOp::And => state.emit_fmt(format_args!("    and {}, {}, {}", dest_reg, old_reg, val_reg)),
-            AtomicRmwOp::Or  => state.emit_fmt(format_args!("    orr {}, {}, {}", dest_reg, old_reg, val_reg)),
-            AtomicRmwOp::Xor => state.emit_fmt(format_args!("    eor {}, {}, {}", dest_reg, old_reg, val_reg)),
+            AtomicRmwOp::Add => state.emit_fmt(format_args!(
+                "    add {}, {}, {}",
+                dest_reg, old_reg, val_reg
+            )),
+            AtomicRmwOp::Sub => state.emit_fmt(format_args!(
+                "    sub {}, {}, {}",
+                dest_reg, old_reg, val_reg
+            )),
+            AtomicRmwOp::And => state.emit_fmt(format_args!(
+                "    and {}, {}, {}",
+                dest_reg, old_reg, val_reg
+            )),
+            AtomicRmwOp::Or => state.emit_fmt(format_args!(
+                "    orr {}, {}, {}",
+                dest_reg, old_reg, val_reg
+            )),
+            AtomicRmwOp::Xor => state.emit_fmt(format_args!(
+                "    eor {}, {}, {}",
+                dest_reg, old_reg, val_reg
+            )),
             AtomicRmwOp::Nand => {
-                state.emit_fmt(format_args!("    and {}, {}, {}", dest_reg, old_reg, val_reg));
+                state.emit_fmt(format_args!(
+                    "    and {}, {}, {}",
+                    dest_reg, old_reg, val_reg
+                ));
                 state.emit_fmt(format_args!("    mvn {}, {}", dest_reg, dest_reg));
             }
             AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {

@@ -9,11 +9,11 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use super::macro_defs::{MacroDef, MacroTable, parse_define};
-use super::conditionals::{ConditionalStack, evaluate_condition};
 use super::builtin_macros::define_builtin_macros;
-use super::utils::{is_ident_start, is_ident_cont};
-use super::text_processing::{strip_line_comment, split_first_word};
+use super::conditionals::{evaluate_condition, ConditionalStack};
+use super::macro_defs::{parse_define, MacroDef, MacroTable};
+use super::text_processing::{split_first_word, strip_line_comment};
+use super::utils::{is_ident_cont, is_ident_start};
 
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
 /// Used to remove duplicate names from nested macro expansions.
@@ -166,7 +166,11 @@ impl Preprocessor {
         let main_output = self.preprocess_source(source, false);
         // Prepend any output from force-included files (e.g., pragma synthetic tokens)
         let (result, prefix_lines) = if self.force_include_output.is_empty() {
-            let prefix_lines = line_marker.as_bytes().iter().filter(|&&b| b == b'\n').count() as u32;
+            let prefix_lines = line_marker
+                .as_bytes()
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32;
             let mut result = line_marker;
             result.push_str(&main_output);
             (result, prefix_lines)
@@ -249,13 +253,14 @@ impl Preprocessor {
             let source_line_num = line_map.get(line_num);
 
             // Update __LINE__, accounting for any #line directive override
-            let effective_line = if let Some((target_line, source_line_at_directive)) = self.line_override {
-                // After #line N, __LINE__ = N + (current_source_line - source_line_of_directive)
-                let offset = source_line_num.saturating_sub(source_line_at_directive);
-                target_line + offset
-            } else {
-                source_line_num + 1
-            };
+            let effective_line =
+                if let Some((target_line, source_line_at_directive)) = self.line_override {
+                    // After #line N, __LINE__ = N + (current_source_line - source_line_of_directive)
+                    let offset = source_line_num.saturating_sub(source_line_at_directive);
+                    target_line + offset
+                } else {
+                    source_line_num + 1
+                };
             self.macros.set_line(effective_line);
 
             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always
@@ -322,7 +327,10 @@ impl Preprocessor {
                 let after_hash = trimmed[1..].trim_start();
                 after_hash.starts_with("line ")
                     || after_hash.starts_with("line\t")
-                    || after_hash.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || after_hash
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit())
             } else {
                 false
             };
@@ -335,8 +343,7 @@ impl Preprocessor {
                 continue;
             }
 
-            let process_directive = is_directive
-                && (!is_include || pending_line.is_empty());
+            let process_directive = is_directive && (!is_include || pending_line.is_empty());
 
             if process_directive {
                 // When accumulating a multi-line expression (pending_line is non-empty)
@@ -360,7 +367,7 @@ impl Preprocessor {
                         // after the preceding tokens, not before them.
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
                         let expanded = self.resolve_has_macros_in_code(&expanded);
-                    output.push_str(&expanded);
+                        output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..pending_newlines {
                             output.push('\n');
@@ -379,7 +386,9 @@ impl Preprocessor {
                     // correct file and line number. source_line_num is 0-based,
                     // and the next line of the parent file is source_line_num + 2
                     // (since the #include directive itself was source_line_num + 1).
-                    let parent_file = self.include_stack.last()
+                    let parent_file = self
+                        .include_stack
+                        .last()
                         .map(|p| super::includes::format_path_for_line_directive(p))
                         .unwrap_or_else(|| self.filename.clone());
                     // Flag 2 indicates returning from an include file (GCC convention)
@@ -410,7 +419,10 @@ impl Preprocessor {
                 // expand macros, handling multi-line macro invocations
                 let output_len_before = output.len();
                 self.accumulate_and_expand(
-                    line, &mut pending_line, &mut pending_newlines, &mut output,
+                    line,
+                    &mut pending_line,
+                    &mut pending_newlines,
+                    &mut output,
                     &mut expanding,
                 );
                 // Collect macro expansion info for diagnostics.
@@ -419,12 +431,11 @@ impl Preprocessor {
                     let expanded_names = self.macros.take_expanded_macros();
                     if !expanded_names.is_empty() {
                         let unique_names = dedup_macro_names(expanded_names);
-                        self.macro_expansion_info.push(
-                            crate::common::source::MacroExpansionInfo {
+                        self.macro_expansion_info
+                            .push(crate::common::source::MacroExpansionInfo {
                                 pp_line: pp_output_line,
                                 macro_names: unique_names,
-                            }
-                        );
+                            });
                     }
                 }
                 // Update pp_output_line by counting newlines in the newly added content
@@ -449,19 +460,18 @@ impl Preprocessor {
         if !pending_line.is_empty() {
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
             let expanded = self.resolve_has_macros_in_code(&expanded);
-                    output.push_str(&expanded);
+            output.push_str(&expanded);
             output.push('\n');
             // Collect macro expansion info for the flushed line
             if !is_include {
                 let expanded_names = self.macros.take_expanded_macros();
                 if !expanded_names.is_empty() {
                     let unique_names = dedup_macro_names(expanded_names);
-                    self.macro_expansion_info.push(
-                        crate::common::source::MacroExpansionInfo {
+                    self.macro_expansion_info
+                        .push(crate::common::source::MacroExpansionInfo {
                             pp_line: pp_output_line,
                             macro_names: unique_names,
-                        }
-                    );
+                        });
                 }
             }
         }
@@ -536,15 +546,19 @@ impl Preprocessor {
 
             if needs_more {
                 // Was accumulating for unbalanced parens
-                if !Self::has_unbalanced_parens(pending_line) || *pending_newlines > MAX_PENDING_NEWLINES {
+                if !Self::has_unbalanced_parens(pending_line)
+                    || *pending_newlines > MAX_PENDING_NEWLINES
+                {
                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
                     // Check if the expanded result ends with a function-like macro
                     // that needs args from the next line (chained macros).
-                    if self.ends_with_funclike_macro(&expanded) && *pending_newlines <= MAX_PENDING_NEWLINES {
+                    if self.ends_with_funclike_macro(&expanded)
+                        && *pending_newlines <= MAX_PENDING_NEWLINES
+                    {
                         // Don't clear pending_line - keep accumulating
                     } else {
                         let expanded = self.resolve_has_macros_in_code(&expanded);
-                    output.push_str(&expanded);
+                        output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
                             output.push('\n');
@@ -556,7 +570,9 @@ impl Preprocessor {
             } else {
                 // Was accumulating for trailing function-like macro name.
                 // Now we have the next line joined. Check if parens are balanced.
-                if Self::has_unbalanced_parens(pending_line) && *pending_newlines <= MAX_PENDING_NEWLINES {
+                if Self::has_unbalanced_parens(pending_line)
+                    && *pending_newlines <= MAX_PENDING_NEWLINES
+                {
                     // The joined text has unbalanced parens (macro args span more lines)
                     // Keep accumulating.
                 } else {
@@ -564,11 +580,13 @@ impl Preprocessor {
                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
                     // Check if the expanded result itself ends with a function-like
                     // macro name that needs args from the next line (chained macros).
-                    if self.ends_with_funclike_macro(&expanded) && *pending_newlines <= MAX_PENDING_NEWLINES {
+                    if self.ends_with_funclike_macro(&expanded)
+                        && *pending_newlines <= MAX_PENDING_NEWLINES
+                    {
                         // Don't clear pending_line - keep accumulating
                     } else {
                         let expanded = self.resolve_has_macros_in_code(&expanded);
-                    output.push_str(&expanded);
+                        output.push_str(&expanded);
                         output.push('\n');
                         for _ in 1..*pending_newlines {
                             output.push('\n');
@@ -656,7 +674,8 @@ impl Preprocessor {
     /// Returns the top of the include stack (the file currently being preprocessed),
     /// falling back to `self.filename` for the main translation unit.
     pub(super) fn current_file(&self) -> String {
-        self.include_stack.last()
+        self.include_stack
+            .last()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| self.filename.clone())
     }
@@ -675,20 +694,24 @@ impl Preprocessor {
     /// lists. This output is used by build systems like Meson to detect compiler
     /// features via preprocessor defines (e.g., `__GNUC__`, `__GNUC_MINOR__`).
     pub fn dump_defines(&self) -> String {
-        let mut defs: Vec<String> = self.macros.iter().map(|def| {
-            if def.is_function_like {
-                let params = def.params.join(",");
-                if def.body.is_empty() {
-                    format!("#define {}({})", def.name, params)
+        let mut defs: Vec<String> = self
+            .macros
+            .iter()
+            .map(|def| {
+                if def.is_function_like {
+                    let params = def.params.join(",");
+                    if def.body.is_empty() {
+                        format!("#define {}({})", def.name, params)
+                    } else {
+                        format!("#define {}({}) {}", def.name, params, def.body)
+                    }
+                } else if def.body.is_empty() {
+                    format!("#define {}", def.name)
                 } else {
-                    format!("#define {}({}) {}", def.name, params, def.body)
+                    format!("#define {} {}", def.name, def.body)
                 }
-            } else if def.body.is_empty() {
-                format!("#define {}", def.name)
-            } else {
-                format!("#define {} {}", def.name, def.body)
-            }
-        }).collect();
+            })
+            .collect();
         defs.sort();
         defs.join("\n")
     }
@@ -783,7 +806,6 @@ impl Preprocessor {
         self.include_stack.pop();
     }
 
-
     /// Process a preprocessor directive line.
     /// Returns Some(content) if an #include was processed and should be inserted.
     /// `line_num` is the 1-based source line number, `col` is the 1-based column
@@ -800,7 +822,8 @@ impl Preprocessor {
 
         // Handle #include<file> and #include"file" (no space between include and path)
         // This handles the common C pattern: #include<stdio.h>
-        let (keyword, rest) = if keyword.starts_with("include<") || keyword.starts_with("include\"") {
+        let (keyword, rest) = if keyword.starts_with("include<") || keyword.starts_with("include\"")
+        {
             ("include", &after_hash["include".len()..])
         } else if keyword.starts_with("include_next<") || keyword.starts_with("include_next\"") {
             ("include_next", &after_hash["include_next".len()..])
@@ -857,7 +880,9 @@ impl Preprocessor {
             }
             "error" => {
                 // Expand macros in error message
-                let expanded = self.macros.expand_line_reuse(rest, &mut self.directive_expanding);
+                let expanded = self
+                    .macros
+                    .expand_line_reuse(rest, &mut self.directive_expanding);
                 self.errors.push(PreprocessorDiagnostic {
                     file: self.current_file(),
                     line: line_num,
@@ -928,7 +953,9 @@ impl Preprocessor {
         // First resolve `defined(X)` and `__has_*()` before macro expansion
         let resolved = self.resolve_defined_in_expr(expr);
         // Expand macros in the resolved expression (reuse directive_expanding set)
-        let expanded = self.macros.expand_line_reuse(&resolved, &mut self.directive_expanding);
+        let expanded = self
+            .macros
+            .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion, in case macros expanded to
         // __has_attribute(), __has_builtin(), __has_include(), etc.
         let expanded = self.resolve_defined_in_expr(&expanded);
@@ -940,7 +967,9 @@ impl Preprocessor {
 
     fn handle_elif(&mut self, expr: &str) {
         let resolved = self.resolve_defined_in_expr(expr);
-        let expanded = self.macros.expand_line_reuse(&resolved, &mut self.directive_expanding);
+        let expanded = self
+            .macros
+            .expand_line_reuse(&resolved, &mut self.directive_expanding);
         // Resolve again after macro expansion (same reason as handle_if)
         let expanded = self.resolve_defined_in_expr(&expanded);
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
@@ -951,7 +980,9 @@ impl Preprocessor {
     fn handle_line_directive(&mut self, rest: &str, source_line_num: usize) {
         // #line digit-sequence ["filename"]
         // The argument undergoes macro expansion first
-        let expanded = self.macros.expand_line_reuse(rest, &mut self.directive_expanding);
+        let expanded = self
+            .macros
+            .expand_line_reuse(rest, &mut self.directive_expanding);
         let expanded = expanded.trim();
 
         // Parse the line number (first token)
@@ -974,8 +1005,6 @@ impl Preprocessor {
             }
         }
     }
-
-
 }
 
 impl Default for Preprocessor {
@@ -983,5 +1012,3 @@ impl Default for Preprocessor {
         Self::new()
     }
 }
-
-

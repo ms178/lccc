@@ -19,8 +19,7 @@ impl Preprocessor {
     /// Return true if a resolved include path has previously used `#pragma once`.
     pub(super) fn is_pragma_once_file(&self, path: &Path) -> bool {
         self.pragma_once_files.contains(path)
-            || Self::file_identity(path)
-                .is_some_and(|id| self.pragma_once_identities.contains(&id))
+            || Self::file_identity(path).is_some_and(|id| self.pragma_once_identities.contains(&id))
     }
 
     /// Linux file identity for robust #pragma once tracking.
@@ -123,10 +122,7 @@ impl Preprocessor {
     fn handle_pragma_push_macro(&mut self, content: &str) {
         if let Some(name) = Self::extract_pragma_macro_name(content) {
             let saved = self.macros.get(&name).cloned();
-            self.macro_save_stack
-                .entry(name)
-                .or_default()
-                .push(saved);
+            self.macro_save_stack.entry(name).or_default().push(saved);
         }
     }
 

@@ -24,9 +24,9 @@
 //! dominated (SSA use sites of the duplicate are, by SSA construction,
 //! dominated by the duplicate's block, hence by the canonical def's block).
 
+use super::alias;
 use crate::common::fx_hash::FxHashMap;
 use crate::ir::reexports::{Instruction, IrFunction, Operand, Terminator, Value};
-use super::alias;
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     if std::env::var("CCC_NO_REDUNDANT_LOADS").is_ok() {
@@ -60,7 +60,13 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
                 match inst {
-                    Instruction::Load { dest, ptr, ty, seg_override, volatile } => {
+                    Instruction::Load {
+                        dest,
+                        ptr,
+                        ty,
+                        seg_override,
+                        volatile,
+                    } => {
                         if *volatile {
                             // Observable side effect: must not be merged away.
                             continue;
@@ -71,8 +77,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         {
                             continue;
                         }
-                        let Some(form) =
-                            alias::resolve_in_frame(func, &defs, &frames, frame, *ptr)
+                        let Some(form) = alias::resolve_in_frame(func, &defs, &frames, frame, *ptr)
                         else {
                             continue;
                         };
@@ -92,7 +97,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         match alias::resolve_in_frame(func, &defs, &frames, frame, *ptr) {
                             Some(sform) => {
                                 let ssz = crate::passes::loop_memory_promote::byte_size(*ty);
-                                let keep = |entry: &(alias::LinForm, crate::common::types::IrType, Value)| {
+                                let keep = |entry: &(
+                                    alias::LinForm,
+                                    crate::common::types::IrType,
+                                    Value,
+                                )| {
                                     match (
                                         crate::passes::loop_memory_promote::byte_size(entry.1),
                                         ssz,
@@ -131,7 +140,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     | Instruction::VaCopy { .. } => {
                         available.clear();
                     }
-                    Instruction::Intrinsic { dest_ptr: Some(_), .. } => {
+                    Instruction::Intrinsic {
+                        dest_ptr: Some(_), ..
+                    } => {
                         available.clear();
                     }
                     Instruction::AtomicLoad { .. } => {

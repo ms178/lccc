@@ -89,19 +89,40 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
     // 4=deref wrong base, 5=after unsafe, 6=fired, 7=parse fail
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: find `movq %rax, N(%rsp)` (StoreRbp, reg 0 = rax family, Q size).
-        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
+        if let LineKind::StoreRbp {
+            reg: 0,
+            offset,
+            size: MoveSize::Q,
+        } = infos[i].kind
+        {
             dbg_stats[0] += 1;
             let n = offset;
             // Step 2: find the next non-nop line: must be `movq N(%rsp), %rX` (LoadRbp).
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
             let load_reg = match infos[j].kind {
-                LineKind::LoadRbp { reg, offset: lo, size: MoveSize::Q } if lo == n && reg != REG_NONE && reg != 0 && reg <= REG_GP_MAX => reg,
-                _ => { dbg_stats[7] += 1; i += 1; continue; }
+                LineKind::LoadRbp {
+                    reg,
+                    offset: lo,
+                    size: MoveSize::Q,
+                } if lo == n && reg != REG_NONE && reg != 0 && reg <= REG_GP_MAX => reg,
+                _ => {
+                    dbg_stats[7] += 1;
+                    i += 1;
+                    continue;
+                }
             };
             dbg_stats[1] += 1;
 
@@ -128,43 +149,91 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
             // any indirect memory (could alias slot N), or any barrier.
             let mut clean = true;
             for k in (i + 1)..j {
-                if infos[k].is_nop() { continue; }
-                if infos[k].kind == LineKind::Empty { continue; }
-                if is_barrier_kind(infos[k].kind) { clean = false; break; }
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if infos[k].kind == LineKind::Empty {
+                    continue;
+                }
+                if is_barrier_kind(infos[k].kind) {
+                    clean = false;
+                    break;
+                }
                 // %rax written?
-                if writes_reg(store, infos, k, 0) { clean = false; break; }
+                if writes_reg(store, infos, k, 0) {
+                    clean = false;
+                    break;
+                }
                 // slot N accessed (store or load)?
-                if accesses_slot(store, infos, k, n) { clean = false; break; }
+                if accesses_slot(store, infos, k, n) {
+                    clean = false;
+                    break;
+                }
                 // indirect memory op could alias slot N
                 if matches!(infos[k].kind, LineKind::Other { .. }) && infos[k].has_indirect_mem {
-                    clean = false; break;
+                    clean = false;
+                    break;
                 }
             }
-            if !clean { dbg_stats[2] += 1; i += 1; continue; }
+            if !clean {
+                dbg_stats[2] += 1;
+                i += 1;
+                continue;
+            }
 
             // Step 4: next non-nop after the load must be a plain load deref
             // through %load_reg, e.g. `movzbl (%rcx), %eax`.
             let mut k = j + 1;
-            while k < len && infos[k].is_nop() { k += 1; }
-            if k >= len { dbg_stats[3] += 1; i += 1; continue; }
-            if is_barrier_kind(infos[k].kind) { dbg_stats[3] += 1; i += 1; continue; }
+            while k < len && infos[k].is_nop() {
+                k += 1;
+            }
+            if k >= len {
+                dbg_stats[3] += 1;
+                i += 1;
+                continue;
+            }
+            if is_barrier_kind(infos[k].kind) {
+                dbg_stats[3] += 1;
+                i += 1;
+                continue;
+            }
             // Between load and deref: no write to load_reg, no write to %rax
             // (the rewrite dereferences through %rax), no slot access, no
             // indirect memory, no barrier.
             for m in (j + 1)..k {
-                if infos[m].is_nop() || infos[m].kind == LineKind::Empty { continue; }
-                if is_barrier_kind(infos[m].kind) { clean = false; break; }
-                if writes_reg(store, infos, m, load_reg) { clean = false; break; }
-                if writes_reg(store, infos, m, 0) { clean = false; break; }
-                if accesses_slot(store, infos, m, n) { clean = false; break; }
+                if infos[m].is_nop() || infos[m].kind == LineKind::Empty {
+                    continue;
+                }
+                if is_barrier_kind(infos[m].kind) {
+                    clean = false;
+                    break;
+                }
+                if writes_reg(store, infos, m, load_reg) {
+                    clean = false;
+                    break;
+                }
+                if writes_reg(store, infos, m, 0) {
+                    clean = false;
+                    break;
+                }
+                if accesses_slot(store, infos, m, n) {
+                    clean = false;
+                    break;
+                }
                 if matches!(infos[m].kind, LineKind::Other { .. }) && infos[m].has_indirect_mem {
-                    clean = false; break;
+                    clean = false;
+                    break;
                 }
             }
-            if !clean { dbg_stats[2] += 1; i += 1; continue; }
+            if !clean {
+                dbg_stats[2] += 1;
+                i += 1;
+                continue;
+            }
 
             let deref_line = infos[k].trimmed(store.get(k));
-            let Some((mnem, _base_reg, dest_text)) = parse_plain_deref(&deref_line, load_reg) else {
+            let Some((mnem, _base_reg, dest_text)) = parse_plain_deref(&deref_line, load_reg)
+            else {
                 dbg_stats[4] += 1;
                 i += 1;
                 continue;
@@ -187,26 +256,46 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
             let mut safe_after = false;
             let mut m = k + 1;
             while m < len {
-                if infos[m].is_nop() || infos[m].kind == LineKind::Empty { m += 1; continue; }
+                if infos[m].is_nop() || infos[m].kind == LineKind::Empty {
+                    m += 1;
+                    continue;
+                }
                 // Ret/end: nothing after executes → safe regardless of writes.
-                if infos[m].kind == LineKind::Ret { safe_after = true; break; }
+                if infos[m].kind == LineKind::Ret {
+                    safe_after = true;
+                    break;
+                }
                 // Any other barrier before both writes → can't see the other
                 // paths → unsafe.
-                if is_barrier_kind(infos[m].kind) { break; }
+                if is_barrier_kind(infos[m].kind) {
+                    break;
+                }
                 // Slot N read before written → unsafe.
-                if matches!(infos[m].kind, LineKind::LoadRbp { offset: lo, .. } if lo == n) { break; }
+                if matches!(infos[m].kind, LineKind::LoadRbp { offset: lo, .. } if lo == n) {
+                    break;
+                }
                 // Slot N written → requirement (a) satisfied.
-                if matches!(infos[m].kind, LineKind::StoreRbp { offset: so, .. } if so == n) { n_written = true; }
+                if matches!(infos[m].kind, LineKind::StoreRbp { offset: so, .. } if so == n) {
+                    n_written = true;
+                }
                 // load_reg read before written → unsafe.
-                if reads_reg(store, infos, m, load_reg) { break; }
+                if reads_reg(store, infos, m, load_reg) {
+                    break;
+                }
                 // load_reg written → requirement (b) satisfied.
-                if writes_reg(store, infos, m, load_reg) { lr_written = true; }
+                if writes_reg(store, infos, m, load_reg) {
+                    lr_written = true;
+                }
                 // A generic instruction with indirect memory could alias slot N
                 // or read load_reg indirectly. Conservative: treat as unsafe.
                 if matches!(infos[m].kind, LineKind::Other { .. }) {
                     let t = infos[m].trimmed(store.get(m));
-                    if t.contains("(%rsp)") { break; }
-                    if infos[m].has_indirect_mem { break; }
+                    if t.contains("(%rsp)") {
+                        break;
+                    }
+                    if infos[m].has_indirect_mem {
+                        break;
+                    }
                 }
                 if n_written && lr_written {
                     safe_after = true;
@@ -214,7 +303,11 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 }
                 m += 1;
             }
-            if !safe_after { dbg_stats[5] += 1; i += 1; continue; }
+            if !safe_after {
+                dbg_stats[5] += 1;
+                i += 1;
+                continue;
+            }
 
             // All checks pass. Rewrite:
             //   drop store (i), drop load (j)
@@ -243,9 +336,19 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
 
 /// Is this line kind a control-flow / barrier line?
 fn is_barrier_kind(kind: LineKind) -> bool {
-    matches!(kind, LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
-        | LineKind::CondJmp | LineKind::Call | LineKind::Ret | LineKind::Directive
-        | LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::InlineAsm)
+    matches!(
+        kind,
+        LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::Directive
+            | LineKind::Push { .. }
+            | LineKind::Pop { .. }
+            | LineKind::InlineAsm
+    )
 }
 
 /// Does the instruction at index `idx` write the GP register family `reg`?
@@ -255,9 +358,17 @@ fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> boo
         LineKind::LoadRbp { reg: r, .. } => r == reg,
         LineKind::Pop { reg: r } => r == reg,
         LineKind::SetCC { reg: r } => r == reg,
-        LineKind::Push { .. } | LineKind::Cmp | LineKind::Label | LineKind::Jmp
-        | LineKind::JmpIndirect | LineKind::CondJmp | LineKind::Call | LineKind::Ret
-        | LineKind::Directive | LineKind::Empty | LineKind::Nop => false,
+        LineKind::Push { .. }
+        | LineKind::Cmp
+        | LineKind::Label
+        | LineKind::Jmp
+        | LineKind::JmpIndirect
+        | LineKind::CondJmp
+        | LineKind::Call
+        | LineKind::Ret
+        | LineKind::Directive
+        | LineKind::Empty
+        | LineKind::Nop => false,
         LineKind::SelfMove => false,
         // Inline asm is opaque: assume it writes every register.
         LineKind::InlineAsm => true,
@@ -295,7 +406,9 @@ fn reads_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool
 /// base_reg must equal `expected_base`.
 fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8, String)> {
     let t = line.trim();
-    for mnem in ["movzbl", "movzwl", "movb", "movw", "movl", "movq", "movzbq", "movzwq"] {
+    for mnem in [
+        "movzbl", "movzwl", "movb", "movw", "movl", "movq", "movzbq", "movzwq",
+    ] {
         if let Some(rest) = t.strip_prefix(mnem) {
             let rest = rest.trim_start();
             // format: (%reg), %dest

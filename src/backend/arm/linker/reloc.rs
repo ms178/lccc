@@ -3,10 +3,10 @@
 //! Applies ELF relocations to the output buffer after section layout
 //! has been determined.
 
-use crate::common::fx_hash::FxHashMap;
 use super::elf::*;
 use super::types::GlobalSymbol;
 use crate::backend::linker_common::OutputSection;
+use crate::common::fx_hash::FxHashMap;
 
 // TLS relocation types (AArch64 Local Exec model for static linking)
 const R_AARCH64_TLSLE_ADD_TPREL_HI12: u32 = 549;
@@ -50,7 +50,9 @@ pub struct GotInfo {
 impl GotInfo {
     /// Get the address of a GOT entry for a given symbol key.
     pub fn entry_addr(&self, key: &str) -> Option<u64> {
-        self.entries.get(key).map(|&idx| self.got_addr + (idx as u64) * 8)
+        self.entries
+            .get(key)
+            .map(|&idx| self.got_addr + (idx as u64) * 8)
     }
 }
 
@@ -67,7 +69,8 @@ pub fn resolve_sym(
 ) -> u64 {
     if sym.sym_type() == STT_SECTION {
         let si = sym.shndx as usize;
-        return section_map.get(&(obj_idx, si))
+        return section_map
+            .get(&(obj_idx, si))
             .map(|&(oi, so)| output_sections[oi].addr + so)
             .unwrap_or(0);
     }
@@ -78,13 +81,22 @@ pub fn resolve_sym(
         // Local (STB_LOCAL) symbols must NOT be resolved via globals, since a
         // local symbol named e.g. "write" must not be confused with libc's write().
         if let Some(g) = globals.get(sym.name.as_str()) {
-            if g.defined_in.is_some() { return g.value; }
+            if g.defined_in.is_some() {
+                return g.value;
+            }
         }
-        if sym.is_weak() { return 0; }
+        if sym.is_weak() {
+            return 0;
+        }
     }
-    if sym.is_undefined() { return 0; }
-    if sym.shndx == SHN_ABS { return sym.value; }
-    section_map.get(&(obj_idx, sym.shndx as usize))
+    if sym.is_undefined() {
+        return 0;
+    }
+    if sym.shndx == SHN_ABS {
+        return sym.value;
+    }
+    section_map
+        .get(&(obj_idx, sym.shndx as usize))
         .map(|&(oi, so)| output_sections[oi].addr + so + sym.value)
         .unwrap_or(sym.value)
 }
@@ -114,7 +126,9 @@ pub fn collect_got_symbols(objects: &[ElfObject]) -> Vec<(String, GotEntryKind)>
             for rela in &objects[obj_idx].relocations[sec_idx] {
                 let kind = match rela.rela_type {
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => GotEntryKind::Regular,
-                    R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 | R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => GotEntryKind::TlsIE,
+                    R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 | R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => {
+                        GotEntryKind::TlsIE
+                    }
                     _ => continue,
                 };
                 let si = rela.sym_idx as usize;
@@ -152,7 +166,9 @@ pub fn apply_relocations(
     for obj_idx in 0..objects.len() {
         for sec_idx in 0..objects[obj_idx].sections.len() {
             let relas = &objects[obj_idx].relocations[sec_idx];
-            if relas.is_empty() { continue; }
+            if relas.is_empty() {
+                continue;
+            }
             let (out_idx, sec_off) = match section_map.get(&(obj_idx, sec_idx)) {
                 Some(&v) => v,
                 None => continue,
@@ -162,7 +178,9 @@ pub fn apply_relocations(
 
             for rela in relas {
                 let si = rela.sym_idx as usize;
-                if si >= objects[obj_idx].symbols.len() { continue; }
+                if si >= objects[obj_idx].symbols.len() {
+                    continue;
+                }
                 let sym = &objects[obj_idx].symbols[si];
                 let p = sa + sec_off + rela.offset;
                 let fp = (sfo + sec_off + rela.offset) as usize;
@@ -170,8 +188,19 @@ pub fn apply_relocations(
                 let s = resolve_sym(obj_idx, sym, globals, section_map, output_sections);
                 let gkey = got_key(obj_idx, sym);
 
-                apply_one_reloc(out, fp, rela.rela_type, s, a, p, &sym.name,
-                                &objects[obj_idx].source_name, tls_info, got_info, &gkey)?;
+                apply_one_reloc(
+                    out,
+                    fp,
+                    rela.rela_type,
+                    s,
+                    a,
+                    p,
+                    &sym.name,
+                    &objects[obj_idx].source_name,
+                    tls_info,
+                    got_info,
+                    &gkey,
+                )?;
             }
         }
     }
@@ -282,7 +311,9 @@ pub fn apply_one_reloc(
 
         // ── Branch instructions ──
         R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let sa = (s as i64).wrapping_add(a) as u64;
             if sa == 0 {
                 // Undefined/weak symbol resolved to 0: replace with NOP
@@ -299,7 +330,9 @@ pub fn apply_one_reloc(
         // ── Conditional branch (19-bit offset) ──
         R_AARCH64_CONDBR19 => {
             let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let mut insn = read_u32(out, fp);
             let imm19 = ((offset >> 2) as u32) & 0x7ffff;
             insn = (insn & 0xff00001f) | (imm19 << 5);
@@ -309,7 +342,9 @@ pub fn apply_one_reloc(
         // ── LDR literal (19-bit offset, e.g. FP constant pool loads) ──
         R_AARCH64_LD_PREL_LO19 => {
             let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let mut insn = read_u32(out, fp);
             let imm19 = ((offset >> 2) as u32) & 0x7ffff;
             insn = (insn & 0xff00001f) | (imm19 << 5);
@@ -319,7 +354,9 @@ pub fn apply_one_reloc(
         // ── Test and branch (14-bit offset) ──
         R_AARCH64_TSTBR14 => {
             let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let mut insn = read_u32(out, fp);
             let imm14 = ((offset >> 2) as u32) & 0x3fff;
             insn = (insn & 0xfff8001f) | (imm14 << 5);
@@ -386,8 +423,10 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSLE_ADD_TPREL_LO12 | R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => {
             let tp = tprel(s, a, tls_info);
             if std::env::var("LINKER_DEBUG_TLS").is_ok() {
-                eprintln!("  TLSLE_LO12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} -> tp=0x{:x}",
-                    sym_name, s, a, tls_info.tls_addr, tp as u64);
+                eprintln!(
+                    "  TLSLE_LO12: sym='{}' s=0x{:x} a={} tls_addr=0x{:x} -> tp=0x{:x}",
+                    sym_name, s, a, tls_info.tls_addr, tp as u64
+                );
             }
             let imm12 = (tp as u64 & 0xFFF) as u32;
             encode_add_imm12(out, fp, imm12);
@@ -419,7 +458,9 @@ pub fn apply_one_reloc(
             } else {
                 // Fallback: relax to MOVZ
                 let tp = tprel(s, a, tls_info);
-                if fp + 4 > out.len() { return Ok(()); }
+                if fp + 4 > out.len() {
+                    return Ok(());
+                }
                 let insn = read_u32(out, fp);
                 let rd = insn & 0x1f;
                 let imm16 = ((tp as u64 >> 16) & 0xffff) as u32;
@@ -433,7 +474,9 @@ pub fn apply_one_reloc(
             } else {
                 // Fallback: relax to MOVK
                 let tp = tprel(s, a, tls_info);
-                if fp + 4 > out.len() { return Ok(()); }
+                if fp + 4 > out.len() {
+                    return Ok(());
+                }
                 let insn = read_u32(out, fp);
                 let rd = insn & 0x1f;
                 let imm16 = (tp as u64 & 0xffff) as u32;
@@ -446,7 +489,9 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSDESC_ADR_PAGE21 => {
             // Replace ADRP with MOVZ Xd, #tprel_g1, LSL #16
             let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let insn = read_u32(out, fp);
             let rd = insn & 0x1f;
             let imm16 = ((tp as u64 >> 16) & 0xffff) as u32;
@@ -456,7 +501,9 @@ pub fn apply_one_reloc(
         R_AARCH64_TLSDESC_LD64_LO12 => {
             // Replace LDR with MOVK Xd, #tprel_lo
             let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let insn = read_u32(out, fp);
             let rd = insn & 0x1f;
             let imm16 = (tp as u64 & 0xffff) as u32;
@@ -465,12 +512,16 @@ pub fn apply_one_reloc(
         }
         R_AARCH64_TLSDESC_ADD_LO12 => {
             // NOP (the value is already in the register from MOVZ+MOVK)
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             w32(out, fp, 0xd503201f); // NOP
         }
         R_AARCH64_TLSDESC_CALL => {
             // NOP (no runtime call needed for static linking)
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             w32(out, fp, 0xd503201f); // NOP
         }
 
@@ -478,7 +529,9 @@ pub fn apply_one_reloc(
         // TODO: full GD relaxation also needs to NOP the BL __tls_get_addr that follows
         R_AARCH64_TLSGD_ADR_PAGE21 => {
             let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let insn = read_u32(out, fp);
             let rd = insn & 0x1f;
             let imm16 = ((tp as u64 >> 16) & 0xffff) as u32;
@@ -487,7 +540,9 @@ pub fn apply_one_reloc(
         }
         R_AARCH64_TLSGD_ADD_LO12_NC => {
             let tp = tprel(s, a, tls_info);
-            if fp + 4 > out.len() { return Ok(()); }
+            if fp + 4 > out.len() {
+                return Ok(());
+            }
             let insn = read_u32(out, fp);
             let rd = insn & 0x1f;
             let imm16 = (tp as u64 & 0xffff) as u32;
@@ -508,7 +563,9 @@ pub fn apply_one_reloc(
 // ── Instruction encoding helpers ───────────────────────────────────────
 
 pub(super) fn encode_adrp(out: &mut [u8], fp: usize, imm: i64) {
-    if fp + 4 > out.len() { return; }
+    if fp + 4 > out.len() {
+        return;
+    }
     let mut insn = read_u32(out, fp);
     let immlo = (imm as u32) & 0x3;
     let immhi = ((imm as u32) >> 2) & 0x7ffff;
@@ -517,7 +574,9 @@ pub(super) fn encode_adrp(out: &mut [u8], fp: usize, imm: i64) {
 }
 
 pub(super) fn encode_adr(out: &mut [u8], fp: usize, offset: i64) {
-    if fp + 4 > out.len() { return; }
+    if fp + 4 > out.len() {
+        return;
+    }
     let mut insn = read_u32(out, fp);
     let imm = offset as u32;
     let immlo = imm & 0x3;
@@ -527,14 +586,18 @@ pub(super) fn encode_adr(out: &mut [u8], fp: usize, offset: i64) {
 }
 
 pub(super) fn encode_add_imm12(out: &mut [u8], fp: usize, imm12: u32) {
-    if fp + 4 > out.len() { return; }
+    if fp + 4 > out.len() {
+        return;
+    }
     let mut insn = read_u32(out, fp);
     insn = (insn & 0xffc003ff) | ((imm12 & 0xfff) << 10);
     w32(out, fp, insn);
 }
 
 pub(super) fn encode_ldst_imm12(out: &mut [u8], fp: usize, lo12: u32, shift: u32) {
-    if fp + 4 > out.len() { return; }
+    if fp + 4 > out.len() {
+        return;
+    }
     let mut insn = read_u32(out, fp);
     let imm12 = (lo12 >> shift) & 0xfff;
     insn = (insn & 0xffc003ff) | (imm12 << 10);
@@ -542,9 +605,10 @@ pub(super) fn encode_ldst_imm12(out: &mut [u8], fp: usize, lo12: u32, shift: u32
 }
 
 pub(super) fn encode_movw(out: &mut [u8], fp: usize, imm16: u32) {
-    if fp + 4 > out.len() { return; }
+    if fp + 4 > out.len() {
+        return;
+    }
     let mut insn = read_u32(out, fp);
     insn = (insn & 0xffe0001f) | ((imm16 & 0xffff) << 5);
     w32(out, fp, insn);
 }
-

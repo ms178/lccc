@@ -11,8 +11,8 @@
 //! - Mask (opmask) values are plain scalars in GPRs; k1 is a per-op scratch
 //!   register that never survives an intrinsic (kmov in -> use -> kmov out).
 
+use super::emit::X86Codegen;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
-use super::emit::{X86Codegen};
 
 impl X86Codegen {
     /// Load a 512-bit operand into a ZMM register.
@@ -27,12 +27,14 @@ impl X86Codegen {
                 return;
             }
             if let Some(mem) = self.value_ptr_mem_operand(v.0) {
-                self.state.emit_fmt(format_args!("    vmovdqu64 {}, %{}", mem, zmm));
+                self.state
+                    .emit_fmt(format_args!("    vmovdqu64 {}, %{}", mem, zmm));
                 return;
             }
         }
         self.operand_to_reg(arg, "rax");
-        self.state.emit_fmt(format_args!("    vmovdqu64 (%rax), %{}", zmm));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu64 (%rax), %{}", zmm));
     }
 
     fn evex_load_arg(&mut self, arg: &Operand) {
@@ -56,7 +58,8 @@ impl X86Codegen {
     /// as live for `dest_ptr` so the next op in the chain reuses it.
     fn evex_store_dest(&mut self, dest_ptr: &Value) {
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state.emit_fmt(format_args!("    vmovdqu64 %zmm0, {}", mem));
+            self.state
+                .emit_fmt(format_args!("    vmovdqu64 %zmm0, {}", mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
             self.state.emit("    vmovdqu64 %zmm0, (%rax)");
@@ -99,26 +102,33 @@ impl X86Codegen {
         match (m0, m1) {
             (Some(m0), _) if commutative => {
                 self.evex_load_arg_to(&args[1], "zmm1");
-                self.state.emit_fmt(format_args!("    {} {}, %zmm1, %zmm0", inst, m0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %zmm1, %zmm0", inst, m0));
             }
             (Some(m0), Some(m1)) => {
-                self.state.emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m0));
-                self.state.emit_fmt(format_args!("    {} {}, %zmm0, %zmm0", inst, m1));
+                self.state
+                    .emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %zmm0, %zmm0", inst, m1));
             }
             (Some(m0), None) => {
                 // NON-commutative: dst = a op b — a (m0) is vvvv, b must be r/m.
-                self.state.emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m0));
+                self.state
+                    .emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m0));
                 self.evex_load_arg_to(&args[1], "zmm1");
-                self.state.emit_fmt(format_args!("    {} %zmm1, %zmm0, %zmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %zmm1, %zmm0, %zmm0", inst));
             }
             (None, Some(m1)) => {
                 self.evex_load_arg(&args[0]);
-                self.state.emit_fmt(format_args!("    {} {}, %zmm0, %zmm0", inst, m1));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %zmm0, %zmm0", inst, m1));
             }
             (None, None) => {
                 self.evex_load_arg(&args[0]);
                 self.evex_load_arg_to(&args[1], "zmm1");
-                self.state.emit_fmt(format_args!("    {} %zmm1, %zmm0, %zmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %zmm1, %zmm0, %zmm0", inst));
             }
         }
         self.evex_store_dest(dest_ptr);
@@ -129,10 +139,12 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         if let Some(m) = self.evex_arg_mem(&args[0]) {
-            self.state.emit_fmt(format_args!("    {} {}, %zmm0", inst, m));
+            self.state
+                .emit_fmt(format_args!("    {} {}, %zmm0", inst, m));
         } else {
             self.evex_load_arg(&args[0]);
-            self.state.emit_fmt(format_args!("    {} %zmm0, %zmm0", inst));
+            self.state
+                .emit_fmt(format_args!("    {} %zmm0, %zmm0", inst));
         }
         self.evex_store_dest(dest_ptr);
     }
@@ -143,10 +155,12 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         let imm = self.simd_imm(&args[1]);
         if let Some(m) = self.evex_arg_mem(&args[0]) {
-            self.state.emit_fmt(format_args!("    {} ${}, {}, %zmm0", inst, imm, m));
+            self.state
+                .emit_fmt(format_args!("    {} ${}, {}, %zmm0", inst, imm, m));
         } else {
             self.evex_load_arg(&args[0]);
-            self.state.emit_fmt(format_args!("    {} ${}, %zmm0, %zmm0", inst, imm));
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %zmm0, %zmm0", inst, imm));
         }
         self.evex_store_dest(dest_ptr);
     }
@@ -180,7 +194,13 @@ impl X86Codegen {
     }
 
     /// Width-aware ternary (AVX-512VL 128/256-bit).
-    fn emit_evex_ternary_w(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str, width: usize) {
+    fn emit_evex_ternary_w(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+        width: usize,
+    ) {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         let (r0, r1, r2) = match width {
@@ -199,10 +219,12 @@ impl X86Codegen {
         self.state.vec_live_regs.insert(dest_ptr.0, r0);
         let m = reg_width_move(r0);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state.emit_fmt(format_args!("    {} %{}, {}", m, r0, mem));
+            self.state
+                .emit_fmt(format_args!("    {} %{}, {}", m, r0, mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
-            self.state.emit_fmt(format_args!("    {} %{}, (%rax)", m, r0));
+            self.state
+                .emit_fmt(format_args!("    {} %{}, (%rax)", m, r0));
         }
     }
 
@@ -228,7 +250,13 @@ impl X86Codegen {
     }
 
     /// Width-aware 3-source op with immediate for TernaryLogic256/128.
-    fn emit_evex_3src_imm_w(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str, width: usize) {
+    fn emit_evex_3src_imm_w(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+        width: usize,
+    ) {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         let (r0, r1) = match width {
@@ -239,14 +267,18 @@ impl X86Codegen {
         let imm = self.simd_imm(&args[2]);
         self.simd_load_arg_to(&args[1], r1);
         self.simd_load_arg_to(&args[0], r0);
-        self.state
-            .emit_fmt(format_args!("    {} ${}, %{}, %{}, %{}", inst, imm, r1, r0, r0));
+        self.state.emit_fmt(format_args!(
+            "    {} ${}, %{}, %{}, %{}",
+            inst, imm, r1, r0, r0
+        ));
         self.state.vec_live_regs.insert(dest_ptr.0, r0);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state.emit_fmt(format_args!("    {} %{}, {}", reg_width_move(r0), r0, mem));
+            self.state
+                .emit_fmt(format_args!("    {} %{}, {}", reg_width_move(r0), r0, mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
-            self.state.emit_fmt(format_args!("    {} %{}, (%rax)", reg_width_move(r0), r0));
+            self.state
+                .emit_fmt(format_args!("    {} %{}, (%rax)", reg_width_move(r0), r0));
         }
     }
 
@@ -272,202 +304,734 @@ impl X86Codegen {
         };
         match op {
             // ---- 512-bit packed integer binary ----
-            Paddb512 => { self.emit_evex_binary_512(dptr, args, "vpaddb", true); true }
-            Paddw512 => { self.emit_evex_binary_512(dptr, args, "vpaddw", true); true }
-            Paddd512 => { self.emit_evex_binary_512(dptr, args, "vpaddd", true); true }
-            Paddq512 => { self.emit_evex_binary_512(dptr, args, "vpaddq", true); true }
-            Psubb512 => { self.emit_evex_binary_512(dptr, args, "vpsubb", false); true }
-            Psubw512 => { self.emit_evex_binary_512(dptr, args, "vpsubw", false); true }
-            Psubd512 => { self.emit_evex_binary_512(dptr, args, "vpsubd", false); true }
-            Psubq512 => { self.emit_evex_binary_512(dptr, args, "vpsubq", false); true }
-            Paddsb512 => { self.emit_evex_binary_512(dptr, args, "vpaddsb", true); true }
-            Paddsw512 => { self.emit_evex_binary_512(dptr, args, "vpaddsw", true); true }
-            Paddusb512 => { self.emit_evex_binary_512(dptr, args, "vpaddusb", true); true }
-            Paddusw512 => { self.emit_evex_binary_512(dptr, args, "vpaddusw", true); true }
-            Psubsb512 => { self.emit_evex_binary_512(dptr, args, "vpsubsb", false); true }
-            Psubsw512 => { self.emit_evex_binary_512(dptr, args, "vpsubsw", false); true }
-            Psubusb512 => { self.emit_evex_binary_512(dptr, args, "vpsubusb", false); true }
-            Psubusw512 => { self.emit_evex_binary_512(dptr, args, "vpsubusw", false); true }
-            Pavgb512 => { self.emit_evex_binary_512(dptr, args, "vpavgb", true); true }
-            Pavgw512 => { self.emit_evex_binary_512(dptr, args, "vpavgw", true); true }
-            Pmaxub512 => { self.emit_evex_binary_512(dptr, args, "vpmaxub", true); true }
-            Pminub512 => { self.emit_evex_binary_512(dptr, args, "vpminub", true); true }
-            Pmaxuw512 => { self.emit_evex_binary_512(dptr, args, "vpmaxuw", true); true }
-            Pminuw512 => { self.emit_evex_binary_512(dptr, args, "vpminuw", true); true }
-            Pmaxsb512 => { self.emit_evex_binary_512(dptr, args, "vpmaxsb", true); true }
-            Pminsb512 => { self.emit_evex_binary_512(dptr, args, "vpminsb", true); true }
-            Pmaxsw512 => { self.emit_evex_binary_512(dptr, args, "vpmaxsw", true); true }
-            Pminsw512 => { self.emit_evex_binary_512(dptr, args, "vpminsw", true); true }
-            Pmaxsd512 => { self.emit_evex_binary_512(dptr, args, "vpmaxsd", true); true }
-            Pminsd512 => { self.emit_evex_binary_512(dptr, args, "vpminsd", true); true }
-            Pmaxud512 => { self.emit_evex_binary_512(dptr, args, "vpmaxud", true); true }
-            Pminud512 => { self.emit_evex_binary_512(dptr, args, "vpminud", true); true }
-            Pmaxsq512 => { self.emit_evex_binary_512(dptr, args, "vpmaxsq", true); true }
-            Pminsq512 => { self.emit_evex_binary_512(dptr, args, "vpminsq", true); true }
-            Pmaxuq512 => { self.emit_evex_binary_512(dptr, args, "vpmaxuq", true); true }
-            Pminuq512 => { self.emit_evex_binary_512(dptr, args, "vpminuq", true); true }
-            Pcmpeqd512 => { self.emit_evex_binary_512(dptr, args, "vpcmpeqd", true); true }
-            Pcmpeqq512 => { self.emit_evex_binary_512(dptr, args, "vpcmpeqq", true); true }
-            Pcmpgtb512 => { self.emit_evex_binary_512(dptr, args, "vpcmpgtb", false); true }
-            Pcmpgtw512 => { self.emit_evex_binary_512(dptr, args, "vpcmpgtw", false); true }
-            Pcmpgtd512 => { self.emit_evex_binary_512(dptr, args, "vpcmpgtd", false); true }
-            Pcmpgtq512 => { self.emit_evex_binary_512(dptr, args, "vpcmpgtq", false); true }
-            Psadbw512 => { self.emit_evex_binary_512(dptr, args, "vpsadbw", true); true }
-            Pmaddubsw512 => { self.emit_evex_binary_512(dptr, args, "vpmaddubsw", true); true }
-            Pmaddwd512 => { self.emit_evex_binary_512(dptr, args, "vpmaddwd", true); true }
-            Pmullw512 => { self.emit_evex_binary_512(dptr, args, "vpmullw", true); true }
-            Pmulhw512 => { self.emit_evex_binary_512(dptr, args, "vpmulhw", true); true }
-            Pmulhuw512 => { self.emit_evex_binary_512(dptr, args, "vpmulhuw", true); true }
-            Pmulld512 => { self.emit_evex_binary_512(dptr, args, "vpmulld", true); true }
-            Pmuludq512 => { self.emit_evex_binary_512(dptr, args, "vpmuludq", true); true }
-            Pxor512 => { self.emit_evex_binary_512(dptr, args, "vpxorq", true); true }
-            Por512 => { self.emit_evex_binary_512(dptr, args, "vporq", true); true }
-            Pand512 => { self.emit_evex_binary_512(dptr, args, "vpandq", true); true }
-            Pandn512 => { self.emit_evex_binary_512(dptr, args, "vpandnq", false); true }
-            Pshufb512 => { self.emit_evex_binary_512(dptr, args, "vpshufb", false); true }
-            Punpcklbw512 => { self.emit_evex_binary_512(dptr, args, "vpunpcklbw", false); true }
-            Punpcklwd512 => { self.emit_evex_binary_512(dptr, args, "vpunpcklwd", false); true }
-            Punpckldq512 => { self.emit_evex_binary_512(dptr, args, "vpunpckldq", false); true }
-            Punpcklqdq512 => { self.emit_evex_binary_512(dptr, args, "vpunpcklqdq", false); true }
-            Punpckhbw512 => { self.emit_evex_binary_512(dptr, args, "vpunpckhbw", false); true }
-            Punpckhwd512 => { self.emit_evex_binary_512(dptr, args, "vpunpckhwd", false); true }
-            Punpckhdq512 => { self.emit_evex_binary_512(dptr, args, "vpunpckhdq", false); true }
-            Punpckhqdq512 => { self.emit_evex_binary_512(dptr, args, "vpunpckhqdq", false); true }
-            Packsswb512 => { self.emit_evex_binary_512(dptr, args, "vpacksswb", false); true }
-            Packuswb512 => { self.emit_evex_binary_512(dptr, args, "vpackuswb", false); true }
-            Packssdw512 => { self.emit_evex_binary_512(dptr, args, "vpackssdw", false); true }
-            Packusdw512 => { self.emit_evex_binary_512(dptr, args, "vpackusdw", false); true }
+            Paddb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddb", true);
+                true
+            }
+            Paddw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddw", true);
+                true
+            }
+            Paddd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddd", true);
+                true
+            }
+            Paddq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddq", true);
+                true
+            }
+            Psubb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubb", false);
+                true
+            }
+            Psubw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubw", false);
+                true
+            }
+            Psubd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubd", false);
+                true
+            }
+            Psubq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubq", false);
+                true
+            }
+            Paddsb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddsb", true);
+                true
+            }
+            Paddsw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddsw", true);
+                true
+            }
+            Paddusb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddusb", true);
+                true
+            }
+            Paddusw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpaddusw", true);
+                true
+            }
+            Psubsb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubsb", false);
+                true
+            }
+            Psubsw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubsw", false);
+                true
+            }
+            Psubusb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubusb", false);
+                true
+            }
+            Psubusw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsubusw", false);
+                true
+            }
+            Pavgb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpavgb", true);
+                true
+            }
+            Pavgw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpavgw", true);
+                true
+            }
+            Pmaxub512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxub", true);
+                true
+            }
+            Pminub512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminub", true);
+                true
+            }
+            Pmaxuw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxuw", true);
+                true
+            }
+            Pminuw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminuw", true);
+                true
+            }
+            Pmaxsb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxsb", true);
+                true
+            }
+            Pminsb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminsb", true);
+                true
+            }
+            Pmaxsw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxsw", true);
+                true
+            }
+            Pminsw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminsw", true);
+                true
+            }
+            Pmaxsd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxsd", true);
+                true
+            }
+            Pminsd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminsd", true);
+                true
+            }
+            Pmaxud512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxud", true);
+                true
+            }
+            Pminud512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminud", true);
+                true
+            }
+            Pmaxsq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxsq", true);
+                true
+            }
+            Pminsq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminsq", true);
+                true
+            }
+            Pmaxuq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaxuq", true);
+                true
+            }
+            Pminuq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpminuq", true);
+                true
+            }
+            Pcmpeqd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpeqd", true);
+                true
+            }
+            Pcmpeqq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpeqq", true);
+                true
+            }
+            Pcmpgtb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpgtb", false);
+                true
+            }
+            Pcmpgtw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpgtw", false);
+                true
+            }
+            Pcmpgtd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpgtd", false);
+                true
+            }
+            Pcmpgtq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpcmpgtq", false);
+                true
+            }
+            Psadbw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpsadbw", true);
+                true
+            }
+            Pmaddubsw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaddubsw", true);
+                true
+            }
+            Pmaddwd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmaddwd", true);
+                true
+            }
+            Pmullw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmullw", true);
+                true
+            }
+            Pmulhw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmulhw", true);
+                true
+            }
+            Pmulhuw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmulhuw", true);
+                true
+            }
+            Pmulld512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmulld", true);
+                true
+            }
+            Pmuludq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpmuludq", true);
+                true
+            }
+            Pxor512 => {
+                self.emit_evex_binary_512(dptr, args, "vpxorq", true);
+                true
+            }
+            Por512 => {
+                self.emit_evex_binary_512(dptr, args, "vporq", true);
+                true
+            }
+            Pand512 => {
+                self.emit_evex_binary_512(dptr, args, "vpandq", true);
+                true
+            }
+            Pandn512 => {
+                self.emit_evex_binary_512(dptr, args, "vpandnq", false);
+                true
+            }
+            Pshufb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpshufb", false);
+                true
+            }
+            Punpcklbw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpcklbw", false);
+                true
+            }
+            Punpcklwd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpcklwd", false);
+                true
+            }
+            Punpckldq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpckldq", false);
+                true
+            }
+            Punpcklqdq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpcklqdq", false);
+                true
+            }
+            Punpckhbw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpckhbw", false);
+                true
+            }
+            Punpckhwd512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpckhwd", false);
+                true
+            }
+            Punpckhdq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpckhdq", false);
+                true
+            }
+            Punpckhqdq512 => {
+                self.emit_evex_binary_512(dptr, args, "vpunpckhqdq", false);
+                true
+            }
+            Packsswb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpacksswb", false);
+                true
+            }
+            Packuswb512 => {
+                self.emit_evex_binary_512(dptr, args, "vpackuswb", false);
+                true
+            }
+            Packssdw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpackssdw", false);
+                true
+            }
+            Packusdw512 => {
+                self.emit_evex_binary_512(dptr, args, "vpackusdw", false);
+                true
+            }
             // ---- unary ----
-            Pabsb512 => { self.emit_evex_unary_512(dptr, args, "vpabsb"); true }
-            Pabsw512 => { self.emit_evex_unary_512(dptr, args, "vpabsw"); true }
-            Pabsd512 => { self.emit_evex_unary_512(dptr, args, "vpabsd"); true }
-            Pabsq512 => { self.emit_evex_unary_512(dptr, args, "vpabsq"); true }
-            Popcntb512 => { self.emit_evex_unary_512(dptr, args, "vpopcntb"); true }
-            Popcntw512 => { self.emit_evex_unary_512(dptr, args, "vpopcntw"); true }
-            Popcntd512 => { self.emit_evex_unary_512(dptr, args, "vpopcntd"); true }
-            Popcntq512 => { self.emit_evex_unary_512(dptr, args, "vpopcntq"); true }
+            Pabsb512 => {
+                self.emit_evex_unary_512(dptr, args, "vpabsb");
+                true
+            }
+            Pabsw512 => {
+                self.emit_evex_unary_512(dptr, args, "vpabsw");
+                true
+            }
+            Pabsd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpabsd");
+                true
+            }
+            Pabsq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpabsq");
+                true
+            }
+            Popcntb512 => {
+                self.emit_evex_unary_512(dptr, args, "vpopcntb");
+                true
+            }
+            Popcntw512 => {
+                self.emit_evex_unary_512(dptr, args, "vpopcntw");
+                true
+            }
+            Popcntd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpopcntd");
+                true
+            }
+            Popcntq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpopcntq");
+                true
+            }
             // ---- shifts / shuffles with immediate ----
-            Psllwi512 => { self.emit_evex_imm_512(dptr, args, "vpsllw"); true }
-            Psrlwi512 => { self.emit_evex_imm_512(dptr, args, "vpsrlw"); true }
-            Psrawi512 => { self.emit_evex_imm_512(dptr, args, "vpsraw"); true }
-            Psllidi512 => { self.emit_evex_imm_512(dptr, args, "vpslld"); true }
-            Psrlidi512 => { self.emit_evex_imm_512(dptr, args, "vpsrld"); true }
-            Psradi512 => { self.emit_evex_imm_512(dptr, args, "vpsrad"); true }
-            Psllqi512 => { self.emit_evex_imm_512(dptr, args, "vpsllq"); true }
-            Psrlqi512 => { self.emit_evex_imm_512(dptr, args, "vpsrlq"); true }
-            Psraqi512 => { self.emit_evex_imm_512(dptr, args, "vpsraq"); true }
-            Pshufd512 => { self.emit_evex_imm_512(dptr, args, "vpshufd"); true }
-            Pshuflw512 => { self.emit_evex_imm_512(dptr, args, "vpshuflw"); true }
-            Pshufhw512 => { self.emit_evex_imm_512(dptr, args, "vpshufhw"); true }
-            Palignr512 => { self.emit_evex_3src_imm_512(dptr, args, "vpalignr"); true }
+            Psllwi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsllw");
+                true
+            }
+            Psrlwi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsrlw");
+                true
+            }
+            Psrawi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsraw");
+                true
+            }
+            Psllidi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpslld");
+                true
+            }
+            Psrlidi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsrld");
+                true
+            }
+            Psradi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsrad");
+                true
+            }
+            Psllqi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsllq");
+                true
+            }
+            Psrlqi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsrlq");
+                true
+            }
+            Psraqi512 => {
+                self.emit_evex_imm_512(dptr, args, "vpsraq");
+                true
+            }
+            Pshufd512 => {
+                self.emit_evex_imm_512(dptr, args, "vpshufd");
+                true
+            }
+            Pshuflw512 => {
+                self.emit_evex_imm_512(dptr, args, "vpshuflw");
+                true
+            }
+            Pshufhw512 => {
+                self.emit_evex_imm_512(dptr, args, "vpshufhw");
+                true
+            }
+            Palignr512 => {
+                self.emit_evex_3src_imm_512(dptr, args, "vpalignr");
+                true
+            }
             // ---- 3-source with immediate ----
-            TernaryLogic512 => { self.emit_evex_ternary_512(dptr, args, "vpternlogd"); true }
-            Vpclmulqdq512 => { self.emit_evex_3src_imm_512(dptr, args, "vpclmulqdq"); true }
-            TernaryLogic256 => { self.emit_evex_ternary_w(dptr, args, "vpternlogd", 32); true }
-            TernaryLogic128 => { self.emit_evex_ternary_w(dptr, args, "vpternlogd", 16); true }
+            TernaryLogic512 => {
+                self.emit_evex_ternary_512(dptr, args, "vpternlogd");
+                true
+            }
+            Vpclmulqdq512 => {
+                self.emit_evex_3src_imm_512(dptr, args, "vpclmulqdq");
+                true
+            }
+            TernaryLogic256 => {
+                self.emit_evex_ternary_w(dptr, args, "vpternlogd", 32);
+                true
+            }
+            TernaryLogic128 => {
+                self.emit_evex_ternary_w(dptr, args, "vpternlogd", 16);
+                true
+            }
             // ---- sign/zero extension (unary, src narrower than dst) ----
-            Pmovzxbw512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxbw"); true }
-            Pmovzxbd512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxbd"); true }
-            Pmovzxbq512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxbq"); true }
-            Pmovzxwd512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxwd"); true }
-            Pmovzxwq512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxwq"); true }
-            Pmovzxdq512 => { self.emit_evex_unary_512(dptr, args, "vpmovzxdq"); true }
-            Pmovsxbw512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxbw"); true }
-            Pmovsxbd512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxbd"); true }
-            Pmovsxbq512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxbq"); true }
-            Pmovsxwd512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxwd"); true }
-            Pmovsxwq512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxwq"); true }
-            Pmovsxdq512 => { self.emit_evex_unary_512(dptr, args, "vpmovsxdq"); true }
+            Pmovzxbw512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxbw");
+                true
+            }
+            Pmovzxbd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxbd");
+                true
+            }
+            Pmovzxbq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxbq");
+                true
+            }
+            Pmovzxwd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxwd");
+                true
+            }
+            Pmovzxwq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxwq");
+                true
+            }
+            Pmovzxdq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovzxdq");
+                true
+            }
+            Pmovsxbw512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxbw");
+                true
+            }
+            Pmovsxbd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxbd");
+                true
+            }
+            Pmovsxbq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxbq");
+                true
+            }
+            Pmovsxwd512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxwd");
+                true
+            }
+            Pmovsxwq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxwq");
+                true
+            }
+            Pmovsxdq512 => {
+                self.emit_evex_unary_512(dptr, args, "vpmovsxdq");
+                true
+            }
             // ---- insert/extract ----
-            InsertI32x4 => { self.emit_evex_insert_512(dptr, args, "vinserti32x4", "xmm1"); true }
-            InsertI64x2 => { self.emit_evex_insert_512(dptr, args, "vinserti64x2", "xmm1"); true }
-            InsertI32x8 => { self.emit_evex_insert_512(dptr, args, "vinserti32x8", "ymm1"); true }
-            InsertI64x4 => { self.emit_evex_insert_512(dptr, args, "vinserti64x4", "ymm1"); true }
-            ExtractI32x4 => { self.emit_evex_extract_512(dptr, args, "vextracti32x4", "xmm0"); true }
-            ExtractI64x2 => { self.emit_evex_extract_512(dptr, args, "vextracti64x2", "xmm0"); true }
-            ExtractI32x8 => { self.emit_evex_extract_512(dptr, args, "vextracti32x8", "ymm0"); true }
-            ExtractI64x4 => { self.emit_evex_extract_512(dptr, args, "vextracti64x4", "ymm0"); true }
+            InsertI32x4 => {
+                self.emit_evex_insert_512(dptr, args, "vinserti32x4", "xmm1");
+                true
+            }
+            InsertI64x2 => {
+                self.emit_evex_insert_512(dptr, args, "vinserti64x2", "xmm1");
+                true
+            }
+            InsertI32x8 => {
+                self.emit_evex_insert_512(dptr, args, "vinserti32x8", "ymm1");
+                true
+            }
+            InsertI64x4 => {
+                self.emit_evex_insert_512(dptr, args, "vinserti64x4", "ymm1");
+                true
+            }
+            ExtractI32x4 => {
+                self.emit_evex_extract_512(dptr, args, "vextracti32x4", "xmm0");
+                true
+            }
+            ExtractI64x2 => {
+                self.emit_evex_extract_512(dptr, args, "vextracti64x2", "xmm0");
+                true
+            }
+            ExtractI32x8 => {
+                self.emit_evex_extract_512(dptr, args, "vextracti32x8", "ymm0");
+                true
+            }
+            ExtractI64x4 => {
+                self.emit_evex_extract_512(dptr, args, "vextracti64x4", "ymm0");
+                true
+            }
             // ---- permutes ----
-            PermutexvarEp32 => { self.emit_evex_binary_512(dptr, args, "vpermd", false); true }
-            PermutexvarEp64 => { self.emit_evex_binary_512(dptr, args, "vpermq", false); true }
+            PermutexvarEp32 => {
+                self.emit_evex_binary_512(dptr, args, "vpermd", false);
+                true
+            }
+            PermutexvarEp64 => {
+                self.emit_evex_binary_512(dptr, args, "vpermq", false);
+                true
+            }
             // ---- broadcasts ----
-            BroadcastI32x4 => { self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti32x4"); true }
-            BroadcastI64x2 => { self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti64x2"); true }
-            BroadcastI32x8 => { self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti32x8"); true }
-            BroadcastI64x4 => { self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti64x4"); true }
-            SetEpi8_512 => { self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastb"); true }
-            SetEpi16_512 => { self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastw"); true }
-            SetEpi32_512 => { self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastd"); true }
-            SetEpi64x512 => { self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastq"); true }
+            BroadcastI32x4 => {
+                self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti32x4");
+                true
+            }
+            BroadcastI64x2 => {
+                self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti64x2");
+                true
+            }
+            BroadcastI32x8 => {
+                self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti32x8");
+                true
+            }
+            BroadcastI64x4 => {
+                self.emit_evex_mem_broadcast_512(dptr, args, "vbroadcasti64x4");
+                true
+            }
+            SetEpi8_512 => {
+                self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastb");
+                true
+            }
+            SetEpi16_512 => {
+                self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastw");
+                true
+            }
+            SetEpi32_512 => {
+                self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastd");
+                true
+            }
+            SetEpi64x512 => {
+                self.emit_evex_gpr_broadcast_512(dptr, args, "vpbroadcastq");
+                true
+            }
             // ---- casts ----
-            Zext128to512 => { self.emit_zext128_512(dptr, args); true }
-            Cast512to256 => { self.emit_cast512_256(dptr, args); true }
-            Cast128to512 => { self.emit_cast128_512(dptr, args); true }
+            Zext128to512 => {
+                self.emit_zext128_512(dptr, args);
+                true
+            }
+            Cast512to256 => {
+                self.emit_cast512_256(dptr, args);
+                true
+            }
+            Cast128to512 => {
+                self.emit_cast128_512(dptr, args);
+                true
+            }
             // ---- loads/stores ----
-            Loadu512 => { self.emit_evex_load_512(dptr, args); true }
-            Storeu512 => { self.emit_evex_store_512(dest_ptr, args); true }
+            Loadu512 => {
+                self.emit_evex_load_512(dptr, args);
+                true
+            }
+            Storeu512 => {
+                self.emit_evex_store_512(dest_ptr, args);
+                true
+            }
             // ---- masked ops (vector results) ----
-            MaskzLoaduEpi8_512 => { self.emit_maskz_load(dptr, args, "zmm0"); true }
-            MaskzLoaduEpi8_256 => { self.emit_maskz_load(dptr, args, "ymm0"); true }
-            MaskzLoaduEpi8_128 => { self.emit_maskz_load(dptr, args, "xmm0"); true }
-            MaskLoaduEpi8_512 => { self.emit_mask_load(dptr, args, "zmm0"); true }
-            MaskLoaduEpi8_256 => { self.emit_mask_load(dptr, args, "ymm0"); true }
-            MaskLoaduEpi8_128 => { self.emit_mask_load(dptr, args, "xmm0"); true }
-            MaskStoreuEpi8_512 => { self.emit_mask_store(dest_ptr, args, "zmm0"); true }
-            MaskStoreuEpi8_256 => { self.emit_mask_store(dest_ptr, args, "ymm0"); true }
-            MaskStoreuEpi8_128 => { self.emit_mask_store(dest_ptr, args, "xmm0"); true }
-            MaskzMaddubsEpi16_512 => { self.emit_maskz_maddubs_512(dptr, args); true }
-            MaskzSet1Epi16_512 => { self.emit_maskz_set1_512(dptr, args, "vpbroadcastw"); true }
-            MaskzSet1Epi32_512 => { self.emit_maskz_set1_512(dptr, args, "vpbroadcastd"); true }
-            MaskzSet1Epi64x512 => { self.emit_maskz_set1_512(dptr, args, "vpbroadcastq"); true }
-            MaskzInsertI64x2 => { self.emit_maskz_insert_512(dptr, args, "vinserti64x2"); true }
-            MaskzInsertI32x4 => { self.emit_maskz_insert_512(dptr, args, "vinserti32x4"); true }
-            MaskzExtractI32x4 => { self.emit_maskz_extract(dptr, args, "vextracti32x4", "xmm0"); true }
-            MaskzExtractI64x4 => { self.emit_maskz_extract(dptr, args, "vextracti64x4", "ymm0"); true }
-            MaskzExtractI64x2 => { self.emit_maskz_extract(dptr, args, "vextracti64x2", "xmm0"); true }
-            MaskzShuffleEpi8_128 => { self.emit_maskz_shuffle_epi8_128(dptr, args, true); true }
-            MaskShuffleEpi8_128 => { self.emit_maskz_shuffle_epi8_128(dptr, args, false); true }
+            MaskzLoaduEpi8_512 => {
+                self.emit_maskz_load(dptr, args, "zmm0");
+                true
+            }
+            MaskzLoaduEpi8_256 => {
+                self.emit_maskz_load(dptr, args, "ymm0");
+                true
+            }
+            MaskzLoaduEpi8_128 => {
+                self.emit_maskz_load(dptr, args, "xmm0");
+                true
+            }
+            MaskLoaduEpi8_512 => {
+                self.emit_mask_load(dptr, args, "zmm0");
+                true
+            }
+            MaskLoaduEpi8_256 => {
+                self.emit_mask_load(dptr, args, "ymm0");
+                true
+            }
+            MaskLoaduEpi8_128 => {
+                self.emit_mask_load(dptr, args, "xmm0");
+                true
+            }
+            MaskStoreuEpi8_512 => {
+                self.emit_mask_store(dest_ptr, args, "zmm0");
+                true
+            }
+            MaskStoreuEpi8_256 => {
+                self.emit_mask_store(dest_ptr, args, "ymm0");
+                true
+            }
+            MaskStoreuEpi8_128 => {
+                self.emit_mask_store(dest_ptr, args, "xmm0");
+                true
+            }
+            MaskzMaddubsEpi16_512 => {
+                self.emit_maskz_maddubs_512(dptr, args);
+                true
+            }
+            MaskzSet1Epi16_512 => {
+                self.emit_maskz_set1_512(dptr, args, "vpbroadcastw");
+                true
+            }
+            MaskzSet1Epi32_512 => {
+                self.emit_maskz_set1_512(dptr, args, "vpbroadcastd");
+                true
+            }
+            MaskzSet1Epi64x512 => {
+                self.emit_maskz_set1_512(dptr, args, "vpbroadcastq");
+                true
+            }
+            MaskzInsertI64x2 => {
+                self.emit_maskz_insert_512(dptr, args, "vinserti64x2");
+                true
+            }
+            MaskzInsertI32x4 => {
+                self.emit_maskz_insert_512(dptr, args, "vinserti32x4");
+                true
+            }
+            MaskzExtractI32x4 => {
+                self.emit_maskz_extract(dptr, args, "vextracti32x4", "xmm0");
+                true
+            }
+            MaskzExtractI64x4 => {
+                self.emit_maskz_extract(dptr, args, "vextracti64x4", "ymm0");
+                true
+            }
+            MaskzExtractI64x2 => {
+                self.emit_maskz_extract(dptr, args, "vextracti64x2", "xmm0");
+                true
+            }
+            MaskzShuffleEpi8_128 => {
+                self.emit_maskz_shuffle_epi8_128(dptr, args, true);
+                true
+            }
+            MaskShuffleEpi8_128 => {
+                self.emit_maskz_shuffle_epi8_128(dptr, args, false);
+                true
+            }
             // ---- VNNI (3-input: dst += a*b) ----
-            Vpdpbusd512 => { self.emit_evex_vpdpbusd_512(dptr, args, "vpdpbusd"); true }
-            Vpdpbusds512 => { self.emit_evex_vpdpbusd_512(dptr, args, "vpdpbusds"); true }
+            Vpdpbusd512 => {
+                self.emit_evex_vpdpbusd_512(dptr, args, "vpdpbusd");
+                true
+            }
+            Vpdpbusds512 => {
+                self.emit_evex_vpdpbusd_512(dptr, args, "vpdpbusds");
+                true
+            }
             // ---- 512-bit FP ----
-            AddPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vaddps"); true }
-            SubPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vsubps"); true }
-            MulPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vmulps"); true }
-            DivPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vdivps"); true }
-            MinPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vminps"); true }
-            MaxPs512 => { self.emit_evex_fp_binary_512(dptr, args, "vmaxps"); true }
-            AddPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vaddpd"); true }
-            SubPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vsubpd"); true }
-            MulPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vmulpd"); true }
-            DivPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vdivpd"); true }
-            MinPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vminpd"); true }
-            MaxPd512 => { self.emit_evex_fp_binary_512(dptr, args, "vmaxpd"); true }
-            SqrtPs512 => { self.emit_evex_unary_512(dptr, args, "vsqrtps"); true }
-            SqrtPd512 => { self.emit_evex_unary_512(dptr, args, "vsqrtpd"); true }
-            CmpPs512 => { self.emit_evex_cmp_512(dptr, args, "vcmpps"); true }
-            CmpPd512 => { self.emit_evex_cmp_512(dptr, args, "vcmppd"); true }
-            CvtPs2Pd512 => { self.emit_evex_unary_512(dptr, args, "vcvtps2pd"); true }
-            CvtPd2Ps512 => { self.emit_evex_unary_512(dptr, args, "vcvtpd2ps"); true }
-            CvtEp32_2Ps512 => { self.emit_evex_unary_512(dptr, args, "vcvtdq2ps"); true }
-            CvtPs2Ep32_512 => { self.emit_evex_unary_512(dptr, args, "vcvtps2dq"); true }
-            CvttPs2Ep32_512 => { self.emit_evex_unary_512(dptr, args, "vcvttps2dq"); true }
-            CvtEp32_2Pd512 => { self.emit_evex_unary_512(dptr, args, "vcvtdq2pd"); true }
-            CvtPd2Ep32_512 => { self.emit_evex_unary_512(dptr, args, "vcvtpd2dq"); true }
-            CvttPd2Ep32_512 => { self.emit_evex_unary_512(dptr, args, "vcvttpd2dq"); true }
-            FmaPs132v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd132ps"); true }
-            FmaPs213v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd213ps"); true }
-            FmaPs231v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd231ps"); true }
-            FmaPd132v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd132pd"); true }
-            FmaPd213v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd213pd"); true }
-            FmaPd231v512 => { self.emit_evex_fma_512(dptr, args, "vfmadd231pd"); true }
+            AddPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vaddps");
+                true
+            }
+            SubPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vsubps");
+                true
+            }
+            MulPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vmulps");
+                true
+            }
+            DivPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vdivps");
+                true
+            }
+            MinPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vminps");
+                true
+            }
+            MaxPs512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vmaxps");
+                true
+            }
+            AddPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vaddpd");
+                true
+            }
+            SubPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vsubpd");
+                true
+            }
+            MulPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vmulpd");
+                true
+            }
+            DivPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vdivpd");
+                true
+            }
+            MinPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vminpd");
+                true
+            }
+            MaxPd512 => {
+                self.emit_evex_fp_binary_512(dptr, args, "vmaxpd");
+                true
+            }
+            SqrtPs512 => {
+                self.emit_evex_unary_512(dptr, args, "vsqrtps");
+                true
+            }
+            SqrtPd512 => {
+                self.emit_evex_unary_512(dptr, args, "vsqrtpd");
+                true
+            }
+            CmpPs512 => {
+                self.emit_evex_cmp_512(dptr, args, "vcmpps");
+                true
+            }
+            CmpPd512 => {
+                self.emit_evex_cmp_512(dptr, args, "vcmppd");
+                true
+            }
+            CvtPs2Pd512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtps2pd");
+                true
+            }
+            CvtPd2Ps512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtpd2ps");
+                true
+            }
+            CvtEp32_2Ps512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtdq2ps");
+                true
+            }
+            CvtPs2Ep32_512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtps2dq");
+                true
+            }
+            CvttPs2Ep32_512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvttps2dq");
+                true
+            }
+            CvtEp32_2Pd512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtdq2pd");
+                true
+            }
+            CvtPd2Ep32_512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvtpd2dq");
+                true
+            }
+            CvttPd2Ep32_512 => {
+                self.emit_evex_unary_512(dptr, args, "vcvttpd2dq");
+                true
+            }
+            FmaPs132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd132ps");
+                true
+            }
+            FmaPs213v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd213ps");
+                true
+            }
+            FmaPs231v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd231ps");
+                true
+            }
+            FmaPd132v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd132pd");
+                true
+            }
+            FmaPd213v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd213pd");
+                true
+            }
+            FmaPd231v512 => {
+                self.emit_evex_fma_512(dptr, args, "vfmadd231pd");
+                true
+            }
             // ---- 128/256-bit FP (via VEX, mirroring the 256-bit AVX pattern) ----
-            DivPs128 | MinPs128 | MaxPs128
-            | DivPd128 | MinPd128 | MaxPd128 => {
+            DivPs128 | MinPs128 | MaxPs128 | DivPd128 | MinPd128 | MaxPd128 => {
                 let (inst, is_ps) = match op {
-                    DivPs128 => ("divps", true), MinPs128 => ("minps", true),
+                    DivPs128 => ("divps", true),
+                    MinPs128 => ("minps", true),
                     MaxPs128 => ("maxps", true),
-                    DivPd128 => ("divpd", false), MinPd128 => ("minpd", false),
+                    DivPd128 => ("divpd", false),
+                    MinPd128 => ("minpd", false),
                     MaxPd128 => ("maxpd", false),
                     _ => unreachable!(),
                 };
@@ -479,33 +1043,27 @@ impl X86Codegen {
                 self.emit_sse_fp_128_op(dptr, op, args);
                 true
             }
-            CmpPs128 | CmpPd128 | ShufPs128 | ShufPd128
-            | UnpcklPs128 | UnpckhPs128 | UnpcklPd128 | UnpckhPd128
-            | HaddPs128 | HsubPs128 | AddsubPs128 | HaddPd128 | HsubPd128 | AddsubPd128
-            | Movddup128 | Movsldup128 | Movshdup128
-            | RoundPs128 | RoundPd128 | BlendPs128 | BlendPd128 | BlendvPs128 | BlendvPd128
-            | DpPs128 | DpPd128 | InsertPs128 | InsertPd128 | VpermilPs128
-            | Movss128 | Movsd128 | CvtSi2Ss128 | CvtSi2Sd128 | CvtSi2Ss64_128 | CvtSi2Sd64_128
-            | CvtSs2Sd128 | CvtSd2Ss128
-            | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128
-            | CvtPs2Pd128 | CvtPd2Ps128 | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128
-            | FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
+            CmpPs128 | CmpPd128 | ShufPs128 | ShufPd128 | UnpcklPs128 | UnpckhPs128
+            | UnpcklPd128 | UnpckhPd128 | HaddPs128 | HsubPs128 | AddsubPs128 | HaddPd128
+            | HsubPd128 | AddsubPd128 | Movddup128 | Movsldup128 | Movshdup128 | RoundPs128
+            | RoundPd128 | BlendPs128 | BlendPd128 | BlendvPs128 | BlendvPd128 | DpPs128
+            | DpPd128 | InsertPs128 | InsertPd128 | VpermilPs128 | Movss128 | Movsd128
+            | CvtSi2Ss128 | CvtSi2Sd128 | CvtSi2Ss64_128 | CvtSi2Sd64_128 | CvtSs2Sd128
+            | CvtSd2Ss128 | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128 | CvtPs2Pd128
+            | CvtPd2Ps128 | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128 | FmaPs132
+            | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
                 self.emit_sse_fp_128_op(dptr, op, args);
                 true
             }
-            DivPs256 | MinPs256 | MaxPs256 | SqrtPs256
-            | DivPd256 | MinPd256 | MaxPd256 | SqrtPd256
-            | CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256
-            | UnpcklPs256 | UnpckhPs256 | UnpcklPd256 | UnpckhPd256
-            | HaddPs256 | HsubPs256 | AddsubPs256
-            | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256
-            | BlendvPs256 | BlendvPd256 | VpermilPs256 | Vperm2f128 | Vinsertf128
-            | Vextractf128 | Vbroadcastss | Vbroadcastsd
-            | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
-            | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
-            | VpermilvarPs256 | VpermilvarPd256
-            | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
-            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
+            DivPs256 | MinPs256 | MaxPs256 | SqrtPs256 | DivPd256 | MinPd256 | MaxPd256
+            | SqrtPd256 | CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | UnpcklPs256
+            | UnpckhPs256 | UnpcklPd256 | UnpckhPd256 | HaddPs256 | HsubPs256 | AddsubPs256
+            | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256 | BlendvPs256 | BlendvPd256
+            | VpermilPs256 | Vperm2f128 | Vinsertf128 | Vextractf128 | Vbroadcastss
+            | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256 | CvtPs2Pd256
+            | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256 | VpermilvarPs256
+            | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256 | FmaPd132v256
+            | FmaPd213v256 | FmaPd231v256 => {
                 self.emit_avx_fp_256_op(dptr, op, args);
                 true
             }
@@ -548,7 +1106,8 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         // args[0] is a pointer to 16/32 bytes.
         self.operand_to_reg(&args[0], "rax");
-        self.state.emit_fmt(format_args!("    {} (%rax), %zmm0", inst));
+        self.state
+            .emit_fmt(format_args!("    {} (%rax), %zmm0", inst));
         self.evex_store_dest(dest_ptr);
     }
 
@@ -557,8 +1116,13 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         self.operand_to_reg(&args[0], "rax");
-        let reg = if matches!(inst, "vpbroadcastq") { "rax" } else { "eax" };
-        self.state.emit_fmt(format_args!("    {} %{}, %zmm0", inst, reg));
+        let reg = if matches!(inst, "vpbroadcastq") {
+            "rax"
+        } else {
+            "eax"
+        };
+        self.state
+            .emit_fmt(format_args!("    {} %{}, %zmm0", inst, reg));
         self.evex_store_dest(dest_ptr);
     }
 
@@ -571,7 +1135,8 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    vinserti32x4 $0, %{}, %zmm0, %zmm0", held));
         } else if let Some(m) = self.evex_arg_mem(&args[0]) {
-            self.state.emit_fmt(format_args!("    vinserti32x4 $0, {}, %zmm0, %zmm0", m));
+            self.state
+                .emit_fmt(format_args!("    vinserti32x4 $0, {}, %zmm0, %zmm0", m));
         } else {
             self.operand_to_reg(&args[0], "rax");
             self.state.emit("    vmovdqu (%rax), %xmm1");
@@ -586,7 +1151,8 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         self.evex_load_arg(&args[0]);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state.emit_fmt(format_args!("    vmovdqu %ymm0, {}", mem));
+            self.state
+                .emit_fmt(format_args!("    vmovdqu %ymm0, {}", mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
             self.state.emit("    vmovdqu %ymm0, (%rax)");
@@ -604,7 +1170,8 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    vmovdqu64 %{}, %zmm0", held));
             }
         } else if let Some(m) = self.evex_arg_mem(&args[0]) {
-            self.state.emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m));
+            self.state
+                .emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m));
         } else {
             self.operand_to_reg(&args[0], "rax");
             self.state.emit("    vmovdqu (%rax), %xmm0");
@@ -643,11 +1210,16 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
-        self.state.emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}{{z}}", reg));
         self.state.vec_live_regs.insert(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state
-                .emit_fmt(format_args!("    {} %{}, {}", reg_width_move(reg), reg, mem));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, {}",
+                reg_width_move(reg),
+                reg,
+                mem
+            ));
         } else {
             self.value_to_reg(dest_ptr, "rax");
             self.state
@@ -663,11 +1235,16 @@ impl X86Codegen {
         self.evex_load_arg_to(&args[2], reg);
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
-        self.state.emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu8 (%rax), %{}{{k1}}", reg));
         self.state.vec_live_regs.insert(dest_ptr.0, reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state
-                .emit_fmt(format_args!("    {} %{}, {}", reg_width_move(reg), reg, mem));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, {}",
+                reg_width_move(reg),
+                reg,
+                mem
+            ));
         } else {
             self.value_to_reg(dest_ptr, "rax");
             self.state
@@ -684,7 +1261,8 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.simd_load_arg_to(&args[1], reg);
         self.value_to_reg(ptr, "rax");
-        self.state.emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{k1}}", reg));
+        self.state
+            .emit_fmt(format_args!("    vmovdqu8 %{}, (%rax){{k1}}", reg));
     }
 
     /// Masked zeroing maddubs: vpmaddubsw %zmm_b, %zmm_a, %zmm0{%k1}{z}.
@@ -694,7 +1272,8 @@ impl X86Codegen {
         self.simd_gpr_to_k1(&args[0]);
         self.evex_load_arg_to(&args[1], "zmm1");
         self.evex_load_arg_to(&args[2], "zmm2");
-        self.state.emit("    vpmaddubsw %zmm2, %zmm1, %zmm0{%k1}{z}");
+        self.state
+            .emit("    vpmaddubsw %zmm2, %zmm1, %zmm0{%k1}{z}");
         self.evex_store_dest(dest_ptr);
     }
 
@@ -704,7 +1283,11 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
-        let reg = if matches!(inst, "vpbroadcastq") { "rax" } else { "eax" };
+        let reg = if matches!(inst, "vpbroadcastq") {
+            "rax"
+        } else {
+            "eax"
+        };
         self.state
             .emit_fmt(format_args!("    {} %{}, %zmm0{{k1}}{{z}}", inst, reg));
         self.evex_store_dest(dest_ptr);
@@ -731,15 +1314,22 @@ impl X86Codegen {
     }
 
     /// Masked zeroing extract: vextracti* $imm, %zmm_src, %xmm0{%k1}{z}.
-    fn emit_maskz_extract(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str, dst_reg: &'static str) {
+    fn emit_maskz_extract(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+        dst_reg: &'static str,
+    ) {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         let imm = self.simd_imm(&args[2]);
         self.simd_gpr_to_k1(&args[0]);
         self.simd_load_arg_to(&args[1], "zmm0");
-        self.state.emit_fmt(
-            format_args!("    {} ${}, %zmm0, %{}{{k1}}{{z}}", inst, imm, dst_reg),
-        );
+        self.state.emit_fmt(format_args!(
+            "    {} ${}, %zmm0, %{}{{k1}}{{z}}",
+            inst, imm, dst_reg
+        ));
         self.state.vec_live_regs.insert(dest_ptr.0, dst_reg);
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
             self.state.emit_fmt(format_args!(
@@ -769,8 +1359,10 @@ impl X86Codegen {
             self.simd_gpr_to_k1(mask);
             self.evex_load_arg_to(&args[1], "xmm1");
             self.evex_load_arg_to(&args[2], "xmm2");
-            self.state
-                .emit_fmt(format_args!("    vpshufb %xmm2, %xmm1, %xmm0{{k1}}{}", zsuf));
+            self.state.emit_fmt(format_args!(
+                "    vpshufb %xmm2, %xmm1, %xmm0{{k1}}{}",
+                zsuf
+            ));
         } else {
             // merge: dest = src (first arg) merged with shuffle result
             self.evex_load_arg_to(&args[1], "xmm0"); // src (dest)
@@ -782,7 +1374,8 @@ impl X86Codegen {
         }
         self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
         if let Some(mem) = self.value_ptr_mem_operand(dest_ptr.0) {
-            self.state.emit_fmt(format_args!("    vmovdqu %xmm0, {}", mem));
+            self.state
+                .emit_fmt(format_args!("    vmovdqu %xmm0, {}", mem));
         } else {
             self.value_to_reg(dest_ptr, "rax");
             self.state.emit("    vmovdqu %xmm0, (%rax)");
@@ -822,7 +1415,7 @@ impl X86Codegen {
         self.evex_load_arg_to(&args[0], "zmm0"); // a (dest)
         self.evex_load_arg_to(&args[1], "zmm1"); // b (r/m)
         self.evex_load_arg_to(&args[2], "zmm2"); // c (vvvv)
-        // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+                                                 // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
         self.state
             .emit_fmt(format_args!("    {} %zmm1, %zmm2, %zmm0", inst));
         self.evex_store_dest(dest_ptr);
@@ -862,25 +1455,31 @@ impl X86Codegen {
         };
         let _ = (w, opcode_ok);
         match op {
-            CmpeqEpu8Mask128 | CmpeqEpu8Mask256 | CmpeqEpu8Mask512
-            | CmpEpi8Mask128 | CmpEpi8Mask256 | CmpEpi8Mask512
-            | CmpeqEpu16Mask512 | CmpEpu16Mask128 | CmpEpu16Mask256
-            | CmpEpi16Mask512 | CmpEpi16Mask128 | CmpEpi16Mask256
-            | CmpeqEpu32Mask512 | CmpEpu32Mask128 | CmpEpu32Mask256
-            | CmpEpi32Mask512 | CmpEpi32Mask128 | CmpEpi32Mask256
-            | CmpeqEpu64Mask512 | CmpEpu64Mask128 | CmpEpu64Mask256
-            | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
+            CmpeqEpu8Mask128 | CmpeqEpu8Mask256 | CmpeqEpu8Mask512 | CmpEpi8Mask128
+            | CmpEpi8Mask256 | CmpEpi8Mask512 | CmpeqEpu16Mask512 | CmpEpu16Mask128
+            | CmpEpu16Mask256 | CmpEpi16Mask512 | CmpEpi16Mask128 | CmpEpi16Mask256
+            | CmpeqEpu32Mask512 | CmpEpu32Mask128 | CmpEpu32Mask256 | CmpEpi32Mask512
+            | CmpEpi32Mask128 | CmpEpi32Mask256 | CmpeqEpu64Mask512 | CmpEpu64Mask128
+            | CmpEpu64Mask256 | CmpEpi64Mask512 | CmpEpi64Mask128 | CmpEpi64Mask256 => {
                 // args: (a, b, imm) — vpcmp* $imm, %zmm_b, %zmm_a, %k1; kmovq %k1, %rax
                 let (reg_a, reg_b) = match op {
                     CmpeqEpu8Mask512 | CmpEpi8Mask512 | CmpeqEpu16Mask512 | CmpEpi16Mask512
-                    | CmpeqEpu32Mask512 | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpi64Mask512 => ("zmm0", "zmm1"),
+                    | CmpeqEpu32Mask512 | CmpEpi32Mask512 | CmpeqEpu64Mask512 | CmpEpi64Mask512 => {
+                        ("zmm0", "zmm1")
+                    }
                     CmpeqEpu8Mask256 | CmpEpi8Mask256 | CmpEpu16Mask256 | CmpEpi16Mask256
-                    | CmpEpu32Mask256 | CmpEpi32Mask256 | CmpEpu64Mask256 | CmpEpi64Mask256 => ("ymm0", "ymm1"),
+                    | CmpEpu32Mask256 | CmpEpi32Mask256 | CmpEpu64Mask256 | CmpEpi64Mask256 => {
+                        ("ymm0", "ymm1")
+                    }
                     _ => ("xmm0", "xmm1"),
                 };
                 self.simd_load_arg_to(&args[0], reg_a);
                 self.simd_load_arg_to(&args[1], reg_b);
-                let imm = if args.len() > 2 { self.simd_imm(&args[2]) } else { 0 };
+                let imm = if args.len() > 2 {
+                    self.simd_imm(&args[2])
+                } else {
+                    0
+                };
                 self.state.emit_fmt(format_args!(
                     "    {} ${}, %{}, %{}, %k1",
                     inst, imm, reg_b, reg_a
@@ -898,7 +1497,8 @@ impl X86Codegen {
                     "xmm0"
                 };
                 self.simd_load_arg_to(&args[0], reg);
-                self.state.emit_fmt(format_args!("    {} %{}, %eax", inst, reg));
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, %eax", inst, reg));
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -917,7 +1517,8 @@ impl X86Codegen {
             }
             CvtSs2Si128 | CvtSd2Si128 => {
                 self.sse_load_arg(&args[0], "xmm0");
-                self.state.emit_fmt(format_args!("    {} %xmm0, %eax", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm0, %eax", inst));
                 if let Some(d) = dest {
                     self.store_rax_to(d);
                 }
@@ -992,7 +1593,8 @@ impl X86Codegen {
         self.state.invalidate_vec_peephole();
         self.sse_load_arg(&args[0], "xmm0");
         self.sse_load_arg(&args[1], "xmm1");
-        self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+        self.state
+            .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
         self.sse_store_dest(dest_ptr, "xmm0");
     }
 
@@ -1004,7 +1606,8 @@ impl X86Codegen {
         // unary 2-op (legacy SSE: no memory operand — alignment)
         let unary = |this: &mut Self, inst: &str| {
             this.sse_load_arg(&args[0], "xmm0");
-            this.state.emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+            this.state
+                .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
             this.sse_store_dest(dest_ptr, "xmm0");
         };
         match op {
@@ -1026,22 +1629,31 @@ impl X86Codegen {
             HaddPs128 | HsubPs128 | AddsubPs128 | HaddPd128 | HsubPd128 | AddsubPd128
             | UnpcklPs128 | UnpckhPs128 | UnpcklPd128 | UnpckhPd128 => {
                 let inst = match op {
-                    HaddPs128 => "haddps", HsubPs128 => "hsubps", AddsubPs128 => "addsubps",
-                    HaddPd128 => "haddpd", HsubPd128 => "hsubpd", AddsubPd128 => "addsubpd",
-                    UnpcklPs128 => "unpcklps", UnpckhPs128 => "unpckhps",
-                    UnpcklPd128 => "unpcklpd", UnpckhPd128 => "unpckhpd",
+                    HaddPs128 => "haddps",
+                    HsubPs128 => "hsubps",
+                    AddsubPs128 => "addsubps",
+                    HaddPd128 => "haddpd",
+                    HsubPd128 => "hsubpd",
+                    AddsubPd128 => "addsubpd",
+                    UnpcklPs128 => "unpcklps",
+                    UnpckhPs128 => "unpckhps",
+                    UnpcklPd128 => "unpcklpd",
+                    UnpckhPd128 => "unpckhpd",
                     _ => unreachable!(),
                 };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.sse_load_arg(&args[1], "xmm1");
-                self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // 2-op with imm: cmpps/cmppd/shufps/shufpd (a, b, imm)
             CmpPs128 | CmpPd128 | ShufPs128 | ShufPd128 => {
                 let inst = match op {
-                    CmpPs128 => "cmpps", CmpPd128 => "cmppd",
-                    ShufPs128 => "shufps", ShufPd128 => "shufpd",
+                    CmpPs128 => "cmpps",
+                    CmpPd128 => "cmppd",
+                    ShufPs128 => "shufps",
+                    ShufPd128 => "shufpd",
                     _ => unreachable!(),
                 };
                 let imm = self.simd_imm(&args[2]);
@@ -1054,7 +1666,8 @@ impl X86Codegen {
             // 1-op with imm: roundps/roundpd/vpermilps (a, imm)
             RoundPs128 | RoundPd128 | VpermilPs128 => {
                 let inst = match op {
-                    RoundPs128 => "roundps", RoundPd128 => "roundpd",
+                    RoundPs128 => "roundps",
+                    RoundPd128 => "roundpd",
                     VpermilPs128 => "vpermilps",
                     _ => unreachable!(),
                 };
@@ -1067,8 +1680,10 @@ impl X86Codegen {
             // blend with imm: blendps/blendpd/dpps/dppd (a, b, imm)
             BlendPs128 | BlendPd128 | DpPs128 | DpPd128 => {
                 let inst = match op {
-                    BlendPs128 => "blendps", BlendPd128 => "blendpd",
-                    DpPs128 => "dpps", DpPd128 => "dppd",
+                    BlendPs128 => "blendps",
+                    BlendPd128 => "blendpd",
+                    DpPs128 => "dpps",
+                    DpPd128 => "dppd",
                     _ => unreachable!(),
                 };
                 let imm = self.simd_imm(&args[2]);
@@ -1080,11 +1695,16 @@ impl X86Codegen {
             }
             // blendv: operands (mask, a, b); mask implicit in xmm0 (legacy).
             BlendvPs128 | BlendvPd128 => {
-                let inst = if matches!(op, BlendvPs128) { "blendvps" } else { "blendvpd" };
+                let inst = if matches!(op, BlendvPs128) {
+                    "blendvps"
+                } else {
+                    "blendvpd"
+                };
                 self.sse_load_arg(&args[0], "xmm0"); // mask
                 self.sse_load_arg(&args[1], "xmm1"); // a (dst)
                 self.sse_load_arg(&args[2], "xmm2"); // b (src)
-                self.state.emit_fmt(format_args!("    {} %xmm2, %xmm1", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm2, %xmm1", inst));
                 self.sse_store_dest(dest_ptr, "xmm1");
             }
             // insertps (a, b, imm): insertps $imm, %xmm_b, %xmm_a
@@ -1098,48 +1718,70 @@ impl X86Codegen {
             }
             // movss/movsd (a, b): movss %xmm_b, %xmm_a
             Movss128 | Movsd128 => {
-                let inst = if matches!(op, Movss128) { "movss" } else { "movsd" };
+                let inst = if matches!(op, Movss128) {
+                    "movss"
+                } else {
+                    "movsd"
+                };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.sse_load_arg(&args[1], "xmm1");
-                self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // cvtsi2ss/cvtsi2sd (a, i): convert i into xmm0 holding a
             CvtSi2Ss128 | CvtSi2Sd128 => {
-                let inst = if matches!(op, CvtSi2Ss128) { "cvtsi2ss" } else { "cvtsi2sd" };
+                let inst = if matches!(op, CvtSi2Ss128) {
+                    "cvtsi2ss"
+                } else {
+                    "cvtsi2sd"
+                };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.operand_to_reg(&args[1], "rax");
-                self.state.emit_fmt(format_args!("    {} %eax, %xmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %eax, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             CvtSi2Ss64_128 | CvtSi2Sd64_128 => {
-                let inst = if matches!(op, CvtSi2Ss64_128) { "cvtsi2ss" } else { "cvtsi2sd" };
+                let inst = if matches!(op, CvtSi2Ss64_128) {
+                    "cvtsi2ss"
+                } else {
+                    "cvtsi2sd"
+                };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.operand_to_reg(&args[1], "rax");
-                self.state.emit_fmt(format_args!("    {} %rax, %xmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %rax, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // cvtss2sd/cvtsd2ss (a, b)
             CvtSs2Sd128 | CvtSd2Ss128 => {
-                let inst = if matches!(op, CvtSs2Sd128) { "cvtss2sd" } else { "cvtsd2ss" };
+                let inst = if matches!(op, CvtSs2Sd128) {
+                    "cvtss2sd"
+                } else {
+                    "cvtsd2ss"
+                };
                 self.sse_load_arg(&args[0], "xmm0");
                 self.sse_load_arg(&args[1], "xmm1");
-                self.state.emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
             }
             // FMA 128 (a, b, c): vfmadd132ps %xmm_c, %xmm_b, %xmm_a
             FmaPs132 | FmaPs213 | FmaPs231 | FmaPd132 | FmaPd213 | FmaPd231 => {
                 let inst = match op {
-                    FmaPs132 => "vfmadd132ps", FmaPs213 => "vfmadd213ps",
+                    FmaPs132 => "vfmadd132ps",
+                    FmaPs213 => "vfmadd213ps",
                     FmaPs231 => "vfmadd231ps",
-                    FmaPd132 => "vfmadd132pd", FmaPd213 => "vfmadd213pd",
+                    FmaPd132 => "vfmadd132pd",
+                    FmaPd213 => "vfmadd213pd",
                     FmaPd231 => "vfmadd231pd",
                     _ => unreachable!(),
                 };
                 self.sse_load_arg(&args[0], "xmm0"); // a (dest)
                 self.sse_load_arg(&args[1], "xmm1"); // b (r/m)
                 self.sse_load_arg(&args[2], "xmm2"); // c (vvvv)
-                // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
+                                                     // vfmadd132ps %B, %C, %A: dst = dst*r/m + vvvv = a*b + c
                 self.state
                     .emit_fmt(format_args!("    {} %xmm1, %xmm2, %xmm0", inst));
                 self.sse_store_dest(dest_ptr, "xmm0");
@@ -1160,10 +1802,12 @@ impl X86Codegen {
         // unary
         let unary = |this: &mut Self, inst: &str| {
             if let Some(m) = this.evex_arg_mem(&args[0]) {
-                this.state.emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
+                this.state
+                    .emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
             } else {
                 this.avx_load_arg(&args[0]);
-                this.state.emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
+                this.state
+                    .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
             }
             this.avx_store_dest(dest_ptr);
         };
@@ -1201,9 +1845,12 @@ impl X86Codegen {
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
                 let inst = match op {
-                    CmpPs256 => "vcmpps", CmpPd256 => "vcmppd",
-                    ShufPs256 => "vshufps", ShufPd256 => "vshufpd",
-                    BlendPs256 => "vblendps", BlendPd256 => "vblendpd",
+                    CmpPs256 => "vcmpps",
+                    CmpPd256 => "vcmppd",
+                    ShufPs256 => "vshufps",
+                    ShufPd256 => "vshufpd",
+                    BlendPs256 => "vblendps",
+                    BlendPd256 => "vblendpd",
                     _ => unreachable!(),
                 };
                 let imm = self.simd_imm(&args[2]);
@@ -1216,8 +1863,10 @@ impl X86Codegen {
             // 2-op with imm: vroundps/vroundpd/vpermilps (a, imm)
             RoundPs256 | RoundPd256 | VpermilPs256 => {
                 let inst = match op {
-                    RoundPs256 => "vroundps", RoundPd256 => "vroundpd",
-                    VpermilPs256 => "vpermilps", _ => unreachable!(),
+                    RoundPs256 => "vroundps",
+                    RoundPd256 => "vroundpd",
+                    VpermilPs256 => "vpermilps",
+                    _ => unreachable!(),
                 };
                 let imm = self.simd_imm(&args[1]);
                 if let Some(m) = self.evex_arg_mem(&args[0]) {
@@ -1244,8 +1893,10 @@ impl X86Codegen {
                 let imm = self.simd_imm(&args[2]);
                 self.avx_load_arg(&args[0]);
                 self.sse_load_arg(&args[1], "xmm1");
-                self.state
-                    .emit_fmt(format_args!("    vinsertf128 ${}, %xmm1, %ymm0, %ymm0", imm));
+                self.state.emit_fmt(format_args!(
+                    "    vinsertf128 ${}, %xmm1, %ymm0, %ymm0",
+                    imm
+                ));
                 self.avx_store_dest(dest_ptr);
             }
             // vextractf128 (a, imm) -> xmm
@@ -1256,7 +1907,8 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    vextractf128 ${}, %ymm0, %xmm0", imm));
                 self.state.vec_live_regs.insert(dest_ptr.0, "xmm0");
                 if let Some(m) = self.value_ptr_mem_operand(dest_ptr.0) {
-                    self.state.emit_fmt(format_args!("    vmovdqu %xmm0, {}", m));
+                    self.state
+                        .emit_fmt(format_args!("    vmovdqu %xmm0, {}", m));
                 } else {
                     self.value_to_reg(dest_ptr, "rax");
                     self.state.emit("    vmovdqu %xmm0, (%rax)");
@@ -1264,21 +1916,31 @@ impl X86Codegen {
             }
             // vbroadcastss/vbroadcastsd (a) — src xmm or mem
             Vbroadcastss | Vbroadcastsd => {
-                let inst = if matches!(op, Vbroadcastss) { "vbroadcastss" } else { "vbroadcastsd" };
+                let inst = if matches!(op, Vbroadcastss) {
+                    "vbroadcastss"
+                } else {
+                    "vbroadcastsd"
+                };
                 if let Some(&held) = self.state.vec_live_regs.get(&simd_value_id(&args[0])) {
                     self.state
                         .emit_fmt(format_args!("    {} %{}, %ymm0", inst, held));
                 } else if let Some(m) = self.evex_arg_mem(&args[0]) {
-                    self.state.emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
                 } else {
                     self.sse_load_arg(&args[0], "xmm1");
-                    self.state.emit_fmt(format_args!("    {} %xmm1, %ymm0", inst));
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm1, %ymm0", inst));
                 }
                 self.avx_store_dest(dest_ptr);
             }
             // vblendvps/vblendvpd: operands (mask, a, b): mask, b(src2), a(src1,dst)
             BlendvPs256 | BlendvPd256 => {
-                let inst = if matches!(op, BlendvPs256) { "vblendvps" } else { "vblendvpd" };
+                let inst = if matches!(op, BlendvPs256) {
+                    "vblendvps"
+                } else {
+                    "vblendvpd"
+                };
                 // The result MUST land in %ymm0: avx_store_dest stores %ymm0,
                 // and the old code computed the blend into %ymm1 then stored
                 // %ymm0 (the mask) instead — blendv returned the mask operand
@@ -1292,12 +1954,14 @@ impl X86Codegen {
                 self.avx_store_dest(dest_ptr);
             }
             // FMA 256 (a, b, c)
-            FmaPs132v256 | FmaPs213v256 | FmaPs231v256
-            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
+            FmaPs132v256 | FmaPs213v256 | FmaPs231v256 | FmaPd132v256 | FmaPd213v256
+            | FmaPd231v256 => {
                 let inst = match op {
-                    FmaPs132v256 => "vfmadd132ps", FmaPs213v256 => "vfmadd213ps",
+                    FmaPs132v256 => "vfmadd132ps",
+                    FmaPs213v256 => "vfmadd213ps",
                     FmaPs231v256 => "vfmadd231ps",
-                    FmaPd132v256 => "vfmadd132pd", FmaPd213v256 => "vfmadd213pd",
+                    FmaPd132v256 => "vfmadd132pd",
+                    FmaPd213v256 => "vfmadd213pd",
                     FmaPd231v256 => "vfmadd231pd",
                     _ => unreachable!(),
                 };

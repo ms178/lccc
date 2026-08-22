@@ -77,8 +77,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // Order functions by hotness class within the TU — hot first, cold
     // last — for I-cache-friendly object layout (GCC -freorder-functions).
     // Declarations and helper functions keep their relative order (class 3).
-    if crate::pgo::summary::get_summary().is_some()
-        && std::env::var("LCCC_PGO_NO_REORDER").is_err()
+    if crate::pgo::summary::get_summary().is_some() && std::env::var("LCCC_PGO_NO_REORDER").is_err()
     {
         let n = m.functions.len();
         let mut cls: Vec<u8> = vec![3; n];
@@ -86,8 +85,8 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
             if f.is_declaration || f.blocks.is_empty() {
                 continue;
             }
-            let Some(fp) = crate::pgo::active_profile_for_function(f)
-                .or_else(|| p.get_for_unit(u, &f.name))
+            let Some(fp) =
+                crate::pgo::active_profile_for_function(f).or_else(|| p.get_for_unit(u, &f.name))
             else {
                 continue;
             };
@@ -174,8 +173,7 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
     // Hot loop headers and join points get 16-byte alignment. Very hot loop
     // headers with larger bodies get 32-byte alignment. Candidates are gated
     // on per-block execution count, so cold blocks receive no padding.
-    if std::env::var("LCCC_PGO_NO_ALIGN").is_err()
-    {
+    if std::env::var("LCCC_PGO_NO_ALIGN").is_err() {
         let mut align_map: crate::common::fx_hash::FxHashMap<u32, u8> =
             crate::common::fx_hash::FxHashMap::default();
         for f in &m.functions {
@@ -192,7 +190,11 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
             for b in &f.blocks {
                 match &b.terminator {
                     Terminator::Branch(x) => *indeg.entry(x.0).or_insert(0) += 1,
-                    Terminator::CondBranch { true_label, false_label, .. } => {
+                    Terminator::CondBranch {
+                        true_label,
+                        false_label,
+                        ..
+                    } => {
                         *indeg.entry(true_label.0).or_insert(0) += 1;
                         *indeg.entry(false_label.0).or_insert(0) += 1;
                     }
@@ -202,7 +204,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                         }
                         *indeg.entry(default.0).or_insert(0) += 1;
                     }
-                    Terminator::IndirectBranch { possible_targets, .. } => {
+                    Terminator::IndirectBranch {
+                        possible_targets, ..
+                    } => {
                         for x in possible_targets {
                             *indeg.entry(x.0).or_insert(0) += 1;
                         }
@@ -240,7 +244,11 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                 };
                 match &p.terminator {
                     Terminator::Branch(x) => mark(x.0),
-                    Terminator::CondBranch { true_label, false_label, .. } => {
+                    Terminator::CondBranch {
+                        true_label,
+                        false_label,
+                        ..
+                    } => {
                         mark(true_label.0);
                         mark(false_label.0);
                     }
@@ -250,7 +258,9 @@ pub fn layout_module(m: &mut IrModule, p: &ProfileData, u: &str) {
                         }
                         mark(default.0);
                     }
-                    Terminator::IndirectBranch { possible_targets, .. } => {
+                    Terminator::IndirectBranch {
+                        possible_targets, ..
+                    } => {
                         for x in possible_targets {
                             mark(x.0);
                         }
@@ -429,8 +439,6 @@ fn layout_function(
     if ordered.len() == f.blocks.len() {
         f.blocks = ordered;
     }
-
-
 
     // Sort switch cases by edge frequency so compare-and-branch chains test
     // likely cases first. Only derived, non-drifted edge counts are valid.

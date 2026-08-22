@@ -246,12 +246,26 @@ pub(crate) fn parse_generic_sysreg(name: &str) -> Result<u32, String> {
 
     // Format: s<op0>_<op1>_c<CRn>_c<CRm>_<op2>
     let parts: Vec<&str> = name.split('_').collect();
-    if parts.len() == 5 && parts[0].starts_with('s') && parts[2].starts_with('c') && parts[3].starts_with('c') {
-        let op0: u32 = parts[0][1..].parse().map_err(|_| format!("unsupported system register: {}", name))?;
-        let op1: u32 = parts[1].parse().map_err(|_| format!("unsupported system register: {}", name))?;
-        let crn: u32 = parts[2][1..].parse().map_err(|_| format!("unsupported system register: {}", name))?;
-        let crm: u32 = parts[3][1..].parse().map_err(|_| format!("unsupported system register: {}", name))?;
-        let op2: u32 = parts[4].parse().map_err(|_| format!("unsupported system register: {}", name))?;
+    if parts.len() == 5
+        && parts[0].starts_with('s')
+        && parts[2].starts_with('c')
+        && parts[3].starts_with('c')
+    {
+        let op0: u32 = parts[0][1..]
+            .parse()
+            .map_err(|_| format!("unsupported system register: {}", name))?;
+        let op1: u32 = parts[1]
+            .parse()
+            .map_err(|_| format!("unsupported system register: {}", name))?;
+        let crn: u32 = parts[2][1..]
+            .parse()
+            .map_err(|_| format!("unsupported system register: {}", name))?;
+        let crm: u32 = parts[3][1..]
+            .parse()
+            .map_err(|_| format!("unsupported system register: {}", name))?;
+        let op2: u32 = parts[4]
+            .parse()
+            .map_err(|_| format!("unsupported system register: {}", name))?;
         let enc = sysreg_encoding(op0, op1, crn, crm, op2);
         Ok(enc)
     } else {
@@ -409,8 +423,8 @@ pub(crate) fn encode_ic(raw_operands: &str) -> Result<EncodeResult, String> {
     };
     let base = match op_name.as_str() {
         "ialluis" => 0xd508711fu32,
-        "iallu"   => 0xd508751f,
-        "ivau"    => 0xd50b7520,
+        "iallu" => 0xd508751f,
+        "ivau" => 0xd50b7520,
         _ => return Err(format!("unsupported ic operation: {}", op_name)),
     };
     let word = (base & !0x1F) | rt;
@@ -448,15 +462,32 @@ pub(crate) fn encode_at(_operands: &[Operand], raw_operands: &str) -> Result<Enc
 pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.split(',').map(|s| s.trim()).collect();
     if parts.len() < 4 {
-        return Err(format!("sys needs at least 4 operands, got: {}", raw_operands));
+        return Err(format!(
+            "sys needs at least 4 operands, got: {}",
+            raw_operands
+        ));
     }
-    let op1: u32 = parts[0].trim_start_matches('#').trim().parse()
+    let op1: u32 = parts[0]
+        .trim_start_matches('#')
+        .trim()
+        .parse()
         .map_err(|_| format!("sys: invalid op1: {}", parts[0]))?;
-    let crn: u32 = parts[1].trim().to_lowercase().trim_start_matches('c').parse()
+    let crn: u32 = parts[1]
+        .trim()
+        .to_lowercase()
+        .trim_start_matches('c')
+        .parse()
         .map_err(|_| format!("sys: invalid CRn: {}", parts[1]))?;
-    let crm: u32 = parts[2].trim().to_lowercase().trim_start_matches('c').parse()
+    let crm: u32 = parts[2]
+        .trim()
+        .to_lowercase()
+        .trim_start_matches('c')
+        .parse()
         .map_err(|_| format!("sys: invalid CRm: {}", parts[2]))?;
-    let op2: u32 = parts[3].trim_start_matches('#').trim().parse()
+    let op2: u32 = parts[3]
+        .trim_start_matches('#')
+        .trim()
+        .parse()
         .map_err(|_| format!("sys: invalid op2: {}", parts[3]))?;
     let rt = if parts.len() >= 5 {
         let reg = parts[4].trim().to_lowercase();
@@ -464,7 +495,12 @@ pub(crate) fn encode_sys(raw_operands: &str) -> Result<EncodeResult, String> {
     } else {
         31 // xzr if no register specified
     };
-    let word = 0xd5080000 | ((op1 & 7) << 16) | ((crn & 0xF) << 12) | ((crm & 0xF) << 8) | ((op2 & 7) << 5) | rt;
+    let word = 0xd5080000
+        | ((op1 & 7) << 16)
+        | ((crn & 0xF) << 12)
+        | ((crm & 0xF) << 8)
+        | ((op2 & 7) << 5)
+        | rt;
     Ok(EncodeResult::Word(word))
 }
 
@@ -474,7 +510,10 @@ pub(crate) fn encode_brk(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(word))
 }
 
-pub(crate) fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<EncodeResult, String> {
+pub(crate) fn encode_tlbi(
+    _operands: &[Operand],
+    raw_operands: &str,
+) -> Result<EncodeResult, String> {
     let parts: Vec<&str> = raw_operands.splitn(2, ',').collect();
     let op_name = parts[0].trim().to_lowercase();
     let rt = if parts.len() > 1 {
@@ -488,49 +527,49 @@ pub(crate) fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<E
     let base = match op_name.as_str() {
         // Standard ARMv8.0 TLBI operations
         "vmalle1is" => 0xd508831fu32,
-        "vmalle1"   => 0xd508871f,
-        "alle1is"   => 0xd50c839f,
-        "alle1"     => 0xd50c879f,
-        "alle2is"   => 0xd50c831f,
-        "vale1is"   => 0xd50883a0,
-        "vale1"     => 0xd50887a0,
-        "vale2is"   => 0xd50c83a0,
-        "vale2"     => 0xd50c87a0,
-        "vaae1is"   => 0xd5088360,
-        "vaae1"     => 0xd5088760,
-        "vaale1is"  => 0xd50883e0,
-        "vaale1"    => 0xd50887e0,
-        "vae1is"    => 0xd5088320,
-        "vae1"      => 0xd5088720,
-        "vae2is"    => 0xd50c8320,
-        "vae2"      => 0xd50c8720,
-        "aside1is"  => 0xd5088340,
-        "aside1"    => 0xd5088740,
+        "vmalle1" => 0xd508871f,
+        "alle1is" => 0xd50c839f,
+        "alle1" => 0xd50c879f,
+        "alle2is" => 0xd50c831f,
+        "vale1is" => 0xd50883a0,
+        "vale1" => 0xd50887a0,
+        "vale2is" => 0xd50c83a0,
+        "vale2" => 0xd50c87a0,
+        "vaae1is" => 0xd5088360,
+        "vaae1" => 0xd5088760,
+        "vaale1is" => 0xd50883e0,
+        "vaale1" => 0xd50887e0,
+        "vae1is" => 0xd5088320,
+        "vae1" => 0xd5088720,
+        "vae2is" => 0xd50c8320,
+        "vae2" => 0xd50c8720,
+        "aside1is" => 0xd5088340,
+        "aside1" => 0xd5088740,
         "vmalls12e1is" => 0xd50c83df,
-        "vmalls12e1"   => 0xd50c87df,
-        "ipas2e1is"    => 0xd50c8020,
-        "ipas2e1"      => 0xd50c8420,
-        "ipas2le1is"   => 0xd50c80a0,
-        "ipas2le1"     => 0xd50c84a0,
+        "vmalls12e1" => 0xd50c87df,
+        "ipas2e1is" => 0xd50c8020,
+        "ipas2e1" => 0xd50c8420,
+        "ipas2le1is" => 0xd50c80a0,
+        "ipas2le1" => 0xd50c84a0,
         // FEAT_TLBIRANGE: range TLBI operations (ARMv8.4-A)
-        "rvae1is"      => 0xd5088220,
-        "rvale1is"     => 0xd50882a0,
-        "rvaae1is"     => 0xd5088260,
-        "rvaale1is"    => 0xd50882e0,
-        "rvae1"        => 0xd5088620,
-        "rvale1"       => 0xd50886a0,
-        "rvaae1"       => 0xd5088660,
-        "rvaale1"      => 0xd50886e0,
-        "rvae1os"      => 0xd5088520,
-        "rvale1os"     => 0xd50885a0,
-        "rvaae1os"     => 0xd5088560,
-        "rvaale1os"    => 0xd50885e0,
-        "ripas2e1is"   => 0xd50c8040,
-        "ripas2e1"     => 0xd50c8440,
-        "ripas2e1os"   => 0xd50c8460,
-        "ripas2le1is"  => 0xd50c80c0,
-        "ripas2le1"    => 0xd50c84c0,
-        "ripas2le1os"  => 0xd50c84e0,
+        "rvae1is" => 0xd5088220,
+        "rvale1is" => 0xd50882a0,
+        "rvaae1is" => 0xd5088260,
+        "rvaale1is" => 0xd50882e0,
+        "rvae1" => 0xd5088620,
+        "rvale1" => 0xd50886a0,
+        "rvaae1" => 0xd5088660,
+        "rvaale1" => 0xd50886e0,
+        "rvae1os" => 0xd5088520,
+        "rvale1os" => 0xd50885a0,
+        "rvaae1os" => 0xd5088560,
+        "rvaale1os" => 0xd50885e0,
+        "ripas2e1is" => 0xd50c8040,
+        "ripas2e1" => 0xd50c8440,
+        "ripas2e1os" => 0xd50c8460,
+        "ripas2le1is" => 0xd50c80c0,
+        "ripas2le1" => 0xd50c84c0,
+        "ripas2le1os" => 0xd50c84e0,
         _ => return Err(format!("unsupported tlbi operation: {}", op_name)),
     };
     // Replace Rt field (bits 4:0)
@@ -542,10 +581,10 @@ pub(crate) fn encode_tlbi(_operands: &[Operand], raw_operands: &str) -> Result<E
 pub(crate) fn encode_bti(raw_operands: &str) -> Result<EncodeResult, String> {
     let target = raw_operands.trim().to_lowercase();
     let word = match target.as_str() {
-        "" => 0xd503241f,    // bti (no target)
-        "c" => 0xd503245f,   // bti c
-        "j" => 0xd503249f,   // bti j
-        "jc" => 0xd50324df,  // bti jc
+        "" => 0xd503241f,   // bti (no target)
+        "c" => 0xd503245f,  // bti c
+        "j" => 0xd503249f,  // bti j
+        "jc" => 0xd50324df, // bti jc
         _ => return Err(format!("unsupported bti target: {}", target)),
     };
     Ok(EncodeResult::Word(word))

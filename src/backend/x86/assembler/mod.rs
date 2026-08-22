@@ -9,12 +9,12 @@
 //! - `encoder.rs`    – Encode x86-64 instructions into machine code bytes
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
-pub mod parser;
-pub mod encoder;
 pub mod elf_writer;
+pub mod encoder;
+pub mod parser;
 
-use parser::parse_asm;
 use elf_writer::ElfWriter;
+use parser::parse_asm;
 
 /// Assemble AT&T syntax x86-64 assembly text into an ELF object file.
 ///

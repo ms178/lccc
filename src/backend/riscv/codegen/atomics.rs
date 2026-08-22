@@ -8,10 +8,10 @@
 //! zeros, count trailing zeros, byte swap, and population count for targets that
 //! lack the Zbb extension.
 
-use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::CodegenState;
 use super::emit::RiscvCodegen;
+use crate::backend::state::CodegenState;
+use crate::common::types::IrType;
+use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
 
 impl RiscvCodegen {
     /// Get the AMO ordering suffix.
@@ -107,11 +107,11 @@ impl RiscvCodegen {
             self.state.emit("    li a4, 0xff");
         } else {
             // 16-bit: can't use andi with 0xffff, load it
-            self.state.emit("    lui a4, 16");     // a4 = 0x10000
+            self.state.emit("    lui a4, 16"); // a4 = 0x10000
             self.state.emit("    addiw a4, a4, -1"); // a4 = 0xFFFF
         }
         self.state.emit("    sllw a4, a4, a3"); // a4 = mask << shift
-        // a5 = ~mask (inverted mask for clearing the field)
+                                                // a5 = ~mask (inverted mask for clearing the field)
         self.state.emit("    not a5, a4");
         // Shift the value into position: t2 = (val & field_mask) << shift
         if bits == 8 {
@@ -124,7 +124,8 @@ impl RiscvCodegen {
 
         // LR/SC loop
         self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
+        self.state
+            .emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
 
         match op {
             AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
@@ -137,7 +138,7 @@ impl RiscvCodegen {
                     self.state.emit("    mv t3, t2");
                 }
                 self.state.emit("    and t4, t0, a5"); // clear old field
-                self.state.emit("    or t4, t4, t3");  // insert new value
+                self.state.emit("    or t4, t4, t3"); // insert new value
             }
             AtomicRmwOp::Add => {
                 // Extract old sub-word, add val, insert result
@@ -145,7 +146,7 @@ impl RiscvCodegen {
                 self.state.emit("    add t3, t3, t2"); // t3 = old + val (shifted)
                 self.state.emit("    and t3, t3, a4"); // mask to field width
                 self.state.emit("    and t4, t0, a5"); // clear old field
-                self.state.emit("    or t4, t4, t3");  // insert new value
+                self.state.emit("    or t4, t4, t3"); // insert new value
             }
             AtomicRmwOp::Sub => {
                 // Extract old sub-word, subtract val, insert result
@@ -153,13 +154,13 @@ impl RiscvCodegen {
                 self.state.emit("    sub t3, t3, t2"); // t3 = old - val (shifted)
                 self.state.emit("    and t3, t3, a4"); // mask to field width
                 self.state.emit("    and t4, t0, a5"); // clear old field
-                self.state.emit("    or t4, t4, t3");  // insert new value
+                self.state.emit("    or t4, t4, t3"); // insert new value
             }
             AtomicRmwOp::And => {
                 // new_field = old_field & val_field
                 // For AND: bits outside the field should remain unchanged.
                 // new_word = old_word & (val_shifted | ~mask)
-                self.state.emit("    or t3, t2, a5");  // val_shifted | ~mask
+                self.state.emit("    or t3, t2, a5"); // val_shifted | ~mask
                 self.state.emit("    and t4, t0, t3"); // old & (val | ~mask)
             }
             AtomicRmwOp::Or => {
@@ -176,16 +177,18 @@ impl RiscvCodegen {
                 // new_field = ~(old_field & val_field)
                 self.state.emit("    and t3, t0, a4"); // old field
                 self.state.emit("    and t3, t3, t2"); // old & val (shifted)
-                self.state.emit("    not t3, t3");     // ~(old & val) - full word invert
+                self.state.emit("    not t3, t3"); // ~(old & val) - full word invert
                 self.state.emit("    and t3, t3, a4"); // mask to field
                 self.state.emit("    and t4, t0, a5"); // clear old field
-                self.state.emit("    or t4, t4, t3");  // insert new value
+                self.state.emit("    or t4, t4, t3"); // insert new value
             }
         }
 
         // SC: rd (t5) must differ from rs2 (t4) per RISC-V spec
-        self.state.emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
-        self.state.emit_fmt(format_args!("    bnez t5, {}", loop_label));
+        self.state
+            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
+        self.state
+            .emit_fmt(format_args!("    bnez t5, {}", loop_label));
         self.state.emit_fmt(format_args!("{}:", done_label));
         // Extract the old sub-word value: t0 = (old_word >> shift) & field_mask
         self.state.emit("    srlw t0, t0, a3");
@@ -210,7 +213,12 @@ impl RiscvCodegen {
     ///   t0 = loaded word
     ///   t2 = shifted expected, t3 = shifted desired
     ///   t4 = new word to store, t5 = SC result flag
-    pub(super) fn emit_subword_atomic_cmpxchg(&mut self, ty: IrType, aq_rl: &str, returns_bool: bool) {
+    pub(super) fn emit_subword_atomic_cmpxchg(
+        &mut self,
+        ty: IrType,
+        aq_rl: &str,
+        returns_bool: bool,
+    ) {
         let bits = Self::subword_bits(ty);
         let loop_label = self.state.fresh_label("sw_cas_loop");
         let fail_label = self.state.fresh_label("sw_cas_fail");
@@ -249,16 +257,20 @@ impl RiscvCodegen {
 
         // LR/SC loop
         self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
+        self.state
+            .emit_fmt(format_args!("    lr.w{} t0, (a2)", aq_rl));
         // Compare only the sub-word field
         self.state.emit("    and t4, t0, a4"); // t4 = current field
-        self.state.emit_fmt(format_args!("    bne t4, t2, {}", fail_label));
+        self.state
+            .emit_fmt(format_args!("    bne t4, t2, {}", fail_label));
         // Build new word: (old & ~mask) | desired_shifted
         self.state.emit("    and t4, t0, a5");
         self.state.emit("    or t4, t4, t3");
         // SC: rd (t5) must differ from rs2 (t4) per RISC-V spec
-        self.state.emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
-        self.state.emit_fmt(format_args!("    bnez t5, {}", loop_label));
+        self.state
+            .emit_fmt(format_args!("    sc.w{} t5, t4, (a2)", aq_rl));
+        self.state
+            .emit_fmt(format_args!("    bnez t5, {}", loop_label));
         // Success
         if returns_bool {
             self.state.emit("    li t0, 1");
@@ -307,15 +319,18 @@ impl RiscvCodegen {
         }
 
         // Handle zero case: clz(0) = bits
-        self.state.emit_fmt(format_args!("    beqz t0, {}", zero_label));
+        self.state
+            .emit_fmt(format_args!("    beqz t0, {}", zero_label));
         // t1 = count = 0, scan from MSB
         self.state.emit("    li t1, 0");
         // t2 = mask = 1 << (bits-1)
         self.state.emit("    li t2, 1");
-        self.state.emit_fmt(format_args!("    slli t2, t2, {}", bits - 1));
+        self.state
+            .emit_fmt(format_args!("    slli t2, t2, {}", bits - 1));
         self.state.emit_fmt(format_args!("{}:", loop_label));
         self.state.emit("    and t3, t0, t2");
-        self.state.emit_fmt(format_args!("    bnez t3, {}", done_label));
+        self.state
+            .emit_fmt(format_args!("    bnez t3, {}", done_label));
         self.state.emit("    srli t2, t2, 1"); // shift mask right
         self.state.emit("    addi t1, t1, 1");
         self.state.emit_fmt(format_args!("    j {}", loop_label));
@@ -338,9 +353,11 @@ impl RiscvCodegen {
         self.state.emit("    li t1, 0");
         self.state.emit_fmt(format_args!("{}:", loop_label));
         self.state.emit_fmt(format_args!("    li t2, {}", bits));
-        self.state.emit_fmt(format_args!("    beq t1, t2, {}", done_label)); // if counted all bits, done
+        self.state
+            .emit_fmt(format_args!("    beq t1, t2, {}", done_label)); // if counted all bits, done
         self.state.emit("    andi t3, t0, 1");
-        self.state.emit_fmt(format_args!("    bnez t3, {}", done_label)); // found a 1 bit
+        self.state
+            .emit_fmt(format_args!("    bnez t3, {}", done_label)); // found a 1 bit
         self.state.emit("    srli t0, t0, 1");
         self.state.emit("    addi t1, t1, 1");
         self.state.emit_fmt(format_args!("    j {}", loop_label));
@@ -392,10 +409,12 @@ impl RiscvCodegen {
                 for i in 0..8u64 {
                     let src_shift = i * 8;
                     let dst_shift = (7 - i) * 8;
-                    self.state.emit_fmt(format_args!("    srli t2, t1, {}", src_shift));
+                    self.state
+                        .emit_fmt(format_args!("    srli t2, t1, {}", src_shift));
                     self.state.emit("    andi t2, t2, 0xff");
                     if dst_shift > 0 {
-                        self.state.emit_fmt(format_args!("    slli t2, t2, {}", dst_shift));
+                        self.state
+                            .emit_fmt(format_args!("    slli t2, t2, {}", dst_shift));
                     }
                     self.state.emit("    or t0, t0, t2");
                 }
@@ -418,9 +437,10 @@ impl RiscvCodegen {
         // t1 = count
         self.state.emit("    li t1, 0");
         self.state.emit_fmt(format_args!("{}:", loop_label));
-        self.state.emit_fmt(format_args!("    beqz t0, {}", done_label));
+        self.state
+            .emit_fmt(format_args!("    beqz t0, {}", done_label));
         self.state.emit("    addi t2, t0, -1"); // t2 = n - 1
-        self.state.emit("    and t0, t0, t2");   // n &= n - 1 (clear lowest set bit)
+        self.state.emit("    and t0, t0, t2"); // n &= n - 1 (clear lowest set bit)
         self.state.emit("    addi t1, t1, 1");
         self.state.emit_fmt(format_args!("    j {}", loop_label));
         self.state.emit_fmt(format_args!("{}:", done_label));
@@ -429,7 +449,15 @@ impl RiscvCodegen {
 
     // ---- Trait-level atomic operations (delegated from ArchCodegen) ----
 
-    pub(super) fn emit_atomic_rmw_impl(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_rmw_impl(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
         // Load ptr into t1, val into t2
         self.operand_to_t0(ptr);
         self.state.emit("    mv t1, t0"); // t1 = ptr
@@ -444,36 +472,46 @@ impl RiscvCodegen {
             let suffix = Self::amo_width_suffix(ty);
             match op {
                 AtomicRmwOp::Add => {
-                    self.state.emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::Sub => {
                     self.state.emit("    neg t2, t2");
-                    self.state.emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoadd.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::And => {
-                    self.state.emit_fmt(format_args!("    amoand.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoand.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::Or => {
-                    self.state.emit_fmt(format_args!("    amoor.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoor.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::Xor => {
-                    self.state.emit_fmt(format_args!("    amoxor.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoxor.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::Xchg => {
-                    self.state.emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
                 AtomicRmwOp::Nand => {
                     let loop_label = self.state.fresh_label("atomic_nand");
                     self.state.emit_fmt(format_args!("{}:", loop_label));
-                    self.state.emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
                     self.state.emit("    and t3, t0, t2");
                     self.state.emit("    not t3, t3");
-                    self.state.emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
-                    self.state.emit_fmt(format_args!("    bnez t4, {}", loop_label));
+                    self.state
+                        .emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    bnez t4, {}", loop_label));
                 }
                 AtomicRmwOp::TestAndSet => {
                     self.state.emit("    li t2, 1");
-                    self.state.emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
+                    self.state
+                        .emit_fmt(format_args!("    amoswap.{}{} t0, t2, (t1)", suffix, aq_rl));
                 }
             }
         }
@@ -481,7 +519,17 @@ impl RiscvCodegen {
         self.store_t0_to(dest);
     }
 
-    pub(super) fn emit_atomic_cmpxchg_impl(&mut self, dest: &Value, ptr: &Operand, expected: &Operand, desired: &Operand, ty: IrType, ordering: AtomicOrdering, _failure_ordering: AtomicOrdering, returns_bool: bool) {
+    pub(super) fn emit_atomic_cmpxchg_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+        _failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
         self.operand_to_t0(ptr);
         self.state.emit("    mv t1, t0");
         self.operand_to_t0(desired);
@@ -501,10 +549,14 @@ impl RiscvCodegen {
             let done_label = self.state.fresh_label("cas_done");
 
             self.state.emit_fmt(format_args!("{}:", loop_label));
-            self.state.emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
-            self.state.emit_fmt(format_args!("    bne t0, t2, {}", fail_label));
-            self.state.emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
-            self.state.emit_fmt(format_args!("    bnez t4, {}", loop_label));
+            self.state
+                .emit_fmt(format_args!("    lr.{}{} t0, (t1)", suffix, aq_rl));
+            self.state
+                .emit_fmt(format_args!("    bne t0, t2, {}", fail_label));
+            self.state
+                .emit_fmt(format_args!("    sc.{}{} t4, t3, (t1)", suffix, aq_rl));
+            self.state
+                .emit_fmt(format_args!("    bnez t4, {}", loop_label));
             if returns_bool {
                 self.state.emit("    li t0, 1");
             }
@@ -518,7 +570,13 @@ impl RiscvCodegen {
         self.store_t0_to(dest);
     }
 
-    pub(super) fn emit_atomic_load_impl(&mut self, dest: &Value, ptr: &Operand, ty: IrType, ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
         self.operand_to_t0(ptr);
         if Self::is_subword_type(ty) {
             if matches!(ordering, AtomicOrdering::SeqCst) {
@@ -531,7 +589,10 @@ impl RiscvCodegen {
                 IrType::U16 => self.state.emit("    lhu t0, 0(t0)"),
                 _ => unreachable!("non-subword type in subword atomic load: {:?}", ty),
             }
-            if matches!(ordering, AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
+            if matches!(
+                ordering,
+                AtomicOrdering::Acquire | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+            ) {
                 self.state.emit("    fence r, rw");
             }
         } else {
@@ -541,18 +602,28 @@ impl RiscvCodegen {
                 AtomicOrdering::Acquire => ".aq",
                 AtomicOrdering::AcqRel | AtomicOrdering::SeqCst => ".aqrl",
             };
-            self.state.emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
+            self.state
+                .emit_fmt(format_args!("    lr.{}{} t0, (t0)", suffix, lr_suffix));
             Self::sign_extend_riscv(&mut self.state, ty);
         }
         self.store_t0_to(dest);
     }
 
-    pub(super) fn emit_atomic_store_impl(&mut self, ptr: &Operand, val: &Operand, ty: IrType, ordering: AtomicOrdering) {
+    pub(super) fn emit_atomic_store_impl(
+        &mut self,
+        ptr: &Operand,
+        val: &Operand,
+        ty: IrType,
+        ordering: AtomicOrdering,
+    ) {
         self.operand_to_t0(val);
         self.state.emit("    mv t1, t0"); // t1 = val
         self.operand_to_t0(ptr);
         if Self::is_subword_type(ty) {
-            if matches!(ordering, AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst) {
+            if matches!(
+                ordering,
+                AtomicOrdering::Release | AtomicOrdering::AcqRel | AtomicOrdering::SeqCst
+            ) {
                 self.state.emit("    fence rw, w");
             }
             match ty {
@@ -566,7 +637,10 @@ impl RiscvCodegen {
         } else {
             let aq_rl = Self::amo_ordering(ordering);
             let suffix = Self::amo_width_suffix(ty);
-            self.state.emit_fmt(format_args!("    amoswap.{}{} zero, t1, (t0)", suffix, aq_rl));
+            self.state.emit_fmt(format_args!(
+                "    amoswap.{}{} zero, t1, (t0)",
+                suffix, aq_rl
+            ));
         }
     }
 

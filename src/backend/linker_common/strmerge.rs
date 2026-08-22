@@ -23,11 +23,8 @@ use super::SectionData;
 use super::SymStr;
 use crate::common::fx_hash::FxHashMap;
 
-use crate::backend::elf::{
-    SHT_PROGBITS, SHF_ALLOC, SHF_MERGE, SHF_STRINGS,
-    STT_SECTION,
-};
 use super::types::Elf64Object;
+use crate::backend::elf::{SHF_ALLOC, SHF_MERGE, SHF_STRINGS, SHT_PROGBITS, STT_SECTION};
 
 /// x86-64 relocation types with a recoverable target offset, and their
 /// instruction bias: `target = S + A + bias`.
@@ -74,7 +71,9 @@ impl StringMergePlan {
     }
 
     /// Recoverable-bias lookup for the emitter.
-    pub fn bias(rtype: u32) -> Option<i64> { reloc_bias_x86(rtype) }
+    pub fn bias(rtype: u32) -> Option<i64> {
+        reloc_bias_x86(rtype)
+    }
 
     /// Map an offset inside an input merge section to
     /// `(pool_idx, new_offset_in_pool)`. Offsets that point into the middle
@@ -83,10 +82,14 @@ impl StringMergePlan {
         let r = self.remaps.get(&(obj, sec))?;
         // binary search for the entry containing `off`
         let i = r.entries.partition_point(|&(start, _, _)| start <= off);
-        if i == 0 { return None; }
+        if i == 0 {
+            return None;
+        }
         let (start, new_off, len) = r.entries[i - 1];
         let delta = off - start;
-        if delta > len { return None; } // past entry end (== len allowed: end pointer)
+        if delta > len {
+            return None;
+        } // past entry end (== len allowed: end pointer)
         Some((r.pool_idx, new_off + delta))
     }
 }
@@ -102,34 +105,65 @@ pub fn plan_string_merge(
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
-            if sec.sh_type != SHT_PROGBITS { continue; }
-            if sec.flags & SHF_MERGE == 0 || sec.flags & SHF_ALLOC == 0 { continue; }
-            if sec.flags & 0x1 != 0 { continue; } // SHF_WRITE: never dedup writable
-            if dead.contains(&(oi, si)) { continue; }
-            if sec.size == 0 { continue; }
+            if sec.sh_type != SHT_PROGBITS {
+                continue;
+            }
+            if sec.flags & SHF_MERGE == 0 || sec.flags & SHF_ALLOC == 0 {
+                continue;
+            }
+            if sec.flags & 0x1 != 0 {
+                continue;
+            } // SHF_WRITE: never dedup writable
+            if dead.contains(&(oi, si)) {
+                continue;
+            }
+            if sec.size == 0 {
+                continue;
+            }
             let data = &obj.section_data[si];
-            if data.len() != sec.size as usize { continue; }
+            if data.len() != sec.size as usize {
+                continue;
+            }
             if sec.flags & SHF_STRINGS != 0 {
-                if sec.entsize != 1 { continue; }         // wide strings: keep as-is
-                if *data.last().unwrap_or(&1) != 0 { continue; } // must end with NUL
+                if sec.entsize != 1 {
+                    continue;
+                } // wide strings: keep as-is
+                if *data.last().unwrap_or(&1) != 0 {
+                    continue;
+                } // must end with NUL
             } else {
                 let ent = sec.entsize;
-                if ent == 0 || ent > 32 || data.len() as u64 % ent != 0 { continue; }
+                if ent == 0 || ent > 32 || data.len() as u64 % ent != 0 {
+                    continue;
+                }
             }
             // A merge section that itself HAS relocations cannot be reordered
             // safely (entry contents would change) — extremely rare; skip.
-            if obj.relocations.get(si).map(|r| !r.is_empty()).unwrap_or(false) { continue; }
+            if obj
+                .relocations
+                .get(si)
+                .map(|r| !r.is_empty())
+                .unwrap_or(false)
+            {
+                continue;
+            }
             // Global/weak named symbols inside a merge section would need
             // their (value+addend) remapped through the global table across
             // objects; compilers only emit local .LC* labels here, so
             // disqualify the exotic case instead of risking corruption.
-            let has_global_sym = obj.symbols.iter().any(|sym|
-                !sym.is_local() && sym.shndx as usize == si);
-            if has_global_sym { continue; }
+            let has_global_sym = obj
+                .symbols
+                .iter()
+                .any(|sym| !sym.is_local() && sym.shndx as usize == si);
+            if has_global_sym {
+                continue;
+            }
             candidates.push((oi, si));
         }
     }
-    if candidates.is_empty() { return None; }
+    if candidates.is_empty() {
+        return None;
+    }
 
     // 2. Disqualify sections referenced by un-recoverable relocation types
     //    from ALLOC sections (their relocs must be remappable).
@@ -139,15 +173,26 @@ pub fn plan_string_merge(
         crate::common::fx_hash::FxHashSet::default();
     for (oi, obj) in objects.iter().enumerate() {
         for (from_sec, relas) in obj.relocations.iter().enumerate() {
-            if relas.is_empty() { continue; }
-            let from_alloc = obj.sections.get(from_sec)
-                .map(|s| s.flags & SHF_ALLOC != 0).unwrap_or(false);
-            if !from_alloc { continue; }
+            if relas.is_empty() {
+                continue;
+            }
+            let from_alloc = obj
+                .sections
+                .get(from_sec)
+                .map(|s| s.flags & SHF_ALLOC != 0)
+                .unwrap_or(false);
+            if !from_alloc {
+                continue;
+            }
             for rela in relas {
                 let si = rela.sym_idx as usize;
-                let Some(sym) = obj.symbols.get(si) else { continue };
+                let Some(sym) = obj.symbols.get(si) else {
+                    continue;
+                };
                 let tsec = sym.shndx as usize;
-                if !cand_set.contains(&(oi, tsec)) { continue; }
+                if !cand_set.contains(&(oi, tsec)) {
+                    continue;
+                }
                 if reloc_bias_x86(rela.rela_type).is_none() {
                     disqualified.insert((oi, tsec));
                 }
@@ -166,7 +211,9 @@ pub fn plan_string_merge(
     let mut remaps: FxHashMap<(usize, usize), SecRemap> = FxHashMap::default();
 
     for &(oi, si) in &candidates {
-        if disqualified.contains(&(oi, si)) { continue; }
+        if disqualified.contains(&(oi, si)) {
+            continue;
+        }
         let sec = &objects[oi].sections[si];
         let data = &objects[oi].section_data[si];
         // Key pools by the INPUT section name: .rodata.str1.1 and
@@ -191,8 +238,12 @@ pub fn plan_string_merge(
             }
         };
         let align = sec.addralign.max(1);
-        if align > pools[pool_idx].align { pools[pool_idx].align = align; }
-        if pools[pool_idx].entsize != sec.entsize { pools[pool_idx].entsize = 0; }
+        if align > pools[pool_idx].align {
+            pools[pool_idx].align = align;
+        }
+        if pools[pool_idx].entsize != sec.entsize {
+            pools[pool_idx].entsize = 0;
+        }
 
         let mut entries: Vec<(u64, u64, u64)> = Vec::new();
         let is_strings = sec.flags & SHF_STRINGS != 0;
@@ -215,7 +266,9 @@ pub fn plan_string_merge(
                     // entry (e.g. .rodata.str1.8 aligns strings to 8).
                     let a = align;
                     if a > 1 {
-                        while pool.data.len() as u64 % a != 0 { pool.data.push(0); }
+                        while pool.data.len() as u64 % a != 0 {
+                            pool.data.push(0);
+                        }
                     }
                     let o = pool.data.len() as u64;
                     pool.data.extend_from_slice(entry);
@@ -229,7 +282,9 @@ pub fn plan_string_merge(
         remaps.insert((oi, si), SecRemap { entries, pool_idx });
     }
 
-    if remaps.is_empty() { return None; }
+    if remaps.is_empty() {
+        return None;
+    }
     Some(StringMergePlan { remaps, pools })
 }
 
@@ -249,8 +304,8 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
     dead_sections: &mut crate::common::fx_hash::FxHashSet<(usize, usize)>,
     plan: &StringMergePlan,
 ) -> bool {
-    use crate::backend::elf::{STB_GLOBAL, STT_OBJECT};
     use super::types::{Elf64Section, Elf64Symbol};
+    use crate::backend::elf::{STB_GLOBAL, STT_OBJECT};
 
     let synth_idx = objects.len();
     let pool_sym_name = |i: usize| format!("__lccc.strmerge.{}", i);
@@ -269,12 +324,19 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
         let mut newly_excluded = false;
         'objs: for (oi, obj) in objects.iter().enumerate() {
             for (from_sec, relas) in obj.relocations.iter().enumerate() {
-                let from_alloc = obj.sections.get(from_sec)
-                    .map(|s| s.flags & SHF_ALLOC != 0).unwrap_or(false);
+                let from_alloc = obj
+                    .sections
+                    .get(from_sec)
+                    .map(|s| s.flags & SHF_ALLOC != 0)
+                    .unwrap_or(false);
                 for (ri, rela) in relas.iter().enumerate() {
-                    let Some(sym) = obj.symbols.get(rela.sym_idx as usize) else { continue };
+                    let Some(sym) = obj.symbols.get(rela.sym_idx as usize) else {
+                        continue;
+                    };
                     let tsec = sym.shndx as usize;
-                    if !plan.contains(oi, tsec) || excluded.contains(&(oi, tsec)) { continue; }
+                    if !plan.contains(oi, tsec) || excluded.contains(&(oi, tsec)) {
+                        continue;
+                    }
                     let Some(bias) = reloc_bias_x86(rela.rela_type) else {
                         if from_alloc {
                             // Unexpected reloc type (pre-scan should have
@@ -286,17 +348,21 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
                         continue; // non-alloc referrer (debug): not emitted
                     };
                     let old_off = sym.value as i64 + rela.addend + bias;
-                    let mapped = if old_off < 0 { None }
-                        else { plan.remap(oi, tsec, old_off as u64) };
+                    let mapped = if old_off < 0 {
+                        None
+                    } else {
+                        plan.remap(oi, tsec, old_off as u64)
+                    };
                     match mapped {
                         Some((pool_idx, new_off)) => {
-                            rewrites.push((oi, from_sec, ri, pool_idx,
-                                           new_off as i64 - bias));
+                            rewrites.push((oi, from_sec, ri, pool_idx, new_off as i64 - bias));
                         }
                         None => {
                             if debug {
-                                eprintln!("[strmerge] exclude {} sec {}: off {} (rtype {})",
-                                    obj.source_name, tsec, old_off, rela.rela_type);
+                                eprintln!(
+                                    "[strmerge] exclude {} sec {}: off {} (rtype {})",
+                                    obj.source_name, tsec, old_off, rela.rela_type
+                                );
                             }
                             excluded.insert((oi, tsec));
                             newly_excluded = true;
@@ -306,44 +372,67 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
                 }
             }
         }
-        if !newly_excluded { break; }
+        if !newly_excluded {
+            break;
+        }
     }
 
     // ── Commit ──────────────────────────────────────────────────────────
     // Synthetic object: NULL section at index 0 (shndx 0 == SHN_UNDEF), pools after.
     let mut sections = vec![Elf64Section {
-        name_idx: 0, name: String::new(), sh_type: 0, flags: 0, addr: 0,
-        offset: 0, size: 0, link: 0, info: 0, addralign: 0, entsize: 0,
+        name_idx: 0,
+        name: String::new(),
+        sh_type: 0,
+        flags: 0,
+        addr: 0,
+        offset: 0,
+        size: 0,
+        link: 0,
+        info: 0,
+        addralign: 0,
+        entsize: 0,
     }];
     let mut section_data = vec![SectionData::empty()];
     let mut symbols = Vec::new();
     for (i, pool) in plan.pools.iter().enumerate() {
         let shndx = sections.len() as u16;
         sections.push(Elf64Section {
-            name_idx: 0, name: pool.name.clone(), sh_type: SHT_PROGBITS,
+            name_idx: 0,
+            name: pool.name.clone(),
+            sh_type: SHT_PROGBITS,
             // Strip SHF_MERGE|SHF_STRINGS from the output: the pool is already
             // deduplicated and may mix entry sizes, so the mergeable contract
             // no longer holds (mold/lld emit plain A here too).
             flags: pool.flags & !(SHF_MERGE | SHF_STRINGS),
-            addr: 0, offset: 0,
-            size: pool.data.len() as u64, link: 0, info: 0,
-            addralign: pool.align, entsize: 0,
+            addr: 0,
+            offset: 0,
+            size: pool.data.len() as u64,
+            link: 0,
+            info: 0,
+            addralign: pool.align,
+            entsize: 0,
         });
         section_data.push(SectionData::owned(pool.data.clone()));
         let sym = Elf64Symbol {
-            name_idx: 0, name: SymStr::new(&pool_sym_name(i)),
+            name_idx: 0,
+            name: SymStr::new(&pool_sym_name(i)),
             // LOCAL binding in the DEFINITION keeps the pool symbol out of
             // --export-dynamic / dynsym; lookups still work because they go
             // through the globals map by name.
-            info: STT_OBJECT, other: 2 /* STV_HIDDEN */,
-            shndx, value: 0, size: pool.data.len() as u64,
+            info: STT_OBJECT,
+            other: 2, /* STV_HIDDEN */
+            shndx,
+            value: 0,
+            size: pool.data.len() as u64,
         };
         globals.insert(pool_sym_name(i), G::new_defined(synth_idx, &sym));
         symbols.push(sym);
     }
     let n_secs = sections.len();
     objects.push(Elf64Object {
-        sections, symbols, section_data,
+        sections,
+        symbols,
+        section_data,
         relocations: vec![Vec::new(); n_secs],
         source_name: "<string-merge>".into(),
     });
@@ -358,9 +447,13 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
             None => {
                 let i = objects[oi].symbols.len() as u32;
                 objects[oi].symbols.push(Elf64Symbol {
-                    name_idx: 0, name: SymStr::new(&pool_sym_name(pool_idx)),
-                    info: (STB_GLOBAL << 4) | STT_OBJECT, other: 0,
-                    shndx: 0 /* SHN_UNDEF */, value: 0, size: 0,
+                    name_idx: 0,
+                    name: SymStr::new(&pool_sym_name(pool_idx)),
+                    info: (STB_GLOBAL << 4) | STT_OBJECT,
+                    other: 0,
+                    shndx: 0, /* SHN_UNDEF */
+                    value: 0,
+                    size: 0,
                 });
                 per_obj_sym.insert((oi, pool_idx), i);
                 i
@@ -383,7 +476,7 @@ pub fn apply_string_merge<G: super::symbols::GlobalSymbolOps>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::linker_common::types::{Elf64Object, Elf64Section, Elf64Symbol, Elf64Rela};
+    use crate::backend::linker_common::types::{Elf64Object, Elf64Rela, Elf64Section, Elf64Symbol};
 
     fn mk_obj(secs: Vec<(&str, u64, u64, Vec<u8>)>) -> Elf64Object {
         // (name, flags, entsize, data)
@@ -391,15 +484,25 @@ mod tests {
         let mut section_data = Vec::new();
         for (name, flags, entsize, data) in secs {
             sections.push(Elf64Section {
-                name_idx: 0, name: name.to_string(), sh_type: SHT_PROGBITS,
-                flags, addr: 0, offset: 0, size: data.len() as u64,
-                link: 0, info: 0, addralign: 1, entsize,
+                name_idx: 0,
+                name: name.to_string(),
+                sh_type: SHT_PROGBITS,
+                flags,
+                addr: 0,
+                offset: 0,
+                size: data.len() as u64,
+                link: 0,
+                info: 0,
+                addralign: 1,
+                entsize,
             });
             section_data.push(SectionData::owned(data));
         }
         let n = sections.len();
         Elf64Object {
-            sections, symbols: Vec::<Elf64Symbol>::new(), section_data,
+            sections,
+            symbols: Vec::<Elf64Symbol>::new(),
+            section_data,
             relocations: vec![Vec::<Elf64Rela>::new(); n],
             source_name: "test.o".into(),
         }
@@ -428,10 +531,13 @@ mod tests {
     #[test]
     fn fixed_size_entries() {
         const MF: u64 = SHF_ALLOC | SHF_MERGE;
-        let o1 = mk_obj(vec![(".rodata.cst8", MF, 8,
-            vec![1,0,0,0,0,0,0,0, 2,0,0,0,0,0,0,0])]);
-        let o2 = mk_obj(vec![(".rodata.cst8", MF, 8,
-            vec![2,0,0,0,0,0,0,0])]);
+        let o1 = mk_obj(vec![(
+            ".rodata.cst8",
+            MF,
+            8,
+            vec![1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0],
+        )]);
+        let o2 = mk_obj(vec![(".rodata.cst8", MF, 8, vec![2, 0, 0, 0, 0, 0, 0, 0])]);
         let objs = vec![o1, o2];
         let dead = crate::common::fx_hash::FxHashSet::default();
         let plan = plan_string_merge(&objs, &dead, |n| n).expect("plan");

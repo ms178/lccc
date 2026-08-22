@@ -8,9 +8,9 @@
 //! The only architecture-specific difference is that RISC-V needs to include
 //! referenced local labels (for pcrel_hi synthetic labels) in the symbol table.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::constants::*;
 use super::object_writer::ObjSection;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 /// A symbol in a relocatable object file.
 pub struct ObjSymbol {
@@ -85,13 +85,18 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
             size: input.symbol_sizes.get(name).copied().unwrap_or(0),
             binding,
             sym_type: input.symbol_types.get(name).copied().unwrap_or(STT_NOTYPE),
-            visibility: input.symbol_visibility.get(name).copied().unwrap_or(STV_DEFAULT),
+            visibility: input
+                .symbol_visibility
+                .get(name)
+                .copied()
+                .unwrap_or(STV_DEFAULT),
             section_name: section.clone(),
         });
     }
 
     // Add alias symbols from .set/.equ directives
-    let defined_names: FxHashMap<String, usize> = symbols.iter()
+    let defined_names: FxHashMap<String, usize> = symbols
+        .iter()
         .enumerate()
         .map(|(i, s)| (s.name.clone(), i))
         .collect();
@@ -211,9 +216,17 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
                 size: 0,
                 binding,
                 sym_type: input.symbol_types.get(name).copied().unwrap_or_else(|| {
-                    if tls_referenced.contains(name) { STT_TLS } else { STT_NOTYPE }
+                    if tls_referenced.contains(name) {
+                        STT_TLS
+                    } else {
+                        STT_NOTYPE
+                    }
                 }),
-                visibility: input.symbol_visibility.get(name).copied().unwrap_or(STV_DEFAULT),
+                visibility: input
+                    .symbol_visibility
+                    .get(name)
+                    .copied()
+                    .unwrap_or(STV_DEFAULT),
                 section_name: "*UND*".to_string(),
             });
         }

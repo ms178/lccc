@@ -9,21 +9,14 @@ use crate::common::fx_hash::FxHashMap;
 
 // Re-export shared ELF constants used throughout the linker
 pub(super) use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS32, ELFDATA2LSB, EV_CURRENT,
-    ET_EXEC, ET_DYN, ET_REL, EM_386,
-    PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_PHDR, PT_TLS, PT_GNU_STACK, PT_GNU_EH_FRAME,
-    SHT_NULL, SHT_PROGBITS, SHT_SYMTAB, SHT_STRTAB, SHT_RELA,
-    SHT_NOBITS, SHT_REL, SHT_DYNSYM, SHT_GROUP,
-    SHT_INIT_ARRAY, SHT_FINI_ARRAY,
-    STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_OBJECT, STT_FUNC, STT_SECTION, STT_FILE, STT_TLS, STT_GNU_IFUNC,
-    STV_DEFAULT,
-    SHN_UNDEF, SHN_ABS, SHN_COMMON,
-    PF_X, PF_W, PF_R,
-    read_u16, read_u32, read_cstr, read_i32,
-    parse_archive_members, parse_thin_archive_members, is_thin_archive,
-    parse_linker_script_entries, LinkerScriptEntry,
-    LinkerSymbolAddresses, get_standard_linker_symbols,
+    get_standard_linker_symbols, is_thin_archive, parse_archive_members,
+    parse_linker_script_entries, parse_thin_archive_members, read_cstr, read_i32, read_u16,
+    read_u32, LinkerScriptEntry, LinkerSymbolAddresses, ELFCLASS32, ELFDATA2LSB, ELF_MAGIC, EM_386,
+    ET_DYN, ET_EXEC, ET_REL, EV_CURRENT, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_EH_FRAME,
+    PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_PHDR, PT_TLS, SHN_ABS, SHN_COMMON, SHN_UNDEF, SHT_DYNSYM,
+    SHT_FINI_ARRAY, SHT_GROUP, SHT_INIT_ARRAY, SHT_NOBITS, SHT_NULL, SHT_PROGBITS, SHT_REL,
+    SHT_RELA, SHT_STRTAB, SHT_SYMTAB, STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FILE, STT_FUNC,
+    STT_GNU_IFUNC, STT_OBJECT, STT_SECTION, STT_TLS, STV_DEFAULT,
 };
 
 // ── ELF32-specific constants ──────────────────────────────────────────────────
@@ -126,8 +119,12 @@ pub(super) struct Elf32Sym {
 
 #[allow(dead_code)] // Convenience accessors; not all used by every code path
 impl Elf32Sym {
-    pub fn binding(&self) -> u8 { self.info >> 4 }
-    pub fn sym_type(&self) -> u8 { self.info & 0xf }
+    pub fn binding(&self) -> u8 {
+        self.info >> 4
+    }
+    pub fn sym_type(&self) -> u8 {
+        self.info & 0xf
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -241,7 +238,9 @@ pub(super) struct DynSymInfo {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub(super) fn align_up(value: u32, align: u32) -> u32 {
-    if align == 0 { return value; }
+    if align == 0 {
+        return value;
+    }
     (value + align - 1) & !(align - 1)
 }
 
@@ -257,8 +256,13 @@ pub(super) fn push_dyn(data: &mut Vec<u8>, tag: i32, val: u32) {
 /// (metadata sections, non-allocated sections, etc.).
 pub(super) fn output_section_name(name: &str, flags: u32, sh_type: u32) -> Option<String> {
     // Skip non-allocatable sections, symbol tables, relocation sections, etc.
-    if sh_type == SHT_NULL || sh_type == SHT_SYMTAB || sh_type == SHT_STRTAB
-        || sh_type == SHT_REL || sh_type == SHT_RELA || sh_type == SHT_GROUP {
+    if sh_type == SHT_NULL
+        || sh_type == SHT_SYMTAB
+        || sh_type == SHT_STRTAB
+        || sh_type == SHT_REL
+        || sh_type == SHT_RELA
+        || sh_type == SHT_GROUP
+    {
         return None;
     }
     if name == ".note.GNU-stack" || name == ".comment" {
@@ -267,8 +271,12 @@ pub(super) fn output_section_name(name: &str, flags: u32, sh_type: u32) -> Optio
 
     // Group by canonical output section name
     if name.starts_with(".text") || name == ".init" || name == ".fini" {
-        if name == ".init" { return Some(".init".to_string()); }
-        if name == ".fini" { return Some(".fini".to_string()); }
+        if name == ".init" {
+            return Some(".init".to_string());
+        }
+        if name == ".fini" {
+            return Some(".fini".to_string());
+        }
         return Some(".text".to_string());
     }
     if name.starts_with(".rodata") {

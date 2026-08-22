@@ -1,4 +1,3 @@
-
 //! Always-on, provably-safe elimination of redundant `pushfq`/`popfq` pairs.
 //!
 //! `emit_select_impl` preserves the condition flags (ZF) across loading the
@@ -37,20 +36,44 @@ fn is_flag_neutral_mnemonic(m: &str) -> bool {
         return false;
     }
     // mov-family, lea, loads: none modify flags.
-    if m.starts_with("mov") { return true; }
-    if m.starts_with("lea") { return true; }
-    if m.starts_with("movzbl") || m.starts_with("movz") { return true; }
-    if m.starts_with("movsb") || m.starts_with("movsw") || m.starts_with("movslq") { return true; }
+    if m.starts_with("mov") {
+        return true;
+    }
+    if m.starts_with("lea") {
+        return true;
+    }
+    if m.starts_with("movzbl") || m.starts_with("movz") {
+        return true;
+    }
+    if m.starts_with("movsb") || m.starts_with("movsw") || m.starts_with("movslq") {
+        return true;
+    }
     // push/pop modify RSP but not flags.
-    if m.starts_with("push") { return true; }
-    if m.starts_with("pop") { return true; }
-    if m.starts_with("nop") { return true; }
-    if m.starts_with("set") { return true; } // setcc reads flags but doesn't change them
-    if m.starts_with("cmov") { return true; } // cmovcc reads flags
-    if m.starts_with("rep") { return true; }
-    if m.starts_with("xchg") { return true; }
+    if m.starts_with("push") {
+        return true;
+    }
+    if m.starts_with("pop") {
+        return true;
+    }
+    if m.starts_with("nop") {
+        return true;
+    }
+    if m.starts_with("set") {
+        return true;
+    } // setcc reads flags but doesn't change them
+    if m.starts_with("cmov") {
+        return true;
+    } // cmovcc reads flags
+    if m.starts_with("rep") {
+        return true;
+    }
+    if m.starts_with("xchg") {
+        return true;
+    }
     // A bare label line ends the linear window (a branch could target it).
-    if m.ends_with(':') { return false; }
+    if m.ends_with(':') {
+        return false;
+    }
     // Anything else is conservatively flag-clobbering.
     false
 }
@@ -75,8 +98,11 @@ fn has_rsp_dependent_operand(t: &str) -> bool {
     // push/pop/call/ret implicitly modify RSP — the stack slot the flags word
     // sits in would shift, so keep these conservative.
     let m = first_mnemonic(t);
-    if m.starts_with("push") || m.starts_with("pop")
-        || m.starts_with("call") || m.starts_with("ret") {
+    if m.starts_with("push")
+        || m.starts_with("pop")
+        || m.starts_with("call")
+        || m.starts_with("ret")
+    {
         return true;
     }
     false
@@ -203,15 +229,39 @@ fn parse_self_xor(line: &str) -> Option<String> {
 /// Map a 32-bit register name to its 64-bit name for `movq $0, %reg`.
 fn map_reg_32_to_64(reg: &str) -> &'static str {
     match reg {
-        "eax" => "rax", "ebx" => "rbx", "ecx" => "rcx", "edx" => "rdx",
-        "esi" => "rsi", "edi" => "rdi", "ebp" => "rbp", "esp" => "rsp",
-        "r8d" => "r8", "r9d" => "r9", "r10d" => "r10", "r11d" => "r11",
-        "r12d" => "r12", "r13d" => "r13", "r14d" => "r14", "r15d" => "r15",
+        "eax" => "rax",
+        "ebx" => "rbx",
+        "ecx" => "rcx",
+        "edx" => "rdx",
+        "esi" => "rsi",
+        "edi" => "rdi",
+        "ebp" => "rbp",
+        "esp" => "rsp",
+        "r8d" => "r8",
+        "r9d" => "r9",
+        "r10d" => "r10",
+        "r11d" => "r11",
+        "r12d" => "r12",
+        "r13d" => "r13",
+        "r14d" => "r14",
+        "r15d" => "r15",
         // Already a 64-bit name.
-        "rax" => "rax", "rbx" => "rbx", "rcx" => "rcx", "rdx" => "rdx",
-        "rsi" => "rsi", "rdi" => "rdi", "rbp" => "rbp", "rsp" => "rsp",
-        "r8" => "r8", "r9" => "r9", "r10" => "r10", "r11" => "r11",
-        "r12" => "r12", "r13" => "r13", "r14" => "r14", "r15" => "r15",
+        "rax" => "rax",
+        "rbx" => "rbx",
+        "rcx" => "rcx",
+        "rdx" => "rdx",
+        "rsi" => "rsi",
+        "rdi" => "rdi",
+        "rbp" => "rbp",
+        "rsp" => "rsp",
+        "r8" => "r8",
+        "r9" => "r9",
+        "r10" => "r10",
+        "r11" => "r11",
+        "r12" => "r12",
+        "r13" => "r13",
+        "r14" => "r14",
+        "r15" => "r15",
         // Unknown: default to rax (won't occur in generated self-xor zeroing).
         _ => "rax",
     }

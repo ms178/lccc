@@ -88,9 +88,13 @@ fn main() {
 /// Cheap: reads at most the first 4 KiB and never allocates on the hot path.
 fn is_lto_bytecode(path: &str) -> bool {
     use std::io::Read;
-    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
     let mut head = [0u8; 4096];
-    let Ok(n) = f.read(&mut head) else { return false };
+    let Ok(n) = f.read(&mut head) else {
+        return false;
+    };
     let head = &head[..n];
     if head.len() >= 4 {
         // LLVM bitcode magic, and the bitcode-wrapper magic.
@@ -108,7 +112,8 @@ fn is_benign_ignorable(a: &str) -> bool {
         return true;
     }
     // Diagnostic / bookkeeping switches with no layout effect.
-    matches!(a,
+    matches!(
+        a,
         "--eh-frame-hdr"          // we always emit .eh_frame_hdr
         | "--no-add-needed"
         | "--no-copy-dt-needed-entries"
@@ -121,9 +126,9 @@ fn is_benign_ignorable(a: &str) -> bool {
         | "--no-fatal-warnings"
         | "--disable-linker-version"
         | "--no-relax"
-        | "-O0" | "-O1" | "-O2" | "-O3"   // ld's own -O is a size/speed hint
+        | "-O0" | "-O1" | "-O2" | "-O3" // ld's own -O is a size/speed hint
     ) || a.starts_with("--build-id=")
-      || a.starts_with("-plugin-opt=")
+        || a.starts_with("-plugin-opt=")
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -153,7 +158,10 @@ fn run(args: &[String]) -> Result<(), String> {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "-o" => { i += 1; output = args.get(i).cloned().ok_or("-o needs an argument")?; }
+            "-o" => {
+                i += 1;
+                output = args.get(i).cloned().ok_or("-o needs an argument")?;
+            }
             "-m" => {
                 // Emulation selects both the input parser and output ELF
                 // class. ELF32 is currently supported for full script links,
@@ -267,8 +275,9 @@ fn run(args: &[String]) -> Result<(), String> {
             // plugins could not resolve back into the host, and backtrace_symbols
             // lost every name. lccc-ld invoked directly worked, which is what
             // made the bug survive — the test used the direct form.
-            "--export-dynamic" | "-export-dynamic" | "-E"
-                => passthrough.push("-rdynamic".to_string()),
+            "--export-dynamic" | "-export-dynamic" | "-E" => {
+                passthrough.push("-rdynamic".to_string())
+            }
             "--no-export-dynamic" | "-no-export-dynamic" => {}
             // --as-needed / --no-as-needed are POSITIONAL: they scope the
             // inputs that follow. Forward them so the shared parser can record
@@ -277,13 +286,18 @@ fn run(args: &[String]) -> Result<(), String> {
             // user asked for with --no-as-needed).
             "--as-needed" | "--no-as-needed" => passthrough.push(a.to_string()),
             "--eh-frame-hdr"
-            | "--fix-cortex-a53-843419" | "--no-copy-dt-needed-entries"
-            | "--allow-shlib-undefined" | "-X" | "-x" => {}
+            | "--fix-cortex-a53-843419"
+            | "--no-copy-dt-needed-entries"
+            | "--allow-shlib-undefined"
+            | "-X"
+            | "-x" => {}
             _ => {
                 if let Some(v) = a.strip_prefix("--script=") {
                     script_path = Some(v.to_string());
                 } else if let Some(v) = a.strip_prefix("-T") {
-                    if !v.is_empty() { script_path = Some(v.to_string()); }
+                    if !v.is_empty() {
+                        script_path = Some(v.to_string());
+                    }
                 } else if let Some(v) = a.strip_prefix("--entry=") {
                     entry_override = Some(v.to_string());
                     passthrough.push(a.to_string());
@@ -369,11 +383,12 @@ fn run(args: &[String]) -> Result<(), String> {
                         passthrough.push(format!("-Wl,--version-script={}", val));
                     }
                 } else if a.starts_with("--orphan-handling")
-                    || a == "--no-warn-rwx-segments" || a.starts_with("-z")
+                    || a == "--no-warn-rwx-segments"
+                    || a.starts_with("-z")
                     || a.starts_with("--hash-style")
                     || a.starts_with("--sort-section")
                     || a.starts_with("--print-")
-                    {
+                {
                     // accepted, not needed for correctness of the static image
                 } else if is_benign_ignorable(a) {
                     // Options every GNU-compatible linker accepts and that do
@@ -394,7 +409,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     // symbol" errors, or quietly drop code). So: accept it,
                     // remember it, and let the object loader complain
                     // precisely if it ever meets an IR member.
-                    if a == "-plugin" { i += 1; } // skip the plugin path
+                    if a == "-plugin" {
+                        i += 1;
+                    } // skip the plugin path
                     saw_lto_plugin = true;
                 } else if a.starts_with('-') {
                     // Unknown flag: warn (parity with ld's permissiveness would
@@ -440,14 +457,16 @@ fn run(args: &[String]) -> Result<(), String> {
     // parser reject the file with a generic "not an ELF object" or — worse —
     // letting a `.o` that happens to parse produce a binary with missing code.
     if saw_lto_plugin {
-        if let Some(bad) = inputs.iter().find_map(|(p, _)| {
-            is_lto_bytecode(p).then(|| p.clone())
-        }) {
+        if let Some(bad) = inputs
+            .iter()
+            .find_map(|(p, _)| is_lto_bytecode(p).then(|| p.clone()))
+        {
             return Err(format!(
                 "'{}' is LTO bytecode, which requires a linker plugin that \
                  lccc-ld does not implement; rebuild that input without -flto \
                  (or link it with the compiler driver)",
-                bad));
+                bad
+            ));
         }
     }
 
@@ -473,14 +492,28 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         if elf_i386 {
             return lccc::linker_entry::link_with_script_i386(
-                &objects, &script_src, &output, emit_symtab,
-                is_pie || shared, emit_relocs, soname.as_deref(), bsymbolic,
-                max_page_size);
+                &objects,
+                &script_src,
+                &output,
+                emit_symtab,
+                is_pie || shared,
+                emit_relocs,
+                soname.as_deref(),
+                bsymbolic,
+                max_page_size,
+            );
         }
         return lccc::linker_entry::link_with_script_x86(
-            &objects, &script_src, &output, emit_symtab,
-            is_pie || shared, emit_relocs, soname.as_deref(), bsymbolic,
-            max_page_size);
+            &objects,
+            &script_src,
+            &output,
+            emit_symtab,
+            is_pie || shared,
+            emit_relocs,
+            soname.as_deref(),
+            bsymbolic,
+            max_page_size,
+        );
     }
 
     if elf_i386 {

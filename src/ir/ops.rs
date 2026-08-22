@@ -61,13 +61,19 @@ pub enum IrBinOp {
 impl IrBinOp {
     /// Returns true if this operation is commutative (a op b == b op a).
     pub fn is_commutative(self) -> bool {
-        matches!(self, IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor)
+        matches!(
+            self,
+            IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+        )
     }
 
     /// Returns true if this operation can trap at runtime (e.g., divide by zero causes SIGFPE).
     /// Such operations must not be speculatively executed by if-conversion.
     pub fn can_trap(self) -> bool {
-        matches!(self, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem)
+        matches!(
+            self,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        )
     }
 
     /// Evaluate this binary operation on two i64 operands using wrapping arithmetic.
@@ -92,19 +98,27 @@ impl IrBinOp {
                 (((lhs as u64) >> (rhs as u32)) & 1) as i64
             }
             IrBinOp::SDiv => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 lhs.wrapping_div(rhs)
             }
             IrBinOp::UDiv => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 ((lhs as u64).wrapping_div(rhs as u64)) as i64
             }
             IrBinOp::SRem => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 lhs.wrapping_rem(rhs)
             }
             IrBinOp::URem => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 ((lhs as u64).wrapping_rem(rhs as u64)) as i64
             }
         })
@@ -127,19 +141,27 @@ impl IrBinOp {
             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
             IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
             IrBinOp::SDiv => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 lhs.wrapping_div(rhs)
             }
             IrBinOp::UDiv => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 (lhs as u128).wrapping_div(rhs as u128) as i128
             }
             IrBinOp::SRem => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 lhs.wrapping_rem(rhs)
             }
             IrBinOp::URem => {
-                if rhs == 0 { return None; }
+                if rhs == 0 {
+                    return None;
+                }
                 (lhs as u128).wrapping_rem(rhs as u128) as i128
             }
         })

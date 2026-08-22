@@ -72,11 +72,18 @@ pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
         }
     }
 
-    if new_order.iter().enumerate().all(|(new_pos, &old_pos)| new_pos == old_pos) {
+    if new_order
+        .iter()
+        .enumerate()
+        .all(|(new_pos, &old_pos)| new_pos == old_pos)
+    {
         return 0;
     }
     let mut old: Vec<Option<BasicBlock>> = func.blocks.drain(..).map(Some).collect();
-    func.blocks = new_order.into_iter().map(|i| old[i].take().unwrap()).collect();
+    func.blocks = new_order
+        .into_iter()
+        .map(|i| old[i].take().unwrap())
+        .collect();
     1
 }
 
@@ -84,11 +91,17 @@ pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
 fn collect_successor_labels(term: &Terminator, out: &mut Vec<u32>) {
     match term {
         Terminator::Branch(l) => out.push(l.0),
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             out.push(true_label.0);
             out.push(false_label.0);
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
             out.extend(possible_targets.iter().map(|l| l.0));
         }
         Terminator::Switch { cases, default, .. } => {

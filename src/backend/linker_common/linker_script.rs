@@ -51,15 +51,36 @@ pub enum Expr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BinOp { Add, Sub, Mul, Div, Rem, Shl, Shr, And, Or, Xor,
-                 Eq, Ne, Lt, Le, Gt, Ge, LAnd, LOr }
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Shl,
+    Shr,
+    And,
+    Or,
+    Xor,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    LAnd,
+    LOr,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AssignOp { Set, Add }
+pub enum AssignOp {
+    Set,
+    Add,
+}
 
 #[derive(Debug, Clone)]
 pub struct Assignment {
-    pub symbol: String,           // "." for the location counter
+    pub symbol: String, // "." for the location counter
     pub op: AssignOp,
     pub expr: Expr,
     pub provide: bool,
@@ -71,7 +92,12 @@ pub struct Assignment {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SortKind { None, ByName, ByAlignment, ByInitPriority }
+pub enum SortKind {
+    None,
+    ByName,
+    ByAlignment,
+    ByInitPriority,
+}
 
 #[derive(Debug, Clone)]
 pub struct InputSpec {
@@ -90,7 +116,10 @@ pub enum SecItem {
     /// in bytes and is one of 1/2/4/8 for BYTE/SHORT/LONG/QUAD respectively.
     /// Keeping the expression (rather than folding constants in the parser)
     /// is required for constructs such as `LONG(symbol - .)`.
-    Data { width: u8, expr: Expr },
+    Data {
+        width: u8,
+        expr: Expr,
+    },
     /// CONSTRUCTORS keyword (legacy; no-op for ELF)
     Constructors,
 }
@@ -171,7 +200,7 @@ struct Lexer<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    Ident(String),      // includes section names like .text..foo, /DISCARD/
+    Ident(String), // includes section names like .text..foo, /DISCARD/
     Num(u64),
     Str(String),
     Punct(&'static str),
@@ -179,7 +208,12 @@ enum Tok {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(src: &'a str) -> Self { Lexer { src: src.as_bytes(), pos: 0 } }
+    fn new(src: &'a str) -> Self {
+        Lexer {
+            src: src.as_bytes(),
+            pos: 0,
+        }
+    }
 
     fn skip_ws(&mut self) {
         loop {
@@ -187,10 +221,14 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             // /* ... */ comments
-            if self.pos + 1 < self.src.len() && self.src[self.pos] == b'/' && self.src[self.pos+1] == b'*' {
+            if self.pos + 1 < self.src.len()
+                && self.src[self.pos] == b'/'
+                && self.src[self.pos + 1] == b'*'
+            {
                 self.pos += 2;
                 while self.pos + 1 < self.src.len()
-                    && !(self.src[self.pos] == b'*' && self.src[self.pos+1] == b'/') {
+                    && !(self.src[self.pos] == b'*' && self.src[self.pos + 1] == b'/')
+                {
                     self.pos += 1;
                 }
                 self.pos = (self.pos + 2).min(self.src.len());
@@ -216,14 +254,18 @@ impl<'a> Lexer<'a> {
     /// Lex the next token in normal (expression/statement) context.
     fn next(&mut self) -> Tok {
         self.skip_ws();
-        if self.pos >= self.src.len() { return Tok::Eof; }
+        if self.pos >= self.src.len() {
+            return Tok::Eof;
+        }
         let c = self.src[self.pos];
 
         // string literal
         if c == b'"' {
             self.pos += 1;
             let start = self.pos;
-            while self.pos < self.src.len() && self.src[self.pos] != b'"' { self.pos += 1; }
+            while self.pos < self.src.len() && self.src[self.pos] != b'"' {
+                self.pos += 1;
+            }
             let s = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
             self.pos = (self.pos + 1).min(self.src.len());
             return Tok::Str(s);
@@ -232,16 +274,25 @@ impl<'a> Lexer<'a> {
         // number
         if c.is_ascii_digit() {
             let start = self.pos;
-            if c == b'0' && self.pos + 1 < self.src.len()
-                && (self.src[self.pos+1] | 0x20) == b'x' {
+            if c == b'0' && self.pos + 1 < self.src.len() && (self.src[self.pos + 1] | 0x20) == b'x'
+            {
                 self.pos += 2;
-                while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() { self.pos += 1; }
+                while self.pos < self.src.len() && self.src[self.pos].is_ascii_hexdigit() {
+                    self.pos += 1;
+                }
                 let v = u64::from_str_radix(
-                    &String::from_utf8_lossy(&self.src[start+2..self.pos]), 16).unwrap_or(0);
+                    &String::from_utf8_lossy(&self.src[start + 2..self.pos]),
+                    16,
+                )
+                .unwrap_or(0);
                 return Tok::Num(self.num_suffix(v));
             }
-            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() { self.pos += 1; }
-            let v: u64 = String::from_utf8_lossy(&self.src[start..self.pos]).parse().unwrap_or(0);
+            while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            let v: u64 = String::from_utf8_lossy(&self.src[start..self.pos])
+                .parse()
+                .unwrap_or(0);
             return Tok::Num(self.num_suffix(v));
         }
 
@@ -265,9 +316,16 @@ impl<'a> Lexer<'a> {
 
         // punctuation / operators (longest match first)
         let two: &[(&[u8], &'static str)] = &[
-            (b"<<", "<<"), (b">>", ">>"), (b"<=", "<="), (b">=", ">="),
-            (b"==", "=="), (b"!=", "!="), (b"&&", "&&"), (b"||", "||"),
-            (b"+=", "+="), (b"-=", "-="),
+            (b"<<", "<<"),
+            (b">>", ">>"),
+            (b"<=", "<="),
+            (b">=", ">="),
+            (b"==", "=="),
+            (b"!=", "!="),
+            (b"&&", "&&"),
+            (b"||", "||"),
+            (b"+=", "+="),
+            (b"-=", "-="),
         ];
         for (pat, tok) in two {
             if self.src[self.pos..].starts_with(pat) {
@@ -276,14 +334,33 @@ impl<'a> Lexer<'a> {
             }
         }
         let one: &[(u8, &'static str)] = &[
-            (b'{', "{"), (b'}', "}"), (b'(', "("), (b')', ")"),
-            (b';', ";"), (b':', ":"), (b',', ","), (b'=', "="),
-            (b'+', "+"), (b'-', "-"), (b'*', "*"), (b'/', "/"), (b'%', "%"),
-            (b'&', "&"), (b'|', "|"), (b'^', "^"), (b'~', "~"), (b'!', "!"),
-            (b'<', "<"), (b'>', ">"), (b'?', "?"),
+            (b'{', "{"),
+            (b'}', "}"),
+            (b'(', "("),
+            (b')', ")"),
+            (b';', ";"),
+            (b':', ":"),
+            (b',', ","),
+            (b'=', "="),
+            (b'+', "+"),
+            (b'-', "-"),
+            (b'*', "*"),
+            (b'/', "/"),
+            (b'%', "%"),
+            (b'&', "&"),
+            (b'|', "|"),
+            (b'^', "^"),
+            (b'~', "~"),
+            (b'!', "!"),
+            (b'<', "<"),
+            (b'>', ">"),
+            (b'?', "?"),
         ];
         for (ch, tok) in one {
-            if c == *ch { self.pos += 1; return Tok::Punct(tok); }
+            if c == *ch {
+                self.pos += 1;
+                return Tok::Punct(tok);
+            }
         }
         // Unknown byte: skip it
         self.pos += 1;
@@ -293,8 +370,14 @@ impl<'a> Lexer<'a> {
     fn num_suffix(&mut self, v: u64) -> u64 {
         if self.pos < self.src.len() {
             match self.src[self.pos] | 0x20 {
-                b'k' => { self.pos += 1; return v << 10; }
-                b'm' => { self.pos += 1; return v << 20; }
+                b'k' => {
+                    self.pos += 1;
+                    return v << 10;
+                }
+                b'm' => {
+                    self.pos += 1;
+                    return v << 20;
+                }
                 _ => {}
             }
         }
@@ -304,20 +387,32 @@ impl<'a> Lexer<'a> {
     /// Lex a section-name glob pattern: everything up to whitespace or ')'.
     fn next_pattern(&mut self) -> Option<String> {
         self.skip_ws();
-        if self.pos >= self.src.len() { return None; }
-        if self.src[self.pos] == b')' { return None; }
+        if self.pos >= self.src.len() {
+            return None;
+        }
+        if self.src[self.pos] == b')' {
+            return None;
+        }
         let start = self.pos;
         while self.pos < self.src.len() {
             let c = self.src[self.pos];
-            if (c as char).is_whitespace() || c == b')' { break; }
+            if (c as char).is_whitespace() || c == b')' {
+                break;
+            }
             self.pos += 1;
         }
-        if self.pos == start { return None; }
+        if self.pos == start {
+            return None;
+        }
         Some(String::from_utf8_lossy(&self.src[start..self.pos]).into_owned())
     }
 
-    fn save(&self) -> usize { self.pos }
-    fn restore(&mut self, p: usize) { self.pos = p; }
+    fn save(&self) -> usize {
+        self.pos
+    }
+    fn restore(&mut self, p: usize) {
+        self.pos = p;
+    }
 }
 
 // ── Parser ──────────────────────────────────────────────────────────────
@@ -333,13 +428,17 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
             Tok::Ident(kw) => match kw.as_str() {
                 "ENTRY" => {
                     expect(&mut lx, "(")?;
-                    if let Tok::Ident(sym) = lx.next() { script.entry = Some(sym); }
+                    if let Tok::Ident(sym) = lx.next() {
+                        script.entry = Some(sym);
+                    }
                     expect(&mut lx, ")")?;
                 }
                 "OUTPUT_FORMAT" | "OUTPUT_ARCH" | "TARGET" | "SEARCH_DIR" | "OUTPUT" => {
                     skip_parens(&mut lx)?;
                 }
-                "INCLUDE" => { let _ = lx.next(); }
+                "INCLUDE" => {
+                    let _ = lx.next();
+                }
                 "PHDRS" => {
                     expect(&mut lx, "{")?;
                     loop {
@@ -347,8 +446,11 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                             Tok::Punct("}") => break,
                             Tok::Ident(name) => {
                                 let mut decl = PhdrDecl {
-                                    name, ptype: 0, flags: None,
-                                    has_phdrs: false, has_filehdr: false,
+                                    name,
+                                    ptype: 0,
+                                    flags: None,
+                                    has_phdrs: false,
+                                    has_filehdr: false,
                                 };
                                 loop {
                                     match lx.next() {
@@ -373,7 +475,9 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                                                 expect(&mut lx, ")")?;
                                                 decl.flags = Some(eval_const(&e).unwrap_or(0));
                                             }
-                                            "AT" => { skip_parens(&mut lx)?; }
+                                            "AT" => {
+                                                skip_parens(&mut lx)?;
+                                            }
                                             _ => {}
                                         },
                                         Tok::Num(n) => decl.ptype = n as u32,
@@ -405,8 +509,7 @@ pub fn parse_linker_script(src: &str) -> Result<LinkerScript, String> {
                     expect(&mut lx, "(")?;
                     // HIDDEN(x = e) defines unconditionally; PROVIDE* only if
                     // the symbol is still undefined.
-                    let a = parse_assignment_inner(
-                        &mut lx, kw != "HIDDEN", kw != "PROVIDE")?;
+                    let a = parse_assignment_inner(&mut lx, kw != "HIDDEN", kw != "PROVIDE")?;
                     expect(&mut lx, ")")?;
                     eat_semi(&mut lx);
                     script.top_assigns.push(a);
@@ -445,7 +548,9 @@ fn expect(lx: &mut Lexer, p: &str) -> Result<(), String> {
 
 fn eat_semi(lx: &mut Lexer) {
     let save = lx.save();
-    if lx.next() != Tok::Punct(";") { lx.restore(save); }
+    if lx.next() != Tok::Punct(";") {
+        lx.restore(save);
+    }
 }
 
 fn skip_parens(lx: &mut Lexer) -> Result<(), String> {
@@ -454,7 +559,12 @@ fn skip_parens(lx: &mut Lexer) -> Result<(), String> {
     loop {
         match lx.next() {
             Tok::Punct("(") => depth += 1,
-            Tok::Punct(")") => { depth -= 1; if depth == 0 { return Ok(()); } }
+            Tok::Punct(")") => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
             Tok::Eof => return Err("unterminated parens".into()),
             _ => {}
         }
@@ -467,8 +577,12 @@ fn parse_assert_args(lx: &mut Lexer) -> Result<(Expr, String), String> {
     let mut msg = String::new();
     let save = lx.save();
     if lx.next() == Tok::Punct(",") {
-        if let Tok::Str(s) = lx.next() { msg = s; }
-    } else { lx.restore(save); }
+        if let Tok::Str(s) = lx.next() {
+            msg = s;
+        }
+    } else {
+        lx.restore(save);
+    }
     expect(lx, ")")?;
     Ok((e, msg))
 }
@@ -479,28 +593,48 @@ fn try_parse_assignment(lx: &mut Lexer) -> Result<Option<Assignment>, String> {
     let save = lx.save();
     let name = match lx.next() {
         Tok::Ident(n) => n,
-        _ => { lx.restore(save); return Ok(None); }
+        _ => {
+            lx.restore(save);
+            return Ok(None);
+        }
     };
     let op = match lx.next() {
         Tok::Punct("=") => AssignOp::Set,
         Tok::Punct("+=") => AssignOp::Add,
-        _ => { lx.restore(save); return Ok(None); }
+        _ => {
+            lx.restore(save);
+            return Ok(None);
+        }
     };
     let expr = parse_expr(lx)?;
     eat_semi(lx);
-    Ok(Some(Assignment { symbol: name, op, expr, provide: false, hidden: false }))
+    Ok(Some(Assignment {
+        symbol: name,
+        op,
+        expr,
+        provide: false,
+        hidden: false,
+    }))
 }
 
-fn parse_assignment_inner(lx: &mut Lexer, provide: bool, hidden: bool)
-    -> Result<Assignment, String>
-{
+fn parse_assignment_inner(
+    lx: &mut Lexer,
+    provide: bool,
+    hidden: bool,
+) -> Result<Assignment, String> {
     let name = match lx.next() {
         Tok::Ident(n) => n,
         t => return Err(format!("expected symbol in PROVIDE/HIDDEN, got {:?}", t)),
     };
     expect(lx, "=")?;
     let expr = parse_expr(lx)?;
-    Ok(Assignment { symbol: name, op: AssignOp::Set, expr, provide, hidden })
+    Ok(Assignment {
+        symbol: name,
+        op: AssignOp::Set,
+        expr,
+        provide,
+        hidden,
+    })
 }
 
 /// Parse a `MEMORY { name (attrs) : ORIGIN = expr, LENGTH = expr  ... }` body.
@@ -549,15 +683,28 @@ fn parse_memory_body(lx: &mut Lexer, out: &mut Vec<MemoryRegion>) -> Result<(), 
                                 return Err(format!("unknown MEMORY key '{}'", k));
                             }
                             let save2 = lx.save();
-                            if lx.next() != Tok::Punct(",") { lx.restore(save2); }
+                            if lx.next() != Tok::Punct(",") {
+                                lx.restore(save2);
+                            }
                         }
-                        _ => { lx.restore(save); break; }
+                        _ => {
+                            lx.restore(save);
+                            break;
+                        }
                     }
                 }
                 let (Some(origin), Some(length)) = (origin, length) else {
-                    return Err(format!("MEMORY region '{}' needs both ORIGIN and LENGTH", name));
+                    return Err(format!(
+                        "MEMORY region '{}' needs both ORIGIN and LENGTH",
+                        name
+                    ));
                 };
-                out.push(MemoryRegion { name, origin, length, attrs });
+                out.push(MemoryRegion {
+                    name,
+                    origin,
+                    length,
+                    attrs,
+                });
             }
             t => return Err(format!("unexpected token in MEMORY block: {:?}", t)),
         }
@@ -620,7 +767,10 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
         match lx.next() {
             Tok::Punct(":") => break,
             Tok::Eof => return Err("unterminated OVERLAY header".into()),
-            _ => { lx.restore(save); start = Some(parse_expr(lx)?); }
+            _ => {
+                lx.restore(save);
+                start = Some(parse_expr(lx)?);
+            }
         }
     }
     let mut lma: Option<Expr> = None;
@@ -649,15 +799,23 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
                 let _ = save;
                 expect(lx, "{")?;
                 let mut def = OutputSecDef {
-                    name: name.clone(), address: Some(base.clone()), info: false,
-                    at_lma: None, items: Vec::new(), phdrs: Vec::new(),
-                    fill: None, align: None, region: None, lma_region: None,
+                    name: name.clone(),
+                    address: Some(base.clone()),
+                    info: false,
+                    at_lma: None,
+                    items: Vec::new(),
+                    phdrs: Vec::new(),
+                    fill: None,
+                    align: None,
+                    region: None,
+                    lma_region: None,
                 };
                 if let Some(ref l) = lma {
                     def.at_lma = Some(match lma_off {
                         None => l.clone(),
-                        Some(ref off) => Expr::Bin(BinOp::Add,
-                            Box::new(l.clone()), Box::new(off.clone())),
+                        Some(ref off) => {
+                            Expr::Bin(BinOp::Add, Box::new(l.clone()), Box::new(off.clone()))
+                        }
                     });
                 }
                 parse_output_section_body(lx, &mut def)?;
@@ -670,16 +828,21 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
                 out.push(SectionsItem::Output(def));
                 out.push(SectionsItem::Assign(Assignment {
                     symbol: format!("__load_start_{}", sym_base),
-                    op: AssignOp::Set, expr: Expr::LoadAddrOf(name.clone()),
-                    provide: true, hidden: false,
+                    op: AssignOp::Set,
+                    expr: Expr::LoadAddrOf(name.clone()),
+                    provide: true,
+                    hidden: false,
                 }));
                 out.push(SectionsItem::Assign(Assignment {
                     symbol: format!("__load_stop_{}", sym_base),
                     op: AssignOp::Set,
-                    expr: Expr::Bin(BinOp::Add,
+                    expr: Expr::Bin(
+                        BinOp::Add,
                         Box::new(Expr::LoadAddrOf(name.clone())),
-                        Box::new(Expr::SizeOf(name.clone()))),
-                    provide: true, hidden: false,
+                        Box::new(Expr::SizeOf(name.clone())),
+                    ),
+                    provide: true,
+                    hidden: false,
                 }));
             }
             t => return Err(format!("unexpected token in OVERLAY body: {:?}", t)),
@@ -689,17 +852,22 @@ fn parse_overlay(lx: &mut Lexer, out: &mut Vec<SectionsItem>) -> Result<(), Stri
     loop {
         let save = lx.save();
         match lx.next() {
-            Tok::Punct(">") | Tok::Punct(":") => { let _ = lx.next(); }
-            Tok::Punct("=") => { let _ = parse_expr(lx)?; }
-            _ => { lx.restore(save); break; }
+            Tok::Punct(">") | Tok::Punct(":") => {
+                let _ = lx.next();
+            }
+            Tok::Punct("=") => {
+                let _ = parse_expr(lx)?;
+            }
+            _ => {
+                lx.restore(save);
+                break;
+            }
         }
     }
     Ok(())
 }
 
-fn parse_output_section_body(lx: &mut Lexer, def: &mut OutputSecDef)
-    -> Result<(), String>
-{
+fn parse_output_section_body(lx: &mut Lexer, def: &mut OutputSecDef) -> Result<(), String> {
     loop {
         let save = lx.save();
         match lx.next() {
@@ -781,9 +949,16 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
         t => return Err(format!("expected section name, got {:?}", t)),
     };
     let mut def = OutputSecDef {
-        name, address: None, info: false, at_lma: None,
-        items: Vec::new(), phdrs: Vec::new(), fill: None, align: None,
-        region: None, lma_region: None,
+        name,
+        address: None,
+        info: false,
+        at_lma: None,
+        items: Vec::new(),
+        phdrs: Vec::new(),
+        fill: None,
+        align: None,
+        region: None,
+        lma_region: None,
     };
 
     // optional address expression and/or (INFO)/(NOLOAD) before ':'
@@ -793,7 +968,9 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
             Tok::Punct(":") => break,
             Tok::Punct("(") => {
                 match lx.next() {
-                    Tok::Ident(t) if t == "INFO" || t == "NOLOAD" || t == "COPY" || t == "DSECT" => {
+                    Tok::Ident(t)
+                        if t == "INFO" || t == "NOLOAD" || t == "COPY" || t == "DSECT" =>
+                    {
                         def.info = true;
                         expect(lx, ")")?;
                     }
@@ -827,8 +1004,15 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
                 def.align = Some(parse_expr(lx)?);
                 expect(lx, ")")?;
             }
-            Tok::Ident(kw) if kw == "SUBALIGN" => { skip_parens(lx)?; }
-            t => return Err(format!("unexpected token before section body: {:?} (pos {})", t, save)),
+            Tok::Ident(kw) if kw == "SUBALIGN" => {
+                skip_parens(lx)?;
+            }
+            t => {
+                return Err(format!(
+                    "unexpected token before section body: {:?} (pos {})",
+                    t, save
+                ))
+            }
         }
     }
 
@@ -838,12 +1022,10 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
     loop {
         let save = lx.save();
         match lx.next() {
-            Tok::Punct(">") => {
-                match lx.next() {
-                    Tok::Ident(r) => def.region = Some(r),
-                    t => return Err(format!("expected region name after '>', got {:?}", t)),
-                }
-            }
+            Tok::Punct(">") => match lx.next() {
+                Tok::Ident(r) => def.region = Some(r),
+                t => return Err(format!("expected region name after '>', got {:?}", t)),
+            },
             // `AT> region` places the LMA in a different region than the VMA:
             // the standard idiom for data that lives in ROM and is copied to
             // RAM at startup.
@@ -858,13 +1040,18 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
                 }
             }
             Tok::Punct(":") => {
-                if let Tok::Ident(ph) = lx.next() { def.phdrs.push(ph); }
+                if let Tok::Ident(ph) = lx.next() {
+                    def.phdrs.push(ph);
+                }
             }
             Tok::Punct("=") => {
                 let e = parse_expr(lx)?;
                 def.fill = eval_const(&e);
             }
-            _ => { lx.restore(save); break; }
+            _ => {
+                lx.restore(save);
+                break;
+            }
         }
     }
     Ok(def)
@@ -874,13 +1061,19 @@ fn parse_output_section(lx: &mut Lexer) -> Result<OutputSecDef, String> {
 /// a KEEP() or standalone. The leading `*` (file glob) is accepted and ignored
 /// (all files match); a leading filename glob other than `*` is also accepted.
 fn parse_input_spec(lx: &mut Lexer) -> Result<InputSpec, String> {
-    let mut spec = InputSpec { patterns: Vec::new(), keep: false, sort: SortKind::None };
+    let mut spec = InputSpec {
+        patterns: Vec::new(),
+        keep: false,
+        sort: SortKind::None,
+    };
     // consume file glob (usually '*')
     let save = lx.save();
     match lx.next() {
         Tok::Punct("*") => {}
         Tok::Ident(_) => { /* named file pattern; treat as match-all */ }
-        _ => { lx.restore(save); }
+        _ => {
+            lx.restore(save);
+        }
     }
     expect(lx, "(")?;
     // Inside: raw pattern lexing until ')'
@@ -892,27 +1085,38 @@ fn parse_input_spec(lx: &mut Lexer) -> Result<InputSpec, String> {
             Tok::Ident(kw) if kw == "SORT" || kw == "SORT_BY_NAME" => {
                 expect(lx, "(")?;
                 spec.sort = SortKind::ByName;
-                while let Some(p) = lx.next_pattern() { spec.patterns.push(p); }
+                while let Some(p) = lx.next_pattern() {
+                    spec.patterns.push(p);
+                }
                 expect(lx, ")")?;
             }
             Tok::Ident(kw) if kw == "SORT_BY_ALIGNMENT" => {
                 expect(lx, "(")?;
                 spec.sort = SortKind::ByAlignment;
-                while let Some(p) = lx.next_pattern() { spec.patterns.push(p); }
+                while let Some(p) = lx.next_pattern() {
+                    spec.patterns.push(p);
+                }
                 expect(lx, ")")?;
             }
             Tok::Ident(kw) if kw == "SORT_BY_INIT_PRIORITY" => {
                 expect(lx, "(")?;
                 spec.sort = SortKind::ByInitPriority;
-                while let Some(p) = lx.next_pattern() { spec.patterns.push(p); }
+                while let Some(p) = lx.next_pattern() {
+                    spec.patterns.push(p);
+                }
                 expect(lx, ")")?;
             }
-            Tok::Ident(kw) if kw == "EXCLUDE_FILE" => { skip_parens(lx)?; }
+            Tok::Ident(kw) if kw == "EXCLUDE_FILE" => {
+                skip_parens(lx)?;
+            }
             _ => {
                 lx.restore(save2);
                 match lx.next_pattern() {
                     Some(p) => spec.patterns.push(p),
-                    None => { expect(lx, ")")?; break; }
+                    None => {
+                        expect(lx, ")")?;
+                        break;
+                    }
                 }
             }
         }
@@ -946,12 +1150,19 @@ fn bin_prec(op: &str) -> Option<(BinOp, u8)> {
         "|" => (BinOp::Or, 3),
         "^" => (BinOp::Xor, 4),
         "&" => (BinOp::And, 5),
-        "==" => (BinOp::Eq, 6), "!=" => (BinOp::Ne, 6),
-        "<" => (BinOp::Lt, 7), "<=" => (BinOp::Le, 7),
-        ">" => (BinOp::Gt, 7), ">=" => (BinOp::Ge, 7),
-        "<<" => (BinOp::Shl, 8), ">>" => (BinOp::Shr, 8),
-        "+" => (BinOp::Add, 9), "-" => (BinOp::Sub, 9),
-        "*" => (BinOp::Mul, 10), "/" => (BinOp::Div, 10), "%" => (BinOp::Rem, 10),
+        "==" => (BinOp::Eq, 6),
+        "!=" => (BinOp::Ne, 6),
+        "<" => (BinOp::Lt, 7),
+        "<=" => (BinOp::Le, 7),
+        ">" => (BinOp::Gt, 7),
+        ">=" => (BinOp::Ge, 7),
+        "<<" => (BinOp::Shl, 8),
+        ">>" => (BinOp::Shr, 8),
+        "+" => (BinOp::Add, 9),
+        "-" => (BinOp::Sub, 9),
+        "*" => (BinOp::Mul, 10),
+        "/" => (BinOp::Div, 10),
+        "%" => (BinOp::Rem, 10),
         _ => return None,
     })
 }
@@ -964,9 +1175,15 @@ fn parse_binary(lx: &mut Lexer, min_prec: u8) -> Result<Expr, String> {
         let (op, prec) = match &tok {
             Tok::Punct(p) => match bin_prec(p) {
                 Some(x) if x.1 >= min_prec => x,
-                _ => { lx.restore(save); return Ok(lhs); }
+                _ => {
+                    lx.restore(save);
+                    return Ok(lhs);
+                }
             },
-            _ => { lx.restore(save); return Ok(lhs); }
+            _ => {
+                lx.restore(save);
+                return Ok(lhs);
+            }
         };
         let rhs = parse_binary(lx, prec + 1)?;
         lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs));
@@ -983,7 +1200,10 @@ fn parse_unary(lx: &mut Lexer) -> Result<Expr, String> {
             Ok(Expr::Bin(BinOp::Eq, Box::new(e), Box::new(Expr::Num(0))))
         }
         Tok::Punct("+") => parse_unary(lx),
-        _ => { lx.restore(save); parse_primary(lx) }
+        _ => {
+            lx.restore(save);
+            parse_primary(lx)
+        }
     }
 }
 
@@ -1057,7 +1277,12 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 expect(lx, "(")?;
                 let seg = match lx.next() {
                     Tok::Str(s) => s,
-                    t => return Err(format!("SEGMENT_START expects a segment name string, got {:?}", t)),
+                    t => {
+                        return Err(format!(
+                            "SEGMENT_START expects a segment name string, got {:?}",
+                            t
+                        ))
+                    }
                 };
                 expect(lx, ",")?;
                 let dflt = parse_expr(lx)?;
@@ -1084,8 +1309,14 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 // Second argument is the expression to return.
                 let save = lx.save();
                 let ret = if lx.next() == Tok::Punct(",") {
-                    let e = parse_expr(lx)?; expect(lx, ")")?; e
-                } else { lx.restore(save); expect(lx, ")")?; off.clone() };
+                    let e = parse_expr(lx)?;
+                    expect(lx, ")")?;
+                    e
+                } else {
+                    lx.restore(save);
+                    expect(lx, ")")?;
+                    off.clone()
+                };
                 Ok(ret)
             }
             "DATA_SEGMENT_END" => {
@@ -1100,8 +1331,11 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 expect(lx, ",")?;
                 let b = parse_expr(lx)?;
                 expect(lx, ")")?;
-                if id == "MIN" { Ok(Expr::Min(Box::new(a), Box::new(b))) }
-                else { Ok(Expr::Max(Box::new(a), Box::new(b))) }
+                if id == "MIN" {
+                    Ok(Expr::Min(Box::new(a), Box::new(b)))
+                } else {
+                    Ok(Expr::Max(Box::new(a), Box::new(b)))
+                }
             }
             "ASSERT" => {
                 expect(lx, "(")?;
@@ -1109,8 +1343,12 @@ fn parse_primary(lx: &mut Lexer) -> Result<Expr, String> {
                 let mut msg = String::new();
                 let save = lx.save();
                 if lx.next() == Tok::Punct(",") {
-                    if let Tok::Str(s) = lx.next() { msg = s; }
-                } else { lx.restore(save); }
+                    if let Tok::Str(s) = lx.next() {
+                        msg = s;
+                    }
+                } else {
+                    lx.restore(save);
+                }
                 expect(lx, ")")?;
                 Ok(Expr::Assert(Box::new(e), msg))
             }
@@ -1159,8 +1397,20 @@ pub fn apply_binop(op: BinOp, a: u64, b: u64) -> u64 {
         BinOp::Add => a.wrapping_add(b),
         BinOp::Sub => a.wrapping_sub(b),
         BinOp::Mul => a.wrapping_mul(b),
-        BinOp::Div => if b == 0 { 0 } else { a / b },
-        BinOp::Rem => if b == 0 { 0 } else { a % b },
+        BinOp::Div => {
+            if b == 0 {
+                0
+            } else {
+                a / b
+            }
+        }
+        BinOp::Rem => {
+            if b == 0 {
+                0
+            } else {
+                a % b
+            }
+        }
         BinOp::Shl => a.wrapping_shl(b as u32),
         BinOp::Shr => a.wrapping_shr(b as u32),
         BinOp::And => a & b,
@@ -1210,7 +1460,10 @@ pub fn eval_expr(e: &Expr, ctx: &EvalCtx) -> Result<u64, EvalError> {
             }
             eval_expr(dflt, ctx)
         }
-        Expr::Sym(name) => ctx.symbols.get(name).copied()
+        Expr::Sym(name) => ctx
+            .symbols
+            .get(name)
+            .copied()
             .ok_or_else(|| EvalError::UndefinedSymbol(name.clone())),
         Expr::Neg(x) => Ok(eval_expr(x, ctx)?.wrapping_neg()),
         Expr::Not(x) => Ok(!eval_expr(x, ctx)?),
@@ -1220,12 +1473,16 @@ pub fn eval_expr(e: &Expr, ctx: &EvalCtx) -> Result<u64, EvalError> {
             match op {
                 BinOp::LOr => {
                     let av = eval_expr(a, ctx)?;
-                    if av != 0 { return Ok(1); }
+                    if av != 0 {
+                        return Ok(1);
+                    }
                     Ok((eval_expr(b, ctx)? != 0) as u64)
                 }
                 BinOp::LAnd => {
                     let av = eval_expr(a, ctx)?;
-                    if av == 0 { return Ok(0); }
+                    if av == 0 {
+                        return Ok(0);
+                    }
                     Ok((eval_expr(b, ctx)? != 0) as u64)
                 }
                 _ => Ok(apply_binop(*op, eval_expr(a, ctx)?, eval_expr(b, ctx)?)),
@@ -1241,9 +1498,15 @@ pub fn eval_expr(e: &Expr, ctx: &EvalCtx) -> Result<u64, EvalError> {
             Ok((v + a - 1) & !(a - 1))
         }
         Expr::Absolute(x) => eval_expr(x, ctx),
-        Expr::AddrOf(name) => ctx.sections.get(name).map(|s| s.0)
+        Expr::AddrOf(name) => ctx
+            .sections
+            .get(name)
+            .map(|s| s.0)
             .ok_or_else(|| EvalError::UnknownSection(name.clone())),
-        Expr::LoadAddrOf(name) => ctx.sections.get(name).map(|s| s.3)
+        Expr::LoadAddrOf(name) => ctx
+            .sections
+            .get(name)
+            .map(|s| s.3)
             .ok_or_else(|| EvalError::UnknownSection(name.clone())),
         Expr::SizeOf(name) => Ok(ctx.sections.get(name).map(|s| s.1).unwrap_or(0)),
         Expr::AlignOf(name) => Ok(ctx.sections.get(name).map(|s| s.2).unwrap_or(1)),
@@ -1258,7 +1521,11 @@ pub fn eval_expr(e: &Expr, ctx: &EvalCtx) -> Result<u64, EvalError> {
             Ok(v)
         }
         Expr::Ternary(c, t, f) => {
-            if eval_expr(c, ctx)? != 0 { eval_expr(t, ctx) } else { eval_expr(f, ctx) }
+            if eval_expr(c, ctx)? != 0 {
+                eval_expr(t, ctx)
+            } else {
+                eval_expr(f, ctx)
+            }
         }
     }
 }
@@ -1277,14 +1544,31 @@ fn glob_match_bytes(p: &[u8], n: &[u8]) -> bool {
     while ni < n.len() {
         if pi < p.len() {
             match p[pi] {
-                b'*' => { star_p = pi; star_n = ni; pi += 1; continue; }
-                b'?' => { pi += 1; ni += 1; continue; }
+                b'*' => {
+                    star_p = pi;
+                    star_n = ni;
+                    pi += 1;
+                    continue;
+                }
+                b'?' => {
+                    pi += 1;
+                    ni += 1;
+                    continue;
+                }
                 b'[' => {
                     if let Some((matched, next_pi)) = match_class(p, pi, n[ni]) {
-                        if matched { pi = next_pi; ni += 1; continue; }
+                        if matched {
+                            pi = next_pi;
+                            ni += 1;
+                            continue;
+                        }
                     }
                 }
-                c if c == n[ni] => { pi += 1; ni += 1; continue; }
+                c if c == n[ni] => {
+                    pi += 1;
+                    ni += 1;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -1297,7 +1581,9 @@ fn glob_match_bytes(p: &[u8], n: &[u8]) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == b'*' { pi += 1; }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
     pi == p.len()
 }
 
@@ -1305,19 +1591,27 @@ fn match_class(p: &[u8], start: usize, c: u8) -> Option<(bool, usize)> {
     // p[start] == '['; find closing ']'
     let mut i = start + 1;
     let negate = i < p.len() && (p[i] == b'!' || p[i] == b'^');
-    if negate { i += 1; }
+    if negate {
+        i += 1;
+    }
     let mut matched = false;
     let class_start = i;
     while i < p.len() && (p[i] != b']' || i == class_start) {
-        if i + 2 < p.len() && p[i+1] == b'-' && p[i+2] != b']' {
-            if p[i] <= c && c <= p[i+2] { matched = true; }
+        if i + 2 < p.len() && p[i + 1] == b'-' && p[i + 2] != b']' {
+            if p[i] <= c && c <= p[i + 2] {
+                matched = true;
+            }
             i += 3;
         } else {
-            if p[i] == c { matched = true; }
+            if p[i] == c {
+                matched = true;
+            }
             i += 1;
         }
     }
-    if i >= p.len() { return None; }
+    if i >= p.len() {
+        return None;
+    }
     Some((matched != negate, i + 1))
 }
 
@@ -1382,8 +1676,14 @@ mod tests {
         assert_eq!(s.phdrs.len(), 3);
         assert_eq!(s.phdrs[0].name, "text");
         assert_eq!(s.phdrs[0].flags, Some(5));
-        let outs: Vec<&OutputSecDef> = s.sections.iter().filter_map(|i| match i {
-            SectionsItem::Output(o) => Some(o), _ => None }).collect();
+        let outs: Vec<&OutputSecDef> = s
+            .sections
+            .iter()
+            .filter_map(|i| match i {
+                SectionsItem::Output(o) => Some(o),
+                _ => None,
+            })
+            .collect();
         let names: Vec<&str> = outs.iter().map(|o| o.name.as_str()).collect();
         assert!(names.contains(&".text"));
         assert!(names.contains(&"/DISCARD/"));
@@ -1398,14 +1698,17 @@ mod tests {
 
     #[test]
     fn parse_phdr_header_membership_and_gnu_types() {
-        let script = parse_linker_script(r#"
+        let script = parse_linker_script(
+            r#"
             PHDRS {
                 image PT_LOAD FILEHDR PHDRS FLAGS(5);
                 stack PT_GNU_STACK FLAGS(6);
                 relro PT_GNU_RELRO FLAGS(4);
             }
             SECTIONS { . = SIZEOF_HEADERS; .text : { *(.text) } :image }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(script.phdrs[0].ptype, 1);
         assert!(script.phdrs[0].has_filehdr);
         assert!(script.phdrs[0].has_phdrs);
@@ -1418,10 +1721,17 @@ mod tests {
     fn expr_eval() {
         let src = "SECTIONS { . = (0x100 + ((0x30 + (0x20 - 1)) & ~(0x20 - 1))); }";
         let s = parse_linker_script(src).unwrap();
-        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let SectionsItem::Assign(a) = &s.sections[0] else {
+            panic!()
+        };
         let syms = FxHashMap::default();
         let secs = FxHashMap::default();
-        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
+        let ctx = EvalCtx {
+            dot: 0,
+            symbols: &syms,
+            sections: &secs,
+            segment_starts: None,
+        };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x100 + 0x40));
     }
 
@@ -1432,11 +1742,18 @@ mod tests {
             /DISCARD/ : { *(.note*) }
         }"#;
         let s = parse_linker_script(src).unwrap();
-        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let SectionsItem::Assign(a) = &s.sections[0] else {
+            panic!()
+        };
         let mut syms = FxHashMap::default();
         syms.insert("text_size".to_string(), 513);
         let secs = FxHashMap::default();
-        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
+        let ctx = EvalCtx {
+            dot: 0,
+            symbols: &syms,
+            sections: &secs,
+            segment_starts: None,
+        };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(4));
         assert!(matches!(&s.sections[1],
             SectionsItem::Output(def) if def.name == "/DISCARD/"));
@@ -1444,40 +1761,55 @@ mod tests {
 
     #[test]
     fn scalar_data_directives_preserve_width_and_expression() {
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             SECTIONS { .signature : {
                 BYTE(0x12); SHORT(0x3456) LONG(target - .) QUAD(0x123456789abcdef0)
             } }
-        "#).unwrap();
-        let SectionsItem::Output(def) = &s.sections[0] else { panic!() };
-        let widths: Vec<u8> = def.items.iter().filter_map(|item| match item {
-            SecItem::Data { width, .. } => Some(*width),
-            _ => None,
-        }).collect();
+        "#,
+        )
+        .unwrap();
+        let SectionsItem::Output(def) = &s.sections[0] else {
+            panic!()
+        };
+        let widths: Vec<u8> = def
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SecItem::Data { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect();
         assert_eq!(widths, vec![1, 2, 4, 8]);
-        assert!(matches!(def.items[2], SecItem::Data {
-            width: 4, expr: Expr::Bin(BinOp::Sub, _, _)
-        }));
+        assert!(matches!(
+            def.items[2],
+            SecItem::Data {
+                width: 4,
+                expr: Expr::Bin(BinOp::Sub, _, _)
+            }
+        ));
     }
 
     #[test]
     fn malformed_scalar_data_directive_is_rejected() {
-        assert!(parse_linker_script(
-            "SECTIONS { .x : { LONG(1 +); } }").is_err());
+        assert!(parse_linker_script("SECTIONS { .x : { LONG(1 +); } }").is_err());
     }
 
     // ── MEMORY regions ──────────────────────────────────────────────────
 
     #[test]
     fn memory_regions_parse_with_attributes_and_abbreviations() {
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             MEMORY {
               rom (rx)  : ORIGIN = 0x08000000, LENGTH = 256K
               ram (rwx) : org    = 0x20000000, len    = 64K
               bare      : ORIGIN = 0, LENGTH = 16
             }
             SECTIONS { .text : { *(.text) } > rom }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(s.memory.len(), 3);
         assert_eq!(s.memory[0].name, "rom");
         assert_eq!(s.memory[0].attrs, "rx");
@@ -1485,7 +1817,9 @@ mod tests {
         // firmware scripts; rejecting them would be a silent portability wall.
         assert_eq!(s.memory[1].name, "ram");
         assert_eq!(s.memory[2].attrs, "", "attribute list is optional");
-        let SectionsItem::Output(def) = &s.sections[0] else { panic!("expected output section") };
+        let SectionsItem::Output(def) = &s.sections[0] else {
+            panic!("expected output section")
+        };
         assert_eq!(def.region.as_deref(), Some("rom"));
     }
 
@@ -1493,14 +1827,19 @@ mod tests {
     fn memory_region_lma_assignment_is_separate_from_vma() {
         // `> ram AT> rom` is the ROM-resident/RAM-executing idiom; the two
         // regions must not be conflated.
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             MEMORY {
               rom (rx)  : ORIGIN = 0x08000000, LENGTH = 256K
               ram (rwx) : ORIGIN = 0x20000000, LENGTH = 64K
             }
             SECTIONS { .data : { *(.data) } > ram AT> rom }
-        "#).unwrap();
-        let SectionsItem::Output(def) = &s.sections[0] else { panic!() };
+        "#,
+        )
+        .unwrap();
+        let SectionsItem::Output(def) = &s.sections[0] else {
+            panic!()
+        };
         assert_eq!(def.region.as_deref(), Some("ram"));
         assert_eq!(def.lma_region.as_deref(), Some("rom"));
     }
@@ -1509,35 +1848,54 @@ mod tests {
     fn memory_region_without_length_is_rejected() {
         // A region missing ORIGIN/LENGTH cannot be range-checked; accepting it
         // would silently disable the overflow diagnostic.
-        assert!(parse_linker_script(
-            "MEMORY { r : ORIGIN = 0 } SECTIONS { .text : { *(.text) } }").is_err());
+        assert!(
+            parse_linker_script("MEMORY { r : ORIGIN = 0 } SECTIONS { .text : { *(.text) } }")
+                .is_err()
+        );
     }
 
     // ── SEGMENT_START / DATA_SEGMENT_* ──────────────────────────────────
 
     #[test]
     fn segment_start_uses_default_without_override() {
-        let s = parse_linker_script(
-            r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#).unwrap();
-        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let s = parse_linker_script(r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#)
+            .unwrap();
+        let SectionsItem::Assign(a) = &s.sections[0] else {
+            panic!()
+        };
         let syms = FxHashMap::default();
         let secs = FxHashMap::default();
-        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: None };
+        let ctx = EvalCtx {
+            dot: 0,
+            symbols: &syms,
+            sections: &secs,
+            segment_starts: None,
+        };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x400000));
     }
 
     #[test]
     fn segment_start_honours_an_override() {
-        let s = parse_linker_script(
-            r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#).unwrap();
-        let SectionsItem::Assign(a) = &s.sections[0] else { panic!() };
+        let s = parse_linker_script(r#"SECTIONS { . = SEGMENT_START("text-segment", 0x400000); }"#)
+            .unwrap();
+        let SectionsItem::Assign(a) = &s.sections[0] else {
+            panic!()
+        };
         let syms = FxHashMap::default();
         let secs = FxHashMap::default();
         let mut ov = FxHashMap::default();
         ov.insert("text-segment".to_string(), 0xdead000u64);
-        let ctx = EvalCtx { dot: 0, symbols: &syms, sections: &secs, segment_starts: Some(&ov) };
-        assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0xdead000),
-                   "-Ttext / -z must be able to override SEGMENT_START");
+        let ctx = EvalCtx {
+            dot: 0,
+            symbols: &syms,
+            sections: &secs,
+            segment_starts: Some(&ov),
+        };
+        assert_eq!(
+            eval_expr(&a.expr, &ctx).ok(),
+            Some(0xdead000),
+            "-Ttext / -z must be able to override SEGMENT_START"
+        );
     }
 
     #[test]
@@ -1545,12 +1903,20 @@ mod tests {
         // The overlap optimisation is optional; the alignment is not. Treating
         // DATA_SEGMENT_ALIGN as ALIGN(maxpagesize) is always correct and lets
         // `ld --verbose` output link unmodified.
-        let s = parse_linker_script(
-            "SECTIONS { . = 0x1001; . = DATA_SEGMENT_ALIGN(0x1000, 0x1000); }").unwrap();
-        let SectionsItem::Assign(a) = &s.sections[1] else { panic!() };
+        let s =
+            parse_linker_script("SECTIONS { . = 0x1001; . = DATA_SEGMENT_ALIGN(0x1000, 0x1000); }")
+                .unwrap();
+        let SectionsItem::Assign(a) = &s.sections[1] else {
+            panic!()
+        };
         let syms = FxHashMap::default();
         let secs = FxHashMap::default();
-        let ctx = EvalCtx { dot: 0x1001, symbols: &syms, sections: &secs, segment_starts: None };
+        let ctx = EvalCtx {
+            dot: 0x1001,
+            symbols: &syms,
+            sections: &secs,
+            segment_starts: None,
+        };
         assert_eq!(eval_expr(&a.expr, &ctx).ok(), Some(0x2000));
     }
 
@@ -1558,28 +1924,44 @@ mod tests {
 
     #[test]
     fn hidden_and_provide_hidden_set_the_hidden_flag() {
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             SECTIONS {
               .text : { *(.text) }
               PROVIDE(vis = .);
               PROVIDE_HIDDEN(ph = .);
               HIDDEN(h = .);
             }
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let get = |i: usize| -> &Assignment {
-            match &s.sections[i] { SectionsItem::Assign(a) => a, _ => panic!("not an assign") }
+            match &s.sections[i] {
+                SectionsItem::Assign(a) => a,
+                _ => panic!("not an assign"),
+            }
         };
-        assert!(!get(1).hidden && get(1).provide, "PROVIDE: visible, conditional");
-        assert!(get(2).hidden && get(2).provide, "PROVIDE_HIDDEN: hidden, conditional");
+        assert!(
+            !get(1).hidden && get(1).provide,
+            "PROVIDE: visible, conditional"
+        );
+        assert!(
+            get(2).hidden && get(2).provide,
+            "PROVIDE_HIDDEN: hidden, conditional"
+        );
         // HIDDEN() defines unconditionally -- it is not a PROVIDE.
-        assert!(get(3).hidden && !get(3).provide, "HIDDEN: hidden, unconditional");
+        assert!(
+            get(3).hidden && !get(3).provide,
+            "HIDDEN: hidden, unconditional"
+        );
     }
 
     // ── OVERLAY ─────────────────────────────────────────────────────────
 
     #[test]
     fn overlay_members_share_a_vma_and_advance_the_lma() {
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             SECTIONS {
               . = 0x400000;
               .text : { *(.text) }
@@ -1588,32 +1970,57 @@ mod tests {
                 .ovl2 { *(.ovl2) }
               }
             }
-        "#).unwrap();
-        let outs: Vec<&OutputSecDef> = s.sections.iter().filter_map(|i| match i {
-            SectionsItem::Output(d) => Some(d), _ => None }).collect();
-        let ovl1 = outs.iter().find(|d| d.name == ".ovl1").expect(".ovl1 missing");
-        let ovl2 = outs.iter().find(|d| d.name == ".ovl2").expect(".ovl2 missing");
+        "#,
+        )
+        .unwrap();
+        let outs: Vec<&OutputSecDef> = s
+            .sections
+            .iter()
+            .filter_map(|i| match i {
+                SectionsItem::Output(d) => Some(d),
+                _ => None,
+            })
+            .collect();
+        let ovl1 = outs
+            .iter()
+            .find(|d| d.name == ".ovl1")
+            .expect(".ovl1 missing");
+        let ovl2 = outs
+            .iter()
+            .find(|d| d.name == ".ovl2")
+            .expect(".ovl2 missing");
         // Both members are pinned to the overlay's start address...
         assert!(matches!(ovl1.address, Some(Expr::Num(0x500000))));
         assert!(matches!(ovl2.address, Some(Expr::Num(0x500000))));
         // ...while their load addresses differ: the first is the plain base,
         // the second is base + SIZEOF(.ovl1).
         assert!(matches!(ovl1.at_lma, Some(Expr::Num(0x480000))));
-        assert!(matches!(ovl2.at_lma, Some(Expr::Bin(BinOp::Add, _, _))),
-                "second member's LMA must advance past the first");
+        assert!(
+            matches!(ovl2.at_lma, Some(Expr::Bin(BinOp::Add, _, _))),
+            "second member's LMA must advance past the first"
+        );
     }
 
     #[test]
     fn overlay_defines_load_start_and_stop_symbols() {
         // The copy routine cannot find the bytes without these, so an overlay
         // that omits them is useless even though it lays out correctly.
-        let s = parse_linker_script(r#"
+        let s = parse_linker_script(
+            r#"
             SECTIONS {
               OVERLAY 0x500000 : AT (0x480000) { .ovl1 { *(.ovl1) } }
             }
-        "#).unwrap();
-        let names: Vec<&str> = s.sections.iter().filter_map(|i| match i {
-            SectionsItem::Assign(a) => Some(a.symbol.as_str()), _ => None }).collect();
+        "#,
+        )
+        .unwrap();
+        let names: Vec<&str> = s
+            .sections
+            .iter()
+            .filter_map(|i| match i {
+                SectionsItem::Assign(a) => Some(a.symbol.as_str()),
+                _ => None,
+            })
+            .collect();
         assert!(names.contains(&"__load_start_ovl1"), "got {:?}", names);
         assert!(names.contains(&"__load_stop_ovl1"), "got {:?}", names);
     }

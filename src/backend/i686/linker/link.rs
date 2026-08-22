@@ -7,12 +7,12 @@
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
-use super::types::*;
+use super::emit::emit_executable;
 use super::input::*;
 use super::sections::merge_sections;
+use super::shared::{emit_shared_library_32, resolve_dynamic_symbols_for_shared};
 use super::symbols::*;
-use super::emit::emit_executable;
-use super::shared::{resolve_dynamic_symbols_for_shared, emit_shared_library_32};
+use super::types::*;
 
 /// Built-in linker entry point with pre-resolved CRT objects and library paths.
 pub fn link_builtin(
@@ -28,21 +28,32 @@ pub fn link_builtin(
     let is_static = user_args.iter().any(|a| a == "-static");
 
     // Phase 1: Parse arguments and collect file lists
-    let (extra_libs, extra_lib_files, extra_lib_paths, extra_objects, defsym_defs) = parse_user_args(user_args);
+    let (extra_libs, extra_lib_files, extra_lib_paths, extra_objects, defsym_defs) =
+        parse_user_args(user_args);
 
-    let all_lib_dirs: Vec<String> = extra_lib_paths.into_iter()
+    let all_lib_dirs: Vec<String> = extra_lib_paths
+        .into_iter()
         .chain(lib_paths.iter().map(|s| s.to_string()))
         .collect();
 
     // Phase 2: Collect all input objects in link order
     let all_objects = collect_input_files(
-        object_files, &extra_objects, crt_objects_before, crt_objects_after,
-        is_nostdlib, is_static, lib_paths,
+        object_files,
+        &extra_objects,
+        crt_objects_before,
+        crt_objects_after,
+        is_nostdlib,
+        is_static,
+        lib_paths,
     );
 
     // Phase 3: Load dynamic library symbols and resolve static libs from -l flags
     let (dynlib_syms, static_lib_objects) = load_libraries(
-        is_static, is_nostdlib, needed_libs_param, &extra_libs, &extra_lib_files,
+        is_static,
+        is_nostdlib,
+        needed_libs_param,
+        &extra_libs,
+        &extra_lib_files,
         &all_lib_dirs,
     );
 
@@ -58,12 +69,16 @@ pub fn link_builtin(
     let (mut output_sections, mut section_name_to_idx, section_map) = merge_sections(&inputs);
 
     // Phase 6: Resolve symbols
-    let (mut global_symbols, sym_resolution) = resolve_symbols(
-        &inputs, &output_sections, &section_map, &dynlib_syms,
-    );
+    let (mut global_symbols, sym_resolution) =
+        resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
 
     // Phase 6b: Allocate COMMON symbols in .bss
-    allocate_common_symbols(&inputs, &mut output_sections, &mut section_name_to_idx, &mut global_symbols);
+    allocate_common_symbols(
+        &inputs,
+        &mut output_sections,
+        &mut section_name_to_idx,
+        &mut global_symbols,
+    );
 
     // Phase 7: Mark PLT/GOT needs and check undefined
     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
@@ -78,13 +93,20 @@ pub fn link_builtin(
     check_undefined_symbols(&global_symbols)?;
 
     // Phase 8: Build PLT/GOT structures
-    let (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total) = build_plt_got_lists(&mut global_symbols);
+    let (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total) =
+        build_plt_got_lists(&mut global_symbols);
 
     // Phase 8b: Mark WEAK dynamic data symbols for text relocations instead of COPY
     if !is_static {
-        let weak_data_syms: Vec<String> = global_symbols.iter()
-            .filter(|(_, s)| s.is_dynamic && s.needs_copy && s.binding == STB_WEAK
-                && s.sym_type != STT_FUNC && s.sym_type != STT_GNU_IFUNC)
+        let weak_data_syms: Vec<String> = global_symbols
+            .iter()
+            .filter(|(_, s)| {
+                s.is_dynamic
+                    && s.needs_copy
+                    && s.binding == STB_WEAK
+                    && s.sym_type != STT_FUNC
+                    && s.sym_type != STT_GNU_IFUNC
+            })
             .map(|(n, _)| n.clone())
             .collect();
         for name in &weak_data_syms {
@@ -100,11 +122,22 @@ pub fn link_builtin(
 
     // Phase 10: Layout + emit
     emit_executable(
-        &inputs, &mut output_sections, &section_name_to_idx, &section_map,
-        &mut global_symbols, &sym_resolution,
-        &dynlib_syms, &plt_symbols, &got_dyn_symbols, &got_local_symbols,
-        num_plt, num_got_total, &ifunc_symbols,
-        is_static, is_nostdlib, needed_libs_param,
+        &inputs,
+        &mut output_sections,
+        &section_name_to_idx,
+        &section_map,
+        &mut global_symbols,
+        &sym_resolution,
+        &dynlib_syms,
+        &plt_symbols,
+        &got_dyn_symbols,
+        &got_local_symbols,
+        num_plt,
+        num_got_total,
+        &ifunc_symbols,
+        is_static,
+        is_nostdlib,
+        needed_libs_param,
         output_path,
     )
 }
@@ -133,10 +166,20 @@ pub fn link_shared(
     while i < args.len() {
         let arg = args[i];
         if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { path };
+            let p = if path.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                path
+            };
             extra_lib_paths.push(p.to_string());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
+            let l = if lib.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                lib
+            };
             libs_to_load.push(l.to_string());
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -156,7 +199,9 @@ pub fn link_shared(
                 j += 1;
             }
         } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" { i += 1; }
+            if arg == "-o" {
+                i += 1;
+            }
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             extra_object_files.push(arg.to_string());
         }
@@ -175,10 +220,10 @@ pub fn link_shared(
     let (mut output_sections, section_name_to_idx, section_map) = merge_sections(&inputs);
 
     // Resolve symbols (no dynamic library symbols for shared lib output)
-    let dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> = FxHashMap::default();
-    let (mut global_symbols, _sym_resolution) = resolve_symbols(
-        &inputs, &output_sections, &section_map, &dynlib_syms,
-    );
+    let dynlib_syms: FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)> =
+        FxHashMap::default();
+    let (mut global_symbols, _sym_resolution) =
+        resolve_symbols(&inputs, &output_sections, &section_map, &dynlib_syms);
 
     // Load -l libraries (resolve into archives and load them)
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
@@ -205,12 +250,22 @@ pub fn link_shared(
 
     // Discover NEEDED dependencies by scanning for undefined symbols
     let mut needed_sonames: Vec<String> = Vec::new();
-    resolve_dynamic_symbols_for_shared(&inputs, &global_symbols, &mut needed_sonames, &all_lib_paths);
+    resolve_dynamic_symbols_for_shared(
+        &inputs,
+        &global_symbols,
+        &mut needed_sonames,
+        &all_lib_paths,
+    );
 
     // Emit shared library
     emit_shared_library_32(
-        &inputs, &mut global_symbols, &mut output_sections,
-        &section_name_to_idx, &section_map,
-        &needed_sonames, output_path, soname,
+        &inputs,
+        &mut global_symbols,
+        &mut output_sections,
+        &section_name_to_idx,
+        &section_map,
+        &needed_sonames,
+        output_path,
+        soname,
     )
 }

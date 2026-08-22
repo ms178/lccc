@@ -6,10 +6,10 @@
 // pointer to a function returning int, read from the name outward. This module
 // handles the recursive parsing needed for this grammar.
 
-use crate::common::types::AddressSpace;
-use crate::frontend::lexer::token::TokenKind;
 use super::ast::*;
 use super::parse::{ModeKind, Parser};
+use crate::common::types::AddressSpace;
+use crate::frontend::lexer::token::TokenKind;
 
 /// Result of parsing a parenthesized abstract declarator.
 pub(super) enum ParenAbstractDecl {
@@ -40,7 +40,16 @@ impl Parser {
 
     /// Parse a declarator, also returning attribute info:
     /// (name, derived, mode_kind, has_common, aligned_value, is_packed)
-    pub(super) fn parse_declarator_with_attrs(&mut self) -> (Option<String>, Vec<DerivedDeclarator>, Option<ModeKind>, bool, Option<usize>, bool) {
+    pub(super) fn parse_declarator_with_attrs(
+        &mut self,
+    ) -> (
+        Option<String>,
+        Vec<DerivedDeclarator>,
+        Option<ModeKind>,
+        bool,
+        Option<usize>,
+        bool,
+    ) {
         let mut derived = Vec::with_capacity(4);
 
         let mut pre_aligned: Option<usize> = None;
@@ -92,7 +101,8 @@ impl Parser {
                         None
                     } else if matches!(self.peek(), TokenKind::Star)
                         && self.pos + 1 < self.tokens.len()
-                        && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket) {
+                        && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket)
+                    {
                         // C99 VLA star syntax: [*] or [const *] means unspecified VLA size
                         self.advance(); // consume '*'
                         None
@@ -139,14 +149,34 @@ impl Parser {
                 !self.typedefs.contains(name) || self.shadowed_typedefs.contains(name)
             }
             TokenKind::RParen | TokenKind::Ellipsis => false,
-            TokenKind::Void | TokenKind::Char | TokenKind::Short | TokenKind::Int |
-            TokenKind::Long | TokenKind::Float | TokenKind::Double | TokenKind::Signed |
-            TokenKind::Unsigned | TokenKind::Struct | TokenKind::Union | TokenKind::Enum |
-            TokenKind::Const | TokenKind::Volatile | TokenKind::Static | TokenKind::Extern |
-            TokenKind::Register | TokenKind::Typedef | TokenKind::Inline | TokenKind::Bool |
-            TokenKind::Typeof | TokenKind::Noreturn | TokenKind::Restrict | TokenKind::Complex |
-            TokenKind::Atomic | TokenKind::Auto | TokenKind::Alignas |
-            TokenKind::Builtin => false,
+            TokenKind::Void
+            | TokenKind::Char
+            | TokenKind::Short
+            | TokenKind::Int
+            | TokenKind::Long
+            | TokenKind::Float
+            | TokenKind::Double
+            | TokenKind::Signed
+            | TokenKind::Unsigned
+            | TokenKind::Struct
+            | TokenKind::Union
+            | TokenKind::Enum
+            | TokenKind::Const
+            | TokenKind::Volatile
+            | TokenKind::Static
+            | TokenKind::Extern
+            | TokenKind::Register
+            | TokenKind::Typedef
+            | TokenKind::Inline
+            | TokenKind::Bool
+            | TokenKind::Typeof
+            | TokenKind::Noreturn
+            | TokenKind::Restrict
+            | TokenKind::Complex
+            | TokenKind::Atomic
+            | TokenKind::Auto
+            | TokenKind::Alignas
+            | TokenKind::Builtin => false,
             _ => false,
         }
     }
@@ -174,12 +204,20 @@ impl Parser {
         }
 
         // Check for function pointer: inner has Pointer(s), outer starts with Function
-        let inner_only_ptr_and_array = inner_derived.iter().all(|d|
-            matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)));
-        let inner_has_pointer = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer));
-        let outer_starts_with_function = matches!(outer_suffixes.first(), Some(DerivedDeclarator::Function(_, _)));
+        let inner_only_ptr_and_array = inner_derived
+            .iter()
+            .all(|d| matches!(d, DerivedDeclarator::Pointer | DerivedDeclarator::Array(_)));
+        let inner_has_pointer = inner_derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer));
+        let outer_starts_with_function = matches!(
+            outer_suffixes.first(),
+            Some(DerivedDeclarator::Function(_, _))
+        );
 
-        if inner_only_ptr_and_array && inner_has_pointer && outer_starts_with_function
+        if inner_only_ptr_and_array
+            && inner_has_pointer
+            && outer_starts_with_function
             && outer_suffixes.len() == 1
         {
             // In C's inside-out reading of declarations:
@@ -206,14 +244,21 @@ impl Parser {
 
             // Count inner pointers. The last one is the function pointer syntax marker.
             // All others are extra indirection levels placed AFTER the FunctionPointer.
-            let inner_ptr_count = inner_derived.iter()
+            let inner_ptr_count = inner_derived
+                .iter()
                 .filter(|d| matches!(d, DerivedDeclarator::Pointer))
                 .count();
-            let extra_indirection_ptrs = if inner_ptr_count > 0 { inner_ptr_count - 1 } else { 0 };
+            let extra_indirection_ptrs = if inner_ptr_count > 0 {
+                inner_ptr_count - 1
+            } else {
+                0
+            };
 
             // Emit the function pointer syntax marker + FunctionPointer
             result.push(DerivedDeclarator::Pointer);
-            if let Some(DerivedDeclarator::Function(params, variadic)) = outer_suffixes.into_iter().next() {
+            if let Some(DerivedDeclarator::Function(params, variadic)) =
+                outer_suffixes.into_iter().next()
+            {
                 result.push(DerivedDeclarator::FunctionPointer(params, variadic));
             }
 
@@ -246,12 +291,16 @@ impl Parser {
         // For `int (*ptrs[2])[4]`: inner=[Pointer, Array(2)], outer=[Array(4)]
         //   Split inner at pointer: pre_ptr=[], post_ptr=[Array(2)]
         //   Result: [] ++ [Array(4)] ++ [Pointer] ++ [Array(2)] = [Array(4), Pointer, Array(2)]
-        let outer_only_arrays = outer_suffixes.iter().all(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let outer_only_arrays = outer_suffixes
+            .iter()
+            .all(|d| matches!(d, DerivedDeclarator::Array(_)));
         if inner_only_ptr_and_array && inner_has_pointer && outer_only_arrays {
             // Split inner_derived at the last Pointer:
             // - pre_ptr_arrays: arrays before the last pointer (part of pointee type)
             // - post_ptr_arrays: arrays after the last pointer (variable's own array dimensions)
-            let last_ptr_idx = inner_derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Pointer))
+            let last_ptr_idx = inner_derived
+                .iter()
+                .rposition(|d| matches!(d, DerivedDeclarator::Pointer))
                 .expect("inner_has_pointer is true, so a Pointer must exist");
             let mut result = outer_pointers;
             // 1. Arrays from inner that come before the pointer (pointee array dimensions)
@@ -283,8 +332,11 @@ impl Parser {
         //
         // This does NOT match function definitions returning function pointers like
         // `int (*g(int))(int)`, where inner has Function (not FunctionPointer).
-        let inner_starts_with_pointer = matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer));
-        let inner_has_fptr = inner_derived.iter().any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+        let inner_starts_with_pointer =
+            matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer));
+        let inner_has_fptr = inner_derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
         if inner_starts_with_pointer && inner_has_fptr && outer_starts_with_function {
             let mut result = outer_pointers;
             // Keep inner_derived in its existing order
@@ -333,7 +385,9 @@ impl Parser {
 
         // Check for K&R-style identifier list
         if let TokenKind::Identifier(ref name) = self.peek() {
-            if (!self.typedefs.contains(name) || self.shadowed_typedefs.contains(name)) && !self.is_type_specifier() {
+            if (!self.typedefs.contains(name) || self.shadowed_typedefs.contains(name))
+                && !self.is_type_specifier()
+            {
                 return self.parse_kr_identifier_list();
             }
         }
@@ -359,8 +413,16 @@ impl Parser {
                 // For `const int *p`, parsing_const is true here; the `*` is handled below.
                 let param_is_const = self.attrs.parsing_const();
                 let param_is_volatile = self.attrs.parsing_volatile();
-                let (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_param_decls, inner_ptr_depth, param_is_restrict) =
-                    self.parse_param_declarator_full();
+                let (
+                    name,
+                    pointer_depth,
+                    array_dims,
+                    is_func_ptr,
+                    ptr_to_array_dims,
+                    fptr_param_decls,
+                    inner_ptr_depth,
+                    param_is_restrict,
+                ) = self.parse_param_declarator_full();
                 self.skip_gcc_extensions();
 
                 // Apply pointer levels
@@ -397,7 +459,16 @@ impl Parser {
 
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
-                params.push(ParamDecl { type_spec, name, fptr_params: fptr_param_decls, is_const: param_is_const, is_volatile: param_is_volatile, is_restrict: param_is_restrict, vla_size_exprs, fptr_inner_ptr_depth: inner_ptr_depth });
+                params.push(ParamDecl {
+                    type_spec,
+                    name,
+                    fptr_params: fptr_param_decls,
+                    is_const: param_is_const,
+                    is_volatile: param_is_volatile,
+                    is_restrict: param_is_restrict,
+                    vla_size_exprs,
+                    fptr_inner_ptr_depth: inner_ptr_depth,
+                });
             } else {
                 self.attrs.set_const(saved_const);
                 self.attrs.set_noreturn(saved_noreturn);
@@ -439,7 +510,18 @@ impl Parser {
 
     /// Parse a parameter declarator with full type information.
     /// Returns (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth).
-    pub(super) fn parse_param_declarator_full(&mut self) -> (Option<String>, u32, Vec<Option<Box<Expr>>>, bool, Vec<Option<Box<Expr>>>, Option<Vec<ParamDecl>>, u32, bool) {
+    pub(super) fn parse_param_declarator_full(
+        &mut self,
+    ) -> (
+        Option<String>,
+        u32,
+        Vec<Option<Box<Expr>>>,
+        bool,
+        Vec<Option<Box<Expr>>>,
+        Option<Vec<ParamDecl>>,
+        u32,
+        bool,
+    ) {
         let mut pointer_depth: u32 = 0;
         let mut is_restrict = false;
         while self.consume_if(&TokenKind::Star) {
@@ -463,7 +545,14 @@ impl Parser {
         let mut fptr_inner_ptr_depth: u32 = 0;
 
         let name = if matches!(self.peek(), TokenKind::LParen) && self.is_paren_declarator() {
-            self.parse_paren_param_declarator(&mut pointer_depth, &mut array_dims, &mut is_func_ptr, &mut ptr_to_array_dims, &mut fptr_params, &mut fptr_inner_ptr_depth)
+            self.parse_paren_param_declarator(
+                &mut pointer_depth,
+                &mut array_dims,
+                &mut is_func_ptr,
+                &mut ptr_to_array_dims,
+                &mut fptr_params,
+                &mut fptr_inner_ptr_depth,
+            )
         } else if let TokenKind::Identifier(ref n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -482,7 +571,8 @@ impl Parser {
                 self.advance();
             } else if matches!(self.peek(), TokenKind::Star)
                 && self.pos + 1 < self.tokens.len()
-                && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket) {
+                && matches!(self.tokens[self.pos + 1].kind, TokenKind::RBracket)
+            {
                 // C99 VLA star syntax: [*] or [static *] means unspecified VLA size
                 self.advance(); // consume '*'
                 array_dims.push(None);
@@ -504,7 +594,16 @@ impl Parser {
             fptr_params = Some(fp_params);
         }
 
-        (name, pointer_depth, array_dims, is_func_ptr, ptr_to_array_dims, fptr_params, fptr_inner_ptr_depth, is_restrict)
+        (
+            name,
+            pointer_depth,
+            array_dims,
+            is_func_ptr,
+            ptr_to_array_dims,
+            fptr_params,
+            fptr_inner_ptr_depth,
+            is_restrict,
+        )
     }
 
     /// Parse a parenthesized parameter declarator: (*name)(params), (name), etc.
@@ -750,7 +849,10 @@ impl Parser {
         if matches!(self.peek(), TokenKind::LParen) {
             if let Some(inner) = self.try_parse_paren_abstract_declarator() {
                 match inner {
-                    ParenAbstractDecl::Simple { ptr_depth: inner_ptrs, array_dims: inner_dims } => {
+                    ParenAbstractDecl::Simple {
+                        ptr_depth: inner_ptrs,
+                        array_dims: inner_dims,
+                    } => {
                         // After inner (*), check if a parameter list follows — making this
                         // a nested function pointer: (*(*)(params))
                         if matches!(self.peek(), TokenKind::LParen) {
@@ -825,7 +927,10 @@ impl Parser {
 
         if self.consume_if(&TokenKind::RParen) {
             if total_ptrs > 0 || !array_dims.is_empty() {
-                Some(ParenAbstractDecl::Simple { ptr_depth: total_ptrs, array_dims })
+                Some(ParenAbstractDecl::Simple {
+                    ptr_depth: total_ptrs,
+                    array_dims,
+                })
             } else {
                 self.pos = save;
                 None

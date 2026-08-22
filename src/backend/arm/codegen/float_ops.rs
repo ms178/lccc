@@ -1,10 +1,10 @@
 //! ArmCodegen: floating-point binary operations.
 
-use crate::ir::reexports::{IrConst, Operand, Value};
-use crate::common::types::IrType;
+use super::emit::{arm_fp_name, is_arm_fp_phys, ArmCodegen};
 use crate::backend::cast::FloatOp;
 use crate::backend::traits::ArchCodegen;
-use super::emit::{ArmCodegen, arm_fp_name, is_arm_fp_phys};
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn float_operand_reg(&mut self, op: &Operand, ty: IrType, scratch: &str) -> String {
@@ -25,7 +25,8 @@ impl ArmCodegen {
                 if is_arm_fp_phys(phys) {
                     let source = arm_fp_name(phys, ty);
                     if source != target {
-                        self.state.emit_fmt(format_args!("    fmov {}, {}", target, source));
+                        self.state
+                            .emit_fmt(format_args!("    fmov {}, {}", target, source));
                     }
                     return;
                 }
@@ -56,10 +57,12 @@ impl ArmCodegen {
             if let Some(bits) = bits {
                 if bits == 0 {
                     let zero = if ty == IrType::F32 { "wzr" } else { "xzr" };
-                    self.state.emit_fmt(format_args!("    fmov {}, {}", target, zero));
+                    self.state
+                        .emit_fmt(format_args!("    fmov {}, {}", target, zero));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state.emit_fmt(format_args!("    ldr {}, {}", target, label));
+                    self.state
+                        .emit_fmt(format_args!("    ldr {}, {}", target, label));
                 }
                 return;
             }
@@ -77,7 +80,8 @@ impl ArmCodegen {
             if is_arm_fp_phys(phys) {
                 let target = arm_fp_name(phys, ty);
                 if target != source {
-                    self.state.emit_fmt(format_args!("    fmov {}, {}", target, source));
+                    self.state
+                        .emit_fmt(format_args!("    fmov {}, {}", target, source));
                 }
                 return;
             }
@@ -100,21 +104,44 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_fused_mul_add_impl(
-        &mut self, _mul_dest: &Value, mul_lhs: &Operand, mul_rhs: &Operand,
-        acc: &Operand, add_dest: &Value, ty: IrType,
+        &mut self,
+        _mul_dest: &Value,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        acc: &Operand,
+        add_dest: &Value,
+        ty: IrType,
     ) {
-        let (r0, r1, r2) = if ty == IrType::F32 { ("s0", "s1", "s2") } else { ("d0", "d1", "d2") };
+        let (r0, r1, r2) = if ty == IrType::F32 {
+            ("s0", "s1", "s2")
+        } else {
+            ("d0", "d1", "d2")
+        };
         let acc_reg = self.float_operand_reg(acc, ty, r2);
         let lhs_reg = self.float_operand_reg(mul_lhs, ty, r0);
         let rhs_reg = self.float_operand_reg(mul_rhs, ty, r1);
-        let output = self.reg_assignments.get(&add_dest.0).copied()
-            .filter(|r| is_arm_fp_phys(*r)).map(|r| arm_fp_name(r, ty))
+        let output = self
+            .reg_assignments
+            .get(&add_dest.0)
+            .copied()
+            .filter(|r| is_arm_fp_phys(*r))
+            .map(|r| arm_fp_name(r, ty))
             .unwrap_or_else(|| r0.to_string());
-        self.state.emit_fmt(format_args!("    fmadd {}, {}, {}, {}", output, lhs_reg, rhs_reg, acc_reg));
+        self.state.emit_fmt(format_args!(
+            "    fmadd {}, {}, {}, {}",
+            output, lhs_reg, rhs_reg, acc_reg
+        ));
         self.store_float_reg(add_dest, ty, &output);
     }
 
-    pub(super) fn emit_float_binop_impl(&mut self, dest: &Value, op: FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    pub(super) fn emit_float_binop_impl(
+        &mut self,
+        dest: &Value,
+        op: FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F128 {
             crate::backend::f128_softfloat::f128_emit_binop(self, dest, op, lhs, rhs);
             return;
@@ -123,13 +150,19 @@ impl ArmCodegen {
         let mnemonic = self.emit_float_binop_mnemonic(op);
         let scratch0 = if ty == IrType::F32 { "s0" } else { "d0" };
         let r1 = if ty == IrType::F32 { "s1" } else { "d1" };
-        let output = self.reg_assignments.get(&dest.0).copied()
+        let output = self
+            .reg_assignments
+            .get(&dest.0)
+            .copied()
             .filter(|r| is_arm_fp_phys(*r))
             .map(|r| arm_fp_name(r, ty))
             .unwrap_or_else(|| scratch0.to_string());
         let lhs_reg = self.float_operand_reg(lhs, ty, scratch0);
         let rhs_reg = self.float_operand_reg(rhs, ty, r1);
-        self.state.emit_fmt(format_args!("    {} {}, {}, {}", mnemonic, output, lhs_reg, rhs_reg));
+        self.state.emit_fmt(format_args!(
+            "    {} {}, {}, {}",
+            mnemonic, output, lhs_reg, rhs_reg
+        ));
         self.store_float_reg(dest, ty, &output);
     }
 
@@ -138,13 +171,15 @@ impl ArmCodegen {
         if ty == IrType::F32 {
             self.state.emit("    fmov s0, w1");
             self.state.emit("    fmov s1, w2");
-            self.state.emit_fmt(format_args!("    {} s0, s0, s1", mnemonic));
+            self.state
+                .emit_fmt(format_args!("    {} s0, s0, s1", mnemonic));
             self.state.emit("    fmov w0, s0");
             self.state.emit("    mov w0, w0"); // zero-extend
         } else {
             self.state.emit("    fmov d0, x1");
             self.state.emit("    fmov d1, x2");
-            self.state.emit_fmt(format_args!("    {} d0, d0, d1", mnemonic));
+            self.state
+                .emit_fmt(format_args!("    {} d0, d0, d1", mnemonic));
             self.state.emit("    fmov x0, d0");
         }
     }

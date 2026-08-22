@@ -1,8 +1,8 @@
 //! I686Codegen: F128 negation.
 
-use crate::ir::reexports::{Operand, Value};
-use crate::emit;
 use super::emit::I686Codegen;
+use crate::emit;
+use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
     pub(super) fn emit_f128_neg_impl(&mut self, dest: &Value, src: &Operand) {

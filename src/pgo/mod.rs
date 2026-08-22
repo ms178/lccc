@@ -9,9 +9,9 @@ pub(crate) mod profile;
 pub(crate) mod promote;
 pub(crate) mod summary;
 pub(crate) mod unroll_pgo;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{BlockId, IrFunction, IrModule};
 use std::cell::{Cell, RefCell};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Default)]

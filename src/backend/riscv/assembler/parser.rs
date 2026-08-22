@@ -31,7 +31,11 @@ pub enum Operand {
     /// Memory operand: offset(base) e.g., 8(sp) or -16(s0)
     Mem { base: String, offset: i64 },
     /// Memory operand with symbol: %lo(symbol)(base) or similar
-    MemSymbol { base: String, symbol: String, modifier: String },
+    MemSymbol {
+        base: String,
+        symbol: String,
+        modifier: String,
+    },
     /// Label reference for branches
     Label(String),
     /// Fence operand: iorw etc.
@@ -52,7 +56,11 @@ pub enum DataValue {
     /// A symbol reference, possibly with an addend: `sym` or `sym+4` or `sym-8`.
     Symbol { name: String, addend: i64 },
     /// A symbol difference: `sym_a - sym_b`, possibly with addend on sym_a.
-    SymbolDiff { sym_a: String, sym_b: String, addend: i64 },
+    SymbolDiff {
+        sym_a: String,
+        sym_b: String,
+        addend: i64,
+    },
     /// A raw expression string that needs alias resolution at emit time.
     Expression(String),
 }
@@ -158,7 +166,11 @@ pub enum Directive {
     /// `.insn ...` — emit raw instruction encoding
     Insn(String),
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
-    Incbin { path: String, skip: u64, count: Option<u64> },
+    Incbin {
+        path: String,
+        skip: u64,
+        count: Option<u64>,
+    },
     /// `.subsection N` — switch to numbered subsection
     Subsection(u64),
     /// Unknown directive — preserved for forward compatibility
@@ -196,7 +208,8 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
     let macro_refs: Vec<&str> = macro_expanded.iter().map(|s| s.as_str()).collect();
 
     // Expand .rept/.endr and .irp/.endr blocks
-    let expanded_lines = asm_preprocess::expand_rept_blocks(&macro_refs, &COMMENT_STYLE, parse_int_literal)?;
+    let expanded_lines =
+        asm_preprocess::expand_rept_blocks(&macro_refs, &COMMENT_STYLE, parse_int_literal)?;
 
     let mut statements = Vec::new();
     // Stack for .if/.else/.endif conditional assembly.
@@ -223,7 +236,10 @@ pub fn parse_asm(text: &str) -> Result<Vec<AsmStatement>, String> {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with(".endif") {
             if if_stack.pop().is_none() {
-                return Err(format!("Line {}: .endif without matching .if", line_num + 1));
+                return Err(format!(
+                    "Line {}: .endif without matching .if",
+                    line_num + 1
+                ));
             }
             continue;
         }
@@ -352,13 +368,19 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".size" => parse_size_directive(args),
 
         ".align" | ".p2align" => {
-            let val: u64 = args.trim().split(',').next()
+            let val: u64 = args
+                .trim()
+                .split(',')
+                .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
                 .unwrap_or(0) as u64;
             Directive::Align(val)
         }
         ".balign" => {
-            let val: u64 = args.trim().split(',').next()
+            let val: u64 = args
+                .trim()
+                .split(',')
+                .next()
                 .and_then(|s| parse_int_literal(s.trim()).ok())
                 .unwrap_or(1) as u64;
             Directive::Balign(val)
@@ -384,7 +406,8 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".zero" | ".space" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
             let size: usize = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("invalid .zero size: {}", args))? as usize;
+                .map_err(|_| format!("invalid .zero size: {}", args))?
+                as usize;
             let fill: u8 = if parts.len() > 1 {
                 parse_data_value_int(parts[1].trim())? as u8
             } else {
@@ -396,22 +419,28 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             // .fill repeat, size, value
             let parts: Vec<&str> = args.splitn(3, ',').collect();
             let repeat = parse_int_literal(parts[0].trim())
-                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))? as u64;
+                .map_err(|_| format!("bad .fill repeat: {}", parts[0].trim()))?
+                as u64;
             let size = if parts.len() > 1 {
                 parse_int_literal(parts[1].trim())
-                    .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))? as u64
+                    .map_err(|_| format!("bad .fill size: {}", parts[1].trim()))?
+                    as u64
             } else {
                 1
             };
             let value = if parts.len() > 2 {
                 parse_int_literal(parts[2].trim())
-                    .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))? as u64
+                    .map_err(|_| format!("bad .fill value: {}", parts[2].trim()))?
+                    as u64
             } else {
                 0
             };
             let total_bytes = (repeat * size.min(8)) as usize;
             if value == 0 {
-                Directive::Zero { size: total_bytes, fill: 0 }
+                Directive::Zero {
+                    size: total_bytes,
+                    fill: 0,
+                }
             } else {
                 let mut data = Vec::with_capacity(total_bytes);
                 let value_bytes = value.to_le_bytes();
@@ -435,9 +464,21 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
 
         ".comm" => {
             let parts: Vec<&str> = args.split(',').collect();
-            let sym = if !parts.is_empty() { parts[0].trim().to_string() } else { String::new() };
-            let size: u64 = if parts.len() >= 2 { parts[1].trim().parse().unwrap_or(0) } else { 0 };
-            let align: u64 = if parts.len() > 2 { parts[2].trim().parse().unwrap_or(1) } else { 1 };
+            let sym = if !parts.is_empty() {
+                parts[0].trim().to_string()
+            } else {
+                String::new()
+            };
+            let size: u64 = if parts.len() >= 2 {
+                parts[1].trim().parse().unwrap_or(0)
+            } else {
+                0
+            };
+            let align: u64 = if parts.len() > 2 {
+                parts[2].trim().parse().unwrap_or(1)
+            } else {
+                1
+            };
             Directive::Comm { sym, size, align }
         }
 
@@ -445,8 +486,16 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
 
         ".set" | ".equ" => {
             let parts: Vec<&str> = args.splitn(2, ',').collect();
-            let sym = if !parts.is_empty() { parts[0].trim().to_string() } else { String::new() };
-            let val = if parts.len() > 1 { parts[1].trim().to_string() } else { String::new() };
+            let sym = if !parts.is_empty() {
+                parts[0].trim().to_string()
+            } else {
+                String::new()
+            };
+            let val = if parts.len() > 1 {
+                parts[1].trim().to_string()
+            } else {
+                String::new()
+            };
             Directive::Set(sym, val)
         }
         ".symver" => {
@@ -475,18 +524,28 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".insn" => Directive::Insn(args.to_string()),
 
         // CFI directives
-        ".cfi_startproc" | ".cfi_endproc" | ".cfi_def_cfa_offset"
-        | ".cfi_offset" | ".cfi_def_cfa_register" | ".cfi_restore"
-        | ".cfi_remember_state" | ".cfi_restore_state"
-        | ".cfi_adjust_cfa_offset" | ".cfi_def_cfa"
-        | ".cfi_sections" | ".cfi_personality" | ".cfi_lsda"
-        | ".cfi_rel_offset" | ".cfi_register" | ".cfi_return_column"
-        | ".cfi_undefined" | ".cfi_same_value" | ".cfi_escape"
+        ".cfi_startproc"
+        | ".cfi_endproc"
+        | ".cfi_def_cfa_offset"
+        | ".cfi_offset"
+        | ".cfi_def_cfa_register"
+        | ".cfi_restore"
+        | ".cfi_remember_state"
+        | ".cfi_restore_state"
+        | ".cfi_adjust_cfa_offset"
+        | ".cfi_def_cfa"
+        | ".cfi_sections"
+        | ".cfi_personality"
+        | ".cfi_lsda"
+        | ".cfi_rel_offset"
+        | ".cfi_register"
+        | ".cfi_return_column"
+        | ".cfi_undefined"
+        | ".cfi_same_value"
+        | ".cfi_escape"
         | ".cfi_signal_frame" => Directive::Cfi,
 
-        ".pushsection" => {
-            Directive::PushSection(parse_section_args(args))
-        }
+        ".pushsection" => Directive::PushSection(parse_section_args(args)),
         ".popsection" => Directive::PopSection,
         ".previous" => Directive::Previous,
 
@@ -502,10 +561,14 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             let path = String::from_utf8(path).map_err(|_| "invalid .incbin path".to_string())?;
             let skip = if parts.len() > 1 {
                 parse_int_literal(parts[1].trim()).unwrap_or(0) as u64
-            } else { 0 };
+            } else {
+                0
+            };
             let count = if parts.len() > 2 {
                 Some(parse_int_literal(parts[2].trim()).unwrap_or(0) as u64)
-            } else { None };
+            } else {
+                None
+            };
             Directive::Incbin { path, skip, count }
         }
 
@@ -515,10 +578,10 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         }
 
         // Other ignorable directives
-        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym"
-        | ".build_attributes" | ".eabi_attribute" | ".end"
-        | ".altmacro" | ".noaltmacro"
-        | ".purgem" => Directive::Ignored,
+        ".file" | ".loc" | ".ident" | ".addrsig" | ".addrsig_sym" | ".build_attributes"
+        | ".eabi_attribute" | ".end" | ".altmacro" | ".noaltmacro" | ".purgem" => {
+            Directive::Ignored
+        }
 
         _ => Directive::Unknown {
             name: name.to_string(),
@@ -549,7 +612,12 @@ fn parse_section_args(args: &str) -> SectionInfo {
             "@progbits".to_string()
         }
     };
-    SectionInfo { name, flags, sec_type, flags_explicit }
+    SectionInfo {
+        name,
+        flags,
+        sec_type,
+        flags_explicit,
+    }
 }
 
 /// Parse `.type sym, @function` etc.
@@ -659,7 +727,8 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
     let is_sym_start = first.is_ascii_alphabetic() || first == '_' || first == '.';
     let could_be_numeric_ref = first.is_ascii_digit();
     let starts_with_paren = first == '(';
-    let has_complex_ops = s.contains('/') || s.contains('*') || s.contains("<<") || s.contains(">>");
+    let has_complex_ops =
+        s.contains('/') || s.contains('*') || s.contains("<<") || s.contains(">>");
     if !has_complex_ops && (is_sym_start || could_be_numeric_ref || starts_with_paren) {
         // Try to find a symbol difference expression
         if let Some(minus_pos) = find_symbol_diff_minus(s) {
@@ -697,7 +766,10 @@ fn parse_single_data_value(s: &str) -> Result<DataValue, String> {
             return Ok(DataValue::Symbol { name: sym, addend });
         } else if could_be_numeric_ref && is_numeric_label_ref(s) {
             // Standalone numeric label reference like "2f" or "1b"
-            return Ok(DataValue::Symbol { name: s.to_string(), addend: 0 });
+            return Ok(DataValue::Symbol {
+                name: s.to_string(),
+                addend: 0,
+            });
         } else if starts_with_paren {
             // Parenthesized single symbol, e.g. "(1b)" or "(.Lfoo)"
             let inner = strip_outer_parens(s);
@@ -878,10 +950,15 @@ fn parse_single_operand(s: &str, is_fence: bool, force_symbol: bool) -> Result<O
     }
 
     // %hi(symbol) or %lo(symbol) - used as immediates in lui/addi
-    if s.starts_with("%hi(") || s.starts_with("%lo(") || s.starts_with("%pcrel_hi(")
-        || s.starts_with("%pcrel_lo(") || s.starts_with("%tprel_hi(")
-        || s.starts_with("%tprel_lo(") || s.starts_with("%tprel_add(")
-        || s.starts_with("%got_pcrel_hi(") || s.starts_with("%tls_ie_pcrel_hi(")
+    if s.starts_with("%hi(")
+        || s.starts_with("%lo(")
+        || s.starts_with("%pcrel_hi(")
+        || s.starts_with("%pcrel_lo(")
+        || s.starts_with("%tprel_hi(")
+        || s.starts_with("%tprel_lo(")
+        || s.starts_with("%tprel_add(")
+        || s.starts_with("%got_pcrel_hi(")
+        || s.starts_with("%tls_ie_pcrel_hi(")
         || s.starts_with("%tls_gd_pcrel_hi(")
     {
         return Ok(Operand::Symbol(s.to_string()));
@@ -1011,7 +1088,10 @@ fn is_fence_arg(s: &str) -> bool {
 }
 
 fn is_rounding_mode(s: &str) -> bool {
-    matches!(s.to_lowercase().as_str(), "rne" | "rtz" | "rdn" | "rup" | "rmm" | "dyn")
+    matches!(
+        s.to_lowercase().as_str(),
+        "rne" | "rtz" | "rdn" | "rup" | "rmm" | "dyn"
+    )
 }
 
 /// Check if a string is a valid RISC-V register name.

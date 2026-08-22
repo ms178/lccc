@@ -4,17 +4,12 @@
 //! pointer parameter handling, struct/union-to-CType conversion, and
 //! the TypeConvertContext trait implementation.
 
-use crate::common::type_builder;
-use crate::frontend::parser::ast::{
-    DerivedDeclarator,
-    EnumVariant,
-    Expr,
-    ParamDecl,
-    StructFieldDecl,
-    TypeSpecifier,
-};
-use crate::common::types::{AddressSpace, StructField, StructLayout, CType};
 use super::lower::Lowerer;
+use crate::common::type_builder;
+use crate::common::types::{AddressSpace, CType, StructField, StructLayout};
+use crate::frontend::parser::ast::{
+    DerivedDeclarator, EnumVariant, Expr, ParamDecl, StructFieldDecl, TypeSpecifier,
+};
 
 impl Lowerer {
     /// Convert a CType back to a TypeSpecifier (for typeof and __auto_type resolution).
@@ -49,8 +44,10 @@ impl Lowerer {
                 // Pointer(Int), causing local variables to be misidentified as extern symbols.
                 if let CType::Function(ft) = inner.as_ref() {
                     let ret_ts = Self::ctype_to_type_spec(&ft.return_type);
-                    let param_decls: Vec<ParamDecl> = ft.params.iter().map(|(cty, name)| {
-                        ParamDecl {
+                    let param_decls: Vec<ParamDecl> = ft
+                        .params
+                        .iter()
+                        .map(|(cty, name)| ParamDecl {
                             type_spec: Self::ctype_to_type_spec(cty),
                             name: name.clone(),
                             fptr_params: None,
@@ -59,16 +56,24 @@ impl Lowerer {
                             is_restrict: false,
                             vla_size_exprs: Vec::new(),
                             fptr_inner_ptr_depth: 0,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     TypeSpecifier::FunctionPointer(Box::new(ret_ts), param_decls, ft.variadic)
                 } else {
-                    TypeSpecifier::Pointer(Box::new(Self::ctype_to_type_spec(inner)), AddressSpace::Default)
+                    TypeSpecifier::Pointer(
+                        Box::new(Self::ctype_to_type_spec(inner)),
+                        AddressSpace::Default,
+                    )
                 }
             }
             CType::Array(elem, size) => TypeSpecifier::Array(
                 Box::new(Self::ctype_to_type_spec(elem)),
-                size.map(|s| Box::new(Expr::IntLiteral(s as i64, crate::common::source::Span::dummy()))),
+                size.map(|s| {
+                    Box::new(Expr::IntLiteral(
+                        s as i64,
+                        crate::common::source::Span::dummy(),
+                    ))
+                }),
             ),
             CType::Struct(key) => {
                 // Extract tag name from key (e.g., "struct.Foo" -> "Foo")
@@ -90,16 +95,16 @@ impl Lowerer {
                     TypeSpecifier::Union(Some(key.to_string()), None, false, None, None)
                 }
             }
-            CType::Enum(et) => {
-                TypeSpecifier::Enum(et.name.clone(), None, et.is_packed)
-            }
+            CType::Enum(et) => TypeSpecifier::Enum(et.name.clone(), None, et.is_packed),
             CType::Function(ft) => {
                 // Bare function type — NOT a pointer. Use BareFunction so that
                 // typeof(func_name) preserves the function type without adding a
                 // pointer level. FunctionPointer already includes a pointer wrapper.
                 let ret_ts = Self::ctype_to_type_spec(&ft.return_type);
-                let param_decls: Vec<ParamDecl> = ft.params.iter().map(|(cty, name)| {
-                    ParamDecl {
+                let param_decls: Vec<ParamDecl> = ft
+                    .params
+                    .iter()
+                    .map(|(cty, name)| ParamDecl {
                         type_spec: Self::ctype_to_type_spec(cty),
                         name: name.clone(),
                         fptr_params: None,
@@ -108,8 +113,8 @@ impl Lowerer {
                         is_restrict: false,
                         vla_size_exprs: Vec::new(),
                         fptr_inner_ptr_depth: 0,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 TypeSpecifier::BareFunction(Box::new(ret_ts), param_decls, ft.variadic)
             }
             // Vector types fall back to element type for type-spec conversion (used
@@ -150,7 +155,8 @@ impl Lowerer {
                 return_ctype
             };
 
-            let param_types: Vec<(CType, Option<String>)> = fptr_params.iter()
+            let param_types: Vec<(CType, Option<String>)> = fptr_params
+                .iter()
                 .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
@@ -178,7 +184,9 @@ impl Lowerer {
             // function type is adjusted to pointer-to-function type.
             if let Some(fti) = self.types.function_typedefs.get(tname).cloned() {
                 let return_ctype = self.type_spec_to_ctype(&fti.return_type);
-                let param_types: Vec<(CType, Option<String>)> = fti.params.iter()
+                let param_types: Vec<(CType, Option<String>)> = fti
+                    .params
+                    .iter()
                     .map(|p| (self.param_ctype(p), p.name.clone()))
                     .collect();
                 let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
@@ -225,7 +233,9 @@ impl Lowerer {
         // Look up the stored function pointer typedef info
         if let Some(fti) = self.types.func_ptr_typedef_info.get(tname) {
             let return_ctype = self.type_spec_to_ctype(&fti.return_type);
-            let param_types: Vec<(CType, Option<String>)> = fti.params.iter()
+            let param_types: Vec<(CType, Option<String>)> = fti
+                .params
+                .iter()
                 .map(|p| (self.type_spec_to_ctype(&p.type_spec), p.name.clone()))
                 .collect();
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
@@ -262,7 +272,11 @@ impl Lowerer {
     ) -> CType {
         let prefix = if is_union { "union" } else { "struct" };
         let wrap = |key: String| -> CType {
-            if is_union { CType::Union(key.into()) } else { CType::Struct(key.into()) }
+            if is_union {
+                CType::Union(key.into())
+            } else {
+                CType::Struct(key.into())
+            }
         };
         // __attribute__((packed)) forces alignment 1; #pragma pack(N) caps to N.
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
@@ -278,36 +292,52 @@ impl Lowerer {
                 if let Some(existing) = self.types.borrow_struct_layouts().get(&cache_key) {
                     if !existing.fields.is_empty() {
                         let result = wrap(cache_key.clone());
-                        self.types.ctype_cache.borrow_mut().insert(cache_key, result.clone());
+                        self.types
+                            .ctype_cache
+                            .borrow_mut()
+                            .insert(cache_key, result.clone());
                         return result;
                     }
                 }
             }
-            let struct_fields: Vec<StructField> = fs.iter().map(|f| {
-                let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                    self.eval_const_expr(bw).and_then(|c| c.to_u32())
-                });
-                let mut ty = self.struct_field_ctype(f);
-                // GCC treats enum bitfields as unsigned: values are zero-extended
-                // on load, not sign-extended. Check both direct enum type specs
-                // and typedef'd enum types (e.g., typedef enum EFoo EFoo).
-                if bit_width.is_some()
-                    && self.is_enum_type_spec(&f.type_spec)
-                        && ty == CType::Int {
-                            ty = CType::UInt;
-                        }
-                StructField {
-                    name: f.name.clone().unwrap_or_default(),
-                    ty,
-                    bit_width,
-                    alignment: f.alignment,
-                    is_packed: f.is_packed,
-                }
-            }).collect();
+            let struct_fields: Vec<StructField> = fs
+                .iter()
+                .map(|f| {
+                    let bit_width = f
+                        .bit_width
+                        .as_ref()
+                        .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
+                    let mut ty = self.struct_field_ctype(f);
+                    // GCC treats enum bitfields as unsigned: values are zero-extended
+                    // on load, not sign-extended. Check both direct enum type specs
+                    // and typedef'd enum types (e.g., typedef enum EFoo EFoo).
+                    if bit_width.is_some()
+                        && self.is_enum_type_spec(&f.type_spec)
+                        && ty == CType::Int
+                    {
+                        ty = CType::UInt;
+                    }
+                    StructField {
+                        name: f.name.clone().unwrap_or_default(),
+                        ty,
+                        bit_width,
+                        alignment: f.alignment,
+                        is_packed: f.is_packed,
+                    }
+                })
+                .collect();
             let mut layout = if is_union {
-                StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+                StructLayout::for_union_with_packing(
+                    &struct_fields,
+                    max_field_align,
+                    &*self.types.borrow_struct_layouts(),
+                )
             } else {
-                StructLayout::for_struct_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+                StructLayout::for_struct_with_packing(
+                    &struct_fields,
+                    max_field_align,
+                    &*self.types.borrow_struct_layouts(),
+                )
             };
             // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
             if let Some(a) = struct_aligned {
@@ -323,10 +353,14 @@ impl Lowerer {
                 let id = self.types.next_anon_struct_id();
                 format!("__anon_struct_{}", id)
             };
-            self.types.insert_struct_layout_scoped_from_ref(&key, layout);
+            self.types
+                .insert_struct_layout_scoped_from_ref(&key, layout);
             self.types.invalidate_ctype_cache_scoped_from_ref(&key);
             let result = wrap(key.clone());
-            self.types.ctype_cache.borrow_mut().insert(key, result.clone());
+            self.types
+                .ctype_cache
+                .borrow_mut()
+                .insert(key, result.clone());
             result
         } else if let Some(tag) = name {
             // If the tag is already an anonymous struct/union key (e.g. from
@@ -355,7 +389,10 @@ impl Lowerer {
                 self.types.insert_struct_layout_from_ref(&key, empty_layout);
             }
             let result = wrap(key.clone());
-            self.types.ctype_cache.borrow_mut().insert(key, result.clone());
+            self.types
+                .ctype_cache
+                .borrow_mut()
+                .insert(key, result.clone());
             result
         } else {
             // Anonymous forward declaration (no name, no fields)
@@ -387,7 +424,11 @@ impl Lowerer {
     /// Build a full CType from a TypeSpecifier and DerivedDeclarator chain.
     /// Delegates to the shared type_builder module for canonical inside-out
     /// declarator application logic.
-    pub(super) fn build_full_ctype(&self, type_spec: &TypeSpecifier, derived: &[DerivedDeclarator]) -> CType {
+    pub(super) fn build_full_ctype(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> CType {
         type_builder::build_full_ctype(self, type_spec, derived)
     }
 }
@@ -422,14 +463,28 @@ impl type_builder::TypeConvertContext for Lowerer {
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
     ) -> CType {
-        self.struct_or_union_to_ctype(name, fields, is_union, is_packed, pragma_pack, struct_aligned)
+        self.struct_or_union_to_ctype(
+            name,
+            fields,
+            is_union,
+            is_packed,
+            pragma_pack,
+            struct_aligned,
+        )
     }
 
-    fn resolve_enum(&self, name: &Option<String>, variants: &Option<Vec<EnumVariant>>, is_packed: bool) -> CType {
+    fn resolve_enum(
+        &self,
+        name: &Option<String>,
+        variants: &Option<Vec<EnumVariant>>,
+        is_packed: bool,
+    ) -> CType {
         // Check if this is a forward reference to a known packed enum
-        let effective_packed = is_packed || name.as_ref()
-            .and_then(|n| self.types.packed_enum_types.get(n))
-            .is_some();
+        let effective_packed = is_packed
+            || name
+                .as_ref()
+                .and_then(|n| self.types.packed_enum_types.get(n))
+                .is_some();
         if !effective_packed {
             // Non-packed enum: normally int (4 bytes), but if any variant
             // value exceeds i32 range while fitting in u32, use unsigned int.
@@ -454,7 +509,11 @@ impl type_builder::TypeConvertContext for Lowerer {
             } else {
                 false
             };
-            return if needs_unsigned { CType::UInt } else { CType::Int };
+            return if needs_unsigned {
+                CType::UInt
+            } else {
+                CType::Int
+            };
         }
         // For packed enums, compute the minimum integer type from variant values
         let variant_values: Vec<i64> = if let Some(vars) = variants {
@@ -489,12 +548,20 @@ impl type_builder::TypeConvertContext for Lowerer {
         let min_val = *variant_values.iter().min().unwrap();
         let max_val = *variant_values.iter().max().unwrap();
         if min_val >= 0 {
-            if max_val <= 0xFF { CType::UChar }
-            else if max_val <= 0xFFFF { CType::UShort }
-            else { CType::UInt }
-        } else if min_val >= -128 && max_val <= 127 { CType::Char }
-        else if min_val >= -32768 && max_val <= 32767 { CType::Short }
-        else { CType::Int }
+            if max_val <= 0xFF {
+                CType::UChar
+            } else if max_val <= 0xFFFF {
+                CType::UShort
+            } else {
+                CType::UInt
+            }
+        } else if min_val >= -128 && max_val <= 127 {
+            CType::Char
+        } else if min_val >= -32768 && max_val <= 32767 {
+            CType::Short
+        } else {
+            CType::Int
+        }
     }
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {

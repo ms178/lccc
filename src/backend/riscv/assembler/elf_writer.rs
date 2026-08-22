@@ -11,19 +11,17 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use super::parser::{AsmStatement, Operand, Directive, DataValue, SymbolType, Visibility, SizeExpr};
-use super::encoder::{encode_instruction, encode_insn_directive, EncodeResult, RelocType};
 use super::compress;
-use crate::backend::elf::{
-    self,
-    SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
-    SHT_PROGBITS, SHT_NOBITS,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS,
-    STV_HIDDEN, STV_PROTECTED, STV_INTERNAL,
-    ELFCLASS64, EM_RISCV,
-    ElfWriterBase, ObjReloc,
+use super::encoder::{encode_insn_directive, encode_instruction, EncodeResult, RelocType};
+use super::parser::{
+    AsmStatement, DataValue, Directive, Operand, SizeExpr, SymbolType, Visibility,
 };
+use crate::backend::elf::{
+    self, ElfWriterBase, ObjReloc, ELFCLASS64, EM_RISCV, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE,
+    SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN, STV_INTERNAL,
+    STV_PROTECTED,
+};
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 // ELF flags for RISC-V
 pub(super) const EF_RISCV_RVC: u32 = 0x1;
@@ -117,7 +115,10 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
         if let AsmStatement::Label(name) = stmt {
             if is_numeric_label(name) {
                 let instance = instance_counter.entry(name.clone()).or_insert(0);
-                label_defs.entry(name.clone()).or_default().push((i, *instance));
+                label_defs
+                    .entry(name.clone())
+                    .or_default()
+                    .push((i, *instance));
                 *instance += 1;
             }
         }
@@ -146,10 +147,15 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
                     result.push(stmt.clone());
                 }
             }
-            AsmStatement::Instruction { mnemonic, operands, raw_operands } => {
-                let new_operands: Vec<Operand> = operands.iter().map(|op| {
-                    rewrite_numeric_ref_in_operand(op, i, &label_defs)
-                }).collect();
+            AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } => {
+                let new_operands: Vec<Operand> = operands
+                    .iter()
+                    .map(|op| rewrite_numeric_ref_in_operand(op, i, &label_defs))
+                    .collect();
                 result.push(AsmStatement::Instruction {
                     mnemonic: mnemonic.clone(),
                     operands: new_operands,
@@ -157,7 +163,8 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
                 });
             }
             AsmStatement::Directive(dir) => {
-                let new_dir = rewrite_numeric_refs_in_directive(dir, i, &label_defs, &mut dot_counter);
+                let new_dir =
+                    rewrite_numeric_refs_in_directive(dir, i, &label_defs, &mut dot_counter);
                 // If the directive references '.', a synthetic label was inserted
                 // before the directive. Check and handle.
                 for d in new_dir {
@@ -294,23 +301,44 @@ fn rewrite_data_value(
     dot_labels: &mut Vec<String>,
 ) -> DataValue {
     match dv {
-        DataValue::SymbolDiff { sym_a, sym_b, addend } => {
+        DataValue::SymbolDiff {
+            sym_a,
+            sym_b,
+            addend,
+        } => {
             let mut needs_dot = None;
-            let new_a = rewrite_symbol_name(sym_a, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() { dot_labels.push(l); }
-            let new_b = rewrite_symbol_name(sym_b, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() { dot_labels.push(l); }
-            DataValue::SymbolDiff { sym_a: new_a, sym_b: new_b, addend: *addend }
+            let new_a =
+                rewrite_symbol_name(sym_a, stmt_idx, label_defs, dot_counter, &mut needs_dot);
+            if let Some(l) = needs_dot.take() {
+                dot_labels.push(l);
+            }
+            let new_b =
+                rewrite_symbol_name(sym_b, stmt_idx, label_defs, dot_counter, &mut needs_dot);
+            if let Some(l) = needs_dot.take() {
+                dot_labels.push(l);
+            }
+            DataValue::SymbolDiff {
+                sym_a: new_a,
+                sym_b: new_b,
+                addend: *addend,
+            }
         }
         DataValue::Symbol { name, addend } => {
             let mut needs_dot = None;
-            let new_name = rewrite_symbol_name(name, stmt_idx, label_defs, dot_counter, &mut needs_dot);
-            if let Some(l) = needs_dot.take() { dot_labels.push(l); }
-            DataValue::Symbol { name: new_name, addend: *addend }
+            let new_name =
+                rewrite_symbol_name(name, stmt_idx, label_defs, dot_counter, &mut needs_dot);
+            if let Some(l) = needs_dot.take() {
+                dot_labels.push(l);
+            }
+            DataValue::Symbol {
+                name: new_name,
+                addend: *addend,
+            }
         }
         DataValue::Expression(expr) => {
             // Rewrite numeric refs and '.' in expression strings
-            let resolved = rewrite_expr_numeric_refs(expr, stmt_idx, label_defs, dot_counter, dot_labels);
+            let resolved =
+                rewrite_expr_numeric_refs(expr, stmt_idx, label_defs, dot_counter, dot_labels);
             DataValue::Expression(resolved)
         }
         other => other.clone(),
@@ -335,8 +363,36 @@ fn rewrite_expr_numeric_refs(
     while i < len {
         if bytes[i] == b'.' {
             // Check if this is a standalone '.' (current position)
-            let prev_is_sep = i == 0 || matches!(bytes[i-1], b' ' | b'(' | b')' | b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b',' | b'~');
-            let next_is_sep = i + 1 >= len || matches!(bytes[i+1], b' ' | b'(' | b')' | b'+' | b'-' | b'*' | b'/' | b'|' | b'&' | b'^' | b',' | b'~');
+            let prev_is_sep = i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b' ' | b'('
+                        | b')'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'|'
+                        | b'&'
+                        | b'^'
+                        | b','
+                        | b'~'
+                );
+            let next_is_sep = i + 1 >= len
+                || matches!(
+                    bytes[i + 1],
+                    b' ' | b'('
+                        | b')'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'|'
+                        | b'&'
+                        | b'^'
+                        | b','
+                        | b'~'
+                );
             if prev_is_sep && next_is_sep {
                 let label = format!(".Ldot_{}", *dot_counter);
                 *dot_counter += 1;
@@ -352,12 +408,15 @@ fn rewrite_expr_numeric_refs(
             while i < len && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            if i < len && (bytes[i] == b'f' || bytes[i] == b'F' || bytes[i] == b'b' || bytes[i] == b'B') {
+            if i < len
+                && (bytes[i] == b'f' || bytes[i] == b'F' || bytes[i] == b'b' || bytes[i] == b'B')
+            {
                 let next_after = if i + 1 < len { bytes[i + 1] } else { b' ' };
                 // Must not be followed by an alphanumeric (to avoid matching hex or identifiers)
                 if !next_after.is_ascii_alphanumeric() && next_after != b'_' {
                     let ref_str = &expr[start..=i];
-                    if let Some(resolved) = resolve_numeric_ref_name(ref_str, stmt_idx, label_defs) {
+                    if let Some(resolved) = resolve_numeric_ref_name(ref_str, stmt_idx, label_defs)
+                    {
                         result.push_str(&resolved);
                         i += 1;
                         continue;
@@ -382,7 +441,10 @@ fn rewrite_data_values(
     dot_counter: &mut usize,
     dot_labels: &mut Vec<String>,
 ) -> Vec<DataValue> {
-    values.iter().map(|dv| rewrite_data_value(dv, stmt_idx, label_defs, dot_counter, dot_labels)).collect()
+    values
+        .iter()
+        .map(|dv| rewrite_data_value(dv, stmt_idx, label_defs, dot_counter, dot_labels))
+        .collect()
 }
 
 /// Rewrite numeric label references and '.' in a directive.
@@ -396,19 +458,23 @@ fn rewrite_numeric_refs_in_directive(
     let mut dot_labels: Vec<String> = Vec::new();
     let new_dir = match dir {
         Directive::Byte(vals) => {
-            let new_vals = rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
+            let new_vals =
+                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
             Directive::Byte(new_vals)
         }
         Directive::Short(vals) => {
-            let new_vals = rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
+            let new_vals =
+                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
             Directive::Short(new_vals)
         }
         Directive::Long(vals) => {
-            let new_vals = rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
+            let new_vals =
+                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
             Directive::Long(new_vals)
         }
         Directive::Quad(vals) => {
-            let new_vals = rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
+            let new_vals =
+                rewrite_data_values(vals, stmt_idx, label_defs, dot_counter, &mut dot_labels);
             Directive::Quad(new_vals)
         }
         _ => dir.clone(),
@@ -532,7 +598,9 @@ impl ElfWriter {
                 self.base.ensure_text_section();
                 let section = self.base.current_section.clone();
                 let offset = self.base.current_offset();
-                self.base.labels.insert(name.clone(), (section.clone(), offset));
+                self.base
+                    .labels
+                    .insert(name.clone(), (section.clone(), offset));
                 if is_numeric_label(name) {
                     self.numeric_labels
                         .entry(name.clone())
@@ -542,13 +610,13 @@ impl ElfWriter {
                 Ok(())
             }
 
-            AsmStatement::Directive(directive) => {
-                self.process_directive(directive)
-            }
+            AsmStatement::Directive(directive) => self.process_directive(directive),
 
-            AsmStatement::Instruction { mnemonic, operands, raw_operands } => {
-                self.process_instruction(mnemonic, operands, raw_operands)
-            }
+            AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } => self.process_instruction(mnemonic, operands, raw_operands),
         }
     }
 
@@ -582,33 +650,44 @@ impl ElfWriter {
             }
 
             Directive::Text => {
-                self.base.switch_to_standard_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR);
+                self.base.switch_to_standard_section(
+                    ".text",
+                    SHT_PROGBITS,
+                    SHF_ALLOC | SHF_EXECINSTR,
+                );
                 Ok(())
             }
             Directive::Data => {
-                self.base.switch_to_standard_section(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
+                self.base
+                    .switch_to_standard_section(".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE);
                 Ok(())
             }
             Directive::Bss => {
-                self.base.switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);
+                self.base
+                    .switch_to_standard_section(".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE);
                 Ok(())
             }
             Directive::Rodata => {
-                self.base.switch_to_standard_section(".rodata", SHT_PROGBITS, SHF_ALLOC);
+                self.base
+                    .switch_to_standard_section(".rodata", SHT_PROGBITS, SHF_ALLOC);
                 Ok(())
             }
 
             Directive::Globl(sym) => {
                 for s in sym.split(',') {
                     let s = s.trim();
-                    if !s.is_empty() { self.base.set_global(s); }
+                    if !s.is_empty() {
+                        self.base.set_global(s);
+                    }
                 }
                 Ok(())
             }
             Directive::Weak(sym) => {
                 for s in sym.split(',') {
                     let s = s.trim();
-                    if !s.is_empty() { self.base.set_weak(s); }
+                    if !s.is_empty() {
+                        self.base.set_weak(s);
+                    }
                 }
                 Ok(())
             }
@@ -675,7 +754,8 @@ impl ElfWriter {
                             } else {
                                 resolved.clone()
                             };
-                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr) {
+                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
+                            {
                                 self.base.emit_bytes(&[v as u8]);
                             } else {
                                 // Defer: alias not yet defined (forward reference)
@@ -732,7 +812,8 @@ impl ElfWriter {
                             } else {
                                 resolved.clone()
                             };
-                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr) {
+                            if let Ok(v) = crate::backend::asm_expr::parse_integer_expr(&eval_expr)
+                            {
                                 self.base.emit_bytes(&(v as u16).to_le_bytes());
                             } else {
                                 // Defer: alias not yet defined (forward reference)
@@ -747,7 +828,11 @@ impl ElfWriter {
                                 self.base.emit_placeholder(2);
                             }
                         }
-                        DataValue::SymbolDiff { sym_a, sym_b, addend } => {
+                        DataValue::SymbolDiff {
+                            sym_a,
+                            sym_b,
+                            addend,
+                        } => {
                             let add_type = RelocType::Add16.elf_type();
                             let sub_type = RelocType::Sub16.elf_type();
                             let (base_a, extra_a) = decompose_symbol_addend(sym_a);
@@ -855,11 +940,19 @@ impl ElfWriter {
                 let data = std::fs::read(path)
                     .map_err(|e| format!(".incbin: failed to read '{}': {}", path, e))?;
                 let skip = *skip as usize;
-                let data = if skip < data.len() { &data[skip..] } else { &[] };
+                let data = if skip < data.len() {
+                    &data[skip..]
+                } else {
+                    &[]
+                };
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() { &data[..c] } else { data }
+                        if c < data.len() {
+                            &data[..c]
+                        } else {
+                            data
+                        }
                     }
                     None => data,
                 };
@@ -872,9 +965,10 @@ impl ElfWriter {
                 Ok(())
             }
 
-            Directive::Unknown { name, args } => {
-                Err(format!("unsupported RISC-V assembler directive: {} {}", name, args))
-            }
+            Directive::Unknown { name, args } => Err(format!(
+                "unsupported RISC-V assembler directive: {} {}",
+                name, args
+            )),
         }
     }
 
@@ -886,7 +980,11 @@ impl ElfWriter {
     /// relocation references the base symbol with a proper addend.
     fn emit_data_value(&mut self, dv: &DataValue, size: usize) -> Result<(), String> {
         match dv {
-            DataValue::SymbolDiff { sym_a, sym_b, addend } => {
+            DataValue::SymbolDiff {
+                sym_a,
+                sym_b,
+                addend,
+            } => {
                 let (add_type, sub_type) = if size == 4 {
                     (RelocType::Add32.elf_type(), RelocType::Sub32.elf_type())
                 } else {
@@ -914,7 +1012,8 @@ impl ElfWriter {
                     } else {
                         RelocType::Abs64.elf_type()
                     };
-                    self.base.emit_data_symbol_ref(name, *addend, size, reloc_type);
+                    self.base
+                        .emit_data_symbol_ref(name, *addend, size, reloc_type);
                 }
             }
             DataValue::Integer(v) => {
@@ -966,7 +1065,8 @@ impl ElfWriter {
                     // produces single-symbol expressions (e.g., ".Lnum_889_0"
                     // from "889f - 888f" being split by whitespace in macro args).
                     // Proper fix: make split_macro_args respect parameter count.
-                    crate::backend::asm_expr::parse_integer_expr(&cross_resolved).unwrap_or_default()
+                    crate::backend::asm_expr::parse_integer_expr(&cross_resolved)
+                        .unwrap_or_default()
                 }
             };
             if let Some(section) = self.base.sections.get_mut(&def.section) {
@@ -985,7 +1085,12 @@ impl ElfWriter {
         Ok(())
     }
 
-    fn process_instruction(&mut self, mnemonic: &str, operands: &[Operand], raw_operands: &str) -> Result<(), String> {
+    fn process_instruction(
+        &mut self,
+        mnemonic: &str,
+        operands: &[Operand],
+        raw_operands: &str,
+    ) -> Result<(), String> {
         self.base.ensure_text_section();
 
         match encode_instruction(mnemonic, operands, raw_operands) {
@@ -999,7 +1104,8 @@ impl ElfWriter {
             }
             Ok(EncodeResult::WordWithReloc { word, reloc }) => {
                 let elf_type = reloc.reloc_type.elf_type();
-                let is_pcrel_hi = elf_type == 23 || elf_type == 20 || elf_type == 22 || elf_type == 21;
+                let is_pcrel_hi =
+                    elf_type == 23 || elf_type == 20 || elf_type == 22 || elf_type == 21;
 
                 if is_pcrel_hi {
                     let label = format!(".Lpcrel_hi{}", self.pcrel_hi_counter);
@@ -1016,17 +1122,20 @@ impl ElfWriter {
                 let is_call_plt = elf_type == 19;
 
                 if is_call_plt {
-                    self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                    self.base
+                        .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                     if !self.no_relax {
                         self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
                     }
                     self.base.emit_u32_le(word);
                 } else if is_branch_or_jal {
-                    self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                    self.base
+                        .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                     self.base.emit_u32_le(word);
                 } else {
-                    let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l")
-                                || parse_numeric_label_ref(&reloc.symbol).is_some();
+                    let is_local = reloc.symbol.starts_with(".L")
+                        || reloc.symbol.starts_with(".l")
+                        || parse_numeric_label_ref(&reloc.symbol).is_some();
 
                     if is_local {
                         let offset = self.base.current_offset();
@@ -1040,7 +1149,8 @@ impl ElfWriter {
                         });
                         self.base.emit_u32_le(word);
                     } else {
-                        self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                        self.base
+                            .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                         self.base.emit_u32_le(word);
                     }
                 }
@@ -1071,10 +1181,11 @@ impl ElfWriter {
                             self.base.labels.insert(label.clone(), (section, offset));
                             pcrel_hi_label = Some(label);
 
-                            self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                            self.base
+                                .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                             if !self.no_relax {
-                        self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
-                    }
+                                self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
+                            }
                             self.base.emit_u32_le(*word);
                             continue;
                         }
@@ -1082,12 +1193,15 @@ impl ElfWriter {
                         let is_pcrel_lo12_i = elf_type == 24;
                         let is_pcrel_lo12_s = elf_type == 25;
 
-                        if let Some(hi_label) = pcrel_hi_label.as_ref().filter(|_| is_pcrel_lo12_i || is_pcrel_lo12_s) {
+                        if let Some(hi_label) = pcrel_hi_label
+                            .as_ref()
+                            .filter(|_| is_pcrel_lo12_i || is_pcrel_lo12_s)
+                        {
                             let hi_label = hi_label.clone();
                             self.base.add_reloc(elf_type, hi_label, 0);
                             if !self.no_relax {
-                        self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
-                    }
+                                self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
+                            }
                             self.base.emit_u32_le(*word);
                             continue;
                         }
@@ -1097,14 +1211,17 @@ impl ElfWriter {
                         let is_branch_or_jal = elf_type == 16 || elf_type == 17;
                         let is_call_plt = elf_type == 19;
                         if is_call_plt {
-                            self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                            self.base
+                                .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                             if !self.no_relax {
-                        self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
-                    }
+                                self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
+                            }
                         } else if is_branch_or_jal {
-                            self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                            self.base
+                                .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                         } else {
-                            let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l")
+                            let is_local = reloc.symbol.starts_with(".L")
+                                || reloc.symbol.starts_with(".l")
                                 || parse_numeric_label_ref(&reloc.symbol).is_some();
                             if is_local {
                                 let offset = self.base.current_offset();
@@ -1117,7 +1234,8 @@ impl ElfWriter {
                                     pcrel_hi_offset: None,
                                 });
                             } else {
-                                self.base.add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                                self.base
+                                    .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                             }
                         }
                     }
@@ -1133,7 +1251,10 @@ impl ElfWriter {
     /// Compress eligible 32-bit instructions in executable sections to 16-bit
     /// RV64C equivalents.
     fn compress_executable_sections(&mut self) {
-        let exec_sections: Vec<String> = self.base.sections.iter()
+        let exec_sections: Vec<String> = self
+            .base
+            .sections
+            .iter()
             .filter(|(_, s)| (s.sh_flags & SHF_EXECINSTR) != 0)
             .map(|(name, _)| name.clone())
             .collect();
@@ -1250,11 +1371,17 @@ impl ElfWriter {
                 continue;
             }
 
-            let resolved = if let Some((label_name, is_backward)) = parse_numeric_label_ref(&reloc.symbol) {
-                self.resolve_numeric_label_ref(label_name, is_backward, &reloc.section, reloc.offset)
-            } else {
-                self.base.labels.get(&reloc.symbol).cloned()
-            };
+            let resolved =
+                if let Some((label_name, is_backward)) = parse_numeric_label_ref(&reloc.symbol) {
+                    self.resolve_numeric_label_ref(
+                        label_name,
+                        is_backward,
+                        &reloc.section,
+                        reloc.offset,
+                    )
+                } else {
+                    self.base.labels.get(&reloc.symbol).cloned()
+                };
 
             let (target_section, target_offset) = match resolved {
                 Some(v) => v,
@@ -1292,7 +1419,9 @@ impl ElfWriter {
                 match reloc.reloc_type {
                     16 => {
                         // R_RISCV_BRANCH (B-type, 12-bit)
-                        if instr_offset + 4 > section.data.len() { continue; }
+                        if instr_offset + 4 > section.data.len() {
+                            continue;
+                        }
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
                             section.data[instr_offset + 1],
@@ -1306,11 +1435,14 @@ impl ElfWriter {
                         let bits4_1 = (imm >> 1) & 0xF;
                         word &= 0x01FFF07F;
                         word |= (bit12 << 31) | (bits10_5 << 25) | (bits4_1 << 8) | (bit11 << 7);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&word.to_le_bytes());
                     }
                     17 => {
                         // R_RISCV_JAL (J-type, 20-bit)
-                        if instr_offset + 4 > section.data.len() { continue; }
+                        if instr_offset + 4 > section.data.len() {
+                            continue;
+                        }
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
                             section.data[instr_offset + 1],
@@ -1323,12 +1455,16 @@ impl ElfWriter {
                         let bit11 = (imm >> 11) & 1;
                         let bits19_12 = (imm >> 12) & 0xFF;
                         word &= 0x00000FFF;
-                        word |= (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                        word |=
+                            (bit20 << 31) | (bits10_1 << 21) | (bit11 << 20) | (bits19_12 << 12);
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&word.to_le_bytes());
                     }
                     19 => {
                         // R_RISCV_CALL_PLT (AUIPC + JALR pair, 8 bytes)
-                        if instr_offset + 8 > section.data.len() { continue; }
+                        if instr_offset + 8 > section.data.len() {
+                            continue;
+                        }
 
                         let hi = ((pc_offset as i32 + 0x800) >> 12) as u32;
                         let lo = ((pc_offset as i32) << 20 >> 20) as u32;
@@ -1340,7 +1476,8 @@ impl ElfWriter {
                             section.data[instr_offset + 3],
                         ]);
                         auipc = (auipc & 0xFFF) | (hi << 12);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&auipc.to_le_bytes());
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&auipc.to_le_bytes());
 
                         let mut jalr = u32::from_le_bytes([
                             section.data[instr_offset + 4],
@@ -1349,11 +1486,14 @@ impl ElfWriter {
                             section.data[instr_offset + 7],
                         ]);
                         jalr = (jalr & 0xFFFFF) | ((lo & 0xFFF) << 20);
-                        section.data[instr_offset + 4..instr_offset + 8].copy_from_slice(&jalr.to_le_bytes());
+                        section.data[instr_offset + 4..instr_offset + 8]
+                            .copy_from_slice(&jalr.to_le_bytes());
                     }
                     23 => {
                         // R_RISCV_PCREL_HI20 (AUIPC hi20)
-                        if instr_offset + 4 > section.data.len() { continue; }
+                        if instr_offset + 4 > section.data.len() {
+                            continue;
+                        }
                         let hi = ((pc_offset as i32 + 0x800) >> 12) as u32;
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
@@ -1362,11 +1502,14 @@ impl ElfWriter {
                             section.data[instr_offset + 3],
                         ]);
                         word = (word & 0xFFF) | (hi << 12);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&word.to_le_bytes());
                     }
                     24 => {
                         // R_RISCV_PCREL_LO12_I (ADDI/LD lo12 I-type)
-                        if instr_offset + 4 > section.data.len() { continue; }
+                        if instr_offset + 4 > section.data.len() {
+                            continue;
+                        }
                         let lo = (pc_offset as i32) & 0xFFF;
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
@@ -1375,11 +1518,14 @@ impl ElfWriter {
                             section.data[instr_offset + 3],
                         ]);
                         word = (word & 0xFFFFF) | (((lo as u32) & 0xFFF) << 20);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&word.to_le_bytes());
                     }
                     25 => {
                         // R_RISCV_PCREL_LO12_S (SW/SD lo12 S-type)
-                        if instr_offset + 4 > section.data.len() { continue; }
+                        if instr_offset + 4 > section.data.len() {
+                            continue;
+                        }
                         let lo = (pc_offset as i32) & 0xFFF;
                         let mut word = u32::from_le_bytes([
                             section.data[instr_offset],
@@ -1391,7 +1537,8 @@ impl ElfWriter {
                         let imm_hi = ((lo as u32) >> 5) & 0x7F;
                         word &= 0x01FFF07F;
                         word |= (imm_hi << 25) | (imm_lo << 7);
-                        section.data[instr_offset..instr_offset + 4].copy_from_slice(&word.to_le_bytes());
+                        section.data[instr_offset..instr_offset + 4]
+                            .copy_from_slice(&word.to_le_bytes());
                     }
                     _ => {
                         section.relocs.push(ObjReloc {

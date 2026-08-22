@@ -170,11 +170,7 @@ pub(crate) fn replace_source_reg_in_instruction(
 /// are everything before that comma. `pushq %rax` (no comma) returns
 /// `None` — the single operand is both source and dest.
 #[allow(dead_code)]
-pub(crate) fn replace_source_reg_att(
-    line: &str,
-    old_reg: &str,
-    new_reg: &str,
-) -> Option<String> {
+pub(crate) fn replace_source_reg_att(line: &str, old_reg: &str, new_reg: &str) -> Option<String> {
     if old_reg.is_empty() || old_reg == new_reg {
         return None;
     }

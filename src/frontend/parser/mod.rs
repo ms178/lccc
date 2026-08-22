@@ -1,8 +1,8 @@
 pub(crate) mod ast;
-pub(crate) mod parse;
 mod declarations;
 mod declarators;
 mod expressions;
+pub(crate) mod parse;
 mod statements;
 mod types;
 

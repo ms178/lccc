@@ -8,12 +8,12 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::path::Path;
 
 use super::elf::*;
-use super::types::GlobalSymbol;
-use super::input::{load_file, resolve_lib, resolve_lib_prefer_shared};
-use super::plt_got::create_plt_got;
 use super::emit_dynamic::emit_dynamic_executable;
 use super::emit_shared::emit_shared_library;
 use super::emit_static::emit_executable;
+use super::input::{load_file, resolve_lib, resolve_lib_prefer_shared};
+use super::plt_got::create_plt_got;
+use super::types::GlobalSymbol;
 use crate::backend::linker_common;
 use linker_common::OutputSection;
 
@@ -35,7 +35,10 @@ pub fn link_builtin(
     is_static: bool,
 ) -> Result<(), String> {
     if std::env::var("LINKER_DEBUG").is_ok() {
-        eprintln!("arm linker: object_files={:?} output={} user_args={:?} static={}", object_files, output_path, user_args, is_static);
+        eprintln!(
+            "arm linker: object_files={:?} output={} user_args={:?} static={}",
+            object_files, output_path, user_args, is_static
+        );
     }
     let mut objects: Vec<ElfObject> = Vec::new();
     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
@@ -46,10 +49,14 @@ pub fn link_builtin(
     // Parse user args for export-dynamic flag
     let mut export_dynamic = false;
     for arg in user_args {
-        if arg == "-rdynamic" { export_dynamic = true; }
+        if arg == "-rdynamic" {
+            export_dynamic = true;
+        }
         if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             for part in wl_arg.split(',') {
-                if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" { export_dynamic = true; }
+                if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" {
+                    export_dynamic = true;
+                }
             }
         }
     }
@@ -57,13 +64,27 @@ pub fn link_builtin(
     // Load CRT objects before user objects
     for path in crt_objects_before {
         if Path::new(path).exists() {
-            load_file(path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, is_static)?;
+            load_file(
+                path,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &all_lib_paths,
+                is_static,
+            )?;
         }
     }
 
     // Load user object files
     for path in object_files {
-        load_file(path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, is_static)?;
+        load_file(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &all_lib_paths,
+            is_static,
+        )?;
     }
 
     // Parse user_args for -l, -L, bare files, etc.
@@ -75,15 +96,36 @@ pub fn link_builtin(
     while arg_i < args.len() {
         let arg = args[arg_i];
         if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && arg_i + 1 < args.len() { arg_i += 1; args[arg_i] } else { path };
+            let p = if path.is_empty() && arg_i + 1 < args.len() {
+                arg_i += 1;
+                args[arg_i]
+            } else {
+                path
+            };
             extra_lib_paths.push(p.to_string());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && arg_i + 1 < args.len() { arg_i += 1; args[arg_i] } else { lib };
-            let resolver = if is_static { resolve_lib } else { resolve_lib_prefer_shared };
+            let l = if lib.is_empty() && arg_i + 1 < args.len() {
+                arg_i += 1;
+                args[arg_i]
+            } else {
+                lib
+            };
+            let resolver = if is_static {
+                resolve_lib
+            } else {
+                resolve_lib_prefer_shared
+            };
             let mut combined = extra_lib_paths.clone();
             combined.extend(all_lib_paths.iter().cloned());
             if let Some(lib_path) = resolver(l, &combined) {
-                load_file(&lib_path, &mut objects, &mut globals, &mut needed_sonames, &combined, is_static)?;
+                load_file(
+                    &lib_path,
+                    &mut objects,
+                    &mut globals,
+                    &mut needed_sonames,
+                    &combined,
+                    is_static,
+                )?;
             }
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -93,24 +135,41 @@ pub fn link_builtin(
                 if let Some(lpath) = part.strip_prefix("-L") {
                     extra_lib_paths.push(lpath.to_string());
                 } else if let Some(lib) = part.strip_prefix("-l") {
-                    let resolver = if is_static { resolve_lib } else { resolve_lib_prefer_shared };
+                    let resolver = if is_static {
+                        resolve_lib
+                    } else {
+                        resolve_lib_prefer_shared
+                    };
                     let mut combined = extra_lib_paths.clone();
                     combined.extend(all_lib_paths.iter().cloned());
                     if let Some(lib_path) = resolver(lib, &combined) {
-                        load_file(&lib_path, &mut objects, &mut globals, &mut needed_sonames, &combined, is_static)?;
+                        load_file(
+                            &lib_path,
+                            &mut objects,
+                            &mut globals,
+                            &mut needed_sonames,
+                            &combined,
+                            is_static,
+                        )?;
                     }
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     // --defsym=SYMBOL=EXPR: define a symbol alias
                     // TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions
                     if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((defsym_arg[..eq_pos].to_string(), defsym_arg[eq_pos + 1..].to_string()));
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
                     }
                 } else if part == "--defsym" && j + 1 < parts.len() {
                     // Two-argument form: --defsym SYM=VAL
                     j += 1;
                     let defsym_arg = parts[j];
                     if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((defsym_arg[..eq_pos].to_string(), defsym_arg[eq_pos + 1..].to_string()));
+                        defsym_defs.push((
+                            defsym_arg[..eq_pos].to_string(),
+                            defsym_arg[eq_pos + 1..].to_string(),
+                        ));
                     }
                 } else if part == "--gc-sections" {
                     gc_sections = true;
@@ -120,7 +179,14 @@ pub fn link_builtin(
                 j += 1;
             }
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
-            load_file(arg, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, is_static)?;
+            load_file(
+                arg,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &all_lib_paths,
+                is_static,
+            )?;
         }
         arg_i += 1;
     }
@@ -128,7 +194,14 @@ pub fn link_builtin(
     // Load CRT objects after user objects
     for path in crt_objects_after {
         if Path::new(path).exists() {
-            load_file(path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, is_static)?;
+            load_file(
+                path,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &all_lib_paths,
+                is_static,
+            )?;
         }
     }
 
@@ -138,7 +211,11 @@ pub fn link_builtin(
 
     // Load default libraries in a group (like ld's --start-group)
     if !needed_libs.is_empty() {
-        let resolver = if is_static { resolve_lib } else { resolve_lib_prefer_shared };
+        let resolver = if is_static {
+            resolve_lib
+        } else {
+            resolve_lib_prefer_shared
+        };
         let mut lib_paths_resolved: Vec<String> = Vec::new();
         for lib_name in needed_libs {
             if let Some(lib_path) = resolver(lib_name, &combined_lib_paths) {
@@ -152,7 +229,14 @@ pub fn link_builtin(
             changed = false;
             let prev_count = objects.len();
             for lib_path in &lib_paths_resolved {
-                load_file(lib_path, &mut objects, &mut globals, &mut needed_sonames, &combined_lib_paths, is_static)?;
+                load_file(
+                    lib_path,
+                    &mut objects,
+                    &mut globals,
+                    &mut needed_sonames,
+                    &combined_lib_paths,
+                    is_static,
+                )?;
             }
             if objects.len() != prev_count {
                 changed = true;
@@ -162,9 +246,17 @@ pub fn link_builtin(
 
     // For dynamic linking, resolve remaining undefined symbols against system libs
     if !is_static {
-        let default_libs = ["libc.so.6", "libm.so.6", "libgcc_s.so.1", "ld-linux-aarch64.so.1"];
+        let default_libs = [
+            "libc.so.6",
+            "libm.so.6",
+            "libgcc_s.so.1",
+            "ld-linux-aarch64.so.1",
+        ];
         linker_common::resolve_dynamic_symbols_elf64(
-            &mut globals, &mut needed_sonames, &combined_lib_paths, &default_libs,
+            &mut globals,
+            &mut needed_sonames,
+            &combined_lib_paths,
+            &default_libs,
         )?;
     }
 
@@ -189,7 +281,9 @@ pub fn link_builtin(
         let mut referenced_from_live: FxHashSet<String> = FxHashSet::default();
         for (obj_idx, obj) in objects.iter().enumerate() {
             for (sec_idx, relas) in obj.relocations.iter().enumerate() {
-                if dead_sections.contains(&(obj_idx, sec_idx)) { continue; }
+                if dead_sections.contains(&(obj_idx, sec_idx)) {
+                    continue;
+                }
                 for rela in relas {
                     if (rela.sym_idx as usize) < obj.symbols.len() {
                         let sym = &obj.symbols[rela.sym_idx as usize];
@@ -201,7 +295,8 @@ pub fn link_builtin(
             }
         }
         globals.retain(|name, sym| {
-            sym.defined_in.is_some() || sym.is_dynamic
+            sym.defined_in.is_some()
+                || sym.is_dynamic
                 || (sym.info >> 4) == STB_WEAK
                 || referenced_from_live.contains(name)
         });
@@ -220,14 +315,25 @@ pub fn link_builtin(
     if !unresolved.is_empty() {
         unresolved.sort();
         unresolved.truncate(20);
-        return Err(format!("undefined symbols: {}",
-            unresolved.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        return Err(format!(
+            "undefined symbols: {}",
+            unresolved
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
 
     // Merge sections (skip dead sections when gc-sections is active)
     let mut output_sections: Vec<OutputSection> = Vec::new();
     let mut section_map: FxHashMap<(usize, usize), (usize, u64)> = FxHashMap::default();
-    linker_common::merge_sections_elf64_gc(&objects, &mut output_sections, &mut section_map, &dead_sections);
+    linker_common::merge_sections_elf64_gc(
+        &objects,
+        &mut output_sections,
+        &mut section_map,
+        &dead_sections,
+    );
 
     // Allocate COMMON symbols (using shared implementation)
     linker_common::allocate_common_symbols_elf64(&mut globals, &mut output_sections);
@@ -241,13 +347,25 @@ pub fn link_builtin(
 
         // Emit dynamically-linked executable
         emit_dynamic_executable(
-            &objects, &mut globals, &mut output_sections, &section_map,
-            &plt_names, &got_entries, &needed_sonames, output_path,
+            &objects,
+            &mut globals,
+            &mut output_sections,
+            &section_map,
+            &plt_names,
+            &got_entries,
+            &needed_sonames,
+            output_path,
             export_dynamic,
         )
     } else {
         // Fall back to static emit
-        emit_executable(&objects, &mut globals, &mut output_sections, &section_map, output_path)
+        emit_executable(
+            &objects,
+            &mut globals,
+            &mut output_sections,
+            &section_map,
+            output_path,
+        )
     }
 }
 
@@ -275,10 +393,20 @@ pub fn link_shared(
     while i < args.len() {
         let arg = args[i];
         if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { path };
+            let p = if path.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                path
+            };
             extra_lib_paths.push(p.to_string());
         } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() { i += 1; args[i] } else { lib };
+            let l = if lib.is_empty() && i + 1 < args.len() {
+                i += 1;
+                args[i]
+            } else {
+                lib
+            };
             libs_to_load.push(l.to_string());
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
@@ -295,7 +423,9 @@ pub fn link_shared(
                 }
             }
         } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" { i += 1; }
+            if arg == "-o" {
+                i += 1;
+            }
         } else if !arg.starts_with('-') && Path::new(arg).exists() {
             extra_object_files.push(arg.to_string());
         }
@@ -303,10 +433,24 @@ pub fn link_shared(
     }
 
     for path in object_files {
-        load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
+        load_file(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &lib_path_strings,
+            false,
+        )?;
     }
     for path in &extra_object_files {
-        load_file(path, &mut objects, &mut globals, &mut needed_sonames, &lib_path_strings, false)?;
+        load_file(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &lib_path_strings,
+            false,
+        )?;
     }
 
     let mut all_lib_paths: Vec<String> = extra_lib_paths;
@@ -326,9 +470,18 @@ pub fn link_shared(
             changed = false;
             let prev_count = objects.len();
             for lib_path in &lib_paths_resolved {
-                load_file(lib_path, &mut objects, &mut globals, &mut needed_sonames, &all_lib_paths, false)?;
+                load_file(
+                    lib_path,
+                    &mut objects,
+                    &mut globals,
+                    &mut needed_sonames,
+                    &all_lib_paths,
+                    false,
+                )?;
             }
-            if objects.len() != prev_count { changed = true; }
+            if objects.len() != prev_count {
+                changed = true;
+            }
         }
     }
 
@@ -346,8 +499,13 @@ pub fn link_shared(
 
     // Emit shared library
     emit_shared_library(
-        &objects, &mut globals, &mut output_sections, &section_map,
-        &needed_sonames, output_path, soname,
+        &objects,
+        &mut globals,
+        &mut output_sections,
+        &section_map,
+        &needed_sonames,
+        output_path,
+        soname,
     )
 }
 
@@ -366,9 +524,13 @@ fn resolve_dynamic_symbols_for_shared(
         for sec_relas in &obj.relocations {
             for rela in sec_relas {
                 let si = rela.sym_idx as usize;
-                if si >= obj.symbols.len() { continue; }
+                if si >= obj.symbols.len() {
+                    continue;
+                }
                 let sym = &obj.symbols[si];
-                if sym.name.is_empty() || sym.is_local() { continue; }
+                if sym.name.is_empty() || sym.is_local() {
+                    continue;
+                }
                 let is_undef = if let Some(g) = globals.get(sym.name.as_str()) {
                     g.is_dynamic || (g.defined_in.is_none() && g.section_idx == SHN_UNDEF)
                 } else {
@@ -380,9 +542,18 @@ fn resolve_dynamic_symbols_for_shared(
             }
         }
     }
-    if undefined.is_empty() { return; }
+    if undefined.is_empty() {
+        return;
+    }
 
-    let lib_names = ["libc.so.6", "libm.so.6", "libpthread.so.0", "libdl.so.2", "librt.so.1", "ld-linux-aarch64.so.1"];
+    let lib_names = [
+        "libc.so.6",
+        "libm.so.6",
+        "libpthread.so.0",
+        "libdl.so.2",
+        "librt.so.1",
+        "ld-linux-aarch64.so.1",
+    ];
     let mut libs: Vec<String> = Vec::new();
     for lib_name in &lib_names {
         for dir in lib_paths {
@@ -394,15 +565,26 @@ fn resolve_dynamic_symbols_for_shared(
         }
     }
     for lib_path in &libs {
-        let data = match std::fs::read(lib_path) { Ok(d) => d, Err(_) => continue };
-        let soname = linker_common::parse_soname(&data).unwrap_or_else(|| {
-            Path::new(lib_path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-        });
-        if needed_sonames.contains(&soname) { continue; }
-        let dyn_syms = match linker_common::parse_shared_library_symbols(&data, lib_path) {
-            Ok(s) => s, Err(_) => continue,
+        let data = match std::fs::read(lib_path) {
+            Ok(d) => d,
+            Err(_) => continue,
         };
-        let provides_any = undefined.iter().any(|name| dyn_syms.iter().any(|ds| ds.name == *name));
+        let soname = linker_common::parse_soname(&data).unwrap_or_else(|| {
+            Path::new(lib_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        });
+        if needed_sonames.contains(&soname) {
+            continue;
+        }
+        let dyn_syms = match linker_common::parse_shared_library_symbols(&data, lib_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let provides_any = undefined
+            .iter()
+            .any(|name| dyn_syms.iter().any(|ds| ds.name == *name));
         if provides_any {
             needed_sonames.push(soname);
         }

@@ -1,17 +1,12 @@
 //! RISC-V InlineAsmEmitter implementation: constraint classification, scratch
 //! register allocation, operand loading/storing, and template substitution.
 
-use crate::ir::reexports::{
-    BlockId,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::IrType;
-use crate::backend::state::CodegenState;
-use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};
 use super::emit::RiscvCodegen;
-use super::inline_asm::{RvConstraintKind, classify_rv_constraint};
+use super::inline_asm::{classify_rv_constraint, RvConstraintKind};
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::state::CodegenState;
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
 
 /// RISC-V scratch registers for inline asm operand allocation.
 /// The order matters: t-registers first (least likely to conflict), then a-registers.
@@ -20,7 +15,9 @@ use super::inline_asm::{RvConstraintKind, classify_rv_constraint};
 /// exhaust the first 13 entries. Without a0/a1, the allocator would overflow to
 /// callee-saved registers (s2-s11) which may already be in use by the register
 /// allocator for other live values, causing silent clobbering.
-const RISCV_GP_SCRATCH: &[&str] = &["t0", "t1", "t2", "t3", "t4", "t5", "t6", "a2", "a3", "a4", "a5", "a6", "a7", "a0", "a1"];
+const RISCV_GP_SCRATCH: &[&str] = &[
+    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "a2", "a3", "a4", "a5", "a6", "a7", "a0", "a1",
+];
 const RISCV_FP_SCRATCH: &[&str] = &["ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7"];
 
 /// Select the correct RISC-V store instruction based on the operand's IR type.
@@ -56,12 +53,18 @@ fn find_gp_scratch_for_output(current_output_reg: &str, all_output_regs: &[&str]
     }
     // Fallback: return the first candidate not equal to current_output_reg.
     // Caller must handle the case where this register is an output (stack spill).
-    let fallback = if current_output_reg != "t0" { "t0" } else { "t1" };
+    let fallback = if current_output_reg != "t0" {
+        "t0"
+    } else {
+        "t1"
+    };
     fallback.to_string()
 }
 
 impl InlineAsmEmitter for RiscvCodegen {
-    fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
+    fn asm_state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
 
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. in store_output_from_reg.
@@ -69,7 +72,7 @@ impl InlineAsmEmitter for RiscvCodegen {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
         if c.starts_with('{') && c.ends_with('}') {
-            let reg_name = &c[1..c.len()-1];
+            let reg_name = &c[1..c.len() - 1];
             return AsmOperandKind::Specific(reg_name.to_string());
         }
         if let Some(cond) = c.strip_prefix("@cc") {
@@ -126,7 +129,12 @@ impl InlineAsmEmitter for RiscvCodegen {
         }
     }
 
-    fn resolve_memory_operand(&mut self, op: &mut AsmOperand, val: &Operand, excluded: &[String]) -> bool {
+    fn resolve_memory_operand(
+        &mut self,
+        op: &mut AsmOperand,
+        val: &Operand,
+        excluded: &[String],
+    ) -> bool {
         // For alloca memory operands with large offsets (>2047), the direct
         // `{offset}(s0)` format doesn't fit RISC-V's 12-bit signed immediate.
         // Compute the address into a scratch register instead.
@@ -151,7 +159,8 @@ impl InlineAsmEmitter for RiscvCodegen {
                 if let Some(&phys) = self.reg_assignments.get(&v.0) {
                     let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
                     let src_name = super::emit::callee_saved_name(phys);
-                    self.state.emit_fmt(format_args!("    mv {}, {}", tmp_reg, src_name));
+                    self.state
+                        .emit_fmt(format_args!("    mv {}, {}", tmp_reg, src_name));
                     op.mem_addr = format!("0({})", tmp_reg);
                     return true;
                 }
@@ -169,7 +178,8 @@ impl InlineAsmEmitter for RiscvCodegen {
                 // Load the constant into a scratch register for indirect addressing.
                 if let Some(addr) = c.to_i64() {
                     let tmp_reg = self.assign_scratch_reg(&AsmOperandKind::GpReg, excluded);
-                    self.state.emit_fmt(format_args!("    li {}, {}", tmp_reg, addr));
+                    self.state
+                        .emit_fmt(format_args!("    li {}, {}", tmp_reg, addr));
                     op.mem_addr = format!("0({})", tmp_reg);
                     return true;
                 }
@@ -193,7 +203,9 @@ impl InlineAsmEmitter for RiscvCodegen {
                 // Collect callee-saved registers already allocated by the register
                 // allocator. When the scratch pool overflows to s2, s3, ... we must
                 // skip any that hold live values to avoid clobbering them.
-                let allocated_callee_saved: Vec<String> = self.reg_assignments.values()
+                let allocated_callee_saved: Vec<String> = self
+                    .reg_assignments
+                    .values()
                     .map(|phys| super::emit::callee_saved_name(*phys).to_string())
                     .collect();
                 loop {
@@ -220,8 +232,9 @@ impl InlineAsmEmitter for RiscvCodegen {
                         // All unallocated callee-saved exhausted. Borrow one that IS
                         // allocated — we'll save/restore it around the inline asm.
                         // Pick from least-likely-to-conflict candidates.
-                        let borrow_candidates = ["s7", "s6", "s1", "s2", "s3", "s4", "s5",
-                                                  "s8", "s9", "s10", "s11"];
+                        let borrow_candidates = [
+                            "s7", "s6", "s1", "s2", "s3", "s4", "s5", "s8", "s9", "s10", "s11",
+                        ];
                         for &bc in &borrow_candidates {
                             if !excluded.iter().any(|e| e == bc)
                                 && !self.asm_borrowed_callee_saved.iter().any(|e| e == bc)
@@ -236,8 +249,7 @@ impl InlineAsmEmitter for RiscvCodegen {
                         // extremely unlikely in practice.
                         return "s7".to_string();
                     };
-                    if !excluded.iter().any(|e| e == &reg)
-                        && !allocated_callee_saved.contains(&reg)
+                    if !excluded.iter().any(|e| e == &reg) && !allocated_callee_saved.contains(&reg)
                     {
                         return reg;
                     }
@@ -307,7 +319,8 @@ impl InlineAsmEmitter for RiscvCodegen {
                 if !self.state.is_alloca(v.0) && !is_fp {
                     if let Some(&phys) = self.reg_assignments.get(&v.0) {
                         let src_name = super::emit::callee_saved_name(phys);
-                        self.state.emit_fmt(format_args!("    mv {}, {}", reg, src_name));
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", reg, src_name));
                         return;
                     }
                 }
@@ -325,7 +338,11 @@ impl InlineAsmEmitter for RiscvCodegen {
                         self.emit_alloca_addr(reg, v.0, slot.0);
                     } else if is_fp {
                         // Use flw for F32, fld for F64/other
-                        let load_op = if op.operand_type == IrType::F32 { "flw" } else { "fld" };
+                        let load_op = if op.operand_type == IrType::F32 {
+                            "flw"
+                        } else {
+                            "fld"
+                        };
                         self.emit_load_from_s0(reg, slot.0, load_op);
                     } else {
                         self.emit_load_from_s0(reg, slot.0, "ld");
@@ -355,7 +372,11 @@ impl InlineAsmEmitter for RiscvCodegen {
                 }
                 AsmOperandKind::FpReg => {
                     // Use flw for F32, fld for F64/other
-                    let load_op = if op.operand_type == IrType::F32 { "flw" } else { "fld" };
+                    let load_op = if op.operand_type == IrType::F32 {
+                        "flw"
+                    } else {
+                        "fld"
+                    };
                     self.emit_load_from_s0(&reg, slot.0, load_op);
                 }
                 AsmOperandKind::Memory => {} // No preload for memory
@@ -371,46 +392,83 @@ impl InlineAsmEmitter for RiscvCodegen {
         }
     }
 
-    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], gcc_to_internal: &[usize], _operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String {
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        _operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String {
         // Build parallel arrays for the RISC-V substitution function
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
         let op_mem_offsets: Vec<i64> = operands.iter().map(|o| o.mem_offset).collect();
         let op_mem_addrs: Vec<String> = operands.iter().map(|o| o.mem_addr.clone()).collect();
         let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
-        let op_imm_symbols: Vec<Option<String>> = operands.iter().map(|o| o.imm_symbol.clone()).collect();
+        let op_imm_symbols: Vec<Option<String>> =
+            operands.iter().map(|o| o.imm_symbol.clone()).collect();
 
         // Convert AsmOperandKind back to RvConstraintKind for the substitution function
-        let op_kinds: Vec<RvConstraintKind> = operands.iter().map(|o| match &o.kind {
-            AsmOperandKind::GpReg => RvConstraintKind::GpReg,
-            AsmOperandKind::FpReg => RvConstraintKind::FpReg,
-            AsmOperandKind::Memory => RvConstraintKind::Memory,
-            AsmOperandKind::Address => RvConstraintKind::Address,
-            AsmOperandKind::Immediate => RvConstraintKind::Immediate,
-            AsmOperandKind::ZeroOrReg => RvConstraintKind::ZeroOrReg,
-            AsmOperandKind::Specific(r) => RvConstraintKind::Specific(r.clone()),
-            AsmOperandKind::Tied(n) => RvConstraintKind::Tied(*n),
-            // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. instead of SETcc.
-            // Currently maps to GpReg which will store incorrect results.
-            AsmOperandKind::ConditionCode(_) => RvConstraintKind::GpReg,
-            // x86-only constraint kinds; map to GpReg as fallback (should never occur on RISC-V)
-            AsmOperandKind::X87St0 | AsmOperandKind::X87St1 | AsmOperandKind::QReg => RvConstraintKind::GpReg,
-        }).collect();
+        let op_kinds: Vec<RvConstraintKind> = operands
+            .iter()
+            .map(|o| match &o.kind {
+                AsmOperandKind::GpReg => RvConstraintKind::GpReg,
+                AsmOperandKind::FpReg => RvConstraintKind::FpReg,
+                AsmOperandKind::Memory => RvConstraintKind::Memory,
+                AsmOperandKind::Address => RvConstraintKind::Address,
+                AsmOperandKind::Immediate => RvConstraintKind::Immediate,
+                AsmOperandKind::ZeroOrReg => RvConstraintKind::ZeroOrReg,
+                AsmOperandKind::Specific(r) => RvConstraintKind::Specific(r.clone()),
+                AsmOperandKind::Tied(n) => RvConstraintKind::Tied(*n),
+                // TODO: RISC-V =@cc not fully implemented — needs SLTU/SEQZ/etc. instead of SETcc.
+                // Currently maps to GpReg which will store incorrect results.
+                AsmOperandKind::ConditionCode(_) => RvConstraintKind::GpReg,
+                // x86-only constraint kinds; map to GpReg as fallback (should never occur on RISC-V)
+                AsmOperandKind::X87St0 | AsmOperandKind::X87St1 | AsmOperandKind::QReg => {
+                    RvConstraintKind::GpReg
+                }
+            })
+            .collect();
 
-        let mut result = Self::substitute_riscv_asm_operands(line, &op_regs, &op_names, &op_kinds, &op_mem_offsets, &op_mem_addrs, &op_imm_values, &op_imm_symbols, gcc_to_internal);
+        let mut result = Self::substitute_riscv_asm_operands(
+            line,
+            &op_regs,
+            &op_names,
+            &op_kinds,
+            &op_mem_offsets,
+            &op_mem_addrs,
+            &op_imm_values,
+            &op_imm_symbols,
+            gcc_to_internal,
+        );
         // Substitute %l[name] goto label references
-        result = crate::backend::inline_asm::substitute_goto_labels(&result, goto_labels, operands.len());
+        result = crate::backend::inline_asm::substitute_goto_labels(
+            &result,
+            goto_labels,
+            operands.len(),
+        );
         result
     }
 
-    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, _constraint: &str, all_output_regs: &[&str]) {
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        _constraint: &str,
+        all_output_regs: &[&str],
+    ) {
         match &op.kind {
             AsmOperandKind::Memory => (),
             AsmOperandKind::Address => (), // AMO/LR/SC wrote through the pointer
             AsmOperandKind::FpReg => {
                 let reg = op.reg.clone();
                 // Use fsw for F32, fsd for F64/other
-                let store_op = if op.operand_type == IrType::F32 { "fsw" } else { "fsd" };
+                let store_op = if op.operand_type == IrType::F32 {
+                    "fsw"
+                } else {
+                    "fsd"
+                };
                 let is_direct = self.state.is_direct_slot(ptr.0);
                 let slot = self.state.get_slot(ptr.0);
                 if is_direct {
@@ -422,27 +480,37 @@ impl InlineAsmEmitter for RiscvCodegen {
                     let src_name = super::emit::callee_saved_name(phys);
                     if all_output_regs.contains(&scratch.as_str()) {
                         self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
-                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
-                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
-                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
                         self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
                     } else {
-                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
                     }
                 } else if let Some(slot) = slot {
                     let scratch = find_gp_scratch_for_output("", all_output_regs);
                     if all_output_regs.contains(&scratch.as_str()) {
                         self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
-                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
                         self.emit_load_from_s0(&scratch, slot.0, "ld");
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
-                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
+                        self.state
+                            .emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
                         self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
                     } else {
                         self.emit_load_from_s0(&scratch, slot.0, "ld");
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, &scratch));
                     }
                 }
             }
@@ -454,7 +522,11 @@ impl InlineAsmEmitter for RiscvCodegen {
                 // use sd because alloca slots are padded to 8 bytes on RV64 and
                 // the preload path uses ld unconditionally.
                 let is_direct = self.state.is_direct_slot(ptr.0);
-                let store_op = if is_direct { "sd" } else { gp_store_for_type(op.operand_type) };
+                let store_op = if is_direct {
+                    "sd"
+                } else {
+                    gp_store_for_type(op.operand_type)
+                };
                 let slot = self.state.get_slot(ptr.0);
                 if is_direct {
                     if let Some(slot) = slot {
@@ -470,15 +542,21 @@ impl InlineAsmEmitter for RiscvCodegen {
                         // save the scratch output on stack, use it as address, then restore.
                         let src_name = super::emit::callee_saved_name(phys);
                         self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
-                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
-                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
-                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
                         self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
                     } else {
                         let src_name = super::emit::callee_saved_name(phys);
-                        self.state.emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    mv {}, {}", scratch, src_name));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
                     }
                 } else if let Some(slot) = slot {
                     // Non-alloca: slot holds a pointer, store through it.
@@ -488,14 +566,18 @@ impl InlineAsmEmitter for RiscvCodegen {
                         // save the scratch output on stack, load address into it,
                         // store through it, then restore the scratch output.
                         self.state.emit_fmt(format_args!("    addi sp, sp, -16"));
-                        self.state.emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    sd {}, 0(sp)", scratch));
                         self.emit_load_from_s0(&scratch, slot.0, "ld");
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
-                        self.state.emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    ld {}, 0(sp)", scratch));
                         self.state.emit_fmt(format_args!("    addi sp, sp, 16"));
                     } else {
                         self.emit_load_from_s0(&scratch, slot.0, "ld");
-                        self.state.emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, 0({})", store_op, reg, scratch));
                     }
                 }
             }

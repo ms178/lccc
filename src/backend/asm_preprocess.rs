@@ -239,20 +239,30 @@ fn collect_block_body<'a>(
 /// Estimate the byte size of a single assembly line for label position tracking.
 /// Used to resolve backward label references in .rept count expressions.
 /// `default_insn_size` is the typical instruction size for the target (4 for ARM/RISC-V).
-fn estimate_line_bytes_generic(trimmed: &str, comment_style: &CommentStyle, default_insn_size: u64) -> u64 {
+fn estimate_line_bytes_generic(
+    trimmed: &str,
+    comment_style: &CommentStyle,
+    default_insn_size: u64,
+) -> u64 {
     if trimmed.is_empty() {
         return 0;
     }
     // Check for comment-only lines
     match comment_style {
         CommentStyle::Hash => {
-            if trimmed.starts_with('#') { return 0; }
+            if trimmed.starts_with('#') {
+                return 0;
+            }
         }
         CommentStyle::HashAndSlashSlash => {
-            if trimmed.starts_with('#') || trimmed.starts_with("//") { return 0; }
+            if trimmed.starts_with('#') || trimmed.starts_with("//") {
+                return 0;
+            }
         }
         CommentStyle::SlashSlashAndAt => {
-            if trimmed.starts_with("//") || trimmed.starts_with('@') { return 0; }
+            if trimmed.starts_with("//") || trimmed.starts_with('@') {
+                return 0;
+            }
         }
     }
     // Label definitions don't add bytes
@@ -262,7 +272,10 @@ fn estimate_line_bytes_generic(trimmed: &str, comment_style: &CommentStyle, defa
     // Strip leading labels like "661:" from lines like "661: bl foo"
     let content = if let Some(pos) = trimmed.find(':') {
         let before = &trimmed[..pos];
-        if before.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+        if before
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
             trimmed[pos + 1..].trim()
         } else {
             trimmed
@@ -276,14 +289,37 @@ fn estimate_line_bytes_generic(trimmed: &str, comment_style: &CommentStyle, defa
     // Directives
     if content.starts_with('.') {
         let lower = content.to_lowercase();
-        if lower.starts_with(".byte ") { return 1; }
-        if lower.starts_with(".hword ") || lower.starts_with(".short ") || lower.starts_with(".2byte ") { return 2; }
-        if lower.starts_with(".word ") || lower.starts_with(".long ") || lower.starts_with(".4byte ") || lower.starts_with(".inst ") { return 4; }
-        if lower.starts_with(".quad ") || lower.starts_with(".xword ") || lower.starts_with(".8byte ") { return 8; }
+        if lower.starts_with(".byte ") {
+            return 1;
+        }
+        if lower.starts_with(".hword ")
+            || lower.starts_with(".short ")
+            || lower.starts_with(".2byte ")
+        {
+            return 2;
+        }
+        if lower.starts_with(".word ")
+            || lower.starts_with(".long ")
+            || lower.starts_with(".4byte ")
+            || lower.starts_with(".inst ")
+        {
+            return 4;
+        }
+        if lower.starts_with(".quad ")
+            || lower.starts_with(".xword ")
+            || lower.starts_with(".8byte ")
+        {
+            return 8;
+        }
         // .zero N, .space N, .skip N
-        if lower.starts_with(".zero ") || lower.starts_with(".space ") || lower.starts_with(".skip ") {
+        if lower.starts_with(".zero ")
+            || lower.starts_with(".space ")
+            || lower.starts_with(".skip ")
+        {
             let arg = content.split_whitespace().nth(1).unwrap_or("0");
-            if let Ok(n) = arg.trim_end_matches(',').parse::<u64>() { return n; }
+            if let Ok(n) = arg.trim_end_matches(',').parse::<u64>() {
+                return n;
+            }
         }
         // Other directives (.align, .section, .globl, .type, .ascii, etc.) — 0 bytes
         return 0;
@@ -378,7 +414,8 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
 ) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     let mut i = 0;
-    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> = crate::common::fx_hash::FxHashMap::default();
+    let mut label_positions: crate::common::fx_hash::FxHashMap<String, Vec<u64>> =
+        crate::common::fx_hash::FxHashMap::default();
     let mut current_byte_pos: u64 = 0;
     while i < lines.len() {
         let trimmed = strip_comment(lines[i], comment_style).trim().to_string();
@@ -387,9 +424,18 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
             let count_val = resolve_rept_label_expr(count_str, &label_positions, parse_int)
                 .map_err(|e| format!(".rept: bad count '{}': {}", count_str, e))?;
             // Treat negative counts as 0 (matches GNU as behavior)
-            let count = if count_val < 0 { 0usize } else { count_val as usize };
+            let count = if count_val < 0 {
+                0usize
+            } else {
+                count_val as usize
+            };
             let body = collect_block_body(lines, &mut i, comment_style)?;
-            let expanded_body = expand_rept_blocks_with_insn_size(&body, comment_style, parse_int, default_insn_size)?;
+            let expanded_body = expand_rept_blocks_with_insn_size(
+                &body,
+                comment_style,
+                parse_int,
+                default_insn_size,
+            )?;
             for _ in 0..count {
                 result.extend(expanded_body.iter().cloned());
             }
@@ -403,14 +449,22 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
             let values: Vec<&str> = values_str.split(',').map(|s| s.trim()).collect();
             let body = collect_block_body(lines, &mut i, comment_style)?;
             for val in &values {
-                let subst_body: Vec<String> = body.iter().map(|line| {
-                    let pattern = format!("\\{}", var);
-                    let substituted = replace_macro_param(line, &pattern, val);
-                    // Strip GAS macro argument delimiters: \() resolves to empty string
-                    substituted.replace("\\()", "")
-                }).collect();
+                let subst_body: Vec<String> = body
+                    .iter()
+                    .map(|line| {
+                        let pattern = format!("\\{}", var);
+                        let substituted = replace_macro_param(line, &pattern, val);
+                        // Strip GAS macro argument delimiters: \() resolves to empty string
+                        substituted.replace("\\()", "")
+                    })
+                    .collect();
                 let subst_refs: Vec<&str> = subst_body.iter().map(|s| s.as_str()).collect();
-                let expanded = expand_rept_blocks_with_insn_size(&subst_refs, comment_style, parse_int, default_insn_size)?;
+                let expanded = expand_rept_blocks_with_insn_size(
+                    &subst_refs,
+                    comment_style,
+                    parse_int,
+                    default_insn_size,
+                )?;
                 result.extend(expanded);
             }
         } else if trimmed == ".endr" {
@@ -426,7 +480,8 @@ pub(crate) fn expand_rept_blocks_with_insn_size(
                         .push(current_byte_pos);
                 }
             }
-            current_byte_pos += estimate_line_bytes_generic(&trimmed, comment_style, default_insn_size);
+            current_byte_pos +=
+                estimate_line_bytes_generic(&trimmed, comment_style, default_insn_size);
             result.push(lines[i].to_string());
         }
         i += 1;
@@ -480,8 +535,9 @@ fn find_toplevel_eq(s: &str) -> Option<usize> {
 /// `\ftr` unexpanded in the macro body.
 fn strip_param_qualifiers(name: &str) -> String {
     match name.split_once(':') {
-        Some((base, qual))
-            if matches!(qual, "req" | "vararg") && !base.is_empty() => base.to_string(),
+        Some((base, qual)) if matches!(qual, "req" | "vararg") && !base.is_empty() => {
+            base.to_string()
+        }
         _ => name.to_string(),
     }
 }
@@ -771,7 +827,10 @@ fn ends_with_operator(token: &str) -> bool {
         return false;
     }
     let last = bytes[bytes.len() - 1];
-    matches!(last, b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~')
+    matches!(
+        last,
+        b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~'
+    )
 }
 
 /// Check if a token starts with an operator character that could be a binary
@@ -783,7 +842,10 @@ fn starts_with_binary_operator(token: &str) -> bool {
         return false;
     }
     let first = bytes[0];
-    matches!(first, b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~')
+    matches!(
+        first,
+        b'+' | b'-' | b'*' | b'/' | b'%' | b'|' | b'&' | b'^' | b'~'
+    )
 }
 
 /// Merge tokens that form arithmetic/bitwise expressions.
@@ -847,10 +909,7 @@ fn merge_expression_tokens(tokens: &[String]) -> Vec<String> {
 /// 2. Expand macro invocations: lines where the first word matches a defined macro
 ///
 /// Handles nested macro definitions and recursive expansion.
-pub fn expand_macros(
-    lines: &[&str],
-    comment_style: &CommentStyle,
-) -> Result<Vec<String>, String> {
+pub fn expand_macros(lines: &[&str], comment_style: &CommentStyle) -> Result<Vec<String>, String> {
     use crate::common::fx_hash::FxHashMap;
     let mut macros: FxHashMap<String, MacroDef> = FxHashMap::default();
     let mut result = Vec::new();
@@ -862,7 +921,10 @@ pub fn expand_macros(
             // Parse: .macro name [param1[, param2, ...]]
             let rest = trimmed[".macro".len()..].trim();
             let (name, params_str) = match rest.find([' ', '\t', ',']) {
-                Some(pos) => (rest[..pos].trim(), rest[pos..].trim().trim_start_matches(',')),
+                Some(pos) => (
+                    rest[..pos].trim(),
+                    rest[pos..].trim().trim_start_matches(','),
+                ),
                 None => (rest, ""),
             };
             let (params, defaults) = parse_macro_params(params_str);
@@ -873,7 +935,10 @@ pub fn expand_macros(
                 let inner = strip_comment(lines[i], comment_style).trim().to_string();
                 if inner.starts_with(".macro ") || inner.starts_with(".macro\t") {
                     depth += 1;
-                } else if inner == ".endm" || inner.starts_with(".endm ") || inner.starts_with(".endm\t") {
+                } else if inner == ".endm"
+                    || inner.starts_with(".endm ")
+                    || inner.starts_with(".endm\t")
+                {
                     depth -= 1;
                     if depth == 0 {
                         break;
@@ -882,8 +947,18 @@ pub fn expand_macros(
                 body.push(lines[i].to_string());
                 i += 1;
             }
-            macros.insert(name.to_string(), MacroDef { params, defaults, body });
-        } else if trimmed == ".endm" || trimmed.starts_with(".endm ") || trimmed.starts_with(".endm\t") {
+            macros.insert(
+                name.to_string(),
+                MacroDef {
+                    params,
+                    defaults,
+                    body,
+                },
+            );
+        } else if trimmed == ".endm"
+            || trimmed.starts_with(".endm ")
+            || trimmed.starts_with(".endm\t")
+        {
             // stray .endm — skip
         } else if trimmed.starts_with(".purgem ") || trimmed.starts_with(".purgem\t") {
             // Remove a macro definition (GAS .purgem directive)
@@ -909,7 +984,8 @@ pub fn expand_macros(
                         let param = &mac.params[pi];
                         let pattern = format!("\\{}", param);
                         let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
-                            mac.defaults.get(pi)
+                            mac.defaults
+                                .get(pi)
                                 .and_then(|d| d.as_deref())
                                 .unwrap_or("0")
                         });
@@ -1003,7 +1079,8 @@ fn expand_macros_with(
                     let param = &mac.params[pi];
                     let pattern = format!("\\{}", param);
                     let replacement = args.get(pi).map(|s| s.as_str()).unwrap_or_else(|| {
-                        mac.defaults.get(pi)
+                        mac.defaults
+                            .get(pi)
                             .and_then(|d| d.as_deref())
                             .unwrap_or("0")
                     });
@@ -1036,13 +1113,31 @@ pub fn resolve_x86_registers(expr: &str) -> String {
     // Replace register names with numeric values, longest first to avoid partial matches.
     // Values match GAS internal encoding for x86-64 registers.
     const REGS: &[(&str, &str)] = &[
-        ("%r10", "114"), ("%r11", "115"), ("%r12", "116"), ("%r13", "117"),
-        ("%r14", "118"), ("%r15", "119"), ("%r8", "112"), ("%r9", "113"),
-        ("%rax", "104"), ("%rcx", "105"), ("%rdx", "106"), ("%rbx", "107"),
-        ("%rsp", "108"), ("%rbp", "109"), ("%rsi", "110"), ("%rdi", "111"),
+        ("%r10", "114"),
+        ("%r11", "115"),
+        ("%r12", "116"),
+        ("%r13", "117"),
+        ("%r14", "118"),
+        ("%r15", "119"),
+        ("%r8", "112"),
+        ("%r9", "113"),
+        ("%rax", "104"),
+        ("%rcx", "105"),
+        ("%rdx", "106"),
+        ("%rbx", "107"),
+        ("%rsp", "108"),
+        ("%rbp", "109"),
+        ("%rsi", "110"),
+        ("%rdi", "111"),
         // 32-bit registers (used in some kernel macros)
-        ("%eax", "40"), ("%ecx", "41"), ("%edx", "42"), ("%ebx", "43"),
-        ("%esp", "44"), ("%ebp", "45"), ("%esi", "46"), ("%edi", "47"),
+        ("%eax", "40"),
+        ("%ecx", "41"),
+        ("%edx", "42"),
+        ("%ebx", "43"),
+        ("%esp", "44"),
+        ("%ebp", "45"),
+        ("%esi", "46"),
+        ("%edi", "47"),
     ];
     let mut result = expr.to_string();
     for &(name, val) in REGS {
@@ -1083,8 +1178,11 @@ fn find_isolated_cmp(cond: &str, ch: char) -> Option<usize> {
         if depth == 0 && bytes[i] == target {
             let next = bytes.get(i + 1).copied();
             let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
-            if next != Some(b'>') && next != Some(b'<') && next != Some(b'=')
-                && prev != Some(b'>') && prev != Some(b'<')
+            if next != Some(b'>')
+                && next != Some(b'<')
+                && next != Some(b'=')
+                && prev != Some(b'>')
+                && prev != Some(b'<')
             {
                 return Some(i);
             }
@@ -1299,16 +1397,25 @@ mod tests {
     #[test]
     fn test_strip_comment_hash() {
         let style = CommentStyle::Hash;
-        assert_eq!(strip_comment("movq %rax, %rbx # comment", &style), "movq %rax, %rbx ");
+        assert_eq!(
+            strip_comment("movq %rax, %rbx # comment", &style),
+            "movq %rax, %rbx "
+        );
         assert_eq!(strip_comment(".asciz \"a#b\"", &style), ".asciz \"a#b\"");
     }
 
     #[test]
     fn test_strip_comment_slash_slash_and_at() {
         let style = CommentStyle::SlashSlashAndAt;
-        assert_eq!(strip_comment("mov x0, x1 // comment", &style), "mov x0, x1 ");
+        assert_eq!(
+            strip_comment("mov x0, x1 // comment", &style),
+            "mov x0, x1 "
+        );
         assert_eq!(strip_comment("mov x0, x1 @ comment", &style), "mov x0, x1 ");
-        assert_eq!(strip_comment(".type foo, @function", &style), ".type foo, @function");
+        assert_eq!(
+            strip_comment(".type foo, @function", &style),
+            ".type foo, @function"
+        );
     }
 
     #[test]
@@ -1350,13 +1457,34 @@ mod tests {
     #[test]
     fn test_eval_if_condition_with_x86_registers() {
         // Test register equality (like kernel UNWIND_HINT_REGS)
-        assert!(eval_if_condition_with_resolver("%rsp == %rsp", resolve_x86_registers));
-        assert!(!eval_if_condition_with_resolver("%rsp == %rbp", resolve_x86_registers));
-        assert!(eval_if_condition_with_resolver("%rbp == %rbp", resolve_x86_registers));
-        assert!(eval_if_condition_with_resolver("%rdi == %rdi", resolve_x86_registers));
-        assert!(eval_if_condition_with_resolver("%rdx == %rdx", resolve_x86_registers));
-        assert!(eval_if_condition_with_resolver("%r10 == %r10", resolve_x86_registers));
-        assert!(eval_if_condition_with_resolver("%rsp != %rbp", resolve_x86_registers));
+        assert!(eval_if_condition_with_resolver(
+            "%rsp == %rsp",
+            resolve_x86_registers
+        ));
+        assert!(!eval_if_condition_with_resolver(
+            "%rsp == %rbp",
+            resolve_x86_registers
+        ));
+        assert!(eval_if_condition_with_resolver(
+            "%rbp == %rbp",
+            resolve_x86_registers
+        ));
+        assert!(eval_if_condition_with_resolver(
+            "%rdi == %rdi",
+            resolve_x86_registers
+        ));
+        assert!(eval_if_condition_with_resolver(
+            "%rdx == %rdx",
+            resolve_x86_registers
+        ));
+        assert!(eval_if_condition_with_resolver(
+            "%r10 == %r10",
+            resolve_x86_registers
+        ));
+        assert!(eval_if_condition_with_resolver(
+            "%rsp != %rbp",
+            resolve_x86_registers
+        ));
     }
 
     #[test]
@@ -1390,13 +1518,17 @@ mod tests {
         assert_eq!(split_macro_args("0(a1), x, y"), vec!["0(a1)", "x", "y"]);
         assert_eq!(split_macro_args(""), Vec::<String>::new());
         // Expression with operator: `889f - 888f` stays as one arg (operator merging)
-        assert_eq!(split_macro_args("886b, 888f, 0x1234, 0, 889f - 888f"),
-            vec!["886b", "888f", "0x1234", "0", "889f-888f"]);
+        assert_eq!(
+            split_macro_args("886b, 888f, 0x1234, 0, 889f - 888f"),
+            vec!["886b", "888f", "0x1234", "0", "889f-888f"]
+        );
         // Without commas, spaces are separators
         assert_eq!(split_macro_args("a b c"), vec!["a", "b", "c"]);
         // Mixed comma and space: `fixup lb a5, 0(a1), 10f` → 4 args
-        assert_eq!(split_macro_args("lb      a5, 0(a1), 10f"),
-            vec!["lb", "a5", "0(a1)", "10f"]);
+        assert_eq!(
+            split_macro_args("lb      a5, 0(a1), 10f"),
+            vec!["lb", "a5", "0(a1)", "10f"]
+        );
         // Expression operators keep tokens together
         assert_eq!(split_macro_args("foo + bar"), vec!["foo+bar"]);
         assert_eq!(split_macro_args("foo + bar, baz"), vec!["foo+bar", "baz"]);
@@ -1476,19 +1608,28 @@ mod tests {
         let nop_count = result.iter().filter(|l| l.trim() == "nop").count();
         assert_eq!(nop_count, 1, "macro should only expand once before .purgem");
         let mymacro_count = result.iter().filter(|l| l.trim() == "mymacro").count();
-        assert_eq!(mymacro_count, 1, "after .purgem, 'mymacro' should be passed through literally");
+        assert_eq!(
+            mymacro_count, 1,
+            "after .purgem, 'mymacro' should be passed through literally"
+        );
     }
 
     #[test]
     fn test_replace_macro_param_basic() {
         // Basic replacement
-        assert_eq!(replace_macro_param(".byte \\orig", "\\orig", "140b"), ".byte 140b");
+        assert_eq!(
+            replace_macro_param(".byte \\orig", "\\orig", "140b"),
+            ".byte 140b"
+        );
     }
 
     #[test]
     fn test_replace_macro_param_boundary_rejection() {
         // \orig should NOT match as prefix of \orig_len
-        assert_eq!(replace_macro_param(".byte \\orig_len", "\\orig", "140b"), ".byte \\orig_len");
+        assert_eq!(
+            replace_macro_param(".byte \\orig_len", "\\orig", "140b"),
+            ".byte \\orig_len"
+        );
     }
 
     #[test]
@@ -1500,7 +1641,10 @@ mod tests {
     #[test]
     fn test_replace_macro_param_followed_by_operator() {
         // \orig followed by '-' (not an identifier char) should be replaced
-        assert_eq!(replace_macro_param("\\orig-\\alt", "\\orig", "142b"), "142b-\\alt");
+        assert_eq!(
+            replace_macro_param("\\orig-\\alt", "\\orig", "142b"),
+            "142b-\\alt"
+        );
     }
 
     #[test]
@@ -1515,7 +1659,10 @@ mod tests {
     #[test]
     fn test_replace_macro_param_no_match() {
         // Pattern not present
-        assert_eq!(replace_macro_param(".byte 42", "\\orig", "140b"), ".byte 42");
+        assert_eq!(
+            replace_macro_param(".byte 42", "\\orig", "140b"),
+            ".byte 42"
+        );
     }
 
     #[test]

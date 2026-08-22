@@ -7,12 +7,12 @@
 // K&R-style function parameters are also handled here, where parameter types
 // are declared separately after the parameter name list.
 
+use super::ast::*;
+use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
 use crate::frontend::lexer::token::TokenKind;
-use super::ast::*;
-use super::parse::{ModeKind, ParsedDeclAttrs, Parser};
 
 /// Context for declaration-level attributes that flow from `parse_external_decl`
 /// into `parse_declaration_rest` and `parse_function_def`.
@@ -61,7 +61,7 @@ impl Parser {
             self.consume_if(&TokenKind::Volatile);
             if matches!(self.peek(), TokenKind::LParen) {
                 self.advance(); // consume (
-                // Collect all string literal pieces (may be concatenated)
+                                // Collect all string literal pieces (may be concatenated)
                 let mut asm_str = String::new();
                 loop {
                     match self.peek() {
@@ -70,7 +70,9 @@ impl Parser {
                             self.advance();
                         }
                         TokenKind::RParen | TokenKind::Eof => break,
-                        _ => { self.advance(); }
+                        _ => {
+                            self.advance();
+                        }
                     }
                 }
                 if matches!(self.peek(), TokenKind::RParen) {
@@ -118,7 +120,9 @@ impl Parser {
             let mut d = Declaration::new(
                 type_spec,
                 Vec::new(),
-                None, None, None,
+                None,
+                None,
+                None,
                 self.attrs.parsing_address_space,
                 self.attrs.parsing_vector_size.take(),
                 self.attrs.parsing_ext_vector_nelem.take(),
@@ -136,8 +140,10 @@ impl Parser {
         // Handle post-type storage class specifiers (C allows "struct S typedef name;")
         self.consume_post_type_qualifiers();
 
-        let (name, derived, decl_mode, decl_common, decl_aligned, _) = self.parse_declarator_with_attrs();
-        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) = self.parse_asm_and_attributes();
+        let (name, derived, decl_mode, decl_common, decl_aligned, _) =
+            self.parse_declarator_with_attrs();
+        let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
+            self.parse_asm_and_attributes();
         let mode_kind = decl_mode.or(post_mode);
         let is_common = decl_common || post_common;
         // Merge alignment from _Alignas (type specifier), declarator attrs, and post-declarator attrs.
@@ -156,7 +162,10 @@ impl Parser {
         let alias_target = self.attrs.parsing_alias_target.take();
         // Use explicit __attribute__((visibility(...))) if present, otherwise fall back
         // to the current #pragma GCC visibility default (if any).
-        let visibility = self.attrs.parsing_visibility.take()
+        let visibility = self
+            .attrs
+            .parsing_visibility
+            .take()
             .or_else(|| self.pragma_default_visibility.clone());
         let section = self.attrs.parsing_section.take();
         let is_error_attr = self.attrs.parsing_error_attr();
@@ -302,21 +311,21 @@ impl Parser {
         derived: &[DerivedDeclarator],
     ) -> TypeSpecifier {
         let mut return_type = base_type;
-        let func_pos = derived.iter().position(|d|
-            matches!(d, DerivedDeclarator::Function(_, _)));
+        let func_pos = derived
+            .iter()
+            .position(|d| matches!(d, DerivedDeclarator::Function(_, _)));
 
         if let Some(fpos) = func_pos {
             // Apply post-Function derivations (Array/Pointer)
-            for d in &derived[fpos+1..] {
+            for d in &derived[fpos + 1..] {
                 match d {
                     DerivedDeclarator::Array(size_expr) => {
-                        return_type = TypeSpecifier::Array(
-                            Box::new(return_type),
-                            size_expr.clone(),
-                        );
+                        return_type =
+                            TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
                     DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                        return_type =
+                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
                     _ => {}
                 }
@@ -325,13 +334,12 @@ impl Parser {
             for d in &derived[..fpos] {
                 match d {
                     DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                        return_type =
+                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
                     DerivedDeclarator::Array(size_expr) => {
-                        return_type = TypeSpecifier::Array(
-                            Box::new(return_type),
-                            size_expr.clone(),
-                        );
+                        return_type =
+                            TypeSpecifier::Array(Box::new(return_type), size_expr.clone());
                     }
                     _ => {}
                 }
@@ -341,7 +349,8 @@ impl Parser {
             for d in derived {
                 match d {
                     DerivedDeclarator::Pointer => {
-                        return_type = TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
+                        return_type =
+                            TypeSpecifier::Pointer(Box::new(return_type), AddressSpace::Default);
                     }
                     _ => break,
                 }
@@ -358,7 +367,8 @@ impl Parser {
                 loop {
                     let (pname, pderived) = self.parse_declarator();
                     if let Some(ref name) = pname {
-                        let (full_type, fptr_params) = self.apply_kr_derivations(&type_spec, &pderived);
+                        let (full_type, fptr_params) =
+                            self.apply_kr_derivations(&type_spec, &pderived);
                         // Compute fptr_inner_ptr_depth for K&R function pointer params.
                         // Count Pointer entries AFTER FunctionPointer in derived list;
                         // these represent extra indirection (pointer-to-function-pointer).
@@ -367,7 +377,8 @@ impl Parser {
                             let mut ptrs_after = 0u32;
                             for d in &pderived {
                                 match d {
-                                    DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _) => {
+                                    DerivedDeclarator::FunctionPointer(_, _)
+                                    | DerivedDeclarator::Function(_, _) => {
                                         found_fptr = true;
                                     }
                                     DerivedDeclarator::Pointer if found_fptr => {
@@ -436,7 +447,10 @@ impl Parser {
             // For `int *(*fp)()`:
             //   pderived = [Pointer, Pointer, FunctionPointer([], false)]
             //   First Pointer is return-type pointer, second is syntax marker.
-            let ptr_count = pderived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+            let ptr_count = pderived
+                .iter()
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .count();
             // Apply all pointers except the syntax marker (last one)
             for _ in 0..ptr_count.saturating_sub(1) {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
@@ -454,13 +468,16 @@ impl Parser {
             }
         }
         // Collect array dimensions
-        let array_dims: Vec<_> = pderived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size) = d {
-                Some(size.clone())
-            } else {
-                None
-            }
-        }).collect();
+        let array_dims: Vec<_> = pderived
+            .iter()
+            .filter_map(|d| {
+                if let DerivedDeclarator::Array(size) = d {
+                    Some(size.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
         // Array params: outermost dimension decays to pointer
         if !array_dims.is_empty() {
             for dim in array_dims.iter().skip(1).rev() {
@@ -501,7 +518,8 @@ impl Parser {
             span: start,
         });
 
-        let (extra_ctor, extra_dtor, _, extra_common, extra_aligned, extra_asm_reg) = self.parse_asm_and_attributes();
+        let (extra_ctor, extra_dtor, _, extra_common, extra_aligned, extra_asm_reg) =
+            self.parse_asm_and_attributes();
         // Merge post-declarator attributes into the most recently pushed declarator.
         // last_mut() is safe because we just pushed above.
         let last_decl = declarators.last_mut().expect("declarator just pushed");
@@ -567,11 +585,18 @@ impl Parser {
             ctx.is_common = ctx.is_common || d_common;
             let d_weak = self.attrs.parsing_weak();
             let d_alias = self.attrs.parsing_alias_target.take();
-            let d_vis = self.attrs.parsing_visibility.take()
+            let d_vis = self
+                .attrs
+                .parsing_visibility
+                .take()
                 .or_else(|| self.pragma_default_visibility.clone());
             // Per-declarator section attribute overrides, otherwise inherit from
             // the declaration-level attribute (e.g. __attribute__((section(".x"))) int a, b;)
-            let d_section = self.attrs.parsing_section.take().or_else(|| section.clone());
+            let d_section = self
+                .attrs
+                .parsing_section
+                .take()
+                .or_else(|| section.clone());
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
             let d_noreturn = self.attrs.parsing_noreturn();
@@ -612,7 +637,11 @@ impl Parser {
             });
             let (_, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             if let Some(reg) = skip_asm_reg {
-                declarators.last_mut().expect("declarator just pushed").attrs.asm_register = Some(reg);
+                declarators
+                    .last_mut()
+                    .expect("declarator just pushed")
+                    .attrs
+                    .asm_register = Some(reg);
             }
             if let Some(a) = skip_aligned {
                 ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
@@ -629,7 +658,9 @@ impl Parser {
         let mut d = Declaration::new(
             type_spec,
             declarators,
-            ctx.alignment, ctx.alignas_type, ctx.alignment_sizeof_type,
+            ctx.alignment,
+            ctx.alignas_type,
+            ctx.alignment_sizeof_type,
             self.attrs.parsing_address_space,
             self.attrs.parsing_vector_size.take(),
             self.attrs.parsing_ext_vector_nelem.take(),
@@ -677,7 +708,9 @@ impl Parser {
             let mut d = Declaration::new(
                 type_spec,
                 declarators,
-                None, None, None,
+                None,
+                None,
+                None,
                 self.attrs.parsing_address_space,
                 self.attrs.parsing_vector_size.take(),
                 self.attrs.parsing_ext_vector_nelem.take(),
@@ -783,7 +816,9 @@ impl Parser {
         let mut d = Declaration::new(
             type_spec,
             declarators,
-            alignment, alignas_type, alignment_sizeof_type,
+            alignment,
+            alignas_type,
+            alignment_sizeof_type,
             self.attrs.parsing_address_space,
             self.attrs.parsing_vector_size.take(),
             self.attrs.parsing_ext_vector_nelem.take(),
@@ -836,17 +871,18 @@ impl Parser {
                 if designators.is_empty() {
                     if let TokenKind::Identifier(name) = self.peek() {
                         let name = name.clone();
-                        if self.pos + 1 < self.tokens.len() && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon) {
+                        if self.pos + 1 < self.tokens.len()
+                            && matches!(self.tokens[self.pos + 1].kind, TokenKind::Colon)
+                        {
                             self.advance(); // consume identifier
                             self.advance(); // consume colon
                             designators.push(Designator::Field(name));
                         }
                     }
                 }
-                if !designators.is_empty()
-                    && matches!(self.peek(), TokenKind::Assign) {
-                        self.advance();
-                    }
+                if !designators.is_empty() && matches!(self.peek(), TokenKind::Assign) {
+                    self.advance();
+                }
                 let init = self.parse_initializer();
                 items.push(InitializerItem { designators, init });
                 if !self.consume_if(&TokenKind::Comma) {
@@ -876,7 +912,11 @@ impl Parser {
     ) -> Vec<InitializerItem> {
         let mut result = Vec::with_capacity(items.len());
         for item in items {
-            if let Some(range_pos) = item.designators.iter().position(|d| matches!(d, Designator::Range(_, _))) {
+            if let Some(range_pos) = item
+                .designators
+                .iter()
+                .position(|d| matches!(d, Designator::Range(_, _)))
+            {
                 if let Designator::Range(ref lo_expr, ref hi_expr) = item.designators[range_pos] {
                     // Try to evaluate lo and hi as integer constants
                     let lo = Self::eval_const_int_expr_with_enums(lo_expr, enum_consts, None);
@@ -884,9 +924,8 @@ impl Parser {
                     if let (Some(lo_val), Some(hi_val)) = (lo, hi) {
                         for idx in lo_val..=hi_val {
                             let mut new_desigs = item.designators.clone();
-                            new_desigs[range_pos] = Designator::Index(
-                                Expr::IntLiteral(idx, Span::dummy())
-                            );
+                            new_desigs[range_pos] =
+                                Designator::Index(Expr::IntLiteral(idx, Span::dummy()));
                             result.push(InitializerItem {
                                 designators: new_desigs,
                                 init: item.init.clone(),
@@ -929,9 +968,7 @@ impl Parser {
             Expr::ULongLongLiteral(val, _) => Some(*val as i64),
             Expr::CharLiteral(val, _) => Some(*val as i64),
             // Identifiers: look up enum constants if available
-            Expr::Identifier(name, _) => {
-                enum_consts.and_then(|m| m.get(name.as_str()).copied())
-            }
+            Expr::Identifier(name, _) => enum_consts.and_then(|m| m.get(name.as_str()).copied()),
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = Self::eval_const_int_expr_with_enums(lhs, enum_consts, tag_aligns)?;
                 let r = Self::eval_const_int_expr_with_enums(rhs, enum_consts, tag_aligns)?;
@@ -1004,7 +1041,8 @@ impl Parser {
                 }
             }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
-                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns).map(|v| v.wrapping_neg())
+                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)
+                    .map(|v| v.wrapping_neg())
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns).map(|v| {
@@ -1020,7 +1058,13 @@ impl Parser {
                 })
             }
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
-                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns).map(|v| if v == 0 { 1 } else { 0 })
+                Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns).map(|v| {
+                    if v == 0 {
+                        1
+                    } else {
+                        0
+                    }
+                })
             }
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
                 Self::eval_const_int_expr_with_enums(inner, enum_consts, tag_aligns)
@@ -1067,21 +1111,23 @@ impl Parser {
                     None
                 }
             }
-            Expr::Sizeof(arg, _) => {
-                match arg.as_ref() {
-                    SizeofArg::Type(ts) => Self::try_sizeof_type_spec(ts).map(|s| s as i64),
-                    SizeofArg::Expr(_) => None,
-                }
-            }
+            Expr::Sizeof(arg, _) => match arg.as_ref() {
+                SizeofArg::Type(ts) => Self::try_sizeof_type_spec(ts).map(|s| s as i64),
+                SizeofArg::Expr(_) => None,
+            },
             Expr::Alignof(ts, _) => {
                 // Can't resolve typedef alignment at parse time
-                if Self::type_spec_has_typedef(ts) { return None; }
+                if Self::type_spec_has_typedef(ts) {
+                    return None;
+                }
                 Some(Self::alignof_type_spec(ts, tag_aligns) as i64)
             }
             // __alignof(type) returns preferred alignment (8 for long long/double on i686)
             Expr::GnuAlignof(ts, _) => {
                 // Can't resolve typedef alignment at parse time
-                if Self::type_spec_has_typedef(ts) { return None; }
+                if Self::type_spec_has_typedef(ts) {
+                    return None;
+                }
                 Some(Self::preferred_alignof_type_spec(ts, tag_aligns) as i64)
             }
             // __alignof__(expr): parser-level can't always determine type alignment
@@ -1101,21 +1147,23 @@ impl Parser {
     fn is_unsigned_int_expr(expr: &Expr) -> bool {
         match expr {
             Expr::UIntLiteral(..) | Expr::ULongLiteral(..) | Expr::ULongLongLiteral(..) => true,
-            Expr::Cast(ts, _, _) => {
-                Self::is_unsigned_type_spec(ts)
-            }
+            Expr::Cast(ts, _, _) => Self::is_unsigned_type_spec(ts),
             // Unary +/- preserve the signedness of the operand.
             // In C, -size_t still has type size_t (unsigned wraparound).
-            Expr::UnaryOp(UnaryOp::Plus, inner, _)
-            | Expr::UnaryOp(UnaryOp::Neg, inner, _) => Self::is_unsigned_int_expr(inner),
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) | Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
+                Self::is_unsigned_int_expr(inner)
+            }
             // Binary ops: unsigned if either operand is unsigned (C promotion)
             Expr::BinaryOp(_, lhs, rhs, _) => {
                 Self::is_unsigned_int_expr(lhs) || Self::is_unsigned_int_expr(rhs)
             }
             // sizeof yields size_t (unsigned). _Alignof yields size_t (unsigned).
             // These are unsigned per C11 6.5.3.4 and 6.5.3.
-            Expr::Sizeof(..) | Expr::Alignof(..) | Expr::GnuAlignof(..)
-            | Expr::AlignofExpr(..) | Expr::GnuAlignofExpr(..) => true,
+            Expr::Sizeof(..)
+            | Expr::Alignof(..)
+            | Expr::GnuAlignof(..)
+            | Expr::AlignofExpr(..)
+            | Expr::GnuAlignofExpr(..) => true,
             _ => false,
         }
     }
@@ -1138,28 +1186,57 @@ impl Parser {
     pub(super) fn consume_post_type_qualifiers(&mut self) {
         loop {
             match self.peek() {
-                TokenKind::Typedef => { self.advance(); self.attrs.set_typedef(true); }
-                TokenKind::Static => { self.advance(); self.attrs.set_static(true); }
-                TokenKind::Extern => { self.advance(); self.attrs.set_extern(true); }
-                TokenKind::Const => { self.advance(); self.attrs.set_const(true); }
-                TokenKind::Volatile => { self.advance(); self.attrs.set_volatile(true); }
-                TokenKind::Restrict
-                | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => { self.advance(); }
-                TokenKind::SegGs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegGs; }
-                TokenKind::SegFs => { self.advance(); self.attrs.parsing_address_space = AddressSpace::SegFs; }
+                TokenKind::Typedef => {
+                    self.advance();
+                    self.attrs.set_typedef(true);
+                }
+                TokenKind::Static => {
+                    self.advance();
+                    self.attrs.set_static(true);
+                }
+                TokenKind::Extern => {
+                    self.advance();
+                    self.attrs.set_extern(true);
+                }
+                TokenKind::Const => {
+                    self.advance();
+                    self.attrs.set_const(true);
+                }
+                TokenKind::Volatile => {
+                    self.advance();
+                    self.attrs.set_volatile(true);
+                }
+                TokenKind::Restrict | TokenKind::Inline | TokenKind::Register | TokenKind::Auto => {
+                    self.advance();
+                }
+                TokenKind::SegGs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegGs;
+                }
+                TokenKind::SegFs => {
+                    self.advance();
+                    self.attrs.parsing_address_space = AddressSpace::SegFs;
+                }
                 TokenKind::Alignas => {
                     self.advance();
                     if let Some(align) = self.parse_alignas_argument() {
-                        self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(align, |prev| prev.max(align)));
+                        self.attrs.parsed_alignas = Some(
+                            self.attrs
+                                .parsed_alignas
+                                .map_or(align, |prev| prev.max(align)),
+                        );
                     }
                 }
                 TokenKind::Attribute => {
                     let (_, aligned, _, _) = self.parse_gcc_attributes();
                     if let Some(a) = aligned {
-                        self.attrs.parsed_alignas = Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+                        self.attrs.parsed_alignas =
+                            Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
                     }
                 }
-                TokenKind::Extension => { self.advance(); }
+                TokenKind::Extension => {
+                    self.advance();
+                }
                 _ => break,
             }
         }
@@ -1202,12 +1279,24 @@ impl Parser {
             }
             Expr::Conditional(cond, then_expr, else_expr, _) => {
                 Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(then_expr, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(else_expr, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(
+                        then_expr,
+                        enum_consts,
+                        unevaluable_consts,
+                    )
+                    || Self::expr_has_non_const_identifier(
+                        else_expr,
+                        enum_consts,
+                        unevaluable_consts,
+                    )
             }
             Expr::GnuConditional(cond, fallback, _) => {
                 Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(fallback, enum_consts, unevaluable_consts)
+                    || Self::expr_has_non_const_identifier(
+                        fallback,
+                        enum_consts,
+                        unevaluable_consts,
+                    )
             }
             Expr::Cast(_, inner, _) => {
                 Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
@@ -1251,7 +1340,11 @@ impl Parser {
                 found_string = true;
                 self.advance();
             }
-            if found_string { Some(msg) } else { None }
+            if found_string {
+                Some(msg)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1288,12 +1381,14 @@ impl Parser {
         } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
             // The expression references variables or non-enum identifiers, which
             // means it's definitely not a valid integer constant expression (C11 6.6).
-            self.emit_error("expression in static assertion is not an integer constant expression", assert_span);
+            self.emit_error(
+                "expression in static assertion is not an integer constant expression",
+                assert_span,
+            );
         }
         // If we can't evaluate the expression but it doesn't contain variable
         // references (e.g. sizeof, offsetof, compiler builtins), silently accept.
         // This matches real-world behavior where complex expressions may not be
         // evaluable at parse time but are valid constant expressions.
     }
-
 }

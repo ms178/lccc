@@ -14,10 +14,10 @@
 //! scope push/pop instead of O(total-map-size).
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::{AddressSpace, CType, RcLayout, StructLayout};
+use crate::frontend::parser::ast::{DerivedDeclarator, ParamDecl, TypeSpecifier};
 use std::cell::RefCell;
 use std::rc::Rc;
-use crate::common::types::{AddressSpace, StructLayout, RcLayout, CType};
-use crate::frontend::parser::ast::{TypeSpecifier, ParamDecl, DerivedDeclarator};
 
 /// Information about a function typedef (e.g., `typedef int func_t(int, int);`).
 /// Used to detect when a declaration like `func_t add;` is a function declaration
@@ -46,9 +46,14 @@ pub fn extract_fptr_typedef_info(
     derived: &[DerivedDeclarator],
 ) -> Option<FunctionTypedefInfo> {
     let (params, variadic) = derived.iter().find_map(|d| {
-        if let DerivedDeclarator::FunctionPointer(p, v) = d { Some((p, v)) } else { None }
+        if let DerivedDeclarator::FunctionPointer(p, v) = d {
+            Some((p, v))
+        } else {
+            None
+        }
     })?;
-    let ptr_count_before_fptr = derived.iter()
+    let ptr_count_before_fptr = derived
+        .iter()
         .take_while(|d| !matches!(d, DerivedDeclarator::FunctionPointer(_, _)))
         .filter(|d| matches!(d, DerivedDeclarator::Pointer))
         .count();
@@ -199,8 +204,16 @@ impl TypeContext {
 
         // On ILP32 (i686): long=32bit, so 64-bit types must use LongLong
         // On LP64 (x86-64, arm64, riscv64): long=64bit
-        let i64_type = if is_32bit { CType::LongLong } else { CType::Long };
-        let u64_type = if is_32bit { CType::ULongLong } else { CType::ULong };
+        let i64_type = if is_32bit {
+            CType::LongLong
+        } else {
+            CType::Long
+        };
+        let u64_type = if is_32bit {
+            CType::ULongLong
+        } else {
+            CType::ULong
+        };
         let size_type = if is_32bit { CType::UInt } else { CType::ULong };
         let ssize_type = if is_32bit { CType::Int } else { CType::Long };
         let ptrdiff_type = if is_32bit { CType::Int } else { CType::Long };
@@ -254,7 +267,10 @@ impl TypeContext {
             // <time.h>
             ("time_t", long_s.clone()),
             ("clock_t", long_s.clone()),
-            ("timer_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "timer_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("clockid_t", CType::Int),
             // <sys/types.h>
             ("off_t", long_s.clone()),
@@ -280,24 +296,54 @@ impl TypeContext {
             ("__s32", CType::Int),
             ("__s64", i64_type.clone()),
             // <locale.h>
-            ("locale_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "locale_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <pthread.h>
             ("pthread_t", size_type),
-            ("pthread_mutex_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_cond_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_mutex_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "pthread_cond_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("pthread_key_t", CType::UInt),
-            ("pthread_attr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_attr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("pthread_once_t", CType::Int),
-            ("pthread_mutexattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("pthread_condattr_t", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "pthread_mutexattr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "pthread_condattr_t",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <setjmp.h>
-            ("jmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("sigjmp_buf", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "jmp_buf",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "sigjmp_buf",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // <stdio.h>
-            ("FILE", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "FILE",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             ("fpos_t", ssize_type),
             // <dirent.h>
-            ("DIR", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "DIR",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
             // POSIX internal names
             ("__u_char", CType::UChar),
             ("__u_short", CType::UShort),
@@ -315,9 +361,18 @@ impl TypeContext {
             // <stdarg.h> - va_list and related types.
             // Sema uses a pointer approximation; the IR lowerer (types_seed.rs)
             // applies the target-specific concrete ABI type.
-            ("va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("__builtin_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
-            ("__gnuc_va_list", CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            (
+                "va_list",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "__builtin_va_list",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
+            (
+                "__gnuc_va_list",
+                CType::Pointer(Box::new(CType::Void), AddressSpace::Default),
+            ),
         ];
         for (name, ct) in builtins {
             self.typedefs.insert(name.to_string(), ct.clone());
@@ -348,7 +403,9 @@ impl TypeContext {
 
     /// Insert a struct layout from a &self context (interior mutability via RefCell).
     pub fn insert_struct_layout_from_ref(&self, key: &str, layout: StructLayout) {
-        self.struct_layouts.borrow_mut().insert(key.to_string(), Rc::new(layout));
+        self.struct_layouts
+            .borrow_mut()
+            .insert(key.to_string(), Rc::new(layout));
     }
 
     /// Check if a struct key is currently shadowed by an inner scope redefinition.

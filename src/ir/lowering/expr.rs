@@ -9,32 +9,24 @@
 //! - `expr_calls`: function call lowering, arguments, dispatch
 //! - `expr_assign`: assignment, compound assignment, bitfield helpers
 
-use crate::frontend::parser::ast::{
-    BinOp,
-    Expr,
-    PostfixOp,
-    UnaryOp,
-};
-use crate::ir::reexports::{
-    Terminator,
-    Instruction,
-    BlockId,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType};
-use super::lower::Lowerer;
 use super::definitions::GlobalInfo;
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType};
+use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
+use crate::ir::reexports::{
+    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, Operand, Terminator, Value,
+};
 
 impl Lowerer {
     /// Mask off the sign bit of a float value for truthiness testing.
     /// This ensures -0.0 is treated as falsy (same as +0.0) while NaN remains truthy.
     /// For F128 (long double), uses a proper float comparison against zero instead of
     /// bit-masking, because x87 80-bit values can't be reliably tested via integer AND.
-    pub(super) fn mask_float_sign_for_truthiness(&mut self, val: Operand, float_ty: IrType) -> Operand {
+    pub(super) fn mask_float_sign_for_truthiness(
+        &mut self,
+        val: Operand,
+        float_ty: IrType,
+    ) -> Operand {
         if !matches!(float_ty, IrType::F32 | IrType::F64 | IrType::F128) {
             return val;
         }
@@ -57,12 +49,22 @@ impl Lowerer {
             return Operand::Value(result);
         }
         let (abs_mask, _, _, _, _) = Self::fp_masks(float_ty);
-        let masked = self.emit_binop_val(IrBinOp::And, val, Operand::Const(IrConst::I64(abs_mask)), IrType::I64);
+        let masked = self.emit_binop_val(
+            IrBinOp::And,
+            val,
+            Operand::Const(IrConst::I64(abs_mask)),
+            IrType::I64,
+        );
         if crate::common::types::target_is_32bit() {
             // On 32-bit targets, the masked result is typed as I64 but needs to
             // be reduced to a boolean for the conditional branch, since the
             // backend's branch-on-nonzero only tests the low 32 bits.
-            let result = self.emit_cmp_val(IrCmpOp::Ne, Operand::Value(masked), Operand::Const(IrConst::I64(0)), IrType::I64);
+            let result = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(masked),
+                Operand::Const(IrConst::I64(0)),
+                IrType::I64,
+            );
             Operand::Value(result)
         } else {
             Operand::Value(masked)
@@ -194,7 +196,10 @@ impl Lowerer {
         // need their result (e.g. `foo(i++)` reads the old value), so clear
         // the flag for the duration of any other subexpression.
         let saved_discard = self.discard_expr_result;
-        if !matches!(expr, Expr::PostfixOp(PostfixOp::PostInc | PostfixOp::PostDec, _, _)) {
+        if !matches!(
+            expr,
+            Expr::PostfixOp(PostfixOp::PostInc | PostfixOp::PostDec, _, _)
+        ) {
             self.discard_expr_result = false;
         }
         let result = self.lower_expr_inner(expr);
@@ -213,7 +218,9 @@ impl Lowerer {
             Expr::ULongLongLiteral(val, _) => Operand::Const(IrConst::I64(*val as i64)),
             Expr::FloatLiteral(val, _) => Operand::Const(IrConst::F64(*val)),
             Expr::FloatLiteralF32(val, _) => Operand::Const(IrConst::F32(*val as f32)),
-            Expr::FloatLiteralLongDouble(val, bytes, _) => Operand::Const(IrConst::long_double_with_bytes(*val, *bytes)),
+            Expr::FloatLiteralLongDouble(val, bytes, _) => {
+                Operand::Const(IrConst::long_double_with_bytes(*val, *bytes))
+            }
             Expr::FloatLiteralF128(_, bytes, _) => {
                 // _Float128 literal: the 16 bytes ARE the IEEE binary128 value;
                 // carried in an I128 constant (bit-exact 16-byte moves). Use the
@@ -230,9 +237,15 @@ impl Lowerer {
             }
 
             // Imaginary literals
-            Expr::ImaginaryLiteral(val, _) => self.lower_imaginary_literal(*val, &CType::ComplexDouble),
-            Expr::ImaginaryLiteralF32(val, _) => self.lower_imaginary_literal(*val, &CType::ComplexFloat),
-            Expr::ImaginaryLiteralLongDouble(val, bytes, _) => self.lower_imaginary_literal_ld(*val, bytes, &CType::ComplexLongDouble),
+            Expr::ImaginaryLiteral(val, _) => {
+                self.lower_imaginary_literal(*val, &CType::ComplexDouble)
+            }
+            Expr::ImaginaryLiteralF32(val, _) => {
+                self.lower_imaginary_literal(*val, &CType::ComplexFloat)
+            }
+            Expr::ImaginaryLiteralLongDouble(val, bytes, _) => {
+                self.lower_imaginary_literal_ld(*val, bytes, &CType::ComplexLongDouble)
+            }
 
             Expr::StringLiteral(s, _) => self.lower_string_literal(s, false),
             Expr::WideStringLiteral(s, _) => self.lower_string_literal(s, true),
@@ -247,9 +260,7 @@ impl Lowerer {
             Expr::Conditional(cond, then_expr, else_expr, _) => {
                 self.lower_conditional(cond, then_expr, else_expr)
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
-                self.lower_gnu_conditional(cond, else_expr)
-            }
+            Expr::GnuConditional(cond, else_expr, _) => self.lower_gnu_conditional(cond, else_expr),
             Expr::Cast(ref target_type, inner, _) => self.lower_cast(target_type, inner),
             Expr::CompoundLiteral(ref type_spec, ref init, _) => {
                 self.lower_compound_literal(type_spec, init)
@@ -286,14 +297,19 @@ impl Lowerer {
             }
             Expr::StmtExpr(compound, _) => self.lower_stmt_expr(compound),
             Expr::VaArg(ap_expr, type_spec, _) => self.lower_va_arg(ap_expr, type_spec),
-            Expr::ConvertVector(src_expr, type_spec, _) => self.lower_convertvector(src_expr, type_spec),
+            Expr::ConvertVector(src_expr, type_spec, _) => {
+                self.lower_convertvector(src_expr, type_spec)
+            }
             Expr::GenericSelection(controlling, associations, _) => {
                 self.lower_generic_selection(controlling, associations)
             }
             Expr::LabelAddr(label_name, _) => {
                 let scoped_label = self.get_or_create_user_label(label_name);
                 let dest = self.fresh_value();
-                self.emit(Instruction::LabelAddr { dest, label: scoped_label });
+                self.emit(Instruction::LabelAddr {
+                    dest,
+                    label: scoped_label,
+                });
                 Operand::Value(dest)
             }
             Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
@@ -316,7 +332,9 @@ impl Lowerer {
                 self.lower_expr_discarded(lhs);
                 self.lower_expr_discarded(rhs);
             }
-            _ => { self.lower_expr(expr); }
+            _ => {
+                self.lower_expr(expr);
+            }
         }
     }
 
@@ -348,7 +366,14 @@ impl Lowerer {
     pub(super) fn read_global_register(&mut self, reg_name: &str, ty: IrType) -> Operand {
         // Create a temporary alloca for the inline asm output
         let tmp_alloca = self.fresh_value();
-        self.emit(Instruction::Alloca { dest: tmp_alloca, ty, size: ty.size(), align: ty.align(), volatile: false, semantic_volatile: false });
+        self.emit(Instruction::Alloca {
+            dest: tmp_alloca,
+            ty,
+            size: ty.size(),
+            align: ty.align(),
+            volatile: false,
+            semantic_volatile: false,
+        });
         let output_constraint = format!("={{{}}}", reg_name);
         self.emit(Instruction::InlineAsm {
             template: String::new(),
@@ -362,13 +387,22 @@ impl Lowerer {
         });
         // Load the result from the alloca
         let result = self.fresh_value();
-        self.emit(Instruction::Load { volatile: false, dest: result, ptr: tmp_alloca, ty , seg_override: AddressSpace::Default });
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: result,
+            ptr: tmp_alloca,
+            ty,
+            seg_override: AddressSpace::Default,
+        });
         Operand::Value(result)
     }
 
     fn load_global_var(&mut self, global_name: String, ginfo: &GlobalInfo) -> Operand {
         let addr = self.fresh_value();
-        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name });
+        self.emit(Instruction::GlobalAddr {
+            dest: addr,
+            name: global_name,
+        });
         if ginfo.is_array || ginfo.is_struct {
             return Operand::Value(addr);
         }
@@ -385,13 +419,20 @@ impl Lowerer {
         let dest = self.fresh_value();
         let is_vol = ginfo.base_type_volatile
             && !matches!(ginfo.var.c_type.as_ref(), Some(CType::Pointer(..)));
-        self.emit(Instruction::Load { volatile: is_vol, dest, ptr: addr, ty: ginfo.ty, seg_override: ginfo.address_space });
+        self.emit(Instruction::Load {
+            volatile: is_vol,
+            dest,
+            ptr: addr,
+            ty: ginfo.ty,
+            seg_override: ginfo.address_space,
+        });
         Operand::Value(dest)
     }
 
     fn lower_identifier(&mut self, name: &str) -> Operand {
         if name == "__func__" || name == "__FUNCTION__" || name == "__PRETTY_FUNCTION__" {
-            let name = self.func().name.clone(); return self.lower_string_literal(&name, false);
+            let name = self.func().name.clone();
+            return self.lower_string_literal(&name, false);
         }
         if name == "NULL" {
             return Operand::Const(IrConst::I64(0));
@@ -432,12 +473,21 @@ impl Lowerer {
 
             if let Some(global_name) = static_global_name {
                 let addr = self.fresh_value();
-                self.emit(Instruction::GlobalAddr { dest: addr, name: global_name });
+                self.emit(Instruction::GlobalAddr {
+                    dest: addr,
+                    name: global_name,
+                });
                 if is_array || is_struct || is_vector {
                     return Operand::Value(addr);
                 }
                 let dest = self.fresh_value();
-                self.emit(Instruction::Load { volatile: is_vol, dest, ptr: addr, ty , seg_override: AddressSpace::Default });
+                self.emit(Instruction::Load {
+                    volatile: is_vol,
+                    dest,
+                    ptr: addr,
+                    ty,
+                    seg_override: AddressSpace::Default,
+                });
                 return Operand::Value(dest);
             }
             if is_array || is_struct {
@@ -447,7 +497,13 @@ impl Lowerer {
                 return Operand::Value(alloca);
             }
             let dest = self.fresh_value();
-            self.emit(Instruction::Load { volatile: is_vol, dest, ptr: alloca, ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Load {
+                volatile: is_vol,
+                dest,
+                ptr: alloca,
+                ty,
+                seg_override: AddressSpace::Default,
+            });
             return Operand::Value(dest);
         }
 
@@ -480,10 +536,12 @@ impl Lowerer {
         // Apply __asm__("label") linker symbol redirect if present.
         let resolved_name = self.resolve_ref_name(name);
         let dest = self.fresh_value();
-        self.emit(Instruction::GlobalAddr { dest, name: resolved_name });
+        self.emit(Instruction::GlobalAddr {
+            dest,
+            name: resolved_name,
+        });
         Operand::Value(dest)
     }
-
 
     // -----------------------------------------------------------------------
     // Utility helpers
@@ -513,10 +571,15 @@ impl Lowerer {
 
     /// Map a byte size to the smallest IR integer type that fits.
     pub(super) fn ir_type_for_size(size: usize) -> IrType {
-        if size <= 1 { IrType::I8 }
-        else if size <= 2 { IrType::I16 }
-        else if size <= 4 { IrType::I32 }
-        else { IrType::I64 }
+        if size <= 1 {
+            IrType::I8
+        } else if size <= 2 {
+            IrType::I16
+        } else if size <= 4 {
+            IrType::I32
+        } else {
+            IrType::I64
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -536,22 +599,38 @@ impl Lowerer {
         match expr {
             // Literals: use C semantic types (narrower than get_expr_type's I64)
             Expr::IntLiteral(val, _) => {
-                if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
+                if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
             }
             Expr::UIntLiteral(val, _) => {
-                if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
+                if *val <= u32::MAX as u64 {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
             }
             // On ILP32, long is 32-bit; values that overflow promote to long long (64-bit)
             Expr::LongLiteral(val, _) => {
                 if crate::common::types::target_is_32bit() {
-                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 { IrType::I32 } else { IrType::I64 }
+                    if *val >= i32::MIN as i64 && *val <= i32::MAX as i64 {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    }
                 } else {
                     IrType::I64
                 }
             }
             Expr::ULongLiteral(val, _) => {
                 if crate::common::types::target_is_32bit() {
-                    if *val <= u32::MAX as u64 { IrType::U32 } else { IrType::U64 }
+                    if *val <= u32::MAX as u64 {
+                        IrType::U32
+                    } else {
+                        IrType::U64
+                    }
                 } else {
                     IrType::U64
                 }
@@ -575,7 +654,13 @@ impl Lowerer {
                         match cur {
                             Expr::BinaryOp(op2, inner_lhs, inner_rhs, _)
                                 if !op2.is_comparison()
-                                    && !matches!(op2, BinOp::LogicalAnd | BinOp::LogicalOr | BinOp::Shl | BinOp::Shr) =>
+                                    && !matches!(
+                                        op2,
+                                        BinOp::LogicalAnd
+                                            | BinOp::LogicalOr
+                                            | BinOp::Shl
+                                            | BinOp::Shr
+                                    ) =>
                             {
                                 let r_ty = self.infer_expr_type(inner_rhs);
                                 result = Self::common_type(result, r_ty);
@@ -594,7 +679,11 @@ impl Lowerer {
             Expr::UnaryOp(UnaryOp::LogicalNot, _, _) => IrType::I32,
             Expr::UnaryOp(UnaryOp::Neg | UnaryOp::BitNot | UnaryOp::Plus, inner, _) => {
                 let inner_ty = self.infer_expr_type(inner);
-                if inner_ty.is_float() { inner_ty } else { Self::integer_promote(inner_ty) }
+                if inner_ty.is_float() {
+                    inner_ty
+                } else {
+                    Self::integer_promote(inner_ty)
+                }
             }
             // Recursive cases that must use infer_expr_type (not get_expr_type)
             // to propagate narrow literal types through the expression tree
@@ -603,9 +692,10 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.infer_expr_type(lhs)
             }
-            Expr::Conditional(_, then_expr, else_expr, _) => {
-                Self::common_type(self.infer_expr_type(then_expr), self.infer_expr_type(else_expr))
-            }
+            Expr::Conditional(_, then_expr, else_expr, _) => Self::common_type(
+                self.infer_expr_type(then_expr),
+                self.infer_expr_type(else_expr),
+            ),
             Expr::GnuConditional(cond, else_expr, _) => {
                 Self::common_type(self.infer_expr_type(cond), self.infer_expr_type(else_expr))
             }
@@ -620,24 +710,44 @@ impl Lowerer {
     pub(super) fn common_type(a: IrType, b: IrType) -> IrType {
         // Map Ptr to the target-appropriate signed integer type so that all
         // the size-based ranking below works correctly on both 32-bit and 64-bit.
-        let a = if a == IrType::Ptr { crate::common::types::target_int_ir_type() } else { a };
-        let b = if b == IrType::Ptr { crate::common::types::target_int_ir_type() } else { b };
+        let a = if a == IrType::Ptr {
+            crate::common::types::target_int_ir_type()
+        } else {
+            a
+        };
+        let b = if b == IrType::Ptr {
+            crate::common::types::target_int_ir_type()
+        } else {
+            b
+        };
 
         if a == IrType::I128 || a == IrType::U128 || b == IrType::I128 || b == IrType::U128 {
-            if a == IrType::U128 || b == IrType::U128 { return IrType::U128; }
+            if a == IrType::U128 || b == IrType::U128 {
+                return IrType::U128;
+            }
             return IrType::I128;
         }
-        if a == IrType::F128 || b == IrType::F128 { return IrType::F128; }
-        if a == IrType::F64 || b == IrType::F64 { return IrType::F64; }
-        if a == IrType::F32 || b == IrType::F32 { return IrType::F32; }
-        if a == IrType::I64 || a == IrType::U64
-            || b == IrType::I64 || b == IrType::U64
-        {
-            if a == IrType::U64 || b == IrType::U64 { return IrType::U64; }
+        if a == IrType::F128 || b == IrType::F128 {
+            return IrType::F128;
+        }
+        if a == IrType::F64 || b == IrType::F64 {
+            return IrType::F64;
+        }
+        if a == IrType::F32 || b == IrType::F32 {
+            return IrType::F32;
+        }
+        if a == IrType::I64 || a == IrType::U64 || b == IrType::I64 || b == IrType::U64 {
+            if a == IrType::U64 || b == IrType::U64 {
+                return IrType::U64;
+            }
             return IrType::I64;
         }
-        if a == IrType::U32 || b == IrType::U32 { return IrType::U32; }
-        if a == IrType::I32 || b == IrType::I32 { return IrType::I32; }
+        if a == IrType::U32 || b == IrType::U32 {
+            return IrType::U32;
+        }
+        if a == IrType::I32 || b == IrType::I32 {
+            return IrType::I32;
+        }
         IrType::I32
     }
 
@@ -649,14 +759,29 @@ impl Lowerer {
     }
 
     /// Insert an implicit type cast if src_ty differs from target_ty.
-    pub(super) fn emit_implicit_cast(&mut self, src: Operand, src_ty: IrType, target_ty: IrType) -> Operand {
-        if src_ty == target_ty { return src; }
-        if target_ty == IrType::Ptr || target_ty == IrType::Void { return src; }
-        if src_ty == IrType::Ptr && target_ty.is_integer() { return src; }
+    pub(super) fn emit_implicit_cast(
+        &mut self,
+        src: Operand,
+        src_ty: IrType,
+        target_ty: IrType,
+    ) -> Operand {
+        if src_ty == target_ty {
+            return src;
+        }
+        if target_ty == IrType::Ptr || target_ty == IrType::Void {
+            return src;
+        }
+        if src_ty == IrType::Ptr && target_ty.is_integer() {
+            return src;
+        }
         // Pointer <-> float conversions are invalid in C; skip the cast
         // (sema should have already emitted an error for this)
-        if src_ty == IrType::Ptr && target_ty.is_float() { return src; }
-        if src_ty.is_float() && target_ty == IrType::Ptr { return src; }
+        if src_ty == IrType::Ptr && target_ty.is_float() {
+            return src;
+        }
+        if src_ty.is_float() && target_ty == IrType::Ptr {
+            return src;
+        }
 
         let needs_cast = (target_ty.is_float() && !src_ty.is_float())
             || (!target_ty.is_float() && src_ty.is_float())
@@ -683,5 +808,4 @@ impl Lowerer {
         let dest = self.emit_cmp_val(IrCmpOp::Ne, val, zero, src_ty);
         Operand::Value(dest)
     }
-
 }

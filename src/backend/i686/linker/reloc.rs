@@ -44,21 +44,31 @@ pub(super) fn apply_relocations(
     let mut text_relocs: Vec<(u32, String)> = Vec::new();
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for sec in &obj.sections {
-            if sec.relocations.is_empty() { continue; }
+            if sec.relocations.is_empty() {
+                continue;
+            }
 
             let _out_name = match output_section_name(&sec.name, sec.flags, sec.sh_type) {
                 Some(n) => n,
                 None => continue,
             };
-            let (out_sec_idx, sec_base_offset) = match ctx.section_map.get(&(obj_idx, sec.input_index)) {
-                Some(&v) => v,
-                None => continue,
-            };
+            let (out_sec_idx, sec_base_offset) =
+                match ctx.section_map.get(&(obj_idx, sec.input_index)) {
+                    Some(&v) => v,
+                    None => continue,
+                };
 
             for &(rel_offset, rel_type, sym_idx, addend) in &sec.relocations {
                 let tr = apply_one_reloc(
-                    obj_idx, obj, sec, out_sec_idx, sec_base_offset,
-                    rel_offset, rel_type, sym_idx, addend,
+                    obj_idx,
+                    obj,
+                    sec,
+                    out_sec_idx,
+                    sec_base_offset,
+                    rel_offset,
+                    rel_type,
+                    sym_idx,
+                    addend,
                     ctx,
                 )?;
                 if let Some(t) = tr {
@@ -96,8 +106,12 @@ fn apply_one_reloc(
     let sym_addr = resolve_sym_addr(obj_idx, sym, ctx);
 
     // Check if this symbol goes through PLT
-    let is_dyn = !sym.name.is_empty() && ctx.global_symbols.get(sym.name.as_str())
-        .map(|gs| gs.is_dynamic && gs.needs_plt).unwrap_or(false);
+    let is_dyn = !sym.name.is_empty()
+        && ctx
+            .global_symbols
+            .get(sym.name.as_str())
+            .map(|gs| gs.is_dynamic && gs.needs_plt)
+            .unwrap_or(false);
 
     let mut relax_got32x = false;
     let mut text_reloc: Option<(u32, String)> = None;
@@ -124,18 +138,17 @@ fn apply_one_reloc(
         }
         R_386_PC32 | R_386_PLT32 => {
             let s = if is_dyn {
-                ctx.global_symbols.get(sym.name.as_str()).map(|gs| gs.address).unwrap_or(0)
+                ctx.global_symbols
+                    .get(sym.name.as_str())
+                    .map(|gs| gs.address)
+                    .unwrap_or(0)
             } else {
                 sym_addr
             };
             (s as i32 + addend - patch_addr as i32) as u32
         }
-        R_386_GOTPC => {
-            (ctx.got_base as i32 + addend - patch_addr as i32) as u32
-        }
-        R_386_GOTOFF => {
-            (sym_addr as i32 + addend - ctx.got_base as i32) as u32
-        }
+        R_386_GOTPC => (ctx.got_base as i32 + addend - patch_addr as i32) as u32,
+        R_386_GOTOFF => (sym_addr as i32 + addend - ctx.got_base as i32) as u32,
         R_386_GOT32 | R_386_GOT32X => {
             resolve_got_reloc(sym, sym_addr, addend, rel_type, ctx, &mut relax_got32x)
         }
@@ -150,12 +163,8 @@ fn apply_one_reloc(
             let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
             (tpoff + addend) as u32
         }
-        R_386_TLS_IE => {
-            resolve_tls_ie(sym, sym_addr, addend, ctx)
-        }
-        R_386_TLS_GOTIE => {
-            resolve_tls_gotie(sym, sym_addr, addend, ctx)
-        }
+        R_386_TLS_IE => resolve_tls_ie(sym, sym_addr, addend, ctx),
+        R_386_TLS_GOTIE => resolve_tls_gotie(sym, sym_addr, addend, ctx),
         R_386_TLS_GD => {
             if ctx.has_tls && sym.sym_type == STT_TLS {
                 let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
@@ -255,7 +264,8 @@ pub(super) fn resolve_got_reloc(
             };
             (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
         } else if gs.needs_got {
-            let got_entry_addr = ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
+            let got_entry_addr =
+                ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
             (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
         } else if rel_type == R_386_GOT32X {
             *relax_got32x = true;
@@ -272,10 +282,16 @@ pub(super) fn resolve_got_reloc(
 }
 
 /// Resolve R_386_TLS_IE relocation.
-pub(super) fn resolve_tls_ie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx: &RelocContext) -> u32 {
+pub(super) fn resolve_tls_ie(
+    sym: &InputSymbol,
+    sym_addr: u32,
+    addend: i32,
+    ctx: &RelocContext,
+) -> u32 {
     if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
         if gs.needs_got {
-            let got_entry_addr = ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
+            let got_entry_addr =
+                ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
             (got_entry_addr as i32 + addend) as u32
         } else {
             let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
@@ -287,10 +303,16 @@ pub(super) fn resolve_tls_ie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx:
 }
 
 /// Resolve R_386_TLS_GOTIE relocation.
-pub(super) fn resolve_tls_gotie(sym: &InputSymbol, sym_addr: u32, addend: i32, ctx: &RelocContext) -> u32 {
+pub(super) fn resolve_tls_gotie(
+    sym: &InputSymbol,
+    sym_addr: u32,
+    addend: i32,
+    ctx: &RelocContext,
+) -> u32 {
     if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
         if gs.needs_got {
-            let got_entry_addr = ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
+            let got_entry_addr =
+                ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
             (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
         } else {
             let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;

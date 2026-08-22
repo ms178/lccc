@@ -14,12 +14,17 @@ use crate::backend::linker_common;
 /// to original index in `hashed_names`, so the caller can reorder dynsym entries.
 pub(super) fn build_gnu_hash_32(hashed_names: &[String], symoffset: u32) -> (Vec<u8>, Vec<usize>) {
     let num_hashed = hashed_names.len();
-    let nbuckets = if num_hashed == 0 { 1 } else { num_hashed.next_power_of_two().max(1) } as u32;
+    let nbuckets = if num_hashed == 0 {
+        1
+    } else {
+        num_hashed.next_power_of_two().max(1)
+    } as u32;
     let bloom_size: u32 = 1;
     let bloom_shift: u32 = 5;
 
     // Compute hashes
-    let orig_hashes: Vec<u32> = hashed_names.iter()
+    let orig_hashes: Vec<u32> = hashed_names
+        .iter()
         .map(|name| linker_common::gnu_hash(name.as_bytes()))
         .collect();
 
@@ -48,7 +53,9 @@ pub(super) fn build_gnu_hash_32(hashed_names: &[String], symoffset: u32) -> (Vec
 
     // Mark the last symbol in each bucket chain with bit 0 set
     for bucket_idx in 0..nbuckets as usize {
-        if buckets[bucket_idx] == 0 { continue; }
+        if buckets[bucket_idx] == 0 {
+            continue;
+        }
         let mut last_in_bucket = 0;
         for (i, &h) in sym_hashes.iter().enumerate() {
             if (h % nbuckets) as usize == bucket_idx {

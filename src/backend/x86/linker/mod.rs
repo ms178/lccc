@@ -17,17 +17,17 @@
 
 #[allow(dead_code)]
 pub mod elf;
+mod emit_exec;
 pub mod emit_rel;
 pub mod emit_script;
-pub mod types;
-mod input;
-mod plt_got;
-mod link;
-mod emit_exec;
 mod emit_shared;
-mod layout_plan;
-mod parallel_reloc;
 pub mod icf;
+mod input;
+mod layout_plan;
+mod link;
+mod parallel_reloc;
+mod plt_got;
+pub mod types;
 pub use icf::parse_icf_mode;
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -59,17 +59,35 @@ pub fn load_inputs_for_ld(
             let is_selective_archive = !*wa
                 && (path.ends_with(".a") || {
                     // sniff: archives start with "!<arch>\n" or "!<thin>\n"
-                    std::fs::File::open(path).ok().and_then(|mut f| {
-                        use std::io::Read;
-                        let mut m = [0u8; 8];
-                        f.read_exact(&mut m).ok().map(|_| &m == b"!<arch>\n" || &m == b"!<thin>\n")
-                    }).unwrap_or(false)
+                    std::fs::File::open(path)
+                        .ok()
+                        .and_then(|mut f| {
+                            use std::io::Read;
+                            let mut m = [0u8; 8];
+                            f.read_exact(&mut m)
+                                .ok()
+                                .map(|_| &m == b"!<arch>\n" || &m == b"!<thin>\n")
+                        })
+                        .unwrap_or(false)
                 });
-            if !is_selective_archive && fully_loaded.contains(path) { continue; }
-            input::load_file(path, objects, &mut globals, &mut needed_sonames, &lib_paths, *wa)?;
-            if !is_selective_archive { fully_loaded.insert(path.clone()); }
+            if !is_selective_archive && fully_loaded.contains(path) {
+                continue;
+            }
+            input::load_file(
+                path,
+                objects,
+                &mut globals,
+                &mut needed_sonames,
+                &lib_paths,
+                *wa,
+            )?;
+            if !is_selective_archive {
+                fully_loaded.insert(path.clone());
+            }
         }
-        if objects.len() != before { changed = true; }
+        if objects.len() != before {
+            changed = true;
+        }
     }
     Ok(())
 }

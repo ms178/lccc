@@ -1,32 +1,29 @@
-use crate::delegate_to_impl;
-use crate::ir::reexports::{
-    AtomicOrdering,
-    AtomicRmwOp,
-    BlockId,
-    IntrinsicOp,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    Operand,
-    Value,
-};
-use crate::common::types::IrType;
-use crate::common::fx_hash::FxHashMap;
-use crate::backend::common::PtrDirective;
-use crate::backend::state::{CodegenState, StackSlot};
-use crate::backend::traits::ArchCodegen;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::cast::FloatOp;
+use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{CodegenState, StackSlot};
+use crate::backend::traits::ArchCodegen;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::types::IrType;
+use crate::delegate_to_impl;
+use crate::ir::reexports::{
+    AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
+    Operand, Value,
+};
 
 /// RISC-V callee-saved registers always available for register allocation.
 /// s0 is the frame pointer.
 /// These 6 registers are always safe to allocate: s1, s7-s11.
 /// PhysReg encoding: 1=s1, 7=s7, 8=s8, 9=s9, 10=s10, 11=s11.
 pub(super) const RISCV_CALLEE_SAVED: [PhysReg; 6] = [
-    PhysReg(1), PhysReg(7), PhysReg(8), PhysReg(9), PhysReg(10), PhysReg(11),
+    PhysReg(1),
+    PhysReg(7),
+    PhysReg(8),
+    PhysReg(9),
+    PhysReg(10),
+    PhysReg(11),
 ];
 
 /// Additional callee-saved registers available for allocation.
@@ -35,15 +32,23 @@ pub(super) const RISCV_CALLEE_SAVED: [PhysReg; 6] = [
 /// are now unconditionally available for the register allocator, giving up to
 /// 11 callee-saved registers total (vs. 6 without these).
 /// PhysReg(2)=s2, PhysReg(3)=s3, PhysReg(4)=s4, PhysReg(5)=s5, PhysReg(6)=s6.
-pub(super) const CALL_TEMP_CALLEE_SAVED: [PhysReg; 5] = [
-    PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5), PhysReg(6),
-];
+pub(super) const CALL_TEMP_CALLEE_SAVED: [PhysReg; 5] =
+    [PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5), PhysReg(6)];
 
 /// Map a PhysReg index to its RISC-V register name.
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
-        1 => "s1", 2 => "s2", 3 => "s3", 4 => "s4", 5 => "s5",
-        6 => "s6", 7 => "s7", 8 => "s8", 9 => "s9", 10 => "s10", 11 => "s11",
+        1 => "s1",
+        2 => "s2",
+        3 => "s3",
+        4 => "s4",
+        5 => "s5",
+        6 => "s6",
+        7 => "s7",
+        8 => "s8",
+        9 => "s9",
+        10 => "s10",
+        11 => "s11",
         _ => unreachable!("invalid RISC-V callee-saved register index"),
     }
 }
@@ -52,7 +57,10 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 /// registers that are used via specific constraints or listed in clobbers.
 pub(super) fn collect_inline_asm_callee_saved_riscv(func: &IrFunction, used: &mut Vec<PhysReg>) {
     crate::backend::generation::collect_inline_asm_callee_saved(
-        func, used, constraint_to_callee_saved_riscv, riscv_reg_to_callee_saved,
+        func,
+        used,
+        constraint_to_callee_saved_riscv,
+        riscv_reg_to_callee_saved,
     );
 }
 
@@ -77,7 +85,7 @@ fn riscv_reg_to_callee_saved(name: &str) -> Option<PhysReg> {
 /// Check if a constraint string refers to a specific RISC-V callee-saved register.
 fn constraint_to_callee_saved_riscv(constraint: &str) -> Option<PhysReg> {
     if constraint.starts_with('{') && constraint.ends_with('}') {
-        let reg = &constraint[1..constraint.len()-1];
+        let reg = &constraint[1..constraint.len() - 1];
         return riscv_reg_to_callee_saved(reg);
     }
     riscv_reg_to_callee_saved(constraint)
@@ -219,18 +227,29 @@ impl RiscvCodegen {
     /// Emit: store `reg` to `offset(s0)`, handling large offsets via t6.
     pub(super) fn emit_store_to_s0(&mut self, reg: &str, offset: i64, store_instr: &str) {
         if Self::fits_imm12(offset) {
-            self.state.emit_fmt(format_args!("    {} {}, {}(s0)", store_instr, reg, offset));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(s0)", store_instr, reg, offset));
         } else {
             self.state.emit_fmt(format_args!("    li t6, {}", offset));
             self.state.emit("    add t6, s0, t6");
-            self.state.emit_fmt(format_args!("    {} {}, 0(t6)", store_instr, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, 0(t6)", store_instr, reg));
         }
     }
 
     /// Emit: load from `offset(base)` into `dest`, handling large offsets via t6.
-    pub(super) fn emit_load_from_reg(state: &mut crate::backend::state::CodegenState, dest: &str, base: &str, offset: i64, load_instr: &str) {
+    pub(super) fn emit_load_from_reg(
+        state: &mut crate::backend::state::CodegenState,
+        dest: &str,
+        base: &str,
+        offset: i64,
+        load_instr: &str,
+    ) {
         if Self::fits_imm12(offset) {
-            state.emit_fmt(format_args!("    {} {}, {}({})", load_instr, dest, offset, base));
+            state.emit_fmt(format_args!(
+                "    {} {}, {}({})",
+                load_instr, dest, offset, base
+            ));
         } else {
             state.emit_fmt(format_args!("    li t6, {}", offset));
             state.emit_fmt(format_args!("    add t6, {}, t6", base));
@@ -241,21 +260,26 @@ impl RiscvCodegen {
     /// Emit: load from `offset(s0)` into `reg`, handling large offsets via t6.
     pub(super) fn emit_load_from_s0(&mut self, reg: &str, offset: i64, load_instr: &str) {
         if Self::fits_imm12(offset) {
-            self.state.emit_fmt(format_args!("    {} {}, {}(s0)", load_instr, reg, offset));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(s0)", load_instr, reg, offset));
         } else {
             self.state.emit_fmt(format_args!("    li t6, {}", offset));
             self.state.emit("    add t6, s0, t6");
-            self.state.emit_fmt(format_args!("    {} {}, 0(t6)", load_instr, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, 0(t6)", load_instr, reg));
         }
     }
 
     /// Emit: `dest_reg = s0 + offset`, handling large offsets.
     pub(super) fn emit_addi_s0(&mut self, dest_reg: &str, offset: i64) {
         if Self::fits_imm12(offset) {
-            self.state.emit_fmt(format_args!("    addi {}, s0, {}", dest_reg, offset));
+            self.state
+                .emit_fmt(format_args!("    addi {}, s0, {}", dest_reg, offset));
         } else {
-            self.state.emit_fmt(format_args!("    li {}, {}", dest_reg, offset));
-            self.state.emit_fmt(format_args!("    add {}, s0, {}", dest_reg, dest_reg));
+            self.state
+                .emit_fmt(format_args!("    li {}, {}", dest_reg, offset));
+            self.state
+                .emit_fmt(format_args!("    add {}, s0, {}", dest_reg, dest_reg));
         }
     }
 
@@ -265,10 +289,13 @@ impl RiscvCodegen {
     pub(super) fn emit_alloca_addr(&mut self, dest: &str, val_id: u32, offset: i64) {
         if let Some(align) = self.state.alloca_over_align(val_id) {
             self.emit_addi_s0(dest, offset);
-            self.state.emit_fmt(format_args!("    li t6, {}", align - 1));
-            self.state.emit_fmt(format_args!("    add {}, {}, t6", dest, dest));
+            self.state
+                .emit_fmt(format_args!("    li t6, {}", align - 1));
+            self.state
+                .emit_fmt(format_args!("    add {}, {}, t6", dest, dest));
             self.state.emit_fmt(format_args!("    li t6, -{}", align));
-            self.state.emit_fmt(format_args!("    and {}, {}, t6", dest, dest));
+            self.state
+                .emit_fmt(format_args!("    and {}, {}, t6", dest, dest));
         } else {
             self.emit_addi_s0(dest, offset);
         }
@@ -277,29 +304,34 @@ impl RiscvCodegen {
     /// Emit: store `reg` to `offset(sp)`, handling large offsets via t6.
     pub(super) fn emit_store_to_sp(&mut self, reg: &str, offset: i64, store_instr: &str) {
         if Self::fits_imm12(offset) {
-            self.state.emit_fmt(format_args!("    {} {}, {}(sp)", store_instr, reg, offset));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(sp)", store_instr, reg, offset));
         } else {
             self.state.emit_fmt(format_args!("    li t6, {}", offset));
             self.state.emit("    add t6, sp, t6");
-            self.state.emit_fmt(format_args!("    {} {}, 0(t6)", store_instr, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, 0(t6)", store_instr, reg));
         }
     }
 
     /// Emit: load from `offset(sp)` into `reg`, handling large offsets via t6.
     pub(super) fn emit_load_from_sp(&mut self, reg: &str, offset: i64, load_instr: &str) {
         if Self::fits_imm12(offset) {
-            self.state.emit_fmt(format_args!("    {} {}, {}(sp)", load_instr, reg, offset));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(sp)", load_instr, reg, offset));
         } else {
             self.state.emit_fmt(format_args!("    li t6, {}", offset));
             self.state.emit("    add t6, sp, t6");
-            self.state.emit_fmt(format_args!("    {} {}, 0(t6)", load_instr, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, 0(t6)", load_instr, reg));
         }
     }
 
     /// Emit: `sp = sp + imm`, handling large immediates via t6.
     pub(super) fn emit_addi_sp(&mut self, imm: i64) {
         if Self::fits_imm12(imm) {
-            self.state.emit_fmt(format_args!("    addi sp, sp, {}", imm));
+            self.state
+                .emit_fmt(format_args!("    addi sp, sp, {}", imm));
         } else if imm > 0 {
             self.state.emit_fmt(format_args!("    li t6, {}", imm));
             self.state.emit("    add sp, sp, t6");
@@ -321,17 +353,22 @@ impl RiscvCodegen {
                     IrConst::I64(v) => self.state.emit_fmt(format_args!("    li t0, {}", v)),
                     IrConst::F32(v) => {
                         let bits = v.to_bits() as u64;
-                        self.state.emit_fmt(format_args!("    li t0, {}", bits as i64));
+                        self.state
+                            .emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
                     IrConst::F64(v) => {
                         let bits = v.to_bits();
-                        self.state.emit_fmt(format_args!("    li t0, {}", bits as i64));
+                        self.state
+                            .emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
                     IrConst::LongDouble(v, _) => {
                         let bits = v.to_bits();
-                        self.state.emit_fmt(format_args!("    li t0, {}", bits as i64));
+                        self.state
+                            .emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
-                    IrConst::I128(v) => self.state.emit_fmt(format_args!("    li t0, {}", *v as i64)),
+                    IrConst::I128(v) => self
+                        .state
+                        .emit_fmt(format_args!("    li t0, {}", *v as i64)),
                     IrConst::Zero => self.state.emit("    li t0, 0"),
                 }
             }
@@ -351,7 +388,9 @@ impl RiscvCodegen {
                         self.emit_load_from_s0("t0", slot.0, "ld");
                     }
                     self.state.reg_cache.set_acc(v.0, is_alloca);
-                } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
+                } else if self.state.reg_cache.acc_has(v.0, false)
+                    || self.state.reg_cache.acc_has(v.0, true)
+                {
                 } else {
                     self.state.emit("    li t0, 0");
                     self.state.reg_cache.invalidate_acc();
@@ -376,24 +415,22 @@ impl RiscvCodegen {
     /// Load a 128-bit operand into t0 (low) : t1 (high).
     pub(super) fn operand_to_t0_t1(&mut self, op: &Operand) {
         match op {
-            Operand::Const(c) => {
-                match c {
-                    IrConst::I128(v) => {
-                        let low = *v as u64 as i64;
-                        let high = (*v >> 64) as u64 as i64;
-                        self.state.emit_fmt(format_args!("    li t0, {}", low));
-                        self.state.emit_fmt(format_args!("    li t1, {}", high));
-                    }
-                    IrConst::Zero => {
-                        self.state.emit("    li t0, 0");
-                        self.state.emit("    li t1, 0");
-                    }
-                    _ => {
-                        self.operand_to_t0(op);
-                        self.state.emit("    li t1, 0");
-                    }
+            Operand::Const(c) => match c {
+                IrConst::I128(v) => {
+                    let low = *v as u64 as i64;
+                    let high = (*v >> 64) as u64 as i64;
+                    self.state.emit_fmt(format_args!("    li t0, {}", low));
+                    self.state.emit_fmt(format_args!("    li t1, {}", high));
                 }
-            }
+                IrConst::Zero => {
+                    self.state.emit("    li t0, 0");
+                    self.state.emit("    li t1, 0");
+                }
+                _ => {
+                    self.operand_to_t0(op);
+                    self.state.emit("    li t1, 0");
+                }
+            },
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     if self.state.is_alloca(v.0) {
@@ -479,9 +516,15 @@ impl ArchCodegen for RiscvCodegen {
         self.reg_assignments.contains_key(&vid)
     }
 
-    fn state(&mut self) -> &mut CodegenState { &mut self.state }
-    fn state_ref(&self) -> &CodegenState { &self.state }
-    fn ptr_directive(&self) -> PtrDirective { PtrDirective::Dword }
+    fn state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
+    fn state_ref(&self) -> &CodegenState {
+        &self.state
+    }
+    fn ptr_directive(&self) -> PtrDirective {
+        PtrDirective::Dword
+    }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
@@ -490,7 +533,8 @@ impl ArchCodegen for RiscvCodegen {
     fn emit_reg_to_reg_move(&mut self, src: PhysReg, dest: PhysReg) {
         let s_name = callee_saved_name(src);
         let d_name = callee_saved_name(dest);
-        self.state.emit_fmt(format_args!("    mv {}, {}", d_name, s_name));
+        self.state
+            .emit_fmt(format_args!("    mv {}, {}", d_name, s_name));
     }
 
     fn emit_acc_to_phys_reg(&mut self, dest: PhysReg) {
@@ -498,8 +542,12 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit_fmt(format_args!("    mv {}, t0", d_name));
     }
 
-    fn jump_mnemonic(&self) -> &'static str { "j" }
-    fn trap_instruction(&self) -> &'static str { "ebreak" }
+    fn jump_mnemonic(&self) -> &'static str {
+        "j"
+    }
+    fn trap_instruction(&self) -> &'static str {
+        "ebreak"
+    }
 
     fn emit_branch(&mut self, label: &str) {
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
@@ -526,21 +574,33 @@ impl ArchCodegen for RiscvCodegen {
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {
         let skip = self.state.fresh_label("sw_skip");
-        let use_32bit = matches!(ty, IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8);
+        let use_32bit = matches!(
+            ty,
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8
+        );
         if use_32bit {
             // Sign-extend both values to match; li already sign-extends on RV64
-            self.state.emit_fmt(format_args!("    li t1, {}", case_val as i32 as i64));
+            self.state
+                .emit_fmt(format_args!("    li t1, {}", case_val as i32 as i64));
             self.state.emit("    sext.w t2, t0");
-            self.state.emit_fmt(format_args!("    bne t2, t1, {}", skip));
+            self.state
+                .emit_fmt(format_args!("    bne t2, t1, {}", skip));
         } else {
             self.state.emit_fmt(format_args!("    li t1, {}", case_val));
-            self.state.emit_fmt(format_args!("    bne t0, t1, {}", skip));
+            self.state
+                .emit_fmt(format_args!("    bne t0, t1, {}", skip));
         }
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
         self.state.emit_fmt(format_args!("{}:", skip));
     }
 
-    fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, _ty: IrType) {
+    fn emit_switch_jump_table(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        _ty: IrType,
+    ) {
         use crate::backend::traits::build_jump_table;
         let (table, min_val, range) = build_jump_table(cases, default);
         let table_label = self.state.fresh_label("jt");
@@ -551,7 +611,8 @@ impl ArchCodegen for RiscvCodegen {
         if min_val != 0 {
             let neg_min = -min_val;
             if (-2048..=2047).contains(&neg_min) {
-                self.state.emit_fmt(format_args!("    addi t0, t0, {}", neg_min));
+                self.state
+                    .emit_fmt(format_args!("    addi t0, t0, {}", neg_min));
             } else {
                 self.state.emit_fmt(format_args!("    li t1, {}", neg_min));
                 self.state.emit("    add t0, t0, t1");
@@ -559,15 +620,19 @@ impl ArchCodegen for RiscvCodegen {
         }
         let range_ok = self.state.fresh_label("range_ok");
         self.state.emit_fmt(format_args!("    li t1, {}", range));
-        self.state.emit_fmt(format_args!("    bltu t0, t1, {}", range_ok));
-        self.state.emit_fmt(format_args!("    jump {}, t6", default_label));
+        self.state
+            .emit_fmt(format_args!("    bltu t0, t1, {}", range_ok));
+        self.state
+            .emit_fmt(format_args!("    jump {}, t6", default_label));
         self.state.emit_fmt(format_args!("{}:", range_ok));
 
-        self.state.emit_fmt(format_args!("    lla t1, {}", table_label));
+        self.state
+            .emit_fmt(format_args!("    lla t1, {}", table_label));
         self.state.emit("    slli t0, t0, 2");
         self.state.emit("    add t1, t1, t0");
         self.state.emit("    lw t0, 0(t1)");
-        self.state.emit_fmt(format_args!("    lla t1, {}", table_label));
+        self.state
+            .emit_fmt(format_args!("    lla t1, {}", table_label));
         self.state.emit("    add t1, t1, t0");
         self.state.emit("    jr t1");
 
@@ -576,49 +641,123 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit_fmt(format_args!("{}:", table_label));
         for target in &table {
             let target_label = target.as_label();
-            self.state.emit_fmt(format_args!("    .word {} - {}", target_label, table_label));
+            self.state
+                .emit_fmt(format_args!("    .word {} - {}", target_label, table_label));
         }
         let sect = self.state.current_text_section.clone();
-        self.state.emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state
+            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
         self.state.reg_cache.invalidate_all();
     }
 
     // ---- Standard trait methods (kept inline - arch-specific) ----
-    fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_t0(op) }
-    fn emit_store_result(&mut self, dest: &Value) { self.store_t0_to(dest) }
-    fn emit_save_acc(&mut self) { self.state.emit("    mv t3, t0"); }
-    fn emit_typed_store_indirect(&mut self, instr: &'static str, _ty: IrType) { self.state.emit_fmt(format_args!("    {} t3, 0(t5)", instr)); }
-    fn emit_typed_load_indirect(&mut self, instr: &'static str) { self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr)); }
-    fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    add t0, t1, t0"); }
-    fn emit_gep_add_const_to_acc(&mut self, offset: i64) { if offset != 0 { self.emit_add_imm_to_acc_impl(offset); } }
-    fn emit_acc_to_secondary(&mut self) { self.state.emit("    mv t1, t0"); }
-    fn emit_reg_to_acc(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mv t0, {}", callee_saved_name(reg))); }
-    fn emit_reg_to_addr(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mv t5, {}", callee_saved_name(reg))); }
-    fn emit_memcpy_store_dest_from_acc(&mut self) { self.state.emit("    mv t1, t5"); }
-    fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    mv t2, t5"); }
-    fn emit_call_store_i128_result(&mut self, _dest: &Value) { unreachable!("RISC-V uses custom emit_call_store_result"); }
-    fn emit_call_store_f128_result(&mut self, _dest: &Value) { unreachable!("RISC-V uses custom emit_call_store_result"); }
-    fn emit_call_move_f32_to_acc(&mut self) { self.state.emit("    fmv.x.w t0, fa0"); }
-    fn emit_call_move_f64_to_acc(&mut self) { self.state.emit("    fmv.x.d t0, fa0"); }
-    fn current_return_type(&self) -> IrType { self.current_return_type }
+    fn emit_load_operand(&mut self, op: &Operand) {
+        self.operand_to_t0(op)
+    }
+    fn emit_store_result(&mut self, dest: &Value) {
+        self.store_t0_to(dest)
+    }
+    fn emit_save_acc(&mut self) {
+        self.state.emit("    mv t3, t0");
+    }
+    fn emit_typed_store_indirect(&mut self, instr: &'static str, _ty: IrType) {
+        self.state.emit_fmt(format_args!("    {} t3, 0(t5)", instr));
+    }
+    fn emit_typed_load_indirect(&mut self, instr: &'static str) {
+        self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr));
+    }
+    fn emit_add_secondary_to_acc(&mut self) {
+        self.state.emit("    add t0, t1, t0");
+    }
+    fn emit_gep_add_const_to_acc(&mut self, offset: i64) {
+        if offset != 0 {
+            self.emit_add_imm_to_acc_impl(offset);
+        }
+    }
+    fn emit_acc_to_secondary(&mut self) {
+        self.state.emit("    mv t1, t0");
+    }
+    fn emit_reg_to_acc(&mut self, reg: PhysReg) {
+        self.state
+            .emit_fmt(format_args!("    mv t0, {}", callee_saved_name(reg)));
+    }
+    fn emit_reg_to_addr(&mut self, reg: PhysReg) {
+        self.state
+            .emit_fmt(format_args!("    mv t5, {}", callee_saved_name(reg)));
+    }
+    fn emit_memcpy_store_dest_from_acc(&mut self) {
+        self.state.emit("    mv t1, t5");
+    }
+    fn emit_memcpy_store_src_from_acc(&mut self) {
+        self.state.emit("    mv t2, t5");
+    }
+    fn emit_call_store_i128_result(&mut self, _dest: &Value) {
+        unreachable!("RISC-V uses custom emit_call_store_result");
+    }
+    fn emit_call_store_f128_result(&mut self, _dest: &Value) {
+        unreachable!("RISC-V uses custom emit_call_store_result");
+    }
+    fn emit_call_move_f32_to_acc(&mut self) {
+        self.state.emit("    fmv.x.w t0, fa0");
+    }
+    fn emit_call_move_f64_to_acc(&mut self) {
+        self.state.emit("    fmv.x.d t0, fa0");
+    }
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
     fn emit_get_return_f128_second(&mut self, _dest: &Value) {}
     fn emit_set_return_f128_second(&mut self, _src: &Operand) {}
-    fn emit_va_arg_struct(&mut self, _dest_ptr: &Value, _va_list_ptr: &Value, _size: usize, _align: usize) {
+    fn emit_va_arg_struct(
+        &mut self,
+        _dest_ptr: &Value,
+        _va_list_ptr: &Value,
+        _size: usize,
+        _align: usize,
+    ) {
         panic!("VaArgStruct should not be emitted for RISC-V target");
     }
 
     // ---- ALU with different impl names ----
-    fn emit_int_clz(&mut self, ty: IrType) { self.emit_clz(ty) }
-    fn emit_int_ctz(&mut self, ty: IrType) { self.emit_ctz(ty) }
-    fn emit_int_bswap(&mut self, ty: IrType) { self.emit_bswap(ty) }
-    fn emit_int_popcount(&mut self, ty: IrType) { self.emit_popcount(ty) }
+    fn emit_int_clz(&mut self, ty: IrType) {
+        self.emit_clz(ty)
+    }
+    fn emit_int_ctz(&mut self, ty: IrType) {
+        self.emit_ctz(ty)
+    }
+    fn emit_int_bswap(&mut self, ty: IrType) {
+        self.emit_bswap(ty)
+    }
+    fn emit_int_popcount(&mut self, ty: IrType) {
+        self.emit_popcount(ty)
+    }
 
     // ---- Float binop body uses different name ----
-    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) { self.emit_float_binop_body(mnemonic, ty) }
+    fn emit_float_binop_impl(&mut self, mnemonic: &str, ty: IrType) {
+        self.emit_float_binop_body(mnemonic, ty)
+    }
 
     // ---- Inline asm / intrinsics ----
-    fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)], inputs: &[(String, Operand, Option<String>)], clobbers: &[String], operand_types: &[IrType], goto_labels: &[(String, BlockId)], input_symbols: &[Option<String>]) {
-        emit_inline_asm_common(self, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
+    fn emit_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+    ) {
+        emit_inline_asm_common(
+            self,
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+        );
         // Restore any callee-saved registers that were borrowed by the scratch
         // allocator. These were saved to the stack before input loading and need
         // to be restored now that all output stores are complete.
@@ -633,7 +772,13 @@ impl ArchCodegen for RiscvCodegen {
             }
         }
     }
-    fn emit_intrinsic(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+    fn emit_intrinsic(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
         self.emit_intrinsic_rv(dest, op, dest_ptr, args);
     }
 

@@ -270,12 +270,20 @@ impl X86Codegen {
                     }
                 } else {
                     self.operand_to_rax(base);
-                    if use_32bit { "%eax".to_string() } else { "%rax".to_string() }
+                    if use_32bit {
+                        "%eax".to_string()
+                    } else {
+                        "%rax".to_string()
+                    }
                 }
             }
             Operand::Const(_) => {
                 self.operand_to_rax(base);
-                if use_32bit { "%eax".to_string() } else { "%rax".to_string() }
+                if use_32bit {
+                    "%eax".to_string()
+                } else {
+                    "%rax".to_string()
+                }
             }
         };
         // BT with an immediate index; otherwise index in a register.
@@ -287,7 +295,8 @@ impl X86Codegen {
         if let Some(imm) = const_index {
             let width: u32 = if use_32bit { 32 } else { 64 };
             let bit = (imm as u32) % width;
-            self.state.emit_fmt(format_args!("    {bt} ${bit}, {base_reg}"));
+            self.state
+                .emit_fmt(format_args!("    {bt} ${bit}, {base_reg}"));
         } else {
             // The index register: prefer its home when it does not alias the
             // staged base; otherwise stage through %rcx.
@@ -310,15 +319,24 @@ impl X86Codegen {
                     }
                     None => {
                         self.operand_to_rcx(index);
-                        if use_32bit { "%ecx".to_string() } else { "%rcx".to_string() }
+                        if use_32bit {
+                            "%ecx".to_string()
+                        } else {
+                            "%rcx".to_string()
+                        }
                     }
                 },
                 _ => {
                     self.operand_to_rcx(index);
-                    if use_32bit { "%ecx".to_string() } else { "%rcx".to_string() }
+                    if use_32bit {
+                        "%ecx".to_string()
+                    } else {
+                        "%rcx".to_string()
+                    }
                 }
             };
-            self.state.emit_fmt(format_args!("    {bt} {idx_reg}, {base_reg}"));
+            self.state
+                .emit_fmt(format_args!("    {bt} {idx_reg}, {base_reg}"));
         }
         // CF = tested bit. jc = branch when set (BitTest result nonzero).
         if self.state.next_block_label == Some(true_block) {
@@ -442,7 +460,11 @@ impl X86Codegen {
         // skipping the testq of the materialized boolean.
         if let Some(op) = self.take_pending_cmp(cond) {
             let jcc = Self::cmp_jcc(op);
-            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
             if hot_next {
                 self.state
                     .out
@@ -464,7 +486,11 @@ impl X86Codegen {
             self.state.reg_cache.invalidate_acc();
             self.emit_int_cmp_replay_insn(&lhs, &rhs, ty);
             let jcc = Self::cmp_jcc(op);
-            let jcc_hot = if pref_true { jcc } else { Self::invert_jcc(jcc) };
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
             if hot_next {
                 self.state
                     .out
@@ -488,8 +514,9 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    testq %{}, %{}", name, name));
                     let jcc_hot = if pref_true { "jne" } else { "je" };
                     if hot_next {
-                        self.state.out.emit_jcc_block(
-                            Self::invert_jcc(jcc_hot), cold.0);
+                        self.state
+                            .out
+                            .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
                     } else {
                         self.state.out.emit_jcc_block(jcc_hot, hot.0);
                         if !cold_next {

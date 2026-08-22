@@ -33,32 +33,28 @@
 //! - `filter_available_regs`: callee-saved register filtering
 //! - `find_param_alloca`: parameter alloca lookup
 
-mod analysis;
 mod alloca_coalescing;
+mod analysis;
 pub(crate) mod copy_coalescing;
 mod graph_coloring;
-mod slot_assignment;
 mod inline_asm;
 mod regalloc_helpers;
+mod slot_assignment;
 
 // Re-export submodule public APIs at the stack_layout:: level
 pub use inline_asm::{
-    collect_inline_asm_callee_saved,
-    collect_inline_asm_callee_saved_with_overflow,
-    collect_inline_asm_callee_saved_with_generic,
-    collect_inline_asm_callee_saved_i686,
+    collect_inline_asm_callee_saved, collect_inline_asm_callee_saved_i686,
+    collect_inline_asm_callee_saved_with_generic, collect_inline_asm_callee_saved_with_overflow,
 };
 pub use regalloc_helpers::{
-    run_regalloc_and_merge_clobbers,
+    filter_available_regs, find_param_alloca, run_regalloc_and_merge_clobbers,
     run_regalloc_and_merge_clobbers_ex,
-    filter_available_regs,
-    find_param_alloca,
 };
 
-use crate::ir::reexports::{IrFunction, Instruction};
-use crate::common::types::IrType;
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use super::regalloc::PhysReg;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{Instruction, IrFunction};
 
 use alloca_coalescing::CoalescableAllocas;
 
@@ -187,7 +183,10 @@ pub fn calculate_stack_space_common(
     use crate::ir::intrinsics::IntrinsicOp;
     let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     if debug_protect {
-        eprintln!("[PROTECT] Scanning function {} for vector intrinsics", func.name);
+        eprintln!(
+            "[PROTECT] Scanning function {} for vector intrinsics",
+            func.name
+        );
     }
 
     // Pass 1: Mark all vector intrinsic destinations as vector values.
@@ -201,13 +200,19 @@ pub fn calculate_stack_space_common(
     // simd_avx2_256 regressions).
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let crate::ir::instruction::Instruction::Intrinsic { dest: Some(d), op, .. } = inst {
+            if let crate::ir::instruction::Instruction::Intrinsic {
+                dest: Some(d), op, ..
+            } = inst
+            {
                 match op.vector_result_width() {
                     Some(32) => {
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            eprintln!("[PROTECT] Marked SSA value {} as protected 256-bit ({:?})", d.0, op);
+                            eprintln!(
+                                "[PROTECT] Marked SSA value {} as protected 256-bit ({:?})",
+                                d.0, op
+                            );
                         }
                     }
                     Some(16) => {
@@ -215,7 +220,10 @@ pub fn calculate_stack_space_common(
                         state.vector_values.insert(d.0);
                         state.protected_slot_values.insert(d.0);
                         if debug_protect {
-                            eprintln!("[PROTECT] Marked SSA value {} as protected 128-bit ({:?})", d.0, op);
+                            eprintln!(
+                                "[PROTECT] Marked SSA value {} as protected 128-bit ({:?})",
+                                d.0, op
+                            );
                         }
                     }
                     _ => {}
@@ -234,7 +242,10 @@ pub fn calculate_stack_space_common(
         for inst in &block.instructions {
             if let crate::ir::instruction::Instruction::Phi { dest, incoming, .. } = inst {
                 if debug_protect {
-                    eprintln!("[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}", dest.0, incoming);
+                    eprintln!(
+                        "[PROTECT-PHI] Checking PHI SSA {}, incoming: {:?}",
+                        dest.0, incoming
+                    );
                 }
                 // If any incoming value is a vector, the PHI result is also a vector
                 let has_vector_incoming = incoming.iter().any(|(val, _)| {
@@ -265,7 +276,10 @@ pub fn calculate_stack_space_common(
                     }
                     state.protected_slot_values.insert(dest.0);
                     if debug_protect {
-                        eprintln!("[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)", dest.0);
+                        eprintln!(
+                            "[PROTECT] Marked PHI SSA value {} as protected (has vector incoming)",
+                            dest.0
+                        );
                     }
                 }
             }
@@ -306,21 +320,35 @@ pub fn calculate_stack_space_common(
     }
 
     if debug_protect {
-        eprintln!("[PROTECT] Total protected values: {}", state.protected_slot_values.len());
+        eprintln!(
+            "[PROTECT] Total protected values: {}",
+            state.protected_slot_values.len()
+        );
     }
 
     // Phase 1: Build analysis context (use-blocks, def-blocks, used values,
     //          dead param allocas, alloca coalescability, copy aliases).
-    let ctx = build_layout_context(func, coalesce, reg_assigned, callee_saved_regs, &state.ra_accumulator_values, &cached_liveness);
+    let ctx = build_layout_context(
+        func,
+        coalesce,
+        reg_assigned,
+        callee_saved_regs,
+        &state.ra_accumulator_values,
+        &cached_liveness,
+    );
 
     // Publish every explicit non-stack home through one location contract.
     state.explicit_locations.clear();
     for &id in &ctx.immediately_consumed {
-        state.explicit_locations.insert(id, crate::backend::state::ExplicitLocation::Accumulator);
+        state
+            .explicit_locations
+            .insert(id, crate::backend::state::ExplicitLocation::Accumulator);
     }
     for (&id, &reg) in reg_assigned {
         // A real allocated register wins over the accumulator hint.
-        state.explicit_locations.insert(id, crate::backend::state::ExplicitLocation::Reg(reg));
+        state
+            .explicit_locations
+            .insert(id, crate::backend::state::ExplicitLocation::Reg(reg));
     }
 
     // vector-intrinsic results that can skip their slot store (their only
@@ -336,16 +364,30 @@ pub fn calculate_stack_space_common(
     let mut max_block_local_space: i64 = 0;
 
     slot_assignment::classify_instructions(
-        state, func, &ctx, &assign_slot, reg_assigned,
-        &mut non_local_space, &mut deferred_slots, &mut multi_block_values,
-        &mut block_local_values, &mut block_space, &mut max_block_local_space,
+        state,
+        func,
+        &ctx,
+        &assign_slot,
+        reg_assigned,
+        &mut non_local_space,
+        &mut deferred_slots,
+        &mut multi_block_values,
+        &mut block_local_values,
+        &mut block_space,
+        &mut max_block_local_space,
     );
 
     // Phase 3: Tier 3 — block-local greedy slot reuse.
     slot_assignment::assign_tier3_block_local_slots(
-        state, func, &ctx, coalesce,
-        &block_local_values, &mut deferred_slots,
-        &mut block_space, &mut max_block_local_space, &assign_slot,
+        state,
+        func,
+        &ctx,
+        coalesce,
+        &block_local_values,
+        &mut deferred_slots,
+        &mut block_space,
+        &mut max_block_local_space,
+        &assign_slot,
     );
 
     // Raptor Lake Optimization: Protect cross-block vector slots
@@ -377,13 +419,22 @@ pub fn calculate_stack_space_common(
 
     // Phase 4: Tier 2 — liveness-based packing for multi-block values.
     slot_assignment::assign_tier2_liveness_packed_slots(
-        state, coalesce, cached_liveness, func,
-        &multi_block_values, &mut non_local_space, &assign_slot,
+        state,
+        coalesce,
+        cached_liveness,
+        func,
+        &multi_block_values,
+        &mut non_local_space,
+        &assign_slot,
     );
 
     // Phase 5: Finalize deferred block-local slots by adding the global base offset.
     let total_space = slot_assignment::finalize_deferred_slots(
-        state, &deferred_slots, non_local_space, max_block_local_space, &assign_slot,
+        state,
+        &deferred_slots,
+        non_local_space,
+        max_block_local_space,
+        &assign_slot,
     );
 
     // Phase 6: Resolve copy aliases (propagate slots from root to aliased values).
@@ -412,7 +463,11 @@ pub fn calculate_stack_space_common(
             let tags: Vec<&str> = {
                 let mut t = Vec::new();
                 if state.vector_values.contains(&id) {
-                    t.push(if state.vector128_values.contains(&id) { "v128" } else { "v256" });
+                    t.push(if state.vector128_values.contains(&id) {
+                        "v128"
+                    } else {
+                        "v256"
+                    });
                 }
                 if state.protected_slot_values.contains(&id) {
                     t.push("prot");
@@ -474,7 +529,8 @@ fn build_layout_context(
     let used_values = analysis::collect_used_values(func);
 
     // Detect dead parameter allocas.
-    let dead_param_allocas = analysis::find_dead_param_allocas(func, &used_values, reg_assigned, callee_saved_regs);
+    let dead_param_allocas =
+        analysis::find_dead_param_allocas(func, &used_values, reg_assigned, callee_saved_regs);
 
     // Authoritative ABI alignment of struct/union parameter allocas (the
     // Alloca.align may have been dropped by a pass; IrParam.struct_align is not).
@@ -489,14 +545,25 @@ fn build_layout_context(
 
     // Alloca coalescability analysis.
     let coalescable_allocas = if coalesce {
-        alloca_coalescing::compute_coalescable_allocas(func, &dead_param_allocas, &func.param_alloca_values)
+        alloca_coalescing::compute_coalescable_allocas(
+            func,
+            &dead_param_allocas,
+            &func.param_alloca_values,
+        )
     } else {
-        CoalescableAllocas { single_block: FxHashMap::default(), dead: FxHashSet::default() }
+        CoalescableAllocas {
+            single_block: FxHashMap::default(),
+            dead: FxHashSet::default(),
+        }
     };
 
     // Copy coalescing analysis.
     let (copy_alias, phi_web_aliases, loop_phi_aliases) = copy_coalescing::build_copy_alias_map(
-        func, &def_block, &multi_def_values, reg_assigned, &use_blocks_map,
+        func,
+        &def_block,
+        &multi_def_values,
+        reg_assigned,
+        &use_blocks_map,
         cached_liveness,
     );
 
@@ -509,22 +576,44 @@ fn build_layout_context(
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, inst) in block.instructions.iter().enumerate() {
                 match inst {
-                    crate::ir::instruction::Instruction::Intrinsic { op, dest_ptr, args, .. } => {
-                        let argids: Vec<String> = args.iter().map(|a| match a {
-                            crate::ir::instruction::Operand::Value(v) => v.0.to_string(),
-                            _ => "_".to_string(),
-                        }).collect();
-                        eprintln!("[VDEFER-IR] b{} i{} Intrinsic {:?} dp={:?} args=[{}]",
-                            bi, ii, op, dest_ptr.map(|v| v.0), argids.join(","));
+                    crate::ir::instruction::Instruction::Intrinsic {
+                        op, dest_ptr, args, ..
+                    } => {
+                        let argids: Vec<String> = args
+                            .iter()
+                            .map(|a| match a {
+                                crate::ir::instruction::Operand::Value(v) => v.0.to_string(),
+                                _ => "_".to_string(),
+                            })
+                            .collect();
+                        eprintln!(
+                            "[VDEFER-IR] b{} i{} Intrinsic {:?} dp={:?} args=[{}]",
+                            bi,
+                            ii,
+                            op,
+                            dest_ptr.map(|v| v.0),
+                            argids.join(",")
+                        );
                     }
                     crate::ir::instruction::Instruction::Memcpy { dest, src, size } => {
-                        eprintln!("[VDEFER-IR] b{} i{} Memcpy dest={} src={} size={}", bi, ii, dest.0, src.0, size);
+                        eprintln!(
+                            "[VDEFER-IR] b{} i{} Memcpy dest={} src={} size={}",
+                            bi, ii, dest.0, src.0, size
+                        );
                     }
                     crate::ir::instruction::Instruction::Copy { src, dest, .. } => {
-                        eprintln!("[VDEFER-IR] b{} i{} Copy dest={} src={:?}", bi, ii, dest.0, src);
+                        eprintln!(
+                            "[VDEFER-IR] b{} i{} Copy dest={} src={:?}",
+                            bi, ii, dest.0, src
+                        );
                     }
                     other => {
-                        eprintln!("[VDEFER-IR] b{} i{} {:?}", bi, ii, std::mem::discriminant(other));
+                        eprintln!(
+                            "[VDEFER-IR] b{} i{} {:?}",
+                            bi,
+                            ii,
+                            std::mem::discriminant(other)
+                        );
                     }
                 }
             }
@@ -558,15 +647,23 @@ fn build_layout_context(
     // forcing the pointer to Tier 2 (multi-block) when the dest crosses blocks.
     if coalesce {
         // Collect alloca value IDs to distinguish direct vs. indirect sources.
-        let alloca_set: FxHashSet<u32> = func.blocks.iter()
+        let alloca_set: FxHashSet<u32> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|inst| {
-                if let Instruction::Alloca { dest, .. } = inst { Some(dest.0) } else { None }
+                if let Instruction::Alloca { dest, .. } = inst {
+                    Some(dest.0)
+                } else {
+                    None
+                }
             })
             .collect();
 
         // Collect (ptr_id, dest_id) pairs for F128 loads from non-alloca pointers.
-        let f128_loads: Vec<(u32, u32)> = func.blocks.iter()
+        let f128_loads: Vec<(u32, u32)> = func
+            .blocks
+            .iter()
             .flat_map(|b| b.instructions.iter())
             .filter_map(|inst| {
                 if let Instruction::Load { dest, ptr, ty, .. } = inst {
@@ -638,7 +735,10 @@ fn build_layout_context(
     // large blocks (register cache effects, multi-operand instructions,
     // fused operations). Tier 2 liveness-packed allocation uses proper live
     // interval computation that handles these cases correctly.
-    let large_blocks: FxHashSet<usize> = func.blocks.iter().enumerate()
+    let large_blocks: FxHashSet<usize> = func
+        .blocks
+        .iter()
+        .enumerate()
         .filter(|(_, b)| b.instructions.len() > slot_assignment::MAX_TIER3_BLOCK_INSTRUCTIONS)
         .map(|(i, _)| i)
         .collect();

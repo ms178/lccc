@@ -90,7 +90,9 @@ fn collect_scalar_values(func: &IrFunction) -> FxHashMap<u32, CoalesceClass> {
             match inst {
                 Instruction::BinOp { dest, ty, .. }
                 | Instruction::UnaryOp { dest, ty, .. }
-                | Instruction::Cast { dest, to_ty: ty, .. }
+                | Instruction::Cast {
+                    dest, to_ty: ty, ..
+                }
                 | Instruction::Load { dest, ty, .. }
                 | Instruction::Select { dest, ty, .. }
                 | Instruction::AtomicLoad { dest, ty, .. }
@@ -509,10 +511,7 @@ fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
 
 /// Worklist liveness seeded in reverse postorder (exits first), then
 /// copy-aware interference. Lattice-height cap is an impl-bug guard only.
-fn cfg_copy_interference(
-    func: &IrFunction,
-    dense: &FxHashMap<u32, usize>,
-) -> Option<Vec<BitSet>> {
+fn cfg_copy_interference(func: &IrFunction, dense: &FxHashMap<u32, usize>) -> Option<Vec<BitSet>> {
     let n = dense.len();
     if n == 0 {
         return Some(Vec::new());
@@ -737,8 +736,8 @@ fn build_cfg_copy_alias_map(
                     dest,
                     src: Operand::Value(source),
                 } => {
-                    let multi = multi_def_values.contains(&dest.0)
-                        || multi_def_values.contains(&source.0);
+                    let multi =
+                        multi_def_values.contains(&dest.0) || multi_def_values.contains(&source.0);
                     try_push_affinity(
                         &mut affinities,
                         dest.0,
@@ -807,10 +806,7 @@ fn build_cfg_copy_alias_map(
         return (FxHashMap::default(), FxHashSet::default());
     }
 
-    let mut tracked: Vec<u32> = affinities
-        .iter()
-        .flat_map(|a| [a.dest, a.src])
-        .collect();
+    let mut tracked: Vec<u32> = affinities.iter().flat_map(|a| [a.dest, a.src]).collect();
     tracked.sort_unstable();
     tracked.dedup();
 
@@ -1097,9 +1093,7 @@ pub(super) fn build_copy_alias_map(
                     .collect();
 
                 let interferes = if let Some(&(start, end)) = interval_map.get(&src_id) {
-                    other_copy_points
-                        .iter()
-                        .any(|&pp| start <= pp && pp <= end)
+                    other_copy_points.iter().any(|&pp| start <= pp && pp <= end)
                 } else {
                     let other_def_blks: FxHashSet<usize> = sources
                         .iter()
@@ -1168,7 +1162,10 @@ pub(super) fn build_copy_alias_map(
                         | Instruction::GlobalAddr { dest, .. }
                         | Instruction::LabelAddr { dest, .. } => (dest.0, true),
                         Instruction::Cast {
-                            dest, to_ty, from_ty, ..
+                            dest,
+                            to_ty,
+                            from_ty,
+                            ..
                         } => (dest.0, scalar_type(*to_ty) && scalar_type(*from_ty)),
                         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                             match info.dest {
@@ -1291,9 +1288,8 @@ pub(super) fn build_copy_alias_map(
         });
     }
     if !unsound.is_empty() {
-        copy_alias.retain(|dest_id, root_id| {
-            !unsound.contains(dest_id) && !unsound.contains(root_id)
-        });
+        copy_alias
+            .retain(|dest_id, root_id| !unsound.contains(dest_id) && !unsound.contains(root_id));
     }
 
     loop_phi_aliases.retain(|v| copy_alias.contains_key(v));
@@ -1353,10 +1349,14 @@ pub(crate) fn compute_immediately_consumed(
                 {
                     non_gpr.insert(dest.0);
                 }
-                Instruction::Cast { dest, to_ty, from_ty, .. }
-                    if !ty_lives_in_gpr_cache(*to_ty)
-                        || from_ty.is_128bit()
-                        || from_ty.is_long_double() =>
+                Instruction::Cast {
+                    dest,
+                    to_ty,
+                    from_ty,
+                    ..
+                } if !ty_lives_in_gpr_cache(*to_ty)
+                    || from_ty.is_128bit()
+                    || from_ty.is_long_double() =>
                 {
                     non_gpr.insert(dest.0);
                 }
@@ -1495,15 +1495,13 @@ fn is_safe_sole_consumer(inst: &Instruction, value_id: u32, lhs_first_binop: boo
             // into %rcx or a memory operand from its HOME. Skipping that home
             // made the load read zero (alu_peepholes sdivm3: `0 - (v/3)`
             // returned 0 instead of the negated quotient).
-            operand_is_value(lhs, value_id)
-                && (operand_is_const(rhs) || lhs_first_binop)
+            operand_is_value(lhs, value_id) && (operand_is_const(rhs) || lhs_first_binop)
         }
         Instruction::Cmp { lhs, rhs, ty, .. } => {
             if ty.is_float() || ty.is_long_double() {
                 return false;
             }
-            operand_is_value(lhs, value_id)
-                && (operand_is_const(rhs) || lhs_first_binop)
+            operand_is_value(lhs, value_id) && (operand_is_const(rhs) || lhs_first_binop)
         }
         _ => false,
     }
@@ -1574,12 +1572,8 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         ));
-        let (aliases, force) = build_cfg_copy_alias_map(
-            &func,
-            &FxHashSet::default(),
-            &FxHashMap::default(),
-            None,
-        );
+        let (aliases, force) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
         assert_eq!(aliases.get(&1), Some(&0));
         assert!(force.contains(&1));
     }
@@ -1630,8 +1624,7 @@ mod cfg_copy_coalesce_tests {
         ];
         let mut multi_def = FxHashSet::default();
         multi_def.insert(2);
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
         assert_ne!(aliases.get(&0), Some(&2));
         assert_ne!(aliases.get(&2), Some(&0));
         assert_eq!(aliases.get(&1), Some(&2));
@@ -1675,12 +1668,15 @@ mod cfg_copy_coalesce_tests {
                 }],
                 Terminator::Branch(BlockId(1)),
             ),
-            block(3, vec![], Terminator::Return(Some(Operand::Value(Value(2))))),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
         ];
         let mut multi_def = FxHashSet::default();
         multi_def.insert(2);
-        let (aliases, _) =
-            build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
+        let (aliases, _) = build_cfg_copy_alias_map(&func, &multi_def, &FxHashMap::default(), None);
         assert_eq!(aliases.get(&0), Some(&2));
         assert_ne!(aliases.get(&1), Some(&2));
     }
@@ -1705,12 +1701,8 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
         ));
-        let (aliases, _) = build_cfg_copy_alias_map(
-            &func,
-            &FxHashSet::default(),
-            &FxHashMap::default(),
-            None,
-        );
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
         assert!(aliases.is_empty());
     }
 
@@ -1728,12 +1720,8 @@ mod cfg_copy_coalesce_tests {
             ],
             Terminator::Return(Some(Operand::Value(Value(0)))),
         ));
-        let (aliases, _) = build_cfg_copy_alias_map(
-            &func,
-            &FxHashSet::default(),
-            &FxHashMap::default(),
-            None,
-        );
+        let (aliases, _) =
+            build_cfg_copy_alias_map(&func, &FxHashSet::default(), &FxHashMap::default(), None);
         assert!(aliases.is_empty());
     }
 
@@ -2108,8 +2096,7 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
     // FP/vector loads are not: their generic lowering can use the same scratch
     // registers. Candidates are non-escaping allocas, so the alias checks
     // below independently reject derivations or non-intrinsic slot uses.
-    let is_vec_invalidator =
-        crate::backend::generation::instruction_may_clobber_vector_scratch;
+    let is_vec_invalidator = crate::backend::generation::instruction_may_clobber_vector_scratch;
 
     let mut defs: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
     let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
@@ -2212,7 +2199,9 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
             }
 
             let Some(Instruction::Intrinsic {
-                op: cop, args: cargs, ..
+                op: cop,
+                args: cargs,
+                ..
             }) = insts.get(u)
             else {
                 all_sites_ok = false;

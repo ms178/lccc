@@ -21,8 +21,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp, Operand,
-    Value,
+    ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp, Operand, Value,
 };
 
 /// A value number expression key. Two instructions with the same ExprKey
@@ -60,7 +59,11 @@ enum ExprKey {
     /// foldable (Load/Store ptr / absorbed GEP) vs must-materialize (call
     /// arg, asm, …). Mixing them pins a RIP-foldable `window(%rip)` into a
     /// GPR. Alias tracking still keys on `name` alone.
-    GlobalAddr { name: String, must_mat: bool, site_local: Option<u32> },
+    GlobalAddr {
+        name: String,
+        must_mat: bool,
+        site_local: Option<u32>,
+    },
     /// Load CSE key: two loads from the same pointer with the same type
     /// produce the same value if no intervening memory modification occurs.
     Load { ptr: VNOperand, ty: IrType },
@@ -318,11 +321,10 @@ impl GvnState {
             Instruction::GlobalAddr { dest, name } => {
                 let idx = dest.0 as usize;
                 if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
-                    self.ptr_global_base
-                        .insert(
-                            self.value_numbers[idx],
-                            self.context.canonical(name).to_string(),
-                        );
+                    self.ptr_global_base.insert(
+                        self.value_numbers[idx],
+                        self.context.canonical(name).to_string(),
+                    );
                 }
             }
             Instruction::GetElementPtr { dest, base, .. } => {
@@ -338,8 +340,7 @@ impl GvnState {
                         .get(&self.value_numbers[b_idx])
                         .cloned()
                     {
-                        self.ptr_global_base
-                            .insert(self.value_numbers[d_idx], sym);
+                        self.ptr_global_base.insert(self.value_numbers[d_idx], sym);
                     }
                 }
             }
@@ -744,10 +745,7 @@ pub(crate) fn run_gvn_function(func: &mut IrFunction) -> usize {
     run_gvn_function_with_context(func, &GvnContext::default())
 }
 
-pub(crate) fn run_gvn_function_with_context(
-    func: &mut IrFunction,
-    context: &GvnContext,
-) -> usize {
+pub(crate) fn run_gvn_function_with_context(func: &mut IrFunction, context: &GvnContext) -> usize {
     let num_blocks = func.blocks.len();
     if num_blocks == 0 || function_uses_128(func) {
         return 0;
@@ -926,9 +924,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
         // cached — this keeps gzip's copy_block `outcnt` in a register across
         // `outbuf` stores.
         if let Instruction::Store {
-            ptr,
-            seg_override,
-            ..
+            ptr, seg_override, ..
         } = &inst
         {
             if *seg_override != AddressSpace::Default {
@@ -985,9 +981,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                     let version = state.memory_version(&ptr_vn);
                     let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
-                    let old_val = state
-                        .store_fwd_map
-                        .insert(fwd_key, (*val, version));
+                    let old_val = state.store_fwd_map.insert(fwd_key, (*val, version));
                     state
                         .store_fwd_rollback_log
                         .push((fwd_key_for_log, old_val));
@@ -1016,12 +1010,19 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         };
                         if let Some((stored_op, version)) = state.store_fwd_map.get(&fwd_key) {
                             if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                eprintln!("[GVNDBG] fwd cand ptr_vn={:?} valid={}", ptr_vn, state.entry_valid_for(ptr_vn, *version));
+                                eprintln!(
+                                    "[GVNDBG] fwd cand ptr_vn={:?} valid={}",
+                                    ptr_vn,
+                                    state.entry_valid_for(ptr_vn, *version)
+                                );
                             }
                             if state.entry_valid_for(ptr_vn, *version) {
                                 let stored_op = *stored_op;
                                 if std::env::var_os("CCC_DEBUG_GVN").is_some() {
-                                    eprintln!("[GVNDBG] FORWARD store->load dest={} stored={:?}", dest.0, stored_op);
+                                    eprintln!(
+                                        "[GVNDBG] FORWARD store->load dest={} stored={:?}",
+                                        dest.0, stored_op
+                                    );
                                 }
                                 // Forward the stored value to the load destination.
                                 // Assign the dest a VN matching the stored value.
@@ -1048,9 +1049,8 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                                 // same pointer can CSE with this load's dest.
                                 let version = state.memory_version(ptr_vn);
                                 let load_key_for_log = expr_key.clone();
-                                let old_load = state
-                                    .load_expr_to_value
-                                    .insert(expr_key, (dest, version));
+                                let old_load =
+                                    state.load_expr_to_value.insert(expr_key, (dest, version));
                                 state.load_rollback_log.push((load_key_for_log, old_load));
                                 new_instructions.push(Instruction::Copy {
                                     dest,
@@ -1129,9 +1129,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         };
                         let version = state.memory_version(&ptr_vn);
                         let key_for_log = expr_key.clone();
-                        let old_val = state
-                            .load_expr_to_value
-                            .insert(expr_key, (dest, version));
+                        let old_val = state.load_expr_to_value.insert(expr_key, (dest, version));
                         state.load_rollback_log.push((key_for_log, old_val));
                     } else {
                         let key_for_log = expr_key.clone();
@@ -1145,7 +1143,10 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
             }
             None => {
                 // Not a numberable expression (store, call, alloca, etc.)
-                if let Instruction::GetElementPtr { dest, base, offset, .. } = &inst {
+                if let Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } = &inst
+                {
                     // GEP offsets are already byte offsets, so pointee metadata
                     // does not affect the resulting address. Canonicalize only
                     // base+offset for memory aliasing; retain the actual GEP.
@@ -1277,7 +1278,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1343,7 +1345,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1360,7 +1362,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0);
@@ -1414,7 +1417,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1431,7 +1434,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1491,7 +1495,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1508,7 +1512,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1);
@@ -1572,7 +1577,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1589,7 +1594,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 1); // two identical GEPs CSE'd into one + Copy
@@ -1653,7 +1659,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1670,7 +1676,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         assert_eq!(eliminated, 0); // Cross-block CSE disabled (same-block only)
@@ -1759,7 +1766,7 @@ mod tests {
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             is_gnu_inline_def: false,
-        ret_is_f128_sse: false,
+            ret_is_f128_sse: false,
             loop_promoted_f64_values: Vec::new(),
         };
 
@@ -1776,7 +1783,8 @@ mod tests {
             symbol_attrs: vec![],
             char16_string_literals: vec![],
             symver_directives: vec![],
-        asm_labels: crate::common::fx_hash::FxHashMap::default(),};
+            asm_labels: crate::common::fx_hash::FxHashMap::default(),
+        };
 
         let eliminated = module.for_each_function(run_gvn_function);
         // Neither branch dominates the other, so NO CSE should happen
@@ -1856,13 +1864,15 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1899,19 +1909,22 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1938,7 +1951,8 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1961,9 +1975,11 @@ mod tests {
                             is_sret: false,
                             is_fastcall: false,
                             ret_eightbyte_classes: Vec::new(),
-                        ret_is_f128_sse: false,},
+                            ret_is_f128_sse: false,
+                        },
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(3),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -1989,7 +2005,8 @@ mod tests {
             vec![
                 BasicBlock {
                     label: BlockId(0),
-                    instructions: vec![Instruction::Load { volatile: false,
+                    instructions: vec![Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2000,7 +2017,8 @@ mod tests {
                 },
                 BasicBlock {
                     label: BlockId(1),
-                    instructions: vec![Instruction::Load { volatile: false,
+                    instructions: vec![Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2035,7 +2053,8 @@ mod tests {
                 // block0: entry, load and branch
                 BasicBlock {
                     label: BlockId(0),
-                    instructions: vec![Instruction::Load { volatile: false,
+                    instructions: vec![Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2051,7 +2070,8 @@ mod tests {
                 // block1: stores to memory
                 BasicBlock {
                     label: BlockId(1),
-                    instructions: vec![Instruction::Store { volatile: false,
+                    instructions: vec![Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2070,7 +2090,8 @@ mod tests {
                 // block3: merge point - loads from same pointer
                 BasicBlock {
                     label: BlockId(3),
-                    instructions: vec![Instruction::Load { volatile: false,
+                    instructions: vec![Instruction::Load {
+                        volatile: false,
                         dest: Value(3),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2103,13 +2124,15 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2145,13 +2168,15 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Value(Value(1)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2187,7 +2212,8 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2210,9 +2236,11 @@ mod tests {
                             is_sret: false,
                             is_fastcall: false,
                             ret_eightbyte_classes: Vec::new(),
-                        ret_is_f128_sse: false,},
+                            ret_is_f128_sse: false,
+                        },
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2238,19 +2266,22 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(99)),
                         ptr: Value(1),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(2),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2278,19 +2309,22 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(42)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Store { volatile: false,
+                    Instruction::Store {
+                        volatile: false,
                         val: Operand::Const(IrConst::I32(99)),
                         ptr: Value(0),
                         ty: IrType::I32,
                         seg_override: AddressSpace::Default,
                     },
-                    Instruction::Load { volatile: false,
+                    Instruction::Load {
+                        volatile: false,
                         dest: Value(1),
                         ptr: Value(0),
                         ty: IrType::I32,
@@ -2422,13 +2456,25 @@ mod tests {
             vec![BasicBlock {
                 label: BlockId(0),
                 instructions: vec![
-                    Instruction::GlobalAddr { dest: Value(1), name: "table".to_string() },
-                    Instruction::GetElementPtr {
-                        dest: Value(2), base: Value(1), offset: Operand::Value(Value(9)), ty: IrType::Ptr,
+                    Instruction::GlobalAddr {
+                        dest: Value(1),
+                        name: "table".to_string(),
                     },
-                    Instruction::GlobalAddr { dest: Value(3), name: "table".to_string() },
                     Instruction::GetElementPtr {
-                        dest: Value(4), base: Value(3), offset: Operand::Value(Value(8)), ty: IrType::Ptr,
+                        dest: Value(2),
+                        base: Value(1),
+                        offset: Operand::Value(Value(9)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(3),
+                        name: "table".to_string(),
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(4),
+                        base: Value(3),
+                        offset: Operand::Value(Value(8)),
+                        ty: IrType::Ptr,
                     },
                 ],
                 terminator: Terminator::Return(None),
@@ -2438,7 +2484,13 @@ mod tests {
         );
         let mut module = make_module(func);
         let _ = module.for_each_function(run_gvn_function);
-        assert_eq!(module.functions[0].blocks[0].instructions.iter()
-            .filter(|i| matches!(i, Instruction::GlobalAddr { .. })).count(), 2);
+        assert_eq!(
+            module.functions[0].blocks[0]
+                .instructions
+                .iter()
+                .filter(|i| matches!(i, Instruction::GlobalAddr { .. }))
+                .count(),
+            2
+        );
     }
 }

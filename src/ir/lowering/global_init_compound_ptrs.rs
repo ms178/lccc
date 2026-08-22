@@ -10,16 +10,11 @@
 //! - `lower_struct_array_with_ptrs` — single-dimension struct arrays
 //! - `fill_composite_or_array_with_ptrs` — nested composite/array dispatch
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::ir::reexports::{GlobalInit};
-use crate::common::types::{AddressSpace, IrType, CType, InitFieldResolution};
-use super::lower::Lowerer;
 use super::global_init_helpers as h;
+use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, InitFieldResolution, IrType};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
+use crate::ir::reexports::GlobalInit;
 
 impl Lowerer {
     /// Lower a (possibly multi-dimensional) array of structs where some fields are pointers.
@@ -36,8 +31,14 @@ impl Lowerer {
         let mut ptr_ranges: Vec<(usize, GlobalInit)> = Vec::new();
 
         self.fill_multidim_struct_array_with_ptrs(
-            items, layout, struct_size, array_dim_strides,
-            &mut bytes, &mut ptr_ranges, 0, total_size,
+            items,
+            layout,
+            struct_size,
+            array_dim_strides,
+            &mut bytes,
+            &mut ptr_ranges,
+            0,
+            total_size,
         );
 
         Self::build_compound_from_bytes_and_ptrs(bytes, ptr_ranges, total_size)
@@ -56,7 +57,9 @@ impl Lowerer {
         base_offset: usize,
         region_size: usize,
     ) {
-        if struct_size == 0 { return; }
+        if struct_size == 0 {
+            return;
+        }
 
         let (this_stride, remaining_strides) = if array_dim_strides.len() > 1 {
             (array_dim_strides[0], &array_dim_strides[1..])
@@ -66,11 +69,21 @@ impl Lowerer {
             (struct_size, &array_dim_strides[0..0])
         };
 
-        let num_elems = if this_stride > 0 { region_size / this_stride } else { 0 };
+        let num_elems = if this_stride > 0 {
+            region_size / this_stride
+        } else {
+            0
+        };
 
         if h::has_array_field_designators(items) && this_stride == struct_size {
             self.fill_array_field_designator_items(
-                items, layout, struct_size, num_elems, base_offset, bytes, ptr_ranges,
+                items,
+                layout,
+                struct_size,
+                num_elems,
+                base_offset,
+                bytes,
+                ptr_ranges,
             );
         } else {
             // Sequential items: each item maps to one element at this_stride
@@ -81,7 +94,10 @@ impl Lowerer {
                         current_idx = idx;
                     }
                 }
-                if current_idx >= num_elems { current_idx += 1; continue; }
+                if current_idx >= num_elems {
+                    current_idx += 1;
+                    continue;
+                }
 
                 let elem_offset = base_offset + current_idx * this_stride;
 
@@ -90,13 +106,23 @@ impl Lowerer {
                         if this_stride > struct_size && !remaining_strides.is_empty() {
                             // Sub-array dimension: recurse
                             self.fill_multidim_struct_array_with_ptrs(
-                                sub_items, layout, struct_size, remaining_strides,
-                                bytes, ptr_ranges, elem_offset, this_stride,
+                                sub_items,
+                                layout,
+                                struct_size,
+                                remaining_strides,
+                                bytes,
+                                ptr_ranges,
+                                elem_offset,
+                                this_stride,
                             );
                         } else {
                             // Single struct element: fill its fields
                             self.fill_nested_struct_with_ptrs(
-                                sub_items, layout, elem_offset, bytes, ptr_ranges,
+                                sub_items,
+                                layout,
+                                elem_offset,
+                                bytes,
+                                ptr_ranges,
                             );
                         }
                     }
@@ -106,9 +132,13 @@ impl Lowerer {
                             let field = &layout.fields[0];
                             let field_offset = elem_offset + field.offset;
                             self.write_expr_to_bytes_or_ptrs(
-                                expr, &field.ty, field_offset,
-                                field.bit_offset, field.bit_width,
-                                bytes, ptr_ranges,
+                                expr,
+                                &field.ty,
+                                field_offset,
+                                field.bit_offset,
+                                field.bit_width,
+                                bytes,
+                                ptr_ranges,
                             );
                         }
                     }
@@ -141,14 +171,23 @@ impl Lowerer {
         if h::has_array_field_designators(items) {
             // Handle [N].field = value pattern (e.g., postgres mcxt_methods[]).
             self.fill_array_field_designator_items(
-                items, layout, struct_size, num_elems, 0, &mut bytes, &mut ptr_ranges,
+                items,
+                layout,
+                struct_size,
+                num_elems,
+                0,
+                &mut bytes,
+                &mut ptr_ranges,
             );
         } else {
             // Original path: items correspond 1-to-1 to array elements (no [N].field designators).
             // Each item is either a braced list for one struct element or a single expression.
             self.fill_struct_array_sequential(
-                items, layout, num_elems,
-                &mut bytes, &mut ptr_ranges,
+                items,
+                layout,
+                num_elems,
+                &mut bytes,
+                &mut ptr_ranges,
             );
         }
 
@@ -175,24 +214,48 @@ impl Lowerer {
         while item_idx < sub_items.len() {
             let sub_item = &sub_items[item_idx];
             let desig_name = h::first_field_designator(sub_item);
-            let resolution = layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = layout.resolve_init_field(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => *idx,
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     // Designator targets a field inside an anonymous struct/union member.
                     // Recursively fill the anonymous member's sub-layout.
-                    let extra_desigs = if sub_item.designators.len() > 1 { &sub_item.designators[1..] } else { &[] };
-                    let anon_res = h::resolve_anonymous_member(layout, *anon_field_idx, inner_name, &sub_item.init, extra_desigs, &self.types.borrow_struct_layouts());
+                    let extra_desigs = if sub_item.designators.len() > 1 {
+                        &sub_item.designators[1..]
+                    } else {
+                        &[]
+                    };
+                    let anon_res = h::resolve_anonymous_member(
+                        layout,
+                        *anon_field_idx,
+                        inner_name,
+                        &sub_item.init,
+                        extra_desigs,
+                        &self.types.borrow_struct_layouts(),
+                    );
                     if let Some(res) = anon_res {
                         let anon_offset = base_offset + res.anon_offset;
                         self.fill_struct_fields_from_items(
-                            &[res.sub_item], &res.sub_layout, anon_offset, bytes, ptr_ranges,
+                            &[res.sub_item],
+                            &res.sub_layout,
+                            anon_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                     }
                     current_field_idx = *anon_field_idx + 1;
                     item_idx += 1;
                     // For unions, only initialize the first (or designated) member
-                    if layout.is_union && desig_name.is_none() { break; }
+                    if layout.is_union && desig_name.is_none() {
+                        break;
+                    }
                     continue;
                 }
                 None => break,
@@ -202,12 +265,17 @@ impl Lowerer {
 
             if h::has_nested_field_designator(sub_item) {
                 self.fill_nested_designator_with_ptrs(
-                    sub_item, &field.ty, field_offset,
-                    bytes, ptr_ranges,
+                    sub_item,
+                    &field.ty,
+                    field_offset,
+                    bytes,
+                    ptr_ranges,
                 );
                 current_field_idx = field_idx + 1;
                 item_idx += 1;
-                if layout.is_union && desig_name.is_none() { break; }
+                if layout.is_union && desig_name.is_none() {
+                    break;
+                }
                 continue;
             }
 
@@ -220,12 +288,18 @@ impl Lowerer {
                         && matches!(&sub_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
-                            &sub_items[item_idx..], elem_ty, arr_size,
-                            field_offset, bytes, ptr_ranges,
+                            &sub_items[item_idx..],
+                            elem_ty,
+                            arr_size,
+                            field_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                         item_idx += consumed;
                         current_field_idx = field_idx + 1;
-                        if layout.is_union && desig_name.is_none() { break; }
+                        if layout.is_union && desig_name.is_none() {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -249,28 +323,36 @@ impl Lowerer {
                 if let Some((sub_layout, has_ptrs)) = sub_layout_info {
                     if has_ptrs {
                         let consumed = self.fill_nested_struct_brace_elided(
-                            &sub_items[item_idx..], &sub_layout, field_offset, bytes, ptr_ranges,
+                            &sub_items[item_idx..],
+                            &sub_layout,
+                            field_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                         item_idx += consumed;
                     } else {
                         let consumed = self.fill_composite_field(
-                            &sub_items[item_idx..], &sub_layout, bytes, field_offset,
+                            &sub_items[item_idx..],
+                            &sub_layout,
+                            bytes,
+                            field_offset,
                         );
                         item_idx += consumed;
                     }
                     current_field_idx = field_idx + 1;
-                    if layout.is_union && desig_name.is_none() { break; }
+                    if layout.is_union && desig_name.is_none() {
+                        break;
+                    }
                     continue;
                 }
             }
 
-            self.emit_struct_field_init_compound(
-                sub_item, field, field_offset,
-                bytes, ptr_ranges,
-            );
+            self.emit_struct_field_init_compound(sub_item, field, field_offset, bytes, ptr_ranges);
             current_field_idx = field_idx + 1;
             item_idx += 1;
-            if layout.is_union && desig_name.is_none() { break; }
+            if layout.is_union && desig_name.is_none() {
+                break;
+            }
         }
     }
 
@@ -298,9 +380,13 @@ impl Lowerer {
                 &field.ty
             };
             self.write_expr_to_bytes_or_ptrs(
-                expr, effective_ty, field_offset,
-                field.bit_offset, field.bit_width,
-                bytes, ptr_ranges,
+                expr,
+                effective_ty,
+                field_offset,
+                field.bit_offset,
+                field.bit_width,
+                bytes,
+                ptr_ranges,
             );
         } else if let Initializer::List(ref inner_items) = item.init {
             if is_ptr_array {
@@ -315,23 +401,39 @@ impl Lowerer {
                 let mut ai = 0usize;
                 for inner_item in inner_items.iter() {
                     // Check for index designator
-                    if let Some(crate::frontend::parser::ast::Designator::Index(ref idx_expr)) = inner_item.designators.first() {
-                        if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
+                    if let Some(crate::frontend::parser::ast::Designator::Index(ref idx_expr)) =
+                        inner_item.designators.first()
+                    {
+                        if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                        {
                             ai = idx;
                         }
                     }
-                    if ai >= arr_size { ai += 1; continue; }
+                    if ai >= arr_size {
+                        ai += 1;
+                        continue;
+                    }
                     let elem_offset = field_offset + ai * ptr_size;
                     if let Initializer::Expr(ref expr) = inner_item.init {
                         self.write_expr_to_bytes_or_ptrs(
-                            expr, &ptr_ty, elem_offset, None, None, bytes, ptr_ranges,
+                            expr,
+                            &ptr_ty,
+                            elem_offset,
+                            None,
+                            None,
+                            bytes,
+                            ptr_ranges,
                         );
                     }
                     ai += 1;
                 }
             } else {
                 self.fill_composite_or_array_with_ptrs(
-                    inner_items, &field.ty, field_offset, bytes, ptr_ranges,
+                    inner_items,
+                    &field.ty,
+                    field_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             }
         }
@@ -371,7 +473,11 @@ impl Lowerer {
             match &item.init {
                 Initializer::List(sub_items) => {
                     self.fill_struct_fields_from_items(
-                        sub_items, layout, base_offset, bytes, ptr_ranges,
+                        sub_items,
+                        layout,
+                        base_offset,
+                        bytes,
+                        ptr_ranges,
                     );
                     item_idx += 1;
                 }
@@ -381,7 +487,11 @@ impl Lowerer {
                     if let Expr::CompoundLiteral(_, ref inner_init, _) = expr {
                         if let Initializer::List(ref sub_items) = **inner_init {
                             self.fill_struct_fields_from_items(
-                                sub_items, layout, base_offset, bytes, ptr_ranges,
+                                sub_items,
+                                layout,
+                                base_offset,
+                                bytes,
+                                ptr_ranges,
                             );
                         } else if let Initializer::Expr(ref inner_expr) = **inner_init {
                             // Scalar compound literal (e.g., ((type){expr})):
@@ -394,8 +504,11 @@ impl Lowerer {
                                     init: Initializer::Expr(inner_expr.clone()),
                                 };
                                 self.emit_struct_field_init_compound(
-                                    &synth_item, field, field_offset,
-                                    bytes, ptr_ranges,
+                                    &synth_item,
+                                    field,
+                                    field_offset,
+                                    bytes,
+                                    ptr_ranges,
                                 );
                             }
                         }
@@ -414,13 +527,18 @@ impl Lowerer {
                             let field_offset = base_offset + field.offset;
 
                             self.emit_struct_field_init_compound(
-                                sub_item, field, field_offset,
-                                bytes, ptr_ranges,
+                                sub_item,
+                                field,
+                                field_offset,
+                                bytes,
+                                ptr_ranges,
                             );
                             current_field_idx += 1;
                             item_idx += 1;
                             // For unions, only initialize the first member
-                            if layout.is_union { break; }
+                            if layout.is_union {
+                                break;
+                            }
                         }
                     }
                 }
@@ -452,39 +570,70 @@ impl Lowerer {
 
             if let Some(Designator::Index(ref idx_expr)) = item.designators.first() {
                 if let Some(idx) = self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()) {
-                    if idx != current_elem_idx { current_field_idx = 0; }
+                    if idx != current_elem_idx {
+                        current_field_idx = 0;
+                    }
                     elem_idx = idx;
                 }
                 remaining_desigs_start = 1;
             }
 
             let mut field_desig: Option<&str> = None;
-            if let Some(Designator::Field(ref name)) = item.designators.get(remaining_desigs_start) {
+            if let Some(Designator::Field(ref name)) = item.designators.get(remaining_desigs_start)
+            {
                 field_desig = Some(name.as_str());
                 remaining_desigs_start += 1;
             }
 
-            if elem_idx >= num_elems { current_elem_idx = elem_idx + 1; continue; }
+            if elem_idx >= num_elems {
+                current_elem_idx = elem_idx + 1;
+                continue;
+            }
 
             let elem_base = array_base_offset + elem_idx * struct_size;
-            let resolution = layout.resolve_init_field(field_desig, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = layout.resolve_init_field(
+                field_desig,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => *idx,
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     // Designator targets a field inside an anonymous struct/union member.
-                    let extra_desigs = if item.designators.len() > remaining_desigs_start { &item.designators[remaining_desigs_start..] } else { &[] };
-                    let anon_res = h::resolve_anonymous_member(layout, *anon_field_idx, inner_name, &item.init, extra_desigs, &self.types.borrow_struct_layouts());
+                    let extra_desigs = if item.designators.len() > remaining_desigs_start {
+                        &item.designators[remaining_desigs_start..]
+                    } else {
+                        &[]
+                    };
+                    let anon_res = h::resolve_anonymous_member(
+                        layout,
+                        *anon_field_idx,
+                        inner_name,
+                        &item.init,
+                        extra_desigs,
+                        &self.types.borrow_struct_layouts(),
+                    );
                     if let Some(res) = anon_res {
                         let anon_offset = elem_base + res.anon_offset;
                         self.fill_struct_fields_from_items(
-                            &[res.sub_item], &res.sub_layout, anon_offset, bytes, ptr_ranges,
+                            &[res.sub_item],
+                            &res.sub_layout,
+                            anon_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                     }
                     current_elem_idx = elem_idx;
                     current_field_idx = *anon_field_idx + 1;
                     continue;
                 }
-                None => { current_elem_idx = elem_idx; continue; }
+                None => {
+                    current_elem_idx = elem_idx;
+                    continue;
+                }
             };
             let field = &layout.fields[field_idx];
             let field_offset = elem_base + field.offset;
@@ -495,12 +644,14 @@ impl Lowerer {
                     init: item.init.clone(),
                 };
                 self.fill_nested_designator_with_ptrs(
-                    &remaining_item, &field.ty, field_offset, bytes, ptr_ranges,
+                    &remaining_item,
+                    &field.ty,
+                    field_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             } else {
-                self.emit_struct_field_init_compound(
-                    item, field, field_offset, bytes, ptr_ranges,
-                );
+                self.emit_struct_field_init_compound(item, field, field_offset, bytes, ptr_ranges);
             }
 
             current_elem_idx = elem_idx;
@@ -532,14 +683,22 @@ impl Lowerer {
         match &item.init {
             Initializer::Expr(expr) => {
                 self.write_expr_to_bytes_or_ptrs(
-                    expr, &current_ty, sub_offset,
-                    drill.bit_offset, drill.bit_width,
-                    bytes, ptr_ranges,
+                    expr,
+                    &current_ty,
+                    sub_offset,
+                    drill.bit_offset,
+                    drill.bit_width,
+                    bytes,
+                    ptr_ranges,
                 );
             }
             Initializer::List(inner_items) => {
                 self.fill_composite_or_array_with_ptrs(
-                    inner_items, &current_ty, sub_offset, bytes, ptr_ranges,
+                    inner_items,
+                    &current_ty,
+                    sub_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             }
         }
@@ -562,10 +721,17 @@ impl Lowerer {
         while item_idx < inner_items.len() {
             let inner_item = &inner_items[item_idx];
             let desig_name = h::first_field_designator(inner_item);
-            let resolution = sub_layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = sub_layout.resolve_init_field(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => *idx,
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     // Drill into anonymous member
                     let anon_field = &sub_layout.fields[*anon_field_idx];
                     let anon_offset = base_offset + anon_field.offset;
@@ -579,38 +745,51 @@ impl Lowerer {
                             init: inner_item.init.clone(),
                         };
                         self.fill_nested_struct_with_ptrs(
-                            &[sub_item], &anon_layout, anon_offset, bytes, ptr_ranges);
+                            &[sub_item],
+                            &anon_layout,
+                            anon_offset,
+                            bytes,
+                            ptr_ranges,
+                        );
                     }
                     current_field_idx = *anon_field_idx + 1;
                     item_idx += 1;
                     // For unions, only initialize the first (or designated) member
-                    if sub_layout.is_union && desig_name.is_none() { break; }
+                    if sub_layout.is_union && desig_name.is_none() {
+                        break;
+                    }
                     continue;
                 }
                 None => break,
             };
 
             // Handle multi-level designators within the nested struct (e.g., .config.i = &val)
-            if h::has_nested_field_designator(inner_item)
-                && field_idx < sub_layout.fields.len() {
-                    let field = &sub_layout.fields[field_idx];
-                    let field_abs_offset = base_offset + field.offset;
+            if h::has_nested_field_designator(inner_item) && field_idx < sub_layout.fields.len() {
+                let field = &sub_layout.fields[field_idx];
+                let field_abs_offset = base_offset + field.offset;
 
-                    if let Some(drill) = self.drill_designators(&inner_item.designators[1..], &field.ty) {
-                        let sub_offset = field_abs_offset + drill.byte_offset;
-                        if let Initializer::Expr(ref expr) = inner_item.init {
-                            self.write_expr_to_bytes_or_ptrs(
-                                expr, &drill.target_ty, sub_offset,
-                                drill.bit_offset, drill.bit_width,
-                                bytes, ptr_ranges,
-                            );
-                        }
+                if let Some(drill) = self.drill_designators(&inner_item.designators[1..], &field.ty)
+                {
+                    let sub_offset = field_abs_offset + drill.byte_offset;
+                    if let Initializer::Expr(ref expr) = inner_item.init {
+                        self.write_expr_to_bytes_or_ptrs(
+                            expr,
+                            &drill.target_ty,
+                            sub_offset,
+                            drill.bit_offset,
+                            drill.bit_width,
+                            bytes,
+                            ptr_ranges,
+                        );
                     }
-                    current_field_idx = field_idx + 1;
-                    item_idx += 1;
-                    if sub_layout.is_union && desig_name.is_none() { break; }
-                    continue;
                 }
+                current_field_idx = field_idx + 1;
+                item_idx += 1;
+                if sub_layout.is_union && desig_name.is_none() {
+                    break;
+                }
+                continue;
+            }
 
             let field = &sub_layout.fields[field_idx];
             let field_abs_offset = base_offset + field.offset;
@@ -623,12 +802,18 @@ impl Lowerer {
                         && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
-                            &inner_items[item_idx..], elem_ty, arr_size,
-                            field_abs_offset, bytes, ptr_ranges,
+                            &inner_items[item_idx..],
+                            elem_ty,
+                            arr_size,
+                            field_abs_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                         item_idx += consumed;
                         current_field_idx = field_idx + 1;
-                        if sub_layout.is_union && desig_name.is_none() { break; }
+                        if sub_layout.is_union && desig_name.is_none() {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -636,18 +821,28 @@ impl Lowerer {
 
             if let Initializer::Expr(ref expr) = inner_item.init {
                 self.write_expr_to_bytes_or_ptrs(
-                    expr, &field.ty, field_abs_offset,
-                    field.bit_offset, field.bit_width,
-                    bytes, ptr_ranges,
+                    expr,
+                    &field.ty,
+                    field_abs_offset,
+                    field.bit_offset,
+                    field.bit_width,
+                    bytes,
+                    ptr_ranges,
                 );
             } else if let Initializer::List(ref nested_items) = inner_item.init {
                 self.fill_composite_or_array_with_ptrs(
-                    nested_items, &field.ty, field_abs_offset, bytes, ptr_ranges,
+                    nested_items,
+                    &field.ty,
+                    field_abs_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             }
             current_field_idx = field_idx + 1;
             item_idx += 1;
-            if sub_layout.is_union && desig_name.is_none() { break; }
+            if sub_layout.is_union && desig_name.is_none() {
+                break;
+            }
         }
     }
 
@@ -723,20 +918,34 @@ impl Lowerer {
                     if !elem_layout.fields.is_empty() {
                         let f = &elem_layout.fields[0];
                         self.write_expr_to_bytes_or_ptrs(
-                            expr, &f.ty, elem_offset + f.offset,
-                            f.bit_offset, f.bit_width,
-                            bytes, ptr_ranges,
+                            expr,
+                            &f.ty,
+                            elem_offset + f.offset,
+                            f.bit_offset,
+                            f.bit_width,
+                            bytes,
+                            ptr_ranges,
                         );
                     }
                 } else {
                     self.write_expr_to_bytes_or_ptrs(
-                        expr, elem_ty, elem_offset, None, None, bytes, ptr_ranges,
+                        expr,
+                        elem_ty,
+                        elem_offset,
+                        None,
+                        None,
+                        bytes,
+                        ptr_ranges,
                     );
                 }
             } else if let Initializer::List(ref sub_items) = item.init {
                 // Braced sub-list for first element
                 self.fill_composite_or_array_with_ptrs(
-                    sub_items, elem_ty, elem_offset, bytes, ptr_ranges,
+                    sub_items,
+                    elem_ty,
+                    elem_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             }
             consumed += 1;
@@ -769,7 +978,13 @@ impl Lowerer {
             if let Initializer::Expr(ref expr) = item.init {
                 if has_ptrs {
                     self.write_expr_to_bytes_or_ptrs(
-                        expr, elem_ty, elem_offset, None, None, bytes, ptr_ranges,
+                        expr,
+                        elem_ty,
+                        elem_offset,
+                        None,
+                        None,
+                        bytes,
+                        ptr_ranges,
                     );
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
@@ -806,7 +1021,11 @@ impl Lowerer {
                         match &item.init {
                             Initializer::List(sub_items) => {
                                 self.fill_nested_struct_with_ptrs(
-                                    sub_items, &elem_layout, elem_offset, bytes, ptr_ranges,
+                                    sub_items,
+                                    &elem_layout,
+                                    elem_offset,
+                                    bytes,
+                                    ptr_ranges,
                                 );
                             }
                             Initializer::Expr(expr) => {
@@ -815,9 +1034,13 @@ impl Lowerer {
                                     let field = &elem_layout.fields[0];
                                     let field_offset = elem_offset + field.offset;
                                     self.write_expr_to_bytes_or_ptrs(
-                                        expr, &field.ty, field_offset,
-                                        field.bit_offset, field.bit_width,
-                                        bytes, ptr_ranges,
+                                        expr,
+                                        &field.ty,
+                                        field_offset,
+                                        field.bit_offset,
+                                        field.bit_width,
+                                        bytes,
+                                        ptr_ranges,
                                     );
                                 }
                             }
@@ -838,13 +1061,23 @@ impl Lowerer {
                         let elem_offset = offset + ai * struct_size;
                         match &items[sub_idx].init {
                             Initializer::List(ref sub_items) => {
-                                self.fill_struct_global_bytes(sub_items, &elem_layout, bytes, elem_offset);
+                                self.fill_struct_global_bytes(
+                                    sub_items,
+                                    &elem_layout,
+                                    bytes,
+                                    elem_offset,
+                                );
                                 sub_idx += 1;
                             }
                             Initializer::Expr(_) => {
                                 // Flat/brace-elided init: pass remaining items to fill
                                 // this struct element field-by-field.
-                                let consumed = self.fill_struct_global_bytes(&items[sub_idx..], &elem_layout, bytes, elem_offset);
+                                let consumed = self.fill_struct_global_bytes(
+                                    &items[sub_idx..],
+                                    &elem_layout,
+                                    bytes,
+                                    elem_offset,
+                                );
                                 sub_idx += consumed;
                             }
                         }
@@ -855,7 +1088,15 @@ impl Lowerer {
                 // Multi-dimensional array of scalars (e.g., unsigned char hash[2][4]):
                 // each item is a braced list for one row of the outer dimension.
                 let elem_size = self.resolve_ctype_size(elem_ty);
-                self.fill_multidim_array_field(items, inner_elem, *inner_size, items.len(), elem_size, bytes, offset);
+                self.fill_multidim_array_field(
+                    items,
+                    inner_elem,
+                    *inner_size,
+                    items.len(),
+                    elem_size,
+                    bytes,
+                    offset,
+                );
             } else {
                 // Array of non-composite elements (scalars, pointers, etc.)
                 self.fill_scalar_array_with_ptrs(items, elem_ty, offset, bytes, ptr_ranges);
@@ -882,7 +1123,11 @@ impl Lowerer {
         match &items[0].init {
             Initializer::List(sub_items) => {
                 self.fill_nested_struct_with_ptrs(
-                    sub_items, sub_layout, base_offset, bytes, ptr_ranges,
+                    sub_items,
+                    sub_layout,
+                    base_offset,
+                    bytes,
+                    ptr_ranges,
                 );
                 1
             }
@@ -891,7 +1136,11 @@ impl Lowerer {
                 if let Expr::CompoundLiteral(_, ref cl_init, _) = expr {
                     if let Initializer::List(sub_items) = cl_init.as_ref() {
                         self.fill_nested_struct_with_ptrs(
-                            sub_items, sub_layout, base_offset, bytes, ptr_ranges,
+                            sub_items,
+                            sub_layout,
+                            base_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                         return 1;
                     }
@@ -899,9 +1148,17 @@ impl Lowerer {
                 // Brace-elided: pass remaining items to fill_nested_struct_with_ptrs
                 // which will consume items field-by-field for the sub-struct.
                 let consumed = self.fill_nested_struct_with_ptrs_count(
-                    items, sub_layout, base_offset, bytes, ptr_ranges,
+                    items,
+                    sub_layout,
+                    base_offset,
+                    bytes,
+                    ptr_ranges,
                 );
-                if consumed == 0 { 1 } else { consumed }
+                if consumed == 0 {
+                    1
+                } else {
+                    consumed
+                }
             }
         }
     }
@@ -922,10 +1179,17 @@ impl Lowerer {
         while item_idx < items.len() {
             let inner_item = &items[item_idx];
             let desig_name = h::first_field_designator(inner_item);
-            let resolution = sub_layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = sub_layout.resolve_init_field(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => *idx,
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     let anon_field = &sub_layout.fields[*anon_field_idx];
                     let anon_offset = base_offset + anon_field.offset;
                     if let Some(anon_layout) = self.get_struct_layout_for_ctype(&anon_field.ty) {
@@ -934,11 +1198,18 @@ impl Lowerer {
                             init: inner_item.init.clone(),
                         };
                         self.fill_nested_struct_with_ptrs(
-                            &[sub_item], &anon_layout, anon_offset, bytes, ptr_ranges);
+                            &[sub_item],
+                            &anon_layout,
+                            anon_offset,
+                            bytes,
+                            ptr_ranges,
+                        );
                     }
                     current_field_idx = *anon_field_idx + 1;
                     item_idx += 1;
-                    if sub_layout.is_union && desig_name.is_none() { break; }
+                    if sub_layout.is_union && desig_name.is_none() {
+                        break;
+                    }
                     continue;
                 }
                 None => break,
@@ -954,12 +1225,18 @@ impl Lowerer {
                         && matches!(&inner_item.init, Initializer::Expr(Expr::StringLiteral(..)));
                     if !is_char_array_str {
                         let consumed = self.fill_flat_array_field_with_ptrs(
-                            &items[item_idx..], elem_ty, arr_size,
-                            field_abs_offset, bytes, ptr_ranges,
+                            &items[item_idx..],
+                            elem_ty,
+                            arr_size,
+                            field_abs_offset,
+                            bytes,
+                            ptr_ranges,
                         );
                         item_idx += consumed;
                         current_field_idx = field_idx + 1;
-                        if sub_layout.is_union && desig_name.is_none() { break; }
+                        if sub_layout.is_union && desig_name.is_none() {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -967,18 +1244,28 @@ impl Lowerer {
 
             if let Initializer::Expr(ref expr) = inner_item.init {
                 self.write_expr_to_bytes_or_ptrs(
-                    expr, &field.ty, field_abs_offset,
-                    field.bit_offset, field.bit_width,
-                    bytes, ptr_ranges,
+                    expr,
+                    &field.ty,
+                    field_abs_offset,
+                    field.bit_offset,
+                    field.bit_width,
+                    bytes,
+                    ptr_ranges,
                 );
             } else if let Initializer::List(ref nested_items) = inner_item.init {
                 self.fill_composite_or_array_with_ptrs(
-                    nested_items, &field.ty, field_abs_offset, bytes, ptr_ranges,
+                    nested_items,
+                    &field.ty,
+                    field_abs_offset,
+                    bytes,
+                    ptr_ranges,
                 );
             }
             current_field_idx = field_idx + 1;
             item_idx += 1;
-            if sub_layout.is_union && desig_name.is_none() { break; }
+            if sub_layout.is_union && desig_name.is_none() {
+                break;
+            }
         }
         item_idx
     }

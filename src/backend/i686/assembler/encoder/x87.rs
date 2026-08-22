@@ -8,7 +8,12 @@ use super::*;
 impl super::InstructionEncoder {
     // ---- x87 FPU encoding (identical to x86-64, no REX needed) ----
 
-    pub(super) fn encode_x87_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(super) fn encode_x87_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("x87 mem op requires 1 operand".to_string());
         }
@@ -21,7 +26,12 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(super) fn encode_x87_wait_mem(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(super) fn encode_x87_wait_mem(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         self.bytes.push(0x9B);
         self.encode_x87_mem(ops, opcode, ext)
     }
@@ -140,7 +150,13 @@ impl super::InstructionEncoder {
         self.encode_fnstsw(ops)
     }
 
-    pub(super) fn encode_x87_st_i(&mut self, ops: &[Operand], opcode: &[u8], base: u8, name: &str) -> Result<(), String> {
+    pub(super) fn encode_x87_st_i(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        base: u8,
+        name: &str,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 st register operand", name));
         }
@@ -288,7 +304,13 @@ impl super::InstructionEncoder {
     }
 
     /// Encode x87 register-register arithmetic (fadd/fmul/fsub/fdiv with st(i) operands).
-    pub(super) fn encode_x87_arith_reg(&mut self, ops: &[Operand], opcode_st0: u8, opcode_sti: u8, base_modrm: u8) -> Result<(), String> {
+    pub(super) fn encode_x87_arith_reg(
+        &mut self,
+        ops: &[Operand],
+        opcode_st0: u8,
+        opcode_sti: u8,
+        base_modrm: u8,
+    ) -> Result<(), String> {
         match ops.len() {
             0 => {
                 // Default: fadd %st(1), %st (i.e., st(0) = st(0) op st(1))
@@ -314,7 +336,8 @@ impl super::InstructionEncoder {
                         let dst_n = parse_st_num(&dst.name)?;
                         if dst_n == 0 {
                             // fadd %st(i), %st -> D8 (base + i)
-                            self.bytes.extend_from_slice(&[opcode_st0, base_modrm + src_n]);
+                            self.bytes
+                                .extend_from_slice(&[opcode_st0, base_modrm + src_n]);
                         } else if src_n == 0 {
                             // fadd %st, %st(i) -> DC (base + i)
                             // Note: fsub/fdiv swap in DC encoding
@@ -325,7 +348,8 @@ impl super::InstructionEncoder {
                                 0xF0 => 0xF8, // fdiv -> fdivr encoding in DC
                                 _ => base_modrm,
                             };
-                            self.bytes.extend_from_slice(&[opcode_sti, dc_modrm + dst_n]);
+                            self.bytes
+                                .extend_from_slice(&[opcode_sti, dc_modrm + dst_n]);
                         } else {
                             return Err("x87 arith: one operand must be st(0)".to_string());
                         }

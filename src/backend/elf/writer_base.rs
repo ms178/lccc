@@ -10,12 +10,12 @@
 //! - ARM adds `pending_sym_diffs` and AArch64-specific branch resolution
 //! - RISC-V adds `pcrel_hi_counter`, `numeric_labels`, and RV64C compression
 
-use crate::common::fx_hash::FxHashMap;
 use super::constants::*;
 use super::linker_symbols::default_section_flags;
-use super::object_writer::{ElfConfig, ObjSection, ObjReloc};
-use super::symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 use super::object_writer::write_relocatable_object;
+use super::object_writer::{ElfConfig, ObjReloc, ObjSection};
+use super::symbol_table::{build_elf_symbol_table, ObjSymbol, SymbolTableInput};
+use crate::common::fx_hash::FxHashMap;
 
 /// Shared ELF writer state used by both ARM and RISC-V assembler backends.
 ///
@@ -84,22 +84,26 @@ impl ElfWriterBase {
     /// Ensure a section exists. If it doesn't, create it with the given properties.
     pub fn ensure_section(&mut self, name: &str, sh_type: u32, sh_flags: u64, align: u64) {
         if !self.sections.contains_key(name) {
-            self.sections.insert(name.to_string(), ObjSection {
-                name: name.to_string(),
-                sh_type,
-                sh_flags,
-                data: Vec::new(),
-                sh_addralign: align,
-                relocs: Vec::new(),
-                comdat_group: None,
-            });
+            self.sections.insert(
+                name.to_string(),
+                ObjSection {
+                    name: name.to_string(),
+                    sh_type,
+                    sh_flags,
+                    data: Vec::new(),
+                    sh_addralign: align,
+                    relocs: Vec::new(),
+                    comdat_group: None,
+                },
+            );
             self.section_order.push(name.to_string());
         }
     }
 
     /// Get the current write offset within the current section.
     pub fn current_offset(&self) -> u64 {
-        self.sections.get(&self.current_section)
+        self.sections
+            .get(&self.current_section)
             .map(|s| s.data.len() as u64)
             .unwrap_or(0)
     }
@@ -166,7 +170,12 @@ impl ElfWriterBase {
     /// Ensure we're in a text section, creating one if needed.
     pub fn ensure_text_section(&mut self) {
         if self.current_section.is_empty() {
-            self.ensure_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, self.text_align);
+            self.ensure_section(
+                ".text",
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_EXECINSTR,
+                self.text_align,
+            );
             self.current_section = ".text".to_string();
         }
     }
@@ -187,7 +196,10 @@ impl ElfWriterBase {
             Some("@nobits") => SHT_NOBITS,
             Some("@note") => SHT_NOTE,
             _ => {
-                if sec_name == ".bss" || sec_name.starts_with(".bss.") || sec_name.starts_with(".tbss") {
+                if sec_name == ".bss"
+                    || sec_name.starts_with(".bss.")
+                    || sec_name.starts_with(".tbss")
+                {
                     SHT_NOBITS
                 } else {
                     SHT_PROGBITS
@@ -196,26 +208,48 @@ impl ElfWriterBase {
         };
 
         let mut sh_flags = 0u64;
-        if flags_str.contains('a') { sh_flags |= SHF_ALLOC; }
-        if flags_str.contains('w') { sh_flags |= SHF_WRITE; }
-        if flags_str.contains('x') { sh_flags |= SHF_EXECINSTR; }
-        if flags_str.contains('M') { sh_flags |= SHF_MERGE; }
-        if flags_str.contains('S') { sh_flags |= SHF_STRINGS; }
-        if flags_str.contains('T') { sh_flags |= SHF_TLS; }
-        if flags_str.contains('G') { sh_flags |= SHF_GROUP; }
+        if flags_str.contains('a') {
+            sh_flags |= SHF_ALLOC;
+        }
+        if flags_str.contains('w') {
+            sh_flags |= SHF_WRITE;
+        }
+        if flags_str.contains('x') {
+            sh_flags |= SHF_EXECINSTR;
+        }
+        if flags_str.contains('M') {
+            sh_flags |= SHF_MERGE;
+        }
+        if flags_str.contains('S') {
+            sh_flags |= SHF_STRINGS;
+        }
+        if flags_str.contains('T') {
+            sh_flags |= SHF_TLS;
+        }
+        if flags_str.contains('G') {
+            sh_flags |= SHF_GROUP;
+        }
 
         if sh_flags == 0 && !flags_explicit {
             sh_flags = default_section_flags(sec_name);
         }
 
-        let align = if sh_flags & SHF_EXECINSTR != 0 { self.text_align } else { 1 };
+        let align = if sh_flags & SHF_EXECINSTR != 0 {
+            self.text_align
+        } else {
+            1
+        };
         self.ensure_section(sec_name, sh_type, sh_flags, align);
         self.previous_section = std::mem::replace(&mut self.current_section, sec_name.to_string());
     }
 
     /// Switch to a named standard section (.text, .data, .bss, .rodata).
     pub fn switch_to_standard_section(&mut self, name: &str, sh_type: u32, sh_flags: u64) {
-        let align = if sh_flags & SHF_EXECINSTR != 0 { self.text_align } else { 1 };
+        let align = if sh_flags & SHF_EXECINSTR != 0 {
+            self.text_align
+        } else {
+            1
+        };
         self.ensure_section(name, sh_type, sh_flags, align);
         self.previous_section = std::mem::replace(&mut self.current_section, name.to_string());
     }
@@ -231,8 +265,15 @@ impl ElfWriterBase {
     /// Push current section onto the stack and switch to a new section.
     /// Saves both current_section and previous_section so that .popsection
     /// fully restores the section state (matching GNU as behavior).
-    pub fn push_section(&mut self, name: &str, flags_str: &str, flags_explicit: bool, sec_type: Option<&str>) {
-        self.section_stack.push((self.current_section.clone(), self.previous_section.clone()));
+    pub fn push_section(
+        &mut self,
+        name: &str,
+        flags_str: &str,
+        flags_explicit: bool,
+        sec_type: Option<&str>,
+    ) {
+        self.section_stack
+            .push((self.current_section.clone(), self.previous_section.clone()));
         self.process_section_directive(name, flags_str, flags_explicit, sec_type);
     }
 
@@ -291,14 +332,19 @@ impl ElfWriterBase {
         let mut remap = FxHashMap::default();
 
         // Collect subsection names grouped by parent
-        let mut subsections: std::collections::BTreeMap<String, std::collections::BTreeMap<u64, String>> =
-            std::collections::BTreeMap::new();
+        let mut subsections: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<u64, String>,
+        > = std::collections::BTreeMap::new();
 
         for name in &self.section_order {
             if let Some(pos) = name.find(".__subsection.") {
                 let parent = name[..pos].to_string();
                 let num: u64 = name[pos + 14..].parse().unwrap_or(0);
-                subsections.entry(parent).or_default().insert(num, name.clone());
+                subsections
+                    .entry(parent)
+                    .or_default()
+                    .insert(num, name.clone());
             }
         }
 
@@ -320,7 +366,9 @@ impl ElfWriterBase {
                     sub_relocs = sub_sec.relocs.clone();
                 }
 
-                let parent_len = self.sections.get(parent)
+                let parent_len = self
+                    .sections
+                    .get(parent)
                     .map(|s| s.data.len() as u64)
                     .unwrap_or(0);
 
@@ -338,13 +386,16 @@ impl ElfWriterBase {
                 }
 
                 // Adjust labels that reference this subsection
-                let labels_to_update: Vec<(String, u64)> = self.labels.iter()
+                let labels_to_update: Vec<(String, u64)> = self
+                    .labels
+                    .iter()
                     .filter(|(_, (sec, _))| sec == sub_name)
                     .map(|(name, (_, off))| (name.clone(), *off))
                     .collect();
 
                 for (label_name, old_offset) in labels_to_update {
-                    self.labels.insert(label_name, (parent.clone(), old_offset + parent_len));
+                    self.labels
+                        .insert(label_name, (parent.clone(), old_offset + parent_len));
                 }
 
                 // Remove the subsection
@@ -353,7 +404,8 @@ impl ElfWriterBase {
         }
 
         // Remove subsection names from section_order
-        self.section_order.retain(|name| !name.contains(".__subsection."));
+        self.section_order
+            .retain(|name| !name.contains(".__subsection."));
 
         // Fix current_section if it pointed to a subsection
         if self.current_section.contains(".__subsection.") {
@@ -392,7 +444,12 @@ impl ElfWriterBase {
 
     /// Record .size for a symbol. If `current_minus_label` is Some, computes
     /// `current_offset - label_offset` in the same section. Otherwise uses the absolute value.
-    pub fn set_symbol_size(&mut self, sym: &str, current_minus_label: Option<&str>, absolute: Option<u64>) {
+    pub fn set_symbol_size(
+        &mut self,
+        sym: &str,
+        current_minus_label: Option<&str>,
+        absolute: Option<u64>,
+    ) {
         if let Some(label) = current_minus_label {
             if let Some((section, label_offset)) = self.labels.get(label) {
                 if *section == self.current_section {
@@ -436,7 +493,9 @@ impl ElfWriterBase {
             if c == b'.' || c == b'_' || c.is_ascii_alphabetic() {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                while i < bytes.len()
+                    && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                {
                     i += 1;
                 }
                 let sym = &expr[start..i];
@@ -446,7 +505,9 @@ impl ElfWriterBase {
                 while let Some(target) = self.aliases.get(resolved) {
                     resolved = target.as_str();
                     seen += 1;
-                    if seen > 20 { break; }
+                    if seen > 20 {
+                        break;
+                    }
                 }
                 result.push_str(resolved);
             } else {
@@ -471,7 +532,9 @@ impl ElfWriterBase {
             if c == b'.' || c == b'_' || c.is_ascii_alphabetic() {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                while i < bytes.len()
+                    && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                {
                     i += 1;
                 }
                 let sym = &expr[start..i];
@@ -511,7 +574,9 @@ impl ElfWriterBase {
             if c == b'.' || c == b'_' || c.is_ascii_alphabetic() {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                while i < bytes.len()
+                    && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                {
                     i += 1;
                 }
                 let sym = &expr[start..i];
@@ -549,7 +614,9 @@ impl ElfWriterBase {
             if c == b'.' || c == b'_' || c.is_ascii_alphabetic() {
                 let start = i;
                 i += 1;
-                while i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                while i < bytes.len()
+                    && (bytes[i] == b'.' || bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric())
+                {
                     i += 1;
                 }
                 let sym = &resolved[start..i];
@@ -616,7 +683,8 @@ impl ElfWriterBase {
                     if (reloc.symbol_name.starts_with(".L") || reloc.symbol_name.starts_with(".l"))
                         && !reloc.symbol_name.is_empty()
                     {
-                        if let Some((label_section, label_offset)) = labels.get(&reloc.symbol_name) {
+                        if let Some((label_section, label_offset)) = labels.get(&reloc.symbol_name)
+                        {
                             reloc.addend += *label_offset as i64;
                             reloc.symbol_name = label_section.clone();
                         }
@@ -631,7 +699,12 @@ impl ElfWriterBase {
     /// `config`: ELF configuration (machine type, flags, class)
     /// `include_referenced_locals`: whether to include .L* labels referenced
     /// by relocations (needed by RISC-V for pcrel_hi/pcrel_lo pairs)
-    pub fn write_elf(&mut self, output_path: &str, config: &ElfConfig, include_referenced_locals: bool) -> Result<(), String> {
+    pub fn write_elf(
+        &mut self,
+        output_path: &str,
+        config: &ElfConfig,
+        include_referenced_locals: bool,
+    ) -> Result<(), String> {
         if !include_referenced_locals {
             self.resolve_local_data_relocs();
         }
@@ -659,12 +732,8 @@ impl ElfWriterBase {
         }
         symbols.append(&mut self.extra_symbols);
 
-        let elf_bytes = write_relocatable_object(
-            config,
-            &self.section_order,
-            &self.sections,
-            &symbols,
-        )?;
+        let elf_bytes =
+            write_relocatable_object(config, &self.section_order, &self.sections, &symbols)?;
 
         std::fs::write(output_path, &elf_bytes)
             .map_err(|e| format!("failed to write ELF file: {}", e))?;

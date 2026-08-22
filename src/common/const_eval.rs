@@ -18,10 +18,10 @@
 //! sizeof/alignof, binary operations with type inference) remain in the
 //! respective callers.
 
-use crate::ir::reexports::IrConst;
-use crate::frontend::parser::ast::{BinOp, Expr};
 use super::const_arith;
 use super::types::target_is_32bit;
+use crate::frontend::parser::ast::{BinOp, Expr};
+use crate::ir::reexports::IrConst;
 
 /// Evaluate a literal expression to an IrConst.
 /// Returns None for non-literal expressions.
@@ -102,9 +102,7 @@ pub fn eval_builtin_call(
             let is_const = args.first().is_some_and(|arg| eval_fn(arg).is_some());
             Some(IrConst::I32(if is_const { 1 } else { 0 }))
         }
-        "__builtin_expect" | "__builtin_expect_with_probability" => {
-            args.first().and_then(eval_fn)
-        }
+        "__builtin_expect" | "__builtin_expect_with_probability" => args.first().and_then(eval_fn),
         "__builtin_bswap16" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u16;
@@ -146,26 +144,38 @@ pub fn eval_builtin_call(
         "__builtin_ctz" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u32;
-            if v == 0 { Some(IrConst::I32(32)) }
-            else { Some(IrConst::I32(v.trailing_zeros() as i32)) }
+            if v == 0 {
+                Some(IrConst::I32(32))
+            } else {
+                Some(IrConst::I32(v.trailing_zeros() as i32))
+            }
         }
         "__builtin_ctzl" => {
             let val = eval_fn(args.first()?)?;
             if target_is_32bit() {
                 let v = val.to_i64()? as u32;
-                if v == 0 { Some(IrConst::I32(32)) }
-                else { Some(IrConst::I32(v.trailing_zeros() as i32)) }
+                if v == 0 {
+                    Some(IrConst::I32(32))
+                } else {
+                    Some(IrConst::I32(v.trailing_zeros() as i32))
+                }
             } else {
                 let v = val.to_i64()? as u64;
-                if v == 0 { Some(IrConst::I32(64)) }
-                else { Some(IrConst::I32(v.trailing_zeros() as i32)) }
+                if v == 0 {
+                    Some(IrConst::I32(64))
+                } else {
+                    Some(IrConst::I32(v.trailing_zeros() as i32))
+                }
             }
         }
         "__builtin_ctzll" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u64;
-            if v == 0 { Some(IrConst::I32(64)) }
-            else { Some(IrConst::I32(v.trailing_zeros() as i32)) }
+            if v == 0 {
+                Some(IrConst::I32(64))
+            } else {
+                Some(IrConst::I32(v.trailing_zeros() as i32))
+            }
         }
         "__builtin_popcount" => {
             let val = eval_fn(args.first()?)?;
@@ -190,26 +200,38 @@ pub fn eval_builtin_call(
         "__builtin_ffs" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u32;
-            if v == 0 { Some(IrConst::I32(0)) }
-            else { Some(IrConst::I32(v.trailing_zeros() as i32 + 1)) }
+            if v == 0 {
+                Some(IrConst::I32(0))
+            } else {
+                Some(IrConst::I32(v.trailing_zeros() as i32 + 1))
+            }
         }
         "__builtin_ffsl" => {
             let val = eval_fn(args.first()?)?;
             if target_is_32bit() {
                 let v = val.to_i64()? as u32;
-                if v == 0 { Some(IrConst::I32(0)) }
-                else { Some(IrConst::I32(v.trailing_zeros() as i32 + 1)) }
+                if v == 0 {
+                    Some(IrConst::I32(0))
+                } else {
+                    Some(IrConst::I32(v.trailing_zeros() as i32 + 1))
+                }
             } else {
                 let v = val.to_i64()? as u64;
-                if v == 0 { Some(IrConst::I32(0)) }
-                else { Some(IrConst::I32(v.trailing_zeros() as i32 + 1)) }
+                if v == 0 {
+                    Some(IrConst::I32(0))
+                } else {
+                    Some(IrConst::I32(v.trailing_zeros() as i32 + 1))
+                }
             }
         }
         "__builtin_ffsll" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u64;
-            if v == 0 { Some(IrConst::I32(0)) }
-            else { Some(IrConst::I32(v.trailing_zeros() as i32 + 1)) }
+            if v == 0 {
+                Some(IrConst::I32(0))
+            } else {
+                Some(IrConst::I32(v.trailing_zeros() as i32 + 1))
+            }
         }
         "__builtin_parity" => {
             let val = eval_fn(args.first()?)?;
@@ -234,29 +256,41 @@ pub fn eval_builtin_call(
         "__builtin_clrsb" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as i32;
-            let result = if v < 0 { (!v as u32).leading_zeros() as i32 - 1 }
-                         else { (v as u32).leading_zeros() as i32 - 1 };
+            let result = if v < 0 {
+                (!v as u32).leading_zeros() as i32 - 1
+            } else {
+                (v as u32).leading_zeros() as i32 - 1
+            };
             Some(IrConst::I32(result))
         }
         "__builtin_clrsbl" => {
             let val = eval_fn(args.first()?)?;
             if target_is_32bit() {
                 let v = val.to_i64()? as i32;
-                let result = if v < 0 { (!v as u32).leading_zeros() as i32 - 1 }
-                             else { (v as u32).leading_zeros() as i32 - 1 };
+                let result = if v < 0 {
+                    (!v as u32).leading_zeros() as i32 - 1
+                } else {
+                    (v as u32).leading_zeros() as i32 - 1
+                };
                 Some(IrConst::I32(result))
             } else {
                 let v = val.to_i64()?;
-                let result = if v < 0 { (!v as u64).leading_zeros() as i32 - 1 }
-                             else { (v as u64).leading_zeros() as i32 - 1 };
+                let result = if v < 0 {
+                    (!v as u64).leading_zeros() as i32 - 1
+                } else {
+                    (v as u64).leading_zeros() as i32 - 1
+                };
                 Some(IrConst::I32(result))
             }
         }
         "__builtin_clrsbll" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()?;
-            let result = if v < 0 { (!v as u64).leading_zeros() as i32 - 1 }
-                         else { (v as u64).leading_zeros() as i32 - 1 };
+            let result = if v < 0 {
+                (!v as u64).leading_zeros() as i32 - 1
+            } else {
+                (v as u64).leading_zeros() as i32 - 1
+            };
             Some(IrConst::I32(result))
         }
         // Float constant builtins: NaN, Infinity, huge_val
@@ -359,6 +393,13 @@ pub fn eval_binop_with_types(
         };
         (result_size <= 4, is_unsigned)
     };
-    const_arith::eval_const_binop(op, lhs, rhs, is_32bit, is_unsigned, lhs_unsigned, rhs_unsigned)
+    const_arith::eval_const_binop(
+        op,
+        lhs,
+        rhs,
+        is_32bit,
+        is_unsigned,
+        lhs_unsigned,
+        rhs_unsigned,
+    )
 }
-

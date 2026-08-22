@@ -1,20 +1,10 @@
-use crate::frontend::parser::ast::{
-    BinOp,
-    Declaration,
-    Expr,
-    StructFieldDecl,
-    TypeSpecifier,
-    UnaryOp,
-};
-use crate::ir::reexports::{
-    Instruction,
-    IrConst,
-    Operand,
-    Value,
-};
-use std::rc::Rc;
-use crate::common::types::{AddressSpace, IrType, StructLayout, RcLayout, CType};
 use super::lower::Lowerer;
+use crate::common::types::{AddressSpace, CType, IrType, RcLayout, StructLayout};
+use crate::frontend::parser::ast::{
+    BinOp, Declaration, Expr, StructFieldDecl, TypeSpecifier, UnaryOp,
+};
+use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+use std::rc::Rc;
 
 impl Lowerer {
     /// Register a struct/union type definition from a TypeSpecifier, computing and
@@ -26,7 +16,8 @@ impl Lowerer {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout = self.compute_struct_union_layout_packed(fields, false, max_field_align);
+                let mut layout =
+                    self.compute_struct_union_layout_packed(fields, false, max_field_align);
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -47,7 +38,8 @@ impl Lowerer {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout = self.compute_struct_union_layout_packed(fields, true, max_field_align);
+                let mut layout =
+                    self.compute_struct_union_layout_packed(fields, true, max_field_align);
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -81,12 +73,21 @@ impl Lowerer {
         for decl in &tu.decls {
             match decl {
                 ExternalDecl::Declaration(decl) => {
-                    Self::collect_struct_union_type_specs(&decl.type_spec, &mut type_specs_to_recompute);
+                    Self::collect_struct_union_type_specs(
+                        &decl.type_spec,
+                        &mut type_specs_to_recompute,
+                    );
                 }
                 ExternalDecl::FunctionDef(func) => {
-                    Self::collect_struct_union_type_specs(&func.return_type, &mut type_specs_to_recompute);
+                    Self::collect_struct_union_type_specs(
+                        &func.return_type,
+                        &mut type_specs_to_recompute,
+                    );
                     for p in &func.params {
-                        Self::collect_struct_union_type_specs(&p.type_spec, &mut type_specs_to_recompute);
+                        Self::collect_struct_union_type_specs(
+                            &p.type_spec,
+                            &mut type_specs_to_recompute,
+                        );
                     }
                 }
                 ExternalDecl::TopLevelAsm(_) => {}
@@ -98,10 +99,13 @@ impl Lowerer {
     }
 
     /// Collect all struct/union TypeSpecifiers with inline field definitions from a type.
-    fn collect_struct_union_type_specs<'a>(ts: &'a TypeSpecifier, out: &mut Vec<&'a TypeSpecifier>) {
+    fn collect_struct_union_type_specs<'a>(
+        ts: &'a TypeSpecifier,
+        out: &mut Vec<&'a TypeSpecifier>,
+    ) {
         match ts {
-            TypeSpecifier::Struct(_, Some(fields), _, _, _) |
-            TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), _, _, _)
+            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
                 out.push(ts);
                 for f in fields {
                     Self::collect_struct_union_type_specs(&f.type_spec, out);
@@ -115,10 +119,17 @@ impl Lowerer {
     /// Updates the existing layout entry in the map using the key from sema.
     fn recompute_layout_if_vector_fields(&mut self, ts: &TypeSpecifier) {
         let (tag, fields, is_union, is_packed, pragma_pack, struct_aligned) = match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, struct_aligned) =>
-                (tag, fields, false, *is_packed, *pragma_pack, *struct_aligned),
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) =>
-                (tag, fields, true, *is_packed, *pragma_pack, *struct_aligned),
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => (
+                tag,
+                fields,
+                false,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+            ),
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
+                (tag, fields, true, *is_packed, *pragma_pack, *struct_aligned)
+            }
             _ => return,
         };
         // Check if any field uses a vector typedef
@@ -126,7 +137,9 @@ impl Lowerer {
             let ctype = self.struct_field_ctype(f);
             ctype.is_vector()
         });
-        if !has_vector_field { return; }
+        if !has_vector_field {
+            return;
+        }
 
         // Find the existing layout key. For tagged types, use the tag-based key.
         // For anonymous types (e.g., typedef union { ... } name), find the key
@@ -156,7 +169,8 @@ impl Lowerer {
 
         if let Some(key) = existing_key {
             let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-            let mut layout = self.compute_struct_union_layout_packed(fields, is_union, max_field_align);
+            let mut layout =
+                self.compute_struct_union_layout_packed(fields, is_union, max_field_align);
             if let Some(a) = struct_aligned {
                 if a > layout.align {
                     layout.align = a;
@@ -291,18 +305,25 @@ impl Lowerer {
             TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
-                    if let Some(layout) = layouts.get(&format!("struct.{}", tag))
+                    if let Some(layout) = layouts
+                        .get(&format!("struct.{}", tag))
                         .or_else(|| layouts.get(tag.as_str()))
                     {
                         return Some(layout.clone());
                     }
                 }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(
+                    fields,
+                    false,
+                    max_field_align,
+                )))
             }
             TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
                 let layouts = self.types.borrow_struct_layouts();
-                layouts.get(&format!("struct.{}", tag)).cloned()
+                layouts
+                    .get(&format!("struct.{}", tag))
+                    .cloned()
                     .or_else(|| {
                         // Anonymous structs from typeof/ctype_to_type_spec use the
                         // raw CType key (e.g., "__anon_struct_N") as the tag.
@@ -312,29 +333,31 @@ impl Lowerer {
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
-                    if let Some(layout) = layouts.get(&format!("union.{}", tag))
+                    if let Some(layout) = layouts
+                        .get(&format!("union.{}", tag))
                         .or_else(|| layouts.get(tag.as_str()))
                     {
                         return Some(layout.clone());
                     }
                 }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(
+                    fields,
+                    true,
+                    max_field_align,
+                )))
             }
             TypeSpecifier::Union(Some(tag), None, _, _, _) => {
                 let layouts = self.types.borrow_struct_layouts();
-                layouts.get(&format!("union.{}", tag)).cloned()
-                    .or_else(|| {
-                        // Anonymous unions from typeof/ctype_to_type_spec use the
-                        // raw CType key (e.g., "__anon_struct_N") as the tag.
-                        layouts.get(tag.as_str()).cloned()
-                    })
+                layouts.get(&format!("union.{}", tag)).cloned().or_else(|| {
+                    // Anonymous unions from typeof/ctype_to_type_spec use the
+                    // raw CType key (e.g., "__anon_struct_N") as the tag.
+                    layouts.get(tag.as_str()).cloned()
+                })
             }
             // For typedef'd array types like `typedef S arr_t[4]`, peel the
             // Array wrapper(s) to find the inner struct/union element type.
-            TypeSpecifier::Array(inner, _) => {
-                self.get_struct_layout_for_type(inner)
-            }
+            TypeSpecifier::Array(inner, _) => self.get_struct_layout_for_type(inner),
             _ => None,
         }
     }
@@ -353,14 +376,20 @@ impl Lowerer {
                 // Static local variables: resolve via mangled global name
                 if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: mangled });
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: mangled,
+                    });
                     return addr;
                 }
                 if let Some(info) = self.func_mut().locals.get(name).cloned() {
                     // Static locals: emit fresh GlobalAddr
                     if let Some(ref global_name) = info.static_global_name {
                         let addr = self.fresh_value();
-                        self.emit(Instruction::GlobalAddr { dest: addr, name: global_name.clone() });
+                        self.emit(Instruction::GlobalAddr {
+                            dest: addr,
+                            name: global_name.clone(),
+                        });
                         return addr;
                     }
                     if info.is_struct {
@@ -373,7 +402,13 @@ impl Lowerer {
                     }
                     // It's a pointer to struct: load the pointer
                     let loaded = self.fresh_value();
-                    self.emit(Instruction::Load { volatile: false, dest: loaded, ptr: info.alloca, ty: IrType::Ptr , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: loaded,
+                        ptr: info.alloca,
+                        ty: IrType::Ptr,
+                        seg_override: AddressSpace::Default,
+                    });
                     return loaded;
                 }
                 if self.globals.contains_key(name) {
@@ -385,7 +420,10 @@ impl Lowerer {
                     // that no member defines).
                     let resolved_name = self.resolve_ref_name(name);
                     let addr = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr { dest: addr, name: resolved_name });
+                    self.emit(Instruction::GlobalAddr {
+                        dest: addr,
+                        name: resolved_name,
+                    });
                     return addr;
                 }
                 // Unknown - try to evaluate as expression
@@ -394,7 +432,10 @@ impl Lowerer {
                     Operand::Value(v) => v,
                     Operand::Const(_) => {
                         let tmp = self.fresh_value();
-                        self.emit(Instruction::Copy { dest: tmp, src: val });
+                        self.emit(Instruction::Copy {
+                            dest: tmp,
+                            src: val,
+                        });
                         tmp
                     }
                 }
@@ -406,7 +447,10 @@ impl Lowerer {
                     Operand::Value(v) => v,
                     Operand::Const(_) => {
                         let tmp = self.fresh_value();
-                        self.emit(Instruction::Copy { dest: tmp, src: val });
+                        self.emit(Instruction::Copy {
+                            dest: tmp,
+                            src: val,
+                        });
                         tmp
                     }
                 }
@@ -436,7 +480,10 @@ impl Lowerer {
                     Operand::Value(v) => v,
                     Operand::Const(_) => {
                         let tmp = self.fresh_value();
-                        self.emit(Instruction::Copy { dest: tmp, src: ptr_val });
+                        self.emit(Instruction::Copy {
+                            dest: tmp,
+                            src: ptr_val,
+                        });
                         tmp
                     }
                 };
@@ -465,8 +512,11 @@ impl Lowerer {
                 } else if let Expr::Identifier(name, _) = func_expr.as_ref() {
                     // Detect function pointer variables: identifiers that are
                     // local/global variables rather than known function names
-                    let is_fptr_var = (self.func_mut().locals.contains_key(name) && !self.known_functions.contains(name))
-                        || (!self.func_mut().locals.contains_key(name) && self.globals.contains_key(name) && !self.known_functions.contains(name));
+                    let is_fptr_var = (self.func_mut().locals.contains_key(name)
+                        && !self.known_functions.contains(name))
+                        || (!self.func_mut().locals.contains_key(name)
+                            && self.globals.contains_key(name)
+                            && !self.known_functions.contains(name));
                     if is_fptr_var {
                         // Indirect call through variable: use struct size to determine ABI
                         struct_size > 8
@@ -485,7 +535,9 @@ impl Lowerer {
                                 // result ADDRESS was spilled as 8 bytes and
                                 // the 32-byte init memcpy read through it
                                 // (clmul256 regression).
-                                let ret_size = self.types.func_return_ctypes
+                                let ret_size = self
+                                    .types
+                                    .func_return_ctypes
                                     .get(name.as_str())
                                     .filter(|c| c.is_struct_or_union() || c.is_vector())
                                     .map(|c| self.ctype_size(c))
@@ -507,7 +559,10 @@ impl Lowerer {
                         Operand::Value(v) => v,
                         Operand::Const(_) => {
                             let tmp = self.fresh_value();
-                            self.emit(Instruction::Copy { dest: tmp, src: val });
+                            self.emit(Instruction::Copy {
+                                dest: tmp,
+                                src: val,
+                            });
                             tmp
                         }
                     }
@@ -518,15 +573,30 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
-                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Alloca {
+                        dest: alloca,
+                        size: alloc_size,
+                        ty: store_ty,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val,
+                        ptr: alloca,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
+                    });
                     alloca
                 }
             }
             // Ternary and assignment on struct values produce rvalues (temporaries).
             // We must copy the struct data to a fresh temporary so that subsequent
             // member writes don't modify the original objects.
-            Expr::Conditional(_, _, _, _) | Expr::GnuConditional(_, _, _) | Expr::Assign(_, _, _) => {
+            Expr::Conditional(_, _, _, _)
+            | Expr::GnuConditional(_, _, _)
+            | Expr::Assign(_, _, _) => {
                 if let Some(struct_size) = self.struct_value_size(expr) {
                     if self.expr_produces_packed_struct_data(expr) {
                         // Small struct packed in a register: spill to alloca
@@ -534,16 +604,40 @@ impl Lowerer {
                         let alloca = self.fresh_value();
                         let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                         let store_ty = Self::packed_store_type(alloc_size);
-                        self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                        self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty, seg_override: AddressSpace::Default });
+                        self.emit(Instruction::Alloca {
+                            dest: alloca,
+                            size: alloc_size,
+                            ty: store_ty,
+                            align: 0,
+                            volatile: false,
+                            semantic_volatile: false,
+                        });
+                        self.emit(Instruction::Store {
+                            volatile: false,
+                            val,
+                            ptr: alloca,
+                            ty: store_ty,
+                            seg_override: AddressSpace::Default,
+                        });
                         alloca
                     } else {
                         // Struct returned by address: copy to a fresh temporary
                         let src_val = self.lower_expr(expr);
                         let src_addr = self.operand_to_value(src_val);
                         let tmp_alloca = self.fresh_value();
-                        self.emit(Instruction::Alloca { dest: tmp_alloca, size: struct_size, ty: IrType::Ptr, align: 0, volatile: false, semantic_volatile: false });
-                        self.emit(Instruction::Memcpy { dest: tmp_alloca, src: src_addr, size: struct_size });
+                        self.emit(Instruction::Alloca {
+                            dest: tmp_alloca,
+                            size: struct_size,
+                            ty: IrType::Ptr,
+                            align: 0,
+                            volatile: false,
+                            semantic_volatile: false,
+                        });
+                        self.emit(Instruction::Memcpy {
+                            dest: tmp_alloca,
+                            src: src_addr,
+                            size: struct_size,
+                        });
                         tmp_alloca
                     }
                 } else {
@@ -553,7 +647,10 @@ impl Lowerer {
                         Operand::Value(v) => v,
                         Operand::Const(_) => {
                             let tmp = self.fresh_value();
-                            self.emit(Instruction::Copy { dest: tmp, src: val });
+                            self.emit(Instruction::Copy {
+                                dest: tmp,
+                                src: val,
+                            });
                             tmp
                         }
                     }
@@ -568,8 +665,21 @@ impl Lowerer {
                     let alloca = self.fresh_value();
                     let alloc_size = if struct_size > 0 { struct_size } else { 8 };
                     let store_ty = Self::packed_store_type(alloc_size);
-                    self.emit(Instruction::Alloca { dest: alloca, size: alloc_size, ty: store_ty, align: 0, volatile: false, semantic_volatile: false });
-                    self.emit(Instruction::Store { volatile: false, val, ptr: alloca, ty: store_ty , seg_override: AddressSpace::Default });
+                    self.emit(Instruction::Alloca {
+                        dest: alloca,
+                        size: alloc_size,
+                        ty: store_ty,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    });
+                    self.emit(Instruction::Store {
+                        volatile: false,
+                        val,
+                        ptr: alloca,
+                        ty: store_ty,
+                        seg_override: AddressSpace::Default,
+                    });
                     alloca
                 } else {
                     let val = self.lower_expr(expr);
@@ -577,7 +687,10 @@ impl Lowerer {
                         Operand::Value(v) => v,
                         Operand::Const(_) => {
                             let tmp = self.fresh_value();
-                            self.emit(Instruction::Copy { dest: tmp, src: val });
+                            self.emit(Instruction::Copy {
+                                dest: tmp,
+                                src: val,
+                            });
                             tmp
                         }
                     }
@@ -604,7 +717,10 @@ impl Lowerer {
                 }
                 // Small struct (<= 8 bytes): produces packed data unless somehow sret
                 if let Expr::Identifier(name, _) = func_expr.as_ref() {
-                    self.func_meta.sigs.get(name.as_str()).is_none_or(|s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
+                    self.func_meta
+                        .sigs
+                        .get(name.as_str())
+                        .is_none_or(|s| s.sret_size.is_none() && s.two_reg_ret_size.is_none())
                 } else {
                     true
                 }
@@ -618,15 +734,14 @@ impl Lowerer {
                 self.expr_produces_packed_struct_data(cond)
                     || self.expr_produces_packed_struct_data(else_expr)
             }
-            Expr::Comma(_, last, _) => {
-                self.expr_produces_packed_struct_data(last)
-            }
+            Expr::Comma(_, last, _) => self.expr_produces_packed_struct_data(last),
             Expr::StmtExpr(compound, _) => {
                 // Statement expression: check if the last expression statement
                 // produces packed struct data (e.g., ({ pfn_pte(...); }))
                 if let Some(crate::frontend::parser::ast::BlockItem::Statement(
-                    crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr))
-                )) = compound.items.last() {
+                    crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr)),
+                )) = compound.items.last()
+                {
                     return self.expr_produces_packed_struct_data(inner_expr);
                 }
                 false
@@ -648,18 +763,33 @@ impl Lowerer {
 
     /// Resolve member access: returns (byte_offset, ir_type_of_field).
     /// Works for both direct (s.field) and pointer (p->field) access.
-    pub(super) fn resolve_member_access(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType) {
+    pub(super) fn resolve_member_access(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType) {
         self.resolve_member_access_impl(base_expr, field_name, false)
     }
 
     /// Resolve pointer member access (p->field): returns (byte_offset, ir_type_of_field).
-    pub(super) fn resolve_pointer_member_access(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType) {
+    pub(super) fn resolve_pointer_member_access(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType) {
         self.resolve_member_access_impl(base_expr, field_name, true)
     }
 
-    fn resolve_member_access_impl(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> (usize, IrType) {
+    fn resolve_member_access_impl(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> (usize, IrType) {
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
-            if let Some((offset, ctype)) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts()) {
+            if let Some((offset, ctype)) =
+                layout.field_offset(field_name, &*self.types.borrow_struct_layouts())
+            {
                 return (offset, IrType::from_ctype(&ctype));
             }
         }
@@ -668,16 +798,29 @@ impl Lowerer {
 
     /// Resolve member access with full bitfield info.
     /// Returns (byte_offset, ir_type, Option<(bit_offset, bit_width)>).
-    pub(super) fn resolve_member_access_full(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType, Option<(u32, u32)>) {
+    pub(super) fn resolve_member_access_full(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType, Option<(u32, u32)>) {
         self.resolve_member_access_full_impl(base_expr, field_name, false)
     }
 
     /// Resolve pointer member access with full bitfield info.
-    pub(super) fn resolve_pointer_member_access_full(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType, Option<(u32, u32)>) {
+    pub(super) fn resolve_pointer_member_access_full(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType, Option<(u32, u32)>) {
         self.resolve_member_access_full_impl(base_expr, field_name, true)
     }
 
-    fn resolve_member_access_full_impl(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> (usize, IrType, Option<(u32, u32)>) {
+    fn resolve_member_access_full_impl(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> (usize, IrType, Option<(u32, u32)>) {
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
             if let Some(fl) = layout.field_layout(field_name) {
                 let ir_ty = IrType::from_ctype(&fl.ty);
@@ -689,7 +832,9 @@ impl Lowerer {
             }
             // Fallback: search anonymous struct/union members recursively,
             // preserving bitfield metadata (bit_offset, bit_width).
-            if let Some((offset, ctype, bit_offset, bit_width)) = layout.field_offset_with_bitfield(field_name, &*self.types.borrow_struct_layouts()) {
+            if let Some((offset, ctype, bit_offset, bit_width)) =
+                layout.field_offset_with_bitfield(field_name, &*self.types.borrow_struct_layouts())
+            {
                 let bf = match (bit_offset, bit_width) {
                     (Some(bo), Some(bw)) => Some((bo, bw)),
                     _ => None,
@@ -749,9 +894,7 @@ impl Lowerer {
             Expr::UnaryOp(UnaryOp::PreInc | UnaryOp::PreDec, inner, _) => {
                 self.get_pointed_struct_layout(inner)
             }
-            Expr::PostfixOp(_, inner, _) => {
-                self.get_pointed_struct_layout(inner)
-            }
+            Expr::PostfixOp(_, inner, _) => self.get_pointed_struct_layout(inner),
             Expr::BinaryOp(op, lhs, rhs, _) if matches!(op, BinOp::Add | BinOp::Sub) => {
                 // Pointer arithmetic: (p + i) or (p - i) preserves the pointed-to struct type
                 if let Some(layout) = self.get_pointed_struct_layout(lhs) {
@@ -797,7 +940,9 @@ impl Lowerer {
             }
             Expr::ArraySubscript(base, _, _) => {
                 // pp[i] where pp is an array of struct pointers
-                if let Some(CType::Array(elem, _) | CType::Pointer(elem, _)) = self.get_expr_ctype(base).as_ref() {
+                if let Some(CType::Array(elem, _) | CType::Pointer(elem, _)) =
+                    self.get_expr_ctype(base).as_ref()
+                {
                     if let CType::Pointer(pointee, _) = elem.as_ref() {
                         return self.struct_layout_from_ctype(pointee);
                     }
@@ -814,20 +959,15 @@ impl Lowerer {
                 self.get_pointed_struct_layout(then_expr)
                     .or_else(|| self.get_pointed_struct_layout(else_expr))
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
-                self.get_pointed_struct_layout(cond)
-                    .or_else(|| self.get_pointed_struct_layout(else_expr))
-            }
-            Expr::Comma(_, last, _) => {
-                self.get_pointed_struct_layout(last)
-            }
+            Expr::GnuConditional(cond, else_expr, _) => self
+                .get_pointed_struct_layout(cond)
+                .or_else(|| self.get_pointed_struct_layout(else_expr)),
+            Expr::Comma(_, last, _) => self.get_pointed_struct_layout(last),
             Expr::StmtExpr(..) => {
                 // Statement expression: use CType resolution to find the
                 // pointed-to struct type, since inner variables may not be
                 // in scope yet during layout lookup.
-                if let Some(CType::Pointer(pointee, _)) =
-                    self.get_expr_ctype(expr).as_ref()
-                {
+                if let Some(CType::Pointer(pointee, _)) = self.get_expr_ctype(expr).as_ref() {
                     return self.struct_layout_from_ctype(pointee);
                 }
                 None
@@ -860,9 +1000,11 @@ impl Lowerer {
     /// Prefers cached layout from struct_layouts when available.
     pub(super) fn struct_layout_from_ctype(&self, ctype: &CType) -> Option<RcLayout> {
         match ctype {
-            CType::Struct(key) | CType::Union(key) => {
-                self.types.borrow_struct_layouts().get(key.as_ref()).cloned()
-            }
+            CType::Struct(key) | CType::Union(key) => self
+                .types
+                .borrow_struct_layouts()
+                .get(key.as_ref())
+                .cloned(),
             _ => None,
         }
     }
@@ -940,15 +1082,9 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.get_layout_for_expr(lhs)
             }
-            Expr::Conditional(_, then_expr, _, _) => {
-                self.get_layout_for_expr(then_expr)
-            }
-            Expr::GnuConditional(cond, _, _) => {
-                self.get_layout_for_expr(cond)
-            }
-            Expr::Comma(_, last, _) => {
-                self.get_layout_for_expr(last)
-            }
+            Expr::Conditional(_, then_expr, _, _) => self.get_layout_for_expr(then_expr),
+            Expr::GnuConditional(cond, _, _) => self.get_layout_for_expr(cond),
+            Expr::Comma(_, last, _) => self.get_layout_for_expr(last),
             Expr::StmtExpr(..) => {
                 // Statement expression: use CType resolution (which handles
                 // inner scopes via sema) to find the struct type, since the
@@ -958,9 +1094,7 @@ impl Lowerer {
                 }
                 None
             }
-            Expr::VaArg(_, type_spec, _) => {
-                self.get_struct_layout_for_type(type_spec)
-            }
+            Expr::VaArg(_, type_spec, _) => self.get_struct_layout_for_type(type_spec),
             _ => None,
         }
     }
@@ -973,9 +1107,16 @@ impl Lowerer {
     /// `want_pointer_deref`: whether the caller wants the field treated as a pointer
     ///   (true for get_pointed_struct_layout: field is a pointer to struct, resolve its pointee)
     ///   (false for get_layout_for_expr: field is a struct, resolve its own layout)
-    fn resolve_field_struct_layout(&self, base: &Expr, field: &str, is_pointer_base: bool, want_pointer_deref: bool) -> Option<RcLayout> {
+    fn resolve_field_struct_layout(
+        &self,
+        base: &Expr,
+        field: &str,
+        is_pointer_base: bool,
+        want_pointer_deref: bool,
+    ) -> Option<RcLayout> {
         let base_layout = self.get_member_layout(base, is_pointer_base)?;
-        let (_offset, ctype) = base_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+        let (_offset, ctype) =
+            base_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
         if want_pointer_deref {
             // Caller wants what the field points to (get_pointed_struct_layout path)
             if let Some(layout) = self.resolve_struct_from_pointer_ctype(&ctype) {
@@ -997,10 +1138,20 @@ impl Lowerer {
     /// Shared helper: resolve struct layout from a function call expression.
     /// For get_pointed_struct_layout: the return type is a pointer to struct, resolve its pointee.
     /// For get_layout_for_expr: the return type is a struct, resolve its layout.
-    fn resolve_func_call_struct_layout(&self, func: &Expr, call_expr: &Expr, want_pointer_deref: bool) -> Option<RcLayout> {
+    fn resolve_func_call_struct_layout(
+        &self,
+        func: &Expr,
+        call_expr: &Expr,
+        want_pointer_deref: bool,
+    ) -> Option<RcLayout> {
         // Try direct function name first
         if let Expr::Identifier(name, _) = func {
-            if let Some(ctype) = self.func_meta.sigs.get(name.as_str()).and_then(|s| s.return_ctype.as_ref()) {
+            if let Some(ctype) = self
+                .func_meta
+                .sigs
+                .get(name.as_str())
+                .and_then(|s| s.return_ctype.as_ref())
+            {
                 if want_pointer_deref {
                     if let CType::Pointer(pointee, _) = ctype {
                         return self.struct_layout_from_ctype(pointee);
@@ -1026,9 +1177,16 @@ impl Lowerer {
     /// Resolve member access to get the CType of the field (not just the IrType).
     /// This is needed to check if a field is an array type (for array decay behavior).
     /// Handles both direct (s.field) and pointer (p->field) access.
-    pub(super) fn resolve_member_field_ctype_impl(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> Option<CType> {
+    pub(super) fn resolve_member_field_ctype_impl(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Option<CType> {
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
-            if let Some((_offset, ctype)) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts()) {
+            if let Some((_offset, ctype)) =
+                layout.field_offset(field_name, &*self.types.borrow_struct_layouts())
+            {
                 return Some(ctype.clone());
             }
         }
@@ -1037,17 +1195,30 @@ impl Lowerer {
 
     /// Resolve member access and return full info including CType.
     /// Returns (byte_offset, ir_type, bitfield_info, field_ctype).
-    pub(super) fn resolve_member_access_with_ctype(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
+    pub(super) fn resolve_member_access_with_ctype(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
         self.resolve_member_access_with_ctype_impl(base_expr, field_name, false)
     }
 
     /// Resolve pointer member access and return full info including CType.
     /// Returns (byte_offset, ir_type, bitfield_info, field_ctype).
-    pub(super) fn resolve_pointer_member_access_with_ctype(&self, base_expr: &Expr, field_name: &str) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
+    pub(super) fn resolve_pointer_member_access_with_ctype(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+    ) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
         self.resolve_member_access_with_ctype_impl(base_expr, field_name, true)
     }
 
-    fn resolve_member_access_with_ctype_impl(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
+    fn resolve_member_access_with_ctype_impl(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> (usize, IrType, Option<(u32, u32)>, Option<CType>) {
         if let Some(layout) = self.get_member_layout(base_expr, is_pointer) {
             if let Some(fl) = layout.field_layout(field_name) {
                 let ir_ty = IrType::from_ctype(&fl.ty);
@@ -1059,7 +1230,9 @@ impl Lowerer {
             }
             // Search anonymous struct/union members recursively,
             // preserving bitfield metadata (bit_offset, bit_width).
-            if let Some((offset, ctype, bit_offset, bit_width)) = layout.field_offset_with_bitfield(field_name, &*self.types.borrow_struct_layouts()) {
+            if let Some((offset, ctype, bit_offset, bit_width)) =
+                layout.field_offset_with_bitfield(field_name, &*self.types.borrow_struct_layouts())
+            {
                 let bf = match (bit_offset, bit_width) {
                     (Some(bo), Some(bw)) => Some((bo, bw)),
                     _ => None,
@@ -1076,7 +1249,9 @@ impl Lowerer {
     /// to pointers, so the element type is the pointed-to struct).
     fn resolve_struct_from_pointer_ctype(&self, ctype: &CType) -> Option<RcLayout> {
         match ctype {
-            CType::Pointer(inner, _) | CType::Array(inner, _) => self.struct_layout_from_ctype(inner),
+            CType::Pointer(inner, _) | CType::Array(inner, _) => {
+                self.struct_layout_from_ctype(inner)
+            }
             _ => None,
         }
     }

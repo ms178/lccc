@@ -3,16 +3,20 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use crate::ir::reexports::{IntrinsicOp, Operand, Value};
+use super::emit::{arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys, ArmCodegen};
 use crate::common::types::IrType;
-use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
+use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
 impl ArmCodegen {
     /// If `val_id` is register-allocated to a NEON register, return its 128-bit
     /// `vN` name (allocator IDs 40..55 map to v16..v31).
     fn assigned_vector_reg(&self, val_id: u32) -> Option<String> {
         self.reg_assignments.get(&val_id).and_then(|&phys| {
-            if is_arm_fp_phys(phys) { Some(arm_vector_name(phys)) } else { None }
+            if is_arm_fp_phys(phys) {
+                Some(arm_vector_name(phys))
+            } else {
+                None
+            }
         })
     }
 
@@ -35,13 +39,19 @@ impl ArmCodegen {
         self.state.vector_values.insert(dest.0);
         if let Some(name) = self.assigned_vector_reg(dest.0) {
             let src = qreg.replacen('q', "v", 1);
-            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, src));
+            self.state
+                .emit_fmt(format_args!("    mov {}.16b, {}.16b", name, src));
         } else if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_sp(qreg, slot.0, "str");
         }
     }
 
-    pub(super) fn emit_neon_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], neon_inst: &str) {
+    pub(super) fn emit_neon_binary_128(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        neon_inst: &str,
+    ) {
         // Load first 128-bit operand pointer into x0, then load q0
         self.operand_to_x0(&args[0]);
         self.state.emit("    ldr q0, [x0]");
@@ -63,7 +73,8 @@ impl ArmCodegen {
         }
         self.state.emit("    ldr q1, [x1]");
         // Apply the binary NEON operation
-        self.state.emit_fmt(format_args!("    {} v0.16b, v0.16b, v1.16b", neon_inst));
+        self.state
+            .emit_fmt(format_args!("    {} v0.16b, v0.16b, v1.16b", neon_inst));
         // Store result to dest_ptr
         self.load_ptr_to_reg(dest_ptr, "x0");
         self.state.emit("    str q0, [x0]");
@@ -84,12 +95,17 @@ impl ArmCodegen {
         // When the dest has an FP register, compute straight into it.
         let dest_reg = dest.and_then(|d| {
             self.reg_assignments.get(&d.0).and_then(|&phys| {
-                if is_arm_fp_phys(phys) { Some(arm_fp_name(phys, IrType::F64)) } else { None }
+                if is_arm_fp_phys(phys) {
+                    Some(arm_fp_name(phys, IrType::F64))
+                } else {
+                    None
+                }
             })
         });
         if let Some(dreg) = dest_reg {
             let src = self.float_operand_reg(&args[0], IrType::F64, "d0");
-            self.state.emit_fmt(format_args!("    {} {}, {}", op_inst, dreg, src));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}", op_inst, dreg, src));
             return;
         }
         self.float_operand_to_reg(&args[0], IrType::F64, "d0");
@@ -109,12 +125,20 @@ impl ArmCodegen {
     }
 
     /// Emit a non-temporal store: load value from args[0], store to dest_ptr.
-    fn emit_nontemporal_store(&mut self, dest_ptr: &Option<Value>, args: &[Operand], save_reg: &str, val_reg: &str) {
+    fn emit_nontemporal_store(
+        &mut self,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+        save_reg: &str,
+        val_reg: &str,
+    ) {
         if let Some(ptr) = dest_ptr {
             self.operand_to_x0(&args[0]);
-            self.state.emit_fmt(format_args!("    mov {}, {}", save_reg, val_reg));
+            self.state
+                .emit_fmt(format_args!("    mov {}, {}", save_reg, val_reg));
             self.load_ptr_to_reg(ptr, "x0");
-            self.state.emit_fmt(format_args!("    str {}, [x0]", save_reg));
+            self.state
+                .emit_fmt(format_args!("    str {}, [x0]", save_reg));
         }
     }
 
@@ -149,7 +173,10 @@ impl ArmCodegen {
         // Non-zero offset: x10 = base + offset. x10 is the designated
         // scratch for address formation in this backend (never allocated).
         let off = offset.expect("checked above");
-        match (base_phys, self.operand_reg(off).filter(|r| !is_arm_fp_phys(*r))) {
+        match (
+            base_phys,
+            self.operand_reg(off).filter(|r| !is_arm_fp_phys(*r)),
+        ) {
             (Some(b), Some(o)) => {
                 self.state.emit_fmt(format_args!(
                     "    add x10, {}, {}",
@@ -170,10 +197,8 @@ impl ArmCodegen {
                     }
                 }
                 self.operand_to_x0(off);
-                self.state.emit_fmt(format_args!(
-                    "    add x10, {}, x0",
-                    callee_saved_name(b)
-                ));
+                self.state
+                    .emit_fmt(format_args!("    add x10, {}, x0", callee_saved_name(b)));
             }
             (None, _) => {
                 // Base not register-resident: build base in x10 first, then
@@ -189,7 +214,13 @@ impl ArmCodegen {
         "x10".to_string()
     }
 
-    pub(super) fn emit_intrinsic_arm(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+    pub(super) fn emit_intrinsic_arm(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
         match op {
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
                 self.state.emit("    dmb ish");
@@ -327,18 +358,24 @@ impl ArmCodegen {
                     self.state.emit("    str q0, [x0]");
                 }
             }
-            IntrinsicOp::Crc32_8 | IntrinsicOp::Crc32_16
-            | IntrinsicOp::Crc32_32 | IntrinsicOp::Crc32_64 => {
+            IntrinsicOp::Crc32_8
+            | IntrinsicOp::Crc32_16
+            | IntrinsicOp::Crc32_32
+            | IntrinsicOp::Crc32_64 => {
                 let is_64 = matches!(op, IntrinsicOp::Crc32_64);
                 let (save_reg, crc_inst) = match op {
-                    IntrinsicOp::Crc32_8  => ("w9", "crc32cb w9, w9, w0"),
+                    IntrinsicOp::Crc32_8 => ("w9", "crc32cb w9, w9, w0"),
                     IntrinsicOp::Crc32_16 => ("w9", "crc32ch w9, w9, w0"),
                     IntrinsicOp::Crc32_32 => ("w9", "crc32cw w9, w9, w0"),
                     IntrinsicOp::Crc32_64 => ("x9", "crc32cx w9, w9, x0"),
                     _ => unreachable!(),
                 };
                 self.operand_to_x0(&args[0]);
-                self.state.emit_fmt(format_args!("    mov {}, {}", save_reg, if is_64 { "x0" } else { "w0" }));
+                self.state.emit_fmt(format_args!(
+                    "    mov {}, {}",
+                    save_reg,
+                    if is_64 { "x0" } else { "w0" }
+                ));
                 self.operand_to_x0(&args[1]);
                 self.state.emit_fmt(format_args!("    {}", crc_inst));
                 self.state.emit("    mov x0, x9");
@@ -366,44 +403,77 @@ impl ArmCodegen {
             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.
             // TODO: consider emitting a runtime trap instead of silent zeros
-            IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128
-            | IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128
-            | IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128
+            IntrinsicOp::Aesenc128
+            | IntrinsicOp::Aesenclast128
+            | IntrinsicOp::Aesdec128
+            | IntrinsicOp::Aesdeclast128
+            | IntrinsicOp::Aesimc128
+            | IntrinsicOp::Aeskeygenassist128
             | IntrinsicOp::Pclmulqdq128
-            | IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128
-            | IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128
-            | IntrinsicOp::Pshufd128 | IntrinsicOp::Loadldi128
-            | IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128
-            | IntrinsicOp::Pmulhw128 | IntrinsicOp::Pmaddwd128
-            | IntrinsicOp::Pcmpgtw128 | IntrinsicOp::Pcmpgtb128
-            | IntrinsicOp::Psllwi128 | IntrinsicOp::Psrlwi128
-            | IntrinsicOp::Psrawi128 | IntrinsicOp::Psradi128
-            | IntrinsicOp::Pslldi128 | IntrinsicOp::Psrldi128
-            | IntrinsicOp::Paddd128 | IntrinsicOp::Psubd128
-            | IntrinsicOp::Packssdw128 | IntrinsicOp::Packsswb128 | IntrinsicOp::Packuswb128
-            | IntrinsicOp::Punpcklbw128 | IntrinsicOp::Punpckhbw128
-            | IntrinsicOp::Punpcklwd128 | IntrinsicOp::Punpckhwd128
-            | IntrinsicOp::SetEpi16 | IntrinsicOp::Pinsrw128
-            | IntrinsicOp::Pextrw128 | IntrinsicOp::Storeldi128
-            | IntrinsicOp::Cvtsi128Si32 | IntrinsicOp::Cvtsi32Si128
+            | IntrinsicOp::Pslldqi128
+            | IntrinsicOp::Psrldqi128
+            | IntrinsicOp::Psllqi128
+            | IntrinsicOp::Psrlqi128
+            | IntrinsicOp::Pshufd128
+            | IntrinsicOp::Loadldi128
+            | IntrinsicOp::Paddw128
+            | IntrinsicOp::Psubw128
+            | IntrinsicOp::Pmulhw128
+            | IntrinsicOp::Pmaddwd128
+            | IntrinsicOp::Pcmpgtw128
+            | IntrinsicOp::Pcmpgtb128
+            | IntrinsicOp::Psllwi128
+            | IntrinsicOp::Psrlwi128
+            | IntrinsicOp::Psrawi128
+            | IntrinsicOp::Psradi128
+            | IntrinsicOp::Pslldi128
+            | IntrinsicOp::Psrldi128
+            | IntrinsicOp::Paddd128
+            | IntrinsicOp::Psubd128
+            | IntrinsicOp::Packssdw128
+            | IntrinsicOp::Packsswb128
+            | IntrinsicOp::Packuswb128
+            | IntrinsicOp::Punpcklbw128
+            | IntrinsicOp::Punpckhbw128
+            | IntrinsicOp::Punpcklwd128
+            | IntrinsicOp::Punpckhwd128
+            | IntrinsicOp::SetEpi16
+            | IntrinsicOp::Pinsrw128
+            | IntrinsicOp::Pextrw128
+            | IntrinsicOp::Storeldi128
+            | IntrinsicOp::Cvtsi128Si32
+            | IntrinsicOp::Cvtsi32Si128
             | IntrinsicOp::Cvtsi128Si64
-            | IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128
-            | IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128
-            | IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128
-            | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
+            | IntrinsicOp::Pshuflw128
+            | IntrinsicOp::Pshufhw128
+            | IntrinsicOp::Pinsrd128
+            | IntrinsicOp::Pextrd128
+            | IntrinsicOp::Pinsrb128
+            | IntrinsicOp::Pextrb128
+            | IntrinsicOp::Pinsrq128
+            | IntrinsicOp::Pextrq128
             | IntrinsicOp::FmaF64x4
-            | IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::FmaF64x4SIB
-            | IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2
-            | IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4
-            | IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2
-            | IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2
-            | IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4
-            | IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2
-            | IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4 => {
+            | IntrinsicOp::FmaF64x4Hoisted
+            | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::LoadF64x4
+            | IntrinsicOp::LoadF64x2
+            | IntrinsicOp::LoadI32x8
+            | IntrinsicOp::LoadI32x4
+            | IntrinsicOp::AddF64x4
+            | IntrinsicOp::AddF64x2
+            | IntrinsicOp::MulF64x4
+            | IntrinsicOp::MulF64x2
+            | IntrinsicOp::AddI32x8
+            | IntrinsicOp::AddI32x4
+            | IntrinsicOp::HorizontalAddF64x4
+            | IntrinsicOp::HorizontalAddF64x2
+            | IntrinsicOp::HorizontalAddI32x8
+            | IntrinsicOp::HorizontalAddI32x4 => {
                 // x86-only: zero dest if present
                 if let Some(dptr) = dest_ptr {
                     if let Some(slot) = self.state.get_slot(dptr.0) {
-                        self.state.emit_fmt(format_args!("    add x9, sp, #{}", slot.0));
+                        self.state
+                            .emit_fmt(format_args!("    add x9, sp, #{}", slot.0));
                         self.state.emit("    stp xzr, xzr, [x9]");
                     }
                 }
@@ -437,7 +507,9 @@ impl ArmCodegen {
             IntrinsicOp::FmaF64x2Hoisted => {
                 if let Some(c_ptr) = dest_ptr {
                     let b_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
-                    let c_phys = self.operand_reg(&Operand::Value(*c_ptr)).filter(|r| !is_arm_fp_phys(*r));
+                    let c_phys = self
+                        .operand_reg(&Operand::Value(*c_ptr))
+                        .filter(|r| !is_arm_fp_phys(*r));
                     let b_addr = b_phys.map(callee_saved_name).unwrap_or("x11");
                     let c_addr = c_phys.map(callee_saved_name).unwrap_or("x12");
                     if b_phys.is_none() {
@@ -448,14 +520,20 @@ impl ArmCodegen {
                         self.operand_to_x0(&Operand::Value(*c_ptr));
                         self.state.emit("    mov x12, x0");
                     }
-                    self.state.emit_fmt(format_args!("    ldr q1, [{}]", b_addr));
-                    self.state.emit_fmt(format_args!("    ldr q2, [{}]", c_addr));
+                    self.state
+                        .emit_fmt(format_args!("    ldr q1, [{}]", b_addr));
+                    self.state
+                        .emit_fmt(format_args!("    ldr q2, [{}]", c_addr));
                     self.state.emit("    fmla v2.2d, v1.2d, v15.2d");
-                    self.state.emit_fmt(format_args!("    str q2, [{}]", c_addr));
-                    self.state.emit_fmt(format_args!("    ldr q1, [{}, #16]", b_addr));
-                    self.state.emit_fmt(format_args!("    ldr q2, [{}, #16]", c_addr));
+                    self.state
+                        .emit_fmt(format_args!("    str q2, [{}]", c_addr));
+                    self.state
+                        .emit_fmt(format_args!("    ldr q1, [{}, #16]", b_addr));
+                    self.state
+                        .emit_fmt(format_args!("    ldr q2, [{}, #16]", c_addr));
                     self.state.emit("    fmla v2.2d, v1.2d, v15.2d");
-                    self.state.emit_fmt(format_args!("    str q2, [{}, #16]", c_addr));
+                    self.state
+                        .emit_fmt(format_args!("    str q2, [{}, #16]", c_addr));
                 }
             }
 
@@ -463,7 +541,8 @@ impl ArmCodegen {
                 if let Some(d) = dest {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    eor {0}.16b, {0}.16b, {0}.16b", name));
+                        self.state
+                            .emit_fmt(format_args!("    eor {0}.16b, {0}.16b, {0}.16b", name));
                     } else {
                         self.state.emit("    eor v0.16b, v0.16b, v0.16b");
                         self.store_vector_value_128(d, "q0");
@@ -477,7 +556,8 @@ impl ArmCodegen {
                     self.state.emit_fmt(format_args!("    ldr d0, [{}]", addr));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    sxtl {}.2d, v0.2s", name));
+                        self.state
+                            .emit_fmt(format_args!("    sxtl {}.2d, v0.2s", name));
                     } else {
                         self.state.emit("    sxtl v0.2d, v0.2s");
                         self.store_vector_value_128(d, "q0");
@@ -489,12 +569,20 @@ impl ArmCodegen {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
                     let b = self.load_vector_value_128(&args[1], "q1");
-                    let mnemonic = if *op == IntrinsicOp::VecAddI64x2 { "add" } else { "mul" };
+                    let mnemonic = if *op == IntrinsicOp::VecAddI64x2 {
+                        "add"
+                    } else {
+                        "mul"
+                    };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    {} {}.2d, {}.2d, {}.2d", mnemonic, name, a, b));
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}.2d, {}.2d, {}.2d",
+                            mnemonic, name, a, b
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    {} v0.2d, {}.2d, {}.2d", mnemonic, a, b));
+                        self.state
+                            .emit_fmt(format_args!("    {} v0.2d, {}.2d, {}.2d", mnemonic, a, b));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -504,7 +592,9 @@ impl ArmCodegen {
                 let a = self.load_vector_value_128(&args[0], "q0");
                 self.state.emit_fmt(format_args!("    addp d0, {}.2d", a));
                 self.state.emit("    fmov x0, d0");
-                if let Some(d) = dest { self.store_x0_to(d); }
+                if let Some(d) = dest {
+                    self.store_x0_to(d);
+                }
             }
 
             // NEON sadalp: accumulate sign-extended adjacent pairs of a 4×I32
@@ -516,14 +606,18 @@ impl ArmCodegen {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
                         if name != acc {
-                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
+                            self.state
+                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
                         }
-                        self.state.emit_fmt(format_args!("    sadalp {}.2d, {}.4s", name, src));
+                        self.state
+                            .emit_fmt(format_args!("    sadalp {}.2d, {}.4s", name, src));
                     } else {
                         if acc != "v0" {
-                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
+                            self.state
+                                .emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
                         }
-                        self.state.emit_fmt(format_args!("    sadalp v0.2d, {}.4s", src));
+                        self.state
+                            .emit_fmt(format_args!("    sadalp v0.2d, {}.4s", src));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -544,14 +638,22 @@ impl ArmCodegen {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
                         if name != acc {
-                            self.state.emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
+                            self.state
+                                .emit_fmt(format_args!("    mov {}.16b, {}.16b", name, acc));
                         }
-                        self.state.emit_fmt(format_args!("    {} {}.2d, {}.{}, {}.{}", mnemonic, name, a, suffix, b, suffix));
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}.2d, {}.{}, {}.{}",
+                            mnemonic, name, a, suffix, b, suffix
+                        ));
                     } else {
                         if acc != "v0" {
-                            self.state.emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
+                            self.state
+                                .emit_fmt(format_args!("    mov v0.16b, {}.16b", acc));
                         }
-                        self.state.emit_fmt(format_args!("    {} v0.2d, {}.{}, {}.{}", mnemonic, a, suffix, b, suffix));
+                        self.state.emit_fmt(format_args!(
+                            "    {} v0.2d, {}.{}, {}.{}",
+                            mnemonic, a, suffix, b, suffix
+                        ));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -559,15 +661,15 @@ impl ArmCodegen {
 
             // Register-based vector operations (NEON 128-bit).
             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
-            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadF32x4
-            | IntrinsicOp::VecLoadI32x4 => {
+            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadF32x4 | IntrinsicOp::VecLoadI32x4 => {
                 if let Some(d) = dest {
                     let addr = self.vec_addr_from_args(&args[0], args.get(1));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         // Load directly into the assigned register (no copy).
                         self.state.vector_values.insert(d.0);
                         let qname = name.replacen('v', "q", 1);
-                        self.state.emit_fmt(format_args!("    ldr {}, [{}]", qname, addr));
+                        self.state
+                            .emit_fmt(format_args!("    ldr {}, [{}]", qname, addr));
                     } else {
                         self.state.emit_fmt(format_args!("    ldr q0, [{}]", addr));
                         self.store_vector_value_128(d, "q0");
@@ -579,7 +681,8 @@ impl ArmCodegen {
                 if let Some(d) = dest {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    eor {0}.16b, {0}.16b, {0}.16b", name));
+                        self.state
+                            .emit_fmt(format_args!("    eor {0}.16b, {0}.16b, {0}.16b", name));
                     } else {
                         self.state.emit("    eor v0.16b, v0.16b, v0.16b");
                         self.store_vector_value_128(d, "q0");
@@ -587,9 +690,12 @@ impl ArmCodegen {
                 }
             }
 
-            IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x2
-            | IntrinsicOp::VecAddF32x4 | IntrinsicOp::VecMulF32x4
-            | IntrinsicOp::VecAddI32x4 | IntrinsicOp::VecMulI32x4 => {
+            IntrinsicOp::VecAddF64x2
+            | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecAddF32x4
+            | IntrinsicOp::VecMulF32x4
+            | IntrinsicOp::VecAddI32x4
+            | IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
                     let b = self.load_vector_value_128(&args[1], "q1");
@@ -603,9 +709,15 @@ impl ArmCodegen {
                     };
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    {} {}.{}, {}.{}, {}.{}", mnemonic, name, suffix, a, suffix, b, suffix));
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}.{}, {}.{}, {}.{}",
+                            mnemonic, name, suffix, a, suffix, b, suffix
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    {} v0.{}, {}.{}, {}.{}", mnemonic, suffix, a, suffix, b, suffix));
+                        self.state.emit_fmt(format_args!(
+                            "    {} v0.{}, {}.{}, {}.{}",
+                            mnemonic, suffix, a, suffix, b, suffix
+                        ));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -618,12 +730,18 @@ impl ArmCodegen {
                     } else {
                         (IrType::F32, "s", "4s")
                     };
-                    self.float_operand_to_reg(&args[0], ty, if ty == IrType::F64 { "d0" } else { "s0" });
+                    self.float_operand_to_reg(
+                        &args[0],
+                        ty,
+                        if ty == IrType::F64 { "d0" } else { "s0" },
+                    );
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!("    dup {}.{}, v0.{}[0]", name, suffix, lane));
+                        self.state
+                            .emit_fmt(format_args!("    dup {}.{}, v0.{}[0]", name, suffix, lane));
                     } else {
-                        self.state.emit_fmt(format_args!("    dup v0.{}, v0.{}[0]", suffix, lane));
+                        self.state
+                            .emit_fmt(format_args!("    dup v0.{}, v0.{}[0]", suffix, lane));
                         self.store_vector_value_128(d, "q0");
                     }
                 }
@@ -642,7 +760,8 @@ impl ArmCodegen {
                 }
             }
 
-            IntrinsicOp::VecStoreF64x2 | IntrinsicOp::VecStoreF32x4
+            IntrinsicOp::VecStoreF64x2
+            | IntrinsicOp::VecStoreF32x4
             | IntrinsicOp::VecStoreI32x4 => {
                 // Store one 128-bit vector to dest_ptr.
                 if dest_ptr.is_some() {
@@ -681,20 +800,25 @@ impl ArmCodegen {
                 let a = self.load_vector_value_128(&args[0], "q0");
                 self.state.emit_fmt(format_args!("    addv s0, {}.4s", a));
                 self.state.emit("    fmov w0, s0");
-                if let Some(d) = dest { self.store_x0_to(d); }
+                if let Some(d) = dest {
+                    self.store_x0_to(d);
+                }
             }
 
             // Not-yet-implemented register-based vector intrinsics for ARM.
-            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadI32x8 |
-            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecMulF64x4 |
-            IntrinsicOp::VecAddI32x8 |
-            IntrinsicOp::VecHorizontalAddF64x4 |
-            IntrinsicOp::VecHorizontalAddI32x8 |
-            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroI32x8 => {
+            IntrinsicOp::VecLoadF64x4
+            | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecAddF64x4
+            | IntrinsicOp::VecMulF64x4
+            | IntrinsicOp::VecAddI32x8
+            | IntrinsicOp::VecHorizontalAddF64x4
+            | IntrinsicOp::VecHorizontalAddI32x8
+            | IntrinsicOp::VecZeroF64x4
+            | IntrinsicOp::VecZeroI32x8 => {
                 unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
             }
-                    _ => { /* x86-only SIMD op on arm: no-op */ }
-}
+            _ => { /* x86-only SIMD op on arm: no-op */ }
+        }
     }
 
     // ---- F128 (long double / IEEE quad precision) soft-float helpers ----
@@ -705,5 +829,4 @@ impl ArmCodegen {
     //   Arithmetic: __addtf3, __subtf3, __multf3, __divtf3
     //   Conversion: __extenddftf2 (f64->f128), __trunctfdf2 (f128->f64)
     // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
-
 }

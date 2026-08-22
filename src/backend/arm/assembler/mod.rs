@@ -9,13 +9,13 @@
 //! - `encoder.rs`    – Encode AArch64 instructions into 32-bit machine words
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
-pub mod parser;
-pub mod encoder;
 pub mod elf_writer;
+pub mod encoder;
+pub mod parser;
 
 use crate::common::fx_hash::FxHashMap;
-use parser::{parse_asm, AsmStatement, Operand, AsmDirective, DataValue};
 use elf_writer::ElfWriter;
+use parser::{parse_asm, AsmDirective, AsmStatement, DataValue, Operand};
 
 /// Assemble AArch64 assembly text into an ELF object file.
 ///
@@ -82,7 +82,11 @@ fn expand_literal_pools(statements: &[AsmStatement]) -> Vec<AsmStatement> {
 
     for stmt in statements {
         match stmt {
-            AsmStatement::LdrLiteralPool { reg, symbol, addend } => {
+            AsmStatement::LdrLiteralPool {
+                reg,
+                symbol,
+                addend,
+            } => {
                 let pool_label = format!(".Llpool_{}", pool_counter);
                 pool_counter += 1;
 
@@ -158,11 +162,13 @@ fn resolve_numeric_name(
     let def_list = defs.get(num)?;
 
     if is_forward {
-        def_list.iter()
+        def_list
+            .iter()
             .find(|(idx, _)| *idx > current_idx)
             .map(|(_, name)| name.clone())
     } else {
-        def_list.iter()
+        def_list
+            .iter()
             .rev()
             .find(|(idx, _)| *idx < current_idx)
             .map(|(_, name)| name.clone())
@@ -209,10 +215,15 @@ fn resolve_numeric_labels(statements: &[AsmStatement]) -> Vec<AsmStatement> {
                 }
                 result.push(stmt.clone());
             }
-            AsmStatement::Instruction { mnemonic, operands, raw_operands } => {
-                let new_ops: Vec<Operand> = operands.iter().map(|op| {
-                    resolve_numeric_operand(op, i, &defs)
-                }).collect();
+            AsmStatement::Instruction {
+                mnemonic,
+                operands,
+                raw_operands,
+            } => {
+                let new_ops: Vec<Operand> = operands
+                    .iter()
+                    .map(|op| resolve_numeric_operand(op, i, &defs))
+                    .collect();
                 result.push(AsmStatement::Instruction {
                     mnemonic: mnemonic.clone(),
                     operands: new_ops,
@@ -220,7 +231,9 @@ fn resolve_numeric_labels(statements: &[AsmStatement]) -> Vec<AsmStatement> {
                 });
             }
             AsmStatement::Directive(dir) => {
-                result.push(AsmStatement::Directive(resolve_numeric_directive(dir, i, &defs)));
+                result.push(AsmStatement::Directive(resolve_numeric_directive(
+                    dir, i, &defs,
+                )));
             }
             _ => result.push(stmt.clone()),
         }
@@ -257,9 +270,17 @@ fn resolve_numeric_operand(
                 op.clone()
             }
         }
-        Operand::MemExpr { base, expr, writeback } => {
+        Operand::MemExpr {
+            base,
+            expr,
+            writeback,
+        } => {
             let resolved_expr = resolve_numeric_refs_in_expr(expr, current_idx, defs);
-            Operand::MemExpr { base: base.clone(), expr: resolved_expr, writeback: *writeback }
+            Operand::MemExpr {
+                base: base.clone(),
+                expr: resolved_expr,
+                writeback: *writeback,
+            }
         }
         Operand::Expr(expr) => {
             let resolved_expr = resolve_numeric_refs_in_expr(expr, current_idx, defs);
@@ -284,9 +305,12 @@ fn resolve_numeric_refs_in_expr(
             let start = i;
             // Skip hex literals (0x..., 0X...) and binary literals (0b..., 0B...)
             // to avoid misinterpreting hex digits as label refs (e.g., 0x1b)
-            if bytes[i] == b'0' && i + 1 < bytes.len()
-                && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X'
-                    || bytes[i + 1] == b'b' || bytes[i + 1] == b'B')
+            if bytes[i] == b'0'
+                && i + 1 < bytes.len()
+                && (bytes[i + 1] == b'x'
+                    || bytes[i + 1] == b'X'
+                    || bytes[i + 1] == b'b'
+                    || bytes[i + 1] == b'B')
             {
                 // Consume the entire hex/binary literal
                 i += 2; // skip 0x or 0b
@@ -349,8 +373,8 @@ fn resolve_numeric_data_values(
     current_idx: usize,
     defs: &FxHashMap<String, Vec<(usize, String)>>,
 ) -> Vec<DataValue> {
-    vals.iter().map(|v| {
-        match v {
+    vals.iter()
+        .map(|v| match v {
             DataValue::Symbol(name) => {
                 if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
                     DataValue::Symbol(resolved)
@@ -376,6 +400,6 @@ fn resolve_numeric_data_values(
                 DataValue::SymbolDiffAddend(new_a, new_b, *add)
             }
             _ => v.clone(),
-        }
-    }).collect()
+        })
+        .collect()
 }

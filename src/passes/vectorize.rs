@@ -124,16 +124,16 @@ fn vectorize_with_analysis_mode(
     fp_contract_fast: bool,
 ) -> usize {
     let num_blocks = func.blocks.len();
-    let loops = loop_analysis::find_natural_loops(
-        num_blocks,
-        &cfg.preds,
-        &cfg.succs,
-        &cfg.idom,
-    );
+    let loops = loop_analysis::find_natural_loops(num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
 
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     if debug {
-        eprintln!("[VEC] Function: {}, blocks: {}, loops: {}", func.name, num_blocks, loops.len());
+        eprintln!(
+            "[VEC] Function: {}, blocks: {}, loops: {}",
+            func.name,
+            num_blocks,
+            loops.len()
+        );
     }
 
     if loops.is_empty() {
@@ -152,21 +152,33 @@ fn vectorize_with_analysis_mode(
         });
 
         if debug {
-            eprintln!("[VEC] Loop {} at header={}, body_size={}, innermost={}",
-                idx, loop_info.header, loop_info.body.len(), is_innermost);
+            eprintln!(
+                "[VEC] Loop {} at header={}, body_size={}, innermost={}",
+                idx,
+                loop_info.header,
+                loop_info.body.len(),
+                is_innermost
+            );
         }
 
         if !is_innermost {
             continue;
         }
 
-        let body_insts = loop_info.body.iter()
+        let body_insts = loop_info
+            .body
+            .iter()
             .map(|&bi| func.blocks.get(bi).map_or(0, |b| b.instructions.len()))
             .sum();
-        if matches!(crate::pgo::unroll_pgo::should_vectorize_loop(
-            func, loop_info.header, body_insts), Some(false)) {
+        if matches!(
+            crate::pgo::unroll_pgo::should_vectorize_loop(func, loop_info.header, body_insts),
+            Some(false)
+        ) {
             if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
-                eprintln!("[VEC] Loop {} (header block {}) not vectorized: PGO trip/body cost veto", idx, loop_info.header);
+                eprintln!(
+                    "[VEC] Loop {} (header block {}) not vectorized: PGO trip/body cost veto",
+                    idx, loop_info.header
+                );
             }
             continue;
         }
@@ -190,30 +202,37 @@ fn vectorize_with_analysis_mode(
                 _ => false,
             };
             if skip_small {
-                if debug { eprintln!("[VEC] Skip: constant trip count < 2x vector width ({})", vec_width); }
-            } else
-
-            if use_sse2 {
                 if debug {
-                    eprintln!("[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)");
+                    eprintln!(
+                        "[VEC] Skip: constant trip count < 2x vector width ({})",
+                        vec_width
+                    );
+                }
+            } else if use_sse2 {
+                if debug {
+                    eprintln!(
+                        "[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)"
+                    );
                 }
                 total_changes += transform_to_fma_f64x2(func, &pattern);
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
-                    eprintln!("[VEC] Matmul pattern matched! Transforming to FmaF64x4 (AVX2, 4-wide)");
+                    eprintln!(
+                        "[VEC] Matmul pattern matched! Transforming to FmaF64x4 (AVX2, 4-wide)"
+                    );
                 }
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
-        } else if let Some(red_pattern) = analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon) {
+        } else if let Some(red_pattern) =
+            analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon)
+        {
             // Packed FP reductions reassociate additions across SIMD lanes.
             // That is observably different for IEEE-754 values (for example
             // [1e100, 1, -1e100, 1] sums to 1 in source order but 2 after a
             // four-lane tree reduction). GCC/Clang likewise require an
             // explicit fast-math/associative-math contract for this rewrite.
-            if matches!(red_pattern.element_type, IrType::F32 | IrType::F64)
-                && !fp_reassoc
-            {
+            if matches!(red_pattern.element_type, IrType::F32 | IrType::F64) && !fp_reassoc {
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
                     eprintln!(
                         "[VEC] Loop {} (header block {}) not vectorized: floating-point reduction requires -fassociative-math or -ffast-math",
@@ -235,7 +254,10 @@ fn vectorize_with_analysis_mode(
             };
             if skip_small {
                 if debug {
-                    eprintln!("[VEC] Skip reduction: constant trip count < 2x vector width ({})", vec_width);
+                    eprintln!(
+                        "[VEC] Skip reduction: constant trip count < 2x vector width ({})",
+                        vec_width
+                    );
                 }
             } else if use_sse2 || red_pattern.element_type == IrType::I64 {
                 // I64 AVX2 4-wide path not wired yet; 2-wide SSE/AVX is competitive
@@ -254,9 +276,7 @@ fn vectorize_with_analysis_mode(
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
-                let avx2 = !neon
-                    && !force_two_wide
-                    && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                let avx2 = !neon && !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
                 if debug {
                     eprintln!(
                         "[VEC] Map pattern matched! Transforming to {}-bit {:?}",
@@ -264,12 +284,7 @@ fn vectorize_with_analysis_mode(
                         map_pattern.elem_ty
                     );
                 }
-                total_changes += transform_map_vector(
-                    func,
-                    &map_pattern,
-                    avx2,
-                    fp_contract_fast,
-                );
+                total_changes += transform_map_vector(func, &map_pattern, avx2, fp_contract_fast);
             } else {
                 let why = take_reject().unwrap_or("pattern shape not recognized");
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
@@ -383,7 +398,9 @@ fn analyze_loop_pattern(
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
 
     // Build label→index map so we can convert BlockId labels to array indices.
-    let label_to_idx: FxHashMap<BlockId, usize> = func.blocks.iter()
+    let label_to_idx: FxHashMap<BlockId, usize> = func
+        .blocks
+        .iter()
         .enumerate()
         .map(|(i, b)| (b.label, i))
         .collect();
@@ -396,11 +413,15 @@ fn analyze_loop_pattern(
     let mut iv = None;
     for inst in &header.instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
-            if incoming.len() != 2 { continue; }
+            if incoming.len() != 2 {
+                continue;
+            }
             let mut derived = FxHashSet::default();
             derived.insert(*dest);
             for candidate in &header.instructions {
-                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } =
+                    candidate
+                {
                     if matches!(src, Operand::Value(v) if derived.contains(v)) {
                         derived.insert(*dest);
                     }
@@ -441,13 +462,23 @@ fn analyze_loop_pattern(
     // Find the comparison instruction for loop exit in header
     let mut exit_cmp_info = None;
     for (idx, inst) in header.instructions.iter().enumerate() {
-        if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+        if let Instruction::Cmp {
+            dest,
+            op: _,
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
             // Check if comparing IV (or derived value) to a limit
             if let Operand::Value(lhs_val) = lhs {
                 if iv_derived.contains(lhs_val) {
                     exit_cmp_info = Some((idx, *dest, rhs.clone()));
                     if debug {
-                        eprintln!("[VEC]   Found comparison with IV-derived on left: {:?} < {:?}", lhs, rhs);
+                        eprintln!(
+                            "[VEC]   Found comparison with IV-derived on left: {:?} < {:?}",
+                            lhs, rhs
+                        );
                     }
                     break;
                 }
@@ -456,7 +487,10 @@ fn analyze_loop_pattern(
                     // IV is on the right, use lhs as the limit
                     exit_cmp_info = Some((idx, *dest, lhs.clone()));
                     if debug {
-                        eprintln!("[VEC]   Found comparison with IV-derived on right: {:?} > {:?}", lhs, rhs);
+                        eprintln!(
+                            "[VEC]   Found comparison with IV-derived on right: {:?} > {:?}",
+                            lhs, rhs
+                        );
                     }
                     break;
                 }
@@ -466,7 +500,10 @@ fn analyze_loop_pattern(
     if exit_cmp_info.is_none() {
         if debug {
             eprintln!("[VEC]   No comparison instruction found for IV");
-            eprintln!("[VEC]   Header block has {} instructions:", header.instructions.len());
+            eprintln!(
+                "[VEC]   Header block has {} instructions:",
+                header.instructions.len()
+            );
             for (idx, inst) in header.instructions.iter().enumerate() {
                 eprintln!("[VEC]     {}: {:?}", idx, inst);
             }
@@ -508,7 +545,11 @@ fn analyze_loop_pattern(
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         match &block.terminator {
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 let then_idx = label_to_idx.get(true_label).copied();
                 let else_idx = label_to_idx.get(false_label).copied();
                 let then_in_loop = then_idx.map_or(false, |i| loop_info.body.contains(&i));
@@ -597,13 +638,19 @@ fn analyze_loop_pattern(
     }
     if store_info.is_none() {
         if debug {
-            eprintln!("[VEC]   No store instruction found in body block {}", body_idx);
+            eprintln!(
+                "[VEC]   No store instruction found in body block {}",
+                body_idx
+            );
         }
         return None;
     }
     let (store_idx, store_addr, store_value) = store_info?;
     if debug {
-        eprintln!("[VEC]   Found store in block {}, tracing backward...", body_idx);
+        eprintln!(
+            "[VEC]   Found store in block {}, tracing backward...",
+            body_idx
+        );
     }
 
     // Trace backwards: store_value should be result of fadd.
@@ -794,12 +841,12 @@ fn analyze_loop_pattern(
     let c_root = proven_object_root(func, c_gep)?;
     let b_root = proven_object_root(func, b_gep)?;
     let a_root = proven_object_root(func, a_ptr)?;
-    if !roots_proven_distinct(&c_root, &b_root)
-        || !roots_proven_distinct(&c_root, &a_root)
-    {
+    if !roots_proven_distinct(&c_root, &b_root) || !roots_proven_distinct(&c_root, &a_root) {
         if debug {
-            eprintln!("[VEC]   Rejecting matmul: C may alias source (C={:?}, B={:?}, A={:?})",
-                c_root, b_root, a_root);
+            eprintln!(
+                "[VEC]   Rejecting matmul: C may alias source (C={:?}, B={:?}, A={:?})",
+                c_root, b_root, a_root
+            );
         }
         set_reject("matmul destination may alias A/B (use restrict or runtime versioning)");
         return None;
@@ -916,9 +963,8 @@ fn reduction_pattern_is_sound(
                     }
                 }
                 Instruction::BinOp { dest, lhs, rhs, .. } => {
-                    let uses_acc =
-                        matches!(lhs, Operand::Value(v) if accumulator_derived.contains(v))
-                            || matches!(rhs, Operand::Value(v) if accumulator_derived.contains(v));
+                    let uses_acc = matches!(lhs, Operand::Value(v) if accumulator_derived.contains(v))
+                        || matches!(rhs, Operand::Value(v) if accumulator_derived.contains(v));
                     if uses_acc && !is_add(block_idx, inst_idx, *dest) {
                         if debug {
                             eprintln!(
@@ -1051,7 +1097,11 @@ fn reduction_pattern_is_sound(
     }
     let mut cur = latch_idx;
     let mut steps = 0;
-    while cur != body_idx && cur < cfg.num_blocks && cur != cfg.idom[cur] && steps < cfg.num_blocks + 1 {
+    while cur != body_idx
+        && cur < cfg.num_blocks
+        && cur != cfg.idom[cur]
+        && steps < cfg.num_blocks + 1
+    {
         cur = cfg.idom[cur];
         steps += 1;
     }
@@ -1082,7 +1132,10 @@ fn analyze_reduction_pattern(
     let header = &func.blocks[header_idx];
 
     if debug {
-        eprintln!("[VEC-RED] Analyzing reduction pattern for loop at header {}", header_idx);
+        eprintln!(
+            "[VEC-RED] Analyzing reduction pattern for loop at header {}",
+            header_idx
+        );
     }
 
     // Find exit and latch blocks first
@@ -1111,7 +1164,10 @@ fn analyze_reduction_pattern(
     // implement.  Treat any internal conditional as a legality failure.
     if loop_info.body.iter().copied().any(|block_idx| {
         block_idx != header_idx
-            && matches!(func.blocks[block_idx].terminator, Terminator::CondBranch { .. })
+            && matches!(
+                func.blocks[block_idx].terminator,
+                Terminator::CondBranch { .. }
+            )
     }) {
         if debug {
             eprintln!("[VEC-RED]   Rejecting conditional reduction loop");
@@ -1124,19 +1180,27 @@ fn analyze_reduction_pattern(
     // choosing the first `add ?, 1` is not reliable.
     let mut iv = None;
     for inst in &header.instructions {
-        let Instruction::Phi { dest, incoming, .. } = inst else { continue };
-        if incoming.len() != 2 { continue; }
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        if incoming.len() != 2 {
+            continue;
+        }
         let mut derived = FxHashSet::default();
         derived.insert(*dest);
         for candidate in &header.instructions {
-            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate {
-                if matches!(src, Operand::Value(v) if derived.contains(v)) { derived.insert(*dest); }
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate
+            {
+                if matches!(src, Operand::Value(v) if derived.contains(v)) {
+                    derived.insert(*dest);
+                }
             }
         }
-        if header.instructions.iter().any(|candidate| matches!(candidate,
+        if header.instructions.iter().any(|candidate| {
+            matches!(candidate,
             Instruction::Cmp { lhs, rhs, .. }
-                if matches!(lhs, Operand::Value(v) if derived.contains(v))))
-        {
+                if matches!(lhs, Operand::Value(v) if derived.contains(v)))
+        }) {
             iv = Some(*dest);
             break;
         }
@@ -1179,7 +1243,14 @@ fn analyze_reduction_pattern(
     // Find comparison for loop exit
     let mut exit_cmp_info = None;
     for (idx, inst) in header.instructions.iter().enumerate() {
-        if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+        if let Instruction::Cmp {
+            dest,
+            op: _,
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
             if let Operand::Value(lhs_val) = lhs {
                 if iv_derived.contains(lhs_val) {
                     exit_cmp_info = Some((idx, *dest, rhs.clone()));
@@ -1254,23 +1325,30 @@ fn analyze_reduction_pattern(
     // Reject loops with multiple reduction phis (e.g., `vBv += ... ; vv += ...`).
     // The vectorizer only handles one reduction; transforming the loop structure
     // (splitting into vector + remainder) corrupts any additional reductions.
-    let other_zero_phis = header.instructions.iter().filter(|inst| {
-        if let Instruction::Phi { dest, incoming, .. } = inst {
-            if *dest != iv && *dest != accumulator_phi && incoming.len() == 2 {
-                return incoming.iter().any(|(val, _)| {
-                    if let Operand::Const(c) = val {
-                        c.to_i64() == Some(0) || c.to_f64().map(|f| f == 0.0).unwrap_or(false)
-                    } else {
-                        false
-                    }
-                });
+    let other_zero_phis = header
+        .instructions
+        .iter()
+        .filter(|inst| {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest != iv && *dest != accumulator_phi && incoming.len() == 2 {
+                    return incoming.iter().any(|(val, _)| {
+                        if let Operand::Const(c) = val {
+                            c.to_i64() == Some(0) || c.to_f64().map(|f| f == 0.0).unwrap_or(false)
+                        } else {
+                            false
+                        }
+                    });
+                }
             }
-        }
-        false
-    }).count();
+            false
+        })
+        .count();
     if other_zero_phis > 0 {
         if debug {
-            eprintln!("[VEC-RED]   Rejecting: {} other zero-init phis in header (multi-reduction)", other_zero_phis);
+            eprintln!(
+                "[VEC-RED]   Rejecting: {} other zero-init phis in header (multi-reduction)",
+                other_zero_phis
+            );
         }
         return None;
     }
@@ -1289,7 +1367,9 @@ fn analyze_reduction_pattern(
                 match inst {
                     Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
                         if let Operand::Value(src_val) = src {
-                            if accumulator_derived.contains(src_val) && !accumulator_derived.contains(dest) {
+                            if accumulator_derived.contains(src_val)
+                                && !accumulator_derived.contains(dest)
+                            {
                                 accumulator_derived.insert(*dest);
                                 changed = true;
                             }
@@ -1311,8 +1391,14 @@ fn analyze_reduction_pattern(
         }
         let block = &func.blocks[block_idx];
         if debug {
-            eprintln!("[VEC-RED]   Searching block {} for accumulator update (accumulator_phi = {})", block_idx, accumulator_phi.0);
-            eprintln!("[VEC-RED]   Accumulator-derived values: {:?}", accumulator_derived);
+            eprintln!(
+                "[VEC-RED]   Searching block {} for accumulator update (accumulator_phi = {})",
+                block_idx, accumulator_phi.0
+            );
+            eprintln!(
+                "[VEC-RED]   Accumulator-derived values: {:?}",
+                accumulator_derived
+            );
             for (idx, inst) in block.instructions.iter().enumerate() {
                 eprintln!("[VEC-RED]     {}: {:?}", idx, inst);
             }
@@ -1327,8 +1413,16 @@ fn analyze_reduction_pattern(
             } = inst
             {
                 // Check if this is accumulator += something (allowing casts)
-                let lhs_is_acc = if let Operand::Value(v) = lhs { accumulator_derived.contains(v) } else { false };
-                let rhs_is_acc = if let Operand::Value(v) = rhs { accumulator_derived.contains(v) } else { false };
+                let lhs_is_acc = if let Operand::Value(v) = lhs {
+                    accumulator_derived.contains(v)
+                } else {
+                    false
+                };
+                let rhs_is_acc = if let Operand::Value(v) = rhs {
+                    accumulator_derived.contains(v)
+                } else {
+                    false
+                };
 
                 if lhs_is_acc || rhs_is_acc {
                     body_idx = Some(block_idx);
@@ -1361,7 +1455,10 @@ fn analyze_reduction_pattern(
     };
 
     // Verify element type is vectorizable (F64, F32, I32, I64)
-    if !matches!(element_type, IrType::F64 | IrType::F32 | IrType::I32 | IrType::I64) {
+    if !matches!(
+        element_type,
+        IrType::F64 | IrType::F32 | IrType::I32 | IrType::I64
+    ) {
         if debug {
             eprintln!("[VEC-RED]   Unsupported element type: {:?}", element_type);
         }
@@ -1372,8 +1469,16 @@ fn analyze_reduction_pattern(
     // Determine what is being added to the accumulator
     let (lhs_val, rhs_val) = match add_inst {
         Instruction::BinOp { lhs, rhs, .. } => {
-            let lhs_v = if let Operand::Value(v) = lhs { Some(*v) } else { None };
-            let rhs_v = if let Operand::Value(v) = rhs { Some(*v) } else { None };
+            let lhs_v = if let Operand::Value(v) = lhs {
+                Some(*v)
+            } else {
+                None
+            };
+            let rhs_v = if let Operand::Value(v) = rhs {
+                Some(*v)
+            } else {
+                None
+            };
             (lhs_v, rhs_v)
         }
         _ => (None, None),
@@ -1395,7 +1500,10 @@ fn analyze_reduction_pattern(
     let added_inst = find_inst_by_dest(body, added_value)?;
 
     if debug {
-        eprintln!("[VEC-RED]   Added value {} is produced by: {:?}", added_value.0, added_inst);
+        eprintln!(
+            "[VEC-RED]   Added value {} is produced by: {:?}",
+            added_value.0, added_inst
+        );
     }
 
     match added_inst {
@@ -1412,7 +1520,10 @@ fn analyze_reduction_pattern(
             }
 
             if debug {
-                eprintln!("[VEC-RED]   Simple sum pattern detected: {:?} += load(arr[iv])", element_type);
+                eprintln!(
+                    "[VEC-RED]   Simple sum pattern detected: {:?} += load(arr[iv])",
+                    element_type
+                );
             }
 
             if !reduction_pattern_is_sound(
@@ -1430,7 +1541,9 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Rejecting unsound reduction (Sum)");
                 }
-                set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
+                set_reject(
+                    "reduction rejected: side effects / control flow / foreign memory in loop",
+                );
                 return None;
             }
 
@@ -1456,23 +1569,41 @@ fn analyze_reduction_pattern(
         }
 
         // Handle cast followed by load (e.g., long sum += (long)arr[i] where arr is int[])
-        Instruction::Cast { src, from_ty, to_ty, .. } => {
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } => {
             // The cast should be widening the element type to match the accumulator
             if *to_ty != element_type {
                 if debug {
-                    eprintln!("[VEC-RED]   Cast type mismatch: cast to {:?} but accumulator is {:?}", to_ty, element_type);
+                    eprintln!(
+                        "[VEC-RED]   Cast type mismatch: cast to {:?} but accumulator is {:?}",
+                        to_ty, element_type
+                    );
                 }
                 return None;
             }
 
             // Check if the source of the cast is a load
-            let cast_src_val = if let Operand::Value(v) = src { *v } else { return None };
+            let cast_src_val = if let Operand::Value(v) = src {
+                *v
+            } else {
+                return None;
+            };
             let cast_src_inst = find_inst_by_dest(body, cast_src_val)?;
 
-            if let Instruction::Load { ptr, ty: load_ty, .. } = cast_src_inst {
+            if let Instruction::Load {
+                ptr, ty: load_ty, ..
+            } = cast_src_inst
+            {
                 if *load_ty != *from_ty {
                     if debug {
-                        eprintln!("[VEC-RED]   Load type {:?} doesn't match cast from_ty {:?}", load_ty, from_ty);
+                        eprintln!(
+                            "[VEC-RED]   Load type {:?} doesn't match cast from_ty {:?}",
+                            load_ty, from_ty
+                        );
                     }
                     return None;
                 }
@@ -1503,9 +1634,8 @@ fn analyze_reduction_pattern(
                 // VecLoadWidenI32ToI64x2: ldr + saddlp/smlal keeps full I64
                 // precision per lane). Gated by allow_widening_i32 so x86
                 // never takes this path.
-                let allowed_widen = allow_widening_i32
-                    && element_type == IrType::I64
-                    && *from_ty == IrType::I32;
+                let allowed_widen =
+                    allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
                 if *from_ty != element_type && !allowed_widen {
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
@@ -1529,13 +1659,15 @@ fn analyze_reduction_pattern(
                     if debug {
                         eprintln!("[VEC-RED]   Rejecting unsound reduction (Cast-Sum)");
                     }
-                    set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
+                    set_reject(
+                        "reduction rejected: side effects / control flow / foreign memory in loop",
+                    );
                     return None;
                 }
 
                 Some(ReductionPattern {
                     kind: ReductionKind::Sum,
-                    element_type: *from_ty,  // Use the actual array element type
+                    element_type: *from_ty, // Use the actual array element type
                     accumulator_type: element_type,
                     header_idx,
                     body_idx,
@@ -1569,8 +1701,16 @@ fn analyze_reduction_pattern(
         } => {
             // Both operands of multiply should be loads, or (NEON i32→i64 dot)
             // sign-extension casts of i32 loads: (long)a[i] * (long)b[i].
-            let mul_lhs_val = if let Operand::Value(v) = lhs { *v } else { return None };
-            let mul_rhs_val = if let Operand::Value(v) = rhs { *v } else { return None };
+            let mul_lhs_val = if let Operand::Value(v) = lhs {
+                *v
+            } else {
+                return None;
+            };
+            let mul_rhs_val = if let Operand::Value(v) = rhs {
+                *v
+            } else {
+                return None;
+            };
 
             let mul_lhs_inst = find_inst_by_dest(body, mul_lhs_val)?;
             let mul_rhs_inst = find_inst_by_dest(body, mul_rhs_val)?;
@@ -1581,9 +1721,20 @@ fn analyze_reduction_pattern(
             let operand_gep = |inst: &Instruction, widened: &mut bool| -> Option<Value> {
                 match inst {
                     Instruction::Load { ptr, .. } => Some(*ptr),
-                    Instruction::Cast { src, from_ty: IrType::I32, to_ty: IrType::I64, .. } if neon => {
-                        let src_val = if let Operand::Value(v) = src { *v } else { return None };
-                        if let Some(Instruction::Load { ptr, .. }) = find_inst_by_dest(body, src_val) {
+                    Instruction::Cast {
+                        src,
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                        ..
+                    } if neon => {
+                        let src_val = if let Operand::Value(v) = src {
+                            *v
+                        } else {
+                            return None;
+                        };
+                        if let Some(Instruction::Load { ptr, .. }) =
+                            find_inst_by_dest(body, src_val)
+                        {
                             *widened = true;
                             Some(*ptr)
                         } else {
@@ -1614,8 +1765,9 @@ fn analyze_reduction_pattern(
             };
 
             // Verify both GEPs use IV
-            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived) ||
-               !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived) {
+            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived)
+                || !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived)
+            {
                 if debug {
                     eprintln!("[VEC-RED]   Array GEPs don't use IV");
                 }
@@ -1624,7 +1776,10 @@ fn analyze_reduction_pattern(
             }
 
             if debug {
-                eprintln!("[VEC-RED]   Dot product pattern detected: {:?} += load(a[iv]) * load(b[iv])", element_type);
+                eprintln!(
+                    "[VEC-RED]   Dot product pattern detected: {:?} += load(a[iv]) * load(b[iv])",
+                    element_type
+                );
             }
 
             if !reduction_pattern_is_sound(
@@ -1642,7 +1797,9 @@ fn analyze_reduction_pattern(
                 if debug {
                     eprintln!("[VEC-RED]   Rejecting unsound reduction (DotProduct)");
                 }
-                set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
+                set_reject(
+                    "reduction rejected: side effects / control flow / foreign memory in loop",
+                );
                 return None;
             }
 
@@ -1701,7 +1858,10 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
             return None;
         }
         let defining = func.blocks.iter().find_map(|block| {
-            block.instructions.iter().find(|inst| inst.dest() == Some(cur))
+            block
+                .instructions
+                .iter()
+                .find(|inst| inst.dest() == Some(cur))
         })?;
         match defining {
             Instruction::GlobalAddr { name, .. } => {
@@ -1712,11 +1872,20 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
             }
             Instruction::ParamRef { param_idx, .. } => {
                 let noalias = func.params.get(*param_idx).is_some_and(|p| p.noalias);
-                return Some(ProvenObjectRoot::Param { index: *param_idx, noalias });
+                return Some(ProvenObjectRoot::Param {
+                    index: *param_idx,
+                    noalias,
+                });
             }
             Instruction::GetElementPtr { base, .. } => cur = *base,
-            Instruction::Copy { src: Operand::Value(src), .. }
-            | Instruction::Cast { src: Operand::Value(src), .. } => cur = *src,
+            Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            }
+            | Instruction::Cast {
+                src: Operand::Value(src),
+                ..
+            } => cur = *src,
             _ => return None,
         }
     }
@@ -1733,8 +1902,14 @@ fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
         return false;
     }
     match (a, b) {
-        (ProvenObjectRoot::Param { noalias: a_noalias, .. },
-         ProvenObjectRoot::Param { noalias: b_noalias, .. }) => *a_noalias || *b_noalias,
+        (
+            ProvenObjectRoot::Param {
+                noalias: a_noalias, ..
+            },
+            ProvenObjectRoot::Param {
+                noalias: b_noalias, ..
+            },
+        ) => *a_noalias || *b_noalias,
         (ProvenObjectRoot::Param { noalias, .. }, _)
         | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
         _ => true,
@@ -1804,7 +1979,10 @@ fn analyze_map_pattern(
     // Reject loops with internal conditionals (predication not supported).
     if loop_info.body.iter().copied().any(|block_idx| {
         block_idx != header_idx
-            && matches!(func.blocks[block_idx].terminator, Terminator::CondBranch { .. })
+            && matches!(
+                func.blocks[block_idx].terminator,
+                Terminator::CondBranch { .. }
+            )
     }) {
         return None;
     }
@@ -1812,7 +1990,9 @@ fn analyze_map_pattern(
     // Identify the induction phi from the header exit comparison.
     let mut iv = None;
     for inst in &header.instructions {
-        let Instruction::Phi { dest, incoming, ty } = inst else { continue };
+        let Instruction::Phi { dest, incoming, ty } = inst else {
+            continue;
+        };
         if incoming.len() != 2
             || !matches!(*ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
         {
@@ -1821,14 +2001,18 @@ fn analyze_map_pattern(
         let mut derived = FxHashSet::default();
         derived.insert(*dest);
         for candidate in &header.instructions {
-            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate {
-                if matches!(src, Operand::Value(v) if derived.contains(v)) { derived.insert(*dest); }
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate
+            {
+                if matches!(src, Operand::Value(v) if derived.contains(v)) {
+                    derived.insert(*dest);
+                }
             }
         }
-        if header.instructions.iter().any(|candidate| matches!(candidate,
+        if header.instructions.iter().any(|candidate| {
+            matches!(candidate,
             Instruction::Cmp { lhs, rhs, .. }
-                if matches!(lhs, Operand::Value(v) if derived.contains(v))))
-        {
+                if matches!(lhs, Operand::Value(v) if derived.contains(v)))
+        }) {
             iv = Some((*dest, *ty));
             break;
         }
@@ -1843,7 +2027,8 @@ fn analyze_map_pattern(
         changed = false;
         for &block_idx in &loop_info.body {
             for inst in &func.blocks[block_idx].instructions {
-                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst {
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst
+                {
                     if let Operand::Value(src_val) = src {
                         if iv_derived.contains(src_val) && iv_derived.insert(*dest) {
                             changed = true;
@@ -1857,14 +2042,15 @@ fn analyze_map_pattern(
     // Exit comparison and limit.
     let mut exit_cmp_info = None;
     for inst in &header.instructions {
-        if let Instruction::Cmp { op, lhs, rhs, ty, .. } = inst {
+        if let Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } = inst
+        {
             if *ty != iv_ty {
                 continue;
             }
             if let Operand::Value(lhs_val) = lhs {
-                if iv_derived.contains(lhs_val)
-                    && matches!(*op, IrCmpOp::Slt | IrCmpOp::Ult)
-                {
+                if iv_derived.contains(lhs_val) && matches!(*op, IrCmpOp::Slt | IrCmpOp::Ult) {
                     exit_cmp_info = Some((*op, rhs.clone()));
                     break;
                 }
@@ -1911,8 +2097,8 @@ fn analyze_map_pattern(
 
     // Scan the loop for loads/stores: exactly one of each, and every other
     // instruction must be simple, side-effect-free arithmetic.
-    let mut load_info = None;   // (block, load dest, ptr value, element type)
-    let mut store_info = None;  // (block, ptr value, stored val, element type)
+    let mut load_info = None; // (block, load dest, ptr value, element type)
+    let mut store_info = None; // (block, ptr value, stored val, element type)
     for &block_idx in &loop_info.body {
         for inst in &func.blocks[block_idx].instructions {
             match inst {
@@ -1931,7 +2117,9 @@ fn analyze_map_pattern(
                     {
                         return None;
                     }
-                    let Operand::Value(store_val) = val else { return None };
+                    let Operand::Value(store_val) = val else {
+                        return None;
+                    };
                     store_info = Some((block_idx, *ptr, *store_val, *ty));
                 }
                 Instruction::BinOp { op, .. } if op.can_trap() => return None,
@@ -1957,13 +2145,18 @@ fn analyze_map_pattern(
     if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
         || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived)
     {
-        if debug { eprintln!("[VEC-MAP]   GEPs don't use IV"); }
+        if debug {
+            eprintln!("[VEC-MAP]   GEPs don't use IV");
+        }
         return None;
     }
     let elem_size = match elem_ty {
         IrType::F64 | IrType::I64 | IrType::U64 => 8,
         IrType::F32 | IrType::I32 | IrType::U32 => 4,
-        _ => { set_reject("map element type not vectorizable"); return None; }
+        _ => {
+            set_reject("map element type not vectorizable");
+            return None;
+        }
     };
     if find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
         || find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none()
@@ -1978,8 +2171,7 @@ fn analyze_map_pattern(
         match op {
             Operand::Const(_) => true,
             Operand::Value(v) => {
-                !iv_derived.contains(v)
-                    && find_inst_in_loop(func, &loop_info.body, *v).is_none()
+                !iv_derived.contains(v) && find_inst_in_loop(func, &loop_info.body, *v).is_none()
             }
         }
     };
@@ -1995,7 +2187,8 @@ fn analyze_map_pattern(
             rhs,
             ty,
             ..
-        } = find_inst_by_dest(body, value)? else {
+        } = find_inst_by_dest(body, value)?
+        else {
             return None;
         };
         if *ty != elem_ty {
@@ -2028,27 +2221,21 @@ fn analyze_map_pattern(
                 rhs,
                 ty,
                 ..
-            } if *ty == elem_ty => {
-                match (lhs, rhs) {
-                    (Operand::Value(v), other)
-                        if *v == load_dest && is_invariant(other) =>
-                    {
-                        (None, Some(other.clone()))
-                    }
-                    (other, Operand::Value(v))
-                        if *v == load_dest && is_invariant(other) =>
-                    {
-                        (None, Some(other.clone()))
-                    }
-                    (Operand::Value(v), other) if is_invariant(other) => {
-                        (Some(scaled_load(*v)?), Some(other.clone()))
-                    }
-                    (other, Operand::Value(v)) if is_invariant(other) => {
-                        (Some(scaled_load(*v)?), Some(other.clone()))
-                    }
-                    _ => return None,
+            } if *ty == elem_ty => match (lhs, rhs) {
+                (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
+                    (None, Some(other.clone()))
                 }
-            }
+                (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
+                    (None, Some(other.clone()))
+                }
+                (Operand::Value(v), other) if is_invariant(other) => {
+                    (Some(scaled_load(*v)?), Some(other.clone()))
+                }
+                (other, Operand::Value(v)) if is_invariant(other) => {
+                    (Some(scaled_load(*v)?), Some(other.clone()))
+                }
+                _ => return None,
+            },
             _ => return None,
         }
     };
@@ -2084,7 +2271,10 @@ fn analyze_map_pattern(
     }
 
     if debug {
-        eprintln!("[VEC-MAP]   Map pattern detected: store(dst[iv]) = load(src[iv]) * {:?} + {:?}", scale, offset);
+        eprintln!(
+            "[VEC-MAP]   Map pattern detected: store(dst[iv]) = load(src[iv]) * {:?} + {:?}",
+            scale, offset
+        );
     }
 
     Some(MapPattern {
@@ -2121,10 +2311,7 @@ fn geps_proven_identical(
         for &block_idx in loop_blocks {
             for inst in &func.blocks[block_idx].instructions {
                 if let Instruction::GetElementPtr {
-                    dest,
-                    base,
-                    offset,
-                    ..
+                    dest, base, offset, ..
                 } = inst
                 {
                     if *dest == target {
@@ -2136,12 +2323,10 @@ fn geps_proven_identical(
         None
     };
     match (find(a), find(b)) {
-        (Some((a_base, Operand::Value(a_offset))),
-         Some((b_base, Operand::Value(b_offset)))) => {
+        (Some((a_base, Operand::Value(a_offset))), Some((b_base, Operand::Value(b_offset)))) => {
             a_base == b_base && a_offset == b_offset
         }
-        (Some((a_base, Operand::Const(a_offset))),
-         Some((b_base, Operand::Const(b_offset)))) => {
+        (Some((a_base, Operand::Const(a_offset))), Some((b_base, Operand::Const(b_offset)))) => {
             a_base == b_base && a_offset.to_i64() == b_offset.to_i64()
         }
         _ => false,
@@ -2160,7 +2345,10 @@ fn gep_uses_iv(
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+            if let Instruction::GetElementPtr {
+                dest, base, offset, ..
+            } = inst
+            {
                 if *dest == gep {
                     // The reduction transform models the access as
                     // `invariant_base + iv * element_size` and later rewrites
@@ -2216,9 +2404,10 @@ fn gep_base_is_loop_invariant(
                     // Constant addresses are invariant regardless of where
                     // they are materialized.
                     Instruction::GlobalAddr { .. } | Instruction::Alloca { .. } => true,
-                    Instruction::Copy { src: Operand::Value(v), .. } => {
-                        gep_base_is_loop_invariant(func, loop_blocks, *v, iv, iv_derived)
-                    }
+                    Instruction::Copy {
+                        src: Operand::Value(v),
+                        ..
+                    } => gep_base_is_loop_invariant(func, loop_blocks, *v, iv, iv_derived),
                     // GEP/BinOp/Cast/Load/Phi defined IN the loop: treat as
                     // variant (fail closed).
                     _ => false,
@@ -2291,22 +2480,36 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
     }
 
     if debug {
-        eprintln!("[VEC-RED]   find_exit: loop body contains block indices: {:?}", loop_info.body);
+        eprintln!(
+            "[VEC-RED]   find_exit: loop body contains block indices: {:?}",
+            loop_info.body
+        );
     }
 
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         if debug {
-            eprintln!("[VEC-RED]   Block[{}] (label={}) terminator: {:?}", block_idx, block.label.0, block.terminator);
+            eprintln!(
+                "[VEC-RED]   Block[{}] (label={}) terminator: {:?}",
+                block_idx, block.label.0, block.terminator
+            );
         }
         match &block.terminator {
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 // Convert BlockId to block index for comparison
                 let true_idx = label_to_idx.get(&true_label.0).copied();
                 let false_idx = label_to_idx.get(&false_label.0).copied();
 
-                let then_in_loop = true_idx.map(|idx| loop_info.body.contains(&idx)).unwrap_or(false);
-                let else_in_loop = false_idx.map(|idx| loop_info.body.contains(&idx)).unwrap_or(false);
+                let then_in_loop = true_idx
+                    .map(|idx| loop_info.body.contains(&idx))
+                    .unwrap_or(false);
+                let else_in_loop = false_idx
+                    .map(|idx| loop_info.body.contains(&idx))
+                    .unwrap_or(false);
 
                 if debug {
                     eprintln!("[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
@@ -2333,13 +2536,19 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
     let header_label = func.blocks[loop_info.header].label;
 
     if debug {
-        eprintln!("[VEC-RED]   find_latch: looking for backedge to header BlockId({})", header_label.0);
+        eprintln!(
+            "[VEC-RED]   find_latch: looking for backedge to header BlockId({})",
+            header_label.0
+        );
     }
 
     for &block_idx in &loop_info.body {
         let block = &func.blocks[block_idx];
         if debug {
-            eprintln!("[VEC-RED]   Block[{}] (label={}) terminator: {:?}", block_idx, block.label.0, block.terminator);
+            eprintln!(
+                "[VEC-RED]   Block[{}] (label={}) terminator: {:?}",
+                block_idx, block.label.0, block.terminator
+            );
         }
         match &block.terminator {
             Terminator::Branch(target) if *target == header_label => {
@@ -2348,7 +2557,11 @@ fn find_latch(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Opti
                 }
                 return Some(block_idx);
             }
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 if *true_label == header_label || *false_label == header_label {
                     if debug {
                         eprintln!("[VEC-RED]   Found latch: block[{}]", block_idx);
@@ -2373,7 +2586,11 @@ fn find_inst_by_dest(block: &BasicBlock, dest: Value) -> Option<&Instruction> {
 }
 
 /// Find an instruction by its destination value, searching all loop blocks.
-fn find_inst_in_loop<'a>(func: &'a IrFunction, loop_blocks: &FxHashSet<usize>, dest: Value) -> Option<(usize, &'a Instruction)> {
+fn find_inst_in_loop<'a>(
+    func: &'a IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    dest: Value,
+) -> Option<(usize, &'a Instruction)> {
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
@@ -2434,10 +2651,17 @@ fn offset_is_index_times(
                 continue;
             }
             return match inst {
-                Instruction::BinOp { op: IrBinOp::Shl, rhs: Operand::Const(c), .. } => {
-                    pow2 && c.to_i64() == Some(log2 as i64)
-                }
-                Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    rhs: Operand::Const(c),
+                    ..
+                } => pow2 && c.to_i64() == Some(log2 as i64),
+                Instruction::BinOp {
+                    op: IrBinOp::Mul,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
                     let k = match (lhs, rhs) {
                         (Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),
                         _ => None,
@@ -2461,7 +2685,10 @@ fn find_reduction_byte_iv(
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+            if let Instruction::GetElementPtr {
+                dest, base, offset, ..
+            } = inst
+            {
                 if *dest != gep_val {
                     continue;
                 }
@@ -2475,21 +2702,31 @@ fn find_reduction_byte_iv(
                             continue;
                         }
                         match inst2 {
-                            Instruction::BinOp { op: IrBinOp::Shl, lhs, rhs, .. } => {
+                            Instruction::BinOp {
+                                op: IrBinOp::Shl,
+                                lhs,
+                                rhs,
+                                ..
+                            } => {
                                 if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
                                     if c.to_i64() == Some(log2 as i64) {
                                         return Some((*base, *v));
                                     }
                                 }
                             }
-                            Instruction::BinOp { op: IrBinOp::Mul, lhs, rhs, .. } => {
+                            Instruction::BinOp {
+                                op: IrBinOp::Mul,
+                                lhs,
+                                rhs,
+                                ..
+                            } => {
                                 let iv_op = match (lhs, rhs) {
-                                    (Operand::Value(v), Operand::Const(c)) => {
-                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
-                                    }
-                                    (Operand::Const(c), Operand::Value(v)) => {
-                                        c.to_i64().and_then(|k| (k == elem_size as i64).then_some(*v))
-                                    }
+                                    (Operand::Value(v), Operand::Const(c)) => c
+                                        .to_i64()
+                                        .and_then(|k| (k == elem_size as i64).then_some(*v)),
+                                    (Operand::Const(c), Operand::Value(v)) => c
+                                        .to_i64()
+                                        .and_then(|k| (k == elem_size as i64).then_some(*v)),
                                     _ => None,
                                 };
                                 if let Some(v) = iv_op {
@@ -2545,8 +2782,16 @@ fn verify_gep_pattern(block: &BasicBlock, gep_val: Value, iv: Value) -> Option<(
                             rhs,
                             ..
                         } => {
-                            let lhs_matches = if let Operand::Value(v) = lhs { *v == iv } else { false };
-                            let rhs_matches = if let Operand::Value(v) = rhs { *v == iv } else { false };
+                            let lhs_matches = if let Operand::Value(v) = lhs {
+                                *v == iv
+                            } else {
+                                false
+                            };
+                            let rhs_matches = if let Operand::Value(v) = rhs {
+                                *v == iv
+                            } else {
+                                false
+                            };
                             if lhs_matches || rhs_matches {
                                 if debug {
                                     eprintln!("[VEC]     GEP uses IV * scale");
@@ -2677,17 +2922,34 @@ fn insert_remainder_loop(
     if debug {
         eprintln!("[VEC] Creating remainder loop blocks...");
         eprintln!("[VEC]   vec_exit (BlockId({}))", vec_exit_label.0);
-        eprintln!("[VEC]   remainder_header (BlockId({}))", remainder_header_label.0);
-        eprintln!("[VEC]   remainder_body (BlockId({}))", remainder_body_label.0);
-        eprintln!("[VEC]   remainder_latch (BlockId({}))", remainder_latch_label.0);
+        eprintln!(
+            "[VEC]   remainder_header (BlockId({}))",
+            remainder_header_label.0
+        );
+        eprintln!(
+            "[VEC]   remainder_body (BlockId({}))",
+            remainder_body_label.0
+        );
+        eprintln!(
+            "[VEC]   remainder_latch (BlockId({}))",
+            remainder_latch_label.0
+        );
     }
 
     // Step 1: Modify vectorized header to exit to vec_exit instead of original exit
     // Find the header block and change its false_label (exit branch) to vec_exit
     let header_block = &mut func.blocks[pattern.header_idx];
-    if let Terminator::CondBranch { true_label: _, false_label, .. } = &mut header_block.terminator {
+    if let Terminator::CondBranch {
+        true_label: _,
+        false_label,
+        ..
+    } = &mut header_block.terminator
+    {
         if debug {
-            eprintln!("[VEC]   Redirecting header exit {} → {}", false_label, vec_exit_label);
+            eprintln!(
+                "[VEC]   Redirecting header exit {} → {}",
+                false_label, vec_exit_label
+            );
         }
         *false_label = vec_exit_label;
     }
@@ -2705,7 +2967,7 @@ fn insert_remainder_loop(
         Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::Mul,
-            lhs: Operand::Value(pattern.iv),   // Final element index
+            lhs: Operand::Value(pattern.iv), // Final element index
             rhs: Operand::Const(IrConst::I32(2)),
             ty: IrType::I32,
         }
@@ -2713,8 +2975,8 @@ fn insert_remainder_loop(
         Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::LShr,
-            lhs: Operand::Value(pattern.iv),   // Final non-negative byte offset
-            rhs: Operand::Const(IrConst::I32(3)),  // log2(sizeof(double))
+            lhs: Operand::Value(pattern.iv), // Final non-negative byte offset
+            rhs: Operand::Const(IrConst::I32(3)), // log2(sizeof(double))
             ty: IrType::I32,
         }
     };
@@ -2741,9 +3003,9 @@ fn insert_remainder_loop(
             },
             Instruction::Cmp {
                 dest: j_rem_cmp,
-                op: IrCmpOp::Slt,  // Signed less-than
+                op: IrCmpOp::Slt, // Signed less-than
                 lhs: Operand::Value(j_rem_iv),
-                rhs: pattern.limit,  // Original N
+                rhs: pattern.limit, // Original N
                 ty: IrType::I32,
             },
         ],
@@ -2780,31 +3042,34 @@ fn insert_remainder_loop(
                 dest: c_rem_gep,
                 base: c_base,
                 offset: Operand::Value(j_rem_offset),
-                ty: IrType::F64,  // Element type, not pointer type
+                ty: IrType::F64, // Element type, not pointer type
             },
             // GEP for B[k][j]
             Instruction::GetElementPtr {
                 dest: b_rem_gep,
                 base: b_base,
                 offset: Operand::Value(j_rem_offset),
-                ty: IrType::F64,  // Element type, not pointer type
+                ty: IrType::F64, // Element type, not pointer type
             },
             // Load C[i][j]
-            Instruction::Load { volatile: false,
+            Instruction::Load {
+                volatile: false,
                 dest: c_rem_load,
                 ptr: c_rem_gep,
                 ty: IrType::F64,
                 seg_override: AddressSpace::Default,
             },
             // Load A[i][k]
-            Instruction::Load { volatile: false,
+            Instruction::Load {
+                volatile: false,
                 dest: a_rem_load,
                 ptr: a_ptr,
                 ty: IrType::F64,
                 seg_override: AddressSpace::Default,
             },
             // Load B[k][j]
-            Instruction::Load { volatile: false,
+            Instruction::Load {
+                volatile: false,
                 dest: b_rem_load,
                 ptr: b_rem_gep,
                 ty: IrType::F64,
@@ -2813,7 +3078,7 @@ fn insert_remainder_loop(
             // Multiply A * B
             Instruction::BinOp {
                 dest: mul_result,
-                op: IrBinOp::Mul,  // Type-generic multiply, determined by ty field
+                op: IrBinOp::Mul, // Type-generic multiply, determined by ty field
                 lhs: Operand::Value(a_rem_load),
                 rhs: Operand::Value(b_rem_load),
                 ty: IrType::F64,
@@ -2821,13 +3086,14 @@ fn insert_remainder_loop(
             // Add C + (A * B)
             Instruction::BinOp {
                 dest: add_result,
-                op: IrBinOp::Add,  // Type-generic add, determined by ty field
+                op: IrBinOp::Add, // Type-generic add, determined by ty field
                 lhs: Operand::Value(c_rem_load),
                 rhs: Operand::Value(mul_result),
                 ty: IrType::F64,
             },
             // Store result back to C[i][j]
-            Instruction::Store { volatile: false,
+            Instruction::Store {
+                volatile: false,
                 val: Operand::Value(add_result),
                 ptr: c_rem_gep,
                 ty: IrType::F64,
@@ -2842,15 +3108,13 @@ fn insert_remainder_loop(
     // Increment j and loop back
     let remainder_latch_block = BasicBlock {
         label: remainder_latch_label,
-        instructions: vec![
-            Instruction::BinOp {
-                dest: j_rem_iv_next,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(j_rem_iv),
-                rhs: Operand::Const(IrConst::I32(1)),
-                ty: IrType::I32,
-            },
-        ],
+        instructions: vec![Instruction::BinOp {
+            dest: j_rem_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(j_rem_iv),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        }],
         terminator: Terminator::Branch(remainder_header_label),
         source_spans: vec![],
     };
@@ -2862,12 +3126,14 @@ fn insert_remainder_loop(
     func.blocks.push(remainder_latch_block);
 
     if debug {
-        eprintln!("[VEC] Remainder phi: [(Value({}), BlockId({})), (Value({}), BlockId({}))]",
-            j_rem_start.0, vec_exit_label.0, j_rem_iv_next.0, remainder_latch_label.0);
+        eprintln!(
+            "[VEC] Remainder phi: [(Value({}), BlockId({})), (Value({}), BlockId({}))]",
+            j_rem_start.0, vec_exit_label.0, j_rem_iv_next.0, remainder_latch_label.0
+        );
         eprintln!("[VEC] Transformation complete: 4 blocks added");
     }
 
-    4  // 4 new blocks added
+    4 // 4 new blocks added
 }
 
 /// Transform the loop to use FmaF64x2 intrinsics.
@@ -2886,9 +3152,11 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
-    let innermost_blocks: FxHashSet<usize> = [
-        pattern.header_idx, pattern.body_idx, pattern.latch_idx,
-    ].iter().copied().collect();
+    let innermost_blocks: FxHashSet<usize> =
+        [pattern.header_idx, pattern.body_idx, pattern.latch_idx]
+            .iter()
+            .copied()
+            .collect();
 
     // Build a set of IV-derived values (for finding all IV-related comparisons)
     // Start with the IV from the header, but also trace back from the GEPs to find
@@ -2902,13 +3170,22 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     for &block_idx in &innermost_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base: _, offset, ty: _ } = inst {
+            if let Instruction::GetElementPtr {
+                dest,
+                base: _,
+                offset,
+                ty: _,
+            } = inst
+            {
                 if *dest == pattern.b_gep || *dest == pattern.c_gep {
                     // This GEP is for B or C array - trace its offset back to find the IV
                     if let Operand::Value(offset_val) = offset {
                         gep_ivs.insert(*offset_val);
                         if debug {
-                            eprintln!("[VEC]   GEP Value({}) uses offset Value({})", dest.0, offset_val.0);
+                            eprintln!(
+                                "[VEC]   GEP Value({}) uses offset Value({})",
+                                dest.0, offset_val.0
+                            );
                         }
                     }
                 }
@@ -2924,7 +3201,13 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
-                    Instruction::BinOp { dest, op: _, lhs, rhs, ty: _ } => {
+                    Instruction::BinOp {
+                        dest,
+                        op: _,
+                        lhs,
+                        rhs,
+                        ty: _,
+                    } => {
                         if gep_ivs.contains(dest) {
                             if let Operand::Value(lhs_val) = lhs {
                                 if gep_ivs.insert(*lhs_val) {
@@ -2969,12 +3252,19 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                 match inst {
                     Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
                         if let Operand::Value(src_val) = src {
-                            if (iv_derived.contains(src_val) || gep_ivs.contains(src_val)) && iv_derived.insert(*dest) {
+                            if (iv_derived.contains(src_val) || gep_ivs.contains(src_val))
+                                && iv_derived.insert(*dest)
+                            {
                                 changed = true;
                             }
                         }
                     }
-                    Instruction::BinOp { dest, op: IrBinOp::Add, lhs, .. } => {
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs,
+                        ..
+                    } => {
                         // IV increment (j = j + 1)
                         if let Operand::Value(lhs_val) = lhs {
                             if iv_derived.contains(lhs_val) && iv_derived.insert(*dest) {
@@ -2989,7 +3279,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     }
 
     if debug {
-        eprintln!("[VEC]   IV-derived values (including j-loop IV): {:?}", iv_derived);
+        eprintln!(
+            "[VEC]   IV-derived values (including j-loop IV): {:?}",
+            iv_derived
+        );
         eprintln!("[VEC]   GEP offset chain: {:?}", gep_ivs);
         eprintln!("[VEC]   Loop contains blocks: {:?}", pattern.loop_blocks);
     }
@@ -3006,7 +3299,9 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                 let div_dest = Value(next_val_id);
                 next_val_id += 1;
 
-                let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                let limit_ty = match &func.blocks[pattern.header_idx].instructions
+                    [pattern.exit_cmp_inst_idx]
+                {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
@@ -3023,10 +3318,15 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     ty: limit_ty,
                 };
 
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx, div_inst);
 
                 if debug {
-                    eprintln!("[VEC]   Inserted division for dynamic limit: Value({})", div_dest.0);
+                    eprintln!(
+                        "[VEC]   Inserted division for dynamic limit: Value({})",
+                        div_dest.0
+                    );
                 }
 
                 Operand::Value(div_dest)
@@ -3046,15 +3346,31 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             if debug {
                 // First pass: log all comparisons in this block
                 for inst in &block.instructions {
-                    if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
-                        eprintln!("[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
-                            block_idx, lhs, rhs, dest);
+                    if let Instruction::Cmp {
+                        dest,
+                        op: _,
+                        lhs,
+                        rhs,
+                        ty: _,
+                    } = inst
+                    {
+                        eprintln!(
+                            "[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
+                            block_idx, lhs, rhs, dest
+                        );
                     }
                 }
             }
 
             for inst in &mut block.instructions {
-                if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+                if let Instruction::Cmp {
+                    dest,
+                    op: _,
+                    lhs,
+                    rhs,
+                    ty: _,
+                } = inst
+                {
                     // Check if this compares an IV-derived value against something
                     let modifies_lhs = if let Operand::Value(lhs_val) = lhs {
                         iv_derived.contains(lhs_val)
@@ -3078,13 +3394,19 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             *rhs = halved_limit.clone();
                             changes += 1;
                             if debug {
-                                eprintln!("[VEC]   -> Modified comparison RHS to {:?}", halved_limit);
+                                eprintln!(
+                                    "[VEC]   -> Modified comparison RHS to {:?}",
+                                    halved_limit
+                                );
                             }
                         } else if modifies_rhs {
                             *lhs = halved_limit.clone();
                             changes += 1;
                             if debug {
-                                eprintln!("[VEC]   -> Modified comparison LHS to {:?}", halved_limit);
+                                eprintln!(
+                                    "[VEC]   -> Modified comparison LHS to {:?}",
+                                    halved_limit
+                                );
                             }
                         }
                     }
@@ -3118,7 +3440,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     } else {
                         false
                     };
-                    let rhs_is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
+                    let rhs_is_8 = matches!(
+                        rhs,
+                        Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8))
+                    );
 
                     if debug && (lhs_is_iv_derived || rhs_is_8) {
                         eprintln!("[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
@@ -3135,7 +3460,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                         changes += 1;
                         modified_any_increment = true;
                         if debug {
-                            eprintln!("[VEC]   Changed GEP stride from 8 to 16 for Value({})", dest.0);
+                            eprintln!(
+                                "[VEC]   Changed GEP stride from 8 to 16 for Value({})",
+                                dest.0
+                            );
                         }
                     }
                 }
@@ -3184,7 +3512,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             }
 
             if debug {
-                eprintln!("[VEC]   Tracked pointer values: {} pointers", pointer_values.len());
+                eprintln!(
+                    "[VEC]   Tracked pointer values: {} pointers",
+                    pointer_values.len()
+                );
             }
 
             // Now modify all pointer increments by 8 to increment by 16
@@ -3200,7 +3531,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     } = inst
                     {
                         // Check if incrementing by 8
-                        let is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
+                        let is_8 = matches!(
+                            rhs,
+                            Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8))
+                        );
 
                         if debug && is_8 {
                             let is_pointer = if let Operand::Value(lhs_val) = lhs {
@@ -3245,7 +3579,13 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             for &block_idx in &innermost_blocks {
                 let block = &func.blocks[block_idx];
                 for (inst_idx, inst) in block.instructions.iter().enumerate() {
-                    if let Instruction::GetElementPtr { dest, base: _, offset, ty } = inst {
+                    if let Instruction::GetElementPtr {
+                        dest,
+                        base: _,
+                        offset,
+                        ty,
+                    } = inst
+                    {
                         // Check if this is a GEP for B or C array
                         if *dest == pattern.b_gep || *dest == pattern.c_gep {
                             if let Operand::Value(offset_val) = offset {
@@ -3279,10 +3619,14 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                 };
 
                 // Insert mul before the GEP
-                func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
+                func.blocks[block_idx]
+                    .instructions
+                    .insert(inst_idx, mul_inst);
 
                 // Update the GEP's offset (now at inst_idx + 1 due to insertion)
-                if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
+                if let Instruction::GetElementPtr { offset, .. } =
+                    &mut func.blocks[block_idx].instructions[inst_idx + 1]
+                {
                     *offset = Operand::Value(mul_dest);
                     changes += 1;
                     modified_any_increment = true;
@@ -3302,16 +3646,21 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
     // AArch64 codegen keeps it in v15, outside the allocator's v16-v31 pool.
     if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
-        if pattern.loop_blocks.contains(&idx) { return None; }
+        if pattern.loop_blocks.contains(&idx) {
+            return None;
+        }
         matches!(block.terminator, Terminator::Branch(label)
-            if label == func.blocks[pattern.header_idx].label).then_some(idx)
+            if label == func.blocks[pattern.header_idx].label)
+        .then_some(idx)
     }) {
-        func.blocks[preheader_idx].instructions.push(Instruction::Intrinsic {
-            dest: None,
-            op: IntrinsicOp::BroadcastLoadF64,
-            dest_ptr: None,
-            args: vec![Operand::Value(pattern.a_ptr)],
-        });
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::BroadcastLoadF64,
+                dest_ptr: None,
+                args: vec![Operand::Value(pattern.a_ptr)],
+            });
         changes += 1;
     }
 
@@ -3324,15 +3673,13 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
             dest: None,
             op: IntrinsicOp::FmaF64x2Hoisted,
             dest_ptr: Some(pattern.c_gep),
-            args: vec![
-                Operand::Value(pattern.b_gep),
-            ],
+            args: vec![Operand::Value(pattern.b_gep)],
         };
 
         // Find the store instruction by scanning (store_idx may be stale after Step 2 insertions).
-        let store_pos = body.instructions.iter().position(|inst| {
-            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
-        });
+        let store_pos = body.instructions.iter().position(
+            |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep),
+        );
 
         if let Some(pos) = store_pos {
             body.instructions.insert(pos, intrinsic);
@@ -3342,8 +3689,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 1;
         if debug {
-            eprintln!("[VEC]   Inserted hoisted FmaF64x2 intrinsic, dest_ptr=Value({}), B=Value({})",
-                pattern.c_gep.0, pattern.b_gep.0);
+            eprintln!(
+                "[VEC]   Inserted hoisted FmaF64x2 intrinsic, dest_ptr=Value({}), B=Value({})",
+                pattern.c_gep.0, pattern.b_gep.0
+            );
         }
 
         // The old load/mul/add instructions are now dead. DCE will clean them up.
@@ -3354,13 +3703,16 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         let remainder_changes = insert_remainder_loop(
             func,
             pattern,
-            4,  // two NEON vectors per iteration
+            4, // two NEON vectors per iteration
             &mut next_val_id,
             &mut next_label,
         );
         changes += remainder_changes;
         if debug {
-            eprintln!("[VEC]   Added remainder loop: {} blocks created", remainder_changes / 4);
+            eprintln!(
+                "[VEC]   Added remainder loop: {} blocks created",
+                remainder_changes / 4
+            );
         }
     }
 
@@ -3389,9 +3741,11 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
     // Restrict all IV/GEP tracing and modifications to the innermost loop blocks only.
     // This prevents accidentally modifying comparisons or GEPs in outer loops.
-    let innermost_blocks: FxHashSet<usize> = [
-        pattern.header_idx, pattern.body_idx, pattern.latch_idx,
-    ].iter().copied().collect();
+    let innermost_blocks: FxHashSet<usize> =
+        [pattern.header_idx, pattern.body_idx, pattern.latch_idx]
+            .iter()
+            .copied()
+            .collect();
 
     // Build a set of IV-derived values (for finding all IV-related comparisons)
     // Start with the IV from the header, but also trace back from the GEPs to find
@@ -3405,13 +3759,22 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     for &block_idx in &innermost_blocks {
         let block = &func.blocks[block_idx];
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base: _, offset, ty: _ } = inst {
+            if let Instruction::GetElementPtr {
+                dest,
+                base: _,
+                offset,
+                ty: _,
+            } = inst
+            {
                 if *dest == pattern.b_gep || *dest == pattern.c_gep {
                     // This GEP is for B or C array - trace its offset back to find the IV
                     if let Operand::Value(offset_val) = offset {
                         gep_ivs.insert(*offset_val);
                         if debug {
-                            eprintln!("[VEC]   GEP Value({}) uses offset Value({})", dest.0, offset_val.0);
+                            eprintln!(
+                                "[VEC]   GEP Value({}) uses offset Value({})",
+                                dest.0, offset_val.0
+                            );
                         }
                     }
                 }
@@ -3427,7 +3790,13 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             let block = &func.blocks[block_idx];
             for inst in &block.instructions {
                 match inst {
-                    Instruction::BinOp { dest, op: _, lhs, rhs, ty: _ } => {
+                    Instruction::BinOp {
+                        dest,
+                        op: _,
+                        lhs,
+                        rhs,
+                        ty: _,
+                    } => {
                         if gep_ivs.contains(dest) {
                             if let Operand::Value(lhs_val) = lhs {
                                 if gep_ivs.insert(*lhs_val) {
@@ -3472,12 +3841,19 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                 match inst {
                     Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
                         if let Operand::Value(src_val) = src {
-                            if (iv_derived.contains(src_val) || gep_ivs.contains(src_val)) && iv_derived.insert(*dest) {
+                            if (iv_derived.contains(src_val) || gep_ivs.contains(src_val))
+                                && iv_derived.insert(*dest)
+                            {
                                 changed = true;
                             }
                         }
                     }
-                    Instruction::BinOp { dest, op: IrBinOp::Add, lhs, .. } => {
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::Add,
+                        lhs,
+                        ..
+                    } => {
                         // IV increment (j = j + 1)
                         if let Operand::Value(lhs_val) = lhs {
                             if iv_derived.contains(lhs_val) && iv_derived.insert(*dest) {
@@ -3492,7 +3868,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     }
 
     if debug {
-        eprintln!("[VEC]   IV-derived values (including j-loop IV): {:?}", iv_derived);
+        eprintln!(
+            "[VEC]   IV-derived values (including j-loop IV): {:?}",
+            iv_derived
+        );
         eprintln!("[VEC]   GEP offset chain: {:?}", gep_ivs);
         eprintln!("[VEC]   Loop contains blocks: {:?}", pattern.loop_blocks);
     }
@@ -3519,7 +3898,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 16) * 128)),
             Operand::Value(limit_val) => {
                 // Dynamic limit: byte_limit = (N/16)*128, hoisted into the header.
-                let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                let limit_ty = match &func.blocks[pattern.header_idx].instructions
+                    [pattern.exit_cmp_inst_idx]
+                {
                     Instruction::Cmp { ty, .. } => *ty,
                     _ => IrType::I64,
                 };
@@ -3538,7 +3919,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     }),
                     ty: limit_ty,
                 };
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx, div_inst);
 
                 // (N/16) * 128
                 let mul_dest = Value(next_val_id);
@@ -3554,10 +3937,15 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     }),
                     ty: limit_ty,
                 };
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
 
                 if debug {
-                    eprintln!("[VEC]   Inserted (N/16)*128 dynamic byte limit: Value({})", mul_dest.0);
+                    eprintln!(
+                        "[VEC]   Inserted (N/16)*128 dynamic byte limit: Value({})",
+                        mul_dest.0
+                    );
                 }
 
                 Operand::Value(mul_dest)
@@ -3577,15 +3965,31 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             if debug {
                 // First pass: log all comparisons in this block
                 for inst in &block.instructions {
-                    if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
-                        eprintln!("[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
-                            block_idx, lhs, rhs, dest);
+                    if let Instruction::Cmp {
+                        dest,
+                        op: _,
+                        lhs,
+                        rhs,
+                        ty: _,
+                    } = inst
+                    {
+                        eprintln!(
+                            "[VEC]   Block {} has comparison: {:?} <cmp> {:?}, dest={:?}",
+                            block_idx, lhs, rhs, dest
+                        );
                     }
                 }
             }
 
             for inst in &mut block.instructions {
-                if let Instruction::Cmp { dest, op: _, lhs, rhs, ty: _ } = inst {
+                if let Instruction::Cmp {
+                    dest,
+                    op: _,
+                    lhs,
+                    rhs,
+                    ty: _,
+                } = inst
+                {
                     // Check if this compares an IV-derived value against something
                     let modifies_lhs = if let Operand::Value(lhs_val) = lhs {
                         iv_derived.contains(lhs_val)
@@ -3648,7 +4052,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     } else {
                         false
                     };
-                    let rhs_is_8 = matches!(rhs, Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8)));
+                    let rhs_is_8 = matches!(
+                        rhs,
+                        Operand::Const(IrConst::I64(8)) | Operand::Const(IrConst::I32(8))
+                    );
 
                     if lhs_is_iv && rhs_is_8 {
                         // Replace multiply with a Copy: the IV already holds the byte offset
@@ -3679,7 +4086,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     } else {
                         false
                     };
-                    let rhs_is_3 = matches!(rhs, Operand::Const(IrConst::I64(3)) | Operand::Const(IrConst::I32(3)));
+                    let rhs_is_3 = matches!(
+                        rhs,
+                        Operand::Const(IrConst::I64(3)) | Operand::Const(IrConst::I32(3))
+                    );
 
                     if lhs_is_iv && rhs_is_3 {
                         let shl_dest = *dest;
@@ -3703,7 +4113,12 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         {
             let latch = &mut func.blocks[pattern.latch_idx];
             if pattern.iv_inc_idx < latch.instructions.len() {
-                if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+                if let Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    rhs,
+                    ..
+                } = &mut latch.instructions[pattern.iv_inc_idx]
+                {
                     *rhs = match rhs {
                         Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(128)),
                         _ => Operand::Const(IrConst::I64(128)),
@@ -3727,9 +4142,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
     // the 256³ matmul kernel on x86-64-v3.
     {
         let body = &mut func.blocks[pattern.body_idx];
-        let store_pos = body.instructions.iter().position(|inst| {
-            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep)
-        });
+        let store_pos = body.instructions.iter().position(
+            |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep),
+        );
 
         let (b_base, b_off, c_base, c_off) = {
             let mut b_base = pattern.b_gep;
@@ -3737,7 +4152,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             let mut c_base = pattern.c_gep;
             let mut c_off = Operand::Const(IrConst::I64(0));
             for inst in &body.instructions {
-                if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                if let Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } = inst
+                {
                     if *dest == pattern.b_gep {
                         b_base = *base;
                         b_off = offset.clone();
@@ -3761,10 +4179,14 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         });
         for chunk in 1u64..4 {
             let byte_off = chunk * 32;
-            let b_off_n = Value(next_val_id); next_val_id += 1;
-            let c_off_n = Value(next_val_id); next_val_id += 1;
-            let b_gep_n = Value(next_val_id); next_val_id += 1;
-            let c_gep_n = Value(next_val_id); next_val_id += 1;
+            let b_off_n = Value(next_val_id);
+            next_val_id += 1;
+            let c_off_n = Value(next_val_id);
+            next_val_id += 1;
+            let b_gep_n = Value(next_val_id);
+            next_val_id += 1;
+            let c_gep_n = Value(next_val_id);
+            next_val_id += 1;
             prelude.push(Instruction::BinOp {
                 dest: b_off_n,
                 op: IrBinOp::Add,
@@ -3824,7 +4246,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         );
         changes += remainder_changes;
         if debug {
-            eprintln!("[VEC]   Added remainder loop: {} blocks created", remainder_changes / 4);
+            eprintln!(
+                "[VEC]   Added remainder loop: {} blocks created",
+                remainder_changes / 4
+            );
         }
     }
 
@@ -3846,9 +4271,9 @@ fn insert_reduction_remainder_loop(
     pattern: &ReductionPattern,
     vec_width: u64,
     horizontal_intrinsic: IntrinsicOp,
-    vec_sum_value: Value,  // Accumulated vector SSA value
+    vec_sum_value: Value, // Accumulated vector SSA value
     byte_offset_iv: bool,
-    second_acc: Option<Value>,  // Second vector accumulator phi (NEON smlal2 half)
+    second_acc: Option<Value>, // Second vector accumulator phi (NEON smlal2 half)
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
@@ -3877,8 +4302,10 @@ fn insert_reduction_remainder_loop(
         }
         let result = base.unwrap_or(pattern.array_a_gep);
         if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
-            eprintln!("[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
-                result.0, pattern.array_a_gep.0);
+            eprintln!(
+                "[VEC-RED] array_a_base = Value({}), array_a_gep = Value({})",
+                result.0, pattern.array_a_gep.0
+            );
         }
         result
     };
@@ -3950,16 +4377,28 @@ fn insert_reduction_remainder_loop(
     if debug {
         eprintln!("[VEC-RED] Creating remainder loop blocks...");
         eprintln!("[VEC-RED]   vec_exit (BlockId({}))", vec_exit_label.0);
-        eprintln!("[VEC-RED]   remainder_header (BlockId({}))", remainder_header_label.0);
-        eprintln!("[VEC-RED]   remainder_body (BlockId({}))", remainder_body_label.0);
-        eprintln!("[VEC-RED]   remainder_latch (BlockId({}))", remainder_latch_label.0);
+        eprintln!(
+            "[VEC-RED]   remainder_header (BlockId({}))",
+            remainder_header_label.0
+        );
+        eprintln!(
+            "[VEC-RED]   remainder_body (BlockId({}))",
+            remainder_body_label.0
+        );
+        eprintln!(
+            "[VEC-RED]   remainder_latch (BlockId({}))",
+            remainder_latch_label.0
+        );
     }
 
     // Step 1: Redirect vectorized header to vec_exit instead of original exit
     let header_block = &mut func.blocks[pattern.header_idx];
     if let Terminator::CondBranch { false_label, .. } = &mut header_block.terminator {
         if debug {
-            eprintln!("[VEC-RED]   Redirecting header exit {} → {}", false_label, vec_exit_label);
+            eprintln!(
+                "[VEC-RED]   Redirecting header exit {} → {}",
+                false_label, vec_exit_label
+            );
         }
         *false_label = vec_exit_label;
     }
@@ -3973,7 +4412,7 @@ fn insert_reduction_remainder_loop(
         IntrinsicOp::HorizontalAddF64x2 => IntrinsicOp::VecHorizontalAddF64x2,
         IntrinsicOp::HorizontalAddI32x8 => IntrinsicOp::VecHorizontalAddI32x8,
         IntrinsicOp::HorizontalAddI32x4 => IntrinsicOp::VecHorizontalAddI32x4,
-        _ => horizontal_intrinsic,  // Fallback
+        _ => horizontal_intrinsic, // Fallback
     };
 
     let vec_exit_block = {
@@ -4070,7 +4509,7 @@ fn insert_reduction_remainder_loop(
                 dest: i_rem_cmp,
                 op: IrCmpOp::Slt,
                 lhs: Operand::Value(i_rem_iv),
-                rhs: pattern.limit.clone(),  // ORIGINAL limit (not divided)
+                rhs: pattern.limit.clone(), // ORIGINAL limit (not divided)
                 ty: IrType::I32,
             },
         ],
@@ -4107,7 +4546,8 @@ fn insert_reduction_remainder_loop(
             ty: pattern.element_type,
         },
         // Load array_a[i]
-        Instruction::Load { volatile: false,
+        Instruction::Load {
+            volatile: false,
             dest: load_rem_a,
             ptr: gep_rem_a,
             ty: pattern.element_type,
@@ -4158,7 +4598,8 @@ fn insert_reduction_remainder_loop(
                     ty: pattern.element_type,
                 },
                 // Load array_b[i]
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: load_rem_b,
                     ptr: gep_rem_b,
                     ty: pattern.element_type,
@@ -4237,7 +4678,10 @@ fn insert_reduction_remainder_loop(
         let acc_id = pattern.accumulator_phi.0;
         let mut updates = 0;
         if debug {
-            eprintln!("[VEC-RED]   Rewiring uses of SSA {} (vector accumulator) outside the loop", acc_id);
+            eprintln!(
+                "[VEC-RED]   Rewiring uses of SSA {} (vector accumulator) outside the loop",
+                acc_id
+            );
         }
 
         // Helper to replace SSA values in operands
@@ -4258,14 +4702,22 @@ fn insert_reduction_remainder_loop(
             for inst in &mut block.instructions {
                 match inst {
                     Instruction::Copy { src, .. } => {
-                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(src, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     Instruction::Store { val, .. } => {
-                        if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(val, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     Instruction::BinOp { lhs, rhs, .. } => {
-                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
-                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     Instruction::Cmp { lhs, rhs, .. } => {
                         // Comparisons consuming the accumulator (e.g.
@@ -4274,46 +4726,76 @@ fn insert_reduction_remainder_loop(
                         // accumulator, emitted as leaq (vectors are
                         // addressed) — comparing a stack address instead of
                         // the sum (the reduction_two_sums regression).
-                        if replace_in_operand(lhs, acc_id, sum_rem_phi) { updates += 1; }
-                        if replace_in_operand(rhs, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(lhs, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
+                        if replace_in_operand(rhs, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     Instruction::UnaryOp { src, .. } | Instruction::Cast { src, .. } => {
-                        if replace_in_operand(src, acc_id, sum_rem_phi) { updates += 1; }
+                        if replace_in_operand(src, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                         for a in &mut info.args {
-                            if replace_in_operand(a, acc_id, sum_rem_phi) { updates += 1; }
+                            if replace_in_operand(a, acc_id, sum_rem_phi) {
+                                updates += 1;
+                            }
                         }
                     }
                     Instruction::Phi { incoming, .. } => {
                         for (op, _) in incoming {
-                            if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
+                            if replace_in_operand(op, acc_id, sum_rem_phi) {
+                                updates += 1;
+                            }
                         }
                     }
-                    Instruction::Select { cond, true_val, false_val, .. } => {
-                        if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
-                        if replace_in_operand(true_val, acc_id, sum_rem_phi) { updates += 1; }
-                        if replace_in_operand(false_val, acc_id, sum_rem_phi) { updates += 1; }
+                    Instruction::Select {
+                        cond,
+                        true_val,
+                        false_val,
+                        ..
+                    } => {
+                        if replace_in_operand(cond, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
+                        if replace_in_operand(true_val, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
+                        if replace_in_operand(false_val, acc_id, sum_rem_phi) {
+                            updates += 1;
+                        }
                     }
                     _ => {}
                 }
             }
             match &mut block.terminator {
                 Terminator::Return(Some(op)) => {
-                    if replace_in_operand(op, acc_id, sum_rem_phi) { updates += 1; }
+                    if replace_in_operand(op, acc_id, sum_rem_phi) {
+                        updates += 1;
+                    }
                 }
                 Terminator::CondBranch { cond, .. } => {
-                    if replace_in_operand(cond, acc_id, sum_rem_phi) { updates += 1; }
+                    if replace_in_operand(cond, acc_id, sum_rem_phi) {
+                        updates += 1;
+                    }
                 }
                 Terminator::Switch { val, .. } => {
-                    if replace_in_operand(val, acc_id, sum_rem_phi) { updates += 1; }
+                    if replace_in_operand(val, acc_id, sum_rem_phi) {
+                        updates += 1;
+                    }
                 }
                 _ => {}
             }
-            }
+        }
 
         if debug {
-            eprintln!("[VEC-RED]   Rewired {} uses of accumulator outside the loop", updates);
+            eprintln!(
+                "[VEC-RED]   Rewired {} uses of accumulator outside the loop",
+                updates
+            );
         }
     }
 
@@ -4321,7 +4803,7 @@ fn insert_reduction_remainder_loop(
         eprintln!("[VEC-RED] Remainder loop complete: 4 blocks added");
     }
 
-    4  // 4 new blocks added
+    4 // 4 new blocks added
 }
 
 /// Transform reduction loop to use AVX2 256-bit vectorization (4×F64, 8×I32, etc.).
@@ -4349,8 +4831,12 @@ fn transform_reduction_avx2(
                 if let Instruction::GetElementPtr { dest, offset, .. } = inst {
                     if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
                         if let Operand::Value(offset_val) = offset {
-                            if !offset_is_index_times(func, &pattern.loop_blocks,
-                                                      *offset_val, elem_size) {
+                            if !offset_is_index_times(
+                                func,
+                                &pattern.loop_blocks,
+                                *offset_val,
+                                elem_size,
+                            ) {
                                 return 0;
                             }
                         }
@@ -4375,37 +4861,39 @@ fn transform_reduction_avx2(
 
     // Determine vector width and intrinsics based on element type
     // NOTE: These are only used for pattern matching - the actual transform uses Vec* variants
-    let (vec_width, _load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) = match pattern.element_type {
-        IrType::F64 => (
-            4u64,
-            IntrinsicOp::LoadF64x4,  // Legacy - not used in register-based transform
-            IntrinsicOp::AddF64x4,   // Legacy - not used in register-based transform
-            Some(IntrinsicOp::MulF64x4),  // Legacy - not used in register-based transform
-            IntrinsicOp::HorizontalAddF64x4,  // Used for remainder loop intrinsic selection
-        ),
-        IrType::I32 => {
-            (
+    let (vec_width, _load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) =
+        match pattern.element_type {
+            IrType::F64 => (
+                4u64,
+                IntrinsicOp::LoadF64x4, // Legacy - not used in register-based transform
+                IntrinsicOp::AddF64x4,  // Legacy - not used in register-based transform
+                Some(IntrinsicOp::MulF64x4), // Legacy - not used in register-based transform
+                IntrinsicOp::HorizontalAddF64x4, // Used for remainder loop intrinsic selection
+            ),
+            IrType::I32 => (
                 8u64,
                 IntrinsicOp::LoadI32x8,
                 IntrinsicOp::AddI32x8,
                 Some(IntrinsicOp::VecMulI32x8),
                 IntrinsicOp::HorizontalAddI32x8,
-            )
-        },
-        IrType::F32 => (
-            8u64,
-            IntrinsicOp::VecLoadF32x8,
-            IntrinsicOp::VecAddF32x8,
-            Some(IntrinsicOp::VecMulF32x8),
-            IntrinsicOp::VecHorizontalAddF32x8,  // pass-through (no legacy F32 form)
-        ),
-        _ => {
-            if debug {
-                eprintln!("[VEC-RED] Unsupported type for AVX2: {:?}", pattern.element_type);
+            ),
+            IrType::F32 => (
+                8u64,
+                IntrinsicOp::VecLoadF32x8,
+                IntrinsicOp::VecAddF32x8,
+                Some(IntrinsicOp::VecMulF32x8),
+                IntrinsicOp::VecHorizontalAddF32x8, // pass-through (no legacy F32 form)
+            ),
+            _ => {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED] Unsupported type for AVX2: {:?}",
+                        pattern.element_type
+                    );
+                }
+                return 0;
             }
-            return 0;
-        }
-    };
+        };
 
     if debug {
         eprintln!("[VEC-RED] Transforming reduction to AVX2:");
@@ -4414,20 +4902,34 @@ fn transform_reduction_avx2(
         eprintln!("[VEC-RED]   Vec width: {}", vec_width);
 
         eprintln!("[VEC-RED] === LOOP STRUCTURE BEFORE TRANSFORM ===");
-        eprintln!("[VEC-RED]   Header: {}, Body: {}, Latch: {}, Exit: {}",
-            pattern.header_idx, pattern.body_idx, pattern.latch_idx, pattern.exit_idx);
+        eprintln!(
+            "[VEC-RED]   Header: {}, Body: {}, Latch: {}, Exit: {}",
+            pattern.header_idx, pattern.body_idx, pattern.latch_idx, pattern.exit_idx
+        );
 
         // Print header terminator
-        eprintln!("[VEC-RED]   Header terminator: {:?}", func.blocks[pattern.header_idx].terminator);
+        eprintln!(
+            "[VEC-RED]   Header terminator: {:?}",
+            func.blocks[pattern.header_idx].terminator
+        );
 
         // Print body terminator
-        eprintln!("[VEC-RED]   Body terminator: {:?}", func.blocks[pattern.body_idx].terminator);
+        eprintln!(
+            "[VEC-RED]   Body terminator: {:?}",
+            func.blocks[pattern.body_idx].terminator
+        );
 
         // Print latch terminator
-        eprintln!("[VEC-RED]   Latch terminator: {:?}", func.blocks[pattern.latch_idx].terminator);
+        eprintln!(
+            "[VEC-RED]   Latch terminator: {:?}",
+            func.blocks[pattern.latch_idx].terminator
+        );
 
         // Print IV and limit
-        eprintln!("[VEC-RED]   IV: {}, Limit: {:?}", pattern.iv.0, pattern.limit);
+        eprintln!(
+            "[VEC-RED]   IV: {}, Limit: {:?}",
+            pattern.iv.0, pattern.limit
+        );
     }
 
     // Build IV-derived values using fixed-point iteration
@@ -4462,7 +4964,12 @@ fn transform_reduction_avx2(
     // `shl/mul(iv_cast, elem_sz)` shape.
     let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
     let byte_stride = elem_sz * vec_width;
-    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
+    let byte_iv_a = find_reduction_byte_iv(
+        func,
+        &pattern.loop_blocks,
+        pattern.array_a_gep,
+        elem_sz as u32,
+    );
     let byte_iv_b = pattern
         .array_b_gep
         .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
@@ -4489,10 +4996,11 @@ fn transform_reduction_avx2(
             let div_dest = Value(next_val_id);
             next_val_id += 1;
 
-            let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
-                Instruction::Cmp { ty, .. } => *ty,
-                _ => IrType::I64,
-            };
+            let limit_ty =
+                match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                    Instruction::Cmp { ty, .. } => *ty,
+                    _ => IrType::I64,
+                };
 
             let div_inst = Instruction::BinOp {
                 dest: div_dest,
@@ -4507,11 +5015,16 @@ fn transform_reduction_avx2(
             };
 
             // Insert before comparison
-            func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+            func.blocks[pattern.header_idx]
+                .instructions
+                .insert(pattern.exit_cmp_inst_idx, div_inst);
             changes += 1;
 
             if debug {
-                eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
+                eprintln!(
+                    "[VEC-RED]   Inserted division for dynamic limit: Value({})",
+                    div_dest.0
+                );
             }
 
             if use_byte_iv {
@@ -4528,7 +5041,9 @@ fn transform_reduction_avx2(
                     }),
                     ty: limit_ty,
                 };
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
                 changes += 1;
                 Operand::Value(mul_dest)
             } else {
@@ -4568,13 +5083,19 @@ fn transform_reduction_avx2(
                     *rhs = divided_limit.clone();
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified RHS)", lhs, op, rhs);
+                        eprintln!(
+                            "[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified RHS)",
+                            lhs, op, rhs
+                        );
                     }
                 } else if modifies_rhs {
                     *lhs = divided_limit.clone();
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified LHS)", lhs, op, rhs);
+                        eprintln!(
+                            "[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified LHS)",
+                            lhs, op, rhs
+                        );
                     }
                 }
             }
@@ -4585,14 +5106,24 @@ fn transform_reduction_avx2(
     if use_byte_iv {
         let latch = &mut func.blocks[pattern.latch_idx];
         if pattern.iv_inc_idx < latch.instructions.len() {
-            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+            if let Instruction::BinOp {
+                op: IrBinOp::Add,
+                rhs,
+                ..
+            } = &mut latch.instructions[pattern.iv_inc_idx]
+            {
                 *rhs = match rhs {
-                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
+                    Operand::Const(IrConst::I32(_)) => {
+                        Operand::Const(IrConst::I32(byte_stride as i32))
+                    }
                     _ => Operand::Const(IrConst::I64(byte_stride as i64)),
                 };
                 changes += 1;
                 if debug {
-                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
+                    eprintln!(
+                        "[VEC-RED]   Changed IV increment to byte stride {}",
+                        byte_stride
+                    );
                 }
             }
         }
@@ -4601,54 +5132,58 @@ fn transform_reduction_avx2(
     // Step 2: Scale array indexing by vector width (element-index scheme only;
     // the byte-offset IV already covers vec_width elements per iteration).
     if !use_byte_iv {
-    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
-    // vec_width so one vector iteration covers vec_width consecutive elements.
-    // Collect ALL matching GEPs first — a dot product has two (array A and
-    // array B) in the same block, and the old `break` after the first match
-    // left array B at scalar stride, loading the wrong elements (miscompile:
-    // dot(x,y,n) returned garbage for both n=255 and n=256).
-    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
-    for &block_idx in &pattern.loop_blocks {
-        let block = &func.blocks[block_idx];
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
-                    if let Operand::Value(offset_val) = offset {
-                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
+        // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+        // vec_width so one vector iteration covers vec_width consecutive elements.
+        // Collect ALL matching GEPs first — a dot product has two (array A and
+        // array B) in the same block, and the old `break` after the first match
+        // left array B at scalar stride, loading the wrong elements (miscompile:
+        // dot(x,y,n) returned garbage for both n=255 and n=256).
+        let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+        for &block_idx in &pattern.loop_blocks {
+            let block = &func.blocks[block_idx];
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                        if let Operand::Value(offset_val) = offset {
+                            geps_to_scale.push((block_idx, inst_idx, *offset_val));
+                        }
                     }
                 }
             }
         }
-    }
-    // Apply in reverse order so earlier insertions don't shift later indices.
-    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
-        let mul_dest = Value(next_val_id);
-        next_val_id += 1;
+        // Apply in reverse order so earlier insertions don't shift later indices.
+        for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
+            let mul_dest = Value(next_val_id);
+            next_val_id += 1;
 
-        let mul_inst = Instruction::BinOp {
-            dest: mul_dest,
-            op: IrBinOp::Mul,
-            lhs: Operand::Value(offset_val),
-            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-            ty: IrType::I64,
-        };
+            let mul_inst = Instruction::BinOp {
+                dest: mul_dest,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(offset_val),
+                rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+                ty: IrType::I64,
+            };
 
-        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
-        changes += 1;
+            func.blocks[block_idx]
+                .instructions
+                .insert(inst_idx, mul_inst);
+            changes += 1;
 
-        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
-            *offset = Operand::Value(mul_dest);
+            if let Instruction::GetElementPtr { offset, .. } =
+                &mut func.blocks[block_idx].instructions[inst_idx + 1]
+            {
+                *offset = Operand::Value(mul_dest);
+            }
+
+            if debug {
+                eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+            }
         }
-
-        if debug {
-            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
-        }
-    }
     }
 
     // Step 3: Transform loop body - register-based vector operations
     // Vector values are SSA values that live in stack slots (backend keeps in registers when possible)
-    let vec_sum_value: Value;  // The accumulated vector value
+    let vec_sum_value: Value; // The accumulated vector value
 
     match pattern.kind {
         ReductionKind::Sum => {
@@ -4676,8 +5211,10 @@ fn transform_reduction_avx2(
             };
 
             if debug {
-                eprintln!("[VEC-RED]   Using register-based intrinsics: {:?}, {:?}",
-                    vec_load_op, vec_add_op);
+                eprintln!(
+                    "[VEC-RED]   Using register-based intrinsics: {:?}, {:?}",
+                    vec_load_op, vec_add_op
+                );
             }
 
             // Value IDs for vector operations (SSA values)
@@ -4707,7 +5244,14 @@ fn transform_reduction_avx2(
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
+                            if matches!(
+                                val,
+                                Operand::Const(IrConst::F32(_))
+                                    | Operand::Const(IrConst::F64(_))
+                                    | Operand::Const(IrConst::I32(0))
+                                    | Operand::Const(IrConst::I64(0))
+                                    | Operand::Const(IrConst::Zero)
+                            ) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4730,7 +5274,10 @@ fn transform_reduction_avx2(
                     args: {
                         let (base, off) = match (use_byte_iv, &byte_iv_a) {
                             (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                            _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                            _ => (
+                                Operand::Value(pattern.array_a_gep),
+                                Operand::Const(IrConst::I64(0)),
+                            ),
                         };
                         vec![base, off]
                     },
@@ -4742,22 +5289,34 @@ fn transform_reduction_avx2(
                     op: vec_add_op,
                     dest_ptr: None,
                     args: vec![
-                        Operand::Value(pattern.accumulator_phi),  // Current accumulator (PHI)
-                        Operand::Value(vec_load),  // Loaded vector
+                        Operand::Value(pattern.accumulator_phi), // Current accumulator (PHI)
+                        Operand::Value(vec_load),                // Loaded vector
                     ],
                 };
 
                 // Insert vector instructions and remove old scalar add
-                body_block.instructions.insert(pattern.accumulator_add_idx, load_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, add_inst);
-                body_block.instructions.remove(pattern.accumulator_add_idx + 2);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx, load_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 1, add_inst);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 2);
                 changes += 2;
 
                 // Debug: Log vector accumulator flow
                 if debug {
                     eprintln!("[VEC-RED-DEBUG] Vec load SSA value: {}", vec_load.0);
-                    eprintln!("[VEC-RED-DEBUG] Vector accumulator SSA value: {}", vec_sum_value.0);
-                    eprintln!("[VEC-RED-DEBUG] Accumulator PHI: {}", pattern.accumulator_phi.0);
+                    eprintln!(
+                        "[VEC-RED-DEBUG] Vector accumulator SSA value: {}",
+                        vec_sum_value.0
+                    );
+                    eprintln!(
+                        "[VEC-RED-DEBUG] Accumulator PHI: {}",
+                        pattern.accumulator_phi.0
+                    );
                     eprintln!("[VEC-RED-DEBUG] Entry init value: {}", init_zero_value.0);
                     eprintln!("[VEC-RED-DEBUG] Vector add op: {:?}", vec_add_op);
                 }
@@ -4798,35 +5357,39 @@ fn transform_reduction_avx2(
             next_val_id += 1;
 
             // Map to register-based intrinsics based on element type
-            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) = match pattern.element_type {
-                IrType::F64 => (
-                    IntrinsicOp::VecLoadF64x4,
-                    IntrinsicOp::VecMulF64x4,
-                    IntrinsicOp::VecAddF64x4,
-                    IntrinsicOp::VecZeroF64x4,
-                    IntrinsicOp::VecFmaF64x4,
-                ),
-                IrType::F32 => (
-                    IntrinsicOp::VecLoadF32x8,
-                    IntrinsicOp::VecMulF32x8,
-                    IntrinsicOp::VecAddF32x8,
-                    IntrinsicOp::VecZeroF32x8,
-                    IntrinsicOp::VecFmaF32x8,
-                ),
-                IrType::I32 => (
-                    IntrinsicOp::VecLoadI32x8,
-                    IntrinsicOp::VecMulI32x8,
-                    IntrinsicOp::VecAddI32x8,
-                    IntrinsicOp::VecZeroI32x8,
-                    IntrinsicOp::VecMulI32x8,
-                ),
-                _ => {
-                    if debug {
-                        eprintln!("[VEC-RED] Unsupported AVX2 dot product type: {:?}", pattern.element_type);
+            let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op) =
+                match pattern.element_type {
+                    IrType::F64 => (
+                        IntrinsicOp::VecLoadF64x4,
+                        IntrinsicOp::VecMulF64x4,
+                        IntrinsicOp::VecAddF64x4,
+                        IntrinsicOp::VecZeroF64x4,
+                        IntrinsicOp::VecFmaF64x4,
+                    ),
+                    IrType::F32 => (
+                        IntrinsicOp::VecLoadF32x8,
+                        IntrinsicOp::VecMulF32x8,
+                        IntrinsicOp::VecAddF32x8,
+                        IntrinsicOp::VecZeroF32x8,
+                        IntrinsicOp::VecFmaF32x8,
+                    ),
+                    IrType::I32 => (
+                        IntrinsicOp::VecLoadI32x8,
+                        IntrinsicOp::VecMulI32x8,
+                        IntrinsicOp::VecAddI32x8,
+                        IntrinsicOp::VecZeroI32x8,
+                        IntrinsicOp::VecMulI32x8,
+                    ),
+                    _ => {
+                        if debug {
+                            eprintln!(
+                                "[VEC-RED] Unsupported AVX2 dot product type: {:?}",
+                                pattern.element_type
+                            );
+                        }
+                        return changes;
                     }
-                    return changes;
-                }
-            };
+                };
 
             if debug {
                 eprintln!("[VEC-RED]   Using register-based dot product intrinsics");
@@ -4851,7 +5414,14 @@ fn transform_reduction_avx2(
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
+                            if matches!(
+                                val,
+                                Operand::Const(IrConst::F32(_))
+                                    | Operand::Const(IrConst::F64(_))
+                                    | Operand::Const(IrConst::I32(0))
+                                    | Operand::Const(IrConst::I64(0))
+                                    | Operand::Const(IrConst::Zero)
+                            ) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -4860,18 +5430,14 @@ fn transform_reduction_avx2(
             }
 
             let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
-                (true, Some((base, off))) => {
-                    (Operand::Value(*base), Operand::Value(*off))
-                }
+                (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
                 _ => (
                     Operand::Value(pattern.array_a_gep),
                     Operand::Const(IrConst::I64(0)),
                 ),
             };
             let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
-                (true, Some((base, off))) => {
-                    (Operand::Value(*base), Operand::Value(*off))
-                }
+                (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
                 _ => (
                     Operand::Value(pattern.array_b_gep.unwrap()),
                     Operand::Const(IrConst::I64(0)),
@@ -4879,9 +5445,7 @@ fn transform_reduction_avx2(
             };
             let body_block = &mut func.blocks[pattern.body_idx];
 
-            if fp_contract_fast
-                && matches!(pattern.element_type, IrType::F32 | IrType::F64)
-            {
+            if fp_contract_fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
                 let fma_inst = Instruction::Intrinsic {
                     dest: Some(vec_sum_value),
                     op: vec_fma_op,
@@ -4894,8 +5458,12 @@ fn transform_reduction_avx2(
                         b_off,
                     ],
                 };
-                body_block.instructions.insert(pattern.accumulator_add_idx, fma_inst);
-                body_block.instructions.remove(pattern.accumulator_add_idx + 1);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx, fma_inst);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 1);
                 changes += 1;
             } else {
                 let load_a_inst = Instruction::Intrinsic {
@@ -4914,10 +5482,7 @@ fn transform_reduction_avx2(
                     dest: Some(vec_mul),
                     op: vec_mul_op,
                     dest_ptr: None,
-                    args: vec![
-                        Operand::Value(vec_load_a),
-                        Operand::Value(vec_load_b),
-                    ],
+                    args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
                 };
                 let add_inst = Instruction::Intrinsic {
                     dest: Some(vec_sum_value),
@@ -4928,11 +5493,21 @@ fn transform_reduction_avx2(
                         Operand::Value(vec_mul),
                     ],
                 };
-                body_block.instructions.insert(pattern.accumulator_add_idx, load_a_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
-                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx, load_a_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 1, load_b_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 2, mul_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 3, add_inst);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 4);
                 changes += 4;
             }
 
@@ -4965,16 +5540,19 @@ fn transform_reduction_avx2(
         pattern,
         vec_width,
         horizontal_intrinsic,
-        vec_sum_value,  // Pass the vector accumulator SSA value
+        vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        None,           // AVX2 path uses a single accumulator
+        None, // AVX2 path uses a single accumulator
         &mut next_val_id,
         &mut next_label,
     );
     changes += remainder_changes;
 
     if debug {
-        eprintln!("[VEC-RED]   Added remainder loop: {} blocks created", remainder_changes / 4);
+        eprintln!(
+            "[VEC-RED]   Added remainder loop: {} blocks created",
+            remainder_changes / 4
+        );
     }
 
     // Update the function's next_value_id and next_label
@@ -4985,7 +5563,11 @@ fn transform_reduction_avx2(
 }
 
 /// Transform reduction loop to use SSE2 128-bit vectorization (2×F64, 4×I32, etc.).
-fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, neon: bool) -> usize {
+fn transform_reduction_sse2(
+    func: &mut IrFunction,
+    pattern: &ReductionPattern,
+    neon: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -5000,64 +5582,64 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
     next_label = std::cmp::max(next_label, max_present_label + 1);
 
     // Determine vector width and intrinsics based on element type (SSE2 = half of AVX2)
-    let (vec_width, load_intrinsic, add_intrinsic, mul_intrinsic, horizontal_intrinsic) = match pattern.element_type {
-        IrType::F64 => (
-            2u64,
-            IntrinsicOp::LoadF64x2,
-            IntrinsicOp::AddF64x2,
-            Some(IntrinsicOp::MulF64x2),
-            IntrinsicOp::HorizontalAddF64x2,
-        ),
-        // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
-        IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
-            4u64,
-            IntrinsicOp::VecLoadI32x4,
-            match pattern.kind {
-                ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
-                ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
-            },
-            None,
-            IntrinsicOp::VecHorizontalAddI64x2,
-        ),
-        IrType::I32 if pattern.accumulator_type == IrType::I64 => (
-            2u64,
-            IntrinsicOp::VecLoadWidenI32ToI64x2,
-            IntrinsicOp::VecAddI64x2,
-            Some(IntrinsicOp::VecMulI64x2),
-            IntrinsicOp::VecHorizontalAddI64x2,
-        ),
-        IrType::I32 => {
-            (
+    let (vec_width, load_intrinsic, add_intrinsic, mul_intrinsic, horizontal_intrinsic) =
+        match pattern.element_type {
+            IrType::F64 => (
+                2u64,
+                IntrinsicOp::LoadF64x2,
+                IntrinsicOp::AddF64x2,
+                Some(IntrinsicOp::MulF64x2),
+                IntrinsicOp::HorizontalAddF64x2,
+            ),
+            // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
+            IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
+                4u64,
+                IntrinsicOp::VecLoadI32x4,
+                match pattern.kind {
+                    ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
+                    ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
+                },
+                None,
+                IntrinsicOp::VecHorizontalAddI64x2,
+            ),
+            IrType::I32 if pattern.accumulator_type == IrType::I64 => (
+                2u64,
+                IntrinsicOp::VecLoadWidenI32ToI64x2,
+                IntrinsicOp::VecAddI64x2,
+                Some(IntrinsicOp::VecMulI64x2),
+                IntrinsicOp::VecHorizontalAddI64x2,
+            ),
+            IrType::I32 => (
                 4u64,
                 IntrinsicOp::LoadI32x4,
                 IntrinsicOp::AddI32x4,
                 Some(IntrinsicOp::VecMulI32x4),
                 IntrinsicOp::HorizontalAddI32x4,
-            )
-        },
-        IrType::I64 => {
-            (
+            ),
+            IrType::I64 => (
                 2u64,
                 IntrinsicOp::VecLoadI64x2,
                 IntrinsicOp::VecAddI64x2,
                 Some(IntrinsicOp::VecMulI64x2),
                 IntrinsicOp::VecHorizontalAddI64x2,
-            )
-        },
-        IrType::F32 => (
-            4u64,
-            IntrinsicOp::VecLoadF32x4,
-            IntrinsicOp::VecAddF32x4,
-            Some(IntrinsicOp::VecMulF32x4),
-            IntrinsicOp::VecHorizontalAddF32x4,  // pass-through (no legacy F32 form)
-        ),
-        _ => {
-            if debug {
-                eprintln!("[VEC-RED] Unsupported type for SSE2: {:?}", pattern.element_type);
+            ),
+            IrType::F32 => (
+                4u64,
+                IntrinsicOp::VecLoadF32x4,
+                IntrinsicOp::VecAddF32x4,
+                Some(IntrinsicOp::VecMulF32x4),
+                IntrinsicOp::VecHorizontalAddF32x4, // pass-through (no legacy F32 form)
+            ),
+            _ => {
+                if debug {
+                    eprintln!(
+                        "[VEC-RED] Unsupported type for SSE2: {:?}",
+                        pattern.element_type
+                    );
+                }
+                return 0;
             }
-            return 0;
-        }
-    };
+        };
 
     if debug {
         eprintln!("[VEC-RED] Transforming reduction to SSE2:");
@@ -5098,7 +5680,12 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
     // `shl/mul(iv_cast, elem_sz)` shape.
     let elem_sz = reduction_element_size(pattern.element_type).unwrap_or(0) as u64;
     let byte_stride = elem_sz * vec_width;
-    let byte_iv_a = find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.array_a_gep, elem_sz as u32);
+    let byte_iv_a = find_reduction_byte_iv(
+        func,
+        &pattern.loop_blocks,
+        pattern.array_a_gep,
+        elem_sz as u32,
+    );
     let byte_iv_b = pattern
         .array_b_gep
         .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
@@ -5125,10 +5712,11 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             let div_dest = Value(next_val_id);
             next_val_id += 1;
 
-            let limit_ty = match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
-                Instruction::Cmp { ty, .. } => *ty,
-                _ => IrType::I64,
-            };
+            let limit_ty =
+                match &func.blocks[pattern.header_idx].instructions[pattern.exit_cmp_inst_idx] {
+                    Instruction::Cmp { ty, .. } => *ty,
+                    _ => IrType::I64,
+                };
 
             let div_inst = Instruction::BinOp {
                 dest: div_dest,
@@ -5143,11 +5731,16 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             };
 
             // Insert before comparison
-            func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx, div_inst);
+            func.blocks[pattern.header_idx]
+                .instructions
+                .insert(pattern.exit_cmp_inst_idx, div_inst);
             changes += 1;
 
             if debug {
-                eprintln!("[VEC-RED]   Inserted division for dynamic limit: Value({})", div_dest.0);
+                eprintln!(
+                    "[VEC-RED]   Inserted division for dynamic limit: Value({})",
+                    div_dest.0
+                );
             }
 
             if use_byte_iv {
@@ -5164,7 +5757,9 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                     }),
                     ty: limit_ty,
                 };
-                func.blocks[pattern.header_idx].instructions.insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
+                func.blocks[pattern.header_idx]
+                    .instructions
+                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
                 changes += 1;
                 Operand::Value(mul_dest)
             } else {
@@ -5204,13 +5799,19 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                     *rhs = divided_limit.clone();
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified RHS)", lhs, op, rhs);
+                        eprintln!(
+                            "[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified RHS)",
+                            lhs, op, rhs
+                        );
                     }
                 } else if modifies_rhs {
                     *lhs = divided_limit.clone();
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified LHS)", lhs, op, rhs);
+                        eprintln!(
+                            "[VEC-RED]   CMP after:  {:?} {:?} {:?} (modified LHS)",
+                            lhs, op, rhs
+                        );
                     }
                 }
             }
@@ -5221,14 +5822,24 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
     if use_byte_iv {
         let latch = &mut func.blocks[pattern.latch_idx];
         if pattern.iv_inc_idx < latch.instructions.len() {
-            if let Instruction::BinOp { op: IrBinOp::Add, rhs, .. } = &mut latch.instructions[pattern.iv_inc_idx] {
+            if let Instruction::BinOp {
+                op: IrBinOp::Add,
+                rhs,
+                ..
+            } = &mut latch.instructions[pattern.iv_inc_idx]
+            {
                 *rhs = match rhs {
-                    Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(byte_stride as i32)),
+                    Operand::Const(IrConst::I32(_)) => {
+                        Operand::Const(IrConst::I32(byte_stride as i32))
+                    }
                     _ => Operand::Const(IrConst::I64(byte_stride as i64)),
                 };
                 changes += 1;
                 if debug {
-                    eprintln!("[VEC-RED]   Changed IV increment to byte stride {}", byte_stride);
+                    eprintln!(
+                        "[VEC-RED]   Changed IV increment to byte stride {}",
+                        byte_stride
+                    );
                 }
             }
         }
@@ -5237,48 +5848,52 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
     // Step 2: Scale array indexing by vector width (element-index scheme only;
     // the byte-offset IV already covers vec_width elements per iteration).
     if !use_byte_iv {
-    // Each GEP's byte offset (element_index * elem_size) must be multiplied by
-    // vec_width so one vector iteration covers vec_width consecutive elements.
-    // Collect ALL matching GEPs first — a dot product has two (array A and
-    // array B) in the same block, and the old `break` after the first match
-    // left array B at scalar stride, loading the wrong elements.
-    let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
-    for &block_idx in &pattern.loop_blocks {
-        let block = &func.blocks[block_idx];
-        for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::GetElementPtr { dest, offset, .. } = inst {
-                if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
-                    if let Operand::Value(offset_val) = offset {
-                        geps_to_scale.push((block_idx, inst_idx, *offset_val));
+        // Each GEP's byte offset (element_index * elem_size) must be multiplied by
+        // vec_width so one vector iteration covers vec_width consecutive elements.
+        // Collect ALL matching GEPs first — a dot product has two (array A and
+        // array B) in the same block, and the old `break` after the first match
+        // left array B at scalar stride, loading the wrong elements.
+        let mut geps_to_scale: Vec<(usize, usize, Value)> = Vec::new();
+        for &block_idx in &pattern.loop_blocks {
+            let block = &func.blocks[block_idx];
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if let Instruction::GetElementPtr { dest, offset, .. } = inst {
+                    if *dest == pattern.array_a_gep || Some(*dest) == pattern.array_b_gep {
+                        if let Operand::Value(offset_val) = offset {
+                            geps_to_scale.push((block_idx, inst_idx, *offset_val));
+                        }
                     }
                 }
             }
         }
-    }
-    // Apply in reverse order so earlier insertions don't shift later indices.
-    for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
-        let mul_dest = Value(next_val_id);
-        next_val_id += 1;
+        // Apply in reverse order so earlier insertions don't shift later indices.
+        for (block_idx, inst_idx, offset_val) in geps_to_scale.into_iter().rev() {
+            let mul_dest = Value(next_val_id);
+            next_val_id += 1;
 
-        let mul_inst = Instruction::BinOp {
-            dest: mul_dest,
-            op: IrBinOp::Mul,
-            lhs: Operand::Value(offset_val),
-            rhs: Operand::Const(IrConst::I64(vec_width as i64)),
-            ty: IrType::I64,
-        };
+            let mul_inst = Instruction::BinOp {
+                dest: mul_dest,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(offset_val),
+                rhs: Operand::Const(IrConst::I64(vec_width as i64)),
+                ty: IrType::I64,
+            };
 
-        func.blocks[block_idx].instructions.insert(inst_idx, mul_inst);
-        changes += 1;
+            func.blocks[block_idx]
+                .instructions
+                .insert(inst_idx, mul_inst);
+            changes += 1;
 
-        if let Instruction::GetElementPtr { offset, .. } = &mut func.blocks[block_idx].instructions[inst_idx + 1] {
-            *offset = Operand::Value(mul_dest);
+            if let Instruction::GetElementPtr { offset, .. } =
+                &mut func.blocks[block_idx].instructions[inst_idx + 1]
+            {
+                *offset = Operand::Value(mul_dest);
+            }
+
+            if debug {
+                eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
+            }
         }
-
-        if debug {
-            eprintln!("[VEC-RED]   Scaled GEP offset by {}", vec_width);
-        }
-    }
     }
 
     // Step 3: Transform loop body - replace scalar operations with vector intrinsics
@@ -5348,7 +5963,10 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             changes += 1;
 
             if debug {
-                eprintln!("[VEC-RED]   Created SSA values: vec_load={}, vec_sum={}", vec_load.0, vec_sum_value.0);
+                eprintln!(
+                    "[VEC-RED]   Created SSA values: vec_load={}, vec_sum={}",
+                    vec_load.0, vec_sum_value.0
+                );
             }
 
             // Update the accumulator PHI to use init_zero_value as the entry predecessor
@@ -5357,7 +5975,14 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
+                            if matches!(
+                                val,
+                                Operand::Const(IrConst::F32(_))
+                                    | Operand::Const(IrConst::F64(_))
+                                    | Operand::Const(IrConst::I32(0))
+                                    | Operand::Const(IrConst::I64(0))
+                                    | Operand::Const(IrConst::Zero)
+                            ) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -5376,7 +6001,10 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 args: {
                     let (base, off) = match (use_byte_iv, &byte_iv_a) {
                         (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                        _ => (
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
                     };
                     vec![base, off]
                 },
@@ -5396,16 +6024,31 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             // Insert instructions and remove old scalar add
             {
                 let body_block = &mut func.blocks[pattern.body_idx];
-                body_block.instructions.insert(pattern.accumulator_add_idx, load_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, add_inst);
-                body_block.instructions.remove(pattern.accumulator_add_idx + 2);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx, load_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 1, add_inst);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 2);
                 changes += 2;
 
                 // Debug: Log vector accumulator flow
                 if debug {
-                    eprintln!("[VEC-RED-DEBUG-SSE2] Vector accumulator SSA value: {}", vec_sum_value.0);
-                    eprintln!("[VEC-RED-DEBUG-SSE2] Accumulator PHI: {}", pattern.accumulator_phi.0);
-                    eprintln!("[VEC-RED-DEBUG-SSE2] Entry init value: {}", init_zero_value.0);
+                    eprintln!(
+                        "[VEC-RED-DEBUG-SSE2] Vector accumulator SSA value: {}",
+                        vec_sum_value.0
+                    );
+                    eprintln!(
+                        "[VEC-RED-DEBUG-SSE2] Accumulator PHI: {}",
+                        pattern.accumulator_phi.0
+                    );
+                    eprintln!(
+                        "[VEC-RED-DEBUG-SSE2] Entry init value: {}",
+                        init_zero_value.0
+                    );
                     eprintln!("[VEC-RED-DEBUG-SSE2] Vector add op: {:?}", vec_add_op);
                 }
             }
@@ -5509,61 +6152,78 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                     .rposition(|inst| matches!(inst, Instruction::Phi { .. }))
                     .map(|p| p + 1)
                     .unwrap_or(0);
-                header_block.instructions.insert(insert_pos, Instruction::Phi {
-                    dest: acc1_phi,
-                    ty: IrType::I64,
-                    incoming: vec![
-                        (Operand::Value(init_zero1), preheader_label),
-                        (Operand::Value(acc1_next), latch_label),
-                    ],
-                });
+                header_block.instructions.insert(
+                    insert_pos,
+                    Instruction::Phi {
+                        dest: acc1_phi,
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(init_zero1), preheader_label),
+                            (Operand::Value(acc1_next), latch_label),
+                        ],
+                    },
+                );
                 changes += 1;
             }
 
             // Body: two 4-wide loads + smlal/smlal2, replacing the scalar add.
             {
                 let body_block = &mut func.blocks[pattern.body_idx];
-                body_block.instructions.insert(pattern.accumulator_add_idx, Instruction::Intrinsic {
-                    dest: Some(vec_load_a),
-                    op: IntrinsicOp::VecLoadI32x4,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.array_a_gep),
-                        Operand::Const(IrConst::I64(0)),
-                    ],
-                });
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, Instruction::Intrinsic {
-                    dest: Some(vec_load_b),
-                    op: IntrinsicOp::VecLoadI32x4,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.array_b_gep.unwrap()),
-                        Operand::Const(IrConst::I64(0)),
-                    ],
-                });
-                body_block.instructions.insert(pattern.accumulator_add_idx + 2, Instruction::Intrinsic {
-                    dest: Some(acc0_next),
-                    op: IntrinsicOp::VecSmlalLoI32x4,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(pattern.accumulator_phi),
-                        Operand::Value(vec_load_a),
-                        Operand::Value(vec_load_b),
-                    ],
-                });
-                body_block.instructions.insert(pattern.accumulator_add_idx + 3, Instruction::Intrinsic {
-                    dest: Some(acc1_next),
-                    op: IntrinsicOp::VecSmlalHiI32x4,
-                    dest_ptr: None,
-                    args: vec![
-                        Operand::Value(acc1_phi),
-                        Operand::Value(vec_load_a),
-                        Operand::Value(vec_load_b),
-                    ],
-                });
+                body_block.instructions.insert(
+                    pattern.accumulator_add_idx,
+                    Instruction::Intrinsic {
+                        dest: Some(vec_load_a),
+                        op: IntrinsicOp::VecLoadI32x4,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ],
+                    },
+                );
+                body_block.instructions.insert(
+                    pattern.accumulator_add_idx + 1,
+                    Instruction::Intrinsic {
+                        dest: Some(vec_load_b),
+                        op: IntrinsicOp::VecLoadI32x4,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.array_b_gep.unwrap()),
+                            Operand::Const(IrConst::I64(0)),
+                        ],
+                    },
+                );
+                body_block.instructions.insert(
+                    pattern.accumulator_add_idx + 2,
+                    Instruction::Intrinsic {
+                        dest: Some(acc0_next),
+                        op: IntrinsicOp::VecSmlalLoI32x4,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(pattern.accumulator_phi),
+                            Operand::Value(vec_load_a),
+                            Operand::Value(vec_load_b),
+                        ],
+                    },
+                );
+                body_block.instructions.insert(
+                    pattern.accumulator_add_idx + 3,
+                    Instruction::Intrinsic {
+                        dest: Some(acc1_next),
+                        op: IntrinsicOp::VecSmlalHiI32x4,
+                        dest_ptr: None,
+                        args: vec![
+                            Operand::Value(acc1_phi),
+                            Operand::Value(vec_load_a),
+                            Operand::Value(vec_load_b),
+                        ],
+                    },
+                );
                 // Remove the old scalar add; the scalar mul/casts/loads are now
                 // dead and cleaned up by DCE.
-                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 4);
                 changes += 4;
             }
 
@@ -5618,7 +6278,10 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 ),
                 _ => {
                     if debug {
-                        eprintln!("[VEC-RED] Unsupported SSE2 dot product type: {:?}", load_intrinsic);
+                        eprintln!(
+                            "[VEC-RED] Unsupported SSE2 dot product type: {:?}",
+                            load_intrinsic
+                        );
                     }
                     return changes;
                 }
@@ -5648,7 +6311,14 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 if let Instruction::Phi { dest, incoming, .. } = inst {
                     if *dest == pattern.accumulator_phi {
                         for (val, _) in incoming.iter_mut() {
-                            if matches!(val, Operand::Const(IrConst::F32(_)) | Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::I32(0)) | Operand::Const(IrConst::I64(0)) | Operand::Const(IrConst::Zero)) {
+                            if matches!(
+                                val,
+                                Operand::Const(IrConst::F32(_))
+                                    | Operand::Const(IrConst::F64(_))
+                                    | Operand::Const(IrConst::I32(0))
+                                    | Operand::Const(IrConst::I64(0))
+                                    | Operand::Const(IrConst::Zero)
+                            ) {
                                 *val = Operand::Value(init_zero_value);
                             }
                         }
@@ -5667,7 +6337,10 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 args: {
                     let (base, off) = match (use_byte_iv, &byte_iv_a) {
                         (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (Operand::Value(pattern.array_a_gep), Operand::Const(IrConst::I64(0))),
+                        _ => (
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
                     };
                     vec![base, off]
                 },
@@ -5680,7 +6353,10 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 args: {
                     let (base, off) = match (use_byte_iv, &byte_iv_b) {
                         (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                        _ => (Operand::Value(pattern.array_b_gep.unwrap()), Operand::Const(IrConst::I64(0))),
+                        _ => (
+                            Operand::Value(pattern.array_b_gep.unwrap()),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
                     };
                     vec![base, off]
                 },
@@ -5691,10 +6367,7 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 dest: Some(vec_mul),
                 op: vec_mul_op,
                 dest_ptr: None,
-                args: vec![
-                    Operand::Value(vec_load_a),
-                    Operand::Value(vec_load_b),
-                ],
+                args: vec![Operand::Value(vec_load_a), Operand::Value(vec_load_b)],
             };
 
             // Create vector add (accumulate)
@@ -5711,10 +6384,18 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
             // Insert all instructions and remove old scalar operations
             {
                 let body_block = &mut func.blocks[pattern.body_idx];
-                body_block.instructions.insert(pattern.accumulator_add_idx, load_a_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 1, load_b_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 2, mul_inst);
-                body_block.instructions.insert(pattern.accumulator_add_idx + 3, add_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx, load_a_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 1, load_b_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 2, mul_inst);
+                body_block
+                    .instructions
+                    .insert(pattern.accumulator_add_idx + 3, add_inst);
 
                 // Remove the dead scalar add (now after the 4 inserted vector
                 // ops). The dead scalar multiply that fed it becomes unreachable
@@ -5723,7 +6404,9 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
                 // deleted the latch's induction-variable increment once the
                 // byte-offset IV stopped inserting per-GEP multiplies
                 // (infinite loop / undefined IV on dot products).
-                body_block.instructions.remove(pattern.accumulator_add_idx + 4);
+                body_block
+                    .instructions
+                    .remove(pattern.accumulator_add_idx + 4);
                 changes += 4;
             }
 
@@ -5755,16 +6438,19 @@ fn transform_reduction_sse2(func: &mut IrFunction, pattern: &ReductionPattern, n
         pattern,
         vec_width,
         horizontal_intrinsic,
-        vec_sum_value,  // Pass the vector accumulator SSA value
+        vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        second_acc,     // Second NEON accumulator phi (smlal2 half), if any
+        second_acc, // Second NEON accumulator phi (smlal2 half), if any
         &mut next_val_id,
         &mut next_label,
     );
     changes += remainder_changes;
 
     if debug {
-        eprintln!("[VEC-RED]   Added remainder loop: {} blocks created", remainder_changes / 4);
+        eprintln!(
+            "[VEC-RED]   Added remainder loop: {} blocks created",
+            remainder_changes / 4
+        );
     }
 
     // Update the function's next_value_id and next_label
@@ -5827,20 +6513,14 @@ fn transform_map_vector(
     };
 
     let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
-    let Some((src_base, _)) = find_reduction_byte_iv(
-        func,
-        &pattern.loop_blocks,
-        pattern.src_gep,
-        elem_size,
-    ) else {
+    let Some((src_base, _)) =
+        find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.src_gep, elem_size)
+    else {
         return 0;
     };
-    let Some((dst_base, _)) = find_reduction_byte_iv(
-        func,
-        &pattern.loop_blocks,
-        pattern.dst_gep,
-        elem_size,
-    ) else {
+    let Some((dst_base, _)) =
+        find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.dst_gep, elem_size)
+    else {
         return 0;
     };
 
@@ -5852,8 +6532,7 @@ fn transform_map_vector(
         changed = false;
         for &block_idx in &pattern.loop_blocks {
             for inst in &func.blocks[block_idx].instructions {
-                if let Instruction::Cast { dest, src, .. }
-                | Instruction::Copy { dest, src } = inst
+                if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = inst
                 {
                     if let Operand::Value(src_val) = src {
                         if iv_derived.contains(src_val) && iv_derived.insert(*dest) {
@@ -5867,12 +6546,8 @@ fn transform_map_vector(
 
     // Divide the loop bound by the packed width (constant folded or dynamic).
     let divided_limit = match &pattern.limit {
-        Operand::Const(IrConst::I32(n)) => {
-            Operand::Const(IrConst::I32(*n / vec_width as i32))
-        }
-        Operand::Const(IrConst::I64(n)) => {
-            Operand::Const(IrConst::I64(*n / vec_width as i64))
-        }
+        Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32(*n / vec_width as i32)),
+        Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(*n / vec_width as i64)),
         Operand::Value(limit_val) => {
             let shift = vec_width.trailing_zeros() as i64;
             let int_const = |n: i64| match pattern.iv_ty {
@@ -5897,14 +6572,13 @@ fn transform_map_vector(
                     dest: sign,
                     op: IrBinOp::AShr,
                     lhs: Operand::Value(*limit_val),
-                    rhs: Operand::Const(int_const(if matches!(
-                        pattern.iv_ty,
-                        IrType::I32 | IrType::U32
-                    ) {
-                        31
-                    } else {
-                        63
-                    })),
+                    rhs: Operand::Const(int_const(
+                        if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+                            31
+                        } else {
+                            63
+                        },
+                    )),
                     ty: pattern.iv_ty,
                 });
                 quotient_insts.push(Instruction::BinOp {
@@ -5954,10 +6628,8 @@ fn transform_map_vector(
     for &block_idx in &pattern.loop_blocks {
         for inst in &mut func.blocks[block_idx].instructions {
             if let Instruction::Cmp { lhs, rhs, .. } = inst {
-                let modifies_lhs =
-                    matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
-                let modifies_rhs =
-                    matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
+                let modifies_lhs = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
+                let modifies_rhs = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
                 if modifies_lhs {
                     *rhs = divided_limit.clone();
                     changes += 1;
@@ -6099,10 +6771,7 @@ fn transform_map_vector(
     {
         let vec_load = Value(next_val_id);
         next_val_id += 1;
-        let load_args = vec![
-            Operand::Value(src_address.0),
-            src_address.1.clone(),
-        ];
+        let load_args = vec![Operand::Value(src_address.0), src_address.1.clone()];
         let mut vec_insts = vec![Instruction::Intrinsic {
             dest: Some(vec_load),
             op: load_op,
@@ -6110,9 +6779,7 @@ fn transform_map_vector(
             args: load_args,
         }];
         let mut current = vec_load;
-        if let (Some(madd), Some(scale), Some(offset)) =
-            (madd_op, scale_vec, offset_vec)
-        {
+        if let (Some(madd), Some(scale), Some(offset)) = (madd_op, scale_vec, offset_vec) {
             let result = Value(next_val_id);
             next_val_id += 1;
             vec_insts.push(Instruction::Intrinsic {
@@ -6163,9 +6830,9 @@ fn transform_map_vector(
         });
 
         let body = &mut func.blocks[pattern.body_idx];
-        let Some(store_pos) = body.instructions.iter().position(|inst| {
-            matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.dst_gep)
-        }) else {
+        let Some(store_pos) = body.instructions.iter().position(
+            |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.dst_gep),
+        ) else {
             if debug {
                 eprintln!("[VEC-MAP]   Store not found at transform time");
             }
@@ -6179,13 +6846,8 @@ fn transform_map_vector(
         changes += inserted;
     }
 
-    changes += insert_map_remainder_loop(
-        func,
-        pattern,
-        vec_width,
-        &mut next_val_id,
-        &mut next_label,
-    );
+    changes +=
+        insert_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -6336,7 +6998,8 @@ fn insert_map_remainder_loop(
         offset: Operand::Value(offset_v),
         ty: pattern.elem_ty,
     });
-    remainder_insts.push(Instruction::Load { volatile: false,
+    remainder_insts.push(Instruction::Load {
+        volatile: false,
         dest: load_v,
         ptr: gep_src,
         ty: pattern.elem_ty,
@@ -6365,7 +7028,8 @@ fn insert_map_remainder_loop(
         });
         scalar_result = value;
     }
-    remainder_insts.push(Instruction::Store { volatile: false,
+    remainder_insts.push(Instruction::Store {
+        volatile: false,
         val: Operand::Value(scalar_result),
         ptr: gep_dst,
         ty: pattern.elem_ty,
@@ -6419,22 +7083,24 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
     // that site.  Restrict this specialized SLP fold to pure address/scalar
     // computation plus ordinary loads.  This conservative whitelist also makes
     // future side-effecting IR variants reject by default.
-    if block.instructions.iter().any(|inst| !matches!(
-        inst,
-        Instruction::Alloca { .. }
-            | Instruction::Load { .. }
-            | Instruction::BinOp { .. }
-            | Instruction::UnaryOp { .. }
-            | Instruction::Cmp { .. }
-            | Instruction::GetElementPtr { .. }
-            | Instruction::Cast { .. }
-            | Instruction::Copy { .. }
-            | Instruction::GlobalAddr { .. }
-            | Instruction::Phi { .. }
-            | Instruction::LabelAddr { .. }
-            | Instruction::Select { .. }
-            | Instruction::ParamRef { .. }
-    )) {
+    if block.instructions.iter().any(|inst| {
+        !matches!(
+            inst,
+            Instruction::Alloca { .. }
+                | Instruction::Load { .. }
+                | Instruction::BinOp { .. }
+                | Instruction::UnaryOp { .. }
+                | Instruction::Cmp { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::Cast { .. }
+                | Instruction::Copy { .. }
+                | Instruction::GlobalAddr { .. }
+                | Instruction::Phi { .. }
+                | Instruction::LabelAddr { .. }
+                | Instruction::Select { .. }
+                | Instruction::ParamRef { .. }
+        )
+    }) {
         return 0;
     }
     let ty = func.return_type;
@@ -6480,7 +7146,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
             ty: load_ty,
             seg_override,
             ..
-        } = find_inst_by_dest(block, value)? else {
+        } = find_inst_by_dest(block, value)?
+        else {
             return None;
         };
         // The fixed-distance intrinsic currently emits ordinary (%gpr) vector
@@ -6509,10 +7176,7 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
     // Four F32 or two F64 lanes do not amortize the baseline horizontal
     // sequence and remain scalar. Full 256-bit F32x8/F64x4 vectors are the
     // measured profitable widths on x86-64-v3.
-    let width_supported = matches!(
-        (ty, lanes),
-        (IrType::F32, 8) | (IrType::F64, 4)
-    );
+    let width_supported = matches!((ty, lanes), (IrType::F32, 8) | (IrType::F64, 4));
     if !width_supported {
         return 0;
     }
@@ -6525,7 +7189,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
             rhs: Operand::Value(rhs),
             ty: mul_ty,
             ..
-        }) = find_inst_by_dest(block, term) else {
+        }) = find_inst_by_dest(block, term)
+        else {
             return 0;
         };
         if *mul_ty != ty || lhs != rhs {
@@ -6537,7 +7202,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
             rhs: Operand::Value(b),
             ty: sub_ty,
             ..
-        }) = find_inst_by_dest(block, *lhs) else {
+        }) = find_inst_by_dest(block, *lhs)
+        else {
             return 0;
         };
         if *sub_ty != ty {
@@ -6552,15 +7218,12 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
         lane_addresses.push((a_addr, b_addr));
     }
     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
-    let a_base = lane_addresses[0].0.0;
-    let b_base = lane_addresses[0].1.0;
+    let a_base = lane_addresses[0].0 .0;
+    let b_base = lane_addresses[0].1 .0;
     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
-    for (lane, ((this_a, a_offset), (this_b, b_offset))) in
-        lane_addresses.iter().enumerate()
-    {
+    for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
         let expected = lane as i64 * elem_size;
-        if *this_a != a_base || *this_b != b_base
-            || *a_offset != expected || *b_offset != expected
+        if *this_a != a_base || *this_b != b_base || *a_offset != expected || *b_offset != expected
         {
             return 0;
         }
@@ -6623,7 +7286,10 @@ fn vectorize_function_mode(
     // legality check, not a global pass disable: functions without dynamic
     // stack allocation retain full vectorization.
     if func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
+        block
+            .instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::DynAlloca { .. }))
     }) {
         return 0;
     }
@@ -6653,14 +7319,8 @@ fn vectorize_function_mode(
     }
 
     let cfg = CfgAnalysis::build(func);
-    let loop_changes = vectorize_with_analysis_mode(
-        func,
-        &cfg,
-        false,
-        false,
-        fp_reassoc,
-        fp_contract_fast,
-    );
+    let loop_changes =
+        vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract_fast);
     let changes = slp_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
@@ -6809,7 +7469,8 @@ mod fixed_distance_slp_tests {
                 ty: IrType::F64,
             });
             let a = fresh();
-            instructions.push(Instruction::Load { volatile: false,
+            instructions.push(Instruction::Load {
+                volatile: false,
                 dest: a,
                 ptr: a_ptr,
                 ty: IrType::F64,
@@ -6823,7 +7484,8 @@ mod fixed_distance_slp_tests {
                 ty: IrType::F64,
             });
             let b = fresh();
-            instructions.push(Instruction::Load { volatile: false,
+            instructions.push(Instruction::Load {
+                volatile: false,
                 dest: b,
                 ptr: b_ptr,
                 ty: IrType::F64,
@@ -6872,7 +7534,8 @@ mod fixed_distance_slp_tests {
             ty: IrType::F64,
         });
         if trailing_store {
-            instructions.push(Instruction::Store { volatile: false,
+            instructions.push(Instruction::Store {
+                volatile: false,
                 val: Operand::Const(IrConst::F64(0.0)),
                 ptr: Value(0),
                 ty: IrType::F64,

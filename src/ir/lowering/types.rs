@@ -4,18 +4,12 @@
 //! Builtin seeding lives in types_seed.rs; CType conversion and the
 //! TypeConvertContext trait impl live in types_ctype.rs.
 
-use std::rc::Rc;
-use crate::frontend::parser::ast::{
-    DerivedDeclarator,
-    Expr,
-    StructFieldDecl,
-    TypeSpecifier,
-};
-use crate::common::types::{IrType, StructField, StructLayout, RcLayout, CType};
 use super::lower::Lowerer;
+use crate::common::types::{CType, IrType, RcLayout, StructField, StructLayout};
+use crate::frontend::parser::ast::{DerivedDeclarator, Expr, StructFieldDecl, TypeSpecifier};
+use std::rc::Rc;
 
 impl Lowerer {
-
     /// Resolve a TypeSpecifier, following TypeofType wrappers.
     /// TypedefName resolution now goes through CType (see type_spec_to_ctype).
     /// This only resolves non-typedef wrappers like TypeofType.
@@ -46,21 +40,25 @@ impl Lowerer {
     /// Check if a TypeSpecifier resolves to a Bool type (through typedefs).
     pub(super) fn is_type_bool(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Bool)
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| matches!(ct, CType::Bool))
+            || self
+                .resolve_typedef_ctype(ts)
+                .is_some_and(|ct| matches!(ct, CType::Bool))
     }
 
     /// Check if a TypeSpecifier resolves to a struct or union type (through typedefs).
     pub(super) fn is_type_struct_or_union(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Struct(..) | TypeSpecifier::Union(..))
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| ct.is_struct_or_union())
+            || self
+                .resolve_typedef_ctype(ts)
+                .is_some_and(|ct| ct.is_struct_or_union())
     }
 
     /// Check if a TypeSpecifier is a transparent union (passed as first member for ABI).
     pub(super) fn is_transparent_union(&self, ts: &TypeSpecifier) -> bool {
         let key = match ts {
-            TypeSpecifier::Union(tag, _, _, _, _) => {
-                tag.as_ref().map(|t| -> Rc<str> { format!("union.{}", t).into() })
-            }
+            TypeSpecifier::Union(tag, _, _, _, _) => tag
+                .as_ref()
+                .map(|t| -> Rc<str> { format!("union.{}", t).into() }),
             TypeSpecifier::TypedefName(name) => {
                 if let Some(CType::Union(key)) = self.types.typedefs.get(name) {
                     Some(key.clone())
@@ -71,7 +69,10 @@ impl Lowerer {
             _ => None,
         };
         if let Some(key) = key {
-            self.types.borrow_struct_layouts().get(&*key).is_some_and(|l| l.is_transparent_union)
+            self.types
+                .borrow_struct_layouts()
+                .get(&*key)
+                .is_some_and(|l| l.is_transparent_union)
         } else {
             false
         }
@@ -79,14 +80,22 @@ impl Lowerer {
 
     /// Check if a TypeSpecifier resolves to a complex type (through typedefs).
     pub(super) fn is_type_complex(&self, ts: &TypeSpecifier) -> bool {
-        matches!(ts, TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble)
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| ct.is_complex())
+        matches!(
+            ts,
+            TypeSpecifier::ComplexFloat
+                | TypeSpecifier::ComplexDouble
+                | TypeSpecifier::ComplexLongDouble
+        ) || self
+            .resolve_typedef_ctype(ts)
+            .is_some_and(|ct| ct.is_complex())
     }
 
     /// Check if a TypeSpecifier resolves to a pointer type (through typedefs).
     pub(super) fn is_type_pointer(&self, ts: &TypeSpecifier) -> bool {
         matches!(ts, TypeSpecifier::Pointer(_, _))
-            || self.resolve_typedef_ctype(ts).is_some_and(|ct| matches!(ct, CType::Pointer(_, _)))
+            || self
+                .resolve_typedef_ctype(ts)
+                .is_some_and(|ct| matches!(ct, CType::Pointer(_, _)))
     }
 
     /// Resolve typeof(expr) to a concrete TypeSpecifier by analyzing the expression type.
@@ -97,11 +106,12 @@ impl Lowerer {
         match ts {
             TypeSpecifier::Typeof(expr) => {
                 // For _Generic selections inside typeof(), resolve fresh to avoid stale cache.
-                let ctype = if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
-                    self.resolve_generic_selection_ctype(controlling, associations)
-                } else {
-                    self.get_expr_ctype(expr)
-                };
+                let ctype =
+                    if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
+                        self.resolve_generic_selection_ctype(controlling, associations)
+                    } else {
+                        self.get_expr_ctype(expr)
+                    };
                 if let Some(ctype) = ctype {
                     Self::ctype_to_type_spec(&ctype)
                 } else {
@@ -112,9 +122,7 @@ impl Lowerer {
                     TypeSpecifier::Int // fallback
                 }
             }
-            TypeSpecifier::TypeofType(inner) => {
-                self.resolve_typeof(inner)
-            }
+            TypeSpecifier::TypeofType(inner) => self.resolve_typeof(inner),
             TypeSpecifier::TypedefName(name) => {
                 // Typedefs now store CType. Convert back to TypeSpecifier for
                 // code that still needs a TypeSpecifier (e.g., typeof resolution).
@@ -132,13 +140,21 @@ impl Lowerer {
     /// Returns 1 if the unqualified types are compatible (same type after resolving
     /// typedefs and typeof), 0 otherwise. Follows GCC semantics: ignores top-level
     /// qualifiers, resolves typedefs, but considers signed/unsigned as distinct.
-    pub(super) fn eval_types_compatible(&self, type1: &TypeSpecifier, type2: &TypeSpecifier) -> i32 {
+    pub(super) fn eval_types_compatible(
+        &self,
+        type1: &TypeSpecifier,
+        type2: &TypeSpecifier,
+    ) -> i32 {
         let ctype1 = self.type_spec_to_ctype(type1);
         let ctype2 = self.type_spec_to_ctype(type2);
         // Strip top-level qualifiers (CType doesn't carry qualifiers, so this is already done).
         // Compare the resolved CTypes. GCC considers enum types as their underlying int type,
         // and considers long/int as distinct even if same size on the platform.
-        if Self::ctypes_compatible(&ctype1, &ctype2) { 1 } else { 0 }
+        if Self::ctypes_compatible(&ctype1, &ctype2) {
+            1
+        } else {
+            0
+        }
     }
 
     /// Check if two CTypes are compatible for __builtin_types_compatible_p purposes.
@@ -148,8 +164,14 @@ impl Lowerer {
     /// - Enums: treated as compatible with int
     fn ctypes_compatible(a: &CType, b: &CType) -> bool {
         // Normalize enum to int for compatibility purposes
-        let a_norm = match a { CType::Enum(_) => &CType::Int, other => other };
-        let b_norm = match b { CType::Enum(_) => &CType::Int, other => other };
+        let a_norm = match a {
+            CType::Enum(_) => &CType::Int,
+            other => other,
+        };
+        let b_norm = match b {
+            CType::Enum(_) => &CType::Int,
+            other => other,
+        };
 
         match (a_norm, b_norm) {
             // Pointers: pointee types must be compatible
@@ -180,8 +202,20 @@ impl Lowerer {
             TypeSpecifier::UnsignedShort => IrType::U16,
             TypeSpecifier::Int | TypeSpecifier::Signed => IrType::I32,
             TypeSpecifier::UnsignedInt | TypeSpecifier::Unsigned => IrType::U32,
-            TypeSpecifier::Long => if is_32bit { IrType::I32 } else { IrType::I64 },
-            TypeSpecifier::UnsignedLong => if is_32bit { IrType::U32 } else { IrType::U64 },
+            TypeSpecifier::Long => {
+                if is_32bit {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
+            }
+            TypeSpecifier::UnsignedLong => {
+                if is_32bit {
+                    IrType::U32
+                } else {
+                    IrType::U64
+                }
+            }
             TypeSpecifier::LongLong => IrType::I64,
             TypeSpecifier::UnsignedLongLong => IrType::U64,
             TypeSpecifier::Int128 => IrType::I128,
@@ -190,7 +224,9 @@ impl Lowerer {
             TypeSpecifier::Double => IrType::F64,
             TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::Float128 => IrType::U128,
-            TypeSpecifier::ComplexFloat | TypeSpecifier::ComplexDouble | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
+            TypeSpecifier::ComplexFloat
+            | TypeSpecifier::ComplexDouble
+            | TypeSpecifier::ComplexLongDouble => IrType::Ptr,
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
             TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => IrType::Ptr,
@@ -209,24 +245,39 @@ impl Lowerer {
                 // Resolve typedef through CType
                 if let Some(ctype) = self.types.typedefs.get(name) {
                     IrType::from_ctype(ctype)
-                } else if is_32bit { IrType::I32 } else { IrType::I64 }
+                } else if is_32bit {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
             }
             TypeSpecifier::Typeof(expr) => {
                 // For _Generic selections inside typeof(), resolve fresh to avoid stale cache.
-                let ctype = if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
-                    self.resolve_generic_selection_ctype(controlling, associations)
-                } else {
-                    self.get_expr_ctype(expr)
-                };
+                let ctype =
+                    if let Expr::GenericSelection(controlling, associations, _) = expr.as_ref() {
+                        self.resolve_generic_selection_ctype(controlling, associations)
+                    } else {
+                        self.get_expr_ctype(expr)
+                    };
                 if let Some(ctype) = ctype {
                     IrType::from_ctype(&ctype)
-                } else if is_32bit { IrType::I32 } else { IrType::I64 }
+                } else if is_32bit {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
             }
             TypeSpecifier::TypeofType(inner) => self.type_spec_to_ir(inner),
             TypeSpecifier::FunctionPointer(_, _, _) => IrType::Ptr, // function pointer is a pointer
             TypeSpecifier::BareFunction(_, _, _) => IrType::Ptr, // bare function type decays to pointer
             // AutoType should be resolved before reaching here (in lower_local_decl)
-            TypeSpecifier::AutoType => if is_32bit { IrType::I32 } else { IrType::I64 },
+            TypeSpecifier::AutoType => {
+                if is_32bit {
+                    IrType::I32
+                } else {
+                    IrType::I64
+                }
+            }
             // Vector type: return the element IR type (used for per-element operations)
             TypeSpecifier::Vector(inner, _) => self.type_spec_to_ir(inner),
         }
@@ -242,8 +293,10 @@ impl Lowerer {
             TypeSpecifier::Void | TypeSpecifier::Bool => Some((1, 1)),
             TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some((1, 1)),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some((2, 2)),
-            TypeSpecifier::Int | TypeSpecifier::UnsignedInt
-            | TypeSpecifier::Signed | TypeSpecifier::Unsigned => Some((4, 4)),
+            TypeSpecifier::Int
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned => Some((4, 4)),
             TypeSpecifier::Long | TypeSpecifier::UnsignedLong => Some((ptr_sz, ptr_sz)),
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong => {
                 // On i686, long long is 8 bytes but aligned to 4
@@ -257,7 +310,11 @@ impl Lowerer {
                 Some((8, align))
             }
             TypeSpecifier::LongDouble => {
-                if ptr_sz == 4 { Some((12, 4)) } else { Some((16, 16)) }
+                if ptr_sz == 4 {
+                    Some((12, 4))
+                } else {
+                    Some((16, 16))
+                }
             }
             // _Float128 (IEEE binary128): 16 bytes, 16-byte aligned (LP64).
             TypeSpecifier::Float128 => Some((16, 16)),
@@ -267,7 +324,11 @@ impl Lowerer {
                 Some((16, align))
             }
             TypeSpecifier::ComplexLongDouble => {
-                if ptr_sz == 4 { Some((24, 4)) } else { Some((32, 16)) }
+                if ptr_sz == 4 {
+                    Some((24, 4))
+                } else {
+                    Some((32, 16))
+                }
             }
             TypeSpecifier::Pointer(_, _) => Some((ptr_sz, ptr_sz)),
             TypeSpecifier::Enum(_, _, false) => Some((4, 4)),
@@ -294,66 +355,99 @@ impl Lowerer {
             TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _) => {
                 // Use cached layout for tagged structs
                 if let Some(tag) = tag {
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&format!("struct.{}", tag)) {
+                    if let Some(layout) = self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&format!("struct.{}", tag))
+                    {
                         return Some(layout.clone());
                     }
                 }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, false, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(
+                    fields,
+                    false,
+                    max_field_align,
+                )))
             }
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _) => {
                 // Use cached layout for tagged unions
                 if let Some(tag) = tag {
-                    if let Some(layout) = self.types.borrow_struct_layouts().get(&format!("union.{}", tag)) {
+                    if let Some(layout) = self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&format!("union.{}", tag))
+                    {
                         return Some(layout.clone());
                     }
                 }
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                Some(Rc::new(self.compute_struct_union_layout_packed(fields, true, max_field_align)))
+                Some(Rc::new(self.compute_struct_union_layout_packed(
+                    fields,
+                    true,
+                    max_field_align,
+                )))
             }
-            TypeSpecifier::Struct(Some(tag), None, _, _, _) =>
-                self.get_struct_union_layout_by_tag("struct", tag),
-            TypeSpecifier::Union(Some(tag), None, _, _, _) =>
-                self.get_struct_union_layout_by_tag("union", tag),
+            TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
+                self.get_struct_union_layout_by_tag("struct", tag)
+            }
+            TypeSpecifier::Union(Some(tag), None, _, _, _) => {
+                self.get_struct_union_layout_by_tag("union", tag)
+            }
             _ => None,
         }
     }
 
-    pub(super) fn compute_struct_union_layout_packed(&self, fields: &[StructFieldDecl], is_union: bool, max_field_align: Option<usize>) -> StructLayout {
-        let struct_fields: Vec<StructField> = fields.iter().map(|f| {
-            let bit_width = f.bit_width.as_ref().and_then(|bw| {
-                self.eval_const_expr(bw).and_then(|c| c.to_u32())
-            });
-            let mut ty = self.struct_field_ctype(f);
-            // GCC treats enum bitfields as unsigned (see struct_or_union_to_ctype).
-            // Check both direct enum type specs and typedef'd enum types.
-            if bit_width.is_some()
-                && self.is_enum_type_spec(&f.type_spec)
-                    && ty == CType::Int {
-                        ty = CType::UInt;
-                    }
-            // Merge per-field alignment with typedef alignment.
-            // If the field's type is a typedef with __aligned__, that alignment
-            // must be applied even when the field itself has no explicit alignment.
-            let field_alignment = {
-                let mut align = f.alignment;
-                if let Some(&ta) = self.typedef_alignment_for_type_spec(&f.type_spec) {
-                    align = Some(align.map_or(ta, |a| a.max(ta)));
+    pub(super) fn compute_struct_union_layout_packed(
+        &self,
+        fields: &[StructFieldDecl],
+        is_union: bool,
+        max_field_align: Option<usize>,
+    ) -> StructLayout {
+        let struct_fields: Vec<StructField> = fields
+            .iter()
+            .map(|f| {
+                let bit_width = f
+                    .bit_width
+                    .as_ref()
+                    .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
+                let mut ty = self.struct_field_ctype(f);
+                // GCC treats enum bitfields as unsigned (see struct_or_union_to_ctype).
+                // Check both direct enum type specs and typedef'd enum types.
+                if bit_width.is_some() && self.is_enum_type_spec(&f.type_spec) && ty == CType::Int {
+                    ty = CType::UInt;
                 }
-                align
-            };
-            StructField {
-                name: f.name.clone().unwrap_or_default(),
-                ty,
-                bit_width,
-                alignment: field_alignment,
-                is_packed: f.is_packed,
-            }
-        }).collect();
+                // Merge per-field alignment with typedef alignment.
+                // If the field's type is a typedef with __aligned__, that alignment
+                // must be applied even when the field itself has no explicit alignment.
+                let field_alignment = {
+                    let mut align = f.alignment;
+                    if let Some(&ta) = self.typedef_alignment_for_type_spec(&f.type_spec) {
+                        align = Some(align.map_or(ta, |a| a.max(ta)));
+                    }
+                    align
+                };
+                StructField {
+                    name: f.name.clone().unwrap_or_default(),
+                    ty,
+                    bit_width,
+                    alignment: field_alignment,
+                    is_packed: f.is_packed,
+                }
+            })
+            .collect();
         if is_union {
-            StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+            StructLayout::for_union_with_packing(
+                &struct_fields,
+                max_field_align,
+                &*self.types.borrow_struct_layouts(),
+            )
         } else {
-            StructLayout::for_struct_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+            StructLayout::for_struct_with_packing(
+                &struct_fields,
+                max_field_align,
+                &*self.types.borrow_struct_layouts(),
+            )
         }
     }
 
@@ -367,9 +461,11 @@ impl Lowerer {
         }
         // Handle packed enums (explicit or forward-reference to packed) via CType resolution
         if let TypeSpecifier::Enum(name, _, is_packed) = ts {
-            let effective_packed = *is_packed || name.as_ref()
-                .and_then(|n| self.types.packed_enum_types.get(n))
-                .is_some();
+            let effective_packed = *is_packed
+                || name
+                    .as_ref()
+                    .and_then(|n| self.types.packed_enum_types.get(n))
+                    .is_some();
             if effective_packed {
                 let ctype = self.type_spec_to_ctype(ts);
                 return ctype.size_ctx(&*self.types.borrow_struct_layouts());
@@ -396,11 +492,14 @@ impl Lowerer {
         }
         if let TypeSpecifier::Array(elem, Some(size_expr)) = ts {
             let elem_size = self.sizeof_type(elem);
-            return self.expr_as_array_size(size_expr)
+            return self
+                .expr_as_array_size(size_expr)
                 .map(|n| elem_size * n as usize)
                 .unwrap_or(elem_size);
         }
-        self.struct_union_layout(ts).map(|l| l.size).unwrap_or(crate::common::types::target_ptr_size())
+        self.struct_union_layout(ts)
+            .map(|l| l.size)
+            .unwrap_or(crate::common::types::target_ptr_size())
     }
 
     /// Compute the alignment of a type in bytes (_Alignof).
@@ -441,7 +540,9 @@ impl Lowerer {
         if let TypeSpecifier::Array(elem, _) = ts {
             return self.alignof_type(elem);
         }
-        self.struct_union_layout(ts).map(|l| l.align).unwrap_or(crate::common::types::target_ptr_size())
+        self.struct_union_layout(ts)
+            .map(|l| l.align)
+            .unwrap_or(crate::common::types::target_ptr_size())
     }
 
     /// Compute preferred (natural) alignment of a type in bytes (__alignof__).
@@ -479,8 +580,9 @@ impl Lowerer {
         let ts = self.resolve_type_spec(ts);
         // On i686, check if scalar type has preferred alignment different from ABI
         match ts {
-            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong
-            | TypeSpecifier::Double => return 8,
+            TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
+                return 8
+            }
             TypeSpecifier::ComplexDouble => return 8,
             _ => {}
         }
@@ -491,7 +593,9 @@ impl Lowerer {
         if let TypeSpecifier::Array(elem, _) = ts {
             return self.preferred_alignof_type(elem);
         }
-        self.struct_union_layout(ts).map(|l| l.align).unwrap_or(target_ptr_size())
+        self.struct_union_layout(ts)
+            .map(|l| l.align)
+            .unwrap_or(target_ptr_size())
     }
 
     /// Return the typedef alignment override for a type specifier, if any.
@@ -507,13 +611,20 @@ impl Lowerer {
     /// Collect array dimensions from derived declarators.
     /// Returns None for unsized dimensions (e.g., `int arr[]`).
     fn collect_derived_array_dims(&self, derived: &[DerivedDeclarator]) -> Vec<Option<usize>> {
-        derived.iter().filter_map(|d| {
-            if let DerivedDeclarator::Array(size_expr) = d {
-                Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
-            } else {
-                None
-            }
-        }).collect()
+        derived
+            .iter()
+            .filter_map(|d| {
+                if let DerivedDeclarator::Array(size_expr) = d {
+                    Some(
+                        size_expr
+                            .as_ref()
+                            .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Compute strides from an array of dimension sizes and a base element size.
@@ -522,7 +633,7 @@ impl Lowerer {
     fn compute_strides_from_dims(dims: &[usize], base_elem_size: usize) -> Vec<usize> {
         let mut strides = Vec::with_capacity(dims.len());
         for i in 0..dims.len() {
-            let stride: usize = dims[i+1..].iter().product::<usize>().max(1) * base_elem_size;
+            let stride: usize = dims[i + 1..].iter().product::<usize>().max(1) * base_elem_size;
             strides.push(stride);
         }
         strides
@@ -542,7 +653,10 @@ impl Lowerer {
             loop {
                 let resolved = self.resolve_type_spec(current);
                 if let TypeSpecifier::Array(elem, size_expr) = resolved {
-                    let n = size_expr.as_ref().and_then(|e| self.expr_as_array_size(e)).unwrap_or(1);
+                    let n = size_expr
+                        .as_ref()
+                        .and_then(|e| self.expr_as_array_size(e))
+                        .unwrap_or(1);
                     dims.push(n as usize);
                     current = elem;
                 } else {
@@ -573,7 +687,9 @@ impl Lowerer {
                 if dims.is_empty() {
                     return vec![];
                 }
-                let base_elem_size = current_ct.size_ctx(&*self.types.borrow_struct_layouts()).max(1);
+                let base_elem_size = current_ct
+                    .size_ctx(&*self.types.borrow_struct_layouts())
+                    .max(1);
                 let full_size: usize = dims.iter().product::<usize>() * base_elem_size;
                 let mut strides = vec![full_size];
                 strides.extend(Self::compute_strides_from_dims(&dims, base_elem_size));
@@ -588,24 +704,35 @@ impl Lowerer {
     /// Returns (alloc_size, elem_size, is_array, is_pointer, array_dim_strides).
     /// For multi-dimensional arrays like int a[2][3], array_dim_strides = [12, 4]
     /// (stride for dim 0 = 3*4=12, stride for dim 1 = 4).
-    pub(super) fn compute_decl_info(&self, ts: &TypeSpecifier, derived: &[DerivedDeclarator]) -> (usize, usize, bool, bool, Vec<usize>) {
+    pub(super) fn compute_decl_info(
+        &self,
+        ts: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> (usize, usize, bool, bool, Vec<usize>) {
         use crate::common::types::target_ptr_size;
         let ptr_sz = target_ptr_size();
         let ts = self.resolve_type_spec(ts);
         // Resolve the type spec through CType for typedef detection
         let resolved_ctype = self.type_spec_to_ctype(ts);
         // Check for pointer declarators (from derived or from the resolved type itself)
-        let has_pointer = derived.iter().any(|d| matches!(d, DerivedDeclarator::Pointer))
+        let has_pointer = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer))
             || matches!(ts, TypeSpecifier::Pointer(_, _))
             || matches!(resolved_ctype, CType::Pointer(_, _));
 
-        let has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)))
+        let has_array = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Array(_)))
             || matches!(resolved_ctype, CType::Array(_, _));
 
         // Handle pointer and array combinations
         if has_pointer && !has_array {
             // Simple pointer: int *p, or typedef'd pointer (e.g., typedef struct Foo *FooPtr)
-            let ptr_count = derived.iter().filter(|d| matches!(d, DerivedDeclarator::Pointer)).count();
+            let ptr_count = derived
+                .iter()
+                .filter(|d| matches!(d, DerivedDeclarator::Pointer))
+                .count();
             let elem_size = if let TypeSpecifier::Pointer(inner, _) = ts {
                 if ptr_count >= 1 {
                     ptr_sz
@@ -635,13 +762,21 @@ impl Lowerer {
             //   e.g., int (*ptrs[3])[4] -> derived=[Array(4), Pointer, Array(3)] -> array of ptrs-to-arrays
             // - Last is Pointer: it's a pointer (to an array)
             //   e.g., int (*p)[5] -> derived=[Array(5), Pointer] -> pointer to array
-            let has_func_ptr = derived.iter().any(|d| matches!(d,
-                DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)));
+            let has_func_ptr = derived.iter().any(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::FunctionPointer(_, _) | DerivedDeclarator::Function(_, _)
+                )
+            });
 
             // If pointer is from resolved type spec (not in derived), and array is in derived,
             // this is an array of typedef'd pointers
-            let ptr_pos = derived.iter().position(|d| matches!(d, DerivedDeclarator::Pointer));
-            let pointer_from_type_spec = ptr_pos.is_none() && (matches!(ts, TypeSpecifier::Pointer(_, _)) || matches!(resolved_ctype, CType::Pointer(_, _)));
+            let ptr_pos = derived
+                .iter()
+                .position(|d| matches!(d, DerivedDeclarator::Pointer));
+            let pointer_from_type_spec = ptr_pos.is_none()
+                && (matches!(ts, TypeSpecifier::Pointer(_, _))
+                    || matches!(resolved_ctype, CType::Pointer(_, _)));
 
             // Check if the outermost (last) derived element is an Array
             let last_is_array = matches!(derived.last(), Some(DerivedDeclarator::Array(_)));
@@ -656,28 +791,41 @@ impl Lowerer {
                 //   (derived=[Array(3), Pointer, FunctionPointer(...)]):
                 //   Array dims BEFORE the Pointer are the variable's dimensions,
                 //   because the Pointer+FunctionPointer group describes the element type.
-                let last_ptr_pos = derived.iter().rposition(|d| matches!(d, DerivedDeclarator::Pointer));
+                let last_ptr_pos = derived
+                    .iter()
+                    .rposition(|d| matches!(d, DerivedDeclarator::Pointer));
                 let array_dims: Vec<Option<usize>> = if let Some(lpp) = last_ptr_pos {
                     // First try: collect Array dims after the last pointer
-                    let after_dims: Vec<Option<usize>> = derived[lpp + 1..].iter().filter_map(|d| {
-                        if let DerivedDeclarator::Array(size_expr) = d {
-                            Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
-                        } else {
-                            None
-                        }
-                    }).collect();
+                    let after_dims: Vec<Option<usize>> =
+                        derived[lpp + 1..]
+                            .iter()
+                            .filter_map(|d| {
+                                if let DerivedDeclarator::Array(size_expr) = d {
+                                    Some(size_expr.as_ref().and_then(|e| {
+                                        self.expr_as_array_size(e).map(|n| n as usize)
+                                    }))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
                     if !after_dims.is_empty() {
                         after_dims
                     } else if has_func_ptr {
                         // For function pointer arrays, array dims come BEFORE the
                         // Pointer+FunctionPointer group (e.g., [Array(3), Pointer, FuncPtr])
-                        derived[..lpp].iter().filter_map(|d| {
-                            if let DerivedDeclarator::Array(size_expr) = d {
-                                Some(size_expr.as_ref().and_then(|e| self.expr_as_array_size(e).map(|n| n as usize)))
-                            } else {
-                                None
-                            }
-                        }).collect()
+                        derived[..lpp]
+                            .iter()
+                            .filter_map(|d| {
+                                if let DerivedDeclarator::Array(size_expr) = d {
+                                    Some(size_expr.as_ref().and_then(|e| {
+                                        self.expr_as_array_size(e).map(|n| n as usize)
+                                    }))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
                     } else {
                         after_dims
                     }
@@ -687,12 +835,13 @@ impl Lowerer {
                     // the variable's own dimensions.
                     self.collect_derived_array_dims(derived)
                 };
-                let resolved_dims: Vec<usize> = array_dims.iter().map(|d| d.unwrap_or(256)).collect();
+                let resolved_dims: Vec<usize> =
+                    array_dims.iter().map(|d| d.unwrap_or(256)).collect();
                 let total_size: usize = resolved_dims.iter().product::<usize>() * ptr_sz;
                 let strides = if resolved_dims.len() > 1 {
                     Self::compute_strides_from_dims(&resolved_dims, ptr_sz)
                 } else {
-                    vec![ptr_sz]  // 1D pointer array: stride is just pointer size
+                    vec![ptr_sz] // 1D pointer array: stride is just pointer size
                 };
                 return (total_size, ptr_sz, true, false, strides);
             }
@@ -705,7 +854,9 @@ impl Lowerer {
             //   int (*p)[5]       -> derived=[Array(5), Pointer]          -> trailing=1, rest=[Array(5)]
             //   Node* (*p)[2]     -> derived=[Pointer, Array(2), Pointer] -> trailing=1, rest=[Pointer, Array(2)]
             //   char (**pp)[2]    -> derived=[Array(2), Pointer, Pointer] -> trailing=2, pp is ptr-to-ptr
-            let trailing_ptr_count = derived.iter().rev()
+            let trailing_ptr_count = derived
+                .iter()
+                .rev()
                 .take_while(|d| matches!(d, DerivedDeclarator::Pointer))
                 .count();
 
@@ -720,16 +871,21 @@ impl Lowerer {
             // Collect array dimensions and count any pointer entries (which make the
             // element type a pointer, e.g., Node* (*p)[2] has element type Node*).
             let rest = &derived[..derived.len() - trailing_ptr_count];
-            let array_dims: Vec<usize> = rest.iter()
+            let array_dims: Vec<usize> = rest
+                .iter()
                 .filter_map(|d| {
                     if let DerivedDeclarator::Array(size_expr) = d {
-                        Some(size_expr.as_ref()
-                            .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize))
-                            .unwrap_or(1))
+                        Some(
+                            size_expr
+                                .as_ref()
+                                .and_then(|e| self.expr_as_array_size(e).map(|n| n as usize))
+                                .unwrap_or(1),
+                        )
                     } else {
                         None
                     }
-                }).collect();
+                })
+                .collect();
             // If the non-trailing part has Pointer entries, the element type includes
             // those pointer levels. E.g., for Node* (*p)[2], rest=[Pointer, Array(2)],
             // the Pointer makes the element type Node* (a pointer), so elem size = ptr_sz.
@@ -757,7 +913,9 @@ impl Lowerer {
         // If the resolved type itself is an Array (e.g., va_list = Array(Char, 24),
         // or typedef'd multi-dimensional arrays like typedef int arr_t[2][3])
         // and there are no derived array declarators, handle it as an array type.
-        let derived_has_array = derived.iter().any(|d| matches!(d, DerivedDeclarator::Array(_)));
+        let derived_has_array = derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Array(_)));
         if !derived_has_array && !has_pointer {
             // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays)
             let is_ts_array = matches!(ts, TypeSpecifier::Array(_, _));
@@ -771,15 +929,26 @@ impl Lowerer {
                 let base_elem_size = self.sizeof_type(inner).max(1);
                 let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
                 let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
-                let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };
+                let elem_size = if strides.len() > 1 {
+                    strides[0]
+                } else {
+                    base_elem_size
+                };
                 return (total, elem_size, true, false, strides);
             } else if is_ctype_array && !is_ts_array {
                 // Typedef'd array (e.g., va_list = CType::Array(Char, 24))
                 let all_dims = Self::collect_ctype_array_dims(&resolved_ctype);
-                let base_elem_size = Self::ctype_innermost_elem_size(&resolved_ctype, &self.types.borrow_struct_layouts());
+                let base_elem_size = Self::ctype_innermost_elem_size(
+                    &resolved_ctype,
+                    &self.types.borrow_struct_layouts(),
+                );
                 let total: usize = all_dims.iter().product::<usize>() * base_elem_size;
                 let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
-                let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };
+                let elem_size = if strides.len() > 1 {
+                    strides[0]
+                } else {
+                    base_elem_size
+                };
                 return (total, elem_size, true, false, strides);
             }
         }
@@ -788,8 +957,12 @@ impl Lowerer {
         let array_dims = self.collect_derived_array_dims(derived);
 
         if !array_dims.is_empty() {
-            let has_func_ptr = derived.iter().any(|d| matches!(d,
-                DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)));
+            let has_func_ptr = derived.iter().any(|d| {
+                matches!(
+                    d,
+                    DerivedDeclarator::Function(_, _) | DerivedDeclarator::FunctionPointer(_, _)
+                )
+            });
             // Account for array dimensions in the type specifier itself
             // Check both TypeSpecifier::Array and CType::Array (for typedef'd arrays)
             let type_dims = if matches!(ts, TypeSpecifier::Array(_, _)) {
@@ -804,13 +977,20 @@ impl Lowerer {
                 crate::common::types::target_ptr_size()
             } else if !type_dims.is_empty() {
                 // Use CType for innermost element size (works for both direct and typedef'd arrays)
-                Self::ctype_innermost_elem_size(&resolved_ctype, &self.types.borrow_struct_layouts())
+                Self::ctype_innermost_elem_size(
+                    &resolved_ctype,
+                    &self.types.borrow_struct_layouts(),
+                )
             } else {
-                resolved_ctype.size_ctx(&*self.types.borrow_struct_layouts()).max(1)
+                resolved_ctype
+                    .size_ctx(&*self.types.borrow_struct_layouts())
+                    .max(1)
             };
 
             // Combine: derived dims come first (outermost), then type dims
-            let all_dims: Vec<usize> = array_dims.iter().map(|d| d.unwrap_or(256))
+            let all_dims: Vec<usize> = array_dims
+                .iter()
+                .map(|d| d.unwrap_or(256))
                 .chain(type_dims.iter().copied())
                 .collect();
 
@@ -821,7 +1001,11 @@ impl Lowerer {
             let strides = Self::compute_strides_from_dims(&all_dims, base_elem_size);
 
             // elem_size is the stride of the outermost dimension (for 1D compat, it's base_elem_size)
-            let elem_size = if strides.len() > 1 { strides[0] } else { base_elem_size };
+            let elem_size = if strides.len() > 1 {
+                strides[0]
+            } else {
+                base_elem_size
+            };
 
             return (total, elem_size, true, false, strides);
         }
@@ -840,8 +1024,14 @@ impl Lowerer {
         // Regular scalar - use sizeof_type for the allocation size
         // Minimum 8 bytes on LP64 (to ensure stack alignment for loads/stores).
         // On ILP32, minimum 4 bytes (pointer-width).
-        let min_alloc = if crate::common::types::target_is_32bit() { 4 } else { 8 };
-        let scalar_size = resolved_ctype.size_ctx(&*self.types.borrow_struct_layouts()).max(min_alloc);
+        let min_alloc = if crate::common::types::target_is_32bit() {
+            4
+        } else {
+            8
+        };
+        let scalar_size = resolved_ctype
+            .size_ctx(&*self.types.borrow_struct_layouts())
+            .max(min_alloc);
         (scalar_size, 0, false, false, vec![])
     }
 
@@ -885,7 +1075,10 @@ impl Lowerer {
     }
 
     /// Get the innermost element size for a CType::Array chain.
-    fn ctype_innermost_elem_size(ctype: &CType, layouts: &crate::common::fx_hash::FxHashMap<String, RcLayout>) -> usize {
+    fn ctype_innermost_elem_size(
+        ctype: &CType,
+        layouts: &crate::common::fx_hash::FxHashMap<String, RcLayout>,
+    ) -> usize {
         let mut current = ctype;
         while let CType::Array(inner, _) = current {
             current = inner.as_ref();
@@ -903,5 +1096,4 @@ impl Lowerer {
             _ => crate::common::types::target_int_ir_type(),
         }
     }
-
 }

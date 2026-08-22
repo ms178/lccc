@@ -4,18 +4,10 @@
 //! replacing the instruction with the computed constant. This eliminates
 //! redundant computation and enables further optimizations (DCE, etc.).
 
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    IrModule,
-    IrUnaryOp,
-    Operand,
-    Value,
-};
 use crate::common::types::IrType;
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand, Value,
+};
 
 /// Run constant folding on the entire module.
 /// Returns the number of instructions folded.
@@ -47,7 +39,8 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
         }
         // Map Value -> string length from GlobalAddr instructions naming a
         // string-literal global (per function; allocas/params excluded).
-        let mut addr_lens: crate::common::fx_hash::FxHashMap<u32, usize> = crate::common::fx_hash::FxHashMap::default();
+        let mut addr_lens: crate::common::fx_hash::FxHashMap<u32, usize> =
+            crate::common::fx_hash::FxHashMap::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::GlobalAddr { dest, name } = inst {
@@ -109,10 +102,17 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
         let mut const_map: Vec<Option<ConstMapEntry>> = vec![None; max_id + 1];
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::Copy { dest, src: Operand::Const(c) } = inst {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Const(c),
+                } = inst
+                {
                     let id = dest.0 as usize;
                     if id <= max_id {
-                        const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: None });
+                        const_map[id] = Some(ConstMapEntry {
+                            konst: Some(*c),
+                            cast_to_ty: None,
+                        });
                     }
                 }
             }
@@ -125,8 +125,15 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
             for block in &func.blocks {
                 for inst in &block.instructions {
                     let (did, sid) = match inst {
-                        Instruction::Copy { dest, src: Operand::Value(v) } => (dest.0 as usize, v.0 as usize),
-                        Instruction::Cast { dest, src: Operand::Value(v), .. } => (dest.0 as usize, v.0 as usize),
+                        Instruction::Copy {
+                            dest,
+                            src: Operand::Value(v),
+                        } => (dest.0 as usize, v.0 as usize),
+                        Instruction::Cast {
+                            dest,
+                            src: Operand::Value(v),
+                            ..
+                        } => (dest.0 as usize, v.0 as usize),
                         _ => continue,
                     };
                     if did <= max_id && sid <= max_id {
@@ -145,7 +152,13 @@ pub fn resolve_remaining_is_constant(module: &mut IrModule) {
         }
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
-                if let Instruction::UnaryOp { dest, op: IrUnaryOp::IsConstant, src, .. } = inst {
+                if let Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::IsConstant,
+                    src,
+                    ..
+                } = inst
+                {
                     let is_const = resolve_const(src, &const_map).is_some();
                     *inst = Instruction::Copy {
                         dest: *dest,
@@ -186,7 +199,10 @@ pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
                 if let Instruction::Cast { dest, to_ty, .. } = inst {
                     let id = dest.0 as usize;
                     if id <= max_id {
-                        const_map[id] = Some(ConstMapEntry { konst: None, cast_to_ty: Some(*to_ty) });
+                        const_map[id] = Some(ConstMapEntry {
+                            konst: None,
+                            cast_to_ty: Some(*to_ty),
+                        });
                     }
                 }
             }
@@ -196,11 +212,18 @@ pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
         // any Cast target type already recorded for this value.
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::Copy { dest, src: Operand::Const(c) } = inst {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Const(c),
+                } = inst
+                {
                     let id = dest.0 as usize;
                     if id <= max_id {
                         let cast_ty = const_map[id].and_then(|e| e.cast_to_ty);
-                        const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: cast_ty });
+                        const_map[id] = Some(ConstMapEntry {
+                            konst: Some(*c),
+                            cast_to_ty: cast_ty,
+                        });
                     }
                 }
             }
@@ -212,11 +235,18 @@ pub(crate) fn fold_function(func: &mut IrFunction) -> usize {
                 if let Some(folded_inst) = try_fold_with_map(inst, &const_map) {
                     // Update the const map immediately so later instructions in
                     // the same block can see through newly-folded constants.
-                    if let Instruction::Copy { dest, src: Operand::Const(c) } = &folded_inst {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Const(c),
+                    } = &folded_inst
+                    {
                         let id = dest.0 as usize;
                         if id <= max_id {
                             let cast_ty = const_map[id].and_then(|e| e.cast_to_ty);
-                            const_map[id] = Some(ConstMapEntry { konst: Some(*c), cast_to_ty: cast_ty });
+                            const_map[id] = Some(ConstMapEntry {
+                                konst: Some(*c),
+                                cast_to_ty: cast_ty,
+                            });
                         }
                     }
                     *inst = folded_inst;
@@ -254,9 +284,18 @@ fn try_fold(inst: &Instruction) -> Option<Instruction> {
 
 /// Try to fold a single instruction, using the const map to resolve Value
 /// operands that are known to be constants (from prior Copy instructions).
-fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) -> Option<Instruction> {
+fn try_fold_with_map(
+    inst: &Instruction,
+    const_map: &[Option<ConstMapEntry>],
+) -> Option<Instruction> {
     match inst {
-        Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+        Instruction::BinOp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
             // For 128-bit types, use native i128 arithmetic to avoid truncation
             if ty.is_128bit() {
                 let lc = resolve_const(lhs, const_map)?;
@@ -329,9 +368,7 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                     // _Float128 constants are I128 bit patterns (binary128);
                     // negation flips the SIGN BIT (bit 127), not the integer
                     // value (-1.5 -> 0xbfff8000..., NOT 0xc0008000...).
-                    IrUnaryOp::Neg if *ty == IrType::F128 => {
-                        ((s as u128) ^ (1u128 << 127)) as i128
-                    }
+                    IrUnaryOp::Neg if *ty == IrType::F128 => ((s as u128) ^ (1u128 << 127)) as i128,
                     IrUnaryOp::Neg => s.wrapping_neg(),
                     IrUnaryOp::Not => !s,
                     _ => return None,
@@ -369,7 +406,13 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 src: Operand::Const(IrConst::from_i64(result, *ty)),
             })
         }
-        Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+        Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } => {
             // For 128-bit types, fold comparisons using native i128
             if ty.is_128bit() {
                 let lc = resolve_const(lhs, const_map)?;
@@ -415,7 +458,12 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 src: Operand::Const(IrConst::I32(result as i32)),
             })
         }
-        Instruction::Cast { dest, src, from_ty, to_ty } => {
+        Instruction::Cast {
+            dest,
+            src,
+            from_ty,
+            to_ty,
+        } => {
             // For casts involving 128-bit types, use native i128 arithmetic
             if from_ty.is_128bit() || to_ty.is_128bit() {
                 let sc = resolve_const(src, const_map)?;
@@ -436,7 +484,13 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
                 src: Operand::Const(IrConst::from_i64(result, *to_ty)),
             })
         }
-        Instruction::Select { dest, cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            dest,
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             // If both arms are the same operand, the result is that operand
             // regardless of the condition. This handles patterns like
             // Select(cond, 0, 0) from dead short-circuit branches.
@@ -448,7 +502,11 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             }
             // If the condition is a known constant, fold to the appropriate value
             if let Some(cond_const) = as_i64_const_mapped(cond, const_map) {
-                let result = if cond_const != 0 { *true_val } else { *false_val };
+                let result = if cond_const != 0 {
+                    *true_val
+                } else {
+                    *false_val
+                };
                 return Some(Instruction::Copy {
                     dest: *dest,
                     src: result,
@@ -460,7 +518,10 @@ fn try_fold_with_map(inst: &Instruction, const_map: &[Option<ConstMapEntry>]) ->
             // where if-conversion creates Select(cond, 0, 0) but one arm is
             // still a Value (from cmp ne 0,0) that constant fold hasn't yet
             // propagated into the Select operands.
-            if let (Some(tv), Some(fv)) = (resolve_const(true_val, const_map), resolve_const(false_val, const_map)) {
+            if let (Some(tv), Some(fv)) = (
+                resolve_const(true_val, const_map),
+                resolve_const(false_val, const_map),
+            ) {
                 // Compare constants across potentially different widths (e.g.,
                 // I32(0) from a cmp result vs I64(0) from a short-circuit default).
                 let same = tv.to_hash_key() == fv.to_hash_key()
@@ -688,7 +749,13 @@ fn fold_f128_cmp(op: IrCmpOp, lhs: &IrConst, rhs: &IrConst) -> bool {
 /// Try to fold a cast involving float types.
 // TODO: simplify.rs also has float cast folding via IrConst::cast_float_to_target
 // which doesn't check for NaN/Inf. These should be unified eventually.
-fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty: IrType, const_map: &[Option<ConstMapEntry>]) -> Option<Instruction> {
+fn try_fold_float_cast_mapped(
+    dest: Value,
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+    const_map: &[Option<ConstMapEntry>],
+) -> Option<Instruction> {
     let src_const = resolve_const(src, const_map)?;
     let result = match (from_ty.is_float(), to_ty.is_float()) {
         (true, true) => {
@@ -701,7 +768,10 @@ fn try_fold_float_cast_mapped(dest: Value, src: &Operand, from_ty: IrType, to_ty
             // For LongDouble, use full x87 precision to avoid mantissa loss
             if let Some(IrConst::LongDouble(fv, bytes)) = resolve_const(src, const_map) {
                 return IrConst::cast_long_double_to_target(fv, &bytes, to_ty).map(|c| {
-                    Instruction::Copy { dest, src: Operand::Const(c) }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Const(c),
+                    }
                 });
             }
             let val = as_f64_const_mapped(src, const_map)?;
@@ -779,7 +849,10 @@ fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCon
     } else {
         // Narrowing from i128 to smaller int
         let i64_val = val as i64;
-        Some(IrConst::from_i64(fold_cast(i64_val, IrType::I64, to_ty), to_ty))
+        Some(IrConst::from_i64(
+            fold_cast(i64_val, IrType::I64, to_ty),
+            to_ty,
+        ))
     }
 }
 
@@ -788,19 +861,26 @@ fn fold_cast_i128(src: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCon
 /// where operands stored as sign-extended i64 must be masked to the correct
 /// bit width to get the proper unsigned representation.
 fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
-    let is_32bit = ty == IrType::I32 || ty == IrType::U32
-        || ty == IrType::I16 || ty == IrType::U16
-        || ty == IrType::I8 || ty == IrType::U8;
+    let is_32bit = ty == IrType::I32
+        || ty == IrType::U32
+        || ty == IrType::I16
+        || ty == IrType::U16
+        || ty == IrType::I8
+        || ty == IrType::U8;
     Some(match op {
         IrBinOp::Add => lhs.wrapping_add(rhs),
         IrBinOp::Sub => lhs.wrapping_sub(rhs),
         IrBinOp::Mul => lhs.wrapping_mul(rhs),
         IrBinOp::SDiv => {
-            if rhs == 0 { return None; } // division by zero is UB, don't fold
+            if rhs == 0 {
+                return None;
+            } // division by zero is UB, don't fold
             lhs.wrapping_div(rhs)
         }
         IrBinOp::UDiv => {
-            if rhs == 0 { return None; }
+            if rhs == 0 {
+                return None;
+            }
             if is_32bit {
                 // For 32-bit types, mask to u32 to get correct unsigned value
                 (lhs as u32).wrapping_div(rhs as u32) as i64
@@ -809,11 +889,15 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
             }
         }
         IrBinOp::SRem => {
-            if rhs == 0 { return None; }
+            if rhs == 0 {
+                return None;
+            }
             lhs.wrapping_rem(rhs)
         }
         IrBinOp::URem => {
-            if rhs == 0 { return None; }
+            if rhs == 0 {
+                return None;
+            }
             if is_32bit {
                 (lhs as u32).wrapping_rem(rhs as u32) as i64
             } else {
@@ -854,9 +938,12 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
 /// whether to operate on 32 or 64 bits, matching the runtime semantics of
 /// __builtin_clz vs __builtin_clzll, etc.
 fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
-    let is_32bit = ty == IrType::I32 || ty == IrType::U32
-        || ty == IrType::I16 || ty == IrType::U16
-        || ty == IrType::I8 || ty == IrType::U8;
+    let is_32bit = ty == IrType::I32
+        || ty == IrType::U32
+        || ty == IrType::I16
+        || ty == IrType::U16
+        || ty == IrType::I8
+        || ty == IrType::U8;
     Some(match op {
         IrUnaryOp::Neg => src.wrapping_neg(),
         IrUnaryOp::Not => !src,
@@ -869,7 +956,11 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
         }
         IrUnaryOp::Ctz => {
             if src == 0 {
-                if is_32bit { 32 } else { 64 }
+                if is_32bit {
+                    32
+                } else {
+                    64
+                }
             } else if is_32bit {
                 (src as u32).trailing_zeros() as i64
             } else {
@@ -914,7 +1005,11 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
 /// For signed source types, we sign-extend to get the correct i64 representation.
 /// For unsigned source types, we zero-extend (mask to type width).
 /// Same logic applies to the target type.
-fn fold_cast(val: i64, from_ty: crate::common::types::IrType, to_ty: crate::common::types::IrType) -> i64 {
+fn fold_cast(
+    val: i64,
+    from_ty: crate::common::types::IrType,
+    to_ty: crate::common::types::IrType,
+) -> i64 {
     // Normalize source to its width/signedness, then convert to target.
     to_ty.truncate_i64(from_ty.truncate_i64(val))
 }
@@ -954,7 +1049,10 @@ mod tests {
 
     #[test]
     fn test_fold_binop_bitwise() {
-        assert_eq!(fold_binop(IrBinOp::And, 0xFF, 0x0F, IrType::I64), Some(0x0F));
+        assert_eq!(
+            fold_binop(IrBinOp::And, 0xFF, 0x0F, IrType::I64),
+            Some(0x0F)
+        );
         assert_eq!(fold_binop(IrBinOp::Or, 0xF0, 0x0F, IrType::I64), Some(0xFF));
         assert_eq!(fold_binop(IrBinOp::Xor, 0xFF, 0xFF, IrType::I64), Some(0));
     }
@@ -964,7 +1062,10 @@ mod tests {
         assert_eq!(fold_binop(IrBinOp::Shl, 1, 3, IrType::I64), Some(8));
         assert_eq!(fold_binop(IrBinOp::AShr, -8, 2, IrType::I64), Some(-2));
         // 64-bit LShr: -1 >> 32 = 0x00000000FFFFFFFF
-        assert_eq!(fold_binop(IrBinOp::LShr, -1i64, 32, IrType::I64), Some(0xFFFFFFFF));
+        assert_eq!(
+            fold_binop(IrBinOp::LShr, -1i64, 32, IrType::I64),
+            Some(0xFFFFFFFF)
+        );
         // 32-bit LShr: -1 (as u32 = 0xFFFFFFFF) >> 31 = 1
         assert_eq!(fold_binop(IrBinOp::LShr, -1i64, 31, IrType::I32), Some(1));
         // 32-bit AShr: -1 >> 31 = -1 (sign bit propagates)
@@ -974,7 +1075,10 @@ mod tests {
     #[test]
     fn test_fold_binop_udiv_32bit() {
         // 32-bit UDiv: -1 (as u32 = 0xFFFFFFFF = 4294967295) / 2 = 2147483647
-        assert_eq!(fold_binop(IrBinOp::UDiv, -1i64, 2, IrType::I32), Some(2147483647));
+        assert_eq!(
+            fold_binop(IrBinOp::UDiv, -1i64, 2, IrType::I32),
+            Some(2147483647)
+        );
         // 32-bit URem: -1 (as u32 = 4294967295) % 2 = 1
         assert_eq!(fold_binop(IrBinOp::URem, -1i64, 2, IrType::I32), Some(1));
     }
@@ -984,15 +1088,27 @@ mod tests {
         assert_eq!(fold_unaryop(IrUnaryOp::Neg, 5, IrType::I64), Some(-5));
         assert_eq!(fold_unaryop(IrUnaryOp::Not, 0, IrType::I64), Some(-1));
         // 32-bit popcount of -33 (0xFFFFFFDF) = 31 set bits
-        assert_eq!(fold_unaryop(IrUnaryOp::Popcount, -33, IrType::I32), Some(31));
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::Popcount, -33, IrType::I32),
+            Some(31)
+        );
         // 64-bit popcount of -33 (0xFFFFFFFFFFFFFFDF) = 63 set bits
-        assert_eq!(fold_unaryop(IrUnaryOp::Popcount, -33, IrType::I64), Some(63));
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::Popcount, -33, IrType::I64),
+            Some(63)
+        );
         // 32-bit CLZ of 1 = 31
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I32), Some(31));
         // 64-bit CLZ of 1 = 63
         assert_eq!(fold_unaryop(IrUnaryOp::Clz, 1, IrType::I64), Some(63));
-        assert_eq!(fold_unaryop(IrUnaryOp::BitReverse, 0x0000_0001, IrType::U32), Some(0x8000_0000));
-        assert_eq!(fold_unaryop(IrUnaryOp::BitReverse, 0x0123_4567_89ab_cdef, IrType::U64), Some(0xf7b3_d591_e6a2_c480u64 as i64));
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::BitReverse, 0x0000_0001, IrType::U32),
+            Some(0x8000_0000)
+        );
+        assert_eq!(
+            fold_unaryop(IrUnaryOp::BitReverse, 0x0123_4567_89ab_cdef, IrType::U64),
+            Some(0xf7b3_d591_e6a2_c480u64 as i64)
+        );
     }
 
     #[test]
@@ -1037,7 +1153,10 @@ mod tests {
         // Truncate I32 to U16: 0x1FFFF & 0xFFFF = 65535
         assert_eq!(fold_cast(0x1FFFF, IrType::I32, IrType::U16), 65535);
         // Truncate I64 to U32: 0x1FFFFFFFF & 0xFFFFFFFF = 4294967295
-        assert_eq!(fold_cast(0x1FFFFFFFF_i64, IrType::I64, IrType::U32), 4294967295);
+        assert_eq!(
+            fold_cast(0x1FFFFFFFF_i64, IrType::I64, IrType::U32),
+            4294967295
+        );
         // Truncate I64 to U32: -1 & 0xFFFFFFFF = 4294967295
         assert_eq!(fold_cast(-1, IrType::I64, IrType::U32), 4294967295);
     }
@@ -1063,7 +1182,10 @@ mod tests {
         };
         let folded = try_fold(&inst).unwrap();
         match folded {
-            Instruction::Copy { src: Operand::Const(IrConst::I32(7)), .. } => {}
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(7)),
+                ..
+            } => {}
             _ => panic!("Expected Copy with constant 7"),
         }
     }
@@ -1159,7 +1281,10 @@ mod tests {
         };
         let result = try_fold(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::F64(v)), .. } => {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::F64(v)),
+                ..
+            } => {
                 assert_eq!(v, 42.0);
             }
             _ => panic!("Expected Copy with F64(42.0)"),
@@ -1176,7 +1301,10 @@ mod tests {
         };
         let result = try_fold(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::I32(v)), .. } => {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(v)),
+                ..
+            } => {
                 assert_eq!(v, 3);
             }
             _ => panic!("Expected Copy with I32(3)"),
@@ -1230,7 +1358,10 @@ mod tests {
         };
         let result = try_fold(&inst).unwrap();
         match result {
-            Instruction::Copy { src: Operand::Const(IrConst::F64(v)), .. } => {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::F64(v)),
+                ..
+            } => {
                 assert_eq!(v, 7.0);
             }
             _ => panic!("Expected Copy with F64(7.0)"),

@@ -8,29 +8,20 @@
 //! - No register-based argument passing (unlike x86-64 SysV ABI)
 //! - Stack aligned to 16 bytes at call sites (modern i386 ABI)
 
-use crate::delegate_to_impl;
-use crate::backend::traits::ArchCodegen;
-use crate::backend::common::PtrDirective;
-use crate::backend::state::{CodegenState, StackSlot};
-use crate::backend::regalloc::PhysReg;
-use crate::backend::generation::is_i128_type;
 use crate::backend::call_abi;
-use crate::ir::reexports::{
-    AtomicOrdering,
-    AtomicRmwOp,
-    BlockId,
-    IntrinsicOp,
-    IrBinOp,
-    IrCmpOp,
-    IrConst,
-    IrFunction,
-    IrUnaryOp,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType};
+use crate::backend::common::PtrDirective;
+use crate::backend::generation::is_i128_type;
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{CodegenState, StackSlot};
+use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::FxHashMap;
-use crate::{emit};
+use crate::common::types::{AddressSpace, IrType};
+use crate::delegate_to_impl;
+use crate::emit;
+use crate::ir::reexports::{
+    AtomicOrdering, AtomicRmwOp, BlockId, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction,
+    IrUnaryOp, Operand, Value,
+};
 
 /// i686 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses cdecl calling convention with no register allocation (accumulator-based).
@@ -89,7 +80,8 @@ pub struct I686Codegen {
 // PhysReg(0) = ebx, PhysReg(1) = esi, PhysReg(2) = edi, PhysReg(3) = ebp
 pub(super) const I686_CALLEE_SAVED: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2)];
 // Extended callee-saved list including ebp (used when -fomit-frame-pointer)
-pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] = &[PhysReg(0), PhysReg(1), PhysReg(2), PhysReg(3)];
+pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] =
+    &[PhysReg(0), PhysReg(1), PhysReg(2), PhysReg(3)];
 // Caller-saved registers for Phase-2 allocation (non-call-spanning values).
 // PhysReg(4) = ecx, PhysReg(5) = edx. %eax stays the accumulator.
 //
@@ -186,7 +178,9 @@ impl I686Codegen {
         self.state.emit_cfi = opts.emit_cfi;
         // 0 (Default::default()) means "unspecified" -> SysV 16.
         self.stack_boundary = match opts.preferred_stack_bytes {
-            4 => 4, 8 => 8, _ => 16,
+            4 => 4,
+            8 => 8,
+            _ => 16,
         };
         self.optimize_for_size = opts.optimize_for_size;
     }
@@ -323,7 +317,9 @@ impl I686Codegen {
                         let low = *v as i32;
                         emit!(self.state, "    movl ${}, %eax", low);
                     }
-                    IrConst::F32(fval) => emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32),
+                    IrConst::F32(fval) => {
+                        emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32)
+                    }
                     IrConst::F64(fval) => {
                         // Store low 32 bits of the f64 bit pattern
                         let low = fval.to_bits() as i32;
@@ -408,43 +404,43 @@ impl I686Codegen {
     /// Load an operand into %ecx.
     pub(super) fn operand_to_ecx(&mut self, op: &Operand) {
         match op {
-            Operand::Const(c) => {
-                match c {
-                    IrConst::I8(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
-                    IrConst::I16(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
-                    IrConst::I32(v) => {
-                        if *v == 0 {
-                            self.state.emit("    xorl %ecx, %ecx");
-                        } else {
-                            emit!(self.state, "    movl ${}, %ecx", v);
-                        }
-                    }
-                    IrConst::I64(v) => {
-                        let low = *v as i32;
-                        if low == 0 {
-                            self.state.emit("    xorl %ecx, %ecx");
-                        } else {
-                            emit!(self.state, "    movl ${}, %ecx", low);
-                        }
-                    }
-                    IrConst::I128(v) => {
-                        let low = *v as i32;
-                        emit!(self.state, "    movl ${}, %ecx", low);
-                    }
-                    IrConst::F32(fval) => emit!(self.state, "    movl ${}, %ecx", fval.to_bits() as i32),
-                    IrConst::F64(fval) => {
-                        let low = fval.to_bits() as i32;
-                        emit!(self.state, "    movl ${}, %ecx", low);
-                    }
-                    IrConst::LongDouble(_, bytes) => {
-                        let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                        emit!(self.state, "    movl ${}, %ecx", low);
-                    }
-                    IrConst::Zero => {
+            Operand::Const(c) => match c {
+                IrConst::I8(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
+                IrConst::I16(v) => emit!(self.state, "    movl ${}, %ecx", *v as i32),
+                IrConst::I32(v) => {
+                    if *v == 0 {
                         self.state.emit("    xorl %ecx, %ecx");
+                    } else {
+                        emit!(self.state, "    movl ${}, %ecx", v);
                     }
                 }
-            }
+                IrConst::I64(v) => {
+                    let low = *v as i32;
+                    if low == 0 {
+                        self.state.emit("    xorl %ecx, %ecx");
+                    } else {
+                        emit!(self.state, "    movl ${}, %ecx", low);
+                    }
+                }
+                IrConst::I128(v) => {
+                    let low = *v as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::F32(fval) => {
+                    emit!(self.state, "    movl ${}, %ecx", fval.to_bits() as i32)
+                }
+                IrConst::F64(fval) => {
+                    let low = fval.to_bits() as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::LongDouble(_, bytes) => {
+                    let low = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    emit!(self.state, "    movl ${}, %ecx", low);
+                }
+                IrConst::Zero => {
+                    self.state.emit("    xorl %ecx, %ecx");
+                }
+            },
             Operand::Value(v) => {
                 let is_alloca = self.state.is_alloca(v.0);
                 if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
@@ -464,7 +460,9 @@ impl I686Codegen {
                     } else {
                         emit!(self.state, "    movl {}, %ecx", sr);
                     }
-                } else if self.state.reg_cache.acc_has(v.0, false) || self.state.reg_cache.acc_has(v.0, true) {
+                } else if self.state.reg_cache.acc_has(v.0, false)
+                    || self.state.reg_cache.acc_has(v.0, true)
+                {
                     // Value is in accumulator (no stack slot) — move eax to ecx.
                     self.state.emit("    movl %eax, %ecx");
                 } else {
@@ -519,10 +517,10 @@ impl I686Codegen {
     /// Return the load mnemonic for a given type.
     pub(super) fn mov_load_for_type(&self, ty: IrType) -> &'static str {
         match ty {
-            IrType::I8 => "movsbl",    // sign-extend byte to 32-bit
-            IrType::U8 => "movzbl",    // zero-extend byte to 32-bit
-            IrType::I16 => "movswl",   // sign-extend word to 32-bit
-            IrType::U16 => "movzwl",   // zero-extend word to 32-bit
+            IrType::I8 => "movsbl",  // sign-extend byte to 32-bit
+            IrType::U8 => "movzbl",  // zero-extend byte to 32-bit
+            IrType::I16 => "movswl", // sign-extend word to 32-bit
+            IrType::U16 => "movzwl", // zero-extend word to 32-bit
             // Everything 32-bit or larger uses movl
             _ => "movl",
         }
@@ -550,15 +548,25 @@ impl I686Codegen {
     /// Check if a param type is eligible for fastcall register passing.
     /// Only DWORD-sized or smaller integer/pointer types qualify.
     pub(super) fn is_fastcall_reg_eligible(&self, ty: IrType) -> bool {
-        matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 |
-                     IrType::I32 | IrType::U32 | IrType::Ptr)
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
     }
 
     /// Count how many leading params are passed in registers for fastcall (max 2).
     pub(super) fn count_fastcall_reg_params(&self, func: &IrFunction) -> usize {
         let mut count = 0;
         for param in &func.params {
-            if count >= 2 { break; }
+            if count >= 2 {
+                break;
+            }
             let ty = param.ty;
             if self.is_fastcall_reg_eligible(ty) {
                 count += 1;
@@ -726,8 +734,13 @@ impl I686Codegen {
     ///   edx:eax = old (expected) value
     ///   ecx:ebx = new (desired) value
     ///   Stack: saved operand value (8 bytes)
-    pub(super) fn emit_atomic_rmw_wide(&mut self, dest: &Value, op: AtomicRmwOp, ptr: &Operand,
-                            val: &Operand) {
+    pub(super) fn emit_atomic_rmw_wide(
+        &mut self,
+        dest: &Value,
+        op: AtomicRmwOp,
+        ptr: &Operand,
+        val: &Operand,
+    ) {
         // Save callee-saved registers we need to clobber
         self.state.emit("    pushl %ebx");
         self.esp_adjust += 4;
@@ -740,8 +753,8 @@ impl I686Codegen {
 
         // Load 64-bit operand value onto stack (8 bytes)
         self.emit_load_acc_pair(val);
-        self.state.emit("    pushl %edx");  // high word at 4(%esp)
-        self.state.emit("    pushl %eax");  // low word at (%esp)
+        self.state.emit("    pushl %edx"); // high word at 4(%esp)
+        self.state.emit("    pushl %eax"); // low word at (%esp)
 
         // Load current value from memory into edx:eax
         self.state.emit("    movl (%esi), %eax");
@@ -848,8 +861,14 @@ impl I686Codegen {
     /// cmpxchg8b: compares edx:eax with 8 bytes at memory.
     /// If equal, stores ecx:ebx to memory and sets ZF.
     /// If not equal, loads memory into edx:eax and clears ZF.
-    pub(super) fn emit_atomic_cmpxchg_wide(&mut self, dest: &Value, ptr: &Operand, expected: &Operand,
-                                desired: &Operand, returns_bool: bool) {
+    pub(super) fn emit_atomic_cmpxchg_wide(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        returns_bool: bool,
+    ) {
         // Save callee-saved registers
         self.state.emit("    pushl %ebx");
         self.esp_adjust += 4;
@@ -974,15 +993,23 @@ impl I686Codegen {
     /// First two DWORD (int/ptr) args go in ECX, EDX.
     /// Remaining args go on the stack (right-to-left push order).
     /// The callee pops stack args, so caller does NOT adjust ESP after call.
-    pub(super) fn emit_fastcall(&mut self, args: &[Operand], arg_types: &[IrType],
-                     direct_name: Option<&str>, func_ptr: Option<&Operand>,
-                     dest: Option<Value>, return_type: IrType) {
+    pub(super) fn emit_fastcall(
+        &mut self,
+        args: &[Operand],
+        arg_types: &[IrType],
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        dest: Option<Value>,
+        return_type: IrType,
+    ) {
         let indirect = func_ptr.is_some() && direct_name.is_none();
 
         // Determine which args go in registers vs stack.
         let mut reg_count = 0usize;
         for ty in arg_types.iter() {
-            if reg_count >= 2 { break; }
+            if reg_count >= 2 {
+                break;
+            }
             if self.is_fastcall_reg_eligible(*ty) {
                 reg_count += 1;
             } else {
@@ -993,7 +1020,11 @@ impl I686Codegen {
         // Compute stack space for overflow args (args beyond the register ones).
         let mut stack_bytes = 0usize;
         for i in reg_count..args.len() {
-            let ty = if i < arg_types.len() { arg_types[i] } else { IrType::I32 };
+            let ty = if i < arg_types.len() {
+                arg_types[i]
+            } else {
+                IrType::I32
+            };
             match ty {
                 IrType::F64 | IrType::I64 | IrType::U64 => stack_bytes += 8,
                 IrType::F128 => stack_bytes += 12,
@@ -1018,7 +1049,11 @@ impl I686Codegen {
         // Write stack args (skipping register args).
         let mut offset = 0i64;
         for i in reg_count..args.len() {
-            let ty = if i < arg_types.len() { arg_types[i] } else { IrType::I32 };
+            let ty = if i < arg_types.len() {
+                arg_types[i]
+            } else {
+                IrType::I32
+            };
             let arg = &args[i];
 
             match ty {
@@ -1190,7 +1225,12 @@ impl I686Codegen {
     }
 
     /// Copy `n_bytes` from stack slot to call stack area, 4 bytes at a time.
-    pub(super) fn emit_copy_slot_to_stack(&mut self, slot: StackSlot, stack_offset: usize, n_bytes: usize) {
+    pub(super) fn emit_copy_slot_to_stack(
+        &mut self,
+        slot: StackSlot,
+        stack_offset: usize,
+        n_bytes: usize,
+    ) {
         let mut copied = 0usize;
         while copied + 4 <= n_bytes {
             let sr = self.slot_ref_offset(slot, copied as i64);
@@ -1208,7 +1248,12 @@ impl I686Codegen {
     }
 
     /// Fallback: store eax to stack, zero-fill remaining bytes.
-    pub(super) fn emit_eax_to_stack_zeroed(&mut self, arg: &Operand, stack_offset: usize, total_bytes: usize) {
+    pub(super) fn emit_eax_to_stack_zeroed(
+        &mut self,
+        arg: &Operand,
+        stack_offset: usize,
+        total_bytes: usize,
+    ) {
         self.operand_to_eax(arg);
         emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
         for j in (4..total_bytes).step_by(4) {
@@ -1249,8 +1294,18 @@ impl I686Codegen {
                 let dword1 = i32::from_le_bytes([x87[4], x87[5], x87[6], x87[7]]);
                 let word2 = i16::from_le_bytes([x87[8], x87[9]]) as i32;
                 emit!(self.state, "    movl ${}, {}(%esp)", dword0, stack_offset);
-                emit!(self.state, "    movl ${}, {}(%esp)", dword1, stack_offset + 4);
-                emit!(self.state, "    movw ${}, {}(%esp)", word2, stack_offset + 8);
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    dword1,
+                    stack_offset + 4
+                );
+                emit!(
+                    self.state,
+                    "    movw ${}, {}(%esp)",
+                    word2,
+                    stack_offset + 8
+                );
             }
             Operand::Const(IrConst::F64(fval)) => {
                 let bits = fval.to_bits();
@@ -1270,7 +1325,12 @@ impl I686Codegen {
     }
 
     /// Emit struct-by-value argument to call stack.
-    pub(super) fn emit_call_struct_stack_arg(&mut self, arg: &Operand, stack_offset: usize, size: usize) {
+    pub(super) fn emit_call_struct_stack_arg(
+        &mut self,
+        arg: &Operand,
+        stack_offset: usize,
+        size: usize,
+    ) {
         if let Operand::Value(v) = arg {
             if self.state.is_alloca(v.0) {
                 if let Some(slot) = self.state.get_slot(v.0) {
@@ -1297,7 +1357,12 @@ impl I686Codegen {
     }
 
     /// Emit 8-byte scalar (F64/I64/U64) to call stack.
-    pub(super) fn emit_call_8byte_stack_arg(&mut self, arg: &Operand, ty: IrType, stack_offset: usize) {
+    pub(super) fn emit_call_8byte_stack_arg(
+        &mut self,
+        arg: &Operand,
+        ty: IrType,
+        stack_offset: usize,
+    ) {
         if let Operand::Value(v) = arg {
             if let Some(slot) = self.state.get_slot(v.0) {
                 let sr0 = self.slot_ref(slot);
@@ -1317,8 +1382,18 @@ impl I686Codegen {
                 let bits = f.to_bits();
                 let lo = (bits & 0xFFFF_FFFF) as u32;
                 let hi = (bits >> 32) as u32;
-                emit!(self.state, "    movl ${}, {}(%esp)", lo as i32, stack_offset);
-                emit!(self.state, "    movl ${}, {}(%esp)", hi as i32, stack_offset + 4);
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    lo as i32,
+                    stack_offset
+                );
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    hi as i32,
+                    stack_offset + 4
+                );
             } else {
                 self.operand_to_eax(arg);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
@@ -1338,7 +1413,6 @@ impl I686Codegen {
     }
 }
 
-
 // ─── ArchCodegen trait implementation ────────────────────────────────────────
 
 impl ArchCodegen for I686Codegen {
@@ -1346,10 +1420,16 @@ impl ArchCodegen for I686Codegen {
         self.reg_assignments.contains_key(&vid)
     }
 
-    fn state(&mut self) -> &mut CodegenState { &mut self.state }
-    fn state_ref(&self) -> &CodegenState { &self.state }
+    fn state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
+    fn state_ref(&self) -> &CodegenState {
+        &self.state
+    }
 
-    fn ptr_directive(&self) -> PtrDirective { PtrDirective::Long }
+    fn ptr_directive(&self) -> PtrDirective {
+        PtrDirective::Long
+    }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {
         self.reg_assignments.get(&val_id).copied()
@@ -1472,7 +1552,13 @@ impl ArchCodegen for I686Codegen {
                     emit!(self.state, "    movl %{}, %{}", b_name, d_name);
                 }
             } else {
-                emit!(self.state, "    leal {}(%{}), %{}", offset as i32, b_name, d_name);
+                emit!(
+                    self.state,
+                    "    leal {}(%{}), %{}",
+                    offset as i32,
+                    b_name,
+                    d_name
+                );
             }
             self.state.reg_cache.invalidate_acc();
             return true;
@@ -1489,14 +1575,30 @@ impl ArchCodegen for I686Codegen {
     }
 
     // ---- Standard trait methods (kept inline - arch-specific) ----
-    fn emit_load_operand(&mut self, op: &Operand) { self.operand_to_eax(op); }
-    fn emit_store_result(&mut self, dest: &Value) { self.store_eax_to(dest); }
-    fn emit_save_acc(&mut self) { self.state.emit("    movl %eax, %edx"); }
-    fn emit_add_secondary_to_acc(&mut self) { self.state.emit("    addl %ecx, %eax"); }
-    fn emit_acc_to_secondary(&mut self) { self.state.emit("    movl %eax, %ecx"); }
-    fn emit_memcpy_store_dest_from_acc(&mut self) { self.state.emit("    movl %eax, %edi"); }
-    fn emit_memcpy_store_src_from_acc(&mut self) { self.state.emit("    movl %eax, %esi"); }
-    fn current_return_type(&self) -> IrType { self.current_return_type }
+    fn emit_load_operand(&mut self, op: &Operand) {
+        self.operand_to_eax(op);
+    }
+    fn emit_store_result(&mut self, dest: &Value) {
+        self.store_eax_to(dest);
+    }
+    fn emit_save_acc(&mut self) {
+        self.state.emit("    movl %eax, %edx");
+    }
+    fn emit_add_secondary_to_acc(&mut self) {
+        self.state.emit("    addl %ecx, %eax");
+    }
+    fn emit_acc_to_secondary(&mut self) {
+        self.state.emit("    movl %eax, %ecx");
+    }
+    fn emit_memcpy_store_dest_from_acc(&mut self) {
+        self.state.emit("    movl %eax, %edi");
+    }
+    fn emit_memcpy_store_src_from_acc(&mut self) {
+        self.state.emit("    movl %eax, %esi");
+    }
+    fn current_return_type(&self) -> IrType {
+        self.current_return_type
+    }
     fn emit_gep_add_const_to_acc(&mut self, offset: i64) {
         if offset != 0 {
             emit!(self.state, "    addl ${}, %eax", offset as i32);
@@ -1523,9 +1625,9 @@ impl ArchCodegen for I686Codegen {
                     self.emit_alloca_aligned_addr_to_acc(slot, id);
                     self.state.emit("    movl %eax, %edi");
                 }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot,true,dest.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot,false,dest.0),
-                SlotAddr::Reg(reg) => emit!(self.state,"    movl %{}, %edi",phys_reg_name(reg)),
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_dest_addr(slot, true, dest.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_dest_addr(slot, false, dest.0),
+                SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %edi", phys_reg_name(reg)),
             }
         }
         // Load src address into esi
@@ -1535,9 +1637,9 @@ impl ArchCodegen for I686Codegen {
                     self.emit_alloca_aligned_addr_to_acc(slot, id);
                     self.state.emit("    movl %eax, %esi");
                 }
-                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot,true,src.0),
-                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot,false,src.0),
-                SlotAddr::Reg(reg) => emit!(self.state,"    movl %{}, %esi",phys_reg_name(reg)),
+                SlotAddr::Direct(slot) => self.emit_memcpy_load_src_addr(slot, true, src.0),
+                SlotAddr::Indirect(slot) => self.emit_memcpy_load_src_addr(slot, false, src.0),
+                SlotAddr::Reg(reg) => emit!(self.state, "    movl %{}, %esi", phys_reg_name(reg)),
             }
         }
         // Perform the copy
@@ -1623,7 +1725,11 @@ impl ArchCodegen for I686Codegen {
         self.operand_to_eax(src);
         match op {
             IrUnaryOp::Neg => {
-                if ty.is_float() { self.emit_float_neg(ty); } else { self.emit_int_neg(ty); }
+                if ty.is_float() {
+                    self.emit_float_neg(ty);
+                } else {
+                    self.emit_int_neg(ty);
+                }
             }
             IrUnaryOp::Not => self.emit_int_not(ty),
             IrUnaryOp::Clz => self.emit_int_clz(ty),
@@ -1638,36 +1744,75 @@ impl ArchCodegen for I686Codegen {
     }
 
     /// Override emit_call to handle fastcall calling convention.
-    fn emit_call(&mut self, args: &[Operand], arg_types: &[IrType], direct_name: Option<&str>,
-                 func_ptr: Option<&Operand>, dest: Option<Value>, return_type: IrType,
-                 is_variadic: bool, _num_fixed_args: usize, struct_arg_sizes: &[Option<usize>],
-                 struct_arg_aligns: &[Option<usize>],
-                 struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
-                 struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
-                 _struct_arg_is_f128_sse: &[bool],
-                 is_sret: bool,
-                 is_fastcall: bool,
-                 ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
-                 _ret_is_f128_sse: bool) {
+    fn emit_call(
+        &mut self,
+        args: &[Operand],
+        arg_types: &[IrType],
+        direct_name: Option<&str>,
+        func_ptr: Option<&Operand>,
+        dest: Option<Value>,
+        return_type: IrType,
+        is_variadic: bool,
+        _num_fixed_args: usize,
+        struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
+        _struct_arg_is_f128_sse: &[bool],
+        is_sret: bool,
+        is_fastcall: bool,
+        ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
+        _ret_is_f128_sse: bool,
+    ) {
         if is_fastcall {
             self.emit_fastcall(args, arg_types, direct_name, func_ptr, dest, return_type);
             return;
         }
         use crate::backend::call_abi::*;
         let config = self.call_abi_config();
-        let arg_classes_vec = classify_call_args(args, arg_types, struct_arg_sizes, struct_arg_aligns, struct_arg_classes, struct_arg_riscv_float_classes, &[], is_variadic, &config);
+        let arg_classes_vec = classify_call_args(
+            args,
+            arg_types,
+            struct_arg_sizes,
+            struct_arg_aligns,
+            struct_arg_classes,
+            struct_arg_riscv_float_classes,
+            &[],
+            is_variadic,
+            &config,
+        );
         let indirect = func_ptr.is_some() && direct_name.is_none();
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
         }
-        let stack_arg_space = self.emit_call_compute_stack_space(&arg_classes_vec, arg_types, struct_arg_aligns);
-        let f128_temp_space = self.emit_call_f128_pre_convert(args, &arg_classes_vec, arg_types, stack_arg_space);
+        let stack_arg_space =
+            self.emit_call_compute_stack_space(&arg_classes_vec, arg_types, struct_arg_aligns);
+        let f128_temp_space =
+            self.emit_call_f128_pre_convert(args, &arg_classes_vec, arg_types, stack_arg_space);
         self.state().reg_cache.invalidate_acc();
-        let total_sp_adjust = self.emit_call_stack_args(args, &arg_classes_vec, arg_types, stack_arg_space,
-                                                        if indirect { self.emit_call_fptr_spill_size() } else { 0 },
-                                                        f128_temp_space, struct_arg_aligns);
+        let total_sp_adjust = self.emit_call_stack_args(
+            args,
+            &arg_classes_vec,
+            arg_types,
+            stack_arg_space,
+            if indirect {
+                self.emit_call_fptr_spill_size()
+            } else {
+                0
+            },
+            f128_temp_space,
+            struct_arg_aligns,
+        );
         self.state().reg_cache.invalidate_acc();
-        self.emit_call_reg_args(args, &arg_classes_vec, arg_types, total_sp_adjust, f128_temp_space, stack_arg_space, &[]);
+        self.emit_call_reg_args(
+            args,
+            &arg_classes_vec,
+            arg_types,
+            total_sp_adjust,
+            f128_temp_space,
+            stack_arg_space,
+            &[],
+        );
         self.emit_call_instruction(direct_name, func_ptr, indirect, stack_arg_space);
         let callee_pops = self.callee_pops_bytes_for_sret(is_sret);
         // Account for bytes the callee pops via `ret $N` (sret pointer on i686).
@@ -1739,13 +1884,21 @@ impl ArchCodegen for I686Codegen {
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
-        if is_sret && self.regparm == 0 { 4 } else { 0 }
+        if is_sret && self.regparm == 0 {
+            4
+        } else {
+            0
+        }
     }
 
     // ---- Control flow ----
 
-    fn jump_mnemonic(&self) -> &'static str { "jmp" }
-    fn trap_instruction(&self) -> &'static str { "ud2" }
+    fn jump_mnemonic(&self) -> &'static str {
+        "jmp"
+    }
+    fn trap_instruction(&self) -> &'static str {
+        "ud2"
+    }
 
     fn emit_branch_nonzero(&mut self, label: &str) {
         self.state.emit("    testl %eax, %eax");
@@ -1753,7 +1906,12 @@ impl ArchCodegen for I686Codegen {
     }
 
     /// On i686, 64-bit conditions need both 32-bit halves tested.
-    fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) {
+    fn emit_cond_branch_blocks(
+        &mut self,
+        cond: &Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    ) {
         match cond {
             Operand::Const(IrConst::I64(v)) => {
                 if *v != 0 {
@@ -1794,7 +1952,13 @@ impl ArchCodegen for I686Codegen {
     }
 
     /// Override emit_switch to handle 64-bit switch values on i686.
-    fn emit_switch(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, ty: IrType) {
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
         let is_wide = match val {
             Operand::Value(v) => self.state.is_wide_value(v.0),
             Operand::Const(IrConst::I64(_)) => true,
@@ -1802,14 +1966,25 @@ impl ArchCodegen for I686Codegen {
         };
 
         if !is_wide {
-            use crate::backend::traits::{MIN_JUMP_TABLE_CASES, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_DENSITY_PERCENT};
+            use crate::backend::traits::{
+                MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT,
+            };
             let use_jump_table = if self.state.no_jump_tables {
                 false
             } else if cases.len() >= MIN_JUMP_TABLE_CASES {
-                let min_val = cases.iter().map(|&(v, _)| v).min().expect("switch must have cases");
-                let max_val = cases.iter().map(|&(v, _)| v).max().expect("switch must have cases");
+                let min_val = cases
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .min()
+                    .expect("switch must have cases");
+                let max_val = cases
+                    .iter()
+                    .map(|&(v, _)| v)
+                    .max()
+                    .expect("switch must have cases");
                 let range = (max_val - min_val + 1) as usize;
-                range <= MAX_JUMP_TABLE_RANGE && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
+                range <= MAX_JUMP_TABLE_RANGE
+                    && cases.len() * 100 / range >= MIN_JUMP_TABLE_DENSITY_PERCENT
             } else {
                 false
             };
@@ -1864,7 +2039,13 @@ impl ArchCodegen for I686Codegen {
         emit!(self.state, "    je {}", label);
     }
 
-    fn emit_switch_jump_table(&mut self, val: &Operand, cases: &[(i64, BlockId)], default: &BlockId, _ty: IrType) {
+    fn emit_switch_jump_table(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        _ty: IrType,
+    ) {
         use crate::backend::traits::build_jump_table;
         let (table, min_val, range) = build_jump_table(cases, default);
         let table_label = self.state.fresh_label("jt");
@@ -1892,17 +2073,27 @@ impl ArchCodegen for I686Codegen {
         for target in &table {
             let target_label = target.as_label();
             if self.state.pic_mode {
-                self.state.emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
+                self.state
+                    .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
             } else {
-                self.state.emit_fmt(format_args!("    .long {}", target_label));
+                self.state
+                    .emit_fmt(format_args!("    .long {}", target_label));
             }
         }
         let sect = self.state.current_text_section.clone();
-        self.state.emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
+        self.state
+            .emit_fmt(format_args!(".section {},\"ax\",@progbits", sect));
         self.state.reg_cache.invalidate_all();
     }
 
-    fn emit_float_binop(&mut self, dest: &Value, op: crate::backend::cast::FloatOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
+    fn emit_float_binop(
+        &mut self,
+        dest: &Value,
+        op: crate::backend::cast::FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
         if ty == IrType::F64 {
             let mnemonic = self.emit_float_binop_mnemonic(op);
             self.emit_f64_load_to_x87(lhs);
@@ -1971,7 +2162,9 @@ impl ArchCodegen for I686Codegen {
 
         if let Operand::Value(v) = src {
             if self.state.f128_direct_slots.contains(&v.0) {
-                if let (Some(src_slot), Some(dest_slot)) = (self.state.get_slot(v.0), self.state.get_slot(dest.0)) {
+                if let (Some(src_slot), Some(dest_slot)) =
+                    (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                {
                     let ssr = self.slot_ref(src_slot);
                     let dsr = self.slot_ref(dest_slot);
                     emit!(self.state, "    fldt {}", ssr);
@@ -1982,7 +2175,9 @@ impl ArchCodegen for I686Codegen {
             }
             if let Some(&alloca_ty) = self.state.alloca_types.get(&v.0) {
                 if alloca_ty == IrType::F128 {
-                    if let (Some(src_slot), Some(dest_slot)) = (self.state.get_slot(v.0), self.state.get_slot(dest.0)) {
+                    if let (Some(src_slot), Some(dest_slot)) =
+                        (self.state.get_slot(v.0), self.state.get_slot(dest.0))
+                    {
                         let ssr = self.slot_ref(src_slot);
                         let dsr = self.slot_ref(dest_slot);
                         emit!(self.state, "    fldt {}", ssr);
@@ -2043,14 +2238,35 @@ impl ArchCodegen for I686Codegen {
         self.emit_store_result(dest);
     }
 
-    fn emit_inline_asm(&mut self, template: &str, outputs: &[(String, Value, Option<String>)],
-                       inputs: &[(String, Operand, Option<String>)], clobbers: &[String],
-                       operand_types: &[IrType], goto_labels: &[(String, BlockId)],
-                       input_symbols: &[Option<String>]) {
-        crate::backend::inline_asm::emit_inline_asm_common(self, template, outputs, inputs, clobbers, operand_types, goto_labels, input_symbols);
+    fn emit_inline_asm(
+        &mut self,
+        template: &str,
+        outputs: &[(String, Value, Option<String>)],
+        inputs: &[(String, Operand, Option<String>)],
+        clobbers: &[String],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+        input_symbols: &[Option<String>],
+    ) {
+        crate::backend::inline_asm::emit_inline_asm_common(
+            self,
+            template,
+            outputs,
+            inputs,
+            clobbers,
+            operand_types,
+            goto_labels,
+            input_symbols,
+        );
     }
 
-    fn emit_intrinsic(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+    fn emit_intrinsic(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
         self.emit_intrinsic_impl(dest, op, dest_ptr, args);
     }
 
@@ -2202,7 +2418,9 @@ impl ArchCodegen for I686Codegen {
         let seg_prefix = match seg {
             AddressSpace::SegGs => "%gs:",
             AddressSpace::SegFs => "%fs:",
-            AddressSpace::Default => unreachable!("segment-prefixed op called with default address space"),
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
         };
         let load_instr = self.mov_load_for_type(ty);
         emit!(self.state, "    {} {}(%ecx), %eax", load_instr, seg_prefix);
@@ -2218,7 +2436,9 @@ impl ArchCodegen for I686Codegen {
         let seg_prefix = match seg {
             AddressSpace::SegGs => "%gs:",
             AddressSpace::SegFs => "%fs:",
-            AddressSpace::Default => unreachable!("segment-prefixed op called with default address space"),
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
         };
         let store_instr = self.mov_store_for_type(ty);
         let reg = match ty {
@@ -2226,14 +2446,22 @@ impl ArchCodegen for I686Codegen {
             IrType::I16 | IrType::U16 => "%dx",
             _ => "%edx",
         };
-        emit!(self.state, "    {} {}, {}(%ecx)", store_instr, reg, seg_prefix);
+        emit!(
+            self.state,
+            "    {} {}, {}(%ecx)",
+            store_instr,
+            reg,
+            seg_prefix
+        );
     }
 
     fn emit_seg_load_symbol(&mut self, dest: &Value, sym: &str, ty: IrType, seg: AddressSpace) {
         let seg_prefix = match seg {
             AddressSpace::SegGs => "%gs:",
             AddressSpace::SegFs => "%fs:",
-            AddressSpace::Default => unreachable!("segment-prefixed op called with default address space"),
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
         };
         let load_instr = self.mov_load_for_type(ty);
         // i686 uses absolute addressing (no RIP-relative)
@@ -2247,7 +2475,9 @@ impl ArchCodegen for I686Codegen {
         let seg_prefix = match seg {
             AddressSpace::SegGs => "%gs:",
             AddressSpace::SegFs => "%fs:",
-            AddressSpace::Default => unreachable!("segment-prefixed op called with default address space"),
+            AddressSpace::Default => {
+                unreachable!("segment-prefixed op called with default address space")
+            }
         };
         let store_instr = self.mov_store_for_type(ty);
         let reg = match ty {
@@ -2255,7 +2485,14 @@ impl ArchCodegen for I686Codegen {
             IrType::I16 | IrType::U16 => "%ax",
             _ => "%eax",
         };
-        emit!(self.state, "    {} {}, {}{}", store_instr, reg, seg_prefix, sym);
+        emit!(
+            self.state,
+            "    {} {}, {}{}",
+            store_instr,
+            reg,
+            seg_prefix,
+            sym
+        );
     }
 
     fn emit_runtime_stubs(&mut self) {
@@ -2319,42 +2556,42 @@ impl I686Codegen {
         // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
         // Stack: ebx(0), ret(4), A_lo(8), A_hi(12), B_lo(16), B_hi(20)
-        s.emit("    movl 20(%esp), %ebx");  // B_hi
-        s.emit("    bsrl %ebx, %ecx");      // ecx = i = index of leading bit of B_hi
-        s.emit("    jz .Ludiv_b_hi_zero");  // B_hi == 0 -> special case
+        s.emit("    movl 20(%esp), %ebx"); // B_hi
+        s.emit("    bsrl %ebx, %ecx"); // ecx = i = index of leading bit of B_hi
+        s.emit("    jz .Ludiv_b_hi_zero"); // B_hi == 0 -> special case
 
         // --- B_hi != 0: quotient fits in 32 bits ---
         // Construct bhi = bits [1+i : 32+i] of B (top 32 bits of B, normalized).
         //   bhi = (B_lo >> (1+i)) | (B_hi << (31-i))
-        s.emit("    movl 16(%esp), %eax");  // B_lo
-        s.emit("    shrl %cl, %eax");       // B_lo >> i
-        s.emit("    shrl %eax");            // B_lo >> (1+i)
-        s.emit("    notl %ecx");            // cl = 31-i (mod 32)
-        s.emit("    shll %cl, %ebx");       // B_hi << (31-i)
-        s.emit("    orl %eax, %ebx");       // ebx = bhi
-        s.emit("    movl 12(%esp), %edx");  // A_hi
-        s.emit("    movl 8(%esp), %eax");   // A_lo
-        s.emit("    cmpl %ebx, %edx");      // if A_hi >= bhi, need overflow path
+        s.emit("    movl 16(%esp), %eax"); // B_lo
+        s.emit("    shrl %cl, %eax"); // B_lo >> i
+        s.emit("    shrl %eax"); // B_lo >> (1+i)
+        s.emit("    notl %ecx"); // cl = 31-i (mod 32)
+        s.emit("    shll %cl, %ebx"); // B_hi << (31-i)
+        s.emit("    orl %eax, %ebx"); // ebx = bhi
+        s.emit("    movl 12(%esp), %edx"); // A_hi
+        s.emit("    movl 8(%esp), %eax"); // A_lo
+        s.emit("    cmpl %ebx, %edx"); // if A_hi >= bhi, need overflow path
         s.emit("    jae .Ludiv_big_overflow");
 
         // A_hi < bhi: divide edx:eax by bhi directly (no overflow)
-        s.emit("    divl %ebx");            // eax = qs
+        s.emit("    divl %ebx"); // eax = qs
         s.emit("    pushl %edi");
         // Stack: edi(0), ebx(4), ret(8), A_lo(12), A_hi(16), B_lo(20), B_hi(24)
-        s.emit("    notl %ecx");            // cl = i again
+        s.emit("    notl %ecx"); // cl = i again
         s.emit("    shrl %eax");
-        s.emit("    shrl %cl, %eax");       // q = qs >> (1+i)
-        s.emit("    movl %eax, %edi");      // edi = q
-        // Verify: compute a - q*b, adjust if negative
-        s.emit("    mull 20(%esp)");        // edx:eax = q * B_lo
+        s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
+        s.emit("    movl %eax, %edi"); // edi = q
+                                       // Verify: compute a - q*b, adjust if negative
+        s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
         s.emit("    movl 12(%esp), %ebx");
-        s.emit("    movl 16(%esp), %ecx");  // ecx:ebx = a
+        s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
         s.emit("    subl %eax, %ebx");
-        s.emit("    sbbl %edx, %ecx");      // ecx:ebx = a - q*B_lo
-        s.emit("    movl 24(%esp), %eax");  // B_hi
-        s.emit("    imull %edi, %eax");     // q * B_hi (low 32 bits)
-        s.emit("    subl %eax, %ecx");      // ecx:ebx = a - q*b
-        s.emit("    sbbl $0, %edi");        // if remainder was negative, decrement q
+        s.emit("    sbbl %edx, %ecx"); // ecx:ebx = a - q*B_lo
+        s.emit("    movl 24(%esp), %eax"); // B_hi
+        s.emit("    imull %edi, %eax"); // q * B_hi (low 32 bits)
+        s.emit("    subl %eax, %ecx"); // ecx:ebx = a - q*b
+        s.emit("    sbbl $0, %edi"); // if remainder was negative, decrement q
         s.emit("    xorl %edx, %edx");
         s.emit("    movl %edi, %eax");
         s.emit("    popl %edi");
@@ -2363,15 +2600,15 @@ impl I686Codegen {
 
         // A_hi >= bhi: subtract bhi first to avoid divl overflow
         s.emit(".Ludiv_big_overflow:");
-        s.emit("    subl %ebx, %edx");      // edx = A_hi - bhi
-        s.emit("    divl %ebx");            // eax = qs (for quotient 1:qs)
+        s.emit("    subl %ebx, %edx"); // edx = A_hi - bhi
+        s.emit("    divl %ebx"); // eax = qs (for quotient 1:qs)
         s.emit("    pushl %edi");
-        s.emit("    notl %ecx");            // cl = i
+        s.emit("    notl %ecx"); // cl = i
         s.emit("    shrl %eax");
         s.emit("    orl $0x80000000, %eax"); // set high bit (the '1' prefix)
-        s.emit("    shrl %cl, %eax");       // q = (1:qs) >> (1+i)
+        s.emit("    shrl %cl, %eax"); // q = (1:qs) >> (1+i)
         s.emit("    movl %eax, %edi");
-        s.emit("    mull 20(%esp)");        // q * B_lo
+        s.emit("    mull 20(%esp)"); // q * B_lo
         s.emit("    movl 12(%esp), %ebx");
         s.emit("    movl 16(%esp), %ecx");
         s.emit("    subl %eax, %ebx");
@@ -2388,14 +2625,14 @@ impl I686Codegen {
 
         // --- B_hi == 0: two-step divide ---
         s.emit(".Ludiv_b_hi_zero:");
-        s.emit("    movl 12(%esp), %eax");  // A_hi
-        s.emit("    movl 16(%esp), %ecx");  // B_lo
+        s.emit("    movl 12(%esp), %eax"); // A_hi
+        s.emit("    movl 16(%esp), %ecx"); // B_lo
         s.emit("    xorl %edx, %edx");
-        s.emit("    divl %ecx");            // eax = Q_hi, edx = rem
-        s.emit("    movl %eax, %ebx");      // save Q_hi
-        s.emit("    movl 8(%esp), %eax");   // A_lo
-        s.emit("    divl %ecx");            // eax = Q_lo
-        s.emit("    movl %ebx, %edx");      // edx = Q_hi
+        s.emit("    divl %ecx"); // eax = Q_hi, edx = rem
+        s.emit("    movl %eax, %ebx"); // save Q_hi
+        s.emit("    movl 8(%esp), %eax"); // A_lo
+        s.emit("    divl %ecx"); // eax = Q_lo
+        s.emit("    movl %ebx, %edx"); // edx = Q_hi
         s.emit("    popl %ebx");
         s.emit("    ret");
         s.emit(".size __udivdi3, .-__udivdi3");
@@ -2417,10 +2654,10 @@ impl I686Codegen {
         // Stack: ebp(0), edi(4), esi(8), ebx(12), ret(16), A_lo(20), A_hi(24), B_lo(28), B_hi(32)
 
         // Call __udivdi3(A, B) to get quotient
-        s.emit("    pushl 32(%esp)");       // B_hi
-        s.emit("    pushl 32(%esp)");       // B_lo (28+4=32 after push)
-        s.emit("    pushl 32(%esp)");       // A_hi (24+8=32 after two pushes)
-        s.emit("    pushl 32(%esp)");       // A_lo (20+12=32 after three pushes)
+        s.emit("    pushl 32(%esp)"); // B_hi
+        s.emit("    pushl 32(%esp)"); // B_lo (28+4=32 after push)
+        s.emit("    pushl 32(%esp)"); // A_hi (24+8=32 after two pushes)
+        s.emit("    pushl 32(%esp)"); // A_lo (20+12=32 after three pushes)
         s.emit("    call __udivdi3");
         s.emit("    addl $16, %esp");
         // edx:eax = quotient (Q_hi:Q_lo)
@@ -2428,19 +2665,19 @@ impl I686Codegen {
         // Compute q * B (64-bit), result in ecx:ebx
         // q * B = Q_lo * B_lo + (Q_lo * B_hi + Q_hi * B_lo) << 32
         // We only need the low 64 bits.
-        s.emit("    movl %eax, %ebx");      // save Q_lo
-        s.emit("    movl %edx, %ecx");      // save Q_hi
-        s.emit("    imull 28(%esp), %ecx");  // ecx = Q_hi * B_lo (low 32)
-        s.emit("    movl 32(%esp), %ebp");   // B_hi
-        s.emit("    imull %ebx, %ebp");      // ebp = Q_lo * B_hi (low 32)
-        s.emit("    addl %ebp, %ecx");       // ecx = cross terms sum
-        s.emit("    movl %ebx, %eax");       // eax = Q_lo
-        s.emit("    mull 28(%esp)");         // edx:eax = Q_lo * B_lo
-        s.emit("    addl %ecx, %edx");       // edx:eax = q * B (low 64 bits)
+        s.emit("    movl %eax, %ebx"); // save Q_lo
+        s.emit("    movl %edx, %ecx"); // save Q_hi
+        s.emit("    imull 28(%esp), %ecx"); // ecx = Q_hi * B_lo (low 32)
+        s.emit("    movl 32(%esp), %ebp"); // B_hi
+        s.emit("    imull %ebx, %ebp"); // ebp = Q_lo * B_hi (low 32)
+        s.emit("    addl %ebp, %ecx"); // ecx = cross terms sum
+        s.emit("    movl %ebx, %eax"); // eax = Q_lo
+        s.emit("    mull 28(%esp)"); // edx:eax = Q_lo * B_lo
+        s.emit("    addl %ecx, %edx"); // edx:eax = q * B (low 64 bits)
 
         // remainder = A - q*B
-        s.emit("    movl 20(%esp), %ebx");   // A_lo
-        s.emit("    movl 24(%esp), %ecx");   // A_hi
+        s.emit("    movl 20(%esp), %ebx"); // A_lo
+        s.emit("    movl 24(%esp), %ecx"); // A_hi
         s.emit("    subl %eax, %ebx");
         s.emit("    sbbl %edx, %ecx");
         s.emit("    movl %ebx, %eax");
@@ -2466,13 +2703,13 @@ impl I686Codegen {
         s.emit("    pushl %esi");
         s.emit("    pushl %edi");
         // Stack: edi, esi, ebx, ret, A_lo(16), A_hi(20), B_lo(24), B_hi(28)
-        s.emit("    movl 20(%esp), %edx");  // A_hi
-        s.emit("    movl 28(%esp), %ecx");  // B_hi
-        s.emit("    movl %edx, %edi");      // save A_hi for sign
-        s.emit("    xorl %ecx, %edi");      // edi = sign of result (bit 31)
-        s.emit("    movl 16(%esp), %eax");  // A_lo
-        s.emit("    movl 24(%esp), %ebx");  // B_lo
-        // Negate A if negative
+        s.emit("    movl 20(%esp), %edx"); // A_hi
+        s.emit("    movl 28(%esp), %ecx"); // B_hi
+        s.emit("    movl %edx, %edi"); // save A_hi for sign
+        s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
+        s.emit("    movl 16(%esp), %eax"); // A_lo
+        s.emit("    movl 24(%esp), %ebx"); // B_lo
+                                           // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Ldiv_a_pos");
         s.emit("    negl %eax");
@@ -2487,10 +2724,10 @@ impl I686Codegen {
         s.emit("    negl %ecx");
         s.emit(".Ldiv_b_pos:");
         // Push unsigned args and call __udivdi3
-        s.emit("    pushl %ecx");           // B_hi (unsigned)
-        s.emit("    pushl %ebx");           // B_lo (unsigned)
-        s.emit("    pushl %edx");           // A_hi (unsigned)
-        s.emit("    pushl %eax");           // A_lo (unsigned)
+        s.emit("    pushl %ecx"); // B_hi (unsigned)
+        s.emit("    pushl %ebx"); // B_lo (unsigned)
+        s.emit("    pushl %edx"); // A_hi (unsigned)
+        s.emit("    pushl %eax"); // A_lo (unsigned)
         s.emit("    call __udivdi3");
         s.emit("    addl $16, %esp");
         // Result in edx:eax. Negate if sign differs.
@@ -2520,12 +2757,12 @@ impl I686Codegen {
         s.emit("    pushl %esi");
         s.emit("    pushl %edi");
         // Stack: edi, esi, ebx, ret, A_lo(16), A_hi(20), B_lo(24), B_hi(28)
-        s.emit("    movl 20(%esp), %edx");  // A_hi
-        s.emit("    movl 28(%esp), %ecx");  // B_hi
-        s.emit("    movl %edx, %edi");      // save A_hi sign (remainder sign = dividend sign)
-        s.emit("    movl 16(%esp), %eax");  // A_lo
-        s.emit("    movl 24(%esp), %ebx");  // B_lo
-        // Negate A if negative
+        s.emit("    movl 20(%esp), %edx"); // A_hi
+        s.emit("    movl 28(%esp), %ecx"); // B_hi
+        s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
+        s.emit("    movl 16(%esp), %eax"); // A_lo
+        s.emit("    movl 24(%esp), %ebx"); // B_lo
+                                           // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Lmod_a_pos");
         s.emit("    negl %eax");

@@ -14,20 +14,12 @@
 //! The main entry point is `emit_struct_init`, which dispatches to per-field-type
 //! helpers to keep each case manageable.
 
-use crate::frontend::parser::ast::{
-    Designator,
-    Expr,
-    Initializer,
-    InitializerItem,
-};
-use crate::ir::reexports::{
-    Instruction,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, CType, StructLayout, StructFieldLayout, InitFieldResolution};
 use super::lower::Lowerer;
+use crate::common::types::{
+    AddressSpace, CType, InitFieldResolution, IrType, StructFieldLayout, StructLayout,
+};
+use crate::frontend::parser::ast::{Designator, Expr, Initializer, InitializerItem};
+use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 
 impl Lowerer {
     /// Recursively emit struct field initialization from an initializer list.
@@ -57,7 +49,11 @@ impl Lowerer {
             let array_start_idx = self.extract_array_start_index(item, desig_name.is_some());
 
             // Resolve which field this init item targets
-            let resolution = layout.resolve_init_field(desig_name, current_field_idx, &*self.types.borrow_struct_layouts());
+            let resolution = layout.resolve_init_field(
+                desig_name,
+                current_field_idx,
+                &*self.types.borrow_struct_layouts(),
+            );
             let field_idx = match &resolution {
                 Some(InitFieldResolution::Direct(idx)) => {
                     let f = &layout.fields[*idx];
@@ -65,7 +61,8 @@ impl Lowerer {
                     // drill into it and consume multiple init items for inner fields.
                     if desig_name.is_none() && f.name.is_empty() && f.bit_width.is_none() {
                         if let CType::Struct(key) | CType::Union(key) = &f.ty {
-                            let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
+                            let sub_layout =
+                                self.types.borrow_struct_layouts().get(&**key).cloned();
                             if let Some(sub_layout) = sub_layout {
                                 let anon_offset = base_offset + f.offset;
                                 // If the current item is a braced sub-initializer (List),
@@ -74,18 +71,28 @@ impl Lowerer {
                                 // This handles `(T){ { .field = val } }` where the inner
                                 // braces wrap the anonymous union/struct member.
                                 if let Initializer::List(sub_items) = &item.init {
-                                    self.emit_struct_init(sub_items, base_alloca, &sub_layout, anon_offset);
+                                    self.emit_struct_init(
+                                        sub_items,
+                                        base_alloca,
+                                        &sub_layout,
+                                        anon_offset,
+                                    );
                                     item_idx += 1;
                                     current_field_idx = *idx + 1;
                                     continue;
                                 }
-                                let anon_field_count = sub_layout.fields.iter()
+                                let anon_field_count = sub_layout
+                                    .fields
+                                    .iter()
                                     .filter(|ff| !ff.name.is_empty() || ff.bit_width.is_none())
                                     .count();
                                 let remaining = &items[item_idx..];
                                 let consume_count = remaining.len().min(anon_field_count);
                                 let consumed = self.emit_struct_init(
-                                    &remaining[..consume_count], base_alloca, &sub_layout, anon_offset,
+                                    &remaining[..consume_count],
+                                    base_alloca,
+                                    &sub_layout,
+                                    anon_offset,
                                 );
                                 item_idx += consumed.max(1);
                                 current_field_idx = *idx + 1;
@@ -95,7 +102,10 @@ impl Lowerer {
                     }
                     *idx
                 }
-                Some(InitFieldResolution::AnonymousMember { anon_field_idx, inner_name }) => {
+                Some(InitFieldResolution::AnonymousMember {
+                    anon_field_idx,
+                    inner_name,
+                }) => {
                     // Designated init targets a field inside an anonymous struct/union member.
                     let anon_field = &layout.fields[*anon_field_idx].clone();
                     let anon_offset = base_offset + anon_field.offset;
@@ -103,10 +113,18 @@ impl Lowerer {
                         CType::Struct(key) | CType::Union(key) => {
                             match self.types.borrow_struct_layouts().get(&**key) {
                                 Some(l) => l.clone(),
-                                None => { item_idx += 1; current_field_idx = *anon_field_idx + 1; continue; }
+                                None => {
+                                    item_idx += 1;
+                                    current_field_idx = *anon_field_idx + 1;
+                                    continue;
+                                }
                             }
                         }
-                        _ => { item_idx += 1; current_field_idx = *anon_field_idx + 1; continue; }
+                        _ => {
+                            item_idx += 1;
+                            current_field_idx = *anon_field_idx + 1;
+                            continue;
+                        }
                     };
                     let mut synth_desigs = vec![Designator::Field(inner_name.clone())];
                     if item.designators.len() > 1 {
@@ -135,29 +153,50 @@ impl Lowerer {
 
             // Dispatch to per-field-type handler
             match &field.ty {
-                CType::Struct(key) | CType::Union(key) if has_nested_designator || is_anon_member_designator => {
+                CType::Struct(key) | CType::Union(key)
+                    if has_nested_designator || is_anon_member_designator =>
+                {
                     self.emit_field_nested_designator(
-                        item, base_alloca, key, field_offset,
-                        is_anon_member_designator, has_nested_designator,
+                        item,
+                        base_alloca,
+                        key,
+                        field_offset,
+                        is_anon_member_designator,
+                        has_nested_designator,
                     );
                     item_idx += 1;
                 }
                 CType::Array(elem_ty, Some(arr_size)) if has_nested_designator => {
                     self.emit_field_array_designated(
-                        item, items, &mut item_idx, base_alloca,
-                        elem_ty, *arr_size, field_offset,
+                        item,
+                        items,
+                        &mut item_idx,
+                        base_alloca,
+                        elem_ty,
+                        *arr_size,
+                        field_offset,
                     );
                 }
                 CType::Struct(key) | CType::Union(key) => {
                     self.emit_field_substruct(
-                        item, items, &mut item_idx, base_alloca,
-                        key, field_offset,
+                        item,
+                        items,
+                        &mut item_idx,
+                        base_alloca,
+                        key,
+                        field_offset,
                     );
                 }
                 CType::Array(elem_ty, Some(arr_size)) => {
                     self.emit_field_array(
-                        item, items, &mut item_idx, base_alloca,
-                        elem_ty, *arr_size, field_offset, array_start_idx,
+                        item,
+                        items,
+                        &mut item_idx,
+                        base_alloca,
+                        elem_ty,
+                        *arr_size,
+                        field_offset,
+                        array_start_idx,
                     );
                 }
                 CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => {
@@ -166,8 +205,13 @@ impl Lowerer {
                 }
                 CType::Vector(ref elem_ty, total_size) => {
                     self.emit_field_vector(
-                        item, items, &mut item_idx, base_alloca,
-                        elem_ty, *total_size, field_offset,
+                        item,
+                        items,
+                        &mut item_idx,
+                        base_alloca,
+                        elem_ty,
+                        *total_size,
+                        field_offset,
                     );
                 }
                 _ => {
@@ -192,7 +236,11 @@ impl Lowerer {
 
     /// Extract the array start index from an initializer item's designators.
     /// Handles both `.field[idx]` and bare `[idx]` patterns.
-    fn extract_array_start_index(&mut self, item: &InitializerItem, has_field_desig: bool) -> Option<usize> {
+    fn extract_array_start_index(
+        &mut self,
+        item: &InitializerItem,
+        has_field_desig: bool,
+    ) -> Option<usize> {
         if has_field_desig {
             item.designators.iter().find_map(|d| {
                 if let Designator::Index(ref idx_expr) = d {
@@ -260,30 +308,53 @@ impl Lowerer {
 
         // Find the first index designator in the remaining designators
         let remaining_desigs = &item.designators[1..];
-        let (first_idx_pos, idx) = remaining_desigs.iter().enumerate().find_map(|(i, d)| {
-            if let Designator::Index(ref idx_expr) = d {
-                self.eval_const_expr(idx_expr).and_then(|c| c.to_usize()).map(|v| (i, v))
-            } else {
-                None
-            }
-        }).unwrap_or((0, 0));
+        let (first_idx_pos, idx) = remaining_desigs
+            .iter()
+            .enumerate()
+            .find_map(|(i, d)| {
+                if let Designator::Index(ref idx_expr) = d {
+                    self.eval_const_expr(idx_expr)
+                        .and_then(|c| c.to_usize())
+                        .map(|v| (i, v))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or((0, 0));
 
         if idx < arr_size {
             let elem_offset = field_offset + idx * elem_size;
             let after_first_idx = &remaining_desigs[first_idx_pos + 1..];
-            let has_field_desigs = after_first_idx.iter().any(|d| matches!(d, Designator::Field(_)));
-            let has_index_desigs = after_first_idx.iter().any(|d| matches!(d, Designator::Index(_)));
+            let has_field_desigs = after_first_idx
+                .iter()
+                .any(|d| matches!(d, Designator::Field(_)));
+            let has_index_desigs = after_first_idx
+                .iter()
+                .any(|d| matches!(d, Designator::Index(_)));
 
             if has_field_desigs {
                 // .a[idx].b = val — drill into struct element
-                self.emit_array_elem_struct_drill(item, base_alloca, elem_ty, elem_offset, after_first_idx);
+                self.emit_array_elem_struct_drill(
+                    item,
+                    base_alloca,
+                    elem_ty,
+                    elem_offset,
+                    after_first_idx,
+                );
             } else if has_index_desigs {
                 // Multi-dimensional: .a[1][2] = val
-                let remaining_index_desigs: Vec<_> = after_first_idx.iter()
+                let remaining_index_desigs: Vec<_> = after_first_idx
+                    .iter()
                     .filter(|d| matches!(d, Designator::Index(_)))
                     .cloned()
                     .collect();
-                self.emit_array_elem_multidim(item, base_alloca, elem_ty, elem_offset, &remaining_index_desigs);
+                self.emit_array_elem_multidim(
+                    item,
+                    base_alloca,
+                    elem_ty,
+                    elem_offset,
+                    &remaining_index_desigs,
+                );
             } else {
                 // No further designators — store element value
                 self.emit_array_elem_value(item, base_alloca, elem_ty, elem_offset, elem_ir_ty);
@@ -297,14 +368,22 @@ impl Lowerer {
         let mut ai = idx + 1;
         while ai < arr_size && *item_idx < items.len() {
             let next_item = &items[*item_idx];
-            if !next_item.designators.is_empty() { break; }
+            if !next_item.designators.is_empty() {
+                break;
+            }
             let expr_opt = match &next_item.init {
                 Initializer::Expr(e) => Some(e),
                 Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
             };
             if let Some(e) = expr_opt {
                 let elem_offset = field_offset + ai * elem_size;
-                self.emit_init_expr_to_offset_bool(e, base_alloca, elem_offset, elem_ir_ty, elem_is_bool);
+                self.emit_init_expr_to_offset_bool(
+                    e,
+                    base_alloca,
+                    elem_offset,
+                    elem_ir_ty,
+                    elem_is_bool,
+                );
             } else {
                 break;
             }
@@ -345,13 +424,16 @@ impl Lowerer {
         remaining_index_desigs: &[Designator],
     ) {
         if let CType::Array(inner_elem_ty, Some(inner_size)) = elem_ty {
-            let inner_idx = remaining_index_desigs.iter().find_map(|d| {
-                if let Designator::Index(ref idx_expr) = d {
-                    self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
-                } else {
-                    None
-                }
-            }).unwrap_or(0);
+            let inner_idx = remaining_index_desigs
+                .iter()
+                .find_map(|d| {
+                    if let Designator::Index(ref idx_expr) = d {
+                        self.eval_const_expr(idx_expr).and_then(|c| c.to_usize())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
             if inner_idx < *inner_size {
                 let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
                 let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
@@ -365,7 +447,13 @@ impl Lowerer {
                             return;
                         }
                     }
-                    self.emit_init_expr_to_offset_bool(e, base_alloca, inner_offset, inner_ir_ty, inner_is_bool);
+                    self.emit_init_expr_to_offset_bool(
+                        e,
+                        base_alloca,
+                        inner_offset,
+                        inner_ir_ty,
+                        inner_is_bool,
+                    );
                 }
             }
         }
@@ -392,7 +480,13 @@ impl Lowerer {
                         }
                     }
                 }
-                self.emit_init_expr_to_offset_bool(e, base_alloca, elem_offset, elem_ir_ty, *elem_ty == CType::Bool);
+                self.emit_init_expr_to_offset_bool(
+                    e,
+                    base_alloca,
+                    elem_offset,
+                    elem_ir_ty,
+                    *elem_ty == CType::Bool,
+                );
             }
             Initializer::List(sub_items) => {
                 // Handle list init for array element (e.g., .a[1] = {1,2,3})
@@ -402,10 +496,18 @@ impl Lowerer {
                         let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
                         let inner_is_bool = **inner_elem_ty == CType::Bool;
                         for (si, sub_item) in sub_items.iter().enumerate() {
-                            if si >= *inner_size { break; }
+                            if si >= *inner_size {
+                                break;
+                            }
                             if let Initializer::Expr(e) = &sub_item.init {
                                 let inner_offset = elem_offset + si * inner_elem_size;
-                                self.emit_init_expr_to_offset_bool(e, base_alloca, inner_offset, inner_ir_ty, inner_is_bool);
+                                self.emit_init_expr_to_offset_bool(
+                                    e,
+                                    base_alloca,
+                                    inner_offset,
+                                    inner_ir_ty,
+                                    inner_is_bool,
+                                );
                             }
                         }
                     }
@@ -445,7 +547,12 @@ impl Lowerer {
                     if self.struct_value_size(expr).is_some() {
                         // Struct/union copy in init list
                         let src_addr = self.get_struct_base_addr(expr);
-                        self.emit_memcpy_at_offset(base_alloca, field_offset, src_addr, sub_layout.size);
+                        self.emit_memcpy_at_offset(
+                            base_alloca,
+                            field_offset,
+                            src_addr,
+                            sub_layout.size,
+                        );
                         *item_idx += 1;
                     } else {
                         // Flat init: consume items for inner struct/union fields.
@@ -458,11 +565,25 @@ impl Lowerer {
                                 init: item.init.clone(),
                             };
                             self.zero_init_region(base_alloca, field_offset, sub_layout.size);
-                            self.emit_struct_init(&[stripped], base_alloca, &sub_layout, field_offset);
+                            self.emit_struct_init(
+                                &[stripped],
+                                base_alloca,
+                                &sub_layout,
+                                field_offset,
+                            );
                             *item_idx += 1;
                         } else {
-                            let consumed = self.emit_struct_init(&items[*item_idx..], base_alloca, &sub_layout, field_offset);
-                            if consumed == 0 { *item_idx += 1; } else { *item_idx += consumed; }
+                            let consumed = self.emit_struct_init(
+                                &items[*item_idx..],
+                                base_alloca,
+                                &sub_layout,
+                                field_offset,
+                            );
+                            if consumed == 0 {
+                                *item_idx += 1;
+                            } else {
+                                *item_idx += consumed;
+                            }
                         }
                     }
                 }
@@ -489,14 +610,26 @@ impl Lowerer {
         match &item.init {
             Initializer::List(sub_items) => {
                 self.emit_array_field_list_init(
-                    sub_items, base_alloca, elem_ty, arr_size, field_offset, elem_size,
+                    sub_items,
+                    base_alloca,
+                    elem_ty,
+                    arr_size,
+                    field_offset,
+                    elem_size,
                 );
                 *item_idx += 1;
             }
             Initializer::Expr(e) => {
                 self.emit_array_field_expr_init(
-                    e, items, item_idx, base_alloca,
-                    elem_ty, arr_size, field_offset, elem_size, array_start_idx,
+                    e,
+                    items,
+                    item_idx,
+                    base_alloca,
+                    elem_ty,
+                    arr_size,
+                    field_offset,
+                    elem_size,
+                    array_start_idx,
                 );
             }
         }
@@ -531,16 +664,31 @@ impl Lowerer {
             let sub_layout = self.types.borrow_struct_layouts().get(&**key).cloned();
             if let Some(sub_layout) = sub_layout {
                 self.emit_array_of_structs_list_init(
-                    sub_items, base_alloca, &sub_layout, arr_size, field_offset, elem_size,
+                    sub_items,
+                    base_alloca,
+                    &sub_layout,
+                    arr_size,
+                    field_offset,
+                    elem_size,
                 );
             }
         } else if elem_ty.is_complex() {
             self.emit_array_of_complex_list_init(
-                sub_items, base_alloca, elem_ty, arr_size, field_offset, elem_size,
+                sub_items,
+                base_alloca,
+                elem_ty,
+                arr_size,
+                field_offset,
+                elem_size,
             );
         } else {
             self.emit_array_of_scalars_list_init(
-                sub_items, base_alloca, elem_ty, arr_size, field_offset, elem_size,
+                sub_items,
+                base_alloca,
+                elem_ty,
+                arr_size,
+                field_offset,
+                elem_size,
             );
         }
     }
@@ -568,11 +716,21 @@ impl Lowerer {
                 Initializer::Expr(e) => {
                     if self.struct_value_size(e).is_some() {
                         let src_addr = self.get_struct_base_addr(e);
-                        self.emit_memcpy_at_offset(base_alloca, elem_offset, src_addr, sub_layout.size);
+                        self.emit_memcpy_at_offset(
+                            base_alloca,
+                            elem_offset,
+                            src_addr,
+                            sub_layout.size,
+                        );
                         si += 1;
                         ai += 1;
                     } else {
-                        let consumed = self.emit_struct_init(&sub_items[si..], base_alloca, sub_layout, elem_offset);
+                        let consumed = self.emit_struct_init(
+                            &sub_items[si..],
+                            base_alloca,
+                            sub_layout,
+                            elem_offset,
+                        );
                         si += consumed;
                         ai += 1;
                     }
@@ -599,7 +757,9 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             match &sub_item.init {
                 Initializer::Expr(e) => {
@@ -632,7 +792,9 @@ impl Lowerer {
                     ai = idx;
                 }
             }
-            if ai >= arr_size { break; }
+            if ai >= arr_size {
+                break;
+            }
             let elem_offset = field_offset + ai * elem_size;
             match &sub_item.init {
                 Initializer::Expr(e) => {
@@ -641,14 +803,25 @@ impl Lowerer {
                     if let Expr::StringLiteral(s, _) = e {
                         if let CType::Array(inner, Some(sub_arr_size)) = elem_ty {
                             if matches!(inner.as_ref(), CType::Char | CType::UChar) {
-                                self.emit_string_to_alloca(base_alloca, s, elem_offset, *sub_arr_size);
+                                self.emit_string_to_alloca(
+                                    base_alloca,
+                                    s,
+                                    elem_offset,
+                                    *sub_arr_size,
+                                );
                                 ai += 1;
                                 continue;
                             }
                         }
                     }
                     let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    self.emit_init_expr_to_offset_bool(e, base_alloca, elem_offset, elem_ir_ty, elem_is_bool);
+                    self.emit_init_expr_to_offset_bool(
+                        e,
+                        base_alloca,
+                        elem_offset,
+                        elem_ir_ty,
+                        elem_is_bool,
+                    );
                 }
                 Initializer::List(inner_items) => {
                     // Handle braced sub-init for array elements (e.g., int arr[2][3] = {{1,2,3},{4,5,6}})
@@ -657,25 +830,49 @@ impl Lowerer {
                         let inner_is_bool = **inner_elem_ty == CType::Bool;
                         let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
                         for (ii, inner_item) in inner_items.iter().enumerate() {
-                            if ii >= *inner_size { break; }
+                            if ii >= *inner_size {
+                                break;
+                            }
                             if let Initializer::Expr(e) = &inner_item.init {
                                 let inner_offset = elem_offset + ii * inner_elem_size;
                                 // String literal targeting a char sub-array: copy string contents
                                 if let Expr::StringLiteral(s, _) = e {
-                                    if let CType::Array(inner_inner, Some(sub_arr_size)) = inner_elem_ty.as_ref() {
-                                        if matches!(inner_inner.as_ref(), CType::Char | CType::UChar) {
-                                            self.emit_string_to_alloca(base_alloca, s, inner_offset, *sub_arr_size);
+                                    if let CType::Array(inner_inner, Some(sub_arr_size)) =
+                                        inner_elem_ty.as_ref()
+                                    {
+                                        if matches!(
+                                            inner_inner.as_ref(),
+                                            CType::Char | CType::UChar
+                                        ) {
+                                            self.emit_string_to_alloca(
+                                                base_alloca,
+                                                s,
+                                                inner_offset,
+                                                *sub_arr_size,
+                                            );
                                             continue;
                                         }
                                     }
                                 }
-                                self.emit_init_expr_to_offset_bool(e, base_alloca, inner_offset, inner_elem_ir_ty, inner_is_bool);
+                                self.emit_init_expr_to_offset_bool(
+                                    e,
+                                    base_alloca,
+                                    inner_offset,
+                                    inner_elem_ir_ty,
+                                    inner_is_bool,
+                                );
                             }
                         }
                     } else if let Some(e) = Self::unwrap_nested_init_expr(inner_items) {
                         // Extra braces around scalar array element: {{{42}}}
                         let elem_ir_ty = IrType::from_ctype(elem_ty);
-                        self.emit_init_expr_to_offset_bool(e, base_alloca, elem_offset, elem_ir_ty, elem_is_bool);
+                        self.emit_init_expr_to_offset_bool(
+                            e,
+                            base_alloca,
+                            elem_offset,
+                            elem_ir_ty,
+                            elem_is_bool,
+                        );
                     }
                 }
             }
@@ -716,9 +913,16 @@ impl Lowerer {
                 let start_ai = array_start_idx.unwrap_or(0);
                 let mut total_consumed = 0usize;
                 for ai in start_ai..arr_size {
-                    if *item_idx + total_consumed >= items.len() { break; }
+                    if *item_idx + total_consumed >= items.len() {
+                        break;
+                    }
                     let elem_offset = field_offset + ai * elem_size;
-                    let consumed = self.emit_struct_init(&items[*item_idx + total_consumed..], base_alloca, &sub_layout, elem_offset);
+                    let consumed = self.emit_struct_init(
+                        &items[*item_idx + total_consumed..],
+                        base_alloca,
+                        &sub_layout,
+                        elem_offset,
+                    );
                     total_consumed += consumed;
                 }
                 *item_idx += total_consumed.max(1);
@@ -733,11 +937,18 @@ impl Lowerer {
             let mut ai = start_ai;
             while ai < arr_size && (*item_idx + consumed) < items.len() {
                 let cur_item = &items[*item_idx + consumed];
-                if !cur_item.designators.is_empty() && consumed > 0 { break; }
+                if !cur_item.designators.is_empty() && consumed > 0 {
+                    break;
+                }
                 let elem_offset = field_offset + ai * elem_size;
                 match &cur_item.init {
                     Initializer::Expr(expr) => {
-                        self.emit_complex_expr_to_offset(expr, base_alloca, elem_offset, &complex_ctype);
+                        self.emit_complex_expr_to_offset(
+                            expr,
+                            base_alloca,
+                            elem_offset,
+                            &complex_ctype,
+                        );
                     }
                     Initializer::List(inner_items) => {
                         let dest_addr = self.emit_gep_offset(base_alloca, elem_offset, IrType::Ptr);
@@ -757,14 +968,22 @@ impl Lowerer {
             let mut ai = start_ai;
             while ai < arr_size && (*item_idx + consumed) < items.len() {
                 let cur_item = &items[*item_idx + consumed];
-                if !cur_item.designators.is_empty() && consumed > 0 { break; }
+                if !cur_item.designators.is_empty() && consumed > 0 {
+                    break;
+                }
                 let expr_opt = match &cur_item.init {
                     Initializer::Expr(expr) => Some(expr),
                     Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
                 };
                 if let Some(expr) = expr_opt {
                     let elem_offset = field_offset + ai * elem_size;
-                    self.emit_init_expr_to_offset_bool(expr, base_alloca, elem_offset, elem_ir_ty, elem_is_bool);
+                    self.emit_init_expr_to_offset_bool(
+                        expr,
+                        base_alloca,
+                        elem_offset,
+                        elem_ir_ty,
+                        elem_is_bool,
+                    );
                     consumed += 1;
                     ai += 1;
                 } else {
@@ -821,7 +1040,11 @@ impl Lowerer {
         field_offset: usize,
     ) {
         let elem_size = elem_ty.size();
-        let num_elems = if elem_size > 0 { total_size / elem_size } else { 0 };
+        let num_elems = if elem_size > 0 {
+            total_size / elem_size
+        } else {
+            0
+        };
         let elem_ir_ty = IrType::from_ctype(elem_ty);
         let field_addr = self.emit_gep_offset(base_alloca, field_offset, IrType::Ptr);
 
@@ -858,10 +1081,14 @@ impl Lowerer {
                     let mut ei = 1;
                     while ei < num_elems && *item_idx < items.len() {
                         let next_item = &items[*item_idx];
-                        if !next_item.designators.is_empty() { break; }
+                        if !next_item.designators.is_empty() {
+                            break;
+                        }
                         let expr_opt = match &next_item.init {
                             Initializer::Expr(ne) => Some(ne),
-                            Initializer::List(sub_items) => Self::unwrap_nested_init_expr(sub_items),
+                            Initializer::List(sub_items) => {
+                                Self::unwrap_nested_init_expr(sub_items)
+                            }
                         };
                         if let Some(ne) = expr_opt {
                             let nval = self.lower_expr(ne);
@@ -900,7 +1127,10 @@ impl Lowerer {
                     let et = self.get_expr_type(e);
                     (self.lower_expr(e), et)
                 } else {
-                    (Operand::Const(IrConst::ptr_int(0)), crate::common::types::target_int_ir_type())
+                    (
+                        Operand::Const(IrConst::ptr_int(0)),
+                        crate::common::types::target_int_ir_type(),
+                    )
                 }
             }
         };
@@ -914,7 +1144,13 @@ impl Lowerer {
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
             self.store_bitfield(addr, field_ty, bit_offset, bit_width, val, false);
         } else {
-            self.emit(Instruction::Store { volatile: false, val, ptr: addr, ty: field_ty , seg_override: AddressSpace::Default });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val,
+                ptr: addr,
+                ty: field_ty,
+                seg_override: AddressSpace::Default,
+            });
         }
     }
 }

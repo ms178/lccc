@@ -108,9 +108,10 @@ impl FileMap {
                 return Ok(m);
             }
         }
-        let data = std::fs::read(path)
-            .map_err(|e| format!("failed to read '{}': {}", path, e))?;
-        Ok(Self { inner: FileMapInner::Owned(data.into()) })
+        let data = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path, e))?;
+        Ok(Self {
+            inner: FileMapInner::Owned(data.into()),
+        })
     }
 
     #[cfg(unix)]
@@ -145,7 +146,9 @@ impl FileMap {
         }
         // The mapping stays valid after the descriptor is closed.
         drop(file);
-        Some(Self { inner: FileMapInner::Mapped(Arc::new(Mapping { ptr, len })) })
+        Some(Self {
+            inner: FileMapInner::Mapped(Arc::new(Mapping { ptr, len })),
+        })
     }
 
     #[cfg(not(unix))]
@@ -229,12 +232,16 @@ impl FileBacking {
     /// non-mappable fallback).
     #[inline]
     pub fn owned(buf: Arc<[u8]>) -> Self {
-        FileBacking { inner: FileBackingInner::Owned(buf) }
+        FileBacking {
+            inner: FileBackingInner::Owned(buf),
+        }
     }
 
     #[inline]
     fn mapped(m: Arc<Mapping>) -> Self {
-        FileBacking { inner: FileBackingInner::Mapped(m) }
+        FileBacking {
+            inner: FileBackingInner::Mapped(m),
+        }
     }
 
     #[inline]
@@ -333,7 +340,9 @@ mod tests {
     /// LCCC_NO_MMAP escape hatch would change link output.
     #[test]
     fn fallback_matches_mapped_bytes() {
-        let content: Vec<u8> = (0..8192u32).map(|i| (i.wrapping_mul(7) % 253) as u8).collect();
+        let content: Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(7) % 253) as u8)
+            .collect();
         let p = write_file("ab", &content);
         let mapped = FileMap::open(p.to_str().unwrap()).unwrap();
         let owned = FileMap {

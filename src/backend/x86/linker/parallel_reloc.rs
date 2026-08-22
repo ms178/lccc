@@ -114,7 +114,9 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
 
         for &(ps, pe) in &partitions {
             let idxs = &order[ps..pe];
-            if idxs.is_empty() { continue; }
+            if idxs.is_empty() {
+                continue;
+            }
 
             // Span of this partition, clamped to the buffer. Writes outside
             // the buffer are filtered in the worker; here we only need a
@@ -123,9 +125,13 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
             // neither end of the span is at a known position.
             let lo = idxs.iter().map(|&i| span(i).0).min().unwrap();
             let hi = idxs.iter().map(|&i| span(i).1).max().unwrap_or(lo);
-            if lo >= out_len { continue; }
+            if lo >= out_len {
+                continue;
+            }
             let hi = hi.min(out_len);
-            if hi <= lo { continue; }
+            if hi <= lo {
+                continue;
+            }
 
             // SAFETY: `partitions` was built so that the [lo, hi) spans of any
             // two partitions are disjoint (a boundary is only placed where the
@@ -133,16 +139,19 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
             // clamped into `0..out_len`. Therefore the sub-slices handed to the
             // workers do not alias and stay inside the allocation that `out`
             // borrows, which outlives the scope.
-            let thread_slice = unsafe {
-                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(lo), hi - lo)
-            };
+            let thread_slice =
+                unsafe { std::slice::from_raw_parts_mut((out_addr as *mut u8).add(lo), hi - lo) };
 
             handles.push(scope.spawn(move || {
                 for &i in idxs {
                     let w = &writes[i as usize];
                     // Same bounds policy as the serial path: skip, never panic.
-                    let Some(end) = w.offset.checked_add(w.width as usize) else { continue };
-                    if end > out_len { continue; }
+                    let Some(end) = w.offset.checked_add(w.width as usize) else {
+                        continue;
+                    };
+                    if end > out_len {
+                        continue;
+                    }
                     write_le(thread_slice, w.offset - lo, w.width, w.value);
                 }
             }));
@@ -167,9 +176,10 @@ pub fn apply_writes_parallel(out: &mut [u8], writes: &[RelocWrite], n_threads: u
 /// * the byte spans of any two partitions are disjoint;
 /// * within a partition, indices are in ascending *list* order, so
 ///   last-writer-wins is preserved for overlapping writes.
-fn plan_partitions_inner(writes: &[RelocWrite], n_threads: usize)
-    -> (Vec<u32>, Vec<(usize, usize)>)
-{
+fn plan_partitions_inner(
+    writes: &[RelocWrite],
+    n_threads: usize,
+) -> (Vec<u32>, Vec<(usize, usize)>) {
     // Index permutation sorted by offset, used only to find safe split points.
     let mut order: Vec<u32> = (0..writes.len() as u32).collect();
     order.sort_by_key(|&i| writes[i as usize].offset);
@@ -228,8 +238,12 @@ pub fn apply_writes_serial(out: &mut [u8], writes: &[RelocWrite]) {
     for w in writes {
         // checked_add: `offset + width` must not wrap for offsets near
         // usize::MAX, which would turn a skip into an out-of-bounds write.
-        let Some(end) = w.offset.checked_add(w.width as usize) else { continue };
-        if end > out.len() { continue; }
+        let Some(end) = w.offset.checked_add(w.width as usize) else {
+            continue;
+        };
+        if end > out.len() {
+            continue;
+        }
         write_le(out, w.offset, w.width, w.value);
     }
 }
@@ -247,7 +261,10 @@ fn write_le(buf: &mut [u8], off: usize, width: u8, value: u64) {
 
 pub fn apply_rewrites(out: &mut [u8], rewrites: &[InsnRewrite]) {
     for r in rewrites {
-        if r.offset.checked_add(r.bytes.len()).is_some_and(|e| e <= out.len()) {
+        if r.offset
+            .checked_add(r.bytes.len())
+            .is_some_and(|e| e <= out.len())
+        {
             out[r.offset..r.offset + r.bytes.len()].copy_from_slice(&r.bytes);
         }
     }
@@ -257,11 +274,18 @@ pub fn desired_threads() -> usize {
     match std::env::var("LCCC_LD_PARALLEL") {
         Ok(s) => {
             let s = s.trim();
-            if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false") || s.eq_ignore_ascii_case("off") {
+            if s.is_empty()
+                || s == "0"
+                || s.eq_ignore_ascii_case("false")
+                || s.eq_ignore_ascii_case("off")
+            {
                 return 1;
             }
             if s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("on") {
-                return std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
+                return std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    .clamp(1, 8);
             }
             s.parse::<usize>().unwrap_or(1).clamp(1, 16)
         }
@@ -277,7 +301,13 @@ mod tests {
     use super::*;
 
     fn sample_writes(n: usize) -> Vec<RelocWrite> {
-        (0..n).map(|i| RelocWrite { offset: i * 8, width: 8, value: 0x1122_3344_5566_7788 + i as u64 }).collect()
+        (0..n)
+            .map(|i| RelocWrite {
+                offset: i * 8,
+                width: 8,
+                value: 0x1122_3344_5566_7788 + i as u64,
+            })
+            .collect()
     }
 
     #[test]
@@ -310,10 +340,26 @@ mod tests {
     #[test]
     fn mixed_widths() {
         let writes = vec![
-            RelocWrite { offset: 0, width: 1, value: 0xaa },
-            RelocWrite { offset: 1, width: 2, value: 0xbbcc },
-            RelocWrite { offset: 3, width: 4, value: 0x11223344 },
-            RelocWrite { offset: 7, width: 8, value: 0xdeadbeefcafebabe },
+            RelocWrite {
+                offset: 0,
+                width: 1,
+                value: 0xaa,
+            },
+            RelocWrite {
+                offset: 1,
+                width: 2,
+                value: 0xbbcc,
+            },
+            RelocWrite {
+                offset: 3,
+                width: 4,
+                value: 0x11223344,
+            },
+            RelocWrite {
+                offset: 7,
+                width: 8,
+                value: 0xdeadbeefcafebabe,
+            },
         ];
         let mut out = vec![0u8; 16];
         apply_writes_parallel(&mut out, &writes, 2);
@@ -338,10 +384,26 @@ mod tests {
     #[test]
     fn unsorted_writes_match_serial() {
         let writes = vec![
-            RelocWrite { offset: 0,    width: 8, value: 0x1111_1111_1111_1111 },
-            RelocWrite { offset: 1000, width: 8, value: 0x2222_2222_2222_2222 },
-            RelocWrite { offset: 8,    width: 8, value: 0x3333_3333_3333_3333 },
-            RelocWrite { offset: 1008, width: 8, value: 0x4444_4444_4444_4444 },
+            RelocWrite {
+                offset: 0,
+                width: 8,
+                value: 0x1111_1111_1111_1111,
+            },
+            RelocWrite {
+                offset: 1000,
+                width: 8,
+                value: 0x2222_2222_2222_2222,
+            },
+            RelocWrite {
+                offset: 8,
+                width: 8,
+                value: 0x3333_3333_3333_3333,
+            },
+            RelocWrite {
+                offset: 1008,
+                width: 8,
+                value: 0x4444_4444_4444_4444,
+            },
         ];
         let mut a = vec![0u8; 2048];
         let mut b = vec![0u8; 2048];
@@ -355,10 +417,26 @@ mod tests {
     #[test]
     fn overlapping_writes_preserve_last_writer_wins() {
         let writes = vec![
-            RelocWrite { offset: 0, width: 8, value: 0xffff_ffff_ffff_ffff },
-            RelocWrite { offset: 0, width: 4, value: 0x0000_0001 },
-            RelocWrite { offset: 2, width: 4, value: 0x0000_0002 },
-            RelocWrite { offset: 1, width: 2, value: 0x0003 },
+            RelocWrite {
+                offset: 0,
+                width: 8,
+                value: 0xffff_ffff_ffff_ffff,
+            },
+            RelocWrite {
+                offset: 0,
+                width: 4,
+                value: 0x0000_0001,
+            },
+            RelocWrite {
+                offset: 2,
+                width: 4,
+                value: 0x0000_0002,
+            },
+            RelocWrite {
+                offset: 1,
+                width: 2,
+                value: 0x0003,
+            },
         ];
         for threads in [1usize, 2, 3, 4, 8] {
             let mut a = vec![0u8; 64];
@@ -375,11 +453,31 @@ mod tests {
     #[test]
     fn out_of_range_writes_are_skipped_not_written() {
         let writes = vec![
-            RelocWrite { offset: 0,  width: 8, value: 0xaaaa_aaaa_aaaa_aaaa },
-            RelocWrite { offset: 60, width: 8, value: 0xbbbb_bbbb_bbbb_bbbb }, // 60+8 > 64
-            RelocWrite { offset: 64, width: 1, value: 0xcc },                  // at end
-            RelocWrite { offset: usize::MAX, width: 8, value: 0xdd },          // wraps
-            RelocWrite { offset: 16, width: 4, value: 0x1234_5678 },
+            RelocWrite {
+                offset: 0,
+                width: 8,
+                value: 0xaaaa_aaaa_aaaa_aaaa,
+            },
+            RelocWrite {
+                offset: 60,
+                width: 8,
+                value: 0xbbbb_bbbb_bbbb_bbbb,
+            }, // 60+8 > 64
+            RelocWrite {
+                offset: 64,
+                width: 1,
+                value: 0xcc,
+            }, // at end
+            RelocWrite {
+                offset: usize::MAX,
+                width: 8,
+                value: 0xdd,
+            }, // wraps
+            RelocWrite {
+                offset: 16,
+                width: 4,
+                value: 0x1234_5678,
+            },
         ];
         for threads in [1usize, 2, 4] {
             let mut a = vec![0u8; 64];
@@ -389,7 +487,10 @@ mod tests {
             assert_eq!(a, b, "thread count {threads}");
             assert_eq!(&a[0..8], &0xaaaa_aaaa_aaaa_aaaau64.to_le_bytes());
             assert_eq!(&a[16..20], &0x1234_5678u32.to_le_bytes());
-            assert!(a[56..64].iter().all(|&x| x == 0), "clobbered past-end region");
+            assert!(
+                a[56..64].iter().all(|&x| x == 0),
+                "clobbered past-end region"
+            );
         }
     }
 
@@ -419,14 +520,21 @@ mod tests {
                 } else {
                     (next() % (BUF as u64 + 16)) as usize
                 };
-                writes.push(RelocWrite { offset, width, value: next() });
+                writes.push(RelocWrite {
+                    offset,
+                    width,
+                    value: next(),
+                });
             }
             let threads = 1 + (next() % 8) as usize;
             let mut a = vec![0u8; BUF];
             let mut b = vec![0u8; BUF];
             apply_writes_serial(&mut a, &writes);
             apply_writes_parallel(&mut b, &writes, threads);
-            assert_eq!(a, b, "round {round} (n={n}, threads={threads}, dense={dense})");
+            assert_eq!(
+                a, b,
+                "round {round} (n={n}, threads={threads}, dense={dense})"
+            );
         }
     }
 
@@ -442,12 +550,18 @@ mod tests {
     #[test]
     fn disjoint_writes_are_partitioned() {
         let writes: Vec<RelocWrite> = (0..1000)
-            .map(|i| RelocWrite { offset: i * 8, width: 8, value: i as u64 })
+            .map(|i| RelocWrite {
+                offset: i * 8,
+                width: 8,
+                value: i as u64,
+            })
             .collect();
         let parts = plan_partitions(&writes, 4);
-        assert!(parts.len() >= 2,
-                "1000 disjoint writes must split across workers, got {} partition(s)",
-                parts.len());
+        assert!(
+            parts.len() >= 2,
+            "1000 disjoint writes must split across workers, got {} partition(s)",
+            parts.len()
+        );
         // And the result must still equal the serial reference.
         let mut a = vec![0u8; 8 * 1000];
         let mut b = vec![0u8; 8 * 1000];
@@ -461,9 +575,16 @@ mod tests {
     #[test]
     fn overlapping_cluster_is_not_split() {
         let writes: Vec<RelocWrite> = (0..100)
-            .map(|i| RelocWrite { offset: 0, width: 8, value: i as u64 })
+            .map(|i| RelocWrite {
+                offset: 0,
+                width: 8,
+                value: i as u64,
+            })
             .collect();
-        assert_eq!(plan_partitions(&writes, 8).len(), 1,
-                   "an all-overlapping cluster must stay in one partition");
+        assert_eq!(
+            plan_partitions(&writes, 8).len(),
+            1,
+            "an all-overlapping cluster must stay in one partition"
+        );
     }
 }

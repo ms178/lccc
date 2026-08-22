@@ -78,11 +78,18 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
         return 0;
     }
 
-    let Some(entry) = func.blocks.first() else { return 0; };
+    let Some(entry) = func.blocks.first() else {
+        return 0;
+    };
     let mut n_param = None;
     let mut acc_param = None;
     for inst in &entry.instructions {
-        if let Instruction::ParamRef { dest, param_idx, ty } = inst {
+        if let Instruction::ParamRef {
+            dest,
+            param_idx,
+            ty,
+        } = inst
+        {
             match (*param_idx, *ty) {
                 (0, crate::common::types::IrType::I32) => n_param = Some(*dest),
                 (1, crate::common::types::IrType::I64) => acc_param = Some(*dest),
@@ -90,7 +97,9 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
             }
         }
     }
-    let (Some(n_param), Some(acc_param)) = (n_param, acc_param) else { return 0; };
+    let (Some(n_param), Some(acc_param)) = (n_param, acc_param) else {
+        return 0;
+    };
 
     // Find the loop header with the two recurrence phis and its n <= 0 test.
     let mut header_idx = None;
@@ -105,17 +114,37 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
             if let Instruction::Phi { dest, ty, .. } = inst {
                 match *ty {
                     crate::common::types::IrType::I32 if found_n.is_none() => found_n = Some(*dest),
-                    crate::common::types::IrType::I64 if found_acc.is_none() => found_acc = Some(*dest),
+                    crate::common::types::IrType::I64 if found_acc.is_none() => {
+                        found_acc = Some(*dest)
+                    }
                     _ => {}
                 }
             }
         }
-        let Some((n_phi_here, acc_phi_here)) = found_n.zip(found_acc) else { continue; };
-        let Terminator::CondBranch { cond, true_label, false_label } = &block.terminator else { continue; };
-        let Operand::Value(cond_value) = cond else { continue; };
+        let Some((n_phi_here, acc_phi_here)) = found_n.zip(found_acc) else {
+            continue;
+        };
+        let Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } = &block.terminator
+        else {
+            continue;
+        };
+        let Operand::Value(cond_value) = cond else {
+            continue;
+        };
         let mut is_base_true = false;
         for inst in &block.instructions {
-            if let Instruction::Cmp { dest, op: crate::ir::reexports::IrCmpOp::Sle, lhs, rhs, ty } = inst {
+            if let Instruction::Cmp {
+                dest,
+                op: crate::ir::reexports::IrCmpOp::Sle,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
                 if *dest == *cond_value
                     && *ty == crate::common::types::IrType::I32
                     && matches!(lhs, Operand::Value(v) if *v == n_phi_here)
@@ -125,7 +154,9 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
                 }
             }
         }
-        if !is_base_true { continue; }
+        if !is_base_true {
+            continue;
+        }
         header_idx = Some(idx);
         n_phi = Some(n_phi_here);
         acc_phi = Some(acc_phi_here);
@@ -135,14 +166,20 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
     }
     let (Some(header_idx), Some(n_phi), Some(acc_phi), Some(base_label), Some(rec_label)) =
         (header_idx, n_phi, acc_phi, base_label, rec_label)
-    else { return 0; };
+    else {
+        return 0;
+    };
     let header_label = func.blocks[header_idx].label;
 
     let find_block = |label: crate::ir::reexports::BlockId| {
         func.blocks.iter().find(|block| block.label == label)
     };
-    let Some(base_block) = find_block(base_label) else { return 0; };
-    let Some(rec_block) = find_block(rec_label) else { return 0; };
+    let Some(base_block) = find_block(base_label) else {
+        return 0;
+    };
+    let Some(rec_block) = find_block(rec_label) else {
+        return 0;
+    };
     if !matches!(base_block.terminator, Terminator::Return(Some(_)))
         || !matches!(rec_block.terminator, Terminator::Branch(label) if label == header_label)
     {
@@ -159,7 +196,9 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
         }
         _ => false,
     };
-    if !base_returns_acc { return 0; }
+    if !base_returns_acc {
+        return 0;
+    }
 
     let mut has_n_step = false;
     let mut has_acc_step = false;
@@ -188,12 +227,18 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
             _ => {}
         }
     }
-    if !has_n_step || !has_acc_step { return 0; }
+    if !has_n_step || !has_acc_step {
+        return 0;
+    }
 
     let formula_label = rec_label;
     let base_label = base_label;
     let mut next = func.next_value_id;
-    let fresh = |next: &mut u32| { let value = Value(*next); *next += 1; value };
+    let fresh = |next: &mut u32| {
+        let value = Value(*next);
+        *next += 1;
+        value
+    };
     let cond = fresh(&mut next);
     let n64 = fresh(&mut next);
     let n_plus_one = fresh(&mut next);
@@ -205,8 +250,16 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
     let entry_block = BasicBlock {
         label: func.blocks[0].label,
         instructions: vec![
-            Instruction::ParamRef { dest: n_param, param_idx: 0, ty: crate::common::types::IrType::I32 },
-            Instruction::ParamRef { dest: acc_param, param_idx: 1, ty: crate::common::types::IrType::I64 },
+            Instruction::ParamRef {
+                dest: n_param,
+                param_idx: 0,
+                ty: crate::common::types::IrType::I32,
+            },
+            Instruction::ParamRef {
+                dest: acc_param,
+                param_idx: 1,
+                ty: crate::common::types::IrType::I64,
+            },
             Instruction::Cmp {
                 dest: cond,
                 op: crate::ir::reexports::IrCmpOp::Sle,
@@ -215,7 +268,11 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
                 ty: crate::common::types::IrType::I32,
             },
         ],
-        terminator: Terminator::CondBranch { cond: Operand::Value(cond), true_label: base_label, false_label: formula_label },
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(cond),
+            true_label: base_label,
+            false_label: formula_label,
+        },
         source_spans: spans(3),
     };
     let base_block = BasicBlock {
@@ -227,11 +284,40 @@ pub(crate) fn closed_form_tail_sum(func: &mut IrFunction) -> usize {
     let formula_block = BasicBlock {
         label: formula_label,
         instructions: vec![
-            Instruction::Cast { dest: n64, src: Operand::Value(n_param), from_ty: crate::common::types::IrType::I32, to_ty: crate::common::types::IrType::I64 },
-            Instruction::BinOp { dest: n_plus_one, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(n64), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)), ty: crate::common::types::IrType::I64 },
-            Instruction::BinOp { dest: product, op: crate::ir::reexports::IrBinOp::Mul, lhs: Operand::Value(n64), rhs: Operand::Value(n_plus_one), ty: crate::common::types::IrType::I64 },
-            Instruction::BinOp { dest: half, op: crate::ir::reexports::IrBinOp::SDiv, lhs: Operand::Value(product), rhs: Operand::Const(crate::ir::reexports::IrConst::I64(2)), ty: crate::common::types::IrType::I64 },
-            Instruction::BinOp { dest: result, op: crate::ir::reexports::IrBinOp::Add, lhs: Operand::Value(acc_param), rhs: Operand::Value(half), ty: crate::common::types::IrType::I64 },
+            Instruction::Cast {
+                dest: n64,
+                src: Operand::Value(n_param),
+                from_ty: crate::common::types::IrType::I32,
+                to_ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: n_plus_one,
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs: Operand::Value(n64),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I64(1)),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: product,
+                op: crate::ir::reexports::IrBinOp::Mul,
+                lhs: Operand::Value(n64),
+                rhs: Operand::Value(n_plus_one),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: half,
+                op: crate::ir::reexports::IrBinOp::SDiv,
+                lhs: Operand::Value(product),
+                rhs: Operand::Const(crate::ir::reexports::IrConst::I64(2)),
+                ty: crate::common::types::IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: result,
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs: Operand::Value(acc_param),
+                rhs: Operand::Value(half),
+                ty: crate::common::types::IrType::I64,
+            },
         ],
         terminator: Terminator::Return(Some(Operand::Value(result))),
         source_spans: spans(5),
@@ -646,7 +732,9 @@ pub(crate) fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32
         }
 
         // ── Inline assembly ──────────────────────────────────────────────
-        Instruction::InlineAsm { outputs, inputs, .. } => {
+        Instruction::InlineAsm {
+            outputs, inputs, ..
+        } => {
             for (_, ptr, _) in outputs {
                 replace_val(ptr, map);
             }
@@ -696,7 +784,8 @@ mod tests {
             .iter()
             .map(|&ty| IrParam {
                 ty,
-                noalias: false, struct_size: None,
+                noalias: false,
+                struct_size: None,
                 struct_align: None,
                 struct_eightbyte_classes: Vec::new(),
                 riscv_float_class: None,
@@ -816,7 +905,8 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],
-                    ret_is_f128_sse: false,},
+                        ret_is_f128_sse: false,
+                    },
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
@@ -1004,7 +1094,8 @@ mod tests {
                         is_sret: false,
                         is_fastcall: false,
                         ret_eightbyte_classes: vec![],
-                    ret_is_f128_sse: false,},
+                        ret_is_f128_sse: false,
+                    },
                 },
                 // %2 = %1 + 1   (uses call result — NOT a tail call)
                 Instruction::BinOp {
@@ -1046,7 +1137,9 @@ mod tests {
         };
         replace_values_in_inst(&mut asm, &map);
         match asm {
-            Instruction::InlineAsm { outputs, inputs, .. } => {
+            Instruction::InlineAsm {
+                outputs, inputs, ..
+            } => {
                 assert_eq!(outputs[0].1, Value(70));
                 assert!(matches!(inputs[0].1, Operand::Value(Value(80))));
             }
@@ -1080,7 +1173,14 @@ mod tests {
         assert_eq!(func.blocks.len(), 3);
         assert!(func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
-                matches!(inst, Instruction::BinOp { op: IrBinOp::SDiv, ty: IrType::I64, .. })
+                matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::SDiv,
+                        ty: IrType::I64,
+                        ..
+                    }
+                )
             })
         }));
     }

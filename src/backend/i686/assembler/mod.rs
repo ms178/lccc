@@ -10,8 +10,8 @@
 //! - `encoder.rs` – Encode i686 instructions into machine code bytes (no REX)
 //! - `elf_writer.rs` – Write 32-bit ELF object files
 
-pub mod encoder;
 pub mod elf_writer;
+pub mod encoder;
 
 // Re-export the x86 parser – AT&T syntax is the same for both architectures
 pub use crate::backend::x86::assembler::parser::parse_asm;

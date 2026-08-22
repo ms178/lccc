@@ -4,15 +4,12 @@
 //! headers, or falling back to program headers (`PT_DYNAMIC`) for stripped libraries.
 //! Also provides SONAME extraction via `parse_soname()`.
 
-use crate::backend::elf::{
-    ELF_MAGIC, ELFCLASS64, ELFDATA2LSB, ET_DYN,
-    SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_VERSYM, SHT_GNU_VERDEF,
-    SHN_UNDEF, PT_DYNAMIC,
-    DT_NULL, DT_SONAME, DT_SYMTAB, DT_STRTAB, DT_STRSZ,
-    DT_GNU_HASH, DT_VERSYM,
-    read_u16, read_u32, read_u64, read_i64, read_cstr, slice_at, table_entry,
-};
 use super::types::DynSymbol;
+use crate::backend::elf::{
+    read_cstr, read_i64, read_u16, read_u32, read_u64, slice_at, table_entry, DT_GNU_HASH, DT_NULL,
+    DT_SONAME, DT_STRSZ, DT_STRTAB, DT_SYMTAB, DT_VERSYM, ELFCLASS64, ELFDATA2LSB, ELF_MAGIC,
+    ET_DYN, PT_DYNAMIC, SHN_UNDEF, SHT_DYNAMIC, SHT_DYNSYM, SHT_GNU_VERDEF, SHT_GNU_VERSYM,
+};
 
 /// Extract dynamic symbols from a shared library (.so) file.
 ///
@@ -31,7 +28,10 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 
     let e_type = read_u16(data, 16);
     if e_type != ET_DYN {
-        return Err(format!("{}: not a shared library (type={})", lib_name, e_type));
+        return Err(format!(
+            "{}: not a shared library (type={})",
+            lib_name, e_type
+        ));
     }
 
     let e_shoff = read_u64(data, 40) as usize;
@@ -57,7 +57,7 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
         }
 
         // Locate .gnu.version (SHT_GNU_VERSYM) and .gnu.verdef (SHT_GNU_VERDEF) sections
-        let mut versym_shdr: Option<(usize, usize)> = None;  // (offset, size)
+        let mut versym_shdr: Option<(usize, usize)> = None; // (offset, size)
         let mut verdef_shdr: Option<(usize, usize, usize)> = None; // (offset, size, link)
         for &(sh_type, offset, size, link) in &sections {
             if sh_type == SHT_GNU_VERSYM {
@@ -68,7 +68,8 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
         }
 
         // Parse version definitions to build index -> version string mapping
-        let mut ver_names: crate::common::fx_hash::FxHashMap<u16, String> = crate::common::fx_hash::FxHashMap::default();
+        let mut ver_names: crate::common::fx_hash::FxHashMap<u16, String> =
+            crate::common::fx_hash::FxHashMap::default();
         if let Some((vd_off, vd_size, vd_link)) = verdef_shdr {
             // Get the string table for verdef (typically the dynstr)
             let vd_strtab = if vd_link < sections.len() {
@@ -103,8 +104,13 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 
                 // vd_next == 0 terminates the chain; a wrapping add would
                 // otherwise loop forever on malformed input.
-                if vd_next == 0 { break; }
-                match pos.checked_add(vd_next) { Some(p) => pos = p, None => break }
+                if vd_next == 0 {
+                    break;
+                }
+                match pos.checked_add(vd_next) {
+                    Some(p) => pos = p,
+                    None => break,
+                }
             }
         }
 
@@ -113,28 +119,38 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
             let (sh_type, offset, size, link) = sections[i];
             if sh_type == SHT_DYNSYM {
                 let strtab_idx = link as usize;
-                if strtab_idx >= sections.len() { continue; }
+                if strtab_idx >= sections.len() {
+                    continue;
+                }
                 let (_, str_off, str_size, _) = sections[strtab_idx];
                 let str_off = str_off as usize;
                 let str_size = str_size as usize;
-                let Some(strtab) = slice_at(data, str_off, str_size) else { continue };
+                let Some(strtab) = slice_at(data, str_off, str_size) else {
+                    continue;
+                };
 
                 let sym_off = offset as usize;
                 let sym_size = size as usize;
-                let Some(sym_data) = slice_at(data, sym_off, sym_size) else { continue };
+                let Some(sym_data) = slice_at(data, sym_off, sym_size) else {
+                    continue;
+                };
                 let sym_count = sym_data.len() / 24;
 
                 let mut symbols = Vec::new();
                 for j in 1..sym_count {
                     let off = j * 24;
-                    if off + 24 > sym_data.len() { break; }
+                    if off + 24 > sym_data.len() {
+                        break;
+                    }
                     let name_idx = read_u32(sym_data, off) as usize;
                     let info = sym_data[off + 4];
                     let shndx = read_u16(sym_data, off + 6);
                     let value = read_u64(sym_data, off + 8);
                     let size = read_u64(sym_data, off + 16);
 
-                    if shndx == SHN_UNDEF { continue; }
+                    if shndx == SHN_UNDEF {
+                        continue;
+                    }
 
                     // Versioned exports include non-default (hidden) versions
                     // such as memcpy@GLIBC_2.2.5 alongside memcpy@@GLIBC_2.14.
@@ -143,7 +159,9 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                     // only bind to the default version, while versioned
                     // references (name@VER) bind to the exact version.
                     let name = read_cstr(strtab, name_idx);
-                    if name.is_empty() { continue; }
+                    if name.is_empty() {
+                        continue;
+                    }
 
                     // Look up version for this symbol from .gnu.version table
                     let (version, is_default_ver) = if let Some((vs_off, _vs_size)) = versym_shdr {
@@ -164,7 +182,14 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
                         (None, true)
                     };
 
-                    symbols.push(DynSymbol { name, info, value, size, version, is_default_ver });
+                    symbols.push(DynSymbol {
+                        name,
+                        info,
+                        value,
+                        size,
+                        version,
+                        is_default_ver,
+                    });
                 }
                 return Ok(symbols);
             }
@@ -185,20 +210,28 @@ pub fn parse_shared_library_symbols(data: &[u8], lib_name: &str) -> Result<Vec<D
 /// 2. Reading DT_SYMTAB, DT_STRTAB, DT_STRSZ from the dynamic section
 /// 3. Determining symtab size from DT_GNU_HASH (number of symbols) or by
 ///    scanning until we hit the strtab address
-fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Result<Vec<DynSymbol>, String> {
+fn parse_shared_library_symbols_from_phdrs(
+    data: &[u8],
+    lib_name: &str,
+) -> Result<Vec<DynSymbol>, String> {
     let e_phoff = read_u64(data, 32) as usize;
     let e_phentsize = read_u16(data, 54) as usize;
     let e_phnum = read_u16(data, 56) as usize;
 
     if e_phoff == 0 || e_phnum == 0 {
-        return Err(format!("{}: no program headers and no section headers", lib_name));
+        return Err(format!(
+            "{}: no program headers and no section headers",
+            lib_name
+        ));
     }
 
     // Find PT_DYNAMIC
     let mut dyn_offset = 0usize;
     let mut dyn_size = 0usize;
     for i in 0..e_phnum {
-        if e_phentsize < 56 || table_entry(data, e_phoff, i, e_phentsize).is_none() { break; }
+        if e_phentsize < 56 || table_entry(data, e_phoff, i, e_phentsize).is_none() {
+            break;
+        }
         let ph = e_phoff + i * e_phentsize;
         let p_type = read_u32(data, ph);
         if p_type == PT_DYNAMIC {
@@ -237,7 +270,10 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
     }
 
     if symtab_addr == 0 || strtab_addr == 0 {
-        return Err(format!("{}: missing DT_SYMTAB or DT_STRTAB in dynamic section", lib_name));
+        return Err(format!(
+            "{}: missing DT_SYMTAB or DT_STRTAB in dynamic section",
+            lib_name
+        ));
     }
 
     // For shared libraries with base address 0 (PIC), the DT_ values are
@@ -259,7 +295,8 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
     // (the symoffset + number of hashed symbols), or by scanning symbols
     // until we reach the strtab address.
     let sym_count = if gnu_hash_addr != 0 {
-        let gnu_hash_file_offset = vaddr_to_file_offset(data, e_phoff, e_phentsize, e_phnum, gnu_hash_addr);
+        let gnu_hash_file_offset =
+            vaddr_to_file_offset(data, e_phoff, e_phentsize, e_phnum, gnu_hash_addr);
         count_dynsyms_from_gnu_hash(data, gnu_hash_file_offset)
     } else {
         // Fallback: symtab ends where strtab begins (they're typically adjacent)
@@ -282,14 +319,18 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
     let mut symbols = Vec::new();
     for j in 1..sym_count {
         let off = symtab_file_offset + j * 24;
-        if off + 24 > data.len() { break; }
+        if off + 24 > data.len() {
+            break;
+        }
         let name_idx = read_u32(data, off) as usize;
         let info = data[off + 4];
         let shndx = read_u16(data, off + 6);
         let value = read_u64(data, off + 8);
         let size = read_u64(data, off + 16);
 
-        if shndx == SHN_UNDEF { continue; }
+        if shndx == SHN_UNDEF {
+            continue;
+        }
 
         // Versym: keep non-default (hidden) exports but mark them so the
         // linker only binds them to explicitly versioned references. The
@@ -307,9 +348,18 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
         }
 
         let name = read_cstr(strtab, name_idx);
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
 
-        symbols.push(DynSymbol { name, info, value, size, version: None, is_default_ver });
+        symbols.push(DynSymbol {
+            name,
+            info,
+            value,
+            size,
+            version: None,
+            is_default_ver,
+        });
     }
 
     Ok(symbols)
@@ -317,14 +367,22 @@ fn parse_shared_library_symbols_from_phdrs(data: &[u8], lib_name: &str) -> Resul
 
 /// Convert a virtual address to a file offset using PT_LOAD program headers.
 pub(crate) fn vaddr_to_file_offset(
-    data: &[u8], e_phoff: usize, e_phentsize: usize, e_phnum: usize, vaddr: u64,
+    data: &[u8],
+    e_phoff: usize,
+    e_phentsize: usize,
+    e_phnum: usize,
+    vaddr: u64,
 ) -> usize {
     use crate::backend::elf::PT_LOAD;
     for i in 0..e_phnum {
         let ph = e_phoff + i * e_phentsize;
-        if ph + e_phentsize > data.len() { break; }
+        if ph + e_phentsize > data.len() {
+            break;
+        }
         let p_type = read_u32(data, ph);
-        if p_type != PT_LOAD { continue; }
+        if p_type != PT_LOAD {
+            continue;
+        }
         let p_offset = read_u64(data, ph + 8);
         let p_vaddr = read_u64(data, ph + 16);
         let p_filesz = read_u64(data, ph + 32);
@@ -341,7 +399,9 @@ pub(crate) fn vaddr_to_file_offset(
 /// The .gnu.hash header contains symoffset (first hashed symbol index).
 /// We scan the hash chains to find the highest symbol index, then add 1.
 fn count_dynsyms_from_gnu_hash(data: &[u8], offset: usize) -> usize {
-    if offset + 16 > data.len() { return 0; }
+    if offset + 16 > data.len() {
+        return 0;
+    }
     let nbuckets = read_u32(data, offset) as usize;
     let symoffset = read_u32(data, offset + 4) as usize;
     let bloom_size = read_u32(data, offset + 8) as usize;
@@ -349,7 +409,9 @@ fn count_dynsyms_from_gnu_hash(data: &[u8], offset: usize) -> usize {
     let buckets_off = offset + 16 + bloom_size * 8;
     let chains_off = buckets_off + nbuckets * 4;
 
-    if buckets_off + nbuckets * 4 > data.len() { return symoffset; }
+    if buckets_off + nbuckets * 4 > data.len() {
+        return symoffset;
+    }
 
     // Find the maximum bucket value (highest starting symbol index)
     let mut max_sym = symoffset;
@@ -360,10 +422,16 @@ fn count_dynsyms_from_gnu_hash(data: &[u8], offset: usize) -> usize {
             let mut idx = bucket_val;
             loop {
                 let chain_pos = chains_off + (idx - symoffset) * 4;
-                if chain_pos + 4 > data.len() { break; }
+                if chain_pos + 4 > data.len() {
+                    break;
+                }
                 let chain_val = read_u32(data, chain_pos);
-                if idx + 1 > max_sym { max_sym = idx + 1; }
-                if chain_val & 1 != 0 { break; } // end of chain
+                if idx + 1 > max_sym {
+                    max_sym = idx + 1;
+                }
+                if chain_val & 1 != 0 {
+                    break;
+                } // end of chain
                 idx += 1;
             }
         }
@@ -381,7 +449,6 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
         return None;
     }
 
-
     let e_shoff = read_u64(data, 40) as usize;
     let e_shentsize = read_u16(data, 58) as usize;
     let e_shnum = read_u16(data, 60) as usize;
@@ -390,7 +457,9 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
     if e_shoff != 0 && e_shnum != 0 {
         for i in 0..e_shnum {
             let off = e_shoff + i * e_shentsize;
-            if off + 64 > data.len() { break; }
+            if off + 64 > data.len() {
+                break;
+            }
             let sh_type = read_u32(data, off + 4);
             if sh_type == SHT_DYNAMIC {
                 let dyn_off = read_u64(data, off + 24) as usize;
@@ -398,17 +467,23 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
                 let link = read_u32(data, off + 40) as usize;
 
                 let str_sec_off = e_shoff + link * e_shentsize;
-                if str_sec_off + 64 > data.len() { return None; }
+                if str_sec_off + 64 > data.len() {
+                    return None;
+                }
                 let str_off = read_u64(data, str_sec_off + 24) as usize;
                 let str_size = read_u64(data, str_sec_off + 32) as usize;
-                if str_off + str_size > data.len() { return None; }
+                if str_off + str_size > data.len() {
+                    return None;
+                }
                 let strtab = &data[str_off..str_off + str_size];
 
                 let mut pos = dyn_off;
                 while pos + 16 <= dyn_off + dyn_size && pos + 16 <= data.len() {
                     let tag = read_i64(data, pos);
                     let val = read_u64(data, pos + 8);
-                    if tag == DT_NULL { break; }
+                    if tag == DT_NULL {
+                        break;
+                    }
                     if tag == DT_SONAME {
                         return Some(read_cstr(strtab, val as usize));
                     }
@@ -425,14 +500,18 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
     let e_phentsize = read_u16(data, 54) as usize;
     let e_phnum = read_u16(data, 56) as usize;
 
-    if e_phoff == 0 || e_phnum == 0 { return None; }
+    if e_phoff == 0 || e_phnum == 0 {
+        return None;
+    }
 
     // Find PT_DYNAMIC
     let mut dyn_file_offset = 0usize;
     let mut dyn_filesz = 0usize;
     for i in 0..e_phnum {
         let ph = e_phoff + i * e_phentsize;
-        if ph + e_phentsize > data.len() { break; }
+        if ph + e_phentsize > data.len() {
+            break;
+        }
         let p_type = read_u32(data, ph);
         if p_type == PT_DYNAMIC {
             dyn_file_offset = read_u64(data, ph + 8) as usize;
@@ -441,7 +520,9 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
         }
     }
 
-    if dyn_file_offset == 0 { return None; }
+    if dyn_file_offset == 0 {
+        return None;
+    }
 
     // First pass: find DT_STRTAB and DT_SONAME offset
     let mut strtab_addr: u64 = 0;
@@ -463,11 +544,15 @@ pub fn parse_soname(data: &[u8]) -> Option<String> {
         pos += 16;
     }
 
-    if strtab_addr == 0 || soname_offset.is_none() { return None; }
+    if strtab_addr == 0 || soname_offset.is_none() {
+        return None;
+    }
 
     let strtab_file_off = vaddr_to_file_offset(data, e_phoff, e_phentsize, e_phnum, strtab_addr);
     let name_off = soname_offset.unwrap() as usize;
-    if strtab_file_off + name_off >= data.len() { return None; }
+    if strtab_file_off + name_off >= data.len() {
+        return None;
+    }
     if strsz > 0 && strtab_file_off + strsz as usize <= data.len() {
         let strtab = &data[strtab_file_off..strtab_file_off + strsz as usize];
         Some(read_cstr(strtab, name_off))

@@ -16,7 +16,9 @@
 //! rcx=1, rdx=2) to avoid breaking live register values.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, is_read_modify_write, is_rsp_shift_line, implicit_read_reg_family};
+use super::helpers::{
+    get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
+};
 
 /// Format a stack slot as an assembly memory operand string.
 /// Uses (%rbp) or (%rsp) depending on the original instruction text.
@@ -33,7 +35,9 @@ fn format_stack_offset(offset: i32, original_line: &str) -> String {
 /// Returns (op_name_with_suffix, dst_reg_str, src_family, dst_family).
 fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
     let b = trimmed.as_bytes();
-    if b.len() < 6 { return None; }
+    if b.len() < 6 {
+        return None;
+    }
 
     let op_len = if b.starts_with(b"add")
         || b.starts_with(b"sub")
@@ -93,23 +97,35 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Look for Other{dest_reg: 25} = writes to %xmm1 (family 24+1=25)
         if let LineKind::Other { dest_reg: 25 } = infos[i].kind {
             let offset = infos[i].rbp_offset;
-            if offset == RBP_OFFSET_NONE { i += 1; continue; }
+            if offset == RBP_OFFSET_NONE {
+                i += 1;
+                continue;
+            }
 
             let line_i = infos[i].trimmed(store.get(i));
             // Verify it is a movsd load from stack (not another xmm1-writing insn)
             if !line_i.starts_with("movsd ") || !line_i.ends_with(", %xmm1") {
-                i += 1; continue;
+                i += 1;
+                continue;
             }
 
             // Find next non-NOP (skip only NOPs, not other instructions)
             let mut j = i + 1;
-            while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && j < i + 4 && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
 
             let line_j = infos[j].trimmed(store.get(j));
             let mem_op = format_stack_offset(offset, line_i);
@@ -154,7 +170,9 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     fn mentions_xmm(line: &str, reg: &str) -> bool {
         line.match_indices(reg).any(|(at, _)| {
-            line.as_bytes().get(at + reg.len()).is_none_or(|b| !b.is_ascii_digit())
+            line.as_bytes()
+                .get(at + reg.len())
+                .is_none_or(|b| !b.is_ascii_digit())
         })
     }
 
@@ -257,24 +275,40 @@ pub(super) fn fold_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Find a load from stack to %rax (scratch register).
-        if let LineKind::LoadRbp { reg: 0, offset, size } = infos[i].kind {
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size,
+        } = infos[i].kind
+        {
             // Only fold Q and L loads (not sign-extending SLQ, which changes value).
             if size != MoveSize::Q && size != MoveSize::L {
-                i += 1; continue;
+                i += 1;
+                continue;
             }
 
             // Step 2: Find next non-NOP instruction.
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
 
             // Step 3: Check if it's "movq %rax, %DEST" or "movl %eax, %DESTd"
             // where DEST is a different GP register.
             let dest_reg = match infos[j].kind {
-                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
                     let line_j = infos[j].trimmed(store.get(j));
                     // Must be a simple register-to-register mov
                     let is_movq_rax = line_j.starts_with("movq %rax, %") && !line_j.contains('(');
@@ -282,23 +316,36 @@ pub(super) fn fold_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
                     if is_movq_rax || is_movl_eax {
                         dest_reg
                     } else {
-                        i += 1; continue;
+                        i += 1;
+                        continue;
                     }
                 }
-                _ => { i += 1; continue; }
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Step 4: Verify no intervening store to the same offset.
             let mut intervening_store = false;
             for k in (i + 1)..j {
                 if let LineKind::StoreRbp { offset: so, .. } = infos[k].kind {
-                    if so == offset { intervening_store = true; break; }
+                    if so == offset {
+                        intervening_store = true;
+                        break;
+                    }
                 }
             }
-            if intervening_store { i += 1; continue; }
+            if intervening_store {
+                i += 1;
+                continue;
+            }
 
             // Step 5: Check rax liveness after the copy.
-            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
 
             // Step 6: Transform! Replace load target and eliminate the copy.
             let load_line = infos[i].trimmed(store.get(i));
@@ -338,45 +385,83 @@ pub(super) fn fold_leaq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
     let mut i = 0;
 
     while i + 2 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Load from stack to %rax.
-        if let LineKind::LoadRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size: MoveSize::Q,
+        } = infos[i].kind
+        {
             // Step 2: Next must be leaq K(%rax), %rax
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
 
             let leaq_offset = {
                 let lj = infos[j].trimmed(store.get(j));
-                if !lj.starts_with("leaq ") || !lj.ends_with(", %rax") { i += 1; continue; }
+                if !lj.starts_with("leaq ") || !lj.ends_with(", %rax") {
+                    i += 1;
+                    continue;
+                }
                 let inner = &lj[5..lj.len() - 6]; // between "leaq " and ", %rax"
-                if !inner.ends_with("(%rax)") { i += 1; continue; }
+                if !inner.ends_with("(%rax)") {
+                    i += 1;
+                    continue;
+                }
                 let num_str = &inner[..inner.len() - 6]; // before "(%rax)"
                 match num_str.parse::<i64>() {
                     Ok(v) => v,
-                    Err(_) => { i += 1; continue; }
+                    Err(_) => {
+                        i += 1;
+                        continue;
+                    }
                 }
             };
 
             // Step 3: Next must be movq %rax, %DEST
             let mut k = j + 1;
-            while k < len && infos[k].is_nop() { k += 1; }
-            if k >= len { i += 1; continue; }
+            while k < len && infos[k].is_nop() {
+                k += 1;
+            }
+            if k >= len {
+                i += 1;
+                continue;
+            }
 
             let dest_reg = match infos[k].kind {
-                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
                     let lk = infos[k].trimmed(store.get(k));
                     if lk.starts_with("movq %rax, %") && !lk.contains('(') {
                         dest_reg
-                    } else { i += 1; continue; }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
                 }
-                _ => { i += 1; continue; }
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Step 4: Check rax is dead after k.
             let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
-            if !rax_dead { i += 1; continue; }
+            if !rax_dead {
+                i += 1;
+                continue;
+            }
 
             // Step 5: Transform.
             let load_line = infos[i].trimmed(store.get(i));
@@ -414,39 +499,74 @@ pub(super) fn fold_cltq_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> 
     let mut i = 0;
 
     while i + 2 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Load from stack to %rax (either movq or movl).
-        if let LineKind::LoadRbp { reg: 0, offset, size } = infos[i].kind {
-            if size != MoveSize::Q && size != MoveSize::L { i += 1; continue; }
+        if let LineKind::LoadRbp {
+            reg: 0,
+            offset,
+            size,
+        } = infos[i].kind
+        {
+            if size != MoveSize::Q && size != MoveSize::L {
+                i += 1;
+                continue;
+            }
 
             // Step 2: Next must be cltq.
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
             {
                 let lj = infos[j].trimmed(store.get(j));
-                if lj != "cltq" { i += 1; continue; }
+                if lj != "cltq" {
+                    i += 1;
+                    continue;
+                }
             }
 
             // Step 3: Next must be movq %rax, %DEST.
             let mut k = j + 1;
-            while k < len && infos[k].is_nop() { k += 1; }
-            if k >= len { i += 1; continue; }
+            while k < len && infos[k].is_nop() {
+                k += 1;
+            }
+            if k >= len {
+                i += 1;
+                continue;
+            }
 
             let dest_reg = match infos[k].kind {
-                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
                     let lk = infos[k].trimmed(store.get(k));
                     if lk.starts_with("movq %rax, %") && !lk.contains('(') {
                         dest_reg
-                    } else { i += 1; continue; }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
                 }
-                _ => { i += 1; continue; }
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Step 4: Check rax is dead after k.
             let rax_dead = is_rax_dead_after(store, infos, k + 1, len);
-            if !rax_dead { i += 1; continue; }
+            if !rax_dead {
+                i += 1;
+                continue;
+            }
 
             // Step 5: Transform! Replace all 3 instructions with one movslq.
             let load_line = infos[i].trimmed(store.get(i));
@@ -484,7 +604,10 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Look for extension instructions writing to %rax from %al/%ax/%eax.
         if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
@@ -501,26 +624,43 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
             } else if line_i == "movswq %ax, %rax" {
                 ("movswl", 2) // W
             } else {
-                i += 1; continue;
+                i += 1;
+                continue;
             };
 
             // Step 2: Next must be movq %rax, %DEST.
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
 
             let dest_reg = match infos[j].kind {
-                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
                     let lj = infos[j].trimmed(store.get(j));
                     if lj.starts_with("movq %rax, %") && !lj.contains('(') {
                         dest_reg
-                    } else { i += 1; continue; }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
                 }
-                _ => { i += 1; continue; }
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Step 3: Check rax is dead after.
-            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
 
             // Step 4: Transform.
             // Use the same sub-register for the source (al/ax from rax family=0).
@@ -556,7 +696,10 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Instruction writes to %rax (dest_reg == 0).
         if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
@@ -564,20 +707,36 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
 
             // Step 2: Next must be movq %rax, %DEST.
             let mut j = i + 1;
-            while j < len && infos[j].is_nop() { j += 1; }
-            if j >= len { i += 1; continue; }
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len {
+                i += 1;
+                continue;
+            }
             let dest_reg = match infos[j].kind {
-                LineKind::Other { dest_reg } if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX => {
+                LineKind::Other { dest_reg }
+                    if dest_reg != REG_NONE && dest_reg != 0 && dest_reg <= REG_GP_MAX =>
+                {
                     let lj = infos[j].trimmed(store.get(j));
                     if lj.starts_with("movq %rax, %") && !lj.contains('(') {
                         dest_reg
-                    } else { i += 1; continue; }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
                 }
-                _ => { i += 1; continue; }
+                _ => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Step 3: Check rax is dead after.
-            if !is_rax_dead_after(store, infos, j + 1, len) { i += 1; continue; }
+            if !is_rax_dead_after(store, infos, j + 1, len) {
+                i += 1;
+                continue;
+            }
 
             let dest_64 = REG_NAMES[0][dest_reg as usize];
             let dest_32 = REG_NAMES[1][dest_reg as usize];
@@ -589,14 +748,16 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
                 // But check the source doesn't reference rax!
                 let src = &line_i[5..line_i.len() - 6]; // between "leaq " and ", %rax"
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    leaq {}, {}", src, dest_64))
             } else if line_i.starts_with("movslq ") && line_i.ends_with(", %rax") {
                 // movslq X, %rax → movslq X, %REG
                 let src = &line_i[7..line_i.len() - 6];
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    movslq {}, {}", src, dest_64))
             } else if line_i == "xorl %eax, %eax" {
@@ -610,34 +771,44 @@ pub(super) fn fold_general_relay(store: &mut LineStore, infos: &mut [LineInfo]) 
                 // movl $imm, %eax → movl $imm, %REGd
                 let imm = &line_i[5..line_i.len() - 6];
                 Some(format!("    movl {}, {}", imm, dest_32))
-            } else if line_i.starts_with("movq ") && line_i.ends_with(", %rax") && line_i.contains('(') {
+            } else if line_i.starts_with("movq ")
+                && line_i.ends_with(", %rax")
+                && line_i.contains('(')
+            {
                 // movq N(%reg), %rax → movq N(%reg), %REG (pointer dereference)
                 // Safe: source is a memory operand, doesn't read %rax as a value.
                 // But check the addressing mode doesn't use %rax as base/index!
                 let src = &line_i[5..line_i.len() - 6]; // between "movq " and ", %rax"
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    movq {}, {}", src, dest_64))
-            } else if line_i.starts_with("movl ") && line_i.ends_with(", %eax") && line_i.contains('(') {
+            } else if line_i.starts_with("movl ")
+                && line_i.ends_with(", %eax")
+                && line_i.contains('(')
+            {
                 // movl N(%reg), %eax → movl N(%reg), %REGd (32-bit pointer dereference)
                 let src = &line_i[5..line_i.len() - 6];
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    movl {}, {}", src, dest_32))
             } else if line_i.starts_with("movzbq ") && line_i.ends_with(", %rax") {
                 // movzbq N(%reg), %rax → movzbl N(%reg), %REGd (byte load zero-extend)
                 let src = &line_i[7..line_i.len() - 6];
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    movzbl {}, {}", src, dest_32))
             } else if line_i.starts_with("movzwq ") && line_i.ends_with(", %rax") {
                 // movzwq N(%reg), %rax → movzwl N(%reg), %REGd
                 let src = &line_i[7..line_i.len() - 6];
                 if src.contains("%rax") || src.contains("%eax") {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 Some(format!("    movzwl {}, {}", src, dest_32))
             } else {
@@ -665,7 +836,10 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: movq %REG, %rax (or movl %REGd, %eax)
         let (src_reg, is_32bit) = match infos[i].kind {
@@ -673,26 +847,51 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
                 let line = infos[i].trimmed(store.get(i));
                 if line.starts_with("movq %") && line.ends_with(", %rax") && !line.contains('(') {
                     let src = &line[6..line.len() - 6]; // between "movq %" and ", %rax"
-                    if !src.contains('%') { // simple register name
+                    if !src.contains('%') {
+                        // simple register name
                         (src.to_string(), false)
-                    } else { i += 1; continue; }
-                } else if line.starts_with("movl %") && line.ends_with(", %eax") && !line.contains('(') {
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else if line.starts_with("movl %")
+                    && line.ends_with(", %eax")
+                    && !line.contains('(')
+                {
                     let src = &line[6..line.len() - 6];
                     if !src.contains('%') {
                         (src.to_string(), true)
-                    } else { i += 1; continue; }
-                } else { i += 1; continue; }
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    i += 1;
+                    continue;
+                }
             }
-            _ => { i += 1; continue; }
+            _ => {
+                i += 1;
+                continue;
+            }
         };
 
         // Step 2: Next must be movq %rax, N(%rsp) or movl %eax, N(%rsp)
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() { j += 1; }
-        if j >= len { i += 1; continue; }
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
 
         let stored = match infos[j].kind {
-            LineKind::StoreRbp { reg: 0, offset, size } => {
+            LineKind::StoreRbp {
+                reg: 0,
+                offset,
+                size,
+            } => {
                 // movq/movl %rax/%eax → stack
                 Some((offset, size))
             }
@@ -712,7 +911,8 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
                 // sub-register.
                 let src_fam = register_family_fast(&format!("%{}", src_reg));
                 if src_fam == REG_NONE || src_fam as usize >= REG_NAMES[0].len() {
-                    i += 1; continue;
+                    i += 1;
+                    continue;
                 }
                 // SOUNDNESS: a 32-bit source move (`movl %REGd, %eax`) ZERO-EXTENDS
                 // to %rax, so a 64-bit store of %rax stores 0 in the upper 32 bits.
@@ -754,13 +954,22 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
 /// Returns true if the register `reg` (0=rax, 1=rcx, 2=rdx) is not read
 /// again before the next write within a 16-instruction window starting at
 /// `start`. Barriers (except calls) conservatively return false.
-fn is_reg_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: usize, reg: u8) -> bool {
+fn is_reg_dead_after(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    len: usize,
+    reg: u8,
+) -> bool {
     let scan_limit = (start + 64).min(len);
     let mask = 1u16 << reg;
     let (reg64, reg32, reg8) = reg_names(reg);
     let mut scan = start;
     while scan < scan_limit {
-        if infos[scan].is_nop() { scan += 1; continue; }
+        if infos[scan].is_nop() {
+            scan += 1;
+            continue;
+        }
         // A barrier means control flow splits or the function returns. Only a
         // function CALL genuinely clobbers caller-saved registers. A Ret may
         // use %rax as the return value, and a branch/label may have the
@@ -782,19 +991,26 @@ fn is_reg_dead_after(store: &LineStore, infos: &[LineInfo], start: usize, len: u
                 LineKind::Pop { reg: r } if r == reg => return true,
                 LineKind::Other { dest_reg } if dest_reg == reg => {
                     let t = infos[scan].trimmed(store.get(scan));
-                    if t == format!("xorl {}, {}", reg32, reg32) { return true; }
-                    if t.ends_with(&format!(", %{}", reg64)) || t.ends_with(&format!(", {}", reg32)) {
+                    if t == format!("xorl {}, {}", reg32, reg32) {
+                        return true;
+                    }
+                    if t.ends_with(&format!(", %{}", reg64)) || t.ends_with(&format!(", {}", reg32))
+                    {
                         // The instruction WRITES the register. It is only dead
                         // (free to retarget) if this write establishes a FRESH
                         // value that does NOT depend on the current value — a
                         // self-move or sign-extension FROM the register still
                         // depends on it, so it is NOT dead.
-                        let src = t.split_once(',').map(|(s, _)| {
-                            let mut toks = s.splitn(2, char::is_whitespace);
-                            let _mnem = toks.next();
-                            toks.next().unwrap_or("")
-                        }).unwrap_or("");
-                        let reads = src.contains(reg32) || src.contains(&format!("%{}", reg64))
+                        let src = t
+                            .split_once(',')
+                            .map(|(s, _)| {
+                                let mut toks = s.splitn(2, char::is_whitespace);
+                                let _mnem = toks.next();
+                                toks.next().unwrap_or("")
+                            })
+                            .unwrap_or("");
+                        let reads = src.contains(reg32)
+                            || src.contains(&format!("%{}", reg64))
                             || src.contains(reg8);
                         if !reads && !is_read_modify_write(t) {
                             return true;
@@ -841,7 +1057,12 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
 
-        if let LineKind::LoadRbp { reg: load_reg, offset, size: load_size } = infos[i].kind {
+        if let LineKind::LoadRbp {
+            reg: load_reg,
+            offset,
+            size: load_size,
+        } = infos[i].kind
+        {
             // Only fold loads into scratch registers (rax=0, rcx=1, rdx=2)
             if load_reg > 2 {
                 i += 1;
@@ -880,8 +1101,8 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
 
-            let is_foldable_target = matches!(infos[j].kind,
-                LineKind::Other { .. } | LineKind::Cmp);
+            let is_foldable_target =
+                matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp);
             if is_foldable_target {
                 // SOUNDNESS: between the load and the fold target, the
                 // loaded register must not be WRITTEN by anything — otherwise
@@ -921,7 +1142,11 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 let test_l = trimmed_j.starts_with("testl ");
                 if (test_q || test_l) && {
                     // confirm it's the loaded scratch reg self-test
-                    let pat = match load_reg { 0 => ("%rax", "%eax"), 1 => ("%rcx", "%ecx"), _ => ("%rdx", "%edx") };
+                    let pat = match load_reg {
+                        0 => ("%rax", "%eax"),
+                        1 => ("%rcx", "%ecx"),
+                        _ => ("%rdx", "%edx"),
+                    };
                     trimmed_j == &format!("testq {}, {}", pat.0, pat.0)
                         || trimmed_j == &format!("testl {}, {}", pat.1, pat.1)
                 } {
@@ -949,7 +1174,11 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                     // register's tested bits); L-load + testl → `cmpl`;
                     // Q-load + testl → `cmpl` (low 4 bytes of the 8-byte
                     // value are what testl sees); Q-load + testq → `cmpq`.
-                    let cmp_suffix = if test_l || load_size == MoveSize::L { "cmpl" } else { "cmpq" };
+                    let cmp_suffix = if test_l || load_size == MoveSize::L {
+                        "cmpl"
+                    } else {
+                        "cmpq"
+                    };
                     let new_inst = format!("    {} $0, {}", cmp_suffix, mem_op);
                     mark_nop(&mut infos[i]);
                     replace_line(store, &mut infos[j], j, new_inst);
@@ -1039,10 +1268,12 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
     // prefix, lock/rep prefix, or destination-in-source aliasing concerns.
     fn parse_mem_load(t: &str) -> Option<(&str, &str, &str)> {
         const LOADS: &[&str] = &[
-            "movzbl", "movzbw", "movzwl", "movslq", "movswq", "movsbq",
-            "movsbl", "movswl", "movl", "movq",
+            "movzbl", "movzbw", "movzwl", "movslq", "movswq", "movsbq", "movsbl", "movswl", "movl",
+            "movq",
         ];
-        let mnem = LOADS.iter().find(|m| t.starts_with(*m) && t.as_bytes().get(m.len()) == Some(&b' '))?;
+        let mnem = LOADS
+            .iter()
+            .find(|m| t.starts_with(*m) && t.as_bytes().get(m.len()) == Some(&b' '))?;
         let rest = &t[mnem.len() + 1..];
         let comma = rest.rfind(',')?;
         let mem = rest[..comma].trim();
@@ -1105,9 +1336,7 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
             // Both copy operands must be GENERAL-PURPOSE registers: the
             // family mapper aliases %xmm/%ymm names onto GPR families, and a
             // GPR<->XMM move is a conversion, never a pure relay.
-            let is_gp = |r: &str| {
-                r.starts_with("%r") || r.starts_with("%e")
-            };
+            let is_gp = |r: &str| r.starts_with("%r") || r.starts_with("%e");
             if !(is_movq || is_movl) {
                 false
             } else if !is_gp(src) || !is_gp(cdest) || cdest.contains('(') {
@@ -1115,7 +1344,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
             } else {
                 let src_fam = register_family_fast(src);
                 let dest_fam = register_family_fast(cdest);
-                if src_fam != load_fam || dest_fam == super::super::types::REG_NONE || src_fam == dest_fam {
+                if src_fam != load_fam
+                    || dest_fam == super::super::types::REG_NONE
+                    || src_fam == dest_fam
+                {
                     false
                 } else if mem.contains(cdest) {
                     false
@@ -1206,8 +1438,7 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
                     if infos[k].reg_refs & (1u16 << load_fam) != 0 {
                         // A pure write to the register family (dest-only) kills it.
                         let writes = matches!(infos[k].kind, LineKind::Other { dest_reg } if dest_reg == load_fam);
-                        let reads_src = reg_names_family(load_fam)
-                            .iter().any(|n| td.contains(n));
+                        let reads_src = reg_names_family(load_fam).iter().any(|n| td.contains(n));
                         if writes && !reads_src {
                             dead = true;
                         }
@@ -1230,7 +1461,9 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         {
             use std::sync::atomic::{AtomicU32, Ordering};
             static LCR_FUSED: AtomicU32 = AtomicU32::new(0);
-            let lim = std::env::var("CCC_LCR_LIMIT").ok().and_then(|v| v.parse::<u32>().ok());
+            let lim = std::env::var("CCC_LCR_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
             if let Some(l) = lim {
                 if LCR_FUSED.load(Ordering::Relaxed) >= l {
                     i = j + 1;
@@ -1241,7 +1474,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         }
         stats[3] += 1;
         if dbg {
-            eprintln!("[LCR][{}] FUSE #{}: [{}] + [{}] -> dest {}", cur_fn, stats[3], t, tc, cdest);
+            eprintln!(
+                "[LCR][{}] FUSE #{}: [{}] + [{}] -> dest {}",
+                cur_fn, stats[3], t, tc, cdest
+            );
         }
         let new_load = format!("    {} {}, {}", mnem, mem, cdest);
         replace_line(store, &mut infos[i], i, new_load);
@@ -1250,8 +1486,10 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         i = j + 1;
     }
     if dbg && stats[0] > 0 {
-        eprintln!("[LCR] loads={} copy-ok={} dead={} fused={} copy-bad={} not-dead={}",
-            stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]);
+        eprintln!(
+            "[LCR] loads={} copy-ok={} dead={} fused={} copy-bad={} not-dead={}",
+            stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]
+        );
     }
     changed
 }
@@ -1284,8 +1522,8 @@ fn reg_names_family(fam: u8) -> &'static [&'static str] {
 #[cfg(test)]
 mod fold_load_copy_relay_tests {
     use super::super::super::types::classify_line;
-    use crate::backend::peephole_common::LineStore;
     use super::fold_load_copy_relay;
+    use crate::backend::peephole_common::LineStore;
 
     fn run(asm: &str) -> (bool, Vec<String>) {
         let mut store = LineStore::new(asm.to_string());
@@ -1327,7 +1565,10 @@ mod fold_load_copy_relay_tests {
 ";
         let (changed, out) = run(asm);
         assert!(changed, "safe relay should fuse");
-        assert!(out[0].contains("%rbp"), "load retargeted to copy dest: {out:?}");
+        assert!(
+            out[0].contains("%rbp"),
+            "load retargeted to copy dest: {out:?}"
+        );
     }
 
     /// Shifts reading %cl must veto a relay of a %rcx-family load.

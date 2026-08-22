@@ -367,12 +367,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
                 if li || lo {
                     eprintln!(
                         "[LIVE]   block {} (label {}) live_in={} live_out={} pts=[{},{}]",
-                        bi,
-                        b.label.0,
-                        li,
-                        lo,
-                        ps.block_start_points[bi],
-                        ps.block_end_points[bi]
+                        bi, b.label.0, li, lo, ps.block_start_points[bi], ps.block_end_points[bi]
                     );
                 }
             }
@@ -403,7 +398,11 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
 fn debug_live_target() -> Option<u32> {
     static T: OnceLock<Option<u32>> = OnceLock::new();
-    *T.get_or_init(|| std::env::var("CCC_DEBUG_LIVE").ok().and_then(|s| s.parse().ok()))
+    *T.get_or_init(|| {
+        std::env::var("CCC_DEBUG_LIVE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
 }
 
 /// Single IR walk: alloca set + dense remap of every non-alloca value.
@@ -1931,7 +1930,8 @@ mod tests {
                     rhs: Operand::Const(IrConst::I64(4)),
                     ty: IrType::Ptr,
                 },
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(2),
                     ptr: Value(1),
                     ty: IrType::U8,

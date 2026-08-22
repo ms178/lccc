@@ -1,7 +1,7 @@
 //! RiscvCodegen: global address loading, PIC-relative.
 
-use crate::ir::reexports::Value;
 use super::emit::RiscvCodegen;
+use crate::ir::reexports::Value;
 
 impl RiscvCodegen {
     pub(super) fn emit_global_addr_impl(&mut self, dest: &Value, name: &str) {
@@ -29,9 +29,12 @@ impl RiscvCodegen {
         // lui t0, %tprel_hi(x)
         // add t0, t0, tp, %tprel_add(x)
         // addi t0, t0, %tprel_lo(x)
-        self.state.emit_fmt(format_args!("    lui t0, %tprel_hi({})", name));
-        self.state.emit_fmt(format_args!("    add t0, t0, tp, %tprel_add({})", name));
-        self.state.emit_fmt(format_args!("    addi t0, t0, %tprel_lo({})", name));
+        self.state
+            .emit_fmt(format_args!("    lui t0, %tprel_hi({})", name));
+        self.state
+            .emit_fmt(format_args!("    add t0, t0, tp, %tprel_add({})", name));
+        self.state
+            .emit_fmt(format_args!("    addi t0, t0, %tprel_lo({})", name));
         self.store_t0_to(dest);
     }
 }

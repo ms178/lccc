@@ -73,10 +73,7 @@
 //! analyses this file must not quietly reimplement.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::reexports::{
-    Instruction,
-    IrFunction,
-};
+use crate::ir::reexports::{Instruction, IrFunction};
 
 /// Sentinel stored in `def_loc` for values that have no removable definition
 /// in this function (parameters, globals, malformed IDs).
@@ -137,9 +134,13 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
             Instruction::Alloca { .. } if !seen_code => true,
             Instruction::ParamRef { .. } if !seen_code => true,
             Instruction::ParamRef { .. } => false,
-            Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            Instruction::Call { .. }
+            | Instruction::CallIndirect { .. }
             | Instruction::InlineAsm { .. } => false,
-            _ => { seen_code = true; true }
+            _ => {
+                seen_code = true;
+                true
+            }
         })
     };
 
@@ -166,8 +167,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
                         // Second def of the same id: post-phi copies. Divert
                         // BOTH sites to the overflow table; liveness of the
                         // value must pin every one of its defs.
-                        multi_defs
-                            .insert(dest.0, vec![(prev_b, prev_i), (bi_u, ii as u32)]);
+                        multi_defs.insert(dest.0, vec![(prev_b, prev_i), (bi_u, ii as u32)]);
                         def_loc[id] = pack(MULTI_DEF, 0);
                     }
                 }
@@ -211,7 +211,9 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     // backend. If parameter k's home survives, every earlier parameter-home
     // Alloca must survive too or k silently shifts to the wrong ABI argument.
     if allow_dead_allocas {
-        let param_allocas: Vec<usize> = func.blocks[0].instructions.iter()
+        let param_allocas: Vec<usize> = func.blocks[0]
+            .instructions
+            .iter()
             .enumerate()
             .filter_map(|(ii, inst)| matches!(inst, Instruction::Alloca { .. }).then_some(ii))
             .take(func.params.len())
@@ -408,7 +410,8 @@ fn dump_dead_instructions(func: &IrFunction, live: &[Vec<u8>]) {
 fn has_side_effects(inst: &Instruction) -> bool {
     // A volatile load is an observable side effect (C11 5.1.2.3) even when
     // its result is unused: it must never be dead-code eliminated.
-    matches!(inst,
+    matches!(
+        inst,
         Instruction::Load { volatile: true, .. } |
         // Ordinary Alloca is conditionally rooted by eliminate_dead_code.
         // DynAlloca modifies the stack pointer at runtime.
@@ -457,7 +460,9 @@ fn has_side_effects(inst: &Instruction) -> bool {
 mod tests {
     use super::*;
     use crate::common::types::{AddressSpace, IrType};
-    use crate::ir::reexports::{BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam, Operand, Terminator, Value};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, CallInfo, IrBinOp, IrConst, IrParam, Operand, Terminator, Value,
+    };
 
     fn make_simple_func() -> IrFunction {
         // Function with: %0 = alloca i32, %1 = add 3, 4 (dead), store 42 to %0, load from %0
@@ -465,7 +470,14 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 // Dead instruction: result %1 is never used
                 Instruction::BinOp {
                     dest: Value(1),
@@ -474,8 +486,20 @@ mod tests {
                     rhs: Operand::Const(IrConst::I32(4)),
                     ty: IrType::I32,
                 },
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I32(42)), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
-                Instruction::Load { volatile: false, dest: Value(2), ptr: Value(0), ty: IrType::I32, seg_override: AddressSpace::Default },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I32(42)),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
             source_spans: Vec::new(),
@@ -497,12 +521,13 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::Call {
-                    func: "printf".to_string(),
-                    info: CallInfo { dest: Some(Value(0)), ..CallInfo::default() },
+            instructions: vec![Instruction::Call {
+                func: "printf".to_string(),
+                info: CallInfo {
+                    dest: Some(Value(0)),
+                    ..CallInfo::default()
                 },
-            ],
+            }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
         });
@@ -517,7 +542,14 @@ mod tests {
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::I32, size: 4, align: 0, volatile: false, semantic_volatile: false },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 0,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
                 Instruction::BinOp {
                     dest: Value(1),
                     op: IrBinOp::Add,
@@ -552,23 +584,59 @@ mod tests {
     #[test]
     fn live_later_parameter_home_pins_positional_prefix() {
         let param = || IrParam {
-            ty: IrType::Ptr, noalias: false, struct_size: None, struct_align: None,
-            struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None,
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: vec![],
+            is_f128_sse: false,
+            riscv_float_class: None,
         };
-        let mut func = IrFunction::new("param_prefix".to_string(), IrType::Void,
-            vec![param(), param()], false);
+        let mut func = IrFunction::new(
+            "param_prefix".to_string(),
+            IrType::Void,
+            vec![param(), param()],
+            false,
+        );
         func.blocks.push(BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca { dest: Value(0), ty: IrType::Ptr, size: 8, align: 8, volatile: false, semantic_volatile: false },
-                Instruction::Alloca { dest: Value(1), ty: IrType::Ptr, size: 8, align: 8, volatile: false, semantic_volatile: false },
-                Instruction::Store { volatile: false, val: Operand::Const(IrConst::I64(7)), ptr: Value(1), ty: IrType::I64, seg_override: AddressSpace::Default },
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I64(7)),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                },
             ],
-            terminator: Terminator::Return(None), source_spans: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
         });
         assert_eq!(eliminate_dead_code(&mut func), 0);
-        assert!(matches!(func.blocks[0].instructions[0], Instruction::Alloca { dest: Value(0), .. }));
-        assert!(matches!(func.blocks[0].instructions[1], Instruction::Alloca { dest: Value(1), .. }));
+        assert!(matches!(
+            func.blocks[0].instructions[0],
+            Instruction::Alloca { dest: Value(0), .. }
+        ));
+        assert!(matches!(
+            func.blocks[0].instructions[1],
+            Instruction::Alloca { dest: Value(1), .. }
+        ));
     }
 
     #[test]
@@ -584,16 +652,14 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(0),
-                    ty: IrType::I64,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
-                        (Operand::Value(Value(0)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(0),
+                ty: IrType::I64,
+                incoming: vec![
+                    (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                    (Operand::Value(Value(0)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Const(IrConst::I32(1)),
                 true_label: BlockId(2),
@@ -635,30 +701,26 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(0),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
-                        (Operand::Value(Value(1)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(0),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(1)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(1),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(0)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Const(IrConst::I32(1)),
                 true_label: BlockId(1),
@@ -692,16 +754,14 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(0),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
-                        (Operand::Value(Value(1)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(0),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(1)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(Value(0)),
                 true_label: BlockId(2),
@@ -711,15 +771,13 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::BinOp {
-                    dest: Value(1),
-                    op: IrBinOp::Add,
-                    lhs: Operand::Value(Value(0)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Branch(BlockId(1)),
             source_spans: Vec::new(),
         });
@@ -753,31 +811,27 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(0),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(0)), BlockId(0)),
-                        (Operand::Value(Value(1)), BlockId(2)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(0),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(0)),
+                    (Operand::Value(Value(1)), BlockId(2)),
+                ],
+            }],
             terminator: Terminator::Branch(BlockId(2)),
             source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: Value(1),
-                    ty: IrType::I32,
-                    incoming: vec![
-                        (Operand::Const(IrConst::I32(1)), BlockId(0)),
-                        (Operand::Value(Value(0)), BlockId(1)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: Value(1),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), BlockId(0)),
+                    (Operand::Value(Value(0)), BlockId(1)),
+                ],
+            }],
             terminator: Terminator::CondBranch {
                 cond: Operand::Const(IrConst::I32(1)),
                 true_label: BlockId(1),
@@ -818,17 +872,19 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Copy { dest: Value(5), src: Operand::Const(IrConst::I32(10)) },
-            ],
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(10)),
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::Copy { dest: Value(5), src: Operand::Const(IrConst::I32(20)) },
-            ],
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(20)),
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
@@ -840,7 +896,10 @@ mod tests {
         });
 
         let removed = eliminate_dead_code(&mut func);
-        assert_eq!(removed, 0, "both defs of a live multi-def value must be kept");
+        assert_eq!(
+            removed, 0,
+            "both defs of a live multi-def value must be kept"
+        );
         assert_eq!(func.blocks[1].instructions.len(), 1, "first copy deleted");
         assert_eq!(func.blocks[2].instructions.len(), 1, "second copy deleted");
     }
@@ -862,17 +921,19 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Copy { dest: Value(5), src: Operand::Const(IrConst::I32(10)) },
-            ],
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(10)),
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
         func.blocks.push(BasicBlock {
             label: BlockId(2),
-            instructions: vec![
-                Instruction::Copy { dest: Value(5), src: Operand::Const(IrConst::I32(20)) },
-            ],
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Const(IrConst::I32(20)),
+            }],
             terminator: Terminator::Branch(BlockId(3)),
             source_spans: Vec::new(),
         });
@@ -910,15 +971,13 @@ mod tests {
         });
         func.blocks.push(BasicBlock {
             label: BlockId(1),
-            instructions: vec![
-                Instruction::Cmp {
-                    dest: Value(7),
-                    op: crate::ir::reexports::IrCmpOp::Eq,
-                    lhs: Operand::Const(IrConst::I32(1)),
-                    rhs: Operand::Const(IrConst::I32(1)),
-                    ty: IrType::I32,
-                },
-            ],
+            instructions: vec![Instruction::Cmp {
+                dest: Value(7),
+                op: crate::ir::reexports::IrCmpOp::Eq,
+                lhs: Operand::Const(IrConst::I32(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            }],
             terminator: Terminator::Branch(BlockId(0)),
             source_spans: Vec::new(),
         });
@@ -930,7 +989,10 @@ mod tests {
         });
 
         let removed = eliminate_dead_code(&mut func);
-        assert_eq!(removed, 0, "Cmp consumed by an earlier-indexed terminator must stay");
+        assert_eq!(
+            removed, 0,
+            "Cmp consumed by an earlier-indexed terminator must stay"
+        );
         assert_eq!(func.blocks[1].instructions.len(), 1);
     }
 
@@ -939,13 +1001,11 @@ mod tests {
         let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
         func.blocks.push(BasicBlock {
             label: BlockId(0),
-            instructions: vec![
-                Instruction::PgoCounterInc {
-                    name: "cnt".to_string(),
-                    offset: 0,
-                    atomic: false,
-                },
-            ],
+            instructions: vec![Instruction::PgoCounterInc {
+                name: "cnt".to_string(),
+                offset: 0,
+                atomic: false,
+            }],
             terminator: Terminator::Return(None),
             source_spans: Vec::new(),
         });

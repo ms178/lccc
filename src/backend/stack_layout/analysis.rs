@@ -4,17 +4,13 @@
 //! three-tier slot allocation: which blocks each value is used in, which
 //! values are referenced at all, and which parameter allocas are dead.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrFunction,
-    Operand,
-};
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::backend::regalloc::PhysReg;
 use crate::backend::liveness::{
-    for_each_operand_in_instruction, for_each_value_use_in_instruction,
-    for_each_operand_in_terminator,
+    for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction,
 };
+use crate::backend::regalloc::PhysReg;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::ir::reexports::{Instruction, IrFunction, Operand};
 
 /// Compute the "use-block map" for all values in the function.
 /// For each value, records the set of block indices where that value is referenced.
@@ -36,7 +32,10 @@ pub(super) fn compute_value_use_blocks(func: &IrFunction) -> FxHashMap<u32, Vec<
     };
 
     // Build BlockId -> block_index map for Phi source block resolution.
-    let block_id_to_idx: FxHashMap<u32, usize> = func.blocks.iter().enumerate()
+    let block_id_to_idx: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
         .map(|(idx, b)| (b.label.0, idx))
         .collect();
 
@@ -83,12 +82,18 @@ pub(super) fn collect_used_values(func: &IrFunction) -> FxHashSet<u32> {
     for block in &func.blocks {
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op { used.insert(v.0); }
+                if let Operand::Value(v) = op {
+                    used.insert(v.0);
+                }
             });
-            for_each_value_use_in_instruction(inst, |v| { used.insert(v.0); });
+            for_each_value_use_in_instruction(inst, |v| {
+                used.insert(v.0);
+            });
         }
         for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op { used.insert(v.0); }
+            if let Operand::Value(v) = op {
+                used.insert(v.0);
+            }
         });
     }
     used
@@ -119,15 +124,16 @@ pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
     }
     func.blocks.iter().any(|b| {
         b.instructions.iter().any(|i| {
-            matches!(i,
+            matches!(
+                i,
                 Instruction::Call { .. }
-                | Instruction::Memcpy { .. }
-                | Instruction::CallIndirect { .. }
-                | Instruction::VaArgStruct { .. }
-                | Instruction::VaArg { .. }
-                | Instruction::VaStart { .. }
-                | Instruction::VaCopy { .. }
-                | Instruction::VaEnd { .. }
+                    | Instruction::Memcpy { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::VaArgStruct { .. }
+                    | Instruction::VaArg { .. }
+                    | Instruction::VaStart { .. }
+                    | Instruction::VaCopy { .. }
+                    | Instruction::VaEnd { .. }
             )
         })
     })
@@ -157,7 +163,10 @@ pub(super) fn find_dead_param_allocas(
     let mut paramref_dests: Vec<Option<u32>> = vec![None; func.param_alloca_values.len()];
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::ParamRef { dest, param_idx, .. } = inst {
+            if let Instruction::ParamRef {
+                dest, param_idx, ..
+            } = inst
+            {
                 if *param_idx < paramref_dests.len() {
                     paramref_dests[*param_idx] = Some(dest.0);
                 }
@@ -184,10 +193,13 @@ pub(super) fn find_dead_param_allocas(
                     // *(int*)b;}` went from 11 instructions with a 24-byte
                     // frame to GCC's 3.
                     let leaf = !function_makes_calls(func);
-                    let has_stable_home = reg_assigned.get(&dest_id)
-                        .map(|phys| callee_saved_regs.contains(phys)
-                             || phys.0 >= 20
-                             || (leaf && is_leaf_caller_gpr(*phys)))
+                    let has_stable_home = reg_assigned
+                        .get(&dest_id)
+                        .map(|phys| {
+                            callee_saved_regs.contains(phys)
+                                || phys.0 >= 20
+                                || (leaf && is_leaf_caller_gpr(*phys))
+                        })
                         .unwrap_or(false);
                     if has_stable_home {
                         dead.insert(pv.0);

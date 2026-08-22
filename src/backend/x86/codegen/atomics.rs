@@ -9,7 +9,10 @@ impl X86Codegen {
     /// `incq` clobbers the flags, so the instrumentation pass never places a
     /// counter between a fused Cmp and its branch/select consumer.
     pub(super) fn emit_pgo_counter_inc_impl(&mut self, name: &str, offset: i64, atomic: bool) {
-        debug_assert!(self.pending_cmp.is_none(), "counter between fused Cmp and consumer");
+        debug_assert!(
+            self.pending_cmp.is_none(),
+            "counter between fused Cmp and consumer"
+        );
         let op = if atomic { "lock incq" } else { "incq" };
         if offset == 0 {
             self.state
@@ -79,8 +82,8 @@ impl X86Codegen {
                     self.operand_to_rax(ptr);
                     self.state.emit("    movq %rax, %rcx");
                     self.state.reg_cache.invalidate_all();
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
+                    self.flush_pending_vec_store_impl();
+                    self.state.invalidate_vec_peephole();
                     // Single-byte atomic increment. PGO counters and most
                     // refcounts use I64; for other widths pick the right suffix.
                     let suffix = match ty {

@@ -1,4 +1,3 @@
-
 //! Always-on, provably-safe elimination of redundant zero/sign-extension moves.
 //!
 //! The codegen emits a widening cast (`u8 -> u32`) as `movzbl %al, %eax` even
@@ -49,10 +48,22 @@ fn family_of_reg(name: &str) -> Option<u8> {
 /// Get the 32-bit register name for a family id (0=rax -> "eax", 8 -> "r8d").
 fn reg32_name(fam: u8) -> Option<&'static str> {
     match fam {
-        0 => Some("eax"), 1 => Some("ecx"), 2 => Some("edx"), 3 => Some("ebx"),
-        4 => Some("esp"), 5 => Some("ebp"), 6 => Some("esi"), 7 => Some("edi"),
-        8 => Some("r8d"), 9 => Some("r9d"), 10 => Some("r10d"), 11 => Some("r11d"),
-        12 => Some("r12d"), 13 => Some("r13d"), 14 => Some("r14d"), 15 => Some("r15d"),
+        0 => Some("eax"),
+        1 => Some("ecx"),
+        2 => Some("edx"),
+        3 => Some("ebx"),
+        4 => Some("esp"),
+        5 => Some("ebp"),
+        6 => Some("esi"),
+        7 => Some("edi"),
+        8 => Some("r8d"),
+        9 => Some("r9d"),
+        10 => Some("r10d"),
+        11 => Some("r11d"),
+        12 => Some("r12d"),
+        13 => Some("r13d"),
+        14 => Some("r14d"),
+        15 => Some("r15d"),
         _ => None,
     }
 }
@@ -67,7 +78,11 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
         return false;
     }
     let op = toks[0];
-    let needle32 = if dst32.starts_with('%') { dst32.to_string() } else { format!("%{dst32}") };
+    let needle32 = if dst32.starts_with('%') {
+        dst32.to_string()
+    } else {
+        format!("%{dst32}")
+    };
     let has_32 = toks.iter().any(|tok| tok.trim_end_matches(',') == needle32);
     if !has_32 {
         return false;
@@ -85,8 +100,11 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
     }
     // r8d/r15d may still be consumed by a 64-bit operation on the same line
     // through their `%r8`/`%r15` alias. Reject that conservatively.
-    if trimmed.starts_with('r') && trimmed.ends_with('d')
-        && trimmed[1..trimmed.len() - 1].bytes().all(|b| b.is_ascii_digit())
+    if trimmed.starts_with('r')
+        && trimmed.ends_with('d')
+        && trimmed[1..trimmed.len() - 1]
+            .bytes()
+            .all(|b| b.is_ascii_digit())
     {
         let d64 = format!("%{}", &trimmed[..trimmed.len() - 1]);
         if toks.iter().any(|tok| tok.trim_end_matches(',') == d64) {
@@ -94,10 +112,21 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
         }
     }
     let d64 = match trimmed {
-        "eax" => "%rax", "ecx" => "%rcx", "edx" => "%rdx", "ebx" => "%rbx",
-        "esi" => "%rsi", "edi" => "%rdi",
-        other if other.starts_with('r') && other.ends_with('d')
-            && other[1..other.len() - 1].bytes().all(|b| b.is_ascii_digit()) => "",
+        "eax" => "%rax",
+        "ecx" => "%rcx",
+        "edx" => "%rdx",
+        "ebx" => "%rbx",
+        "esi" => "%rsi",
+        "edi" => "%rdi",
+        other
+            if other.starts_with('r')
+                && other.ends_with('d')
+                && other[1..other.len() - 1]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit()) =>
+        {
+            ""
+        }
         _ => return false,
     };
     if toks.iter().any(|tok| tok.trim_end_matches(',') == d64) {
@@ -108,11 +137,35 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
     // unusual mnemonics are deliberately left unchanged.
     matches!(
         op,
-        "movl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "cmpl" | "testl"
-            | "leal" | "imull" | "sall" | "shll" | "shrl" | "sarl"
-            | "movzbl" | "movzwl" | "cmovl" | "cmovel" | "cmovnel"
-            | "cmovsl" | "cmovns" | "cmovgl" | "cmovgel" | "cmovll"
-            | "cmovlel" | "cmovbl" | "cmovael" | "cmovbel" | "cmoval"
+        "movl"
+            | "addl"
+            | "subl"
+            | "andl"
+            | "orl"
+            | "xorl"
+            | "cmpl"
+            | "testl"
+            | "leal"
+            | "imull"
+            | "sall"
+            | "shll"
+            | "shrl"
+            | "sarl"
+            | "movzbl"
+            | "movzwl"
+            | "cmovl"
+            | "cmovel"
+            | "cmovnel"
+            | "cmovsl"
+            | "cmovns"
+            | "cmovgl"
+            | "cmovgel"
+            | "cmovll"
+            | "cmovlel"
+            | "cmovbl"
+            | "cmovael"
+            | "cmovbel"
+            | "cmoval"
     )
 }
 
@@ -135,7 +188,9 @@ fn is_32bit_or_smaller(name: &str) -> bool {
 /// it is not a small rN register. Handles one- and two-digit register numbers.
 fn r_reg_width(n: &str) -> u8 {
     let bytes = n.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'r' { return 0; }
+    if bytes.len() < 2 || bytes[0] != b'r' {
+        return 0;
+    }
     // parse the numeric part before the size suffix
     let mut i = 1;
     let mut num = 0usize;
@@ -143,7 +198,9 @@ fn r_reg_width(n: &str) -> u8 {
         num = num * 10 + (bytes[i] - b'0') as usize;
         i += 1;
     }
-    if num < 8 || num > 15 { return 0; }
+    if num < 8 || num > 15 {
+        return 0;
+    }
     let suffix = &n[i..];
     match suffix {
         "b" => 1,
@@ -179,7 +236,9 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     for i in 0..lines.len() {
         let line = &lines[i];
         let t = line.trim();
-        if t.is_empty() || t.starts_with('.') { continue; }
+        if t.is_empty() || t.starts_with('.') {
+            continue;
+        }
 
         // Skip labels: at a label we don't know which path was taken, so we
         // conservatively clear all flags.
@@ -217,7 +276,10 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     let u32z = (sf as usize).lt(&GP_FAMILIES) && upper32_zero[sf as usize];
                     let bytez = (sf as usize).lt(&GP_FAMILIES) && is_byte[sf as usize];
                     if std::env::var("CCC_TRACE_EXT").is_ok() {
-                        eprintln!("[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}", t, sf, df, is32, u32z, bytez);
+                        eprintln!(
+                            "[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}",
+                            t, sf, df, is32, u32z, bytez
+                        );
                     }
                     // A BYTE re-extension is a no-op only when bits 8..31
                     // are already zero (is_byte). upper32_zero alone proves
@@ -259,7 +321,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         //    16-bit re-zero-extension of a value already zero-extended) ---
         if ext16_enabled
             && (t.starts_with("movzwl ") || t.starts_with("movzwq "))
-            && !t.contains('(') {
+            && !t.contains('(')
+        {
             // reg-reg form only (memory sources are handled by the flag
             // update below: movzwl mem,%eax already zero-extends).
             if let Some(comma) = t.rfind(',') {
@@ -290,7 +353,10 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         && is_16[sf as usize]
                         && (is_32bit_or_smaller(dst) || upper32_zero[sf as usize]);
                     if std::env::var("CCC_TRACE_EXT").is_ok() {
-                        eprintln!("[EXT16] t='{}' src_fam={:?} dst_fam={:?} fits16={}", t, sf, df, fits16);
+                        eprintln!(
+                            "[EXT16] t='{}' src_fam={:?} dst_fam={:?} fits16={}",
+                            t, sf, df, fits16
+                        );
                     }
                     if fits16 && sf == df {
                         // Same family, value already zero-extended to 16 bits:
@@ -414,11 +480,29 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 fn is_32bit_zero_extend_write(op: &str) -> bool {
     matches!(
         op,
-        "addl" | "subl" | "andl" | "orl" | "leal" | "imull"
-            | "sall" | "shll" | "shrl" | "sarl"
-            | "cmovl" | "cmovel" | "cmovnel" | "cmovsl" | "cmovns"
-            | "cmovgl" | "cmovgel" | "cmovll" | "cmovlel"
-            | "cmovbl" | "cmovael" | "cmovbel" | "cmoval"
+        "addl"
+            | "subl"
+            | "andl"
+            | "orl"
+            | "leal"
+            | "imull"
+            | "sall"
+            | "shll"
+            | "shrl"
+            | "sarl"
+            | "cmovl"
+            | "cmovel"
+            | "cmovnel"
+            | "cmovsl"
+            | "cmovns"
+            | "cmovgl"
+            | "cmovgel"
+            | "cmovll"
+            | "cmovlel"
+            | "cmovbl"
+            | "cmovael"
+            | "cmovbel"
+            | "cmoval"
     )
 }
 
@@ -429,7 +513,9 @@ fn self_update(
     is_16: &mut Vec<bool>,
 ) {
     let toks: Vec<&str> = t.split_whitespace().collect();
-    if toks.is_empty() { return; }
+    if toks.is_empty() {
+        return;
+    }
     let op = toks[0];
 
     // Calls clobber the full 64-bit values of caller-saved registers.  The
@@ -613,15 +699,13 @@ mod tests {
 
     #[test]
     fn narrows_known_zero_extended_register_copy() {
-        let asm = run(
-            "crc32_update:\n\
+        let asm = run("crc32_update:\n\
              \x20   movzbl (%rdx), %r8d\n\
              \x20   movl %esi, %eax\n\
              \x20   movq %r8, %rcx\n\
              \x20   xorl %ecx, %eax\n\
              \x20   movq %rax, %r8\n\
-             \x20   andl $255, %r8d\n"
-        );
+             \x20   andl $255, %r8d\n");
         assert!(asm.contains("movl %r8d, %ecx"), "asm was:\n{asm}");
         assert!(asm.contains("movl %eax, %r8d"), "asm was:\n{asm}");
         assert!(!asm.contains("movq %r8, %rcx"));
@@ -648,11 +732,9 @@ mod tests {
 
     #[test]
     fn removes_byte_reextension_of_known_byte_value() {
-        let asm = run(
-            "f:\n\
+        let asm = run("f:\n\
              \x20   movzbl (%rdi), %eax\n\
-             \x20   movzbl %al, %eax\n"
-        );
+             \x20   movzbl %al, %eax\n");
         assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
         assert!(asm.contains("movzbl (%rdi), %eax"), "asm was:\n{asm}");
     }
@@ -662,24 +744,23 @@ mod tests {
         // The comma inside the SIB memory operand must not confuse operand
         // splitting: the load still records a byte fact for %eax, so the
         // register re-extension is a no-op (gzip CRC / table-index shape).
-        let asm = run(
-            "f:\n\
+        let asm = run("f:\n\
              \x20   movzbl (%rcx, %r12), %eax\n\
-             \x20   movzbl %al, %eax\n"
-        );
+             \x20   movzbl %al, %eax\n");
         assert_eq!(asm.matches("movzbl").count(), 1, "asm was:\n{asm}");
         assert!(asm.contains("movzbl (%rcx, %r12), %eax"), "asm was:\n{asm}");
     }
 
     #[test]
     fn removes_16bit_reextension_after_sib_memory_load() {
-        let asm = run(
-            "f:\n\
+        let asm = run("f:\n\
              \x20   movzwl (%rcx, %rdi, 2), %eax\n\
-             \x20   movzwl %ax, %eax\n"
-        );
+             \x20   movzwl %ax, %eax\n");
         assert_eq!(asm.matches("movzwl").count(), 1, "asm was:\n{asm}");
-        assert!(asm.contains("movzwl (%rcx, %rdi, 2), %eax"), "asm was:\n{asm}");
+        assert!(
+            asm.contains("movzwl (%rcx, %rdi, 2), %eax"),
+            "asm was:\n{asm}"
+        );
     }
 
     #[test]
@@ -687,14 +768,12 @@ mod tests {
         // 32-bit ALU writes zero-extend: after `addl`/`subl` the accumulator
         // family is upper-32-zero, so a 64-bit copy into a 32-bit consumer
         // narrows to `movl`.
-        let asm = run(
-            "f:\n\
+        let asm = run("f:\n\
              \x20   movl 128(%rsp), %esi\n\
              \x20   addl %r15d, %esi\n\
              \x20   subl $45, %esi\n\
              \x20   movq %rsi, %r12\n\
-             \x20   addl %eax, %r12d\n"
-        );
+             \x20   addl %eax, %r12d\n");
         assert!(asm.contains("movl %esi, %r12d"), "asm was:\n{asm}");
         assert!(!asm.contains("movq %rsi, %r12"), "asm was:\n{asm}");
     }

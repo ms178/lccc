@@ -5,7 +5,9 @@
 //! backend select its native instruction without making codegen source-specific.
 
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand,
+};
 
 fn const_u64(op: Operand) -> Option<u64> {
     match op {
@@ -24,8 +26,12 @@ fn peel(mut op: Operand, defs: &[Option<Instruction>]) -> Operand {
     for _ in 0..32 {
         let Operand::Value(v) = op else { break };
         match defs.get(v.0 as usize).and_then(Option::as_ref) {
-            Some(Instruction::Cast { src, from_ty, to_ty, .. })
-                if from_ty.is_integer() && to_ty.is_integer() => op = *src,
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() => op = *src,
             Some(Instruction::Copy { src, .. }) => op = *src,
             _ => break,
         }
@@ -41,40 +47,82 @@ fn same(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
     }
 }
 
-fn binop(opnd: Operand, wanted: IrBinOp, defs: &[Option<Instruction>]) -> Option<(Operand, Operand, IrType)> {
-    let Operand::Value(v) = peel(opnd, defs) else { return None };
+fn binop(
+    opnd: Operand,
+    wanted: IrBinOp,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel(opnd, defs) else {
+        return None;
+    };
     match defs.get(v.0 as usize).and_then(Option::as_ref) {
-        Some(Instruction::BinOp { op, lhs, rhs, ty, .. }) if *op == wanted => Some((*lhs, *rhs, *ty)),
+        Some(Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        }) if *op == wanted => Some((*lhs, *rhs, *ty)),
         _ => None,
     }
 }
 
-fn commutative_const(opnd: Operand, wanted: IrBinOp, constant: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+fn commutative_const(
+    opnd: Operand,
+    wanted: IrBinOp,
+    constant: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
     let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
-    if const_u64(rhs) == Some(constant) { Some(lhs) }
-    else if const_u64(lhs) == Some(constant) { Some(rhs) }
-    else { None }
+    if const_u64(rhs) == Some(constant) {
+        Some(lhs)
+    } else if const_u64(lhs) == Some(constant) {
+        Some(rhs)
+    } else {
+        None
+    }
 }
 
-fn shift(opnd: Operand, wanted: IrBinOp, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+fn shift(
+    opnd: Operand,
+    wanted: IrBinOp,
+    amount: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
     let (lhs, rhs, _) = binop(opnd, wanted, defs)?;
     (const_u64(rhs) == Some(amount)).then_some(lhs)
 }
 
-fn select(opnd: Operand, defs: &[Option<Instruction>]) -> Option<(Operand, Operand, Operand, IrType)> {
-    let Operand::Value(v) = peel(opnd, defs) else { return None };
+fn select(
+    opnd: Operand,
+    defs: &[Option<Instruction>],
+) -> Option<(Operand, Operand, Operand, IrType)> {
+    let Operand::Value(v) = peel(opnd, defs) else {
+        return None;
+    };
     match defs.get(v.0 as usize).and_then(Option::as_ref) {
-        Some(Instruction::Select { cond, true_val, false_val, ty, .. }) =>
-            Some((*cond, *true_val, *false_val, *ty)),
+        Some(Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ty,
+            ..
+        }) => Some((*cond, *true_val, *false_val, *ty)),
         _ => None,
     }
 }
 
-fn unsigned_le_const(opnd: Operand, constant: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
-    let Operand::Value(v) = peel(opnd, defs) else { return None };
+fn unsigned_le_const(
+    opnd: Operand,
+    constant: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let Operand::Value(v) = peel(opnd, defs) else {
+        return None;
+    };
     match defs.get(v.0 as usize).and_then(Option::as_ref) {
-        Some(Instruction::Cmp { op: IrCmpOp::Ule, lhs, rhs, .. })
-            if const_u64(*rhs) == Some(constant) => Some(*lhs),
+        Some(Instruction::Cmp {
+            op: IrCmpOp::Ule,
+            lhs,
+            rhs,
+            ..
+        }) if const_u64(*rhs) == Some(constant) => Some(*lhs),
         _ => None,
     }
 }
@@ -83,11 +131,19 @@ fn add_const(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option
     commutative_const(opnd, IrBinOp::Add, amount, defs)
 }
 
-fn is_incremented(true_val: Operand, false_val: Operand, amount: u64, defs: &[Option<Instruction>]) -> bool {
+fn is_incremented(
+    true_val: Operand,
+    false_val: Operand,
+    amount: u64,
+    defs: &[Option<Instruction>],
+) -> bool {
     if add_const(true_val, amount, defs).is_some_and(|base| same(base, false_val, defs)) {
         return true;
     }
-    match (const_u64(peel(true_val, defs)), const_u64(peel(false_val, defs))) {
+    match (
+        const_u64(peel(true_val, defs)),
+        const_u64(peel(false_val, defs)),
+    ) {
         (Some(a), Some(b)) => a == b.wrapping_add(amount),
         _ => false,
     }
@@ -101,19 +157,31 @@ fn match_popcount32(result: Operand, defs: &[Option<Instruction>]) -> Option<Ope
     let stage3 = commutative_const(multiplied, IrBinOp::Mul, 0x0101_0101, defs)?;
     let stage3_add = commutative_const(stage3, IrBinOp::And, 0x0f0f_0f0f, defs)?;
     let (a, b, _) = binop(stage3_add, IrBinOp::Add, defs)?;
-    let stage2 = if shift(a, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, b, defs)) { b }
-        else if shift(b, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, a, defs)) { a }
-        else { return None };
+    let stage2 = if shift(a, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, b, defs)) {
+        b
+    } else if shift(b, IrBinOp::LShr, 4, defs).is_some_and(|base| same(base, a, defs)) {
+        a
+    } else {
+        return None;
+    };
 
     let (a, b, _) = binop(stage2, IrBinOp::Add, defs)?;
     let a_base = commutative_const(a, IrBinOp::And, 0x3333_3333, defs)?;
     let b_base = commutative_const(b, IrBinOp::And, 0x3333_3333, defs)?;
-    let stage1 = if shift(a_base, IrBinOp::LShr, 2, defs).is_some_and(|base| same(base, b_base, defs)) { b_base }
-        else if shift(b_base, IrBinOp::LShr, 2, defs).is_some_and(|base| same(base, a_base, defs)) { a_base }
-        else { return None };
+    let stage1 = if shift(a_base, IrBinOp::LShr, 2, defs)
+        .is_some_and(|base| same(base, b_base, defs))
+    {
+        b_base
+    } else if shift(b_base, IrBinOp::LShr, 2, defs).is_some_and(|base| same(base, a_base, defs)) {
+        a_base
+    } else {
+        return None;
+    };
 
     let (original, subtracted, ty) = binop(stage1, IrBinOp::Sub, defs)?;
-    if ty != IrType::U32 && ty != IrType::I32 { return None; }
+    if ty != IrType::U32 && ty != IrType::I32 {
+        return None;
+    }
     let shifted = commutative_const(subtracted, IrBinOp::And, 0x5555_5555, defs)?;
     let shifted_base = shift(shifted, IrBinOp::LShr, 1, defs)?;
     same(original, shifted_base, defs).then_some(peel(original, defs))
@@ -125,7 +193,9 @@ fn match_popcount32(result: Operand, defs: &[Option<Instruction>]) -> Option<Ope
 /// agree makes this substantially stricter than merely matching the constants.
 fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
     let (final_cond, final_true, final_false, final_ty) = select(result, defs)?;
-    if final_ty != IrType::I32 && final_ty != IrType::U32 { return None; }
+    if final_ty != IrType::I32 && final_ty != IrType::U32 {
+        return None;
+    }
     let mut count = final_false;
     if !is_incremented(final_true, count, 1, defs) {
         return None;
@@ -143,15 +213,21 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
             return None;
         }
         let (value_cond, value_true, value_false, value_ty) = select(working, defs)?;
-        if value_ty != IrType::U32 && value_ty != IrType::I32 { return None; }
+        if value_ty != IrType::U32 && value_ty != IrType::I32 {
+            return None;
+        }
         if !same(count_cond, value_cond, defs) {
             return None;
         }
-        if !shift(value_true, IrBinOp::Shl, amount, defs).is_some_and(|base| same(base, value_false, defs)) {
+        if !shift(value_true, IrBinOp::Shl, amount, defs)
+            .is_some_and(|base| same(base, value_false, defs))
+        {
             return None;
         }
         let compared = unsigned_le_const(value_cond, threshold, defs)?;
-        if !same(compared, value_false, defs) { return None; }
+        if !same(compared, value_false, defs) {
+            return None;
+        }
         count = count_false;
         working = value_false;
     }
@@ -164,13 +240,17 @@ fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) ->
         shift(a, IrBinOp::LShr, amount, defs),
         shift(b, IrBinOp::Shl, amount, defs),
     ) {
-        if same(x, y, defs) { return Some(x); }
+        if same(x, y, defs) {
+            return Some(x);
+        }
     }
     if let (Some(x), Some(y)) = (
         shift(b, IrBinOp::LShr, amount, defs),
         shift(a, IrBinOp::Shl, amount, defs),
     ) {
-        if same(x, y, defs) { return Some(x); }
+        if same(x, y, defs) {
+            return Some(x);
+        }
     }
     None
 }
@@ -182,7 +262,9 @@ fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) ->
 fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
     let byte_swapped = match_shift_pair(result, 16, defs)?;
     let (a, b, ty) = binop(byte_swapped, IrBinOp::Or, defs)?;
-    if ty != IrType::U32 && ty != IrType::I32 { return None; }
+    if ty != IrType::U32 && ty != IrType::I32 {
+        return None;
+    }
 
     let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
         let right_shifted = commutative_const(right, IrBinOp::And, 0x00ff_00ff, defs)?;
@@ -194,9 +276,16 @@ fn match_bswap32_network(result: Operand, defs: &[Option<Instruction>]) -> Optio
     match_halves(a, b).or_else(|| match_halves(b, a))
 }
 
-fn match_masked_swap_stage(result: Operand, amount: u64, mask: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+fn match_masked_swap_stage(
+    result: Operand,
+    amount: u64,
+    mask: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
     let (a, b, ty) = binop(result, IrBinOp::Or, defs)?;
-    if ty != IrType::U32 && ty != IrType::I32 { return None; }
+    if ty != IrType::U32 && ty != IrType::I32 {
+        return None;
+    }
     let match_halves = |right: Operand, left: Operand| -> Option<Operand> {
         let shifted = commutative_const(right, IrBinOp::And, mask, defs)?;
         let original = shift(shifted, IrBinOp::LShr, amount, defs)?;
@@ -229,34 +318,63 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             match inst {
-                Instruction::BinOp { dest, op: IrBinOp::LShr, ty, .. }
-                    if *ty == IrType::U32 || *ty == IrType::I32 => {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::LShr,
+                    ty,
+                    ..
+                } if *ty == IrType::U32 || *ty == IrType::I32 => {
                     let result = Operand::Value(*dest);
                     if let Some(src) = match_popcount32(result, &defs) {
-                        *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::Popcount, src, ty: IrType::U32 };
+                        *inst = Instruction::UnaryOp {
+                            dest: *dest,
+                            op: IrUnaryOp::Popcount,
+                            src,
+                            ty: IrType::U32,
+                        };
                         changes += 1;
                     }
                 }
-                Instruction::BinOp { dest, op: IrBinOp::Or, ty, .. }
-                    if *ty == IrType::U32 || *ty == IrType::I32 => {
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Or,
+                    ty,
+                    ..
+                } if *ty == IrType::U32 || *ty == IrType::I32 => {
                     let result = Operand::Value(*dest);
                     if enable_bit_reverse {
                         if let Some(src) = match_bit_reverse32(result, &defs) {
-                            *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::BitReverse, src, ty: IrType::U32 };
+                            *inst = Instruction::UnaryOp {
+                                dest: *dest,
+                                op: IrUnaryOp::BitReverse,
+                                src,
+                                ty: IrType::U32,
+                            };
                             changes += 1;
                             continue;
                         }
                     }
                     if let Some(src) = match_bswap32_network(result, &defs) {
-                        *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::Bswap, src, ty: IrType::U32 };
+                        *inst = Instruction::UnaryOp {
+                            dest: *dest,
+                            op: IrUnaryOp::Bswap,
+                            src,
+                            ty: IrType::U32,
+                        };
                         changes += 1;
                     }
                 }
                 Instruction::Select { dest, ty, .. }
-                    if *ty == IrType::U32 || *ty == IrType::I32 => {
+                    if *ty == IrType::U32 || *ty == IrType::I32 =>
+                {
                     let result = Operand::Value(*dest);
                     if let Some(src) = match_clz32(result, &defs) {
-                        *inst = Instruction::UnaryOp { dest: *dest, op: IrUnaryOp::Clz, src, ty: IrType::U32 };
+                        *inst = Instruction::UnaryOp {
+                            dest: *dest,
+                            op: IrUnaryOp::Clz,
+                            src,
+                            ty: IrType::U32,
+                        };
                         changes += 1;
                     }
                 }
@@ -278,7 +396,11 @@ mod tests {
         let mut defs = vec![None; 13];
         let mut put = |id, op, lhs, rhs| {
             defs[id as usize] = Some(Instruction::BinOp {
-                dest: Value(id), op, lhs, rhs, ty: IrType::U32,
+                dest: Value(id),
+                op,
+                lhs,
+                rhs,
+                ty: IrType::U32,
             });
         };
         put(1, IrBinOp::LShr, value(0), constant(1));
@@ -299,7 +421,11 @@ mod tests {
     #[test]
     fn recognizes_canonical_swar_popcount32() {
         let defs = swar_defs(0x3333_3333);
-        assert!(same(match_popcount32(Operand::Value(Value(12)), &defs).unwrap(), Operand::Value(Value(0)), &defs));
+        assert!(same(
+            match_popcount32(Operand::Value(Value(12)), &defs).unwrap(),
+            Operand::Value(Value(0)),
+            &defs
+        ));
     }
 
     #[test]

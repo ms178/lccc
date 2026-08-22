@@ -9,19 +9,12 @@
 //! binary operation arithmetic) lives in `common::const_eval` and `common::const_arith`,
 //! called by both this module and `sema::const_eval`.
 
-use crate::frontend::parser::ast::{
-    BinOp,
-    Expr,
-    Initializer,
-    SizeofArg,
-    TypeSpecifier,
-    UnaryOp,
-};
-use crate::ir::reexports::{GlobalInit, IrConst};
-use crate::common::types::{CType, IrType};
+use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
-use super::lower::Lowerer;
+use crate::common::types::{CType, IrType};
+use crate::frontend::parser::ast::{BinOp, Expr, Initializer, SizeofArg, TypeSpecifier, UnaryOp};
+use crate::ir::reexports::{GlobalInit, IrConst};
 
 impl Lowerer {
     /// Look up a pre-computed constant value from sema's ConstMap.
@@ -87,16 +80,18 @@ impl Lowerer {
         }
         match expr {
             // Literals: delegate to shared evaluation
-            Expr::IntLiteral(..) | Expr::LongLiteral(..) | Expr::LongLongLiteral(..)
-            | Expr::UIntLiteral(..) | Expr::ULongLiteral(..) | Expr::ULongLongLiteral(..)
-            | Expr::CharLiteral(..) | Expr::FloatLiteral(..)
-            | Expr::FloatLiteralF32(..) | Expr::FloatLiteralLongDouble(..)
-            | Expr::FloatLiteralF128(..) => {
-                shared_const_eval::eval_literal(expr)
-            }
-            Expr::UnaryOp(UnaryOp::Plus, inner, _) => {
-                self.eval_const_expr(inner)
-            }
+            Expr::IntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::CharLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
                 // _Float128 constants are carried as I128 bit patterns
@@ -111,7 +106,8 @@ impl Lowerer {
                         return Some(IrConst::I128(toggled as i128));
                     }
                 }
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
+                let promoted =
+                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
                 const_arith::negate_const(promoted)
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
@@ -179,15 +175,12 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted = shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
+                let promoted =
+                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
                 const_arith::bitnot_const(promoted)
             }
-            Expr::Cast(ref target_type, inner, _) => {
-                self.eval_const_cast(target_type, inner)
-            }
-            Expr::Identifier(name, _) => {
-                self.eval_const_identifier(name)
-            }
+            Expr::Cast(ref target_type, inner, _) => self.eval_const_cast(target_type, inner),
+            Expr::Identifier(name, _) => self.eval_const_identifier(name),
             Expr::Sizeof(arg, _) => {
                 let size = match arg.as_ref() {
                     SizeofArg::Type(ts) => self.sizeof_type(ts),
@@ -239,9 +232,7 @@ impl Lowerer {
                 }
             }
             // Handle &((type*)0)->member pattern (offsetof)
-            Expr::AddressOf(inner, _) => {
-                self.eval_offsetof_pattern(inner)
-            }
+            Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
             Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
                 let result = self.eval_types_compatible(type1, type2);
                 Some(IrConst::I64(result as i64))
@@ -249,9 +240,9 @@ impl Lowerer {
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
-                    shared_const_eval::eval_builtin_call(
-                        name.as_str(), args, &|e| self.eval_const_expr(e),
-                    )
+                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
+                        self.eval_const_expr(e)
+                    })
                 } else {
                     None
                 }
@@ -323,9 +314,18 @@ impl Lowerer {
     }
 
     /// Convert raw bits to an IrConst of the given target type, truncating as needed.
-    fn cast_bits_to_ir_const(&self, bits: u64, src_signed: bool, target_ir_ty: IrType) -> Option<IrConst> {
+    fn cast_bits_to_ir_const(
+        &self,
+        bits: u64,
+        src_signed: bool,
+        target_ir_ty: IrType,
+    ) -> Option<IrConst> {
         let target_width = target_ir_ty.size() * 8;
-        let truncated = if target_width >= 64 { bits } else { bits & ((1u64 << target_width) - 1) };
+        let truncated = if target_width >= 64 {
+            bits
+        } else {
+            bits & ((1u64 << target_width) - 1)
+        };
         let result = match target_ir_ty {
             IrType::I8 => IrConst::I8(truncated as i8),
             IrType::U8 => IrConst::I64(truncated as u8 as i64),
@@ -337,11 +337,19 @@ impl Lowerer {
             IrType::Ptr => IrConst::ptr_int(truncated as i64),
             IrType::I128 | IrType::U128 => unreachable!("handled above"),
             IrType::F32 => {
-                let int_val = if src_signed { bits as i64 as f32 } else { bits as f32 };
+                let int_val = if src_signed {
+                    bits as i64 as f32
+                } else {
+                    bits as f32
+                };
                 IrConst::F32(int_val)
             }
             IrType::F64 => {
-                let int_val = if src_signed { bits as i64 as f64 } else { bits as f64 };
+                let int_val = if src_signed {
+                    bits as i64 as f64
+                } else {
+                    bits as f64
+                };
                 IrConst::F64(int_val)
             }
             _ => return None,
@@ -350,7 +358,9 @@ impl Lowerer {
     }
 
     fn eval_const_identifier(&self, name: &str) -> Option<IrConst> {
-        let is_local = self.func_state.as_ref()
+        let is_local = self
+            .func_state
+            .as_ref()
             .is_some_and(|fs| fs.locals.contains_key(name));
         if !is_local {
             if let Some(&val) = self.types.enum_constants.get(name) {
@@ -367,14 +377,21 @@ impl Lowerer {
 
     /// Evaluate scalar compound literals in constant expressions.
     /// Returns None for multi-field aggregates (those go through struct init path).
-    fn eval_const_compound_literal(&self, type_spec: &TypeSpecifier, init: &Initializer) -> Option<IrConst> {
+    fn eval_const_compound_literal(
+        &self,
+        type_spec: &TypeSpecifier,
+        init: &Initializer,
+    ) -> Option<IrConst> {
         let cl_ctype = self.type_spec_to_ctype(type_spec);
         let is_multi_field_aggregate = match &cl_ctype {
             CType::Struct(key) | CType::Union(key) => {
                 if let Some(layout) = self.types.borrow_struct_layouts().get(&**key) {
                     layout.fields.len() > 1
                         || layout.fields.iter().any(|f| {
-                            matches!(f.ty, CType::Array(..) | CType::Struct(..) | CType::Union(..))
+                            matches!(
+                                f.ty,
+                                CType::Array(..) | CType::Struct(..) | CType::Union(..)
+                            )
                         })
                 } else {
                     false
@@ -425,15 +442,18 @@ impl Lowerer {
                 // base should be (type*)0 - a cast of 0 to a pointer type
                 let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(base)?;
                 let layout = self.get_struct_layout_for_type(&type_spec)?;
-                let (field_offset, field_ty) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
+                let (field_offset, field_ty) =
+                    layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                 Some((base_offset + field_offset, field_ty))
             }
             Expr::MemberAccess(base, field_name, _) => {
                 // First try: base is *((type*)0) (deref pattern)
                 if let Expr::Deref(inner, _) = base.as_ref() {
-                    let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(inner)?;
+                    let (type_spec, base_offset) =
+                        self.extract_null_pointer_cast_with_offset(inner)?;
                     let layout = self.get_struct_layout_for_type(&type_spec)?;
-                    let (field_offset, field_ty) = layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
+                    let (field_offset, field_ty) =
+                        layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                     return Some((base_offset + field_offset, field_ty));
                 }
                 // Second try: base is itself an offsetof sub-expression (chained access)
@@ -461,7 +481,10 @@ impl Lowerer {
                     CType::Array(elem, _) => (**elem).clone(),
                     _ => return None,
                 };
-                Some(((base_offset as i64 + idx * elem_size as i64) as usize, elem_ty))
+                Some((
+                    (base_offset as i64 + idx * elem_size as i64) as usize,
+                    elem_ty,
+                ))
             }
             _ => None,
         }
@@ -499,8 +522,15 @@ impl Lowerer {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;
-                let target_signed = matches!(target_ir_ty, IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64);
-                Some(const_arith::truncate_and_extend_bits(bits, target_width, target_signed))
+                let target_signed = matches!(
+                    target_ir_ty,
+                    IrType::I8 | IrType::I16 | IrType::I32 | IrType::I64
+                );
+                Some(const_arith::truncate_and_extend_bits(
+                    bits,
+                    target_width,
+                    target_signed,
+                ))
             }
             _ => {
                 let val = self.eval_const_expr(expr)?;
@@ -527,11 +557,19 @@ impl Lowerer {
             IrType::I128 | IrType::U128 => IrConst::I128(v128),
             IrType::F32 => {
                 // int-to-float: signedness comes from the source type
-                let fv = if src_unsigned { (v128 as u128) as f32 } else { v128 as f32 };
+                let fv = if src_unsigned {
+                    (v128 as u128) as f32
+                } else {
+                    v128 as f32
+                };
                 IrConst::F32(fv)
             }
             IrType::F64 => {
-                let fv = if src_unsigned { (v128 as u128) as f64 } else { v128 as f64 };
+                let fv = if src_unsigned {
+                    (v128 as u128) as f64
+                } else {
+                    v128 as f64
+                };
                 IrConst::F64(fv)
             }
             IrType::F128 => {
@@ -550,11 +588,22 @@ impl Lowerer {
     /// Evaluate a constant binary operation.
     /// Delegates to `shared_const_eval::eval_binop_with_types` which implements
     /// C's usual arithmetic conversions (C11 6.3.1.8).
-    fn eval_const_binop(&self, op: &BinOp, lhs: &IrConst, rhs: &IrConst, lhs_ty: IrType, rhs_ty: IrType) -> Option<IrConst> {
+    fn eval_const_binop(
+        &self,
+        op: &BinOp,
+        lhs: &IrConst,
+        rhs: &IrConst,
+        lhs_ty: IrType,
+        rhs_ty: IrType,
+    ) -> Option<IrConst> {
         shared_const_eval::eval_binop_with_types(
-            op, lhs, rhs,
-            lhs_ty.size().max(4), lhs_ty.is_unsigned(),
-            rhs_ty.size().max(4), rhs_ty.is_unsigned(),
+            op,
+            lhs,
+            rhs,
+            lhs_ty.size().max(4),
+            lhs_ty.is_unsigned(),
+            rhs_ty.size().max(4),
+            rhs_ty.is_unsigned(),
         )
     }
 
@@ -571,7 +620,12 @@ impl Lowerer {
     /// Try to constant-fold a binary operation from its parts.
     /// Used by lower_binary_op to avoid generating IR for constant expressions,
     /// ensuring correct C type semantics (especially 32-bit vs 64-bit width).
-    pub(super) fn eval_const_expr_from_parts(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<IrConst> {
+    pub(super) fn eval_const_expr_from_parts(
+        &self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Option<IrConst> {
         let l = self.eval_const_expr(lhs)?;
         let r = self.eval_const_expr(rhs)?;
         let lhs_ty = self.infer_expr_type(lhs);
@@ -650,7 +704,12 @@ impl Lowerer {
     }
 
     /// Coerce a constant to the target type, using the source expression's type for signedness.
-    pub(super) fn coerce_const_to_type_with_src(&self, val: IrConst, target_ty: IrType, src_ty: IrType) -> IrConst {
+    pub(super) fn coerce_const_to_type_with_src(
+        &self,
+        val: IrConst,
+        target_ty: IrType,
+        src_ty: IrType,
+    ) -> IrConst {
         val.coerce_to_with_src(target_ty, Some(src_ty))
     }
 
@@ -660,8 +719,12 @@ impl Lowerer {
     pub(super) fn expr_as_array_size(&self, expr: &Expr) -> Option<i64> {
         // Try simple literals first (fast path)
         match expr {
-            Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => return Some(*n),
-            Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => return Some(*n as i64),
+            Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => {
+                return Some(*n)
+            }
+            Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => {
+                return Some(*n as i64)
+            }
             _ => {}
         }
         // Fall back to full constant expression evaluation (handles sizeof, arithmetic, etc.)
@@ -689,4 +752,3 @@ impl Lowerer {
         }
     }
 }
-

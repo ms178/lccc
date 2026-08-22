@@ -5,16 +5,16 @@
 //! and REL (not RELA) relocation format. All shared logic lives in
 //! `backend::elf_writer_common`.
 
-use crate::backend::x86::assembler::parser::*;
 use super::encoder::*;
 use crate::backend::elf::{ELFCLASS32, EM_386};
 use crate::backend::elf_writer_common::{
-    X86Arch, ElfWriterCore, EncodeResult, EncoderReloc, JumpDetection,
+    ElfWriterCore, EncodeResult, EncoderReloc, JumpDetection, X86Arch,
 };
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86_64Encoder,
-    R_X86_64_64, R_X86_64_PC32, R_X86_64_PLT32, R_X86_64_32, R_X86_64_32S,
+    InstructionEncoder as X86_64Encoder, R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_PC32,
+    R_X86_64_PLT32,
 };
+use crate::backend::x86::assembler::parser::*;
 
 /// i686 architecture implementation for the shared ELF writer.
 pub struct I686Arch;
@@ -33,8 +33,8 @@ impl X86Arch for I686Arch {
         // Detect jump instructions for relaxation
         let jump = {
             let mnem = &instr.mnemonic;
-            let is_jump = mnem == "jmp" || mnem == "loop"
-                || (mnem.starts_with('j') && mnem.len() >= 2);
+            let is_jump =
+                mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
             if is_jump && instr.operands.len() == 1 {
                 if let Operand::Label(_) = &instr.operands[0] {
                     let is_short_only = matches!(mnem.as_str(), "jecxz" | "jcxz" | "loop");
@@ -64,15 +64,17 @@ impl X86Arch for I686Arch {
             }
         };
 
-        let relocations = encoder.relocations.into_iter().map(|r| {
-            EncoderReloc {
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| EncoderReloc {
                 offset: r.offset,
                 symbol: r.symbol,
                 reloc_type: r.reloc_type,
                 addend: r.addend,
                 diff_symbol: r.diff_symbol,
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(EncodeResult {
             bytes: encoder.bytes,
@@ -81,8 +83,12 @@ impl X86Arch for I686Arch {
         })
     }
 
-    fn elf_machine() -> u16 { EM_386 }
-    fn elf_class() -> u8 { ELFCLASS32 }
+    fn elf_machine() -> u16 {
+        EM_386
+    }
+    fn elf_class() -> u8 {
+        ELFCLASS32
+    }
 
     fn reloc_abs(size: usize) -> u32 {
         // `.word sym` must carry R_386_16, not R_386_32: a 32-bit patch of a
@@ -95,10 +101,18 @@ impl X86Arch for I686Arch {
             _ => R_386_32,
         }
     }
-    fn reloc_abs64() -> u32 { R_386_32 } // i686 doesn't have 64-bit relocs
-    fn reloc_pc32() -> u32 { R_386_PC32 }
-    fn reloc_pc16() -> Option<u32> { Some(R_386_PC16) }
-    fn reloc_pc8() -> Option<u32> { Some(23) } // R_386_PC8
+    fn reloc_abs64() -> u32 {
+        R_386_32
+    } // i686 doesn't have 64-bit relocs
+    fn reloc_pc32() -> u32 {
+        R_386_PC32
+    }
+    fn reloc_pc16() -> Option<u32> {
+        Some(R_386_PC16)
+    }
+    fn reloc_pc8() -> Option<u32> {
+        Some(23)
+    } // R_386_PC8
     fn reloc_patch_size(reloc_type: u32) -> u8 {
         match reloc_type {
             // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
@@ -106,13 +120,23 @@ impl X86Arch for I686Arch {
             _ => 4,
         }
     }
-    fn reloc_plt32() -> u32 { R_386_PLT32 }
+    fn reloc_plt32() -> u32 {
+        R_386_PLT32
+    }
 
-    fn uses_rel_format() -> bool { true }
-    fn supports_deferred_skips() -> bool { true }
-    fn resolve_set_aliases_in_data() -> bool { true }
+    fn uses_rel_format() -> bool {
+        true
+    }
+    fn supports_deferred_skips() -> bool {
+        true
+    }
+    fn resolve_set_aliases_in_data() -> bool {
+        true
+    }
 
-    fn default_code_mode() -> u8 { 32 }
+    fn default_code_mode() -> u8 {
+        32
+    }
 
     /// Encode an instruction using the x86-64 encoder for .code64 sections.
     /// This is needed for kernel realmode trampoline code (trampoline_64.S)
@@ -145,21 +169,38 @@ impl X86Arch for I686Arch {
                     // than in 32-bit mode.
                     let expected_len = if is_conditional { 4 } else { 3 };
                     if instr_len == expected_len {
-                        Some(JumpDetection { is_conditional, already_short: false })
-                    } else { None }
-                } else { None }
-            } else { None }
+                        Some(JumpDetection {
+                            is_conditional,
+                            already_short: false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
-        let relocations = encoder.relocations.into_iter().map(|r| EncoderReloc {
-            offset: r.offset,
-            symbol: r.symbol,
-            reloc_type: r.reloc_type,
-            addend: r.addend,
-            diff_symbol: None,
-        }).collect();
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| EncoderReloc {
+                offset: r.offset,
+                symbol: r.symbol,
+                reloc_type: r.reloc_type,
+                addend: r.addend,
+                diff_symbol: None,
+            })
+            .collect();
 
-        Ok(EncodeResult { bytes: encoder.bytes, relocations, jump })
+        Ok(EncodeResult {
+            bytes: encoder.bytes,
+            relocations,
+            jump,
+        })
     }
 
     fn encode_instruction_code64(
@@ -202,21 +243,25 @@ impl X86Arch for I686Arch {
         // i686 object, we need to keep i686 relocation types (R_386_*) because
         // the object file is still ELF32. The linker (ld -m elf_i386) expects
         // R_386_* relocations.
-        let relocations = encoder.relocations.into_iter().map(|r| {
-            // Map x86-64 reloc types to i686 equivalents
-            let reloc_type = match r.reloc_type {
-                R_X86_64_PC32 | R_X86_64_PLT32 => R_386_PC32,
-                R_X86_64_64 | R_X86_64_32 | R_X86_64_32S => R_386_32,
-                other => other,
-            };
-            EncoderReloc {
-                offset: r.offset,
-                symbol: r.symbol,
-                reloc_type,
-                addend: r.addend,
-                diff_symbol: None,
-            }
-        }).collect();
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| {
+                // Map x86-64 reloc types to i686 equivalents
+                let reloc_type = match r.reloc_type {
+                    R_X86_64_PC32 | R_X86_64_PLT32 => R_386_PC32,
+                    R_X86_64_64 | R_X86_64_32 | R_X86_64_32S => R_386_32,
+                    other => other,
+                };
+                EncoderReloc {
+                    offset: r.offset,
+                    symbol: r.symbol,
+                    reloc_type,
+                    addend: r.addend,
+                    diff_symbol: None,
+                }
+            })
+            .collect();
 
         Ok(EncodeResult {
             bytes: encoder.bytes,

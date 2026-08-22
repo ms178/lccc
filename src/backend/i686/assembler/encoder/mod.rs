@@ -4,12 +4,12 @@
 //! Similar to the x86-64 encoder but without REX prefixes and with
 //! 32-bit default operand size. Uses R_386_* relocation types.
 
-mod registers;
 mod core;
 mod gp_integer;
+mod registers;
 mod sse;
-mod x87;
 mod system;
+mod x87;
 
 pub(crate) use registers::*;
 
@@ -181,8 +181,14 @@ impl InstructionEncoder {
         let mut keep: Vec<u8> = Vec::new();
         while i < self.bytes.len() {
             match self.bytes[i] {
-                0x66 => { had_66 = true; i += 1; }
-                0x67 => { had_67 = true; i += 1; }
+                0x66 => {
+                    had_66 = true;
+                    i += 1;
+                }
+                0x67 => {
+                    had_67 = true;
+                    i += 1;
+                }
                 b @ (0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65) => {
                     keep.push(b);
                     i += 1;
@@ -210,8 +216,12 @@ impl InstructionEncoder {
 
         let mut out = Vec::with_capacity(self.bytes.len() - start + 2);
         // GAS byte order: address-size override precedes operand-size override.
-        if want_67 { out.push(0x67); }
-        if want_66 { out.push(0x66); }
+        if want_67 {
+            out.push(0x67);
+        }
+        if want_66 {
+            out.push(0x66);
+        }
         out.extend_from_slice(&keep);
         out.extend_from_slice(&body);
 
@@ -312,10 +322,22 @@ impl InstructionEncoder {
             "shrdl" | "shrd" => self.encode_double_shift(ops, 0xAC, 4),
 
             // Sign extension
-            "cltd" | "cdq" => { self.bytes.push(0x99); Ok(()) }
-            "cwtl" | "cwde" => { self.bytes.push(0x98); Ok(()) }
-            "cbtw" | "cbw" => { self.bytes.extend_from_slice(&[0x66, 0x98]); Ok(()) }
-            "cwtd" | "cwd" => { self.bytes.extend_from_slice(&[0x66, 0x99]); Ok(()) }
+            "cltd" | "cdq" => {
+                self.bytes.push(0x99);
+                Ok(())
+            }
+            "cwtl" | "cwde" => {
+                self.bytes.push(0x98);
+                Ok(())
+            }
+            "cbtw" | "cbw" => {
+                self.bytes.extend_from_slice(&[0x66, 0x98]);
+                Ok(())
+            }
+            "cwtd" | "cwd" => {
+                self.bytes.extend_from_slice(&[0x66, 0x99]);
+                Ok(())
+            }
 
             // Byte swap
             "bswapl" | "bswap" => self.encode_bswap(ops),
@@ -324,35 +346,33 @@ impl InstructionEncoder {
             "lzcntl" | "tzcntl" | "popcntl" => self.encode_bit_count(ops, mnemonic),
             "bsrl" | "bsfl" | "bsr" | "bsf" => self.encode_bsr_bsf(ops, mnemonic),
             "bsrw" | "bsfw" => self.encode_bsr_bsf_16(ops, mnemonic),
-            "btl" | "btsl" | "btrl" | "btcl" | "bt" | "bts" | "btr" | "btc" => self.encode_bt(ops, mnemonic),
+            "btl" | "btsl" | "btrl" | "btcl" | "bt" | "bts" | "btr" | "btc" => {
+                self.encode_bt(ops, mnemonic)
+            }
 
             // Conditional set
-            "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge"
-            | "setb" | "setc" | "setbe" | "seta" | "setae" | "setnc" | "setnp" | "setp"
-            | "sets" | "setns" | "seto" | "setno" => self.encode_setcc(ops, mnemonic),
+            "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge" | "setb"
+            | "setc" | "setbe" | "seta" | "setae" | "setnc" | "setnp" | "setp" | "sets"
+            | "setns" | "seto" | "setno" => self.encode_setcc(ops, mnemonic),
 
             // Conditional move
-            "cmovel" | "cmovnel" | "cmovll" | "cmovlel" | "cmovgl" | "cmovgel"
-            | "cmovbl" | "cmovbel" | "cmoval" | "cmovael"
-            | "cmovsl" | "cmovnsl" | "cmovzl" | "cmovnzl" | "cmovpl" | "cmovnpl"
-            | "cmovol" | "cmovnol" | "cmovcl" | "cmovncl"
-            | "cmovew" | "cmovnew" | "cmovlw" | "cmovlew" | "cmovgw" | "cmovgew"
-            | "cmovbw" | "cmovbew" | "cmovaw" | "cmovaew"
-            | "cmovsw" | "cmovnsw" | "cmovzw" | "cmovnzw" | "cmovpw" | "cmovnpw"
-            | "cmovow" | "cmovnow" | "cmovcw" | "cmovncw"
-            | "cmove" | "cmovne" | "cmovl" | "cmovle" | "cmovg" | "cmovge"
-            | "cmovb" | "cmovbe" | "cmova" | "cmovae"
-            | "cmovs" | "cmovns" | "cmovz" | "cmovnz" | "cmovp" | "cmovnp"
-            | "cmovo" | "cmovno" | "cmovc" | "cmovnc" => self.encode_cmovcc(ops, mnemonic),
+            "cmovel" | "cmovnel" | "cmovll" | "cmovlel" | "cmovgl" | "cmovgel" | "cmovbl"
+            | "cmovbel" | "cmoval" | "cmovael" | "cmovsl" | "cmovnsl" | "cmovzl" | "cmovnzl"
+            | "cmovpl" | "cmovnpl" | "cmovol" | "cmovnol" | "cmovcl" | "cmovncl" | "cmovew"
+            | "cmovnew" | "cmovlw" | "cmovlew" | "cmovgw" | "cmovgew" | "cmovbw" | "cmovbew"
+            | "cmovaw" | "cmovaew" | "cmovsw" | "cmovnsw" | "cmovzw" | "cmovnzw" | "cmovpw"
+            | "cmovnpw" | "cmovow" | "cmovnow" | "cmovcw" | "cmovncw" | "cmove" | "cmovne"
+            | "cmovl" | "cmovle" | "cmovg" | "cmovge" | "cmovb" | "cmovbe" | "cmova" | "cmovae"
+            | "cmovs" | "cmovns" | "cmovz" | "cmovnz" | "cmovp" | "cmovnp" | "cmovo" | "cmovno"
+            | "cmovc" | "cmovnc" => self.encode_cmovcc(ops, mnemonic),
 
             // Jumps
             // `jmpl` is the explicit 32-bit-operand spelling; in 32-bit
             // mode it is the SAME encoding as `jmp` (pmjump.S: `jmpl *%eax`
             // = ff e0). GAS accepts both spellings interchangeably here.
             "jmp" | "jmpl" => self.encode_jmp(ops),
-            "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge"
-            | "jb" | "jbe" | "ja" | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp"
-            | "jc" | "jnc" => {
+            "je" | "jz" | "jne" | "jnz" | "jl" | "jle" | "jg" | "jge" | "jb" | "jbe" | "ja"
+            | "jae" | "js" | "jns" | "jo" | "jno" | "jp" | "jnp" | "jc" | "jnc" => {
                 self.encode_jcc(ops, mnemonic)
             }
             // GAS accepts every canonical and negated condition-code alias:
@@ -405,7 +425,9 @@ impl InstructionEncoder {
                 // Plain `call` is the mode-default width (rel16 in .code16).
                 // sized_op routes both through the prefix inversion; the
                 // rel width is chosen inside encode_call.
-                if mnemonic == "calll" { self.sized_op = true; }
+                if mnemonic == "calll" {
+                    self.sized_op = true;
+                }
                 self.encode_call(ops)
             }
             // `retl` = explicit 32-bit near return (same C3 byte in 32-bit
@@ -414,8 +436,13 @@ impl InstructionEncoder {
                 // Width follows the suffix. .code32: retw = 66 C3, ret/retl
                 // = C3. .code16 (via the prefix inversion): retl marks
                 // sized_op -> 66 C3 (retl); ret/retw stay C3. GAS verified.
-                if mnemonic == "retw" { self.sized_op = true; self.bytes.push(0x66); }
-                if mnemonic == "retl" { self.sized_op = true; }
+                if mnemonic == "retw" {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                }
+                if mnemonic == "retl" {
+                    self.sized_op = true;
+                }
                 if ops.is_empty() {
                     self.bytes.push(0xC3);
                 } else if let Some(Operand::Immediate(ImmediateValue::Integer(val))) = ops.first() {
@@ -442,22 +469,22 @@ impl InstructionEncoder {
             // offset in the direct form (realmode wakemain.c BIOS video call
             // `lcallw $0xc000, $3` — without this the offset would be encoded
             // as imm32 and the following bytes misinterpreted as code).
-            "lcallw" => {
-                match ops.as_slice() {
-                    [Operand::Immediate(ImmediateValue::Integer(seg)),
-                     Operand::Immediate(ImmediateValue::Integer(off))] => {
-                        self.sized_op = true; self.bytes.push(0x66);
-                        self.bytes.push(0x9A);
-                        self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    _ => {
-                        self.sized_op = true; self.bytes.push(0x66);
-                        self.encode_lcall(ops)
-                    }
+            "lcallw" => match ops.as_slice() {
+                [Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))] =>
+                {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                    self.bytes.push(0x9A);
+                    self.bytes.extend_from_slice(&(*off as u16).to_le_bytes());
+                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                    Ok(())
                 }
-            }
+                _ => {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                    self.encode_lcall(ops)
+                }
+            },
             "lcalll" | "lcall" => self.encode_lcall(ops),
             // Far return
             // IRET / IRETD. Real-mode boot code returns from BIOS interrupts
@@ -519,81 +546,194 @@ impl InstructionEncoder {
             }
 
             // No-ops and misc
-            "nop" => { self.bytes.push(0x90); Ok(()) }
-            "ud2" => { self.bytes.extend_from_slice(&[0x0F, 0x0B]); Ok(()) }
-            "pause" => { self.bytes.extend_from_slice(&[0xF3, 0x90]); Ok(()) }
-            "mfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF0]); Ok(()) }
-            "lfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xE8]); Ok(()) }
-            "sfence" => { self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]); Ok(()) }
+            "nop" => {
+                self.bytes.push(0x90);
+                Ok(())
+            }
+            "ud2" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x0B]);
+                Ok(())
+            }
+            "pause" => {
+                self.bytes.extend_from_slice(&[0xF3, 0x90]);
+                Ok(())
+            }
+            "mfence" => {
+                self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF0]);
+                Ok(())
+            }
+            "lfence" => {
+                self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xE8]);
+                Ok(())
+            }
+            "sfence" => {
+                self.bytes.extend_from_slice(&[0x0F, 0xAE, 0xF8]);
+                Ok(())
+            }
             "clflush" => self.encode_clflush(ops),
             "ldmxcsr" => self.encode_sse_mem_only(ops, 2),
             "stmxcsr" => self.encode_sse_mem_only(ops, 3),
             "int" => self.encode_int(ops),
-            "cpuid" => { self.bytes.extend_from_slice(&[0x0F, 0xA2]); Ok(()) }
-            "rdtsc" => { self.bytes.extend_from_slice(&[0x0F, 0x31]); Ok(()) }
-            "rdtscp" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xF9]); Ok(()) }
+            "cpuid" => {
+                self.bytes.extend_from_slice(&[0x0F, 0xA2]);
+                Ok(())
+            }
+            "rdtsc" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x31]);
+                Ok(())
+            }
+            "rdtscp" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xF9]);
+                Ok(())
+            }
             // RDPID: F3 0F C7 /7 — operand is r32 in 32-bit mode (kernel
             // vdso32 vgetcpu uses `rdpid %ecx`).
-            "rdpid" => {
-                match ops.as_slice() {
-                    [Operand::Register(r)] => {
-                        let num = reg_num(&r.name).ok_or("rdpid: bad register")?;
-                        self.bytes.push(0xF3);
-                        self.bytes.extend_from_slice(&[0x0F, 0xC7]);
-                        self.bytes.push(0xC0 | (7 << 3) | num);
-                        Ok(())
-                    }
-                    _ => Err("rdpid requires one register operand".to_string()),
+            "rdpid" => match ops.as_slice() {
+                [Operand::Register(r)] => {
+                    let num = reg_num(&r.name).ok_or("rdpid: bad register")?;
+                    self.bytes.push(0xF3);
+                    self.bytes.extend_from_slice(&[0x0F, 0xC7]);
+                    self.bytes.push(0xC0 | (7 << 3) | num);
+                    Ok(())
                 }
+                _ => Err("rdpid requires one register operand".to_string()),
+            },
+            "xgetbv" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD0]);
+                Ok(())
             }
-            "xgetbv" => { self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD0]); Ok(()) }
-            "syscall" => { self.bytes.extend_from_slice(&[0x0F, 0x05]); Ok(()) }
-            "sysenter" => { self.bytes.extend_from_slice(&[0x0F, 0x34]); Ok(()) }
-            "hlt" => { self.bytes.push(0xF4); Ok(()) }
-            "emms" => { self.bytes.extend_from_slice(&[0x0F, 0x77]); Ok(()) }
+            "syscall" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x05]);
+                Ok(())
+            }
+            "sysenter" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x34]);
+                Ok(())
+            }
+            "hlt" => {
+                self.bytes.push(0xF4);
+                Ok(())
+            }
+            "emms" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x77]);
+                Ok(())
+            }
             "cmpxchg8b" => self.encode_cmpxchg8b(ops),
-            "rdmsr" => { self.bytes.extend_from_slice(&[0x0F, 0x32]); Ok(()) }
-            "wrmsr" => { self.bytes.extend_from_slice(&[0x0F, 0x30]); Ok(()) }
-            "rdpmc" => { self.bytes.extend_from_slice(&[0x0F, 0x33]); Ok(()) }
-            "wbinvd" => { self.bytes.extend_from_slice(&[0x0F, 0x09]); Ok(()) }
+            "rdmsr" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x32]);
+                Ok(())
+            }
+            "wrmsr" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x30]);
+                Ok(())
+            }
+            "rdpmc" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x33]);
+                Ok(())
+            }
+            "wbinvd" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x09]);
+                Ok(())
+            }
             "invlpg" => self.encode_invlpg(ops),
             "verw" => self.encode_verw(ops),
             "lsl" => self.encode_lsl(ops),
-            "sgdt" | "sgdtl" | "sidt" | "sidtl" | "lgdt" | "lgdtl" | "lidt" | "lidtl" => self.encode_system_table(ops, mnemonic),
+            "sgdt" | "sgdtl" | "sidt" | "sidtl" | "lgdt" | "lgdtl" | "lidt" | "lidtl" => {
+                self.encode_system_table(ops, mnemonic)
+            }
             // 0F 00 /r group: descriptor-table register loads/stores with an
             // r/m16 operand. head_64.S runs `lldt %ax` / `ltr %ax` in its
             // .code32 startup path (clearing LDT, loading the boot TSS).
             "sldt" => self.encode_system_reg16(ops, 0),
             "lldt" => self.encode_system_reg16(ops, 2),
             "ltr" => self.encode_system_reg16(ops, 3),
-            "str" if ops.len() == 1 && matches!(&ops[0], Operand::Register(_)) => self.encode_system_reg16(ops, 1),
+            "str" if ops.len() == 1 && matches!(&ops[0], Operand::Register(_)) => {
+                self.encode_system_reg16(ops, 1)
+            }
             "lmsw" => self.encode_lmsw(ops),
             "smsw" => self.encode_smsw(ops),
 
             // Standalone prefix mnemonics (e.g. from "rep; nop" split on semicolon)
-            "lock" if ops.is_empty() => { self.bytes.push(0xF0); Ok(()) }
-            "rep" | "repe" | "repz" if ops.is_empty() => { self.bytes.push(0xF3); Ok(()) }
-            "repnz" | "repne" if ops.is_empty() => { self.bytes.push(0xF2); Ok(()) }
+            "lock" if ops.is_empty() => {
+                self.bytes.push(0xF0);
+                Ok(())
+            }
+            "rep" | "repe" | "repz" if ops.is_empty() => {
+                self.bytes.push(0xF3);
+                Ok(())
+            }
+            "repnz" | "repne" if ops.is_empty() => {
+                self.bytes.push(0xF2);
+                Ok(())
+            }
 
             // String ops
-            "movsb" if ops.is_empty() => { self.bytes.push(0xA4); Ok(()) }
-            "movsl" if ops.is_empty() => { self.bytes.push(0xA5); Ok(()) }
-            "stosb" => { self.bytes.push(0xAA); Ok(()) }
-            "stosl" => { self.bytes.push(0xAB); Ok(()) }
-            "cmpsb" => { self.bytes.push(0xA6); Ok(()) }
-            "cmpsl" => { self.bytes.push(0xA7); Ok(()) }
-            "scasb" => { self.bytes.push(0xAE); Ok(()) }
-            "scasl" => { self.bytes.push(0xAF); Ok(()) }
-            "lodsb" => { self.bytes.push(0xAC); Ok(()) }
-            "lodsl" => { self.bytes.push(0xAD); Ok(()) }
+            "movsb" if ops.is_empty() => {
+                self.bytes.push(0xA4);
+                Ok(())
+            }
+            "movsl" if ops.is_empty() => {
+                self.bytes.push(0xA5);
+                Ok(())
+            }
+            "stosb" => {
+                self.bytes.push(0xAA);
+                Ok(())
+            }
+            "stosl" => {
+                self.bytes.push(0xAB);
+                Ok(())
+            }
+            "cmpsb" => {
+                self.bytes.push(0xA6);
+                Ok(())
+            }
+            "cmpsl" => {
+                self.bytes.push(0xA7);
+                Ok(())
+            }
+            "scasb" => {
+                self.bytes.push(0xAE);
+                Ok(())
+            }
+            "scasl" => {
+                self.bytes.push(0xAF);
+                Ok(())
+            }
+            "lodsb" => {
+                self.bytes.push(0xAC);
+                Ok(())
+            }
+            "lodsl" => {
+                self.bytes.push(0xAD);
+                Ok(())
+            }
 
             // I/O string ops
-            "insb" => { self.bytes.push(0x6C); Ok(()) }
-            "insw" => { self.bytes.extend_from_slice(&[0x66, 0x6D]); Ok(()) }
-            "insl" => { self.bytes.push(0x6D); Ok(()) }
-            "outsb" => { self.bytes.push(0x6E); Ok(()) }
-            "outsw" => { self.bytes.extend_from_slice(&[0x66, 0x6F]); Ok(()) }
-            "outsl" => { self.bytes.push(0x6F); Ok(()) }
+            "insb" => {
+                self.bytes.push(0x6C);
+                Ok(())
+            }
+            "insw" => {
+                self.bytes.extend_from_slice(&[0x66, 0x6D]);
+                Ok(())
+            }
+            "insl" => {
+                self.bytes.push(0x6D);
+                Ok(())
+            }
+            "outsb" => {
+                self.bytes.push(0x6E);
+                Ok(())
+            }
+            "outsw" => {
+                self.bytes.extend_from_slice(&[0x66, 0x6F]);
+                Ok(())
+            }
+            "outsl" => {
+                self.bytes.push(0x6F);
+                Ok(())
+            }
 
             // Port I/O instructions
             "outb" | "outw" | "outl" => self.encode_out(ops, mnemonic),
@@ -683,8 +823,12 @@ impl InstructionEncoder {
             "cvtss2sd" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5A]),
             "cvtsi2sdl" | "cvtsi2sd" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF2, 0x0F, 0x2A]),
             "cvtsi2ssl" | "cvtsi2ss" => self.encode_sse_cvt_gp_to_xmm(ops, &[0xF3, 0x0F, 0x2A]),
-            "cvttsd2sil" | "cvttsd2si" | "cvtsd2sil" | "cvtsd2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C]),
-            "cvttss2sil" | "cvttss2si" | "cvtss2sil" | "cvtss2si" => self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C]),
+            "cvttsd2sil" | "cvttsd2si" | "cvtsd2sil" | "cvtsd2si" => {
+                self.encode_sse_cvt_xmm_to_gp(ops, &[0xF2, 0x0F, 0x2C])
+            }
+            "cvttss2sil" | "cvttss2si" | "cvtss2sil" | "cvtss2si" => {
+                self.encode_sse_cvt_xmm_to_gp(ops, &[0xF3, 0x0F, 0x2C])
+            }
             "cvtps2pd" => self.encode_sse_op(ops, &[0x0F, 0x5A]),
             "cvtpd2ps" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5A]),
             "cvtdq2ps" => self.encode_sse_op(ops, &[0x0F, 0x5B]),
@@ -796,51 +940,164 @@ impl InstructionEncoder {
             "fistpq" => self.encode_x87_mem(ops, &[0xDF], 7),
             "fisttpq" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fisttpl" => self.encode_x87_mem(ops, &[0xDB], 1),
-            "faddp" => { self.bytes.extend_from_slice(&[0xDE, 0xC1]); Ok(()) }
+            "faddp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xC1]);
+                Ok(())
+            }
             // Note: AT&T syntax swaps the meaning of fsub/fsubr and fdiv/fdivr
             // relative to Intel mnemonics for the *p (pop) forms.
             // GAS: fsubp = DE E1, fsubrp = DE E9, fdivp = DE F1, fdivrp = DE F9
-            "fsubp" => { self.bytes.extend_from_slice(&[0xDE, 0xE1]); Ok(()) }
-            "fsubrp" => { self.bytes.extend_from_slice(&[0xDE, 0xE9]); Ok(()) }
-            "fmulp" => { self.bytes.extend_from_slice(&[0xDE, 0xC9]); Ok(()) }
-            "fdivp" => { self.bytes.extend_from_slice(&[0xDE, 0xF1]); Ok(()) }
-            "fdivrp" => { self.bytes.extend_from_slice(&[0xDE, 0xF9]); Ok(()) }
-            "fchs" => { self.bytes.extend_from_slice(&[0xD9, 0xE0]); Ok(()) }
-            "fabs" => { self.bytes.extend_from_slice(&[0xD9, 0xE1]); Ok(()) }
-            "fsqrt" => { self.bytes.extend_from_slice(&[0xD9, 0xFA]); Ok(()) }
-            "fsin" => { self.bytes.extend_from_slice(&[0xD9, 0xFE]); Ok(()) }
-            "fcos" => { self.bytes.extend_from_slice(&[0xD9, 0xFF]); Ok(()) }
-            "fpatan" => { self.bytes.extend_from_slice(&[0xD9, 0xF3]); Ok(()) }
-            "fptan" => { self.bytes.extend_from_slice(&[0xD9, 0xF2]); Ok(()) }
-            "fprem" => { self.bytes.extend_from_slice(&[0xD9, 0xF8]); Ok(()) }
-            "fprem1" => { self.bytes.extend_from_slice(&[0xD9, 0xF5]); Ok(()) }
-            "frndint" => { self.bytes.extend_from_slice(&[0xD9, 0xFC]); Ok(()) }
-            "fscale" => { self.bytes.extend_from_slice(&[0xD9, 0xFD]); Ok(()) }
-            "f2xm1" => { self.bytes.extend_from_slice(&[0xD9, 0xF0]); Ok(()) }
-            "fyl2x" => { self.bytes.extend_from_slice(&[0xD9, 0xF1]); Ok(()) }
-            "fyl2xp1" => { self.bytes.extend_from_slice(&[0xD9, 0xF9]); Ok(()) }
-            "fld1" => { self.bytes.extend_from_slice(&[0xD9, 0xE8]); Ok(()) }
-            "fldl2e" => { self.bytes.extend_from_slice(&[0xD9, 0xEA]); Ok(()) }
-            "fldl2t" => { self.bytes.extend_from_slice(&[0xD9, 0xE9]); Ok(()) }
-            "fldlg2" => { self.bytes.extend_from_slice(&[0xD9, 0xEC]); Ok(()) }
-            "fldln2" => { self.bytes.extend_from_slice(&[0xD9, 0xED]); Ok(()) }
-            "fldpi" => { self.bytes.extend_from_slice(&[0xD9, 0xEB]); Ok(()) }
-            "fldz" => { self.bytes.extend_from_slice(&[0xD9, 0xEE]); Ok(()) }
+            "fsubp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xE1]);
+                Ok(())
+            }
+            "fsubrp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xE9]);
+                Ok(())
+            }
+            "fmulp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xC9]);
+                Ok(())
+            }
+            "fdivp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xF1]);
+                Ok(())
+            }
+            "fdivrp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xF9]);
+                Ok(())
+            }
+            "fchs" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE0]);
+                Ok(())
+            }
+            "fabs" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE1]);
+                Ok(())
+            }
+            "fsqrt" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFA]);
+                Ok(())
+            }
+            "fsin" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFE]);
+                Ok(())
+            }
+            "fcos" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFF]);
+                Ok(())
+            }
+            "fpatan" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF3]);
+                Ok(())
+            }
+            "fptan" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF2]);
+                Ok(())
+            }
+            "fprem" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF8]);
+                Ok(())
+            }
+            "fprem1" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF5]);
+                Ok(())
+            }
+            "frndint" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFC]);
+                Ok(())
+            }
+            "fscale" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFD]);
+                Ok(())
+            }
+            "f2xm1" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF0]);
+                Ok(())
+            }
+            "fyl2x" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF1]);
+                Ok(())
+            }
+            "fyl2xp1" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF9]);
+                Ok(())
+            }
+            "fld1" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE8]);
+                Ok(())
+            }
+            "fldl2e" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xEA]);
+                Ok(())
+            }
+            "fldl2t" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE9]);
+                Ok(())
+            }
+            "fldlg2" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xEC]);
+                Ok(())
+            }
+            "fldln2" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xED]);
+                Ok(())
+            }
+            "fldpi" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xEB]);
+                Ok(())
+            }
+            "fldz" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xEE]);
+                Ok(())
+            }
             "fnstsw" => self.encode_fnstsw(ops),
             "fstsw" => self.encode_fstsw(ops),
             "fnstcw" => self.encode_x87_mem(ops, &[0xD9], 7),
             "fstcw" => self.encode_x87_wait_mem(ops, &[0xD9], 7),
             "fldcw" => self.encode_x87_mem(ops, &[0xD9], 5),
-            "fwait" | "wait" => { self.bytes.push(0x9B); Ok(()) }
-            "fnclex" => { self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
-            "fclex" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE2]); Ok(()) }
-            "fninit" => { self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
-            "finit" => { self.bytes.push(0x9B); self.bytes.extend_from_slice(&[0xDB, 0xE3]); Ok(()) }
-            "ftst" => { self.bytes.extend_from_slice(&[0xD9, 0xE4]); Ok(()) }
-            "fxam" => { self.bytes.extend_from_slice(&[0xD9, 0xE5]); Ok(()) }
-            "fnop" => { self.bytes.extend_from_slice(&[0xD9, 0xD0]); Ok(()) }
-            "fincstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF7]); Ok(()) }
-            "fdecstp" => { self.bytes.extend_from_slice(&[0xD9, 0xF6]); Ok(()) }
+            "fwait" | "wait" => {
+                self.bytes.push(0x9B);
+                Ok(())
+            }
+            "fnclex" => {
+                self.bytes.extend_from_slice(&[0xDB, 0xE2]);
+                Ok(())
+            }
+            "fclex" => {
+                self.bytes.push(0x9B);
+                self.bytes.extend_from_slice(&[0xDB, 0xE2]);
+                Ok(())
+            }
+            "fninit" => {
+                self.bytes.extend_from_slice(&[0xDB, 0xE3]);
+                Ok(())
+            }
+            "finit" => {
+                self.bytes.push(0x9B);
+                self.bytes.extend_from_slice(&[0xDB, 0xE3]);
+                Ok(())
+            }
+            "ftst" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE4]);
+                Ok(())
+            }
+            "fxam" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xE5]);
+                Ok(())
+            }
+            "fnop" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xD0]);
+                Ok(())
+            }
+            "fincstp" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF7]);
+                Ok(())
+            }
+            "fdecstp" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF6]);
+                Ok(())
+            }
             "fcomip" => self.encode_fcomip(ops),
             "fucomip" => self.encode_fucomip(ops),
             "fucomi" => self.encode_fucomi(ops),
@@ -869,7 +1126,10 @@ impl InstructionEncoder {
             "fdiv" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF0),
 
             // x87 additional
-            "fxtract" => { self.bytes.extend_from_slice(&[0xD9, 0xF4]); Ok(()) }
+            "fxtract" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xF4]);
+                Ok(())
+            }
             "fnstenv" => self.encode_x87_mem(ops, &[0xD9], 6),
             "fstenv" => self.encode_x87_wait_mem(ops, &[0xD9], 6),
             "fldenv" => self.encode_x87_mem(ops, &[0xD9], 4),
@@ -879,9 +1139,18 @@ impl InstructionEncoder {
             "ffree" => self.encode_x87_st_i(ops, &[0xDD], 0xC0, "ffree"),
             "fcom" => self.encode_fcom(ops),
             "fcomp" => self.encode_fcomp(ops),
-            "fcompp" => { self.bytes.extend_from_slice(&[0xDE, 0xD9]); Ok(()) }
-            "fucompp" => { self.bytes.extend_from_slice(&[0xDA, 0xE9]); Ok(()) }
-            "fsincos" => { self.bytes.extend_from_slice(&[0xD9, 0xFB]); Ok(()) }
+            "fcompp" => {
+                self.bytes.extend_from_slice(&[0xDE, 0xD9]);
+                Ok(())
+            }
+            "fucompp" => {
+                self.bytes.extend_from_slice(&[0xDA, 0xE9]);
+                Ok(())
+            }
+            "fsincos" => {
+                self.bytes.extend_from_slice(&[0xD9, 0xFB]);
+                Ok(())
+            }
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
             "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
             "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
@@ -889,25 +1158,58 @@ impl InstructionEncoder {
             "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
 
             // Flag manipulation
-            "cld" => { self.bytes.push(0xFC); Ok(()) }
-            "std" => { self.bytes.push(0xFD); Ok(()) }
-            "clc" => { self.bytes.push(0xF8); Ok(()) }
-            "stc" => { self.bytes.push(0xF9); Ok(()) }
-            "cmc" => { self.bytes.push(0xF5); Ok(()) }
-            "cli" => { self.bytes.push(0xFA); Ok(()) }
-            "sti" => { self.bytes.push(0xFB); Ok(()) }
-            "sahf" => { self.bytes.push(0x9E); Ok(()) }
-            "lahf" => { self.bytes.push(0x9F); Ok(()) }
+            "cld" => {
+                self.bytes.push(0xFC);
+                Ok(())
+            }
+            "std" => {
+                self.bytes.push(0xFD);
+                Ok(())
+            }
+            "clc" => {
+                self.bytes.push(0xF8);
+                Ok(())
+            }
+            "stc" => {
+                self.bytes.push(0xF9);
+                Ok(())
+            }
+            "cmc" => {
+                self.bytes.push(0xF5);
+                Ok(())
+            }
+            "cli" => {
+                self.bytes.push(0xFA);
+                Ok(())
+            }
+            "sti" => {
+                self.bytes.push(0xFB);
+                Ok(())
+            }
+            "sahf" => {
+                self.bytes.push(0x9E);
+                Ok(())
+            }
+            "lahf" => {
+                self.bytes.push(0x9F);
+                Ok(())
+            }
             "pushf" | "pushfl" => {
                 // The 'l' spelling selects the 32-bit form — a real size
                 // choice, so it participates in the .code16 inversion
                 // (wakeup_asm.S pushfl = 66 9c in real mode).
-                if mnemonic == "pushfl" { self.sized_op = true; }
-                self.bytes.push(0x9C); Ok(())
+                if mnemonic == "pushfl" {
+                    self.sized_op = true;
+                }
+                self.bytes.push(0x9C);
+                Ok(())
             }
             "popf" | "popfl" => {
-                if mnemonic == "popfl" { self.sized_op = true; }
-                self.bytes.push(0x9D); Ok(())
+                if mnemonic == "popfl" {
+                    self.sized_op = true;
+                }
+                self.bytes.push(0x9D);
+                Ok(())
             }
             // PUSHA/POPA (60/61): push/pop all eight GP registers. 32-bit
             // only (invalid in 64-bit mode — correctly absent from the x86-64
@@ -915,24 +1217,45 @@ impl InstructionEncoder {
             // register file around INT calls (arch/x86/boot/bioscall.S).
             // `pushaw`/`popaw` are the 16-bit-operand forms (0x66 prefix).
             "pusha" | "pushal" => {
-                if mnemonic == "pushal" { self.sized_op = true; }
-                self.bytes.push(0x60); Ok(())
+                if mnemonic == "pushal" {
+                    self.sized_op = true;
+                }
+                self.bytes.push(0x60);
+                Ok(())
             }
             "popa" | "popal" => {
-                if mnemonic == "popal" { self.sized_op = true; }
-                self.bytes.push(0x61); Ok(())
+                if mnemonic == "popal" {
+                    self.sized_op = true;
+                }
+                self.bytes.push(0x61);
+                Ok(())
             }
-            "pushaw" => { self.bytes.extend_from_slice(&[0x66, 0x60]); Ok(()) }
-            "popaw" => { self.bytes.extend_from_slice(&[0x66, 0x61]); Ok(()) }
+            "pushaw" => {
+                self.bytes.extend_from_slice(&[0x66, 0x60]);
+                Ok(())
+            }
+            "popaw" => {
+                self.bytes.extend_from_slice(&[0x66, 0x61]);
+                Ok(())
+            }
 
             // Leave (stack frame teardown)
-            "leave" => { self.bytes.push(0xC9); Ok(()) }
+            "leave" => {
+                self.bytes.push(0xC9);
+                Ok(())
+            }
 
             // int3 (explicit breakpoint mnemonic)
-            "int3" => { self.bytes.push(0xCC); Ok(()) }
+            "int3" => {
+                self.bytes.push(0xCC);
+                Ok(())
+            }
 
             // Endbr32 (CET)
-            "endbr32" => { self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFB]); Ok(()) }
+            "endbr32" => {
+                self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x1E, 0xFB]);
+                Ok(())
+            }
 
             // SSE packed float arithmetic
             "addpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x58]),
@@ -962,9 +1285,18 @@ impl InstructionEncoder {
             "pmulhrsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x0B]),
 
             // SSE4.1 blend
-            "blendvpd" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x15]) }
-            "blendvps" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x14]) }
-            "pblendvb" => { let ops2 = if ops.len() == 3 { &ops[1..] } else { ops }; self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x10]) }
+            "blendvpd" => {
+                let ops2 = if ops.len() == 3 { &ops[1..] } else { ops };
+                self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x15])
+            }
+            "blendvps" => {
+                let ops2 = if ops.len() == 3 { &ops[1..] } else { ops };
+                self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x14])
+            }
+            "pblendvb" => {
+                let ops2 = if ops.len() == 3 { &ops[1..] } else { ops };
+                self.encode_sse_op(ops2, &[0x66, 0x0F, 0x38, 0x10])
+            }
             "roundsd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0B]),
             "roundss" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0A]),
             "roundpd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x09]),
@@ -1032,24 +1364,52 @@ impl InstructionEncoder {
             "rcrb" | "rcrw" | "rcrl" | "rcr" => self.encode_shift(ops, mnemonic, 3),
 
             // 16-bit string operations
-            "movsw" if ops.is_empty() => { self.bytes.extend_from_slice(&[0x66, 0xA5]); Ok(()) }
-            "stosw" => { self.bytes.extend_from_slice(&[0x66, 0xAB]); Ok(()) }
-            "lodsw" => { self.bytes.extend_from_slice(&[0x66, 0xAD]); Ok(()) }
-            "scasw" => { self.bytes.extend_from_slice(&[0x66, 0xAF]); Ok(()) }
-            "cmpsw" => { self.bytes.extend_from_slice(&[0x66, 0xA7]); Ok(()) }
+            "movsw" if ops.is_empty() => {
+                self.bytes.extend_from_slice(&[0x66, 0xA5]);
+                Ok(())
+            }
+            "stosw" => {
+                self.bytes.extend_from_slice(&[0x66, 0xAB]);
+                Ok(())
+            }
+            "lodsw" => {
+                self.bytes.extend_from_slice(&[0x66, 0xAD]);
+                Ok(())
+            }
+            "scasw" => {
+                self.bytes.extend_from_slice(&[0x66, 0xAF]);
+                Ok(())
+            }
+            "cmpsw" => {
+                self.bytes.extend_from_slice(&[0x66, 0xA7]);
+                Ok(())
+            }
 
             // Additional multiply/divide sizes
             "mulb" => self.encode_unary_rm(ops, 4, 1),
-            "mulw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 4, 2) }
-            "divw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 6, 2) }
+            "mulw" => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.encode_unary_rm(ops, 4, 2)
+            }
+            "divw" => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.encode_unary_rm(ops, 6, 2)
+            }
             "divb" => self.encode_unary_rm(ops, 6, 1),
-            "idivw" => { self.sized_op = true; self.bytes.push(0x66); self.encode_unary_rm(ops, 7, 2) }
+            "idivw" => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.encode_unary_rm(ops, 7, 2)
+            }
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "imulw" => self.encode_imul(ops, 2),
 
-            _ => {
-                Err(format!("unhandled i686 instruction: {} {:?}", mnemonic, ops))
-            }
+            _ => Err(format!(
+                "unhandled i686 instruction: {} {:?}",
+                mnemonic, ops
+            )),
         }
     }
 }

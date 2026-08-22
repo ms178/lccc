@@ -20,18 +20,11 @@
 //! with a single pointer addition. The dead multiply and cast are then removed
 //! by subsequent DCE.
 
+use super::loop_analysis::{self, NaturalLoop};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrConst,
-    IrFunction,
-    Operand,
-    Value,
-};
-use super::loop_analysis::{self, NaturalLoop};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Maximum byte stride eligible for pointer induction. Matrix row strides are
 /// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
@@ -92,7 +85,8 @@ pub(crate) fn ivsr_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     }
 
     // Find natural loops
-    let loops = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+    let loops =
+        loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
     if loops.is_empty() {
         return 0;
     }
@@ -116,7 +110,9 @@ pub(crate) fn ivsr_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     let mut kept_bodies: Vec<FxHashSet<usize>> = Vec::new();
 
     for natural_loop in &sorted_loops {
-        let overlaps_kept = kept_bodies.iter().any(|kept| !kept.is_disjoint(&natural_loop.body));
+        let overlaps_kept = kept_bodies
+            .iter()
+            .any(|kept| !kept.is_disjoint(&natural_loop.body));
         if overlaps_kept {
             if debug {
                 eprintln!(
@@ -150,13 +146,16 @@ fn reduce_loop(
     let preheader = match loop_analysis::find_preheader(header, &natural_loop.body, preds) {
         Some(ph) => ph,
         None => {
-            if dbg { eprintln!("[IVSR] header={} no preheader", header); }
+            if dbg {
+                eprintln!("[IVSR] header={} no preheader", header);
+            }
             return 0;
         }
     };
 
     // Find back-edge blocks (predecessors of header that are inside the loop)
-    let back_blocks: Vec<usize> = preds.row(header)
+    let back_blocks: Vec<usize> = preds
+        .row(header)
         .iter()
         .map(|&p| p as usize)
         .filter(|p| natural_loop.body.contains(p))
@@ -164,25 +163,35 @@ fn reduce_loop(
 
     // Only handle simple single-latch loops
     if back_blocks.len() != 1 {
-        if dbg { eprintln!("[IVSR] header={} back_blocks={}", header, back_blocks.len()); }
+        if dbg {
+            eprintln!("[IVSR] header={} back_blocks={}", header, back_blocks.len());
+        }
         return 0;
     }
 
     // Step 1: Identify basic induction variables from phi nodes in the header.
     let basic_ivs = find_basic_ivs(func, header, &natural_loop.body, preheader, &back_blocks);
     if basic_ivs.is_empty() {
-        if dbg { eprintln!("[IVSR] header={} no basic ivs", header); }
+        if dbg {
+            eprintln!("[IVSR] header={} no basic ivs", header);
+        }
         return 0;
     }
-    if dbg { eprintln!("[IVSR] header={} ivs={}", header, basic_ivs.len()); }
+    if dbg {
+        eprintln!("[IVSR] header={} ivs={}", header, basic_ivs.len());
+    }
 
     // Step 2: Find derived expressions (iv * const) used in GEPs.
     let derived = find_derived_exprs(func, &basic_ivs, &natural_loop.body);
     if derived.is_empty() {
-        if dbg { eprintln!("[IVSR] header={} no derived exprs", header); }
+        if dbg {
+            eprintln!("[IVSR] header={} no derived exprs", header);
+        }
         return 0;
     }
-    if dbg { eprintln!("[IVSR] header={} derived={}", header, derived.len()); }
+    if dbg {
+        eprintln!("[IVSR] header={} derived={}", header, derived.len());
+    }
 
     // Step 3: Apply strength reduction transformations.
     let mut reductions = 0;
@@ -201,9 +210,16 @@ fn reduce_loop(
     let mut pointer_groups: Vec<(usize, i64, i64, Value, Vec<(usize, usize, Value)>)> = Vec::new();
     for d in &derived {
         for &(gep_block_idx, gep_inst_idx, gep_dest, gep_base) in &d.gep_uses {
-            if let Some((_, _, _, _, uses)) = pointer_groups.iter_mut().find(|(iv_index, stride, off, base, _)| {
-                *iv_index == d.iv_index && *stride == d.stride && *off == d.add_offset && *base == gep_base
-            }) {
+            if let Some((_, _, _, _, uses)) =
+                pointer_groups
+                    .iter_mut()
+                    .find(|(iv_index, stride, off, base, _)| {
+                        *iv_index == d.iv_index
+                            && *stride == d.stride
+                            && *off == d.add_offset
+                            && *base == gep_base
+                    })
+            {
                 uses.push((gep_block_idx, gep_inst_idx, gep_dest));
             } else {
                 pointer_groups.push((
@@ -360,9 +376,9 @@ fn reduce_loop(
         for inst in preheader_insts {
             func.blocks[preheader].instructions.push(inst);
             if ph_has_spans {
-                func.blocks[preheader].source_spans.push(
-                    crate::common::source::Span::dummy(),
-                );
+                func.blocks[preheader]
+                    .source_spans
+                    .push(crate::common::source::Span::dummy());
             }
         }
 
@@ -372,7 +388,9 @@ fn reduce_loop(
             .iter()
             .position(|inst| !matches!(inst, Instruction::Phi { .. }))
             .unwrap_or(func.blocks[header].instructions.len());
-        func.blocks[header].instructions.insert(insert_pos, phi_inst);
+        func.blocks[header]
+            .instructions
+            .insert(insert_pos, phi_inst);
         if hdr_has_spans {
             func.blocks[header]
                 .source_spans
@@ -402,11 +420,10 @@ fn reduce_loop(
                 let inst = &func.blocks[gep_block_idx].instructions[adjusted_idx];
                 if let Some(dest) = inst.dest() {
                     if dest == gep_dest {
-                        func.blocks[gep_block_idx].instructions[adjusted_idx] =
-                            Instruction::Copy {
-                                dest: gep_dest,
-                                src: Operand::Value(ptr_iv_val),
-                            };
+                        func.blocks[gep_block_idx].instructions[adjusted_idx] = Instruction::Copy {
+                            dest: gep_dest,
+                            src: Operand::Value(ptr_iv_val),
+                        };
                         reductions += 1;
                     }
                 }
@@ -458,7 +475,8 @@ fn find_basic_ivs(
             let mut back_val = None;
 
             for (op, block_id) in incoming {
-                let bi_opt = func.blocks
+                let bi_opt = func
+                    .blocks
                     .iter()
                     .enumerate()
                     .find(|(_, b)| b.label == *block_id)
@@ -552,7 +570,12 @@ fn find_derived_exprs(
             }
             for inst in &func.blocks[bi].instructions {
                 match inst {
-                    Instruction::Cast { dest, src: Operand::Value(v), from_ty, to_ty } => {
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(v),
+                        from_ty,
+                        to_ty,
+                    } => {
                         // Only treat widening casts as IV-derived.
                         // Truncating casts (e.g. I32->U8) change the value
                         // and must not be strength-reduced as if linear.
@@ -565,7 +588,10 @@ fn find_derived_exprs(
                             }
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(v) } => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(v),
+                    } => {
                         let idx = iv_values.get(&v.0).or_else(|| iv_derived.get(&v.0));
                         if let Some(&iv_idx) = idx {
                             if !iv_derived.contains_key(&dest.0) {
@@ -587,7 +613,10 @@ fn find_derived_exprs(
 
     // Look up whether a value derives from an IV
     let find_iv = |val_id: u32| -> Option<usize> {
-        iv_values.get(&val_id).or_else(|| iv_derived.get(&val_id)).copied()
+        iv_values
+            .get(&val_id)
+            .or_else(|| iv_derived.get(&val_id))
+            .copied()
     };
     // Affine form: `add(iv, k)` (or `add(k, iv)`) — recognized so that
     // `(iv + k) * stride` strength-reduces with an initial offset of k*stride.
@@ -600,7 +629,13 @@ fn find_derived_exprs(
                 if inst.dest() != Some(Value(val_id)) {
                     continue;
                 }
-                if let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } = inst {
+                if let Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } = inst
+                {
                     if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
                         if let (Some(idx), Some(k)) = (find_iv(v.0), c.to_i64()) {
                             return Some((idx, k));
@@ -619,7 +654,11 @@ fn find_derived_exprs(
     if std::env::var("CCC_IVSR_DEBUG").is_ok() {
         let mut d: Vec<u32> = iv_derived.keys().copied().collect();
         d.sort_unstable();
-        eprintln!("[IVSR-DERIV] iv_values={:?} iv_derived={:?}", iv_values.keys().collect::<Vec<_>>(), d);
+        eprintln!(
+            "[IVSR-DERIV] iv_values={:?} iv_derived={:?}",
+            iv_values.keys().collect::<Vec<_>>(),
+            d
+        );
     }
 
     // Find multiplications/shifts of IV values by constants
@@ -629,35 +668,52 @@ fn find_derived_exprs(
         }
         for inst in func.blocks[bi].instructions.iter() {
             if std::env::var("CCC_IVSR_DEBUG").is_ok() {
-                eprintln!("[IVSR-DERIV] b{} label={} inst={:?}", bi, func.blocks[bi].label.0, std::mem::discriminant(inst));
-                if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
-                    eprintln!("[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}", bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs);
+                eprintln!(
+                    "[IVSR-DERIV] b{} label={} inst={:?}",
+                    bi,
+                    func.blocks[bi].label.0,
+                    std::mem::discriminant(inst)
+                );
+                if let Instruction::BinOp {
+                    dest, op, lhs, rhs, ..
+                } = inst
+                {
+                    eprintln!(
+                        "[IVSR-DERIV] b{} label={} BinOp v{} op={:?} lhs={:?} rhs={:?}",
+                        bi, func.blocks[bi].label.0, dest.0, op, lhs, rhs
+                    );
                 }
             }
             let (mul_dest, iv_idx, stride, add_offset) = match inst {
                 // Multiply by constant (plain `iv * s`, or affine
                 // `(iv + k) * s` via find_affine).
                 Instruction::BinOp {
-                    dest, op: IrBinOp::Mul, lhs, rhs, ..
-                } => {
-                    match (lhs, rhs) {
-                        (Operand::Value(v), Operand::Const(c))
-                        | (Operand::Const(c), Operand::Value(v)) => {
-                            let s = c.to_i64();
-                            if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
-                                (*dest, idx, s, 0)
-                            } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
-                                (*dest, idx, s, k)
-                            } else {
-                                continue;
-                            }
+                    dest,
+                    op: IrBinOp::Mul,
+                    lhs,
+                    rhs,
+                    ..
+                } => match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(c))
+                    | (Operand::Const(c), Operand::Value(v)) => {
+                        let s = c.to_i64();
+                        if let (Some(idx), Some(s)) = (find_iv(v.0), s) {
+                            (*dest, idx, s, 0)
+                        } else if let (Some((idx, k)), Some(s)) = (find_affine(v.0), s) {
+                            (*dest, idx, s, k)
+                        } else {
+                            continue;
                         }
-                        _ => continue,
                     }
-                }
+                    _ => continue,
+                },
                 // Shift left by constant (= multiply by 2^k)
                 Instruction::BinOp {
-                    dest, op: IrBinOp::Shl, lhs: Operand::Value(v), rhs: Operand::Const(c), ..
+                    dest,
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(v),
+                    rhs: Operand::Const(c),
+                    ..
                 } => {
                     if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
                         if (0..64).contains(&shift) {
@@ -731,7 +787,10 @@ fn find_derived_exprs(
                     gep_uses,
                 });
             } else if std::env::var("CCC_IVSR_DEBUG").is_ok() {
-                eprintln!("[IVSR-DERIV] mul v{} stride {} has no GEP uses", mul_dest.0, stride);
+                eprintln!(
+                    "[IVSR-DERIV] mul v{} stride {} has no GEP uses",
+                    mul_dest.0, stride
+                );
             }
         }
     }
@@ -746,8 +805,14 @@ fn look_through_casts(val_id: u32, loop_defs: &FxHashMap<u32, &Instruction>) -> 
     for _ in 0..MAX_CAST_CHAIN_LENGTH {
         if let Some(inst) = loop_defs.get(&current) {
             match inst {
-                Instruction::Cast { src: Operand::Value(v), .. }
-                | Instruction::Copy { src: Operand::Value(v), .. } => {
+                Instruction::Cast {
+                    src: Operand::Value(v),
+                    ..
+                }
+                | Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } => {
                     current = v.0;
                 }
                 _ => break,
@@ -822,7 +887,9 @@ mod tests {
         // Simulate sorted asc processing: inner first, then outer, then separate
         let mut kept: Vec<FxHashSet<usize>> = Vec::new();
         // inner does not overlap kept (empty) -> keep
-        assert!(!kept.iter().any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body)));
+        assert!(!kept
+            .iter()
+            .any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body)));
         kept.push(inner.body.clone());
         // outer overlaps kept inner -> should be skipped
         assert!(kept.iter().any(|b| !b.is_disjoint(&outer.body)));
@@ -981,7 +1048,8 @@ mod tests {
                     offset: Operand::Value(Value(6)),
                     ty: IrType::I32,
                 },
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(8),
                     ptr: Value(7),
                     ty: IrType::I32,
@@ -1003,7 +1071,8 @@ mod tests {
                     offset: Operand::Value(Value(11)),
                     ty: IrType::I32,
                 },
-                Instruction::Load { volatile: false,
+                Instruction::Load {
+                    volatile: false,
                     dest: Value(13),
                     ptr: Value(12),
                     ty: IrType::I32,
@@ -1058,12 +1127,17 @@ mod tests {
             .instructions
             .iter()
             .filter_map(|i| match i {
-                Instruction::Copy { dest, src: Operand::Value(src) }
-                    if *dest == Value(7) || *dest == Value(12) => Some((*dest, *src)),
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } if *dest == Value(7) || *dest == Value(12) => Some((*dest, *src)),
                 _ => None,
             })
             .collect();
         assert_eq!(body_copies.len(), 2, "Expected both GEPs to become Copies");
-        assert_eq!(body_copies[0].1, body_copies[1].1, "Expected one shared pointer IV");
+        assert_eq!(
+            body_copies[0].1, body_copies[1].1,
+            "Expected one shared pointer IV"
+        );
     }
 }

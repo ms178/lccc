@@ -46,8 +46,12 @@ impl super::InstructionEncoder {
 
         // Handle zero-operand form (implicit operands)
         if ops.is_empty() {
-            if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+            if size == 2 || size == 4 {
+                self.sized_op = true;
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            }
             self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
             return Ok(());
         }
@@ -58,14 +62,22 @@ impl super::InstructionEncoder {
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 {
+                    self.sized_op = true;
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
             (Operand::Register(_src), Operand::Immediate(ImmediateValue::Integer(val))) => {
-                if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 {
+                    self.sized_op = true;
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -84,8 +96,12 @@ impl super::InstructionEncoder {
         };
 
         if ops.is_empty() {
-            if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+            if size == 2 || size == 4 {
+                self.sized_op = true;
+            }
+            if size == 2 {
+                self.bytes.push(0x66);
+            }
             self.bytes.push(if size == 1 { 0xEC } else { 0xED });
             return Ok(());
         }
@@ -96,14 +112,22 @@ impl super::InstructionEncoder {
 
         match (&ops[0], &ops[1]) {
             (Operand::Register(_src), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 {
+                    self.sized_op = true;
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_dst)) => {
-                if size == 2 || size == 4 { self.sized_op = true; }
-        if size == 2 { self.bytes.push(0x66); }
+                if size == 2 || size == 4 {
+                    self.sized_op = true;
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -155,9 +179,13 @@ impl super::InstructionEncoder {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let is_16 = matches!(src.name.as_str(), "ax"|"bx"|"cx"|"dx"|"si"|"di"|"sp"|"bp");
+                let is_16 = matches!(
+                    src.name.as_str(),
+                    "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
+                );
                 if is_16 {
-                    self.sized_op = true; self.bytes.push(0x66);
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x03]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
@@ -176,14 +204,19 @@ impl super::InstructionEncoder {
     /// 0F 00 /r group (sldt/lldt/ltr/str): register form only, r/m16.
     /// GAS encodes `lldt %ax` as `0f 00 d0` — no operand-size prefix; the
     /// operand is architecturally 16-bit regardless of spelling.
-    pub(super) fn encode_system_reg16(&mut self, ops: &[Operand], reg_ext: u8) -> Result<(), String> {
+    pub(super) fn encode_system_reg16(
+        &mut self,
+        ops: &[Operand],
+        reg_ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("system segment instruction requires 1 operand".to_string());
         }
         match &ops[0] {
             Operand::Register(reg) => {
-                let rm = reg_num(&reg.name)
-                    .ok_or_else(|| format!("bad register for system segment instruction: {}", reg.name))?;
+                let rm = reg_num(&reg.name).ok_or_else(|| {
+                    format!("bad register for system segment instruction: {}", reg.name)
+                })?;
                 self.bytes.extend_from_slice(&[0x0F, 0x00]);
                 self.bytes.push(self.modrm(3, reg_ext, rm));
                 Ok(())
@@ -192,7 +225,11 @@ impl super::InstructionEncoder {
         }
     }
 
-    pub(super) fn encode_system_table(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+    pub(super) fn encode_system_table(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 operand", mnemonic));
         }
@@ -259,9 +296,13 @@ impl super::InstructionEncoder {
             Operand::Register(reg) => {
                 let rm = reg_num(&reg.name).ok_or("bad register")?;
                 // 16-bit register form needs operand size prefix
-                let is_16 = matches!(reg.name.as_str(), "ax"|"bx"|"cx"|"dx"|"si"|"di"|"sp"|"bp");
+                let is_16 = matches!(
+                    reg.name.as_str(),
+                    "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
+                );
                 if is_16 {
-                    self.sized_op = true; self.bytes.push(0x66);
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
                 }
                 self.bytes.extend_from_slice(&[0x0F, 0x01]);
                 self.bytes.push(self.modrm(3, 4, rm));
@@ -360,16 +401,32 @@ impl super::InstructionEncoder {
                 if is_segment_reg(&reg.name) {
                     // Segment register pops don't use 0x66 prefix
                     match reg.name.as_str() {
-                        "es" => { self.bytes.push(0x07); Ok(()) }
-                        "ss" => { self.bytes.push(0x17); Ok(()) }
-                        "ds" => { self.bytes.push(0x1F); Ok(()) }
-                        "fs" => { self.bytes.extend_from_slice(&[0x0F, 0xA1]); Ok(()) }
-                        "gs" => { self.bytes.extend_from_slice(&[0x0F, 0xA9]); Ok(()) }
+                        "es" => {
+                            self.bytes.push(0x07);
+                            Ok(())
+                        }
+                        "ss" => {
+                            self.bytes.push(0x17);
+                            Ok(())
+                        }
+                        "ds" => {
+                            self.bytes.push(0x1F);
+                            Ok(())
+                        }
+                        "fs" => {
+                            self.bytes.extend_from_slice(&[0x0F, 0xA1]);
+                            Ok(())
+                        }
+                        "gs" => {
+                            self.bytes.extend_from_slice(&[0x0F, 0xA9]);
+                            Ok(())
+                        }
                         _ => Err(format!("cannot pop to {}", reg.name)),
                     }
                 } else {
                     let num = reg_num(&reg.name).ok_or("bad register")?;
-                    self.sized_op = true; self.bytes.push(0x66);
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
                     self.bytes.push(0x58 + num);
                     Ok(())
                 }
@@ -379,7 +436,11 @@ impl super::InstructionEncoder {
     }
 
     /// Encode 16-bit BSF/BSR: bsfw/bsrw
-    pub(super) fn encode_bsr_bsf_16(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+    pub(super) fn encode_bsr_bsf_16(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
         if ops.len() != 2 {
             return Err(format!("{} requires 2 operands", mnemonic));
         }
@@ -388,7 +449,8 @@ impl super::InstructionEncoder {
             "bsfw" => [0x0F, 0xBC],
             _ => return Err(format!("unknown bit scan: {}", mnemonic)),
         };
-        self.sized_op = true; self.bytes.push(0x66); // 16-bit operand size prefix
+        self.sized_op = true;
+        self.bytes.push(0x66); // 16-bit operand size prefix
         match (&ops[0], &ops[1]) {
             (Operand::Register(src), Operand::Register(dst)) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;

@@ -8,12 +8,12 @@
 //! arch-specific logic (instruction encoding, branch resolution, etc.), then
 //! calls `write_relocatable_object` for the final ELF serialization step.
 
-use crate::common::fx_hash::FxHashMap;
 use super::constants::*;
-use super::string_table::StringTable;
 use super::io::*;
 use super::linker_symbols::section_index;
+use super::string_table::StringTable;
 use super::symbol_table::ObjSymbol;
+use crate::common::fx_hash::FxHashMap;
 
 /// Configuration for ELF object file emission. Parameterizes the format
 /// differences between architectures (machine type, ELF class, flags, etc).
@@ -91,11 +91,27 @@ pub fn write_relocatable_object(
     // (e.g., RISC-V) always use RELA even in 32-bit mode.
     let use_rela = !is_32bit || config.force_rela;
 
-    let ehdr_size = if is_32bit { ELF32_EHDR_SIZE } else { ELF64_EHDR_SIZE };
-    let shdr_size = if is_32bit { ELF32_SHDR_SIZE } else { ELF64_SHDR_SIZE };
-    let sym_entry_size = if is_32bit { ELF32_SYM_SIZE } else { ELF64_SYM_SIZE };
+    let ehdr_size = if is_32bit {
+        ELF32_EHDR_SIZE
+    } else {
+        ELF64_EHDR_SIZE
+    };
+    let shdr_size = if is_32bit {
+        ELF32_SHDR_SIZE
+    } else {
+        ELF64_SHDR_SIZE
+    };
+    let sym_entry_size = if is_32bit {
+        ELF32_SYM_SIZE
+    } else {
+        ELF64_SYM_SIZE
+    };
     let reloc_entry_size = if use_rela {
-        if is_32bit { ELF32_RELA_SIZE } else { ELF64_RELA_SIZE }
+        if is_32bit {
+            ELF32_RELA_SIZE
+        } else {
+            ELF64_RELA_SIZE
+        }
     } else {
         ELF32_REL_SIZE
     };
@@ -112,10 +128,13 @@ pub fn write_relocatable_object(
         for sec_name in section_order {
             if let Some(section) = sections.get(sec_name) {
                 if let Some(ref group_name) = section.comdat_group {
-                    group_map.entry(group_name.clone()).or_insert_with(|| {
-                        group_order.push(group_name.clone());
-                        Vec::new()
-                    }).push(sec_name.clone());
+                    group_map
+                        .entry(group_name.clone())
+                        .or_insert_with(|| {
+                            group_order.push(group_name.clone());
+                            Vec::new()
+                        })
+                        .push(sec_name.clone());
                 }
             }
         }
@@ -165,8 +184,12 @@ pub fn write_relocatable_object(
 
     // NULL symbol (index 0)
     sym_entries.push(SymEntry {
-        st_name: 0, st_info: 0, st_other: 0,
-        st_shndx: 0, st_value: 0, st_size: 0,
+        st_name: 0,
+        st_info: 0,
+        st_other: 0,
+        st_shndx: 0,
+        st_value: 0,
+        st_size: 0,
     });
 
     // Section symbols (one per content section)
@@ -232,7 +255,9 @@ pub fn write_relocatable_object(
         data.extend_from_slice(&GRP_COMDAT.to_le_bytes());
         for member_name in members {
             // Find the section header index of this member
-            let member_idx = content_sections.iter().position(|s| s == member_name)
+            let member_idx = content_sections
+                .iter()
+                .position(|s| s == member_name)
                 .map(|i| content_shndx_offset as u32 + i as u32)
                 .unwrap_or(0);
             data.extend_from_slice(&member_idx.to_le_bytes());
@@ -375,18 +400,40 @@ pub fn write_relocatable_object(
                 }
                 for reloc in &section.relocs {
                     let sym_idx = find_symbol_index_shared(
-                        &reloc.symbol_name, &sym_entries, &strtab, content_sections,
+                        &reloc.symbol_name,
+                        &sym_entries,
+                        &strtab,
+                        content_sections,
                     );
                     if use_rela && !is_32bit {
-                        write_rela64(&mut elf, reloc.offset, sym_idx, reloc.reloc_type, reloc.addend);
+                        write_rela64(
+                            &mut elf,
+                            reloc.offset,
+                            sym_idx,
+                            reloc.reloc_type,
+                            reloc.addend,
+                        );
                     } else if use_rela && is_32bit {
                         debug_assert!(reloc.reloc_type <= 255, "ELF32 reloc type must fit in u8");
-                        debug_assert!(reloc.addend >= i32::MIN as i64 && reloc.addend <= i32::MAX as i64,
-                            "ELF32 RELA addend must fit in i32");
-                        write_rela32(&mut elf, reloc.offset as u32, sym_idx, reloc.reloc_type as u8, reloc.addend as i32);
+                        debug_assert!(
+                            reloc.addend >= i32::MIN as i64 && reloc.addend <= i32::MAX as i64,
+                            "ELF32 RELA addend must fit in i32"
+                        );
+                        write_rela32(
+                            &mut elf,
+                            reloc.offset as u32,
+                            sym_idx,
+                            reloc.reloc_type as u8,
+                            reloc.addend as i32,
+                        );
                     } else {
                         debug_assert!(reloc.reloc_type <= 255, "ELF32 reloc type must fit in u8");
-                        write_rel32(&mut elf, reloc.offset as u32, sym_idx, reloc.reloc_type as u8);
+                        write_rel32(
+                            &mut elf,
+                            reloc.offset as u32,
+                            sym_idx,
+                            reloc.reloc_type as u8,
+                        );
                     }
                 }
                 reloc_idx += 1;
@@ -400,11 +447,25 @@ pub fn write_relocatable_object(
     }
     for sym in &sym_entries {
         if is_32bit {
-            write_sym32(&mut elf, sym.st_name, sym.st_value as u32, sym.st_size as u32,
-                       sym.st_info, sym.st_other, sym.st_shndx);
+            write_sym32(
+                &mut elf,
+                sym.st_name,
+                sym.st_value as u32,
+                sym.st_size as u32,
+                sym.st_info,
+                sym.st_other,
+                sym.st_shndx,
+            );
         } else {
-            write_sym64(&mut elf, sym.st_name, sym.st_info, sym.st_other,
-                       sym.st_shndx, sym.st_value, sym.st_size);
+            write_sym64(
+                &mut elf,
+                sym.st_name,
+                sym.st_info,
+                sym.st_other,
+                sym.st_shndx,
+                sym.st_value,
+                sym.st_size,
+            );
         }
     }
 
@@ -430,20 +491,44 @@ pub fn write_relocatable_object(
         for (gi, (group_name, _members)) in comdat_groups.iter().enumerate() {
             let sh_name = shstrtab.offset_of(".group");
             // sh_link = symtab index, sh_info = symbol index of group signature
-            let sig_sym_idx = find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
-            write_shdr32(&mut elf, sh_name, SHT_GROUP, 0,
-                        0, group_offsets[gi] as u32, group_section_data[gi].len() as u32,
-                        symtab_shndx as u32, sig_sym_idx,
-                        4, 4);
+            let sig_sym_idx =
+                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
+            write_shdr32(
+                &mut elf,
+                sh_name,
+                SHT_GROUP,
+                0,
+                0,
+                group_offsets[gi] as u32,
+                group_section_data[gi].len() as u32,
+                symtab_shndx as u32,
+                sig_sym_idx,
+                4,
+                4,
+            );
         }
         // Content sections
         for (i, sec_name) in content_sections.iter().enumerate() {
             let section = sections.get(sec_name).unwrap();
             let sh_name = shstrtab.offset_of(sec_name);
-            let sh_offset = if section.sh_type == SHT_NOBITS { 0 } else { section_offsets[i] as u32 };
-            write_shdr32(&mut elf, sh_name, section.sh_type, section.sh_flags as u32,
-                        0, sh_offset, section.data.len() as u32,
-                        0, 0, section.sh_addralign as u32, 0);
+            let sh_offset = if section.sh_type == SHT_NOBITS {
+                0
+            } else {
+                section_offsets[i] as u32
+            };
+            write_shdr32(
+                &mut elf,
+                sh_name,
+                section.sh_type,
+                section.sh_flags as u32,
+                0,
+                sh_offset,
+                section.data.len() as u32,
+                0,
+                0,
+                section.sh_addralign as u32,
+                0,
+            );
         }
         // Reloc sections
         reloc_idx = 0;
@@ -454,45 +539,109 @@ pub fn write_relocatable_object(
                     let sh_name = shstrtab.offset_of(&reloc_name);
                     let sh_offset = reloc_offsets[reloc_idx] as u32;
                     let sh_size = (section.relocs.len() * reloc_entry_size) as u32;
-                    write_shdr32(&mut elf, sh_name, reloc_sh_type, 0,
-                                0, sh_offset, sh_size,
-                                symtab_shndx as u32, content_shndx_offset as u32 + i as u32,
-                                4, reloc_entry_size as u32);
+                    write_shdr32(
+                        &mut elf,
+                        sh_name,
+                        reloc_sh_type,
+                        0,
+                        0,
+                        sh_offset,
+                        sh_size,
+                        symtab_shndx as u32,
+                        content_shndx_offset as u32 + i as u32,
+                        4,
+                        reloc_entry_size as u32,
+                    );
                     reloc_idx += 1;
                 }
             }
         }
         // .symtab
-        write_shdr32(&mut elf, shstrtab.offset_of(".symtab"), SHT_SYMTAB, 0,
-                    0, symtab_offset as u32, symtab_size as u32,
-                    strtab_shndx as u32, first_global_idx as u32,
-                    4, sym_entry_size as u32);
+        write_shdr32(
+            &mut elf,
+            shstrtab.offset_of(".symtab"),
+            SHT_SYMTAB,
+            0,
+            0,
+            symtab_offset as u32,
+            symtab_size as u32,
+            strtab_shndx as u32,
+            first_global_idx as u32,
+            4,
+            sym_entry_size as u32,
+        );
         // .strtab
-        write_shdr32(&mut elf, shstrtab.offset_of(".strtab"), SHT_STRTAB, 0,
-                    0, strtab_offset as u32, strtab_data.len() as u32, 0, 0, 1, 0);
+        write_shdr32(
+            &mut elf,
+            shstrtab.offset_of(".strtab"),
+            SHT_STRTAB,
+            0,
+            0,
+            strtab_offset as u32,
+            strtab_data.len() as u32,
+            0,
+            0,
+            1,
+            0,
+        );
         // .shstrtab
-        write_shdr32(&mut elf, shstrtab.offset_of(".shstrtab"), SHT_STRTAB, 0,
-                    0, shstrtab_offset as u32, shstrtab_data.len() as u32, 0, 0, 1, 0);
+        write_shdr32(
+            &mut elf,
+            shstrtab.offset_of(".shstrtab"),
+            SHT_STRTAB,
+            0,
+            0,
+            shstrtab_offset as u32,
+            shstrtab_data.len() as u32,
+            0,
+            0,
+            1,
+            0,
+        );
     } else {
         // NULL
         write_shdr64(&mut elf, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
         // Group sections (COMDAT)
         for (gi, (group_name, _members)) in comdat_groups.iter().enumerate() {
             let sh_name = shstrtab.offset_of(".group");
-            let sig_sym_idx = find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
-            write_shdr64(&mut elf, sh_name, SHT_GROUP, 0,
-                        0, group_offsets[gi] as u64, group_section_data[gi].len() as u64,
-                        symtab_shndx as u32, sig_sym_idx,
-                        4, 4);
+            let sig_sym_idx =
+                find_symbol_index_shared(group_name, &sym_entries, &strtab, content_sections);
+            write_shdr64(
+                &mut elf,
+                sh_name,
+                SHT_GROUP,
+                0,
+                0,
+                group_offsets[gi] as u64,
+                group_section_data[gi].len() as u64,
+                symtab_shndx as u32,
+                sig_sym_idx,
+                4,
+                4,
+            );
         }
         // Content sections
         for (i, sec_name) in content_sections.iter().enumerate() {
             let section = sections.get(sec_name).unwrap();
             let sh_name = shstrtab.offset_of(sec_name);
-            let sh_offset = if section.sh_type == SHT_NOBITS { 0 } else { section_offsets[i] as u64 };
-            write_shdr64(&mut elf, sh_name, section.sh_type, section.sh_flags,
-                        0, sh_offset, section.data.len() as u64,
-                        0, 0, section.sh_addralign, 0);
+            let sh_offset = if section.sh_type == SHT_NOBITS {
+                0
+            } else {
+                section_offsets[i] as u64
+            };
+            write_shdr64(
+                &mut elf,
+                sh_name,
+                section.sh_type,
+                section.sh_flags,
+                0,
+                sh_offset,
+                section.data.len() as u64,
+                0,
+                0,
+                section.sh_addralign,
+                0,
+            );
         }
         // Reloc sections
         reloc_idx = 0;
@@ -503,25 +652,65 @@ pub fn write_relocatable_object(
                     let sh_name = shstrtab.offset_of(&reloc_name);
                     let sh_offset = reloc_offsets[reloc_idx] as u64;
                     let sh_size = (section.relocs.len() * reloc_entry_size) as u64;
-                    write_shdr64(&mut elf, sh_name, reloc_sh_type, SHF_INFO_LINK,
-                                0, sh_offset, sh_size,
-                                symtab_shndx as u32, content_shndx_offset as u32 + i as u32,
-                                8, reloc_entry_size as u64);
+                    write_shdr64(
+                        &mut elf,
+                        sh_name,
+                        reloc_sh_type,
+                        SHF_INFO_LINK,
+                        0,
+                        sh_offset,
+                        sh_size,
+                        symtab_shndx as u32,
+                        content_shndx_offset as u32 + i as u32,
+                        8,
+                        reloc_entry_size as u64,
+                    );
                     reloc_idx += 1;
                 }
             }
         }
         // .symtab
-        write_shdr64(&mut elf, shstrtab.offset_of(".symtab"), SHT_SYMTAB, 0,
-                    0, symtab_offset as u64, symtab_size as u64,
-                    strtab_shndx as u32, first_global_idx as u32,
-                    8, sym_entry_size as u64);
+        write_shdr64(
+            &mut elf,
+            shstrtab.offset_of(".symtab"),
+            SHT_SYMTAB,
+            0,
+            0,
+            symtab_offset as u64,
+            symtab_size as u64,
+            strtab_shndx as u32,
+            first_global_idx as u32,
+            8,
+            sym_entry_size as u64,
+        );
         // .strtab
-        write_shdr64(&mut elf, shstrtab.offset_of(".strtab"), SHT_STRTAB, 0,
-                    0, strtab_offset as u64, strtab_data.len() as u64, 0, 0, 1, 0);
+        write_shdr64(
+            &mut elf,
+            shstrtab.offset_of(".strtab"),
+            SHT_STRTAB,
+            0,
+            0,
+            strtab_offset as u64,
+            strtab_data.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
         // .shstrtab
-        write_shdr64(&mut elf, shstrtab.offset_of(".shstrtab"), SHT_STRTAB, 0,
-                    0, shstrtab_offset as u64, shstrtab_data.len() as u64, 0, 0, 1, 0);
+        write_shdr64(
+            &mut elf,
+            shstrtab.offset_of(".shstrtab"),
+            SHT_STRTAB,
+            0,
+            0,
+            shstrtab_offset as u64,
+            shstrtab_data.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
     }
 
     Ok(elf)

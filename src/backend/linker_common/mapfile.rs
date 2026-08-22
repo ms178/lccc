@@ -63,7 +63,8 @@ impl LinkMap {
         } else {
             let _ = writeln!(
                 out,
-                "Archive member included to satisfy reference by file (symbol)\n");
+                "Archive member included to satisfy reference by file (symbol)\n"
+            );
             for m in &self.archive_members {
                 let _ = writeln!(out, "{}({})", m.archive, m.member);
                 let _ = writeln!(out, "                              {}", m.reason_symbol);
@@ -74,10 +75,12 @@ impl LinkMap {
         let _ = writeln!(out, "Memory Configuration\n");
         let _ = writeln!(
             out,
-            "Name             Origin             Length             Attributes");
+            "Name             Origin             Length             Attributes"
+        );
         let _ = writeln!(
             out,
-            "*default*        0x0000000000000000 0xffffffffffffffff\n");
+            "*default*        0x0000000000000000 0xffffffffffffffff\n"
+        );
 
         let _ = writeln!(out, "Linker script and memory map\n");
 
@@ -90,7 +93,8 @@ impl LinkMap {
                 let _ = writeln!(
                     out,
                     "{:<15} 0x{:016x} {:>8x}",
-                    c.output_section, c.out_section_addr, c.out_section_size);
+                    c.output_section, c.out_section_addr, c.out_section_size
+                );
                 current_out = Some(c.output_section.as_str());
             }
             // Input-section contribution: one leading space, then the address
@@ -98,18 +102,23 @@ impl LinkMap {
             let _ = writeln!(
                 out,
                 " {:<14} 0x{:016x} {:>8x} {}",
-                c.input_section, c.output_addr, c.size, c.input_file);
+                c.input_section, c.output_addr, c.size, c.input_file
+            );
             for (name, addr) in &c.symbols {
                 let _ = writeln!(
                     out,
-                    "                0x{:016x}                {}", addr, name);
+                    "                0x{:016x}                {}",
+                    addr, name
+                );
             }
         }
 
         if let Some(ref e) = self.entry_symbol {
             let _ = writeln!(
                 out,
-                "\n                0x{:016x}                {}", self.entry_addr, e);
+                "\n                0x{:016x}                {}",
+                self.entry_addr, e
+            );
         }
     }
 
@@ -127,7 +136,8 @@ impl LinkMap {
             use std::io::Write;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            return lock.write_all(s.as_bytes())
+            return lock
+                .write_all(s.as_bytes())
                 .and_then(|_| lock.flush())
                 .map_err(|e| e.to_string());
         }
@@ -195,7 +205,10 @@ pub fn build_link_map(
     let mut by_input: crate::common::fx_hash::FxHashMap<(usize, usize), Vec<(&str, u64)>> =
         crate::common::fx_hash::FxHashMap::default();
     for (name, oi, si, val) in symbols {
-        by_input.entry((*oi, *si)).or_default().push((name.as_str(), *val));
+        by_input
+            .entry((*oi, *si))
+            .or_default()
+            .push((name.as_str(), *val));
     }
 
     let mut map = LinkMap {
@@ -246,17 +259,39 @@ mod build_tests {
 
     fn sec(name: &str, addr: u64, size: u64, inputs: Vec<InputSection>) -> OutputSection {
         OutputSection {
-            name: name.into(), sh_type: 1, flags: 0, alignment: 1,
-            inputs, data: Vec::new(), addr, file_offset: 0, mem_size: size,
+            name: name.into(),
+            sh_type: 1,
+            flags: 0,
+            alignment: 1,
+            inputs,
+            data: Vec::new(),
+            addr,
+            file_offset: 0,
+            mem_size: size,
         }
     }
 
     #[test]
     fn map_reports_addresses_per_input_and_symbol() {
-        let secs = vec![sec(".text", 0x401000, 0x40, vec![
-            InputSection { object_idx: 0, section_idx: 1, output_offset: 0, size: 0x2d },
-            InputSection { object_idx: 1, section_idx: 1, output_offset: 0x2d, size: 0xd },
-        ])];
+        let secs = vec![sec(
+            ".text",
+            0x401000,
+            0x40,
+            vec![
+                InputSection {
+                    object_idx: 0,
+                    section_idx: 1,
+                    output_offset: 0,
+                    size: 0x2d,
+                },
+                InputSection {
+                    object_idx: 1,
+                    section_idx: 1,
+                    output_offset: 0x2d,
+                    size: 0xd,
+                },
+            ],
+        )];
         let names = vec!["bmain.o".to_string(), "syms.o".to_string()];
         let syms = vec![
             ("_start".to_string(), 0usize, 1usize, 0u64),
@@ -267,7 +302,10 @@ mod build_tests {
         m.write_gnu(&mut s);
 
         // Output-section header carries the section's own address and size.
-        assert!(s.contains(".text           0x0000000000401000       40"), "{s}");
+        assert!(
+            s.contains(".text           0x0000000000401000       40"),
+            "{s}"
+        );
         // Each input is attributed to its file at its real address.
         assert!(s.contains("0x0000000000401000       2d bmain.o"), "{s}");
         assert!(s.contains("0x000000000040102d        d syms.o"), "{s}");
@@ -278,9 +316,17 @@ mod build_tests {
 
     #[test]
     fn symbols_are_sorted_by_address() {
-        let secs = vec![sec(".data", 0x403000, 0x10, vec![
-            InputSection { object_idx: 0, section_idx: 2, output_offset: 0, size: 0x10 },
-        ])];
+        let secs = vec![sec(
+            ".data",
+            0x403000,
+            0x10,
+            vec![InputSection {
+                object_idx: 0,
+                section_idx: 2,
+                output_offset: 0,
+                size: 0x10,
+            }],
+        )];
         let names = vec!["a.o".to_string()];
         // Deliberately supplied out of order.
         let syms = vec![

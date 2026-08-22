@@ -28,11 +28,11 @@
 //! session-23 audit). On i686 div_by_const is disabled, so the chain never
 //! exists and the pass legitimately stays cold.
 
+use super::loop_analysis;
 use crate::common::fx_hash::FxHashSet;
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrFunction, IrBinOp, IrConst, Operand, Value};
-use super::loop_analysis;
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     if std::env::var("CCC_NO_QUAD_SR").is_ok() {
@@ -43,7 +43,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
     let cfg = CfgAnalysis::build(func);
     let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
-        cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom));
+        cfg.num_blocks,
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    ));
     let mut total = 0;
     for lp in &loops {
         // Innermost loops only (no nested loop inside).
@@ -73,16 +77,28 @@ fn affine_in_iv(
         return Some((1, None));
     }
     let inst = loop_body.iter().find_map(|&bi| {
-        func.blocks[bi].instructions.iter().find(|i| i.dest() == Some(v))
+        func.blocks[bi]
+            .instructions
+            .iter()
+            .find(|i| i.dest() == Some(v))
     })?;
-    if let Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. } = inst {
+    if let Instruction::BinOp {
+        op: IrBinOp::Add,
+        lhs,
+        rhs,
+        ..
+    } = inst
+    {
         for (a, b) in [(lhs, rhs), (rhs, lhs)] {
             if matches!(a, Operand::Value(x) if *x == iv) {
                 // b must be loop-invariant.
                 let inv_ok = match b {
                     Operand::Const(_) => true,
                     Operand::Value(bv) => !loop_body.iter().any(|&bi| {
-                        func.blocks[bi].instructions.iter().any(|i| i.dest() == Some(*bv))
+                        func.blocks[bi]
+                            .instructions
+                            .iter()
+                            .any(|i| i.dest() == Some(*bv))
                     }),
                 };
                 if inv_ok {
@@ -104,7 +120,12 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
     // Find the slope-1 IV phi (backedge step is `phi + 1`).
     let mut iv_phi = None;
     for inst in &func.blocks[header].instructions {
-        if let Instruction::Phi { dest, ty: IrType::I32, incoming } = inst {
+        if let Instruction::Phi {
+            dest,
+            ty: IrType::I32,
+            incoming,
+        } = inst
+        {
             if incoming.len() != 2 {
                 continue;
             }
@@ -122,7 +143,9 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             }
         }
     }
-    let Some((iv, incoming)) = iv_phi else { return 0 };
+    let Some((iv, incoming)) = iv_phi else {
+        return 0;
+    };
     let _ = incoming;
 
     // Find a triangular product: Mul(a, b) where b = a + 1 and a is affine
@@ -130,8 +153,19 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
     let mut triangular: Option<(Value, Value, Option<Operand>, Value)> = None; // (prod, a, a_inv, div2_result)
     for &bi in &lp.body {
         for inst in &func.blocks[bi].instructions {
-            let Instruction::BinOp { dest: prod, op: IrBinOp::Mul, lhs, rhs, .. } = inst else { continue };
-            let (Operand::Value(av), Operand::Value(bv)) = (lhs, rhs) else { continue };
+            let Instruction::BinOp {
+                dest: prod,
+                op: IrBinOp::Mul,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let (Operand::Value(av), Operand::Value(bv)) = (lhs, rhs) else {
+                continue;
+            };
             // One of them must be Add(other, 1).
             let (a_val, b_val) = {
                 let b_is_a_plus1 = is_plus_one_of(func, &lp.body, *bv, *av);
@@ -145,7 +179,9 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
                 }
             };
             // a must be affine slope-1 in the IV: coef == 1.
-            let Some((coef, a_inv)) = affine_in_iv(func, &lp.body, iv, a_val, 16) else { continue };
+            let Some((coef, a_inv)) = affine_in_iv(func, &lp.body, iv, a_val, 16) else {
+                continue;
+            };
             if coef != 1 {
                 continue;
             }
@@ -153,7 +189,10 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             if let Some(d2) = find_div2_result(func, &lp.body, *prod) {
                 triangular = Some((*prod, a_val, a_inv, d2));
                 if debug {
-                    eprintln!("[QUAD_SR] loop header={} triangular prod={} a={} div2={}", header, prod.0, a_val.0, d2.0);
+                    eprintln!(
+                        "[QUAD_SR] loop header={} triangular prod={} a={} div2={}",
+                        header, prod.0, a_val.0, d2.0
+                    );
                 }
                 break;
             }
@@ -162,7 +201,9 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
             break;
         }
     }
-    let Some((_prod, a_val, a_inv, half)) = triangular else { return 0 };
+    let Some((_prod, a_val, a_inv, half)) = triangular else {
+        return 0;
+    };
 
     // `half` = t(t+1)/2 must feed the final index via adds of loop-invariants.
     // Find the final value: follow single-use Add chains from `half` adding
@@ -180,7 +221,14 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
         let mut next = None;
         for &bi in &lp.body {
             for inst in &func.blocks[bi].instructions {
-                if let Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, .. } = inst {
+                if let Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } = inst
+                {
                     let lhs_is = matches!(lhs, Operand::Value(v) if *v == final_val);
                     let rhs_is = matches!(rhs, Operand::Value(v) if *v == final_val);
                     if lhs_is || rhs_is {
@@ -189,7 +237,10 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
                         let inv = match other {
                             Operand::Const(_) => true,
                             Operand::Value(v) => !lp.body.iter().any(|&bj| {
-                                func.blocks[bj].instructions.iter().any(|i| i.dest() == Some(*v))
+                                func.blocks[bj]
+                                    .instructions
+                                    .iter()
+                                    .any(|i| i.dest() == Some(*v))
                             }),
                         };
                         if inv {
@@ -220,8 +271,12 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
     });
     // We only handle IV init of 0 (the common case); the invariant part a_inv
     // must be a plain Value (the outer IV or a param), not a constant.
-    let Some(IrConst::I32(0)) = init_op else { return 0 };
-    let Some(Operand::Value(inv_val)) = a_inv else { return 0 };
+    let Some(IrConst::I32(0)) = init_op else {
+        return 0;
+    };
+    let Some(Operand::Value(inv_val)) = a_inv else {
+        return 0;
+    };
 
     // Build the accumulator: two new phis (idx, s) + preheader inits.
     let mut next_id = func.next_value_id;
@@ -320,32 +375,46 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
     // position when -g is on).
     if !header_block.source_spans.is_empty() {
         let dummy = crate::common::source::Span::dummy();
-        header_block.source_spans.insert(insert_pos.min(header_block.source_spans.len()), dummy);
-        header_block.source_spans.insert(insert_pos.min(header_block.source_spans.len()), dummy);
+        header_block
+            .source_spans
+            .insert(insert_pos.min(header_block.source_spans.len()), dummy);
+        header_block
+            .source_spans
+            .insert(insert_pos.min(header_block.source_spans.len()), dummy);
     }
-    header_block.instructions.insert(insert_pos, Instruction::Phi {
-        dest: s_phi,
-        ty: IrType::I32,
-        incoming: vec![
-            (Operand::Value(s_init), pre_label),
-            (Operand::Value(s_next), latch_label),
-        ],
-    });
-    header_block.instructions.insert(insert_pos, Instruction::Phi {
-        dest: idx_phi,
-        ty: IrType::I32,
-        incoming: vec![
-            (Operand::Value(idx_init), pre_label),
-            (Operand::Value(idx_next), latch_label),
-        ],
-    });
+    header_block.instructions.insert(
+        insert_pos,
+        Instruction::Phi {
+            dest: s_phi,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(s_init), pre_label),
+                (Operand::Value(s_next), latch_label),
+            ],
+        },
+    );
+    header_block.instructions.insert(
+        insert_pos,
+        Instruction::Phi {
+            dest: idx_phi,
+            ty: IrType::I32,
+            incoming: vec![
+                (Operand::Value(idx_init), pre_label),
+                (Operand::Value(idx_next), latch_label),
+            ],
+        },
+    );
 
     // Latch increments: idx_next = idx_phi + s_phi; s_next = s_phi + 1.
     {
         let latch_block = &mut func.blocks[latch];
         if !latch_block.source_spans.is_empty() {
-            latch_block.source_spans.push(crate::common::source::Span::dummy());
-            latch_block.source_spans.push(crate::common::source::Span::dummy());
+            latch_block
+                .source_spans
+                .push(crate::common::source::Span::dummy());
+            latch_block
+                .source_spans
+                .push(crate::common::source::Span::dummy());
         }
         latch_block.instructions.push(Instruction::BinOp {
             dest: idx_next,
@@ -382,7 +451,9 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
                     replace(lhs);
                     replace(rhs);
                 }
-                Instruction::Cast { src, .. } | Instruction::Copy { src, .. } | Instruction::UnaryOp { src, .. } => {
+                Instruction::Cast { src, .. }
+                | Instruction::Copy { src, .. }
+                | Instruction::UnaryOp { src, .. } => {
                     replace(src);
                 }
                 Instruction::Store { val, .. } => {
@@ -396,7 +467,10 @@ fn reduce_loop(func: &mut IrFunction, lp: &loop_analysis::NaturalLoop, cfg: &Cfg
 
     func.next_value_id = next_id;
     if debug {
-        eprintln!("[QUAD_SR] transformed loop header={} final_val={} -> idx_phi={}", header, final_val.0, idx_phi.0);
+        eprintln!(
+            "[QUAD_SR] transformed loop header={} final_val={} -> idx_phi={}",
+            header, final_val.0, idx_phi.0
+        );
     }
     1
 }
@@ -436,15 +510,23 @@ fn find_div2_result(func: &IrFunction, loop_body: &FxHashSet<usize>, prod: Value
     let mut half = None;
     for &bi in loop_body {
         for inst in &func.blocks[bi].instructions {
-            if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+            if let Instruction::BinOp {
+                dest, op, lhs, rhs, ..
+            } = inst
+            {
                 let lhs_v = matches!(lhs, Operand::Value(v) if *v == prod);
                 match op {
-                    IrBinOp::AShr if lhs_v && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) => {
+                    IrBinOp::AShr
+                        if lhs_v && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>
+                    {
                         sign = Some(*dest);
                     }
-                    IrBinOp::LShr if matches!(lhs, Operand::Value(v) if Some(*v) == sign) && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) => {
+                    IrBinOp::LShr
+                        if matches!(lhs, Operand::Value(v) if Some(*v) == sign)
+                            && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>
+                    {
                         adj = None; // placeholder; LShr dest is the mask
-                        // record mask separately below
+                                    // record mask separately below
                     }
                     _ => {}
                 }
@@ -455,9 +537,15 @@ fn find_div2_result(func: &IrFunction, loop_body: &FxHashSet<usize>, prod: Value
     let mut mask = None;
     for &bi in loop_body {
         for inst in &func.blocks[bi].instructions {
-            if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+            if let Instruction::BinOp {
+                dest, op, lhs, rhs, ..
+            } = inst
+            {
                 match op {
-                    IrBinOp::LShr if matches!(lhs, Operand::Value(v) if Some(*v) == sign) && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) => {
+                    IrBinOp::LShr
+                        if matches!(lhs, Operand::Value(v) if Some(*v) == sign)
+                            && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(31)) =>
+                    {
                         mask = Some(*dest);
                     }
                     IrBinOp::Add => {
@@ -468,7 +556,10 @@ fn find_div2_result(func: &IrFunction, loop_body: &FxHashSet<usize>, prod: Value
                             adj = Some(*dest);
                         }
                     }
-                    IrBinOp::AShr if matches!(lhs, Operand::Value(v) if Some(*v) == adj) && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)) => {
+                    IrBinOp::AShr
+                        if matches!(lhs, Operand::Value(v) if Some(*v) == adj)
+                            && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)) =>
+                    {
                         half = Some(*dest);
                     }
                     _ => {}

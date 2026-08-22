@@ -6,14 +6,8 @@
 //! metadata, and typedef helpers.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::reexports::{
-    BlockId,
-    GlobalInit,
-    IrConst,
-    IrParam,
-    Value,
-};
-use crate::common::types::{AddressSpace, IrType, RcLayout, CType};
+use crate::common::types::{AddressSpace, CType, IrType, RcLayout};
+use crate::ir::reexports::{BlockId, GlobalInit, IrConst, IrParam, Value};
 
 /// Type metadata shared between local and global variables.
 ///
@@ -106,11 +100,15 @@ pub(super) struct LocalInfo {
 
 impl std::ops::Deref for LocalInfo {
     type Target = VarInfo;
-    fn deref(&self) -> &VarInfo { &self.var }
+    fn deref(&self) -> &VarInfo {
+        &self.var
+    }
 }
 
 impl std::ops::DerefMut for LocalInfo {
-    fn deref_mut(&mut self) -> &mut VarInfo { &mut self.var }
+    fn deref_mut(&mut self) -> &mut VarInfo {
+        &mut self.var
+    }
 }
 
 /// Information about a global variable tracked by the lowerer.
@@ -130,11 +128,15 @@ pub(super) struct GlobalInfo {
 
 impl std::ops::Deref for GlobalInfo {
     type Target = VarInfo;
-    fn deref(&self) -> &VarInfo { &self.var }
+    fn deref(&self) -> &VarInfo {
+        &self.var
+    }
 }
 
 impl std::ops::DerefMut for GlobalInfo {
-    fn deref_mut(&mut self) -> &mut VarInfo { &mut self.var }
+    fn deref_mut(&mut self) -> &mut VarInfo {
+        &mut self.var
+    }
 }
 
 /// Pre-computed declaration analysis shared between `lower_local_decl` and
@@ -172,13 +174,14 @@ pub(super) struct DeclAnalysis {
     pub pointee_type: Option<IrType>,
     /// Full C type for multi-level pointer resolution.
     pub c_type: Option<CType>,
-   
+
     /// Whether the declared BASE type carries a C `volatile` qualifier
     /// (e.g. `volatile int x`, `volatile int *p`, `volatile T a[N]`).
     /// Governs access volatility: for scalar/array declarations the object
     /// accesses are volatile; for pointer declarations the POINTEE accesses
     /// (deref) are volatile when exactly one pointer level was added.
-    pub base_type_volatile: bool, /// Whether this is a _Bool variable (not pointer or array of _Bool).
+    pub base_type_volatile: bool,
+    /// Whether this is a _Bool variable (not pointer or array of _Bool).
     pub is_bool: bool,
     /// The element IR type for arrays (accounts for typedef'd arrays).
     pub elem_ir_ty: IrType,
@@ -245,10 +248,16 @@ pub(super) struct LValue {
 
 impl LValue {
     pub(super) fn variable(v: Value, volatile: bool) -> Self {
-        LValue { kind: LValueKind::Variable(v), volatile }
+        LValue {
+            kind: LValueKind::Variable(v),
+            volatile,
+        }
     }
     pub(super) fn address(v: Value, seg: AddressSpace, volatile: bool) -> Self {
-        LValue { kind: LValueKind::Address(v, seg), volatile }
+        LValue {
+            kind: LValueKind::Address(v, seg),
+            volatile,
+        }
     }
 }
 
@@ -456,7 +465,11 @@ impl VarInfo {
 impl GlobalInfo {
     /// Construct a GlobalInfo from a DeclAnalysis, avoiding repeated field construction.
     pub(super) fn from_analysis(da: &DeclAnalysis) -> Self {
-        GlobalInfo { var: VarInfo::from_analysis(da), asm_register: None, base_type_volatile: da.base_type_volatile }
+        GlobalInfo {
+            var: VarInfo::from_analysis(da),
+            asm_register: None,
+            base_type_volatile: da.base_type_volatile,
+        }
     }
 }
 

@@ -1,9 +1,9 @@
 //! I686Codegen: global address operations (global, label, TLS).
 
-use crate::ir::reexports::Value;
-use crate::emit;
 use super::emit::I686Codegen;
 use crate::backend::traits::ArchCodegen;
+use crate::emit;
+use crate::ir::reexports::Value;
 
 impl I686Codegen {
     pub(super) fn emit_global_addr_impl(&mut self, dest: &Value, name: &str) {
@@ -23,7 +23,12 @@ impl I686Codegen {
     /// Folded GlobalAddr+Load: `movl sym, %eax` (absolute addressing).
     /// Only reachable in non-PIC mode (supports_global_addr_fold gates on it).
     /// The `sym` may carry a constant offset ("sym+4") from the GEP fold.
-    pub(super) fn emit_global_load_abs_impl(&mut self, dest: &Value, sym: &str, ty: crate::common::types::IrType) {
+    pub(super) fn emit_global_load_abs_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        ty: crate::common::types::IrType,
+    ) {
         use crate::common::types::IrType;
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
             emit!(self.state, "    movl {}, %eax", sym);
@@ -46,9 +51,14 @@ impl I686Codegen {
     }
 
     /// Folded GlobalAddr+Store: `movl %eax, sym` (absolute addressing).
-    pub(super) fn emit_global_store_abs_impl(&mut self, val: &crate::ir::reexports::Operand, sym: &str, ty: crate::common::types::IrType) {
+    pub(super) fn emit_global_store_abs_impl(
+        &mut self,
+        val: &crate::ir::reexports::Operand,
+        sym: &str,
+        ty: crate::common::types::IrType,
+    ) {
         use crate::common::types::IrType;
-        use crate::ir::reexports::{Operand, IrConst};
+        use crate::ir::reexports::{IrConst, Operand};
         if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
             self.emit_load_acc_pair_impl(val);
             emit!(self.state, "    movl %eax, {}", sym);

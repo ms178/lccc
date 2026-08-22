@@ -14,7 +14,10 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
-use super::helpers::{is_valid_gp_reg, has_implicit_reg_usage, replace_reg_family, is_callee_saved_reg, get_dest_reg, is_read_modify_write, implicit_read_reg_family, extract_jump_target};
+use super::helpers::{
+    extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
+    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
+};
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
@@ -35,10 +38,14 @@ fn line_stack_base(trimmed: &str) -> Option<&'static str> {
 /// High registers (%r8-%r15) get 'd' suffix, classic regs use 'e' prefix form.
 fn reg_64_to_32(r64: &str) -> String {
     match r64 {
-        "%rax" => "%eax".into(), "%rcx" => "%ecx".into(),
-        "%rdx" => "%edx".into(), "%rbx" => "%ebx".into(),
-        "%rsp" => "%esp".into(), "%rbp" => "%ebp".into(),
-        "%rsi" => "%esi".into(), "%rdi" => "%edi".into(),
+        "%rax" => "%eax".into(),
+        "%rcx" => "%ecx".into(),
+        "%rdx" => "%edx".into(),
+        "%rbx" => "%ebx".into(),
+        "%rsp" => "%esp".into(),
+        "%rbp" => "%ebp".into(),
+        "%rsi" => "%esi".into(),
+        "%rdi" => "%edi".into(),
         _ if r64.starts_with("%r") => format!("{}d", r64),
         _ => String::new(),
     }
@@ -52,13 +59,20 @@ fn reg_64_to_32(r64: &str) -> String {
 /// integrated-assembler stage (observed building expat's xmlparse.c at -O2).
 fn bare_reg_64_to_32(r64: &str) -> Option<String> {
     Some(match r64 {
-        "rax" => "eax".into(), "rcx" => "ecx".into(),
-        "rdx" => "edx".into(), "rbx" => "ebx".into(),
-        "rsp" => "esp".into(), "rbp" => "ebp".into(),
-        "rsi" => "esi".into(), "rdi" => "edi".into(),
+        "rax" => "eax".into(),
+        "rcx" => "ecx".into(),
+        "rdx" => "edx".into(),
+        "rbx" => "ebx".into(),
+        "rsp" => "esp".into(),
+        "rbp" => "ebp".into(),
+        "rsi" => "esi".into(),
+        "rdi" => "edi".into(),
         _ if r64.starts_with('r')
             && !r64[1..].is_empty()
-            && r64[1..].chars().all(|c| c.is_ascii_digit()) => format!("{}d", r64),
+            && r64[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            format!("{}d", r64)
+        }
         // Already a 32-bit name: leave it alone.
         _ if r64.starts_with('e') || r64.ends_with('d') => r64.to_string(),
         _ => return None,
@@ -123,7 +137,9 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             if trimmed == "xorl %eax, %eax" {
                 // Check if the next non-nop instruction overwrites %rax.
                 let mut j = i + 1;
-                while j < len && infos[j].is_nop() { j += 1; }
+                while j < len && infos[j].is_nop() {
+                    j += 1;
+                }
                 if j < len {
                     let overwrites_rax = match infos[j].kind {
                         LineKind::LoadRbp { reg: 0, .. } => true, // movq/movslq/etc → %rax
@@ -135,8 +151,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         LineKind::Other { dest_reg: 0 } => {
                             // Check if it's a load that writes %rax (not a read-modify-write)
                             let nj = infos[j].trimmed(store.get(j));
-                            let is_mov_into_rax =
-                                   nj.starts_with("movq ") || nj.starts_with("movl ")
+                            let is_mov_into_rax = nj.starts_with("movq ") || nj.starts_with("movl ")
                                 || nj.starts_with("movslq ") || nj.starts_with("movzbq ")
                                 || nj.starts_with("movzwq ") || nj.starts_with("movsbq ")
                                 || nj.starts_with("movswq ") || nj.starts_with("leaq ")
@@ -154,12 +169,15 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 // operand) and refuse to treat rax-reading sources as
                                 // an overwrite.
                                 // "movq %r12, %rax" -> src = "%r12"; "movl %eax, %eax" -> src = "%eax".
-                                let src = nj.split_once(',').map(|(s, _)| {
-                                    // Strip the leading mnemonic (first whitespace token).
-                                    let mut toks = s.splitn(2, char::is_whitespace);
-                                    let _mnemonic = toks.next();
-                                    toks.next().unwrap_or("").trim()
-                                }).unwrap_or("");
+                                let src = nj
+                                    .split_once(',')
+                                    .map(|(s, _)| {
+                                        // Strip the leading mnemonic (first whitespace token).
+                                        let mut toks = s.splitn(2, char::is_whitespace);
+                                        let _mnemonic = toks.next();
+                                        toks.next().unwrap_or("").trim()
+                                    })
+                                    .unwrap_or("");
                                 let src_fam = register_family_fast(src);
                                 // Source must not be the %rax family. REG_NONE (255) for
                                 // memory/immediate sources -> overwrites (%rax not read).
@@ -215,10 +233,16 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     // Exception: instructions like div/idiv/mul/cqto that
                     // implicitly clobber rax through dest_reg rdx.
                     let trimmed = infos[i].trimmed(store.get(i));
-                    if trimmed.starts_with("div") || trimmed.starts_with("idiv")
-                        || trimmed.starts_with("mul") || trimmed.starts_with("imul")
-                        || trimmed == "cqto" || trimmed == "cqo" || trimmed == "cdq"
-                        || trimmed.starts_with("xchg") || trimmed.starts_with("cmpxchg") {
+                    if trimmed.starts_with("div")
+                        || trimmed.starts_with("idiv")
+                        || trimmed.starts_with("mul")
+                        || trimmed.starts_with("imul")
+                        || trimmed == "cqto"
+                        || trimmed == "cqo"
+                        || trimmed == "cdq"
+                        || trimmed.starts_with("xchg")
+                        || trimmed.starts_with("cmpxchg")
+                    {
                         rax_is_zero = false;
                     }
                     // Otherwise rax is only read, not written - keep tracking.
@@ -231,16 +255,23 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             LineKind::LoadRbp { .. } => {
                 // Load to non-rax register, rax_is_zero unchanged.
             }
-            LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
-            | LineKind::CondJmp | LineKind::Ret | LineKind::Call => {
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Ret
+            | LineKind::Call => {
                 // Control flow or label - invalidate tracking
                 rax_is_zero = false;
             }
             LineKind::Pop { reg: 0 } | LineKind::SetCC { reg: 0 } => {
                 rax_is_zero = false;
             }
-            LineKind::Pop { .. } | LineKind::SetCC { .. }
-            | LineKind::Push { .. } | LineKind::Cmp | LineKind::Directive => {
+            LineKind::Pop { .. }
+            | LineKind::SetCC { .. }
+            | LineKind::Push { .. }
+            | LineKind::Cmp
+            | LineKind::Directive => {
                 // Don't affect rax
             }
             _ => {
@@ -280,9 +311,11 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         let src_fam = register_family_fast(src);
                         let dst_fam = register_family_fast(dst);
                         // Both must be GP registers, different families, both register operands
-                        if is_valid_gp_reg(src_fam) && is_valid_gp_reg(dst_fam)
+                        if is_valid_gp_reg(src_fam)
+                            && is_valid_gp_reg(dst_fam)
                             && src_fam != dst_fam
-                            && src.starts_with('%') && dst.starts_with('%')
+                            && src.starts_with('%')
+                            && dst.starts_with('%')
                         {
                             // Find the next non-NOP, non-StoreRbp instruction.
                             // Limit search to 8 lines to avoid pathological scanning.
@@ -408,15 +441,28 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         }
 
         // --- Pattern: adjacent store/load at same %rbp offset ---
-        if let LineKind::StoreRbp { reg: sr, offset: so, size: ss } = infos[i].kind {
+        if let LineKind::StoreRbp {
+            reg: sr,
+            offset: so,
+            size: ss,
+        } = infos[i].kind
+        {
             if i + 1 < len && !infos[i + 1].is_nop() {
-                if let LineKind::LoadRbp { reg: lr, offset: lo, size: ls } = infos[i + 1].kind {
+                if let LineKind::LoadRbp {
+                    reg: lr,
+                    offset: lo,
+                    size: ls,
+                } = infos[i + 1].kind
+                {
                     // Same base register (both %rsp or both %rbp) so the offsets refer
                     // to the same slot. With FPO the codegen uses (%rsp); otherwise
                     // (%rbp). Mixing bases at the same numeric offset would be wrong.
                     let store_base = line_stack_base(infos[i].trimmed(store.get(i)));
                     let load_base = line_stack_base(infos[i + 1].trimmed(store.get(i + 1)));
-                    if so == lo && ss == ls && store_base.is_some() && store_base == load_base
+                    if so == lo
+                        && ss == ls
+                        && store_base.is_some()
+                        && store_base == load_base
                         && sr != REG_NONE
                     {
                         if sr == lr {
@@ -425,9 +471,14 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             changed = true;
                             i += 1;
                             continue;
-                        } else if lr != REG_NONE && is_valid_gp_reg(sr) && is_valid_gp_reg(lr)
+                        } else if lr != REG_NONE
+                            && is_valid_gp_reg(sr)
+                            && is_valid_gp_reg(lr)
                             && matches!(ss, MoveSize::Q | MoveSize::L)
-                            && lr != 4 && lr != 5 && sr != 4 && sr != 5
+                            && lr != 4
+                            && lr != 5
+                            && sr != 4
+                            && sr != 5
                         {
                             // Different registers at the SAME offset, ADJACENT (i+1):
                             //   movq %sr, OFF(%rsp)   ; store
@@ -439,8 +490,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             // (a plain move; SLQ/zero-extend differ).
                             let store_reg_str = reg_id_to_name(sr, ls);
                             let load_reg_str = reg_id_to_name(lr, ls);
-                            let new_text = format!("    {} {}, {}",
-                                ls.mnemonic(), store_reg_str, load_reg_str);
+                            let new_text = format!(
+                                "    {} {}, {}",
+                                ls.mnemonic(),
+                                store_reg_str,
+                                load_reg_str
+                            );
                             replace_line(store, &mut infos[i + 1], i + 1, new_text);
                             changed = true;
                             i += 1;
@@ -465,17 +520,34 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // destination is %S itself (LineKind-visible write), middle line does
         // not reference %D and has no memory operand at OFF, and %D is not a
         // source of the middle line.
-        if let LineKind::StoreRbp { reg: sr, offset: so, size: ss } = infos[i].kind {
-            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != 4 && sr != 5 {
+        if let LineKind::StoreRbp {
+            reg: sr,
+            offset: so,
+            size: ss,
+        } = infos[i].kind
+        {
+            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != 4 && sr != 5
+            {
                 let m = next_non_nop(infos, i + 1, len);
                 if m < len && !infos[m].is_barrier() {
                     let l = next_non_nop(infos, m + 1, len);
                     if l < len {
-                        if let LineKind::LoadRbp { reg: lr, offset: lo, size: ls } = infos[l].kind {
+                        if let LineKind::LoadRbp {
+                            reg: lr,
+                            offset: lo,
+                            size: ls,
+                        } = infos[l].kind
+                        {
                             let store_base = line_stack_base(infos[i].trimmed(store.get(i)));
                             let load_base = line_stack_base(infos[l].trimmed(store.get(l)));
-                            if so == lo && ss == ls && store_base.is_some() && store_base == load_base
-                                && is_valid_gp_reg(lr) && lr != 4 && lr != 5 && lr != sr
+                            if so == lo
+                                && ss == ls
+                                && store_base.is_some()
+                                && store_base == load_base
+                                && is_valid_gp_reg(lr)
+                                && lr != 4
+                                && lr != 5
+                                && lr != sr
                             {
                                 // Middle line: writes %S, doesn't read %D, no memory access,
                                 // and is a plain register-dest instruction.
@@ -489,13 +561,18 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 // that is an arithmetic source, not a load).
                                 // Any other paren operand is a real access.
                                 let mid_t = infos[m].trimmed(store.get(m));
-                                let mid_is_lea = mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
+                                let mid_is_lea =
+                                    mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
                                 let mid_has_mem = infos[m].rbp_offset != RBP_OFFSET_NONE
                                     || (!mid_is_lea
                                         && (infos[m].has_indirect_mem || mid_t.contains("(%")));
                                 if mid_writes_s && !mid_refs_d && !mid_has_mem {
-                                    let copy = format!("    {} {}, {}",
-                                        ls.mnemonic(), reg_id_to_name(sr, ls), reg_id_to_name(lr, ls));
+                                    let copy = format!(
+                                        "    {} {}, {}",
+                                        ls.mnemonic(),
+                                        reg_id_to_name(sr, ls),
+                                        reg_id_to_name(lr, ls)
+                                    );
                                     // Rewrite the LOAD line into the hoisted copy and
                                     // swap it before the modifier by rewriting in place:
                                     // line i stays (store), line m becomes the copy,
@@ -535,19 +612,40 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             let prev_ext = infos[i].ext_kind;
 
             let is_redundant_ext = match next_ext {
-                ExtKind::MovzbqAlRax => matches!(prev_ext, ExtKind::ProducerMovzbqToRax | ExtKind::MovzbqAlRax),
-                ExtKind::MovzwqAxRax => matches!(prev_ext, ExtKind::ProducerMovzwqToRax | ExtKind::MovzwqAxRax),
-                ExtKind::MovsbqAlRax => matches!(prev_ext, ExtKind::ProducerMovsbqToRax | ExtKind::MovsbqAlRax),
-                ExtKind::MovslqEaxRax => matches!(prev_ext, ExtKind::ProducerMovslqToRax | ExtKind::MovslqEaxRax),
-                ExtKind::Cltq => matches!(prev_ext,
-                    ExtKind::ProducerMovslqToRax | ExtKind::ProducerMovqConstRax |
-                    ExtKind::MovslqEaxRax | ExtKind::Cltq),
-                ExtKind::MovlEaxEax => matches!(prev_ext,
-                    ExtKind::ProducerArith32 | ExtKind::ProducerMovlToEax |
-                    ExtKind::ProducerMovzbToEax | ExtKind::ProducerMovzbqToRax |
-                    ExtKind::ProducerMovzwToEax | ExtKind::ProducerMovzwqToRax |
-                    ExtKind::ProducerDiv32 |
-                    ExtKind::MovlEaxEax),
+                ExtKind::MovzbqAlRax => matches!(
+                    prev_ext,
+                    ExtKind::ProducerMovzbqToRax | ExtKind::MovzbqAlRax
+                ),
+                ExtKind::MovzwqAxRax => matches!(
+                    prev_ext,
+                    ExtKind::ProducerMovzwqToRax | ExtKind::MovzwqAxRax
+                ),
+                ExtKind::MovsbqAlRax => matches!(
+                    prev_ext,
+                    ExtKind::ProducerMovsbqToRax | ExtKind::MovsbqAlRax
+                ),
+                ExtKind::MovslqEaxRax => matches!(
+                    prev_ext,
+                    ExtKind::ProducerMovslqToRax | ExtKind::MovslqEaxRax
+                ),
+                ExtKind::Cltq => matches!(
+                    prev_ext,
+                    ExtKind::ProducerMovslqToRax
+                        | ExtKind::ProducerMovqConstRax
+                        | ExtKind::MovslqEaxRax
+                        | ExtKind::Cltq
+                ),
+                ExtKind::MovlEaxEax => matches!(
+                    prev_ext,
+                    ExtKind::ProducerArith32
+                        | ExtKind::ProducerMovlToEax
+                        | ExtKind::ProducerMovzbToEax
+                        | ExtKind::ProducerMovzbqToRax
+                        | ExtKind::ProducerMovzwToEax
+                        | ExtKind::ProducerMovzwqToRax
+                        | ExtKind::ProducerDiv32
+                        | ExtKind::MovlEaxEax
+                ),
                 _ => false,
             };
 
@@ -574,12 +672,16 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     let mut k = i - 1;
                     while k >= scan_limit {
                         if infos[k].is_nop() {
-                            if k == 0 { break; }
+                            if k == 0 {
+                                break;
+                            }
                             k -= 1;
                             continue;
                         }
                         if matches!(infos[k].kind, LineKind::StoreRbp { .. }) {
-                            if k == 0 { break; }
+                            if k == 0 {
+                                break;
+                            }
                             k -= 1;
                             continue;
                         }
@@ -589,10 +691,13 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         }
                         // Check if this instruction is a sign-extension producer for rax
                         let k_ext = infos[k].ext_kind;
-                        if matches!(k_ext,
-                            ExtKind::ProducerMovslqToRax | ExtKind::ProducerMovqConstRax |
-                            ExtKind::MovslqEaxRax | ExtKind::Cltq)
-                        {
+                        if matches!(
+                            k_ext,
+                            ExtKind::ProducerMovslqToRax
+                                | ExtKind::ProducerMovqConstRax
+                                | ExtKind::MovslqEaxRax
+                                | ExtKind::Cltq
+                        ) {
                             found_producer = true;
                             break;
                         }
@@ -605,7 +710,9 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         if writes_rax {
                             break;
                         }
-                        if k == 0 { break; }
+                        if k == 0 {
+                            break;
+                        }
                         k -= 1;
                     }
                     if found_producer {
@@ -644,7 +751,10 @@ pub(super) fn eliminate_dead_sign_extensions(
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         let t = infos[i].trimmed(store.get(i));
 
@@ -663,7 +773,10 @@ pub(super) fn eliminate_dead_sign_extensions(
                     let mut j = i + 1;
                     let mut found_re_extend = false;
                     while j < len && j < i + 4 {
-                        if infos[j].is_nop() { j += 1; continue; }
+                        if infos[j].is_nop() {
+                            j += 1;
+                            continue;
+                        }
                         let t2 = infos[j].trimmed(store.get(j));
                         // Next instruction uses %REGd as source (re-extends)
                         if t2.starts_with("movslq ") && t2.contains(src) {
@@ -698,10 +811,19 @@ pub(super) fn eliminate_dead_sign_extensions(
             let mut j = i + 1;
             let mut can_eliminate = false;
             while j < len && j < i + 8 {
-                if infos[j].is_nop() { j += 1; continue; }
-                if infos[j].is_barrier() { break; }
+                if infos[j].is_nop() {
+                    j += 1;
+                    continue;
+                }
+                if infos[j].is_barrier() {
+                    break;
+                }
                 match infos[j].kind {
-                    LineKind::StoreRbp { reg: 0, offset: n, size } => {
+                    LineKind::StoreRbp {
+                        reg: 0,
+                        offset: n,
+                        size,
+                    } => {
                         // Narrow store persists only the low bits: the cltq
                         // upper half is discarded by the store itself.
                         if !matches!(size, MoveSize::Q) {
@@ -714,8 +836,14 @@ pub(super) fn eliminate_dead_sign_extensions(
                         let mut scans = 0usize;
                         while k < len && scans < 64 {
                             scans += 1;
-                            if infos[k].is_nop() { k += 1; continue; }
-                            if infos[k].is_barrier() { safe = false; break; }
+                            if infos[k].is_nop() {
+                                k += 1;
+                                continue;
+                            }
+                            if infos[k].is_barrier() {
+                                safe = false;
+                                break;
+                            }
                             match infos[k].kind {
                                 LineKind::LoadRbp { offset: lo, .. } if lo == n => {
                                     saw_load = true;
@@ -730,19 +858,29 @@ pub(super) fn eliminate_dead_sign_extensions(
                                     break;
                                 }
                                 _ => {
-                                    if infos[k].has_indirect_mem { safe = false; break; }
+                                    if infos[k].has_indirect_mem {
+                                        safe = false;
+                                        break;
+                                    }
                                     // Any other slot reference (xmm load, lea
                                     // escape, ...) is not proven narrow.
                                     let tk = infos[k].trimmed(store.get(k));
                                     if let Some((_, off)) = super::direct_stack_slot_in_line(tk) {
-                                        if off == n { safe = false; break; }
+                                        if off == n {
+                                            safe = false;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                             k += 1;
                         }
-                        if scans >= 64 { safe = false; }
-                        if safe && saw_load { can_eliminate = true; }
+                        if scans >= 64 {
+                            safe = false;
+                        }
+                        if safe && saw_load {
+                            can_eliminate = true;
+                        }
                         break;
                     }
                     LineKind::Other { dest_reg: 0 } => {
@@ -789,14 +927,17 @@ pub(super) fn eliminate_dead_sign_extensions(
                 let dst_family = super::super::types::register_family_fast(dst);
                 if src_family == dst_family && src_family != super::super::types::REG_NONE {
                     let reg_family = dst_family;
-                    if reg_family != 0 { // rax is handled by cltq pattern
+                    if reg_family != 0 {
+                        // rax is handled by cltq pattern
                         let reg_bit = 1u16 << reg_family;
 
                         // Sub-pattern 3a: next non-NOP is `movq %REG, %rax` followed
                         // by a 32-bit consumer of %eax. Replace both movslq+movq with
                         // a single `movl %REGd, %eax`.
                         let mut j = i + 1;
-                        while j < len && infos[j].is_nop() { j += 1; }
+                        while j < len && infos[j].is_nop() {
+                            j += 1;
+                        }
                         if j < len && !infos[j].is_barrier() {
                             let reg64 = dst; // e.g., "%rbx"
                             let expected_movq = format!("movq {}, %rax", reg64);
@@ -805,7 +946,9 @@ pub(super) fn eliminate_dead_sign_extensions(
                                 // Found movq %REG, %rax. Check the next instruction
                                 // is a 32-bit consumer of %eax.
                                 let mut k = j + 1;
-                                while k < len && infos[k].is_nop() { k += 1; }
+                                while k < len && infos[k].is_nop() {
+                                    k += 1;
+                                }
                                 // A store of %rax persists all 64 bits, so it is
                                 // NOT a 32-bit consumer: replacing the sign-extending
                                 // movslq+movq with a zero-extending movl would corrupt
@@ -818,22 +961,34 @@ pub(super) fn eliminate_dead_sign_extensions(
                                         }
                                         _ => false,
                                     }
-                                } else { false };
+                                } else {
+                                    false
+                                };
 
                                 if next_is_32bit {
                                     // Verify %REG is overwritten before next 64-bit read
                                     let mut m = j + 1;
                                     let mut reg_safe = true;
                                     while m < len && m < j + 12 {
-                                        if infos[m].is_nop() { m += 1; continue; }
-                                        if infos[m].is_barrier() { break; }
-                                        if infos[m].reg_refs & reg_bit == 0 { m += 1; continue; }
+                                        if infos[m].is_nop() {
+                                            m += 1;
+                                            continue;
+                                        }
+                                        if infos[m].is_barrier() {
+                                            break;
+                                        }
+                                        if infos[m].reg_refs & reg_bit == 0 {
+                                            m += 1;
+                                            continue;
+                                        }
                                         // Found reference to %REG
                                         match infos[m].kind {
                                             LineKind::LoadRbp { reg, .. } if reg == reg_family => {
                                                 break; // overwritten → safe
                                             }
-                                            LineKind::Other { dest_reg } if dest_reg == reg_family => {
+                                            LineKind::Other { dest_reg }
+                                                if dest_reg == reg_family =>
+                                            {
                                                 break; // overwritten → safe
                                             }
                                             _ => {
@@ -859,13 +1014,21 @@ pub(super) fn eliminate_dead_sign_extensions(
                         // Sub-pattern 3b: %REG is overwritten before any 64-bit read.
                         // Also safe if %REG is only read in 32-bit form (%REGd).
                         let reg32_suffix = src; // e.g. "%ebx"
-                        let reg64_name = dst;   // e.g. "%rbx"
+                        let reg64_name = dst; // e.g. "%rbx"
                         let mut j2 = i + 1;
                         let mut can_eliminate = false;
                         while j2 < len && j2 < i + 12 {
-                            if infos[j2].is_nop() { j2 += 1; continue; }
-                            if infos[j2].is_barrier() { break; }
-                            if infos[j2].reg_refs & reg_bit == 0 { j2 += 1; continue; }
+                            if infos[j2].is_nop() {
+                                j2 += 1;
+                                continue;
+                            }
+                            if infos[j2].is_barrier() {
+                                break;
+                            }
+                            if infos[j2].reg_refs & reg_bit == 0 {
+                                j2 += 1;
+                                continue;
+                            }
                             // This instruction references our register family.
                             match infos[j2].kind {
                                 LineKind::LoadRbp { reg, .. } if reg == reg_family => {
@@ -932,10 +1095,7 @@ pub(super) fn eliminate_dead_sign_extensions(
 // emits them, while the whole-function dead-register check keeps the rewrite
 // sound across CFG edges.
 
-pub(super) fn fold_lea_into_memory_op(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
@@ -994,10 +1154,7 @@ pub(super) fn fold_lea_into_memory_op(
                 continue;
             }
             let base_family = register_family_fast(base);
-            if base_family == REG_NONE
-                || base_family > REG_GP_MAX
-                || dst_family == base_family
-            {
+            if base_family == REG_NONE || base_family > REG_GP_MAX || dst_family == base_family {
                 i += 1;
                 continue;
             }
@@ -1086,7 +1243,10 @@ pub(super) fn fold_lea_into_memory_op(
             //   movq %rdi, %rcx
             //   movb $0, (%rcx)
             // Fold that form as well, provided the copied temporary is dead.
-            if let Some((src, tmp)) = next.strip_prefix("movq ").and_then(|rest| rest.split_once(',')) {
+            if let Some((src, tmp)) = next
+                .strip_prefix("movq ")
+                .and_then(|rest| rest.split_once(','))
+            {
                 let src = src.trim();
                 let tmp = tmp.trim();
                 let tmp_family = register_family_fast(tmp);
@@ -1097,7 +1257,9 @@ pub(super) fn fold_lea_into_memory_op(
                     && tmp_family != index_family
                 {
                     let mut k = j + 1;
-                    while k < len && infos[k].is_nop() { k += 1; }
+                    while k < len && infos[k].is_nop() {
+                        k += 1;
+                    }
                     if k < len && !infos[k].is_barrier() {
                         let mem_next = infos[k].trimmed(store.get(k));
                         let tmp_pat = format!("({})", tmp);
@@ -1120,7 +1282,12 @@ pub(super) fn fold_lea_into_memory_op(
                             if replacement != mem_next {
                                 mark_nop(&mut infos[i]);
                                 mark_nop(&mut infos[j]);
-                                replace_line(store, &mut infos[k], k, format!("    {}", replacement));
+                                replace_line(
+                                    store,
+                                    &mut infos[k],
+                                    k,
+                                    format!("    {}", replacement),
+                                );
                                 changed = true;
                                 i = k + 1;
                                 continue;
@@ -1216,10 +1383,9 @@ fn fam_read_after(store: &LineStore, infos: &[LineInfo], start: usize, fam: u8) 
             let src_part = td[..td.rfind(',').unwrap_or(td.len())].to_string();
             let fam_in_src = src_part.contains(&format!("%{}", name64))
                 || src_part.contains(&format!("%{}", name32));
-            let mov_store = (td.starts_with("mov")
-                || td.starts_with("movabs")
-                || td.starts_with("lea"))
-                && !fam_in_src;
+            let mov_store =
+                (td.starts_with("mov") || td.starts_with("movabs") || td.starts_with("lea"))
+                    && !fam_in_src;
             let explicit_lea_write = td.starts_with("lea")
                 && td.ends_with(&format!(", %{}", name64))
                 && !td[..td.rfind(',').unwrap_or(0)].contains(name64);
@@ -1271,37 +1437,77 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         let lea = infos[i].trimmed(store.get(i));
-        if !lea.starts_with("leaq ") { i += 1; continue; }
+        if !lea.starts_with("leaq ") {
+            i += 1;
+            continue;
+        }
 
-        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else { i += 1; continue };
+        let Some((addr_text, dst_text)) = lea[5..].rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
         let (addr_text, dst_text) = (addr_text.trim(), dst_text.trim());
-        if !dst_text.starts_with('%') { i += 1; continue; }
+        if !dst_text.starts_with('%') {
+            i += 1;
+            continue;
+        }
         let dst_family = register_family_fast(dst_text);
-        if dst_family == REG_NONE || dst_family > REG_GP_MAX { i += 1; continue; }
+        if dst_family == REG_NONE || dst_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
 
         let (Some(open), Some(close)) = (addr_text.find('('), addr_text.rfind(')')) else {
-            i += 1; continue;
+            i += 1;
+            continue;
         };
-        if close <= open || close + 1 != addr_text.len() { i += 1; continue; }
+        if close <= open || close + 1 != addr_text.len() {
+            i += 1;
+            continue;
+        }
         let displacement = addr_text[..open].trim();
-        let fields: Vec<&str> = addr_text[open + 1..close].split(',').map(str::trim).collect();
+        let fields: Vec<&str> = addr_text[open + 1..close]
+            .split(',')
+            .map(str::trim)
+            .collect();
         // Only the two- and three-field SIB forms; the single-base form is
         // already handled (and folding it here would duplicate that work).
-        if fields.len() < 2 || fields.len() > 3 { i += 1; continue; }
-        if fields.iter().any(|f| !f.starts_with('%')) { i += 1; continue; }
-        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") { i += 1; continue; }
+        if fields.len() < 2 || fields.len() > 3 {
+            i += 1;
+            continue;
+        }
+        if fields.iter().any(|f| !f.starts_with('%')) {
+            i += 1;
+            continue;
+        }
+        if fields.len() == 3 && !matches!(fields[2], "1" | "2" | "4" | "8") {
+            i += 1;
+            continue;
+        }
 
         let base_family = register_family_fast(fields[0]);
         let index_family = register_family_fast(fields[1]);
-        if base_family == REG_NONE || index_family == REG_NONE
-            || base_family > REG_GP_MAX || index_family > REG_GP_MAX
-            || dst_family == base_family || dst_family == index_family
-        { i += 1; continue; }
+        if base_family == REG_NONE
+            || index_family == REG_NONE
+            || base_family > REG_GP_MAX
+            || index_family > REG_GP_MAX
+            || dst_family == base_family
+            || dst_family == index_family
+        {
+            i += 1;
+            continue;
+        }
 
         let sib = if fields.len() == 3 {
-            format!("{}({},{},{})", displacement, fields[0], fields[1], fields[2])
+            format!(
+                "{}({},{},{})",
+                displacement, fields[0], fields[1], fields[2]
+            )
         } else {
             format!("{}({},{})", displacement, fields[0], fields[1])
         };
@@ -1317,15 +1523,22 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
         let mut ok = true;
         let mut n = i + 1;
         while n < len {
-            if infos[n].is_nop() { n += 1; continue; }
-            if infos[n].is_barrier() { break; }
+            if infos[n].is_nop() {
+                n += 1;
+                continue;
+            }
+            if infos[n].is_barrier() {
+                break;
+            }
             let t = infos[n].trimmed(store.get(n));
 
             // Base or index redefined => the LEA's value is no longer
             // reproducible from them; stop (uses collected so far are still
             // valid only if we fold nothing after this point).
             let writes = get_dest_reg(&infos[n]);
-            if writes == base_family || writes == index_family { break; }
+            if writes == base_family || writes == index_family {
+                break;
+            }
             if infos[n].reg_refs & dst_mask != 0 {
                 // A bare `(%tmp)` operand is rewritable. Anything else that
                 // mentions the register (displacement form, plain read, or a
@@ -1344,16 +1557,19 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
                     // Reject a line that ALSO uses %tmp in a non-bare position.
                     let stripped = t.replace(&addr_pat, "");
                     if stripped.contains(dst64) || stripped.contains(dst32) {
-                        ok = false; break;
+                        ok = false;
+                        break;
                     }
                     uses.push(n);
                 } else if mentions {
                     // A pure redefinition of %tmp ends its live range cleanly:
                     // everything after belongs to a different value.
-                    if writes == dst_family
-                        && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
-                    { break; }
-                    ok = false; break;
+                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
+                    {
+                        break;
+                    }
+                    ok = false;
+                    break;
                 }
             }
             let _ = (base_mask, index_mask);
@@ -1362,14 +1578,23 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
 
         // Need at least two rewritable uses to beat the existing single-use
         // pass; with one use that pass already fires (and is better tested).
-        if !ok || uses.len() < 2 { i += 1; continue; }
+        if !ok || uses.len() < 2 {
+            i += 1;
+            continue;
+        }
         // %tmp must be dead after the block region we rewrote.
-        if fam_read_after(store, infos, n, dst_family) { i += 1; continue; }
+        if fam_read_after(store, infos, n, dst_family) {
+            i += 1;
+            continue;
+        }
 
         for &u in &uses {
             let t = infos[u].trimmed(store.get(u));
             let replacement = t.replacen(&addr_pat, &sib, 1);
-            if replacement == t { ok = false; break; }
+            if replacement == t {
+                ok = false;
+                break;
+            }
             replace_line(store, &mut infos[u], u, format!("    {}", replacement));
         }
         if ok {
@@ -1381,49 +1606,73 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
-pub(super) fn fold_base_index_addressing(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fold_base_index_addressing(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Look for: movq %REG, %rax (copy a GP register to accumulator)
         let ti = infos[i].trimmed(store.get(i));
-        if !ti.starts_with("movq %") || !ti.ends_with(", %rax") { i += 1; continue; }
+        if !ti.starts_with("movq %") || !ti.ends_with(", %rax") {
+            i += 1;
+            continue;
+        }
 
         // Extract the source register (the index)
         let idx_reg = &ti[5..ti.len() - 6]; // strip "movq " prefix and ", %rax" suffix
         if !idx_reg.starts_with('%') || idx_reg == "%rax" || idx_reg == "%rcx" {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
         // Must be a valid GP register
         let idx_family = register_family_fast(idx_reg);
-        if idx_family == REG_NONE || idx_family > REG_GP_MAX { i += 1; continue; }
+        if idx_family == REG_NONE || idx_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
 
         // Next non-NOP: must be addq %REG_BASE, %rax
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() { j += 1; }
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let tj = infos[j].trimmed(store.get(j));
-        if !tj.starts_with("addq %") || !tj.ends_with(", %rax") { i += 1; continue; }
+        if !tj.starts_with("addq %") || !tj.ends_with(", %rax") {
+            i += 1;
+            continue;
+        }
 
         let base_reg = &tj[5..tj.len() - 6]; // strip "addq " and ", %rax"
         if !base_reg.starts_with('%') || base_reg == "%rax" {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
         let base_family = register_family_fast(base_reg);
-        if base_family == REG_NONE || base_family > REG_GP_MAX { i += 1; continue; }
+        if base_family == REG_NONE || base_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
 
         // Next non-NOP: either a memory op using (%rax), or movq %rax, %REG_TMP
         let mut k = j + 1;
-        while k < len && infos[k].is_nop() { k += 1; }
-        if k >= len || infos[k].is_barrier() { i += 1; continue; }
+        while k < len && infos[k].is_nop() {
+            k += 1;
+        }
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let tk = infos[k].trimmed(store.get(k));
 
@@ -1452,15 +1701,18 @@ pub(super) fn fold_base_index_addressing(
         if tk.starts_with("movq %rax, %") {
             let tmp_reg = &tk[11..]; // after "movq %rax, " (includes the %)
             let tmp_family = register_family_fast(tmp_reg);
-            if tmp_family != REG_NONE && tmp_family <= REG_GP_MAX
-                && tmp_family != idx_family // idx must differ from tmp
+            if tmp_family != REG_NONE && tmp_family <= REG_GP_MAX && tmp_family != idx_family
+            // idx must differ from tmp
             {
                 let mut m = k + 1;
-                while m < len && infos[m].is_nop() { m += 1; }
+                while m < len && infos[m].is_nop() {
+                    m += 1;
+                }
                 if m < len && !infos[m].is_barrier() {
                     let tm = infos[m].trimmed(store.get(m));
                     let addr_pat = format!("(%{})", &tmp_reg[1..]); // e.g. "(%rcx)"
-                    if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg) {
+                    if let Some(folded) = try_fold_mem_op_with_sib(tm, &addr_pat, base_reg, idx_reg)
+                    {
                         // Safety: verify %TMP is dead after m. If anything
                         // reads %TMP after the folded mem op, the NOP'd movq
                         // at k means %TMP holds a stale value. Whole-function
@@ -1495,9 +1747,16 @@ pub(super) fn fold_base_index_addressing(
 
 /// Try to replace a memory operand `(ADDR_PAT)` in an instruction with SIB `(%BASE,%IDX)`.
 /// Returns the new instruction text if the pattern matches.
-fn try_fold_mem_op_with_sib(instr: &str, addr_pat: &str, base_reg: &str, idx_reg: &str) -> Option<String> {
+fn try_fold_mem_op_with_sib(
+    instr: &str,
+    addr_pat: &str,
+    base_reg: &str,
+    idx_reg: &str,
+) -> Option<String> {
     // The instruction must contain the address pattern exactly once
-    if !instr.contains(addr_pat) { return None; }
+    if !instr.contains(addr_pat) {
+        return None;
+    }
     // Don't fold into instructions that also reference rax/rcx in a way that conflicts
     // (the movq/addq we're removing clobber rax)
     // Build the SIB replacement
@@ -1521,40 +1780,68 @@ fn try_fold_mem_op_with_sib(instr: &str, addr_pat: &str, base_reg: &str, idx_reg
 // Saves 2 instructions per occurrence. Common in arith_loop where 32-bit
 // variables are stored to 64-bit stack slots through the accumulator.
 
-pub(super) fn fold_accumulator_alu_store(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Step 1: Look for `movl %REGd, %eax`
         let (src_reg32, src_family) = {
             let ti = infos[i].trimmed(store.get(i));
-            if !ti.starts_with("movl %") || !ti.ends_with(", %eax") { i += 1; continue; }
+            if !ti.starts_with("movl %") || !ti.ends_with(", %eax") {
+                i += 1;
+                continue;
+            }
             let sr = &ti[5..ti.len() - 6];
-            if !sr.starts_with('%') || sr == "%eax" { i += 1; continue; }
+            if !sr.starts_with('%') || sr == "%eax" {
+                i += 1;
+                continue;
+            }
             let sf = register_family_fast(sr);
-            if sf == REG_NONE || sf == 0 { i += 1; continue; }
+            if sf == REG_NONE || sf == 0 {
+                i += 1;
+                continue;
+            }
             (sr.to_string(), sf)
         };
 
         // Step 2: Next non-NOP must be `addl/subl/andl/orl/xorl STACK, %eax`
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() { j += 1; }
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let (alu_op_s, mem_src_s) = {
             let tj = infos[j].trimmed(store.get(j));
-            let ao = if let Some(pos) = tj.find(' ') { &tj[..pos] } else { i += 1; continue };
-            if !matches!(ao, "addl" | "subl" | "andl" | "orl" | "xorl") { i += 1; continue; }
-            if !tj.ends_with(", %eax") { i += 1; continue; }
+            let ao = if let Some(pos) = tj.find(' ') {
+                &tj[..pos]
+            } else {
+                i += 1;
+                continue;
+            };
+            if !matches!(ao, "addl" | "subl" | "andl" | "orl" | "xorl") {
+                i += 1;
+                continue;
+            }
+            if !tj.ends_with(", %eax") {
+                i += 1;
+                continue;
+            }
             let ms = tj[ao.len() + 1..tj.len() - 6].trim().to_string();
-            if !ms.ends_with("(%rsp)") && !ms.ends_with("(%rbp)") { i += 1; continue; }
+            if !ms.ends_with("(%rsp)") && !ms.ends_with("(%rbp)") {
+                i += 1;
+                continue;
+            }
             (ao.to_string(), ms)
         };
 
@@ -1572,18 +1859,31 @@ pub(super) fn fold_accumulator_alu_store(
         // extension (`movl %eax,slot`), so `OP mem,%REGd; movl %REGd,slot` is
         // exactly equivalent.
         let mut m = j + 1;
-        while m < len && infos[m].is_nop() { m += 1; }
-        if m >= len || infos[m].is_barrier() { i += 1; continue; }
+        while m < len && infos[m].is_nop() {
+            m += 1;
+        }
+        if m >= len || infos[m].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let store_dst_s = {
             let is_32bit_store_rax = match infos[m].kind {
-                LineKind::StoreRbp { reg: 0, size: MoveSize::L, .. } => true,
+                LineKind::StoreRbp {
+                    reg: 0,
+                    size: MoveSize::L,
+                    ..
+                } => true,
                 _ => {
                     let tm = infos[m].trimmed(store.get(m));
-                    tm.starts_with("movl %eax, ") && (tm.ends_with("(%rsp)") || tm.ends_with("(%rbp)"))
+                    tm.starts_with("movl %eax, ")
+                        && (tm.ends_with("(%rsp)") || tm.ends_with("(%rbp)"))
                 }
             };
-            if !is_32bit_store_rax { i += 1; continue; }
+            if !is_32bit_store_rax {
+                i += 1;
+                continue;
+            }
             let tm = infos[m].trimmed(store.get(m));
             tm[11..].to_string() // after "movl %eax, "
         };
@@ -1596,7 +1896,10 @@ pub(super) fn fold_accumulator_alu_store(
         let mut n = j + 1;
         let mut src_safe = true;
         while n < len && n < j + 16 {
-            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_nop() {
+                n += 1;
+                continue;
+            }
             if infos[n].is_barrier() {
                 // A branch/label means %SRC may be LIVE on another path; the
                 // transform overwrites %SRC with the ALU result, so we cannot
@@ -1605,7 +1908,10 @@ pub(super) fn fold_accumulator_alu_store(
                 src_safe = false;
                 break;
             }
-            if infos[n].reg_refs & src_bit == 0 { n += 1; continue; }
+            if infos[n].reg_refs & src_bit == 0 {
+                n += 1;
+                continue;
+            }
             match infos[n].kind {
                 LineKind::LoadRbp { reg, .. } if reg == src_family => break,
                 LineKind::Other { dest_reg } if dest_reg == src_family => break,
@@ -1620,7 +1926,10 @@ pub(super) fn fold_accumulator_alu_store(
                 }
             }
         }
-        if !src_safe { i += 1; continue; }
+        if !src_safe {
+            i += 1;
+            continue;
+        }
 
         // SOUNDNESS (v9 / BUG-003): after the fold, %eax no longer holds the
         // ALU result — `OP mem, %REGd` writes %REG, and the store is rewritten
@@ -1659,9 +1968,19 @@ fn is_32bit_eax_consumer(trimmed: &str) -> bool {
         } else {
             trimmed
         };
-        return matches!(op,
-            "addl" | "subl" | "imull" | "andl" | "orl" | "xorl"
-            | "shll" | "shrl" | "sarl" | "movl" | "leal"
+        return matches!(
+            op,
+            "addl"
+                | "subl"
+                | "imull"
+                | "andl"
+                | "orl"
+                | "xorl"
+                | "shll"
+                | "shrl"
+                | "sarl"
+                | "movl"
+                | "leal"
         );
     }
     false
@@ -1691,7 +2010,10 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Pattern X: XMM -> GPR -> XMM relay. The mature emitter uses the
         // integer accumulator as a compatibility bridge for values that are
@@ -1711,15 +2033,18 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 && src.starts_with('%')
             {
                 let mut j = i + 1;
-                while j < len && infos[j].is_nop() { j += 1; }
+                while j < len && infos[j].is_nop() {
+                    j += 1;
+                }
                 if j < len {
                     let relay = infos[j].trimmed(store.get(j));
                     let expected = format!("movq {}, %xmm", dst_gpr);
                     if relay.starts_with(&expected) {
-                        let dst_xmm = relay.rsplit_once(',').map(|(_, dst)| dst.trim()).unwrap_or("");
-                        if !dst_xmm.is_empty()
-                            && !fam_read_after(store, infos, j + 1, gpr_family)
-                        {
+                        let dst_xmm = relay
+                            .rsplit_once(',')
+                            .map(|(_, dst)| dst.trim())
+                            .unwrap_or("");
+                        if !dst_xmm.is_empty() && !fam_read_after(store, infos, j + 1, gpr_family) {
                             let replacement = format!("    movsd {}, {}", src, dst_xmm);
                             replace_line(store, &mut infos[i], i, replacement);
                             mark_nop(&mut infos[j]);
@@ -1733,15 +2058,26 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
         }
 
         // Pattern A: LoadRbp{rax(0) or rcx(1), Q} then "movq %gpr, %xmmN"
-        if let LineKind::LoadRbp { reg: load_reg, offset, size: MoveSize::Q } = infos[i].kind {
+        if let LineKind::LoadRbp {
+            reg: load_reg,
+            offset,
+            size: MoveSize::Q,
+        } = infos[i].kind
+        {
             if load_reg <= 1 {
                 let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                while j < len && j < i + 4 && infos[j].is_nop() {
+                    j += 1;
+                }
                 if j < len && !infos[j].is_nop() {
                     let line_j = infos[j].trimmed(store.get(j));
                     // Generalize to any %xmmN destination (the emitter rotates
                     // through xmm2..xmm13); the load_reg selects the bridge GPR.
-                    let bridge = if load_reg == 0 { "movq %rax, " } else { "movq %rcx, " };
+                    let bridge = if load_reg == 0 {
+                        "movq %rax, "
+                    } else {
+                        "movq %rcx, "
+                    };
                     if line_j.starts_with(bridge) {
                         let xmm_str = &line_j[bridge.len()..];
                         // SOUNDNESS: this rewrites the LOAD itself, so the
@@ -1758,7 +2094,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                         // `addq $7, %rax` reading a register nothing defines.
                         if xmm_str.starts_with("%xmm") && !xmm_str.contains(' ') {
                             let mut k = j + 1;
-                            while k < len && infos[k].is_nop() { k += 1; }
+                            while k < len && infos[k].is_nop() {
+                                k += 1;
+                            }
                             let bridge_dead = if load_reg == 0 {
                                 rax_elidable_after(store, infos, k, len)
                             } else {
@@ -1766,8 +2104,13 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                             };
                             if bridge_dead {
                                 let load_text = infos[i].trimmed(store.get(i));
-                                let base = if load_text.contains("(%rsp)") { "rsp" } else { "rbp" };
-                                let new_text = format!("    movsd {}(%{}), {}", offset, base, xmm_str);
+                                let base = if load_text.contains("(%rsp)") {
+                                    "rsp"
+                                } else {
+                                    "rbp"
+                                };
+                                let new_text =
+                                    format!("    movsd {}(%{}), {}", offset, base, xmm_str);
                                 replace_line(store, &mut infos[i], i, new_text);
                                 mark_nop(&mut infos[j]);
                                 changed = true;
@@ -1791,15 +2134,29 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                 let src_xmm = &line_i[5..line_i.len() - 6]; // strip "movq " and ", %rax"
                 if src_xmm.starts_with("%xmm") {
                     let mut j = i + 1;
-                    while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                    while j < len && j < i + 4 && infos[j].is_nop() {
+                        j += 1;
+                    }
                     if j < len {
-                        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
+                        if let LineKind::StoreRbp {
+                            reg: 0,
+                            offset,
+                            size: MoveSize::Q,
+                        } = infos[j].kind
+                        {
                             let mut k = j + 1;
-                            while k < len && infos[k].is_nop() { k += 1; }
+                            while k < len && infos[k].is_nop() {
+                                k += 1;
+                            }
                             if rax_elidable_after(store, infos, k, len) {
                                 let store_text = infos[j].trimmed(store.get(j));
-                                let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
-                                let new_text = format!("    movsd {}, {}(%{})", src_xmm, offset, base);
+                                let base = if store_text.contains("(%rsp)") {
+                                    "rsp"
+                                } else {
+                                    "rbp"
+                                };
+                                let new_text =
+                                    format!("    movsd {}, {}(%{})", src_xmm, offset, base);
                                 mark_nop(&mut infos[i]);
                                 replace_line(store, &mut infos[j], j, new_text);
                                 changed = true;
@@ -1815,9 +2172,16 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
         // Pattern E: StoreRbp{rax, O} immediately followed by "movq %rax, %xmmN"
         // The stack store is dead (value used from %rax directly). NOP it so
         // Pattern D can fire on the adjacent movq-from-ptr + movq-to-xmm.
-        if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[i].kind {
+        if let LineKind::StoreRbp {
+            reg: 0,
+            offset,
+            size: MoveSize::Q,
+        } = infos[i].kind
+        {
             let mut j = i + 1;
-            while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+            while j < len && j < i + 4 && infos[j].is_nop() {
+                j += 1;
+            }
             if j < len {
                 let line_j = infos[j].trimmed(store.get(j));
                 if line_j == "movq %rax, %xmm0" || line_j == "movq %rax, %xmm1" {
@@ -1840,7 +2204,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
             let line_i = infos[i].trimmed(store.get(i));
             if line_i.starts_with("movq (%") && line_i.ends_with("), %rax") {
                 let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                while j < len && j < i + 4 && infos[j].is_nop() {
+                    j += 1;
+                }
                 if j < len {
                     let line_j = infos[j].trimmed(store.get(j));
                     let xmm = if line_j == "movq %rax, %xmm0" {
@@ -1854,7 +2220,9 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
                         // Extract pointer register from "movq (%<ptr>), %rax"
                         let ptr_reg = &line_i[7..line_i.len() - 7]; // strip "movq (%" and "), %rax"
                         let mut k = j + 1;
-                        while k < len && infos[k].is_nop() { k += 1; }
+                        while k < len && infos[k].is_nop() {
+                            k += 1;
+                        }
                         if rax_elidable_after(store, infos, k, len) {
                             let new_text = format!("    movsd (%{}), {}", ptr_reg, xmm_str);
                             replace_line(store, &mut infos[i], i, new_text);
@@ -1877,28 +2245,36 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
             if line_i == "movq %xmm0, %rax" {
                 // Find J: "movq %rax, %<gprA>"
                 let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                while j < len && j < i + 4 && infos[j].is_nop() {
+                    j += 1;
+                }
                 if j < len {
                     let line_j = infos[j].trimmed(store.get(j));
                     if line_j.starts_with("movq %rax, %") && !line_j.ends_with("%xmm0") {
                         let gpr_a = &line_j[12..]; // "movq %rax, %" is 12 chars
-                        // Find K: "movq %<gprB>, %rcx"
+                                                   // Find K: "movq %<gprB>, %rcx"
                         let mut k = j + 1;
-                        while k < len && k < j + 4 && infos[k].is_nop() { k += 1; }
+                        while k < len && k < j + 4 && infos[k].is_nop() {
+                            k += 1;
+                        }
                         if k < len {
                             let line_k = infos[k].trimmed(store.get(k));
                             if line_k.starts_with("movq %") && line_k.ends_with(", %rcx") {
                                 let gpr_b = &line_k[6..line_k.len() - 6]; // strip "movq %" and ", %rcx"
-                                // Find L: "movq %<gprA>, (%rcx)"
+                                                                          // Find L: "movq %<gprA>, (%rcx)"
                                 let mut l = k + 1;
-                                while l < len && l < k + 4 && infos[l].is_nop() { l += 1; }
+                                while l < len && l < k + 4 && infos[l].is_nop() {
+                                    l += 1;
+                                }
                                 if l < len {
                                     let expected_l = format!("movq %{}, (%rcx)", gpr_a);
                                     let line_l = infos[l].trimmed(store.get(l));
                                     if line_l == expected_l {
                                         // Check rax not live after J, gprA not live after L.
                                         let mut after_j = j + 1;
-                                        while after_j < len && infos[after_j].is_nop() { after_j += 1; }
+                                        while after_j < len && infos[after_j].is_nop() {
+                                            after_j += 1;
+                                        }
                                         if rax_elidable_after(store, infos, after_j, len) {
                                             let new_text = format!("    movsd %xmm0, (%{})", gpr_b);
                                             replace_line(store, &mut infos[i], i, new_text);
@@ -1934,16 +2310,16 @@ pub(super) fn eliminate_fp_xmm_roundtrips(store: &mut LineStore, infos: &mut [Li
 // Folds to:  NOP I, NOP J,  replace O(%rbp) in K with (%<ptr>).
 // This eliminates the GPR round-trip and stack spill.
 //
-pub(super) fn fold_ptr_deref_through_stack(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fold_ptr_deref_through_stack(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match I: "movq (%<ptr>), %rax"
         if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
@@ -1953,11 +2329,25 @@ pub(super) fn fold_ptr_deref_through_stack(
 
                 // Match J: immediately adjacent StoreRbp{0, O, Q}
                 let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
-                if j >= len { i += 1; continue; }
-                if let LineKind::StoreRbp { reg: 0, offset, size: MoveSize::Q } = infos[j].kind {
+                while j < len && j < i + 4 && infos[j].is_nop() {
+                    j += 1;
+                }
+                if j >= len {
+                    i += 1;
+                    continue;
+                }
+                if let LineKind::StoreRbp {
+                    reg: 0,
+                    offset,
+                    size: MoveSize::Q,
+                } = infos[j].kind
+                {
                     let store_text = infos[j].trimmed(store.get(j));
-                    let base = if store_text.contains("(%rsp)") { "rsp" } else { "rbp" };
+                    let base = if store_text.contains("(%rsp)") {
+                        "rsp"
+                    } else {
+                        "rbp"
+                    };
                     let offset_str = format!("{}(%{})", offset, base);
                     let ptr_mem = format!("(%{})", ptr_reg);
 
@@ -1969,7 +2359,10 @@ pub(super) fn fold_ptr_deref_through_stack(
                     let mut found = false;
 
                     while k < len && count < 20 {
-                        if infos[k].is_nop() { k += 1; continue; }
+                        if infos[k].is_nop() {
+                            k += 1;
+                            continue;
+                        }
                         let t = infos[k].trimmed(store.get(k));
 
                         // Stop at control flow.
@@ -1986,12 +2379,13 @@ pub(super) fn fold_ptr_deref_through_stack(
                         // Check if %rax is read before overwritten (safety for NOP'ing I).
                         if !rax_overwritten {
                             match infos[k].kind {
-                                LineKind::LoadRbp { reg: 0, .. } |
-                                LineKind::Other { dest_reg: 0 } => {
+                                LineKind::LoadRbp { reg: 0, .. }
+                                | LineKind::Other { dest_reg: 0 } => {
                                     rax_overwritten = true;
                                 }
                                 _ => {
-                                    if t.contains("%rax") || t.contains("%eax") || t.contains("%al") {
+                                    if t.contains("%rax") || t.contains("%eax") || t.contains("%al")
+                                    {
                                         // %rax is read before being overwritten → unsafe.
                                         break;
                                     }
@@ -2001,7 +2395,9 @@ pub(super) fn fold_ptr_deref_through_stack(
 
                         // Check for StoreRbp writing the same offset → our store is overwritten.
                         if let LineKind::StoreRbp { offset: o, .. } = infos[k].kind {
-                            if o == offset { break; }
+                            if o == offset {
+                                break;
+                            }
                         }
 
                         // Found an FP instruction using O(%rbp) as source operand?
@@ -2009,14 +2405,23 @@ pub(super) fn fold_ptr_deref_through_stack(
                             // Verify it's a source (not dest). StoreRbp is already caught above.
                             // For movsd/mulsd/addsd/subsd/divsd: the memory operand is the source
                             // if it comes before the comma.
-                            if (t.starts_with("movsd ") || t.starts_with("mulsd ") ||
-                                t.starts_with("addsd ") || t.starts_with("subsd ") ||
-                                t.starts_with("divsd ")) &&
-                                t.contains(&offset_str)
+                            if (t.starts_with("movsd ")
+                                || t.starts_with("mulsd ")
+                                || t.starts_with("addsd ")
+                                || t.starts_with("subsd ")
+                                || t.starts_with("divsd "))
+                                && t.contains(&offset_str)
                             {
                                 // Check O(%rbp) not read again after K.
-                                if rbp_offset_dead_after(store, infos, k + 1, len, i64::from(offset)) {
-                                    let new_text = format!("    {}", t.replace(&offset_str, &ptr_mem));
+                                if rbp_offset_dead_after(
+                                    store,
+                                    infos,
+                                    k + 1,
+                                    len,
+                                    i64::from(offset),
+                                ) {
+                                    let new_text =
+                                        format!("    {}", t.replace(&offset_str, &ptr_mem));
                                     mark_nop(&mut infos[i]);
                                     mark_nop(&mut infos[j]);
                                     replace_line(store, &mut infos[k], k, new_text);
@@ -2071,13 +2476,18 @@ pub(super) fn eliminate_fp_spill_around_load(
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         let line_i = infos[i].trimmed(store.get(i));
 
         // Match I: "movsd %xmm0, <offset>(%rbp)"
-        if line_i.starts_with("movsd %xmm0, ") && (line_i.ends_with("(%rbp)") || line_i.ends_with("(%rsp)")) {
+        if line_i.starts_with("movsd %xmm0, ")
+            && (line_i.ends_with("(%rbp)") || line_i.ends_with("(%rsp)"))
+        {
             let mem_operand = &line_i[13..]; // after "movsd %xmm0, " (13 chars)
-            // Extract numeric offset from e.g. "-48(%rbp)"
+                                             // Extract numeric offset from e.g. "-48(%rbp)"
             let paren_pos = mem_operand.find('(');
             if let Some(pp) = paren_pos {
                 let offset_num: Result<i64, _> = mem_operand[..pp].parse();
@@ -2090,10 +2500,18 @@ pub(super) fn eliminate_fp_spill_around_load(
                     let mut count = 0;
 
                     while j < len && count < 16 {
-                        if infos[j].is_nop() { j += 1; continue; }
+                        if infos[j].is_nop() {
+                            j += 1;
+                            continue;
+                        }
                         let t = infos[j].trimmed(store.get(j));
-                        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") { break; }
-                        if t.contains("%xmm1") { xmm1_clear = false; break; }
+                        if t.starts_with('j') || t.starts_with("call") || t.starts_with("ret") {
+                            break;
+                        }
+                        if t.contains("%xmm1") {
+                            xmm1_clear = false;
+                            break;
+                        }
 
                         // Find K: "movsd <something>, %xmm0" (load overwriting xmm0)
                         if k_pos == 0 && t.starts_with("movsd ") && t.ends_with(", %xmm0") {
@@ -2118,9 +2536,12 @@ pub(super) fn eliminate_fp_spill_around_load(
                         if rbp_offset_dead_after(store, infos, l_pos + 1, len, offset) {
                             // Also verify xmm1 is dead after L.
                             let mut after_l = l_pos + 1;
-                            while after_l < len && infos[after_l].is_nop() { after_l += 1; }
-                            let xmm1_dead_after = if after_l >= len { true }
-                            else {
+                            while after_l < len && infos[after_l].is_nop() {
+                                after_l += 1;
+                            }
+                            let xmm1_dead_after = if after_l >= len {
+                                true
+                            } else {
                                 let t = infos[after_l].trimmed(store.get(after_l));
                                 !t.contains("%xmm1")
                             };
@@ -2172,10 +2593,19 @@ pub(super) fn promote_loop_invariant_fp_load(
     // Find loop back-edges: jmp to a label that appears before the jmp.
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
-        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        if infos[i].kind != LineKind::Jmp {
+            i += 1;
+            continue;
+        }
         let jmp_text = infos[i].trimmed(store.get(i));
-        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
+        if !jmp_text.starts_with("jmp ") {
+            i += 1;
+            continue;
+        }
         let target = &jmp_text[4..];
         let target_label = format!("{}:", target);
 
@@ -2191,7 +2621,10 @@ pub(super) fn promote_loop_invariant_fp_load(
         }
         let header = match header_pos {
             Some(h) => h,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Loop body is [header..=i]. Find movsd -O(%rbp), %xmm0 in body.
@@ -2206,12 +2639,18 @@ pub(super) fn promote_loop_invariant_fp_load(
 
         // Scan body for "movsd -O(%rbp), %xmm0" candidates.
         for pos in body_start + 1..i {
-            if infos[pos].is_nop() { continue; }
+            if infos[pos].is_nop() {
+                continue;
+            }
             let t = infos[pos].trimmed(store.get(pos));
-            if !t.starts_with("movsd ") || !t.ends_with(", %xmm0") { continue; }
+            if !t.starts_with("movsd ") || !t.ends_with(", %xmm0") {
+                continue;
+            }
             // Check it's a stack load: "movsd -N(%rbp), %xmm0" or "movsd N(%rsp), %xmm0"
             let src = &t[6..t.len() - 7]; // between "movsd " and ", %xmm0"
-            if !src.ends_with("(%rbp)") && !src.ends_with("(%rsp)") { continue; }
+            if !src.ends_with("(%rbp)") && !src.ends_with("(%rsp)") {
+                continue;
+            }
             let offset_str = src.to_string();
 
             // Check -O(%rbp) is NOT written in the loop body [body_start..=i].
@@ -2220,26 +2659,41 @@ pub(super) fn promote_loop_invariant_fp_load(
             let numeric_offset: i32 = offset_str[..numeric_offset_end].parse().unwrap_or(0);
             let mut written_in_body = false;
             for chk in body_start + 1..i {
-                if infos[chk].is_nop() { continue; }
+                if infos[chk].is_nop() {
+                    continue;
+                }
                 if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
-                    if o == numeric_offset { written_in_body = true; break; }
+                    if o == numeric_offset {
+                        written_in_body = true;
+                        break;
+                    }
                 }
                 // Also check text for movsd stores to this offset.
                 let ct = infos[chk].trimmed(store.get(chk));
                 if ct.ends_with(&offset_str) && ct.starts_with("movsd ") {
-                    written_in_body = true; break;
+                    written_in_body = true;
+                    break;
                 }
             }
-            if written_in_body { continue; }
+            if written_in_body {
+                continue;
+            }
 
             // Check xmm2 is not used anywhere in [header..=i].
             let mut xmm2_used = false;
             for chk in header..=i {
-                if infos[chk].is_nop() { continue; }
+                if infos[chk].is_nop() {
+                    continue;
+                }
                 let ct = infos[chk].trimmed(store.get(chk));
-                if ct.contains("%xmm2") { xmm2_used = true; break; }
+                if ct.contains("%xmm2") {
+                    xmm2_used = true;
+                    break;
+                }
             }
-            if xmm2_used { continue; }
+            if xmm2_used {
+                continue;
+            }
 
             // Find preheader store: "movq %rax, -O(%rbp)" before the header.
             // Scan backward, crossing labels but stopping at function boundaries (.size).
@@ -2248,26 +2702,36 @@ pub(super) fn promote_loop_invariant_fp_load(
             let mut ph_count = 0;
             while ph_count < 60 {
                 if infos[ph].is_nop() {
-                    if ph == 0 { break; }
+                    if ph == 0 {
+                        break;
+                    }
                     ph -= 1;
                     continue;
                 }
                 // Stop at function boundaries, not labels
                 if infos[ph].kind == LineKind::Directive {
                     let dt = infos[ph].trimmed(store.get(ph));
-                    if dt.starts_with(".size ") || dt.starts_with(".globl ") || dt.starts_with(".type ") {
+                    if dt.starts_with(".size ")
+                        || dt.starts_with(".globl ")
+                        || dt.starts_with(".type ")
+                    {
                         break;
                     }
                 }
                 // Labels are OK to cross — we're looking for ANY store to this offset
                 // that dominates the loop header.
-                if let LineKind::StoreRbp { reg: 0, offset: o, .. } = infos[ph].kind {
+                if let LineKind::StoreRbp {
+                    reg: 0, offset: o, ..
+                } = infos[ph].kind
+                {
                     if o == numeric_offset {
                         preheader_store = Some(ph);
                         break;
                     }
                 }
-                if ph == 0 { break; }
+                if ph == 0 {
+                    break;
+                }
                 ph -= 1;
                 ph_count += 1;
             }
@@ -2301,53 +2765,65 @@ pub(super) fn promote_loop_invariant_fp_load(
 // The addq→leaq rewrite drops flags. We verify the next non-NOP instruction
 // sets its own flags (doesn't consume ours) before applying.
 //
-pub(super) fn fuse_copy_and_operation(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match: "movq %<src>, %<dst>" where src != dst, both are GP regs.
         if let LineKind::Other { dest_reg } = infos[i].kind {
-            if dest_reg > 15 { i += 1; continue; }
+            if dest_reg > 15 {
+                i += 1;
+                continue;
+            }
             let line_i = infos[i].trimmed(store.get(i));
-            if !line_i.starts_with("movq %") { i += 1; continue; }
+            if !line_i.starts_with("movq %") {
+                i += 1;
+                continue;
+            }
 
             // Parse "movq %<src>, %<dst>"
             if let Some(comma) = line_i.find(", %") {
                 let src_reg = &line_i[6..comma]; // after "movq %"
                 let dst_reg_str = &line_i[comma + 3..]; // after ", %"
-                // A segment override source (e.g. `movq %fs:0, %rax` from TLS
-                // initial-exec) must NOT be folded into a following lea:
-                // `lea disp(%fs:0), %rax` would compute disp WITHOUT adding the
-                // segment base (LEA ignores segment overrides by design), so
-                // the TLS address would be wrong. `movq %fs:0, %rax` + `leaq
-                // tpoff(%rax), %rax` must stay two instructions.
+                                                        // A segment override source (e.g. `movq %fs:0, %rax` from TLS
+                                                        // initial-exec) must NOT be folded into a following lea:
+                                                        // `lea disp(%fs:0), %rax` would compute disp WITHOUT adding the
+                                                        // segment base (LEA ignores segment overrides by design), so
+                                                        // the TLS address would be wrong. `movq %fs:0, %rax` + `leaq
+                                                        // tpoff(%rax), %rax` must stay two instructions.
                 if src_reg == dst_reg_str || src_reg.contains('(') || src_reg.contains(':') {
                     i += 1;
                     continue;
                 }
 
                 let mut j = i + 1;
-                while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
-                if j >= len { i += 1; continue; }
+                while j < len && j < i + 4 && infos[j].is_nop() {
+                    j += 1;
+                }
+                if j >= len {
+                    i += 1;
+                    continue;
+                }
                 let line_j = infos[j].trimmed(store.get(j));
 
                 // Sub-pattern: leaq disp(%<dst>), %<dst> → leaq disp(%<src>), %<dst>
                 let lea_prefix = format!("leaq ");
                 let lea_base = format!("(%{}), %{}", dst_reg_str, dst_reg_str);
-                if line_j.starts_with(&lea_prefix) && line_j.ends_with(&format!("), %{}", dst_reg_str)) &&
-                   line_j.contains(&format!("(%{})", dst_reg_str))
+                if line_j.starts_with(&lea_prefix)
+                    && line_j.ends_with(&format!("), %{}", dst_reg_str))
+                    && line_j.contains(&format!("(%{})", dst_reg_str))
                 {
-                    let new_text = format!("    {}", line_j.replace(
-                        &format!("(%{})", dst_reg_str),
-                        &format!("(%{})", src_reg),
-                    ));
+                    let new_text = format!(
+                        "    {}",
+                        line_j.replace(&format!("(%{})", dst_reg_str), &format!("(%{})", src_reg),)
+                    );
                     mark_nop(&mut infos[i]);
                     replace_line(store, &mut infos[j], j, new_text);
                     changed = true;
@@ -2360,23 +2836,35 @@ pub(super) fn fuse_copy_and_operation(
                 let add_suffix = format!(", %{}", dst_reg_str);
                 if line_j.starts_with("addq $") && line_j.ends_with(&add_suffix) {
                     let imm_str = &line_j[6..line_j.len() - add_suffix.len()]; // between "addq $" and ", %dst"
-                    // Check flags safety: next instruction must not read flags.
+                                                                               // Check flags safety: next instruction must not read flags.
                     let mut k = j + 1;
-                    while k < len && infos[k].is_nop() { k += 1; }
-                    let flags_safe = if k >= len { true } else {
+                    while k < len && infos[k].is_nop() {
+                        k += 1;
+                    }
+                    let flags_safe = if k >= len {
+                        true
+                    } else {
                         let next = infos[k].trimmed(store.get(k));
                         // Instructions that consume flags: jCC, setCC, adcq, sbbq, cmovc, etc.
                         // Conservative: if next instruction starts with any of these, bail.
-                        !(next.starts_with("ja") || next.starts_with("jb") ||
-                          next.starts_with("je") || next.starts_with("jn") ||
-                          next.starts_with("jg") || next.starts_with("jl") ||
-                          next.starts_with("js") || next.starts_with("jo") ||
-                          next.starts_with("jc") || next.starts_with("jp") ||
-                          next.starts_with("set") || next.starts_with("adc") ||
-                          next.starts_with("sbb") || next.starts_with("cmov"))
+                        !(next.starts_with("ja")
+                            || next.starts_with("jb")
+                            || next.starts_with("je")
+                            || next.starts_with("jn")
+                            || next.starts_with("jg")
+                            || next.starts_with("jl")
+                            || next.starts_with("js")
+                            || next.starts_with("jo")
+                            || next.starts_with("jc")
+                            || next.starts_with("jp")
+                            || next.starts_with("set")
+                            || next.starts_with("adc")
+                            || next.starts_with("sbb")
+                            || next.starts_with("cmov"))
                     };
                     if flags_safe {
-                        let new_text = format!("    leaq {}(%{}), %{}", imm_str, src_reg, dst_reg_str);
+                        let new_text =
+                            format!("    leaq {}(%{}), %{}", imm_str, src_reg, dst_reg_str);
                         mark_nop(&mut infos[i]);
                         replace_line(store, &mut infos[j], j, new_text);
                         changed = true;
@@ -2413,11 +2901,7 @@ fn rax_elidable_after(store: &LineStore, infos: &[LineInfo], mut at: usize, len:
         let t = infos[at].trimmed(store.get(at));
         // Control-flow / calls: conservative — a branch may skip any write, so
         // the value could be observed on another path. Never fuse across them.
-        if t.contains("call")
-            || t.starts_with("j")
-            || t.starts_with("ret")
-            || t.contains("jmp")
-        {
+        if t.contains("call") || t.starts_with("j") || t.starts_with("ret") || t.contains("jmp") {
             return false;
         }
         // A definitive write of %rax/%eax makes earlier values dead.
@@ -2473,11 +2957,16 @@ fn rbp_offset_dead_after(
     let mut i = start;
     let mut count = 0;
     while i < len && count < 2048 {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         let t = infos[i].trimmed(store.get(i));
         // A later write to the same offset (StoreRbp) re-validates the slot.
         if let LineKind::StoreRbp { offset: o, .. } = infos[i].kind {
-            if i64::from(o) == offset { return true; }
+            if i64::from(o) == offset {
+                return true;
+            }
         }
         // Any other mention of the offset (a load, an address operand) means
         // the slot must stay valid — do NOT eliminate the store.
@@ -2500,33 +2989,37 @@ fn rbp_offset_dead_after(
 // When %rcx is dead after the dereference we can fold to:
 //   movq (%<ptr>), %rax   OR   movsd (%<ptr>), %xmmN
 //
-pub(super) fn eliminate_rcx_address_copy(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match: "movq %<gpr>, %rcx" (any GPR → rcx, rcx = family 1)
         if let LineKind::Other { dest_reg: 1 } = infos[i].kind {
             let line_i = infos[i].trimmed(store.get(i));
             if line_i.starts_with("movq %") && line_i.ends_with(", %rcx") {
                 let src_reg = &line_i[6..line_i.len() - 6]; // between "movq %" and ", %rcx"
-                // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
+                                                            // src_reg must not be "rcx" itself (no-op move) and must be a plain GPR
                 if src_reg != "rcx" && !src_reg.contains('(') && !src_reg.contains('$') {
                     let mut j = i + 1;
-                    while j < len && j < i + 4 && infos[j].is_nop() { j += 1; }
+                    while j < len && j < i + 4 && infos[j].is_nop() {
+                        j += 1;
+                    }
                     if j < len {
                         let line_j = infos[j].trimmed(store.get(j));
 
                         // Sub-pattern G1: movq (%rcx), %rax → movq (%<src>), %rax
                         if line_j == "movq (%rcx), %rax" {
                             let mut k = j + 1;
-                            while k < len && infos[k].is_nop() { k += 1; }
+                            while k < len && infos[k].is_nop() {
+                                k += 1;
+                            }
                             if !rcx_is_live_at(store, infos, k, len) {
                                 let new = format!("    movq (%{}), %rax", src_reg);
                                 mark_nop(&mut infos[i]);
@@ -2541,7 +3034,9 @@ pub(super) fn eliminate_rcx_address_copy(
                         if line_j.starts_with("movsd (%rcx), %xmm") {
                             let xmm_dest = &line_j[14..]; // after "movsd (%rcx), " → "%xmmN"
                             let mut k = j + 1;
-                            while k < len && infos[k].is_nop() { k += 1; }
+                            while k < len && infos[k].is_nop() {
+                                k += 1;
+                            }
                             if !rcx_is_live_at(store, infos, k, len) {
                                 let new = format!("    movsd (%{}), {}", src_reg, xmm_dest);
                                 mark_nop(&mut infos[i]);
@@ -2562,7 +3057,9 @@ pub(super) fn eliminate_rcx_address_copy(
 }
 
 fn rcx_is_live_at(store: &LineStore, infos: &[LineInfo], at: usize, len: usize) -> bool {
-    if at >= len { return false; }
+    if at >= len {
+        return false;
+    }
     match infos[at].kind {
         // LoadRbp loads into a GP reg — doesn't use %rcx as address
         LineKind::LoadRbp { .. } => false,
@@ -2619,10 +3116,15 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
 
         // Check if next instruction is a fusable extension/truncation on %rax
         let next_ext = infos[j].ext_kind;
-        let fusable = matches!(next_ext,
-            ExtKind::MovlEaxEax | ExtKind::MovslqEaxRax | ExtKind::Cltq |
-            ExtKind::MovzbqAlRax | ExtKind::MovzwqAxRax |
-            ExtKind::MovsbqAlRax);
+        let fusable = matches!(
+            next_ext,
+            ExtKind::MovlEaxEax
+                | ExtKind::MovslqEaxRax
+                | ExtKind::Cltq
+                | ExtKind::MovzbqAlRax
+                | ExtKind::MovzwqAxRax
+                | ExtKind::MovsbqAlRax
+        );
         if !fusable {
             i += 1;
             continue;
@@ -2642,8 +3144,12 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
                 } else {
                     REG_NONE
                 }
-            } else { REG_NONE }
-        } else { REG_NONE };
+            } else {
+                REG_NONE
+            }
+        } else {
+            REG_NONE
+        };
 
         if src_family == REG_NONE {
             i += 1;
@@ -2701,44 +3207,61 @@ pub(super) fn fuse_movq_ext_truncation(store: &mut LineStore, infos: &mut [LineI
 //
 // Also handles cltq (= movslq %eax, %rax) as the sign-extend source.
 
-pub(super) fn fuse_signext_and_move(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fuse_signext_and_move(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match: movslq %Xd, %rax (or cltq)
         let ti = infos[i].trimmed(store.get(i));
         let src_family = if ti.starts_with("movslq %") && ti.ends_with(", %rax") {
             let src_32 = &ti[7..ti.len() - 6]; // between "movslq " and ", %rax"
-            if !src_32.starts_with('%') { i += 1; continue; }
+            if !src_32.starts_with('%') {
+                i += 1;
+                continue;
+            }
             let fam = register_family_fast(src_32);
-            if fam == REG_NONE || fam == 0 { i += 1; continue; }
+            if fam == REG_NONE || fam == 0 {
+                i += 1;
+                continue;
+            }
             fam
         } else if ti == "cltq" {
             0u8 // cltq sign-extends %eax → %rax, src is rax family itself
         } else {
-            i += 1; continue;
+            i += 1;
+            continue;
         };
 
         // For cltq, we can't retarget (src == dest == rax family), skip
-        if src_family == 0 { i += 1; continue; }
+        if src_family == 0 {
+            i += 1;
+            continue;
+        }
 
         // Next non-NOP: must be movq %rax, %Y
         let j = next_non_nop(infos, i + 1, len);
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let tj = infos[j].trimmed(store.get(j));
-        if !tj.starts_with("movq %rax, %") { i += 1; continue; }
+        if !tj.starts_with("movq %rax, %") {
+            i += 1;
+            continue;
+        }
         let dest_reg = &tj[11..]; // after "movq %rax, " (includes %)
         let dest_family = register_family_fast(dest_reg);
         if dest_family == REG_NONE || dest_family == 0 || dest_family == src_family {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
 
         // Check if %rax is dead after j, or only used in a redirectable cmpl.
@@ -2750,7 +3273,10 @@ pub(super) fn fuse_signext_and_move(
         let mut cmpl_lines: Vec<usize> = Vec::new();
         let mut n = j + 1;
         while n < len {
-            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_nop() {
+                n += 1;
+                continue;
+            }
             if infos[n].is_barrier() {
                 // At ANY barrier, conservatively assume rax is alive.
                 // Even jmp/call could have successors that read rax
@@ -2767,7 +3293,10 @@ pub(super) fn fuse_signext_and_move(
                 // for zero-extension) are NOT pure writes — they depend on the
                 // current rax value.
                 match infos[n].kind {
-                    LineKind::LoadRbp { reg: 0, .. } => { rax_dead = true; break; }
+                    LineKind::LoadRbp { reg: 0, .. } => {
+                        rax_dead = true;
+                        break;
+                    }
                     LineKind::Other { dest_reg: 0 } => {
                         // Verify it's a pure write, not a read-modify-write.
                         let tn = infos[n].trimmed(store.get(n));
@@ -2776,8 +3305,10 @@ pub(super) fn fuse_signext_and_move(
                             // rax-family register (eax, ax, al, rax).
                             let is_rax_in_src = if let Some(comma) = tn.rfind(',') {
                                 let src = &tn[..comma];
-                                src.contains("%rax") || src.contains("%eax")
-                                    || src.contains("%ax") || src.contains("%al")
+                                src.contains("%rax")
+                                    || src.contains("%eax")
+                                    || src.contains("%ax")
+                                    || src.contains("%al")
                             } else {
                                 true // single-operand → assumes reads rax
                             };
@@ -2799,23 +3330,38 @@ pub(super) fn fuse_signext_and_move(
                     let src_bit = 1u16 << src_family;
                     let mut src_modified = false;
                     for chk in (i + 1)..n {
-                        if infos[chk].is_nop() { continue; }
+                        if infos[chk].is_nop() {
+                            continue;
+                        }
                         // Calls clobber all caller-saved registers. If src is
                         // caller-saved (rdi=6, rsi=7, r8-r11=8-11), it's modified.
                         if infos[chk].kind == LineKind::Call {
-                            if src_family >= 6 { // caller-saved families
-                                src_modified = true; break;
+                            if src_family >= 6 {
+                                // caller-saved families
+                                src_modified = true;
+                                break;
                             }
                         }
                         // Any barrier could modify the register
                         if infos[chk].is_barrier() && infos[chk].kind == LineKind::Call {
                             // already handled above
                         }
-                        if infos[chk].reg_refs & src_bit == 0 { continue; }
+                        if infos[chk].reg_refs & src_bit == 0 {
+                            continue;
+                        }
                         match infos[chk].kind {
-                            LineKind::Other { dest_reg: d } if d == src_family => { src_modified = true; break; }
-                            LineKind::LoadRbp { reg: r, .. } if r == src_family => { src_modified = true; break; }
-                            LineKind::Pop { reg: r } if r == src_family => { src_modified = true; break; }
+                            LineKind::Other { dest_reg: d } if d == src_family => {
+                                src_modified = true;
+                                break;
+                            }
+                            LineKind::LoadRbp { reg: r, .. } if r == src_family => {
+                                src_modified = true;
+                                break;
+                            }
+                            LineKind::Pop { reg: r } if r == src_family => {
+                                src_modified = true;
+                                break;
+                            }
                             LineKind::StoreRbp { reg: r, .. } if r == src_family => {} // store reads, doesn't modify
                             _ => {} // read-only reference is fine
                         }
@@ -2847,7 +3393,10 @@ pub(super) fn fuse_signext_and_move(
         // default value for x == 2. This previously stayed hidden because the
         // parameter spill reloaded %rax; eliminating that dead spill exposed
         // it.)
-        if !rax_dead { i += 1; continue; }
+        if !rax_dead {
+            i += 1;
+            continue;
+        }
 
         // Apply the transformation
         let dest_reg_stripped = &dest_reg[1..]; // without leading %
@@ -2859,7 +3408,10 @@ pub(super) fn fuse_signext_and_move(
         // lose their operand's definition when the movslq is retargeted.
         for cmp_idx in cmpl_lines {
             let tc = infos[cmp_idx].trimmed(store.get(cmp_idx));
-            let new_cmp = format!("    {}", tc.replace(", %eax", &format!(", {}", src_32_name)));
+            let new_cmp = format!(
+                "    {}",
+                tc.replace(", %eax", &format!(", {}", src_32_name))
+            );
             replace_line(store, &mut infos[cmp_idx], cmp_idx, new_cmp);
         }
 
@@ -2883,32 +3435,47 @@ pub(super) fn fuse_signext_and_move(
 //   - No implicit register hazards (div, mul, etc.)
 //   - Window limited to 6 instructions to keep analysis local
 
-pub(super) fn coalesce_phi_register_copies(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match: movq %SRC, %TMP where both are GP regs, SRC != TMP
         let ti = infos[i].trimmed(store.get(i));
-        if !ti.starts_with("movq %") { i += 1; continue; }
+        if !ti.starts_with("movq %") {
+            i += 1;
+            continue;
+        }
         if let Some(comma) = ti.find(", %") {
             let src_reg = &ti[5..comma]; // includes leading %
             let tmp_reg = &ti[comma + 2..]; // includes leading %
-            if src_reg == tmp_reg || src_reg.contains('(') { i += 1; continue; }
+            if src_reg == tmp_reg || src_reg.contains('(') {
+                i += 1;
+                continue;
+            }
 
             let src_family = register_family_fast(src_reg);
             let tmp_family = register_family_fast(tmp_reg);
-            if src_family == REG_NONE || src_family > REG_GP_MAX { i += 1; continue; }
-            if tmp_family == REG_NONE || tmp_family > REG_GP_MAX { i += 1; continue; }
+            if src_family == REG_NONE || src_family > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
+            if tmp_family == REG_NONE || tmp_family > REG_GP_MAX {
+                i += 1;
+                continue;
+            }
             // Don't coalesce rax(0) or rcx(1) as SRC — they're accumulator regs
             // with heavy implicit use
-            if src_family <= 1 || tmp_family <= 1 { i += 1; continue; }
+            if src_family <= 1 || tmp_family <= 1 {
+                i += 1;
+                continue;
+            }
             // Don't coalesce when SRC is a caller-saved register and TMP is callee-saved.
             // Caller-saved registers (rax=0, rcx=1, rdx=2, rsi=6, rdi=7, r8-r11=8-11)
             // get clobbered by function calls. Coalescing away the copy to a callee-saved
@@ -2916,7 +3483,10 @@ pub(super) fn coalesce_phi_register_copies(
             // pre-stores (movq %rdi, %r12) that save params before calls.
             let src_is_caller_saved = matches!(src_family, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11);
             let tmp_is_callee_saved = matches!(tmp_family, 3 | 5 | 12 | 13 | 14 | 15);
-            if src_is_caller_saved && tmp_is_callee_saved { i += 1; continue; }
+            if src_is_caller_saved && tmp_is_callee_saved {
+                i += 1;
+                continue;
+            }
 
             let src_bit = 1u16 << src_family;
             let tmp_bit = 1u16 << tmp_family;
@@ -2945,8 +3515,13 @@ pub(super) fn coalesce_phi_register_copies(
             let mut chain_pos: Option<usize> = None;
 
             while j < len && instr_count < 8 {
-                if infos[j].is_nop() { j += 1; continue; }
-                if infos[j].is_barrier() { break; }
+                if infos[j].is_nop() {
+                    j += 1;
+                    continue;
+                }
+                if infos[j].is_barrier() {
+                    break;
+                }
 
                 let tj = infos[j].trimmed(store.get(j));
 
@@ -2954,12 +3529,20 @@ pub(super) fn coalesce_phi_register_copies(
                 // copy-back, coalescing is unsound (the copy-back would carry a
                 // modified value). Detect writes to TMP.
                 match infos[j].kind {
-                    LineKind::Other { dest_reg } if dest_reg == tmp_family => { tmp_written = true; }
-                    LineKind::LoadRbp { reg, .. } if reg == tmp_family => { tmp_written = true; }
-                    LineKind::Pop { reg } if reg == tmp_family => { tmp_written = true; }
+                    LineKind::Other { dest_reg } if dest_reg == tmp_family => {
+                        tmp_written = true;
+                    }
+                    LineKind::LoadRbp { reg, .. } if reg == tmp_family => {
+                        tmp_written = true;
+                    }
+                    LineKind::Pop { reg } if reg == tmp_family => {
+                        tmp_written = true;
+                    }
                     _ => {}
                 }
-                if tmp_written { break; }
+                if tmp_written {
+                    break;
+                }
 
                 // Check for direct copy-back: movq %TMP, %SRC
                 if tj == copy_back_pat {
@@ -2969,7 +3552,8 @@ pub(super) fn coalesce_phi_register_copies(
 
                 // Check for chain copy-back: movq %TMP2, %SRC (where TMP2 came from movslq %TMPd, %TMP2)
                 if chain_family != REG_NONE {
-                    let chain_wb = format!("movq {}, {}", REG_NAMES[0][chain_family as usize], src_reg);
+                    let chain_wb =
+                        format!("movq {}, {}", REG_NAMES[0][chain_family as usize], src_reg);
                     if tj == chain_wb {
                         copy_back_pos = Some(j);
                         break;
@@ -2989,7 +3573,11 @@ pub(super) fn coalesce_phi_register_copies(
                     if tj.starts_with(&chain_prefix) {
                         let other_reg = &tj[chain_prefix.len() - 1..];
                         let other_fam = register_family_fast(other_reg);
-                        if other_fam != REG_NONE && other_fam != tmp_family && other_fam != src_family && other_fam > 1 {
+                        if other_fam != REG_NONE
+                            && other_fam != tmp_family
+                            && other_fam != src_family
+                            && other_fam > 1
+                        {
                             // SOUNDNESS: the chain register (%OTHER) is DEFINED
                             // by this movslq. It may not be READ before this point:
                             // before the movslq, %OTHER holds an unrelated live value,
@@ -3013,7 +3601,8 @@ pub(super) fn coalesce_phi_register_copies(
             }
 
             if src_referenced || has_implicit_hazard || tmp_written || copy_back_pos.is_none() {
-                i += 1; continue;
+                i += 1;
+                continue;
             }
 
             // SOUNDNESS: if a chain register (%OTHER from movslq %TMP,%OTHER)
@@ -3022,13 +3611,18 @@ pub(super) fn coalesce_phi_register_copies(
             if let Some(cp) = chain_pos {
                 let mut bad = false;
                 for chk in (i + 1)..cp {
-                    if infos[chk].is_nop() { continue; }
+                    if infos[chk].is_nop() {
+                        continue;
+                    }
                     if infos[chk].reg_refs & chain_bit != 0 {
                         bad = true;
                         break;
                     }
                 }
-                if bad { i += 1; continue; }
+                if bad {
+                    i += 1;
+                    continue;
+                }
             }
 
             let cb = copy_back_pos.unwrap();
@@ -3039,7 +3633,10 @@ pub(super) fn coalesce_phi_register_copies(
             let mut n = cb + 1;
             let mut chk_count = 0;
             while n < len && chk_count < 8 {
-                if infos[n].is_nop() { n += 1; continue; }
+                if infos[n].is_nop() {
+                    n += 1;
+                    continue;
+                }
                 if infos[n].is_barrier() {
                     // A branch/label/call is a control-flow barrier: the temp may
                     // be LIVE on another edge (e.g. a loop-carried value via a
@@ -3051,8 +3648,16 @@ pub(super) fn coalesce_phi_register_copies(
                     // Check each referenced temp
                     let mut is_write = false;
                     match infos[n].kind {
-                        LineKind::Other { dest_reg } if dest_reg == tmp_family || dest_reg == chain_family => { is_write = true; }
-                        LineKind::LoadRbp { reg, .. } if reg == tmp_family || reg == chain_family => { is_write = true; }
+                        LineKind::Other { dest_reg }
+                            if dest_reg == tmp_family || dest_reg == chain_family =>
+                        {
+                            is_write = true;
+                        }
+                        LineKind::LoadRbp { reg, .. }
+                            if reg == tmp_family || reg == chain_family =>
+                        {
+                            is_write = true;
+                        }
                         _ => {}
                     }
                     if !is_write {
@@ -3062,22 +3667,32 @@ pub(super) fn coalesce_phi_register_copies(
                 chk_count += 1;
                 n += 1;
             }
-            if chk_count >= 8 { tmp_dead = true; }
+            if chk_count >= 8 {
+                tmp_dead = true;
+            }
 
-            if !tmp_dead { i += 1; continue; }
+            if !tmp_dead {
+                i += 1;
+                continue;
+            }
 
             // The copy-back line may be PINNED (e.g. a "param pre-store" heuristic
             // pins `movq %arg_reg, %callee_saved` copies seen before the first call).
             // If the copy-back is pinned, mark_nop won't remove it, leaving a dangling
             // read of a dead temp after the copy-out is removed and the intermediate
             // ops are rewritten to SRC. That is a miscompile — abort the coalesce.
-            if infos[cb].pinned { i += 1; continue; }
+            if infos[cb].pinned {
+                i += 1;
+                continue;
+            }
 
             // Apply: remove copy-out, replace TMP with SRC in intermediate ops, remove copy-back
             // For chain coalescing, also replace TMP2 with SRC
             mark_nop(&mut infos[i]);
             for mid in (i + 1)..cb {
-                if infos[mid].is_nop() { continue; }
+                if infos[mid].is_nop() {
+                    continue;
+                }
                 let needs_replace = infos[mid].reg_refs & (tmp_bit | chain_bit) != 0;
                 if needs_replace {
                     let mut new_text = store.get(mid).to_string();
@@ -3124,28 +3739,42 @@ pub(super) fn coalesce_phi_register_copies(
 //     ...use %REG...             ← load removed
 //     jmp .LBB_header
 
-pub(super) fn hoist_loop_invariant_gpr_load(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn hoist_loop_invariant_gpr_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
 
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         // Match both unconditional (jmp) and conditional (jle, jl, jne, etc.) back-edges
         let jmp_text = infos[i].trimmed(store.get(i)).to_string();
-        let target = if jmp_text.starts_with("jmp ") { jmp_text[4..].to_string() }
-            else if jmp_text.starts_with("jl ") { jmp_text[3..].to_string() }
-            else if jmp_text.starts_with("jle ") { jmp_text[4..].to_string() }
-            else if jmp_text.starts_with("jne ") { jmp_text[4..].to_string() }
-            else if jmp_text.starts_with("jge ") { jmp_text[4..].to_string() }
-            else if jmp_text.starts_with("jg ") { jmp_text[3..].to_string() }
-            else if jmp_text.starts_with("jb ") { jmp_text[3..].to_string() }
-            else if jmp_text.starts_with("ja ") { jmp_text[3..].to_string() }
-            else { i += 1; continue; };
-        if !target.starts_with(".L") { i += 1; continue; }
+        let target = if jmp_text.starts_with("jmp ") {
+            jmp_text[4..].to_string()
+        } else if jmp_text.starts_with("jl ") {
+            jmp_text[3..].to_string()
+        } else if jmp_text.starts_with("jle ") {
+            jmp_text[4..].to_string()
+        } else if jmp_text.starts_with("jne ") {
+            jmp_text[4..].to_string()
+        } else if jmp_text.starts_with("jge ") {
+            jmp_text[4..].to_string()
+        } else if jmp_text.starts_with("jg ") {
+            jmp_text[3..].to_string()
+        } else if jmp_text.starts_with("jb ") {
+            jmp_text[3..].to_string()
+        } else if jmp_text.starts_with("ja ") {
+            jmp_text[3..].to_string()
+        } else {
+            i += 1;
+            continue;
+        };
+        if !target.starts_with(".L") {
+            i += 1;
+            continue;
+        }
         let target_label = format!("{}:", target);
 
         // Find the target label (must be before the branch = back-edge)
@@ -3160,7 +3789,10 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         let header = match header_pos {
             Some(h) => h,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Validate this is a real loop: the range [header..=i] must not contain
@@ -3169,14 +3801,24 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         let mut has_ret = false;
         let mut has_call = false;
         for chk in header..=i {
-            if infos[chk].is_nop() { continue; }
+            if infos[chk].is_nop() {
+                continue;
+            }
             match infos[chk].kind {
-                LineKind::Ret => { has_ret = true; break; }
-                LineKind::Call => { has_call = true; }
+                LineKind::Ret => {
+                    has_ret = true;
+                    break;
+                }
+                LineKind::Call => {
+                    has_call = true;
+                }
                 _ => {}
             }
         }
-        if has_ret { i += 1; continue; }
+        if has_ret {
+            i += 1;
+            continue;
+        }
 
         // Loop body is [header..=i]. Find the body start (first label after header).
         let mut body_start = header;
@@ -3190,15 +3832,24 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
         // Only hoist one load per loop per pass (to avoid interactions).
         // Skip loops with function calls — caller-saved regs could be clobbered.
-        if has_call { i += 1; continue; }
+        if has_call {
+            i += 1;
+            continue;
+        }
         let mut hoisted_one = false;
         for pos in body_start + 1..i {
-            if hoisted_one { break; }
-            if infos[pos].is_nop() { continue; }
+            if hoisted_one {
+                break;
+            }
+            if infos[pos].is_nop() {
+                continue;
+            }
 
             // Match: movq OFFSET(%rsp), %REG or movq OFFSET(%rbp), %REG
             let t = infos[pos].trimmed(store.get(pos));
-            if !t.starts_with("movq ") { continue; }
+            if !t.starts_with("movq ") {
+                continue;
+            }
             // Parse: "movq SRC, %DST"
             let after_movq = &t[5..];
             let comma = match after_movq.find(", %") {
@@ -3209,30 +3860,47 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             let dst_part = &after_movq[comma + 2..]; // includes %
 
             // Source must be a stack slot
-            if !src_part.ends_with("(%rsp)") && !src_part.ends_with("(%rbp)") { continue; }
+            if !src_part.ends_with("(%rsp)") && !src_part.ends_with("(%rbp)") {
+                continue;
+            }
             // Destination must be a GP register
             let dst_family = register_family_fast(dst_part);
-            if dst_family == REG_NONE || dst_family > REG_GP_MAX { continue; }
+            if dst_family == REG_NONE || dst_family > REG_GP_MAX {
+                continue;
+            }
             // Don't hoist into rax/rcx (accumulator) or rsp/rbp
             // Skip rax (primary accumulator), rsp, rbp (frame registers)
-            if dst_family == 0 || dst_family == 4 || dst_family == 5 { continue; }
+            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
+                continue;
+            }
 
             // Parse the numeric offset
             let offset_end = src_part.find('(').unwrap_or(src_part.len());
             let numeric_offset: i32 = src_part[..offset_end].parse().unwrap_or(i32::MIN);
-            if numeric_offset == i32::MIN { continue; }
+            if numeric_offset == i32::MIN {
+                continue;
+            }
 
             // Check: the stack slot is NOT written anywhere in [header..=i]
             let mut slot_written = false;
             for chk in header..=i {
-                if infos[chk].is_nop() { continue; }
+                if infos[chk].is_nop() {
+                    continue;
+                }
                 if let LineKind::StoreRbp { offset: o, .. } = infos[chk].kind {
-                    if o == numeric_offset { slot_written = true; break; }
+                    if o == numeric_offset {
+                        slot_written = true;
+                        break;
+                    }
                 }
                 // Also check Other instructions that store to this offset
                 let ct = infos[chk].trimmed(store.get(chk));
-                if ct.ends_with(src_part) && (ct.starts_with("movq ") || ct.starts_with("movl ")
-                    || ct.starts_with("movb ") || ct.starts_with("movw ")) {
+                if ct.ends_with(src_part)
+                    && (ct.starts_with("movq ")
+                        || ct.starts_with("movl ")
+                        || ct.starts_with("movb ")
+                        || ct.starts_with("movw "))
+                {
                     // This could be a store TO this slot
                     if let Some(c) = ct.find(", ") {
                         if ct[c + 2..] == *src_part {
@@ -3242,7 +3910,9 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                     }
                 }
             }
-            if slot_written { continue; }
+            if slot_written {
+                continue;
+            }
 
             // Check: the destination register is NOT written by any other instruction
             // in [header..=i] besides this load. Also check it's not used as a
@@ -3250,8 +3920,12 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             let dst_bit = 1u16 << dst_family;
             let mut reg_written_elsewhere = false;
             for chk in header..=i {
-                if chk == pos { continue; } // skip the load itself
-                if infos[chk].is_nop() { continue; }
+                if chk == pos {
+                    continue;
+                } // skip the load itself
+                if infos[chk].is_nop() {
+                    continue;
+                }
                 match infos[chk].kind {
                     LineKind::Other { dest_reg } if dest_reg == dst_family => {
                         reg_written_elsewhere = true;
@@ -3271,7 +3945,9 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                     _ => {}
                 }
             }
-            if reg_written_elsewhere { continue; }
+            if reg_written_elsewhere {
+                continue;
+            }
 
             // All checks passed. Hoist the load into the PREHEADER.
             //
@@ -3300,7 +3976,9 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             let mut p = header;
             while p > 0 {
                 p -= 1;
-                if infos[p].is_nop() { continue; }
+                if infos[p].is_nop() {
+                    continue;
+                }
                 let t = infos[p].trimmed(store.get(p));
                 if t == format!("jmp {}", target) || t == format!("jmp {}", target_label) {
                     // Must be an unconditional forward jump to the header.
@@ -3313,10 +3991,13 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                     || infos[p].kind == LineKind::CondJmp
                     || infos[p].kind == LineKind::Label
                     || infos[p].kind == LineKind::Call
-                    || infos[p].kind == LineKind::Ret {
+                    || infos[p].kind == LineKind::Ret
+                {
                     break;
                 }
-                if p == 0 || p + 8 < header { break; }
+                if p == 0 || p + 8 < header {
+                    break;
+                }
             }
             // If we didn't find the entry jump right before the header (fall-through
             // or multiple-entry), do NOT hoist (can't place a dominating load safely).
@@ -3338,7 +4019,9 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             // destination is not written inside the loop (verified above).
             let mut forward_entries = 0u32;
             for idx in 0..header {
-                if infos[idx].is_nop() { continue; }
+                if infos[idx].is_nop() {
+                    continue;
+                }
                 if matches!(infos[idx].kind, LineKind::Jmp | LineKind::CondJmp) {
                     let t = infos[idx].trimmed(store.get(idx));
                     if let Some(tg) = extract_jump_target(t) {
@@ -3356,7 +4039,12 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             // Replace the entry jmp with the load; execution falls through into the
             // header. The load is invariant (slot not written in loop, no calls) and
             // the dest register is not written in the loop (checked above).
-            replace_line(store, &mut infos[entry], entry, load_text.trim_end().to_string());
+            replace_line(
+                store,
+                &mut infos[entry],
+                entry,
+                load_text.trim_end().to_string(),
+            );
             mark_nop(&mut infos[pos]); // remove original in-loop load
             changed = true;
             hoisted_one = true;
@@ -3388,70 +4076,115 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         // Find back-edge: jl/jle/jne/jb/ja/jmp to a label before this instruction
         let jmp_text = infos[i].trimmed(store.get(i));
-        let target = if jmp_text.starts_with("jl ") { &jmp_text[3..] }
-            else if jmp_text.starts_with("jle ") { &jmp_text[4..] }
-            else if jmp_text.starts_with("jne ") { &jmp_text[4..] }
-            else if jmp_text.starts_with("jmp ") { &jmp_text[4..] }
-            else { i += 1; continue; };
-        if !target.starts_with(".L") { i += 1; continue; }
+        let target = if jmp_text.starts_with("jl ") {
+            &jmp_text[3..]
+        } else if jmp_text.starts_with("jle ") {
+            &jmp_text[4..]
+        } else if jmp_text.starts_with("jne ") {
+            &jmp_text[4..]
+        } else if jmp_text.starts_with("jmp ") {
+            &jmp_text[4..]
+        } else {
+            i += 1;
+            continue;
+        };
+        if !target.starts_with(".L") {
+            i += 1;
+            continue;
+        }
 
         let target_label = format!("{}:", target);
         let mut header_pos = None;
         for lbl in 0..i {
-            if infos[lbl].kind == LineKind::Label &&
-               infos[lbl].trimmed(store.get(lbl)) == target_label {
+            if infos[lbl].kind == LineKind::Label
+                && infos[lbl].trimmed(store.get(lbl)) == target_label
+            {
                 header_pos = Some(lbl);
                 break;
             }
         }
         let header = match header_pos {
             Some(h) => h,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Validate: no ret or call in loop
         let mut has_ret = false;
         let mut has_call = false;
         for chk in header..=i {
-            if infos[chk].is_nop() { continue; }
+            if infos[chk].is_nop() {
+                continue;
+            }
             match infos[chk].kind {
-                LineKind::Ret => { has_ret = true; break; }
-                LineKind::Call => { has_call = true; }
+                LineKind::Ret => {
+                    has_ret = true;
+                    break;
+                }
+                LineKind::Call => {
+                    has_call = true;
+                }
                 _ => {}
             }
         }
-        if has_ret || has_call { i += 1; continue; }
+        if has_ret || has_call {
+            i += 1;
+            continue;
+        }
 
         // Scan loop body for: movsd (%REG), %xmm1 followed by vbroadcastsd %xmm1, %ymm1
         let mut hoisted_one = false;
         for pos in header + 1..i {
-            if hoisted_one { break; }
-            if infos[pos].is_nop() { continue; }
+            if hoisted_one {
+                break;
+            }
+            if infos[pos].is_nop() {
+                continue;
+            }
             let t1 = infos[pos].trimmed(store.get(pos));
-            if !t1.starts_with("movsd (%") || !t1.ends_with("), %xmm1") { continue; }
+            if !t1.starts_with("movsd (%") || !t1.ends_with("), %xmm1") {
+                continue;
+            }
 
             // Extract the source register
             let reg_start = 7; // after "movsd (%"
             let reg_end = t1.find("), %xmm1").unwrap_or(0);
-            if reg_end <= reg_start { continue; }
+            if reg_end <= reg_start {
+                continue;
+            }
             let src_reg = &t1[reg_start..reg_end];
 
             // Next non-NOP must be vbroadcastsd
             let mut pos2 = pos + 1;
-            while pos2 < i && infos[pos2].is_nop() { pos2 += 1; }
-            if pos2 >= i { continue; }
+            while pos2 < i && infos[pos2].is_nop() {
+                pos2 += 1;
+            }
+            if pos2 >= i {
+                continue;
+            }
             let t2 = infos[pos2].trimmed(store.get(pos2));
-            if t2 != "vbroadcastsd %xmm1, %ymm1" { continue; }
+            if t2 != "vbroadcastsd %xmm1, %ymm1" {
+                continue;
+            }
 
             // Check that src_reg is NOT modified within the loop
             let write_pattern = format!(", %{}", src_reg);
             let mut reg_modified = false;
             for chk in header..=i {
-                if chk == pos || chk == pos2 { continue; }
-                if infos[chk].is_nop() { continue; }
+                if chk == pos || chk == pos2 {
+                    continue;
+                }
+                if infos[chk].is_nop() {
+                    continue;
+                }
                 let ct = infos[chk].trimmed(store.get(chk));
                 if ct.contains(&write_pattern) || ct.ends_with(&format!("%{}", src_reg)) {
                     // Check if it's a destination (after last comma)
@@ -3464,7 +4197,9 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
                     }
                 }
             }
-            if reg_modified { continue; }
+            if reg_modified {
+                continue;
+            }
 
             // Find a NOP slot JUST before the header (within 10 lines) to place
             // both hoisted instructions as a combined two-line string.
@@ -3475,8 +4210,12 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
                     break;
                 }
                 // Only search in the immediate preheader
-                if p < header.saturating_sub(10) { break; }
-                if infos[p].kind == LineKind::Label { break; }
+                if p < header.saturating_sub(10) {
+                    break;
+                }
+                if infos[p].kind == LineKind::Label {
+                    break;
+                }
             }
 
             if let Some(s) = slot {
@@ -3518,58 +4257,91 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
 //
 // Saves 1 instruction per loop iteration. Common in loop counter increments.
 
-pub(super) fn collapse_increment_chain(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn collapse_increment_chain(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         // Match: leaq DISP(%SRC), %TMP1
         let ti = infos[i].trimmed(store.get(i));
-        if !ti.starts_with("leaq ") { i += 1; continue; }
+        if !ti.starts_with("leaq ") {
+            i += 1;
+            continue;
+        }
 
         let after_leaq = &ti[5..];
         let paren_open = match after_leaq.find('(') {
             Some(p) => p,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         let disp_str = &after_leaq[..paren_open];
         let paren_close = match after_leaq.find(')') {
             Some(p) => p,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
         let src_reg = &after_leaq[paren_open + 1..paren_close];
         let after_paren = &after_leaq[paren_close + 1..];
-        if !after_paren.starts_with(", %") { i += 1; continue; }
+        if !after_paren.starts_with(", %") {
+            i += 1;
+            continue;
+        }
         let tmp1_reg_name = &after_paren[2..];
 
         let src_family = register_family_fast(src_reg);
         let tmp1_family = register_family_fast(tmp1_reg_name);
-        if src_family == REG_NONE || src_family > REG_GP_MAX { i += 1; continue; }
-        if tmp1_family == REG_NONE || tmp1_family > REG_GP_MAX { i += 1; continue; }
-        if src_family == tmp1_family || src_family <= 1 { i += 1; continue; }
+        if src_family == REG_NONE || src_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        if tmp1_family == REG_NONE || tmp1_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
+        if src_family == tmp1_family || src_family <= 1 {
+            i += 1;
+            continue;
+        }
 
         let disp: i32 = match disp_str.parse() {
             Ok(d) => d,
-            Err(_) => { i += 1; continue; }
+            Err(_) => {
+                i += 1;
+                continue;
+            }
         };
 
         // Next non-NOP: movslq %TMP1d, %TMP2
         let j = next_non_nop(infos, i + 1, len);
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
 
         let tj = infos[j].trimmed(store.get(j));
         let tmp1_32 = REG_NAMES[1][tmp1_family as usize];
         let expected_prefix = format!("movslq {}, %", tmp1_32);
-        if !tj.starts_with(&expected_prefix) { i += 1; continue; }
+        if !tj.starts_with(&expected_prefix) {
+            i += 1;
+            continue;
+        }
         let tmp2_reg_str = &tj[expected_prefix.len() - 1..];
         let tmp2_family = register_family_fast(tmp2_reg_str);
-        if tmp2_family == REG_NONE || tmp2_family > REG_GP_MAX { i += 1; continue; }
+        if tmp2_family == REG_NONE || tmp2_family > REG_GP_MAX {
+            i += 1;
+            continue;
+        }
 
         // Search for movq %TMP2, %SRC within a window of 4 non-NOP instructions
         let src_64 = REG_NAMES[0][src_family as usize];
@@ -3578,23 +4350,42 @@ pub(super) fn collapse_increment_chain(
         let mut wb_found = false;
         let mut wb_count = 0;
         while k < len && wb_count < 4 {
-            if infos[k].is_nop() { k += 1; continue; }
-            if infos[k].is_barrier() { break; }
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            if infos[k].is_barrier() {
+                break;
+            }
             let tk = infos[k].trimmed(store.get(k));
-            if tk == expected_wb { wb_found = true; break; }
+            if tk == expected_wb {
+                wb_found = true;
+                break;
+            }
             wb_count += 1;
             k += 1;
         }
-        if !wb_found { i += 1; continue; }
+        if !wb_found {
+            i += 1;
+            continue;
+        }
 
         // Check SRC not referenced between i+1 and k
         let src_bit = 1u16 << src_family;
         let mut src_ref = false;
         for mid in (i + 1)..k {
-            if infos[mid].is_nop() { continue; }
-            if infos[mid].reg_refs & src_bit != 0 { src_ref = true; break; }
+            if infos[mid].is_nop() {
+                continue;
+            }
+            if infos[mid].reg_refs & src_bit != 0 {
+                src_ref = true;
+                break;
+            }
         }
-        if src_ref { i += 1; continue; }
+        if src_ref {
+            i += 1;
+            continue;
+        }
 
         // Check TMPs dead after k
         let tmp1_bit = 1u16 << tmp1_family;
@@ -3603,7 +4394,10 @@ pub(super) fn collapse_increment_chain(
         let mut n = k + 1;
         let mut chk = 0;
         while n < len && chk < 8 {
-            if infos[n].is_nop() { n += 1; continue; }
+            if infos[n].is_nop() {
+                n += 1;
+                continue;
+            }
             if infos[n].is_barrier() {
                 // Control-flow barrier: temps may be live on another edge.
                 // Cannot prove dead → abort (leave tmps_dead=false).
@@ -3626,20 +4420,33 @@ pub(super) fn collapse_increment_chain(
             chk += 1;
             n += 1;
         }
-        if chk >= 8 { tmps_dead = true; }
-        if !tmps_dead { i += 1; continue; }
+        if chk >= 8 {
+            tmps_dead = true;
+        }
+        if !tmps_dead {
+            i += 1;
+            continue;
+        }
 
         // Flags safety check
         let post = next_non_nop(infos, k + 1, len);
         if post < len && !infos[post].is_barrier() {
             let tp = infos[post].trimmed(store.get(post));
-            if tp.starts_with("ja") || tp.starts_with("jb") ||
-               tp.starts_with("je") || tp.starts_with("jn") ||
-               tp.starts_with("jg") || tp.starts_with("jl") ||
-               tp.starts_with("js") || tp.starts_with("jo") ||
-               tp.starts_with("set") || tp.starts_with("cmov") ||
-               tp.starts_with("adc") || tp.starts_with("sbb") {
-                i += 1; continue;
+            if tp.starts_with("ja")
+                || tp.starts_with("jb")
+                || tp.starts_with("je")
+                || tp.starts_with("jn")
+                || tp.starts_with("jg")
+                || tp.starts_with("jl")
+                || tp.starts_with("js")
+                || tp.starts_with("jo")
+                || tp.starts_with("set")
+                || tp.starts_with("cmov")
+                || tp.starts_with("adc")
+                || tp.starts_with("sbb")
+            {
+                i += 1;
+                continue;
             }
         }
 
@@ -3674,61 +4481,105 @@ pub(super) fn collapse_increment_chain(
 // Saves 2 instructions per occurrence. Common in array address computation
 // where stride = element_size * vector_width (e.g., 8 * 4 = 32 for AVX2 doubles).
 
-pub(super) fn fold_cascaded_shifts(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn fold_cascaded_shifts(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
 
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
 
         let ti = infos[i].trimmed(store.get(i));
 
         // Pattern 1: movq %SRC, %TMP; shlq $A, %TMP; movq %TMP, %DST; shlq $B, %DST
         if ti.starts_with("movq %") && ti.contains(", %") && !ti.contains("(%") {
-            let comma = match ti.find(", %") { Some(c) => c, None => { i += 1; continue; } };
+            let comma = match ti.find(", %") {
+                Some(c) => c,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            };
             let src_name = &ti[5..comma];
             let tmp_name = &ti[comma + 2..];
-            if src_name == tmp_name || !src_name.starts_with('%') { i += 1; continue; }
+            if src_name == tmp_name || !src_name.starts_with('%') {
+                i += 1;
+                continue;
+            }
             let src_fam = register_family_fast(src_name);
             let tmp_fam = register_family_fast(tmp_name);
-            if src_fam == REG_NONE || tmp_fam == REG_NONE { i += 1; continue; }
+            if src_fam == REG_NONE || tmp_fam == REG_NONE {
+                i += 1;
+                continue;
+            }
 
             // Next: shlq $A, %TMP
             let j = next_non_nop(infos, i + 1, len);
-            if j >= len || infos[j].is_barrier() { i += 1; continue; }
+            if j >= len || infos[j].is_barrier() {
+                i += 1;
+                continue;
+            }
             let tj = infos[j].trimmed(store.get(j));
             let shl_suffix = format!(", {}", tmp_name);
-            if !tj.starts_with("shlq $") || !tj.ends_with(&shl_suffix) { i += 1; continue; }
+            if !tj.starts_with("shlq $") || !tj.ends_with(&shl_suffix) {
+                i += 1;
+                continue;
+            }
             let shift_a: u32 = match tj[6..tj.len() - shl_suffix.len()].parse() {
-                Ok(s) => s, Err(_) => { i += 1; continue; }
+                Ok(s) => s,
+                Err(_) => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Next: movq %TMP, %DST
             let k = next_non_nop(infos, j + 1, len);
-            if k >= len || infos[k].is_barrier() { i += 1; continue; }
+            if k >= len || infos[k].is_barrier() {
+                i += 1;
+                continue;
+            }
             let tk = infos[k].trimmed(store.get(k));
             let mov_prefix = format!("movq {}, %", tmp_name);
-            if !tk.starts_with(&mov_prefix) { i += 1; continue; }
+            if !tk.starts_with(&mov_prefix) {
+                i += 1;
+                continue;
+            }
             let dst_name = &tk[mov_prefix.len() - 1..]; // includes %
             let dst_fam = register_family_fast(dst_name);
-            if dst_fam == REG_NONE || dst_fam == tmp_fam { i += 1; continue; }
+            if dst_fam == REG_NONE || dst_fam == tmp_fam {
+                i += 1;
+                continue;
+            }
 
             // Next: shlq $B, %DST
             let m = next_non_nop(infos, k + 1, len);
-            if m >= len || infos[m].is_barrier() { i += 1; continue; }
+            if m >= len || infos[m].is_barrier() {
+                i += 1;
+                continue;
+            }
             let tm = infos[m].trimmed(store.get(m));
             let shl_dst = format!(", {}", dst_name);
-            if !tm.starts_with("shlq $") || !tm.ends_with(&shl_dst) { i += 1; continue; }
+            if !tm.starts_with("shlq $") || !tm.ends_with(&shl_dst) {
+                i += 1;
+                continue;
+            }
             let shift_b: u32 = match tm[6..tm.len() - shl_dst.len()].parse() {
-                Ok(s) => s, Err(_) => { i += 1; continue; }
+                Ok(s) => s,
+                Err(_) => {
+                    i += 1;
+                    continue;
+                }
             };
 
             let total_shift = shift_a + shift_b;
-            if total_shift > 63 { i += 1; continue; }
+            if total_shift > 63 {
+                i += 1;
+                continue;
+            }
 
             // Check TMP is dead after this sequence
             let tmp_bit = 1u16 << tmp_fam;
@@ -3736,7 +4587,10 @@ pub(super) fn fold_cascaded_shifts(
             let mut n = m + 1;
             let mut chk = 0;
             while n < len && chk < 8 {
-                if infos[n].is_nop() { n += 1; continue; }
+                if infos[n].is_nop() {
+                    n += 1;
+                    continue;
+                }
                 if infos[n].is_barrier() {
                     // Control-flow barrier: temp may be live on another edge.
                     // Cannot prove dead → abort (leave tmp_dead=false).
@@ -3744,16 +4598,27 @@ pub(super) fn fold_cascaded_shifts(
                 }
                 if infos[n].reg_refs & tmp_bit != 0 {
                     match infos[n].kind {
-                        LineKind::Other { dest_reg } if dest_reg == tmp_fam => { tmp_dead = true; break; }
-                        LineKind::LoadRbp { reg, .. } if reg == tmp_fam => { tmp_dead = true; break; }
+                        LineKind::Other { dest_reg } if dest_reg == tmp_fam => {
+                            tmp_dead = true;
+                            break;
+                        }
+                        LineKind::LoadRbp { reg, .. } if reg == tmp_fam => {
+                            tmp_dead = true;
+                            break;
+                        }
                         _ => break, // TMP read → not dead
                     }
                 }
                 chk += 1;
                 n += 1;
             }
-            if chk >= 8 { tmp_dead = true; }
-            if !tmp_dead { i += 1; continue; }
+            if chk >= 8 {
+                tmp_dead = true;
+            }
+            if !tmp_dead {
+                i += 1;
+                continue;
+            }
 
             // Apply: movq %SRC, %DST + shlq $total, %DST
             let new_mov = format!("    movq {}, {}", src_name, dst_name);
@@ -3791,19 +4656,25 @@ pub(super) fn fold_cascaded_shifts(
 // Only applied when the header setup is 0-3 instructions (simple cases).
 // The jmp is replaced with a multi-line string (setup + cmp + inverted branch).
 
-pub(super) fn rotate_loops(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn rotate_loops(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
 
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
-        if infos[i].kind != LineKind::Jmp { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        if infos[i].kind != LineKind::Jmp {
+            i += 1;
+            continue;
+        }
         let jmp_text = infos[i].trimmed(store.get(i));
-        if !jmp_text.starts_with("jmp ") { i += 1; continue; }
+        if !jmp_text.starts_with("jmp ") {
+            i += 1;
+            continue;
+        }
         let target = &jmp_text[4..];
         let target_label = format!("{}:", target);
 
@@ -3819,21 +4690,34 @@ pub(super) fn rotate_loops(
         }
         let header = match header_pos {
             Some(h) => h,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Validate: no ret/call in the loop body
         let mut has_ret = false;
         let mut has_call = false;
         for chk in header..=i {
-            if infos[chk].is_nop() { continue; }
+            if infos[chk].is_nop() {
+                continue;
+            }
             match infos[chk].kind {
-                LineKind::Ret => { has_ret = true; break; }
-                LineKind::Call => { has_call = true; }
+                LineKind::Ret => {
+                    has_ret = true;
+                    break;
+                }
+                LineKind::Call => {
+                    has_call = true;
+                }
                 _ => {}
             }
         }
-        if has_ret || has_call { i += 1; continue; }
+        if has_ret || has_call {
+            i += 1;
+            continue;
+        }
 
         // Collect non-NOP instructions between header label and the first conditional jump.
         let mut header_instrs: Vec<usize> = Vec::new();
@@ -3841,13 +4725,19 @@ pub(super) fn rotate_loops(
         let mut body_label_pos = None;
         let mut pos = header + 1;
         while pos < i {
-            if infos[pos].is_nop() { pos += 1; continue; }
+            if infos[pos].is_nop() {
+                pos += 1;
+                continue;
+            }
             if infos[pos].kind == LineKind::CondJmp {
                 cond_jmp_pos = Some(pos);
                 // Find body label right after conditional jump
                 let mut bl = pos + 1;
                 while bl < i {
-                    if infos[bl].is_nop() { bl += 1; continue; }
+                    if infos[bl].is_nop() {
+                        bl += 1;
+                        continue;
+                    }
                     if infos[bl].kind == LineKind::Label {
                         body_label_pos = Some(bl);
                     }
@@ -3855,46 +4745,74 @@ pub(super) fn rotate_loops(
                 }
                 break;
             }
-            if infos[pos].kind == LineKind::Label { break; } // complex header
-            if infos[pos].is_barrier() { break; }
+            if infos[pos].kind == LineKind::Label {
+                break;
+            } // complex header
+            if infos[pos].is_barrier() {
+                break;
+            }
             header_instrs.push(pos);
             pos += 1;
         }
 
         let cjmp = match cond_jmp_pos {
             Some(c) => c,
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Only handle simple headers (0-3 setup instructions before the cond jmp)
-        if header_instrs.len() > 3 { i += 1; continue; }
+        if header_instrs.len() > 3 {
+            i += 1;
+            continue;
+        }
 
         // The instruction(s) before the cond jmp must include a compare/test.
         // Find the compare in the header setup.
         let has_cmp = header_instrs.iter().any(|&idx| {
             let t = infos[idx].trimmed(store.get(idx));
-            t.starts_with("cmpl ") || t.starts_with("cmpq ") ||
-            t.starts_with("cmpb ") || t.starts_with("cmpw ") ||
-            t.starts_with("testl ") || t.starts_with("testq ") ||
-            matches!(infos[idx].kind, LineKind::Cmp)
+            t.starts_with("cmpl ")
+                || t.starts_with("cmpq ")
+                || t.starts_with("cmpb ")
+                || t.starts_with("cmpw ")
+                || t.starts_with("testl ")
+                || t.starts_with("testq ")
+                || matches!(infos[idx].kind, LineKind::Cmp)
         });
-        if !has_cmp { i += 1; continue; }
+        if !has_cmp {
+            i += 1;
+            continue;
+        }
 
         // Get the conditional jump and invert it
         let cjmp_text = infos[cjmp].trimmed(store.get(cjmp));
         let (cond, exit_label) = match cjmp_text.find(' ') {
             Some(space) => (&cjmp_text[..space], &cjmp_text[space + 1..]),
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         let inv_cond = match cond {
-            "je" => "jne", "jne" => "je",
-            "jl" => "jge", "jge" => "jl",
-            "jle" => "jg", "jg" => "jle",
-            "jb" => "jae", "jae" => "jb",
-            "jbe" => "ja", "ja" => "jbe",
-            "js" => "jns", "jns" => "js",
-            _ => { i += 1; continue; }
+            "je" => "jne",
+            "jne" => "je",
+            "jl" => "jge",
+            "jge" => "jl",
+            "jle" => "jg",
+            "jg" => "jle",
+            "jb" => "jae",
+            "jae" => "jb",
+            "jbe" => "ja",
+            "ja" => "jbe",
+            "js" => "jns",
+            "jns" => "js",
+            _ => {
+                i += 1;
+                continue;
+            }
         };
 
         // Find the body label for the rotated backedge
@@ -3903,7 +4821,10 @@ pub(super) fn rotate_loops(
                 let bt = infos[bl].trimmed(store.get(bl));
                 bt.trim_end_matches(':').to_string()
             }
-            None => { i += 1; continue; }
+            None => {
+                i += 1;
+                continue;
+            }
         };
 
         // Optimize the latch: detect redundant sign-extend pattern.
@@ -3922,20 +4843,30 @@ pub(super) fn rotate_loops(
                 if let Some(comma) = first_setup.find(", %") {
                     let src_32 = &first_setup[7..comma]; // e.g., "%r12d"
                     let dst_64 = &first_setup[comma + 2..]; // e.g., "%r14"
-                    // src_32 should be a 32-bit register like "%r12d"
-                    // Derive the 64-bit version by removing the 'd' suffix
+                                                            // src_32 should be a 32-bit register like "%r12d"
+                                                            // Derive the 64-bit version by removing the 'd' suffix
                     let src_64 = if src_32.ends_with('d') {
                         let base = &src_32[..src_32.len() - 1];
                         if base.starts_with("%r") && base.len() >= 3 {
                             Some(base.to_string())
-                        } else if base == "%eax" { Some("%rax".to_string()) }
-                        else if base == "%ecx" { Some("%rcx".to_string()) }
-                        else if base == "%edx" { Some("%rdx".to_string()) }
-                        else if base == "%ebx" { Some("%rbx".to_string()) }
-                        else if base == "%esi" { Some("%rsi".to_string()) }
-                        else if base == "%edi" { Some("%rdi".to_string()) }
-                        else { None }
-                    } else { None };
+                        } else if base == "%eax" {
+                            Some("%rax".to_string())
+                        } else if base == "%ecx" {
+                            Some("%rcx".to_string())
+                        } else if base == "%edx" {
+                            Some("%rdx".to_string())
+                        } else if base == "%ebx" {
+                            Some("%rbx".to_string())
+                        } else if base == "%esi" {
+                            Some("%rsi".to_string())
+                        } else if base == "%edi" {
+                            Some("%rdi".to_string())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                     if let Some(ref src_64_name) = src_64 {
                         // Look for `movslq %Xd, %X` in the body just before the jmp
@@ -3945,7 +4876,9 @@ pub(super) fn rotate_loops(
                         let mut search_count = 0;
                         while search > header && search_count < 4 {
                             if infos[search].is_nop() {
-                                if search == 0 { break; }
+                                if search == 0 {
+                                    break;
+                                }
                                 search -= 1;
                                 continue;
                             }
@@ -3955,7 +4888,9 @@ pub(super) fn rotate_loops(
                                 break;
                             }
                             search_count += 1;
-                            if search == 0 { break; }
+                            if search == 0 {
+                                break;
+                            }
                             search -= 1;
                         }
 
@@ -3995,9 +4930,9 @@ pub(super) fn rotate_loops(
             if let Some(comma) = first_text.find(", %") {
                 let src_32 = &first_text[7..comma]; // e.g., "%r12d"
                 let dst_64 = &first_text[comma + 2..]; // e.g., "%r14"
-                // `starts_with("%r")` is TRUE for %rdx/%rsi/... too, so the
-                // numbered-register test must be explicit or `%rdx` becomes
-                // the nonexistent `%rdxd`.
+                                                       // `starts_with("%r")` is TRUE for %rdx/%rsi/... too, so the
+                                                       // numbered-register test must be explicit or `%rdx` becomes
+                                                       // the nonexistent `%rdxd`.
                 let dst_32 = reg_64_to_32(dst_64);
                 let last_setup_idx = *header_instrs.last().unwrap();
                 let cmp_text = store.get(last_setup_idx).to_string();
@@ -4088,15 +5023,21 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
     }
 
     for i in 0..len {
-        if infos[i].is_nop() { continue; }
+        if infos[i].is_nop() {
+            continue;
+        }
         let line = infos[i].trimmed(store.get(i));
 
         // Block/control-flow boundary resets tracking: labels, unconditional
         // jumps, ANY conditional jump (back edges, jumps into the middle),
         // calls, returns.
-        if line.ends_with(':') || line.starts_with(".LBB") || line == "ret"
-            || line.starts_with("jmp ") || line.starts_with("call ")
-            || (line.starts_with('j') && !line.starts_with("jmp ")) {
+        if line.ends_with(':')
+            || line.starts_with(".LBB")
+            || line == "ret"
+            || line.starts_with("jmp ")
+            || line.starts_with("call ")
+            || (line.starts_with('j') && !line.starts_with("jmp "))
+        {
             rax_leaq_src = None;
             continue;
         }
@@ -4104,12 +5045,14 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
         // Check if this is `leaq X, %rax`
         if line.starts_with("leaq ") && line.ends_with(", %rax") {
             let src = &line[5..line.len() - 6]; // between "leaq " and ", %rax"
-            // Collect the register families referenced by the source.
+                                                // Collect the register families referenced by the source.
             let mut src_fams: Vec<RegId> = Vec::new();
             let mut rest = src;
             while let Some(pct) = rest.find('%') {
                 let tok = &rest[pct + 1..];
-                let end = tok.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(tok.len());
+                let end = tok
+                    .find(|c: char| !c.is_ascii_alphanumeric())
+                    .unwrap_or(tok.len());
                 let reg = format!("%{}", &tok[..end]);
                 let fam = register_family_fast(&reg);
                 if fam != REG_NONE && !src_fams.contains(&fam) {
@@ -4171,13 +5114,23 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
     let mut labels = FxHashMap::default();
     for i in 0..n {
         if infos[i].kind == LineKind::Label {
-            labels.insert(infos[i].trimmed(store.get(i)).trim_end_matches(':').to_string(), i);
+            labels.insert(
+                infos[i]
+                    .trimmed(store.get(i))
+                    .trim_end_matches(':')
+                    .to_string(),
+                i,
+            );
         }
     }
     let mut uses = vec![0u16; n];
     let mut defs = vec![0u16; n];
-    let caller_saved: u16 = [0u8,1,2,4,5,8,9,10,11].iter().fold(0, |m,r| m | (1u16<<r));
-    let call_args: u16 = [0u8,1,2,4,5,8,9].iter().fold(0, |m,r| m | (1u16<<r));
+    let caller_saved: u16 = [0u8, 1, 2, 4, 5, 8, 9, 10, 11]
+        .iter()
+        .fold(0, |m, r| m | (1u16 << r));
+    let call_args: u16 = [0u8, 1, 2, 4, 5, 8, 9]
+        .iter()
+        .fold(0, |m, r| m | (1u16 << r));
     for i in 0..n {
         let refs = infos[i].reg_refs;
         match infos[i].kind {
@@ -4185,16 +5138,29 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
             LineKind::StoreRbp { reg, .. } if is_valid_gp_reg(reg) => uses[i] = 1u16 << reg,
             LineKind::Push { reg } if is_valid_gp_reg(reg) => uses[i] = 1u16 << reg,
             LineKind::Pop { reg } if is_valid_gp_reg(reg) => defs[i] = 1u16 << reg,
-            LineKind::SetCC { reg } if is_valid_gp_reg(reg) => { uses[i] = 1u16 << reg; defs[i] = 1u16 << reg; }
-            LineKind::Call => { uses[i] = call_args | refs; defs[i] = caller_saved; }
+            LineKind::SetCC { reg } if is_valid_gp_reg(reg) => {
+                uses[i] = 1u16 << reg;
+                defs[i] = 1u16 << reg;
+            }
+            LineKind::Call => {
+                uses[i] = call_args | refs;
+                defs[i] = caller_saved;
+            }
             LineKind::Ret => uses[i] = (1u16 << 0) | (1u16 << 2),
             LineKind::Cmp | LineKind::JmpIndirect => uses[i] = refs,
             LineKind::Other { dest_reg } if is_valid_gp_reg(dest_reg) => {
                 let bit = 1u16 << dest_reg;
                 defs[i] = bit;
                 let t = infos[i].trimmed(store.get(i));
-                uses[i] = if is_read_modify_write(t) { refs } else { refs & !bit };
-                if has_implicit_reg_usage(t) { uses[i] |= caller_saved; defs[i] |= caller_saved; }
+                uses[i] = if is_read_modify_write(t) {
+                    refs
+                } else {
+                    refs & !bit
+                };
+                if has_implicit_reg_usage(t) {
+                    uses[i] |= caller_saved;
+                    defs[i] |= caller_saved;
+                }
             }
             LineKind::Other { .. } => uses[i] = refs,
             _ => uses[i] = refs,
@@ -4210,21 +5176,39 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
             match infos[i].kind {
                 LineKind::Ret => {}
                 LineKind::Jmp => {
-                    if let Some(target) = t.split_whitespace().last().and_then(|x| labels.get(x)) { out |= live_in[*target]; }
-                    else { out = u16::MAX; }
+                    if let Some(target) = t.split_whitespace().last().and_then(|x| labels.get(x)) {
+                        out |= live_in[*target];
+                    } else {
+                        out = u16::MAX;
+                    }
                 }
                 LineKind::JmpIndirect => out = u16::MAX,
                 LineKind::CondJmp => {
-                    if i + 1 < n { out |= live_in[i+1]; }
-                    if let Some(target) = t.split_whitespace().last().and_then(|x| labels.get(x)) { out |= live_in[*target]; }
-                    else { out = u16::MAX; }
+                    if i + 1 < n {
+                        out |= live_in[i + 1];
+                    }
+                    if let Some(target) = t.split_whitespace().last().and_then(|x| labels.get(x)) {
+                        out |= live_in[*target];
+                    } else {
+                        out = u16::MAX;
+                    }
                 }
-                _ => if i + 1 < n { out = live_in[i+1]; },
+                _ => {
+                    if i + 1 < n {
+                        out = live_in[i + 1];
+                    }
+                }
             }
             let inn = uses[i] | (out & !defs[i]);
-            if out != live_out[i] || inn != live_in[i] { live_out[i]=out; live_in[i]=inn; changed=true; }
+            if out != live_out[i] || inn != live_in[i] {
+                live_out[i] = out;
+                live_in[i] = inn;
+                changed = true;
+            }
         }
-        if !changed { break; }
+        if !changed {
+            break;
+        }
     }
     live_out
 }
@@ -4251,38 +5235,76 @@ pub(super) fn fold_copy_shift_copyback(store: &mut LineStore, infos: &mut [LineI
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned { i += 1; continue; }
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
         let a = infos[i].trimmed(store.get(i));
-        if !a.starts_with("movq %") || a.contains("(%") { i += 1; continue; }
-        let Some((a_src, a_dst)) = a[5..].split_once(',') else { i += 1; continue; };
+        if !a.starts_with("movq %") || a.contains("(%") {
+            i += 1;
+            continue;
+        }
+        let Some((a_src, a_dst)) = a[5..].split_once(',') else {
+            i += 1;
+            continue;
+        };
         let src = register_family_fast(a_src.trim());
         let tmp = register_family_fast(a_dst.trim());
-        if !is_valid_gp_reg(src) || !is_valid_gp_reg(tmp) || src == tmp { i += 1; continue; }
+        if !is_valid_gp_reg(src) || !is_valid_gp_reg(tmp) || src == tmp {
+            i += 1;
+            continue;
+        }
 
         let j = next_non_nop(infos, i + 1, len);
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
         let b = infos[j].trimmed(store.get(j));
         let mnemonic = b.split_ascii_whitespace().next().unwrap_or("");
         let safe_update = matches!(
             mnemonic,
-            "incl" | "decl" | "negl" | "notl" | "addl" | "subl"
-                | "andl" | "orl" | "xorl" | "shll" | "shrl" | "sarl" | "sall"
+            "incl"
+                | "decl"
+                | "negl"
+                | "notl"
+                | "addl"
+                | "subl"
+                | "andl"
+                | "orl"
+                | "xorl"
+                | "shll"
+                | "shrl"
+                | "sarl"
+                | "sall"
         ) || (mnemonic == "imull" && b.contains(','));
-        if !safe_update
-            || !matches!(infos[j].kind, LineKind::Other { dest_reg } if dest_reg == tmp)
+        if !safe_update || !matches!(infos[j].kind, LineKind::Other { dest_reg } if dest_reg == tmp)
         {
-            i += 1; continue;
+            i += 1;
+            continue;
         }
         let tmp32 = reg_id_to_name(tmp, MoveSize::L);
-        if !b.ends_with(tmp32) { i += 1; continue; }
+        if !b.ends_with(tmp32) {
+            i += 1;
+            continue;
+        }
 
         let k = next_non_nop(infos, j + 1, len);
-        if k >= len || infos[k].is_barrier() { i += 1; continue; }
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
         let c = infos[k].trimmed(store.get(k));
         let expected = format!("movl {}, {}", tmp32, reg_id_to_name(src, MoveSize::L));
-        if c != expected { i += 1; continue; }
+        if c != expected {
+            i += 1;
+            continue;
+        }
 
-        if live_out[k] & (1u16 << tmp) != 0 { i += 1; continue; }
+        if live_out[k] & (1u16 << tmp) != 0 {
+            i += 1;
+            continue;
+        }
 
         let rewritten = replace_reg_family(b, tmp, src);
         mark_nop(&mut infos[i]);
@@ -4308,35 +5330,87 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() { i += 1; continue; }
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
         let sh = infos[i].trimmed(store.get(i));
-        if !sh.starts_with("shll $") { i += 1; continue; }
-        let Some((_, shdst)) = sh.rsplit_once(',') else { i += 1; continue; };
+        if !sh.starts_with("shll $") {
+            i += 1;
+            continue;
+        }
+        let Some((_, shdst)) = sh.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
         let breg = register_family_fast(shdst.trim());
-        if !is_valid_gp_reg(breg) { i += 1; continue; }
+        if !is_valid_gp_reg(breg) {
+            i += 1;
+            continue;
+        }
 
         let j = next_non_nop(infos, i + 1, len);
-        if j >= len || infos[j].is_barrier() { i += 1; continue; }
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
         let m1 = infos[j].trimmed(store.get(j));
-        if !m1.starts_with("movl %") || m1.contains("(%") { i += 1; continue; }
-        let Some((asrc, tdst)) = m1[5..].split_once(',') else { i += 1; continue; };
+        if !m1.starts_with("movl %") || m1.contains("(%") {
+            i += 1;
+            continue;
+        }
+        let Some((asrc, tdst)) = m1[5..].split_once(',') else {
+            i += 1;
+            continue;
+        };
         let areg = register_family_fast(asrc.trim());
         let treg = register_family_fast(tdst.trim());
-        if !is_valid_gp_reg(areg) || !is_valid_gp_reg(treg) || areg == treg || areg == breg || treg == breg { i += 1; continue; }
+        if !is_valid_gp_reg(areg)
+            || !is_valid_gp_reg(treg)
+            || areg == treg
+            || areg == breg
+            || treg == breg
+        {
+            i += 1;
+            continue;
+        }
 
         let k = next_non_nop(infos, j + 1, len);
-        if k >= len || infos[k].is_barrier() { i += 1; continue; }
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
         let m2 = infos[k].trimmed(store.get(k));
-        let expected_m2 = format!("movq {}, {}", reg_id_to_name(breg, MoveSize::Q), reg_id_to_name(areg, MoveSize::Q));
-        if m2 != expected_m2 { i += 1; continue; }
+        let expected_m2 = format!(
+            "movq {}, {}",
+            reg_id_to_name(breg, MoveSize::Q),
+            reg_id_to_name(areg, MoveSize::Q)
+        );
+        if m2 != expected_m2 {
+            i += 1;
+            continue;
+        }
 
         let m = next_non_nop(infos, k + 1, len);
-        if m >= len || infos[m].is_barrier() { i += 1; continue; }
+        if m >= len || infos[m].is_barrier() {
+            i += 1;
+            continue;
+        }
         let xr = infos[m].trimmed(store.get(m));
-        let expected_xr = format!("xorq {}, {}", reg_id_to_name(treg, MoveSize::Q), reg_id_to_name(areg, MoveSize::Q));
-        if xr != expected_xr { i += 1; continue; }
+        let expected_xr = format!(
+            "xorq {}, {}",
+            reg_id_to_name(treg, MoveSize::Q),
+            reg_id_to_name(areg, MoveSize::Q)
+        );
+        if xr != expected_xr {
+            i += 1;
+            continue;
+        }
 
-        if live_out[m] & (1u16 << treg) != 0 { i += 1; continue; }
+        if live_out[m] & (1u16 << treg) != 0 {
+            i += 1;
+            continue;
+        }
 
         // The original XOR flags may differ in SF width; require them to be
         // killed before any consumer.
@@ -4344,26 +5418,57 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
         let mut q = m + 1;
         let limit = (q + 24).min(len);
         while q < limit {
-            if infos[q].is_nop() { q += 1; continue; }
+            if infos[q].is_nop() {
+                q += 1;
+                continue;
+            }
             let t = infos[q].trimmed(store.get(q));
             if matches!(infos[q].kind, LineKind::CondJmp | LineKind::SetCC { .. })
-                || t.starts_with("cmov") || t.starts_with("adc") || t.starts_with("sbb")
-                || t.starts_with("rcl") || t.starts_with("rcr") || t.starts_with("pushf")
-            { break; }
-            if matches!(infos[q].kind, LineKind::Call | LineKind::Ret) {
-                flags_dead = true; break;
+                || t.starts_with("cmov")
+                || t.starts_with("adc")
+                || t.starts_with("sbb")
+                || t.starts_with("rcl")
+                || t.starts_with("rcr")
+                || t.starts_with("pushf")
+            {
+                break;
             }
-            if matches!(infos[q].kind, LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect) { break; }
+            if matches!(infos[q].kind, LineKind::Call | LineKind::Ret) {
+                flags_dead = true;
+                break;
+            }
+            if matches!(
+                infos[q].kind,
+                LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
+            ) {
+                break;
+            }
             let op = t.split_whitespace().next().unwrap_or("");
-            if ["add","sub","and","or","xor","shl","shr","sar","rol","ror","imul","cmp","test","inc","dec","neg","ucomis","comis"]
-                .iter().any(|p| op.starts_with(p))
-            { flags_dead = true; break; }
+            if [
+                "add", "sub", "and", "or", "xor", "shl", "shr", "sar", "rol", "ror", "imul", "cmp",
+                "test", "inc", "dec", "neg", "ucomis", "comis",
+            ]
+            .iter()
+            .any(|p| op.starts_with(p))
+            {
+                flags_dead = true;
+                break;
+            }
             q += 1;
         }
-        if q >= limit { flags_dead = true; }
-        if !flags_dead { i += 1; continue; }
+        if q >= limit {
+            flags_dead = true;
+        }
+        if !flags_dead {
+            i += 1;
+            continue;
+        }
 
-        let folded = format!("    xorl {}, {}", reg_id_to_name(breg, MoveSize::L), reg_id_to_name(areg, MoveSize::L));
+        let folded = format!(
+            "    xorl {}, {}",
+            reg_id_to_name(breg, MoveSize::L),
+            reg_id_to_name(areg, MoveSize::L)
+        );
         replace_line(store, &mut infos[j], j, folded);
         mark_nop(&mut infos[k]);
         mark_nop(&mut infos[m]);
@@ -4373,7 +5478,6 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
     changed
 }
 
-
 /// Recognize canonical rotate synthesis and emit the native rotate instruction:
 ///   movq S,A; shlq $L,A; movq S,B; shrq $R,B;
 ///   movq A,S; orq B,S        (L+R=64)
@@ -4381,40 +5485,201 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
 /// The mirror image becomes RORQ. Temporary liveness and EFLAGS liveness are
 /// proven on the textual CFG before rewriting.
 pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    let len=store.len(); let live_out=compute_gpr_live_out(store,infos); let mut changed=false; let mut i=0;
-    while i<len {
-        if infos[i].is_nop(){i+=1;continue;} let a=infos[i].trimmed(store.get(i));
-        let Some(rest)=a.strip_prefix("movq ") else{i+=1;continue;}; let Some((ss,aa))=rest.split_once(',') else{i+=1;continue;};
-        let sreg=register_family_fast(ss.trim());let areg=register_family_fast(aa.trim());
-        if !is_valid_gp_reg(sreg)||!is_valid_gp_reg(areg)||sreg==areg{i+=1;continue;}
-        let j=next_non_nop(infos,i+1,len);if j>=len{i+=1;continue;} let sh1=infos[j].trimmed(store.get(j));
-        let (left,imm1)=if sh1.starts_with("shlq $") {(true,&sh1[6..sh1.find(',').unwrap_or(6)])} else if sh1.starts_with("shrq $") {(false,&sh1[6..sh1.find(',').unwrap_or(6)])} else{i+=1;continue;};
-        if !sh1.ends_with(&format!(", {}",reg_id_to_name(areg,MoveSize::Q))){i+=1;continue;}
-        let n1=if let Some(hex)=imm1.strip_prefix("0x") { u32::from_str_radix(hex,16) } else { imm1.parse::<u32>() }; let Ok(n1)=n1 else{i+=1;continue;};
-        let k=next_non_nop(infos,j+1,len);if k>=len{i+=1;continue;} let mv2=infos[k].trimmed(store.get(k));
-        let Some(r2)=mv2.strip_prefix("movq ") else{i+=1;continue;};let Some((s2,b2))=r2.split_once(',') else{i+=1;continue;};
-        let breg=register_family_fast(b2.trim());if register_family_fast(s2.trim())!=sreg||!is_valid_gp_reg(breg)||breg==sreg||breg==areg{i+=1;continue;}
-        let m=next_non_nop(infos,k+1,len);if m>=len{i+=1;continue;}let sh2=infos[m].trimmed(store.get(m));
-        let expected=if left{"shrq $"}else{"shlq $"};if !sh2.starts_with(expected)||!sh2.ends_with(&format!(", {}",reg_id_to_name(breg,MoveSize::Q))){i+=1;continue;}
-        let comma=sh2.find(',').unwrap_or(6);let raw=&sh2[6..comma];let n2=if let Some(hex)=raw.strip_prefix("0x") {u32::from_str_radix(hex,16)}else{raw.parse::<u32>()};let Ok(n2)=n2 else{i+=1;continue;};
-        if n1==0||n2==0||n1+n2!=64{i+=1;continue;}
-        let q=next_non_nop(infos,m+1,len);if q>=len{i+=1;continue;}
-        if infos[q].trimmed(store.get(q))!=format!("movq {}, {}",reg_id_to_name(areg,MoveSize::Q),reg_id_to_name(sreg,MoveSize::Q)){i+=1;continue;}
-        let r=next_non_nop(infos,q+1,len);if r>=len{i+=1;continue;}
-        if infos[r].trimmed(store.get(r))!=format!("orq {}, {}",reg_id_to_name(breg,MoveSize::Q),reg_id_to_name(sreg,MoveSize::Q)){i+=1;continue;}
-        if live_out[r]&((1u16<<areg)|(1u16<<breg))!=0{i+=1;continue;}
-        // OR and rotate flags differ; require a kill before any consumer.
-        let mut fdead=false;let mut x=r+1;let lim=(x+24).min(len);
-        while x<lim {if infos[x].is_nop(){x+=1;continue;}let t=infos[x].trimmed(store.get(x));
-            if matches!(infos[x].kind,LineKind::CondJmp|LineKind::SetCC{..})||t.starts_with("cmov")||t.starts_with("adc")||t.starts_with("sbb"){break;}
-            if matches!(infos[x].kind,LineKind::Call|LineKind::Ret){fdead=true;break;}
-            if matches!(infos[x].kind,LineKind::Label|LineKind::Jmp|LineKind::JmpIndirect){break;}
-            let op=t.split_whitespace().next().unwrap_or("");
-            if ["add","sub","and","or","xor","shl","shr","sar","imul","cmp","test","inc","dec","neg","ucomis","comis"].iter().any(|z|op.starts_with(z)){fdead=true;break;}x+=1;
+    let len = store.len();
+    let live_out = compute_gpr_live_out(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
         }
-        if x>=lim{fdead=true;}if !fdead{i+=1;continue;}
-        let rot=if left{"rolq"}else{"rorq"};replace_line(store,&mut infos[i],i,format!("    {} ${}, {}",rot,n1,reg_id_to_name(sreg,MoveSize::Q)));
-        for z in [j,k,m,q,r]{mark_nop(&mut infos[z]);}changed=true;i=r+1;
+        let a = infos[i].trimmed(store.get(i));
+        let Some(rest) = a.strip_prefix("movq ") else {
+            i += 1;
+            continue;
+        };
+        let Some((ss, aa)) = rest.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let sreg = register_family_fast(ss.trim());
+        let areg = register_family_fast(aa.trim());
+        if !is_valid_gp_reg(sreg) || !is_valid_gp_reg(areg) || sreg == areg {
+            i += 1;
+            continue;
+        }
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let sh1 = infos[j].trimmed(store.get(j));
+        let (left, imm1) = if sh1.starts_with("shlq $") {
+            (true, &sh1[6..sh1.find(',').unwrap_or(6)])
+        } else if sh1.starts_with("shrq $") {
+            (false, &sh1[6..sh1.find(',').unwrap_or(6)])
+        } else {
+            i += 1;
+            continue;
+        };
+        if !sh1.ends_with(&format!(", {}", reg_id_to_name(areg, MoveSize::Q))) {
+            i += 1;
+            continue;
+        }
+        let n1 = if let Some(hex) = imm1.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16)
+        } else {
+            imm1.parse::<u32>()
+        };
+        let Ok(n1) = n1 else {
+            i += 1;
+            continue;
+        };
+        let k = next_non_nop(infos, j + 1, len);
+        if k >= len {
+            i += 1;
+            continue;
+        }
+        let mv2 = infos[k].trimmed(store.get(k));
+        let Some(r2) = mv2.strip_prefix("movq ") else {
+            i += 1;
+            continue;
+        };
+        let Some((s2, b2)) = r2.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let breg = register_family_fast(b2.trim());
+        if register_family_fast(s2.trim()) != sreg
+            || !is_valid_gp_reg(breg)
+            || breg == sreg
+            || breg == areg
+        {
+            i += 1;
+            continue;
+        }
+        let m = next_non_nop(infos, k + 1, len);
+        if m >= len {
+            i += 1;
+            continue;
+        }
+        let sh2 = infos[m].trimmed(store.get(m));
+        let expected = if left { "shrq $" } else { "shlq $" };
+        if !sh2.starts_with(expected)
+            || !sh2.ends_with(&format!(", {}", reg_id_to_name(breg, MoveSize::Q)))
+        {
+            i += 1;
+            continue;
+        }
+        let comma = sh2.find(',').unwrap_or(6);
+        let raw = &sh2[6..comma];
+        let n2 = if let Some(hex) = raw.strip_prefix("0x") {
+            u32::from_str_radix(hex, 16)
+        } else {
+            raw.parse::<u32>()
+        };
+        let Ok(n2) = n2 else {
+            i += 1;
+            continue;
+        };
+        if n1 == 0 || n2 == 0 || n1 + n2 != 64 {
+            i += 1;
+            continue;
+        }
+        let q = next_non_nop(infos, m + 1, len);
+        if q >= len {
+            i += 1;
+            continue;
+        }
+        if infos[q].trimmed(store.get(q))
+            != format!(
+                "movq {}, {}",
+                reg_id_to_name(areg, MoveSize::Q),
+                reg_id_to_name(sreg, MoveSize::Q)
+            )
+        {
+            i += 1;
+            continue;
+        }
+        let r = next_non_nop(infos, q + 1, len);
+        if r >= len {
+            i += 1;
+            continue;
+        }
+        if infos[r].trimmed(store.get(r))
+            != format!(
+                "orq {}, {}",
+                reg_id_to_name(breg, MoveSize::Q),
+                reg_id_to_name(sreg, MoveSize::Q)
+            )
+        {
+            i += 1;
+            continue;
+        }
+        if live_out[r] & ((1u16 << areg) | (1u16 << breg)) != 0 {
+            i += 1;
+            continue;
+        }
+        // OR and rotate flags differ; require a kill before any consumer.
+        let mut fdead = false;
+        let mut x = r + 1;
+        let lim = (x + 24).min(len);
+        while x < lim {
+            if infos[x].is_nop() {
+                x += 1;
+                continue;
+            }
+            let t = infos[x].trimmed(store.get(x));
+            if matches!(infos[x].kind, LineKind::CondJmp | LineKind::SetCC { .. })
+                || t.starts_with("cmov")
+                || t.starts_with("adc")
+                || t.starts_with("sbb")
+            {
+                break;
+            }
+            if matches!(infos[x].kind, LineKind::Call | LineKind::Ret) {
+                fdead = true;
+                break;
+            }
+            if matches!(
+                infos[x].kind,
+                LineKind::Label | LineKind::Jmp | LineKind::JmpIndirect
+            ) {
+                break;
+            }
+            let op = t.split_whitespace().next().unwrap_or("");
+            if [
+                "add", "sub", "and", "or", "xor", "shl", "shr", "sar", "imul", "cmp", "test",
+                "inc", "dec", "neg", "ucomis", "comis",
+            ]
+            .iter()
+            .any(|z| op.starts_with(z))
+            {
+                fdead = true;
+                break;
+            }
+            x += 1;
+        }
+        if x >= lim {
+            fdead = true;
+        }
+        if !fdead {
+            i += 1;
+            continue;
+        }
+        let rot = if left { "rolq" } else { "rorq" };
+        replace_line(
+            store,
+            &mut infos[i],
+            i,
+            format!("    {} ${}, {}", rot, n1, reg_id_to_name(sreg, MoveSize::Q)),
+        );
+        for z in [j, k, m, q, r] {
+            mark_nop(&mut infos[z]);
+        }
+        changed = true;
+        i = r + 1;
     }
     changed
 }
@@ -4430,11 +5695,17 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             continue;
         }
         let t = infos[i].trimmed(store.get(i));
-        let Some(rest) = t.strip_prefix("vmovdqu ").or_else(|| t.strip_prefix("vmovdqa "))
-            .or_else(|| t.strip_prefix("vmovupd ")).or_else(|| t.strip_prefix("vmovaps "))
-            .or_else(|| t.strip_prefix("vmovd ")).or_else(|| t.strip_prefix("vmovq "))
-            .or_else(|| t.strip_prefix("movdqu ")).or_else(|| t.strip_prefix("movdqa "))
-            .or_else(|| t.strip_prefix("movups ")).or_else(|| t.strip_prefix("movaps "))
+        let Some(rest) = t
+            .strip_prefix("vmovdqu ")
+            .or_else(|| t.strip_prefix("vmovdqa "))
+            .or_else(|| t.strip_prefix("vmovupd "))
+            .or_else(|| t.strip_prefix("vmovaps "))
+            .or_else(|| t.strip_prefix("vmovd "))
+            .or_else(|| t.strip_prefix("vmovq "))
+            .or_else(|| t.strip_prefix("movdqu "))
+            .or_else(|| t.strip_prefix("movdqa "))
+            .or_else(|| t.strip_prefix("movups "))
+            .or_else(|| t.strip_prefix("movaps "))
         else {
             continue;
         };
@@ -4479,7 +5750,10 @@ jmp .LBB11
         // first LEA's (%r15,%r11) address.
         for line in out.lines() {
             if line.contains("xmm5") && line.contains("(%r15,%r11)") {
-                panic!("second LEA's uses folded to the FIRST LEA's address:\n{}", out);
+                panic!(
+                    "second LEA's uses folded to the FIRST LEA's address:\n{}",
+                    out
+                );
             }
         }
     }
@@ -4507,13 +5781,18 @@ mod lea_scan_debug {
     movss %xmm5, (%rdx)
 ";
         let mut store = LineStore::new(asm.to_string());
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         let changed = fold_lea_all_uses_in_block(&mut store, &mut infos);
         let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
         eprintln!("changed={} out=\n{}", changed, out.join("\n"));
         for line in &out {
-            assert!(!(line.contains("xmm5") && line.contains("(%r15,%r11)")),
-                "cross-fold! {}", line);
+            assert!(
+                !(line.contains("xmm5") && line.contains("(%r15,%r11)")),
+                "cross-fold! {}",
+                line
+            );
         }
     }
 }

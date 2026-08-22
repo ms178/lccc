@@ -2,11 +2,17 @@
 //! (128-bit bitwise, byte compare, saturating subtract, pmovmskb) using scalar
 //! RISC-V instructions, plus hardware intrinsics (fences, CRC32, sqrt, fabs).
 
-use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 use super::emit::RiscvCodegen;
+use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
 impl RiscvCodegen {
-    pub(super) fn emit_intrinsic_rv(&mut self, dest: &Option<Value>, op: &IntrinsicOp, dest_ptr: &Option<Value>, args: &[Operand]) {
+    pub(super) fn emit_intrinsic_rv(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        dest_ptr: &Option<Value>,
+        args: &[Operand],
+    ) {
         match op {
             IntrinsicOp::Lfence | IntrinsicOp::Mfence => {
                 self.state.emit("    fence iorw, iorw");
@@ -148,8 +154,10 @@ impl RiscvCodegen {
                     self.state.emit("    sd t0, 8(t1)");
                 }
             }
-            IntrinsicOp::Crc32_8 | IntrinsicOp::Crc32_16 |
-            IntrinsicOp::Crc32_32 | IntrinsicOp::Crc32_64 => {
+            IntrinsicOp::Crc32_8
+            | IntrinsicOp::Crc32_16
+            | IntrinsicOp::Crc32_32
+            | IntrinsicOp::Crc32_64 => {
                 // Software CRC32C (Castagnoli) using bit-by-bit computation.
                 // args[0] = current CRC accumulator, args[1] = data value
                 let num_bytes = match op {
@@ -174,13 +182,15 @@ impl RiscvCodegen {
                 let skip_label = self.state.fresh_label("crc_skip");
                 self.state.emit_fmt(format_args!("    li t6, {}", num_bits));
                 self.state.emit_fmt(format_args!("{}:", loop_label));
-                self.state.emit_fmt(format_args!("    beqz t6, {}", done_label));
+                self.state
+                    .emit_fmt(format_args!("    beqz t6, {}", done_label));
                 // Check LSB of crc
                 self.state.emit("    andi t0, t3, 1");
                 // Shift CRC right by 1
                 self.state.emit("    srli t3, t3, 1");
                 // If LSB was set, XOR with polynomial
-                self.state.emit_fmt(format_args!("    beqz t0, {}", skip_label));
+                self.state
+                    .emit_fmt(format_args!("    beqz t0, {}", skip_label));
                 self.state.emit("    xor t3, t3, t5");
                 self.state.emit_fmt(format_args!("{}:", skip_label));
                 self.state.emit("    addi t6, t6, -1");
@@ -256,40 +266,75 @@ impl RiscvCodegen {
             // not appear in RISC-V codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.
             // TODO: consider emitting a runtime trap instead of silent zeros
-            IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128
-            | IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128
-            | IntrinsicOp::Aesimc128 | IntrinsicOp::Aeskeygenassist128
+            IntrinsicOp::Aesenc128
+            | IntrinsicOp::Aesenclast128
+            | IntrinsicOp::Aesdec128
+            | IntrinsicOp::Aesdeclast128
+            | IntrinsicOp::Aesimc128
+            | IntrinsicOp::Aeskeygenassist128
             | IntrinsicOp::Pclmulqdq128
-            | IntrinsicOp::Pslldqi128 | IntrinsicOp::Psrldqi128
-            | IntrinsicOp::Psllqi128 | IntrinsicOp::Psrlqi128
-            | IntrinsicOp::Pshufd128 | IntrinsicOp::Loadldi128
-            | IntrinsicOp::Paddw128 | IntrinsicOp::Psubw128
-            | IntrinsicOp::Pmulhw128 | IntrinsicOp::Pmaddwd128
-            | IntrinsicOp::Pcmpgtw128 | IntrinsicOp::Pcmpgtb128
-            | IntrinsicOp::Psllwi128 | IntrinsicOp::Psrlwi128
-            | IntrinsicOp::Psrawi128 | IntrinsicOp::Psradi128
-            | IntrinsicOp::Pslldi128 | IntrinsicOp::Psrldi128
-            | IntrinsicOp::Paddd128 | IntrinsicOp::Psubd128
-            | IntrinsicOp::Packssdw128 | IntrinsicOp::Packsswb128 | IntrinsicOp::Packuswb128
-            | IntrinsicOp::Punpcklbw128 | IntrinsicOp::Punpckhbw128
-            | IntrinsicOp::Punpcklwd128 | IntrinsicOp::Punpckhwd128
-            | IntrinsicOp::SetEpi16 | IntrinsicOp::Pinsrw128
-            | IntrinsicOp::Pextrw128 | IntrinsicOp::Storeldi128
-            | IntrinsicOp::Cvtsi128Si32 | IntrinsicOp::Cvtsi32Si128
+            | IntrinsicOp::Pslldqi128
+            | IntrinsicOp::Psrldqi128
+            | IntrinsicOp::Psllqi128
+            | IntrinsicOp::Psrlqi128
+            | IntrinsicOp::Pshufd128
+            | IntrinsicOp::Loadldi128
+            | IntrinsicOp::Paddw128
+            | IntrinsicOp::Psubw128
+            | IntrinsicOp::Pmulhw128
+            | IntrinsicOp::Pmaddwd128
+            | IntrinsicOp::Pcmpgtw128
+            | IntrinsicOp::Pcmpgtb128
+            | IntrinsicOp::Psllwi128
+            | IntrinsicOp::Psrlwi128
+            | IntrinsicOp::Psrawi128
+            | IntrinsicOp::Psradi128
+            | IntrinsicOp::Pslldi128
+            | IntrinsicOp::Psrldi128
+            | IntrinsicOp::Paddd128
+            | IntrinsicOp::Psubd128
+            | IntrinsicOp::Packssdw128
+            | IntrinsicOp::Packsswb128
+            | IntrinsicOp::Packuswb128
+            | IntrinsicOp::Punpcklbw128
+            | IntrinsicOp::Punpckhbw128
+            | IntrinsicOp::Punpcklwd128
+            | IntrinsicOp::Punpckhwd128
+            | IntrinsicOp::SetEpi16
+            | IntrinsicOp::Pinsrw128
+            | IntrinsicOp::Pextrw128
+            | IntrinsicOp::Storeldi128
+            | IntrinsicOp::Cvtsi128Si32
+            | IntrinsicOp::Cvtsi32Si128
             | IntrinsicOp::Cvtsi128Si64
-            | IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128
-            | IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128
-            | IntrinsicOp::Pinsrb128 | IntrinsicOp::Pextrb128
-            | IntrinsicOp::Pinsrq128 | IntrinsicOp::Pextrq128
-            | IntrinsicOp::FmaF64x2 | IntrinsicOp::FmaF64x2Hoisted | IntrinsicOp::FmaF64x4
-            | IntrinsicOp::FmaF64x4Hoisted | IntrinsicOp::BroadcastLoadF64 | IntrinsicOp::FmaF64x4SIB
-            | IntrinsicOp::LoadF64x4 | IntrinsicOp::LoadF64x2
-            | IntrinsicOp::LoadI32x8 | IntrinsicOp::LoadI32x4
-            | IntrinsicOp::AddF64x4 | IntrinsicOp::AddF64x2
-            | IntrinsicOp::MulF64x4 | IntrinsicOp::MulF64x2
-            | IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4
-            | IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2
-            | IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4 => {
+            | IntrinsicOp::Pshuflw128
+            | IntrinsicOp::Pshufhw128
+            | IntrinsicOp::Pinsrd128
+            | IntrinsicOp::Pextrd128
+            | IntrinsicOp::Pinsrb128
+            | IntrinsicOp::Pextrb128
+            | IntrinsicOp::Pinsrq128
+            | IntrinsicOp::Pextrq128
+            | IntrinsicOp::FmaF64x2
+            | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::FmaF64x4
+            | IntrinsicOp::FmaF64x4Hoisted
+            | IntrinsicOp::BroadcastLoadF64
+            | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::LoadF64x4
+            | IntrinsicOp::LoadF64x2
+            | IntrinsicOp::LoadI32x8
+            | IntrinsicOp::LoadI32x4
+            | IntrinsicOp::AddF64x4
+            | IntrinsicOp::AddF64x2
+            | IntrinsicOp::MulF64x4
+            | IntrinsicOp::MulF64x2
+            | IntrinsicOp::AddI32x8
+            | IntrinsicOp::AddI32x4
+            | IntrinsicOp::HorizontalAddF64x4
+            | IntrinsicOp::HorizontalAddF64x2
+            | IntrinsicOp::HorizontalAddI32x8
+            | IntrinsicOp::HorizontalAddI32x4 => {
                 // x86-only: zero dest if present
                 if let Some(dptr) = dest_ptr {
                     if let Some(slot) = self.state.get_slot(dptr.0) {
@@ -300,25 +345,41 @@ impl RiscvCodegen {
             }
 
             // Register-based vector intrinsics (x86-specific, not implemented for RISC-V)
-            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 | IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
-            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-            IntrinsicOp::VecHorizontalAddF64x4 | IntrinsicOp::VecHorizontalAddF64x2 |
-            IntrinsicOp::VecHorizontalAddI32x8 | IntrinsicOp::VecHorizontalAddI32x4 |
-            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-            IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecAddI64x2 |
-            IntrinsicOp::VecMulI64x2 | IntrinsicOp::VecHorizontalAddI64x2 |
-            IntrinsicOp::VecZeroI64x2 |
-            IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecBroadcastI32x4 |
-            IntrinsicOp::VecStoreI32x4 |
-            IntrinsicOp::VecSadalpI32x4 |
-            IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4 => {
+            IntrinsicOp::VecLoadF64x4
+            | IntrinsicOp::VecLoadF64x2
+            | IntrinsicOp::VecLoadI32x8
+            | IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecAddF64x4
+            | IntrinsicOp::VecAddF64x2
+            | IntrinsicOp::VecMulF64x4
+            | IntrinsicOp::VecMulF64x2
+            | IntrinsicOp::VecAddI32x8
+            | IntrinsicOp::VecAddI32x4
+            | IntrinsicOp::VecHorizontalAddF64x4
+            | IntrinsicOp::VecHorizontalAddF64x2
+            | IntrinsicOp::VecHorizontalAddI32x8
+            | IntrinsicOp::VecHorizontalAddI32x4
+            | IntrinsicOp::VecZeroF64x4
+            | IntrinsicOp::VecZeroF64x2
+            | IntrinsicOp::VecZeroI32x8
+            | IntrinsicOp::VecZeroI32x4
+            | IntrinsicOp::VecLoadWidenI32ToI64x2
+            | IntrinsicOp::VecAddI64x2
+            | IntrinsicOp::VecMulI64x2
+            | IntrinsicOp::VecHorizontalAddI64x2
+            | IntrinsicOp::VecZeroI64x2
+            | IntrinsicOp::VecMulI32x4
+            | IntrinsicOp::VecBroadcastI32x4
+            | IntrinsicOp::VecStoreI32x4
+            | IntrinsicOp::VecSadalpI32x4
+            | IntrinsicOp::VecSmlalLoI32x4
+            | IntrinsicOp::VecSmlalHiI32x4 => {
                 // These are x86-64/AArch64-specific register-based vector operations
                 // RISC-V would use RVV (RISC-V Vector extension) differently
                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
             }
-                    _ => { /* x86-only SIMD op on riscv: no-op */ }
-}
+            _ => { /* x86-only SIMD op on riscv: no-op */ }
+        }
     }
 
     /// Emit 128-bit binary op (or, and, xor) using two 64-bit operations.
@@ -359,12 +420,12 @@ impl RiscvCodegen {
         // Actually simplest approach: process byte by byte using a loop-like unroll
         // For correctness, use a helper that processes 8 bytes of XOR result
         self.emit_rv_zero_byte_mask("t1", "t3"); // t3 = mask where equal bytes -> 0xFF
-        // Do the same for high 8 bytes
+                                                 // Do the same for high 8 bytes
         self.state.emit("    ld t1, 8(a6)");
         self.state.emit("    ld t2, 8(a7)");
         self.state.emit("    xor t1, t1, t2");
         self.emit_rv_zero_byte_mask("t1", "t4"); // t4 = mask for high bytes
-        // Store results
+                                                 // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -378,26 +439,42 @@ impl RiscvCodegen {
         // Using: has_zero = (x - 0x0101...) & ~x & 0x8080...
         // This detects zero bytes by checking if subtracting 1 from each byte
         // causes a borrow from a non-zero byte.
-        self.state.emit_fmt(format_args!("    li t5, 0x0101010101010101"));
-        self.state.emit_fmt(format_args!("    li t6, 0x8080808080808080"));
-        self.state.emit_fmt(format_args!("    sub {dst}, {src}, t5", dst=dst_reg, src=src_reg));
-        self.state.emit_fmt(format_args!("    not t5, {src}", src=src_reg));
-        self.state.emit_fmt(format_args!("    and {dst}, {dst}, t5", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    and {dst}, {dst}, t6", dst=dst_reg));
+        self.state
+            .emit_fmt(format_args!("    li t5, 0x0101010101010101"));
+        self.state
+            .emit_fmt(format_args!("    li t6, 0x8080808080808080"));
+        self.state.emit_fmt(format_args!(
+            "    sub {dst}, {src}, t5",
+            dst = dst_reg,
+            src = src_reg
+        ));
+        self.state
+            .emit_fmt(format_args!("    not t5, {src}", src = src_reg));
+        self.state
+            .emit_fmt(format_args!("    and {dst}, {dst}, t5", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    and {dst}, {dst}, t6", dst = dst_reg));
         // Now dst has 0x80 in each byte position where src byte was 0x00.
         // Expand 0x80 -> 0xFF by shifting right 7 (get 0x01) then replicating
         // bit 0 to all 8 bit positions via: x | (x<<1) | (x<<2) | ... | (x<<7)
-        self.state.emit_fmt(format_args!("    srli {dst}, {dst}, 7", dst=dst_reg));
+        self.state
+            .emit_fmt(format_args!("    srli {dst}, {dst}, 7", dst = dst_reg));
         // Now dst has 0x01 where bytes were zero, 0x00 elsewhere.
         // Replicate: x * 0xFF works correctly here because each byte is 0 or 1,
         // and adjacent bytes can both be 1: 0x0101 * 0xFF = 0xFEFF (WRONG).
         // Instead use shift-or cascade:
-        self.state.emit_fmt(format_args!("    slli t5, {dst}, 1", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    or {dst}, {dst}, t5", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    slli t5, {dst}, 2", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    or {dst}, {dst}, t5", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    slli t5, {dst}, 4", dst=dst_reg));
-        self.state.emit_fmt(format_args!("    or {dst}, {dst}, t5", dst=dst_reg));
+        self.state
+            .emit_fmt(format_args!("    slli t5, {dst}, 1", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    or {dst}, {dst}, t5", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    slli t5, {dst}, 2", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    or {dst}, {dst}, t5", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    slli t5, {dst}, 4", dst = dst_reg));
+        self.state
+            .emit_fmt(format_args!("    or {dst}, {dst}, t5", dst = dst_reg));
         // Now each byte that was 0x01 has become 0xFF (bits replicated),
         // and each byte that was 0x00 stays 0x00.
     }
@@ -425,7 +502,7 @@ impl RiscvCodegen {
         self.state.emit("    not t3, t3"); // -1 if equal, 0 if not -> 0xFFFFFFFF or 0
         self.state.emit("    slli t3, t3, 32");
         self.state.emit("    srli t3, t3, 32"); // mask to 32 bits
-        // Compare high dword (bits 32-63)
+                                                // Compare high dword (bits 32-63)
         self.state.emit("    srli t5, t1, 32");
         self.state.emit("    srli t6, t2, 32");
         self.state.emit("    sub t5, t5, t6");
@@ -477,14 +554,14 @@ impl RiscvCodegen {
         // Get dest address
         self.load_ptr_to_reg_rv(dest_ptr, "a5");
         // Process low 8 bytes
-        self.state.emit("    ld t1, 0(a6)");  // a_lo
-        self.state.emit("    ld t2, 0(a7)");  // b_lo
+        self.state.emit("    ld t1, 0(a6)"); // a_lo
+        self.state.emit("    ld t2, 0(a7)"); // b_lo
         self.emit_rv_psubusb_8bytes("t1", "t2", "t3"); // t3 = saturate(a_lo - b_lo)
-        // Process high 8 bytes
-        self.state.emit("    ld t1, 8(a6)");  // a_hi
-        self.state.emit("    ld t2, 8(a7)");  // b_hi
+                                                       // Process high 8 bytes
+        self.state.emit("    ld t1, 8(a6)"); // a_hi
+        self.state.emit("    ld t2, 8(a7)"); // b_hi
         self.emit_rv_psubusb_8bytes("t1", "t2", "t4"); // t4 = saturate(a_hi - b_hi)
-        // Store results
+                                                       // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -495,32 +572,41 @@ impl RiscvCodegen {
     pub(super) fn emit_rv_psubusb_8bytes(&mut self, a_reg: &str, b_reg: &str, dst_reg: &str) {
         // Process 8 bytes one at a time using shift-and-mask
         // Result accumulates in dst_reg
-        self.state.emit_fmt(format_args!("    li {dst}, 0", dst=dst_reg));
+        self.state
+            .emit_fmt(format_args!("    li {dst}, 0", dst = dst_reg));
         for i in 0..8 {
             let shift = i * 8;
             // Extract byte i from a into t5
             if shift == 0 {
-                self.state.emit_fmt(format_args!("    andi t5, {a}, 0xff", a=a_reg));
+                self.state
+                    .emit_fmt(format_args!("    andi t5, {a}, 0xff", a = a_reg));
             } else {
-                self.state.emit_fmt(format_args!("    srli t5, {a}, {shift}", a=a_reg));
+                self.state
+                    .emit_fmt(format_args!("    srli t5, {a}, {shift}", a = a_reg));
                 self.state.emit("    andi t5, t5, 0xff");
             }
             // Extract byte i from b into t6
             if shift == 0 {
-                self.state.emit_fmt(format_args!("    andi t6, {b}, 0xff", b=b_reg));
+                self.state
+                    .emit_fmt(format_args!("    andi t6, {b}, 0xff", b = b_reg));
             } else {
-                self.state.emit_fmt(format_args!("    srli t6, {b}, {shift}", b=b_reg));
+                self.state
+                    .emit_fmt(format_args!("    srli t6, {b}, {shift}", b = b_reg));
                 self.state.emit("    andi t6, t6, 0xff");
             }
             // Saturating subtract: max(a_byte - b_byte, 0)
             let skip_label = self.state.fresh_label("psub_skip");
-            self.state.emit_fmt(format_args!("    bltu t5, t6, {skip}", skip=skip_label));
+            self.state
+                .emit_fmt(format_args!("    bltu t5, t6, {skip}", skip = skip_label));
             self.state.emit("    sub t5, t5, t6");
             if shift > 0 {
-                self.state.emit_fmt(format_args!("    slli t5, t5, {shift}"));
+                self.state
+                    .emit_fmt(format_args!("    slli t5, t5, {shift}"));
             }
-            self.state.emit_fmt(format_args!("    or {dst}, {dst}, t5", dst=dst_reg));
-            self.state.emit_fmt(format_args!("{skip}:", skip=skip_label));
+            self.state
+                .emit_fmt(format_args!("    or {dst}, {dst}, t5", dst = dst_reg));
+            self.state
+                .emit_fmt(format_args!("{skip}:", skip = skip_label));
         }
     }
 
@@ -536,14 +622,14 @@ impl RiscvCodegen {
         // Get dest address
         self.load_ptr_to_reg_rv(dest_ptr, "a5");
         // Process low 8 bytes
-        self.state.emit("    ld t1, 0(a6)");  // a_lo
-        self.state.emit("    ld t2, 0(a7)");  // b_lo
+        self.state.emit("    ld t1, 0(a6)"); // a_lo
+        self.state.emit("    ld t2, 0(a7)"); // b_lo
         self.emit_rv_psubsb_8bytes("t1", "t2", "t3"); // t3 = signed_saturate(a_lo - b_lo)
-        // Process high 8 bytes
-        self.state.emit("    ld t1, 8(a6)");  // a_hi
-        self.state.emit("    ld t2, 8(a7)");  // b_hi
+                                                      // Process high 8 bytes
+        self.state.emit("    ld t1, 8(a6)"); // a_hi
+        self.state.emit("    ld t2, 8(a7)"); // b_hi
         self.emit_rv_psubsb_8bytes("t1", "t2", "t4"); // t4 = signed_saturate(a_hi - b_hi)
-        // Store results
+                                                      // Store results
         self.state.emit("    sd t3, 0(a5)");
         self.state.emit("    sd t4, 8(a5)");
     }
@@ -552,45 +638,60 @@ impl RiscvCodegen {
     /// dst = clamp(a - b, -128, 127) for each byte lane.
     /// Processes each byte individually.
     pub(super) fn emit_rv_psubsb_8bytes(&mut self, a_reg: &str, b_reg: &str, dst_reg: &str) {
-        self.state.emit_fmt(format_args!("    li {dst}, 0", dst=dst_reg));
+        self.state
+            .emit_fmt(format_args!("    li {dst}, 0", dst = dst_reg));
         for i in 0..8 {
             let shift = i * 8;
             // Extract byte i from a into t5 (as signed: sign-extend from 8 bits)
             if shift == 0 {
-                self.state.emit_fmt(format_args!("    slli t5, {a}, 56", a=a_reg));
+                self.state
+                    .emit_fmt(format_args!("    slli t5, {a}, 56", a = a_reg));
             } else {
-                self.state.emit_fmt(format_args!("    slli t5, {a}, {s}", a=a_reg, s=56 - shift));
+                self.state.emit_fmt(format_args!(
+                    "    slli t5, {a}, {s}",
+                    a = a_reg,
+                    s = 56 - shift
+                ));
             }
             self.state.emit("    srai t5, t5, 56"); // sign-extend byte to 64-bit
-            // Extract byte i from b into t6 (as signed)
+                                                    // Extract byte i from b into t6 (as signed)
             if shift == 0 {
-                self.state.emit_fmt(format_args!("    slli t6, {b}, 56", b=b_reg));
+                self.state
+                    .emit_fmt(format_args!("    slli t6, {b}, 56", b = b_reg));
             } else {
-                self.state.emit_fmt(format_args!("    slli t6, {b}, {s}", b=b_reg, s=56 - shift));
+                self.state.emit_fmt(format_args!(
+                    "    slli t6, {b}, {s}",
+                    b = b_reg,
+                    s = 56 - shift
+                ));
             }
             self.state.emit("    srai t6, t6, 56"); // sign-extend byte to 64-bit
-            // Compute difference in t5
+                                                    // Compute difference in t5
             self.state.emit("    sub t5, t5, t6");
             // Clamp to [-128, 127]
             let no_clamp_hi = self.state.fresh_label("psubsb_noclamp_hi");
             let done = self.state.fresh_label("psubsb_done");
             self.state.emit_fmt(format_args!("    li t6, 127"));
-            self.state.emit_fmt(format_args!("    ble t5, t6, {}", no_clamp_hi));
+            self.state
+                .emit_fmt(format_args!("    ble t5, t6, {}", no_clamp_hi));
             self.state.emit_fmt(format_args!("    li t5, 127"));
             self.state.emit_fmt(format_args!("    j {}", done));
             self.state.emit_fmt(format_args!("{}:", no_clamp_hi));
             self.state.emit_fmt(format_args!("    li t6, -128"));
             let no_clamp_lo = self.state.fresh_label("psubsb_noclamp_lo");
-            self.state.emit_fmt(format_args!("    bge t5, t6, {}", no_clamp_lo));
+            self.state
+                .emit_fmt(format_args!("    bge t5, t6, {}", no_clamp_lo));
             self.state.emit_fmt(format_args!("    li t5, -128"));
             self.state.emit_fmt(format_args!("{}:", no_clamp_lo));
             self.state.emit_fmt(format_args!("{}:", done));
             // Mask to 8 bits and place in correct position
             self.state.emit("    andi t5, t5, 0xff");
             if shift > 0 {
-                self.state.emit_fmt(format_args!("    slli t5, t5, {shift}"));
+                self.state
+                    .emit_fmt(format_args!("    slli t5, t5, {shift}"));
             }
-            self.state.emit_fmt(format_args!("    or {dst}, {dst}, t5", dst=dst_reg));
+            self.state
+                .emit_fmt(format_args!("    or {dst}, {dst}, t5", dst = dst_reg));
         }
     }
 
@@ -598,15 +699,15 @@ impl RiscvCodegen {
     pub(super) fn emit_rv_pmovmskb(&mut self, dest: &Option<Value>, args: &[Operand]) {
         // Load 128-bit source
         self.operand_to_t0(&args[0]);
-        self.state.emit("    ld t1, 0(t0)");  // low 8 bytes
-        self.state.emit("    ld t2, 8(t0)");  // high 8 bytes
-        // Extract bit 7 of each byte and collect into a mask.
-        // For low 8 bytes (t1) -> bits 0-7 of result
-        // For high 8 bytes (t2) -> bits 8-15 of result
-        // Method: AND with 0x8080808080808080, then compress.
-        // After AND, each byte is either 0x80 or 0x00.
-        // Multiply by magic constant to pack bits together:
-        //   0x0002040810204081 will shift each 0x80 bit to accumulate in the high byte
+        self.state.emit("    ld t1, 0(t0)"); // low 8 bytes
+        self.state.emit("    ld t2, 8(t0)"); // high 8 bytes
+                                             // Extract bit 7 of each byte and collect into a mask.
+                                             // For low 8 bytes (t1) -> bits 0-7 of result
+                                             // For high 8 bytes (t2) -> bits 8-15 of result
+                                             // Method: AND with 0x8080808080808080, then compress.
+                                             // After AND, each byte is either 0x80 or 0x00.
+                                             // Multiply by magic constant to pack bits together:
+                                             //   0x0002040810204081 will shift each 0x80 bit to accumulate in the high byte
         self.state.emit("    li t3, 0x8080808080808080");
         self.state.emit("    and t1, t1, t3");
         self.state.emit("    and t2, t2, t3");
@@ -617,7 +718,7 @@ impl RiscvCodegen {
         self.state.emit("    srli t1, t1, 56"); // extract byte 7 = low 8-bit mask
         self.state.emit("    mul t2, t2, t3");
         self.state.emit("    srli t2, t2, 56"); // high 8-bit mask
-        // Combine
+                                                // Combine
         self.state.emit("    slli t2, t2, 8");
         self.state.emit("    or t0, t1, t2");
         // Store scalar result

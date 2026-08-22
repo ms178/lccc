@@ -57,10 +57,20 @@ pub(super) const X86_CALLER_SAVED: [PhysReg; 6] = [
 /// Caller-saved (SysV ABI), only for values that don't span calls.
 /// xmm0/xmm1 are reserved for the accumulator pattern and FP return values.
 pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
-    PhysReg(20), PhysReg(21), PhysReg(22), PhysReg(23),
-    PhysReg(24), PhysReg(25), PhysReg(26), PhysReg(27),
-    PhysReg(28), PhysReg(29), PhysReg(30), PhysReg(31),
-    PhysReg(32), PhysReg(33),
+    PhysReg(20),
+    PhysReg(21),
+    PhysReg(22),
+    PhysReg(23),
+    PhysReg(24),
+    PhysReg(25),
+    PhysReg(26),
+    PhysReg(27),
+    PhysReg(28),
+    PhysReg(29),
+    PhysReg(30),
+    PhysReg(31),
+    PhysReg(32),
+    PhysReg(33),
 ];
 
 /// Convert a 64-bit register name string to its 32-bit sub-register name.
@@ -558,20 +568,26 @@ impl X86Codegen {
     pub(super) fn emit_retpoline_call(&mut self, reg: &str) {
         if self.state.indirect_branch_thunk_inline {
             let id = self.state.next_label_id();
-            self.state.emit_fmt(format_args!("    jmp .Lrpl_outer_{}", id));
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_outer_{}", id));
             self.state.emit_fmt(format_args!(".Lrpl_inner_{}:", id));
-            self.state.emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_set_{}", id));
             self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
             self.state.emit("    pause");
             self.state.emit("    lfence");
-            self.state.emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
             self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
-            self.state.emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
             self.state.emit("    ret");
             self.state.emit_fmt(format_args!(".Lrpl_outer_{}:", id));
-            self.state.emit_fmt(format_args!("    call .Lrpl_inner_{}", id));
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_inner_{}", id));
         } else if self.state.indirect_branch_thunk {
-            self.state.emit_fmt(format_args!("    call __x86_indirect_thunk_{}", reg));
+            self.state
+                .emit_fmt(format_args!("    call __x86_indirect_thunk_{}", reg));
         } else {
             self.state.emit_fmt(format_args!("    call *%{}", reg));
         }
@@ -585,16 +601,20 @@ impl X86Codegen {
     pub(super) fn emit_retpoline_jump(&mut self, reg: &str) {
         if self.state.indirect_branch_thunk_inline {
             let id = self.state.next_label_id();
-            self.state.emit_fmt(format_args!("    call .Lrpl_set_{}", id));
+            self.state
+                .emit_fmt(format_args!("    call .Lrpl_set_{}", id));
             self.state.emit_fmt(format_args!(".Lrpl_spec_{}:", id));
             self.state.emit("    pause");
             self.state.emit("    lfence");
-            self.state.emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
+            self.state
+                .emit_fmt(format_args!("    jmp .Lrpl_spec_{}", id));
             self.state.emit_fmt(format_args!(".Lrpl_set_{}:", id));
-            self.state.emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, (%rsp)", reg));
             self.state.emit("    ret");
         } else if self.state.indirect_branch_thunk {
-            self.state.emit_fmt(format_args!("    jmp __x86_indirect_thunk_{}", reg));
+            self.state
+                .emit_fmt(format_args!("    jmp __x86_indirect_thunk_{}", reg));
         } else {
             self.state.emit_fmt(format_args!("    jmpq *%{}", reg));
         }
@@ -754,10 +774,18 @@ impl X86Codegen {
         for ((value, width), label) in entries {
             self.state.out.emit_named_label(label);
             match width {
-                1 => self.state.emit_fmt(format_args!("    .byte {}", *value as u8)),
-                2 => self.state.emit_fmt(format_args!("    .short {}", *value as u16)),
-                8 => self.state.emit_fmt(format_args!("    .quad {}", *value as i64)),
-                _ => self.state.emit_fmt(format_args!("    .long {}", *value as i32)),
+                1 => self
+                    .state
+                    .emit_fmt(format_args!("    .byte {}", *value as u8)),
+                2 => self
+                    .state
+                    .emit_fmt(format_args!("    .short {}", *value as u16)),
+                8 => self
+                    .state
+                    .emit_fmt(format_args!("    .quad {}", *value as i64)),
+                _ => self
+                    .state
+                    .emit_fmt(format_args!("    .long {}", *value as i32)),
             }
         }
         self.state
@@ -965,7 +993,8 @@ impl X86Codegen {
         // Prefer the immediate form whenever rhs is an encodable constant,
         // matching emit_int_cmp_insn_typed (cmp $imm, %al/%eax/%rax).
         if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-            self.state.emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %{}", cmp_instr, imm, acc_reg));
             return;
         }
         match rhs {
@@ -977,15 +1006,11 @@ impl X86Codegen {
             }
         }
         let rreg = if use_32bit { "ecx" } else { "rcx" };
-        self.state.emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
+        self.state
+            .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rreg, acc_reg));
     }
 
-    pub(super) fn emit_int_cmp_insn_typed(
-        &mut self,
-        lhs: &Operand,
-        rhs: &Operand,
-        ty: IrType,
-    ) {
+    pub(super) fn emit_int_cmp_insn_typed(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
         let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
         let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
         let lhs_phys = self.operand_reg(lhs);
@@ -1004,8 +1029,10 @@ impl X86Codegen {
                         ));
                     } else {
                         self.operand_to_rax(lhs);
-                        self.state
-                            .emit_fmt(format_args!("    {} %{}, %{}", test_instr, acc_reg, acc_reg));
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, %{}",
+                            test_instr, acc_reg, acc_reg
+                        ));
                     }
                 } else if let Some(lhs_r) = lhs_phys {
                     let lhs_name = typed_phys_reg_name(lhs_r, ty);
@@ -1051,8 +1078,10 @@ impl X86Codegen {
         } else if let Some(rhs_r) = rhs_phys {
             let rhs_name = typed_phys_reg_name(rhs_r, ty);
             self.operand_to_rax(lhs);
-            self.state
-                .emit_fmt(format_args!("    {} %{}, %{}", cmp_instr, rhs_name, acc_reg));
+            self.state.emit_fmt(format_args!(
+                "    {} %{}, %{}",
+                cmp_instr, rhs_name, acc_reg
+            ));
         } else {
             // Neither operand has a register. Load lhs to %rax.
             self.operand_to_rax(lhs);
@@ -1387,7 +1416,9 @@ impl X86Codegen {
                 if c.to_i64() == Some(0) {
                     self.state.emit("    xorl %eax, %eax");
                 } else if let Some(v) = c.to_i64() {
-                    self.state.out.emit_instr_imm_reg("    movl", v as i32 as i64, "eax");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movl", v as i32 as i64, "eax");
                 } else {
                     self.operand_to_rax(op);
                 }
@@ -1408,7 +1439,8 @@ impl X86Codegen {
                         self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
                     } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
                         let name32 = phys_reg_name_32(reg);
-                        self.state.emit_fmt(format_args!("    movl %{name32}, %eax"));
+                        self.state
+                            .emit_fmt(format_args!("    movl %{name32}, %eax"));
                     } else {
                         self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
                     }
@@ -1417,12 +1449,30 @@ impl X86Codegen {
                     // emitted `movq slot, %eax` when passed a 32-bit register.
                     // For a small integer return use a width-consistent load.
                     match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
-                        IrType::I8 => self.state.out.emit_instr_rbp_reg("    movsbq", slot.0, "eax"),
-                        IrType::U8 => self.state.out.emit_instr_rbp_reg("    movzbl", slot.0, "eax"),
-                        IrType::I16 => self.state.out.emit_instr_rbp_reg("    movswq", slot.0, "eax"),
-                        IrType::U16 => self.state.out.emit_instr_rbp_reg("    movzwl", slot.0, "eax"),
-                        IrType::I32 if self.needs_sext_values.contains(&v.0) =>
-                            self.state.out.emit_instr_rbp_reg("    movslq", slot.0, "rax"),
+                        IrType::I8 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movsbq", slot.0, "eax")
+                        }
+                        IrType::U8 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movzbl", slot.0, "eax")
+                        }
+                        IrType::I16 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movswq", slot.0, "eax")
+                        }
+                        IrType::U16 => {
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movzwl", slot.0, "eax")
+                        }
+                        IrType::I32 if self.needs_sext_values.contains(&v.0) => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movslq", slot.0, "rax"),
                         _ => self.state.out.emit_instr_rbp_reg("    movl", slot.0, "eax"),
                     }
                 } else {
@@ -1481,7 +1531,10 @@ impl X86Codegen {
             // Value is consumed by the very next instruction — skip the store.
             // The accumulator cache (set below) ensures the consumer finds it in %rax.
         } else {
-            panic!("x86 codegen: live value {} has no assigned location", dest.0);
+            panic!(
+                "x86 codegen: live value {} has no assigned location",
+                dest.0
+            );
         }
         self.state.reg_cache.set_acc(dest.0, false);
     }
@@ -1505,27 +1558,39 @@ impl X86Codegen {
                     // preserve the destination's upper bits, creating a false
                     // dependency on its old value. movapd copies all 128 bits
                     // (dead above bit 63 for scalars) with no false dependency.
-                    self.state.emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
+                    self.state
+                        .emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
                 }
             } else if ty == IrType::F32 {
-                self.state.emit_fmt(format_args!("    movd %{}, %{}", src_xmm, phys_reg_name_32(reg)));
+                self.state.emit_fmt(format_args!(
+                    "    movd %{}, %{}",
+                    src_xmm,
+                    phys_reg_name_32(reg)
+                ));
             } else {
-                self.state.emit_fmt(format_args!("    movq %{}, %{}", src_xmm, reg_name));
+                self.state
+                    .emit_fmt(format_args!("    movq %{}, %{}", src_xmm, reg_name));
             }
             return;
         }
         if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
             if let Some(slot) = self.state.get_slot(dest.0) {
-                let instr = if ty == IrType::F32 { "    movss" } else { "    movsd" };
+                let instr = if ty == IrType::F32 {
+                    "    movss"
+                } else {
+                    "    movsd"
+                };
                 self.state.out.emit_instr_reg_rbp(instr, src_xmm, slot.0);
                 return;
             }
         }
         // Fallback: route through %rax like store_rax_to does.
         if ty == IrType::F32 {
-            self.state.emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
+            self.state
+                .emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
         } else {
-            self.state.emit_fmt(format_args!("    movq %{}, %rax", src_xmm));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, %rax", src_xmm));
         }
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
@@ -1566,7 +1631,10 @@ impl X86Codegen {
             // No register: store 64 bits to preserve sign extension.
             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
         } else if !self.state.is_accumulator_location(dest.0) {
-            panic!("x86 codegen: live value {} has no assigned location", dest.0);
+            panic!(
+                "x86 codegen: live value {} has no assigned location",
+                dest.0
+            );
         }
         self.state.reg_cache.set_acc(dest.0, false);
     }
@@ -2024,7 +2092,10 @@ impl X86Codegen {
 
     fn value_to_reg_inner(&mut self, val: &Value, reg: &str, depth: u8) {
         if depth >= 32 {
-            panic!("x86 codegen: cyclic or excessive Copy chain for value {}", val.0);
+            panic!(
+                "x86 codegen: cyclic or excessive Copy chain for value {}",
+                val.0
+            );
         }
         // Every materialisation below is a 64-bit `movq`/`leaq` into `reg`, so
         // `reg` must name a 64-bit register. Passing a 32-bit name produced
@@ -3148,7 +3219,12 @@ fn resolve_stack_vregs(
                 size: *size,
             }
         }
-        MachInst::Movzx { src, dst, from_size, to_size } => {
+        MachInst::Movzx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
             // movzx/movsx accept a memory source: a slot-backed (spilled) src
             // vreg can be resolved to StackSlot directly. The emitter formats
             // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
@@ -3171,7 +3247,12 @@ fn resolve_stack_vregs(
                 to_size: *to_size,
             }
         }
-        MachInst::Movsx { src, dst, from_size, to_size } => {
+        MachInst::Movsx {
+            src,
+            dst,
+            from_size,
+            to_size,
+        } => {
             let src_resolved = match src {
                 MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
                     if let Some(slot) = state.get_slot(*id) {
@@ -3457,7 +3538,10 @@ impl ArchCodegen for X86Codegen {
         // Debug knob: CCC_MI_SKIP_FUNC=name1,name2 disables the MachInst path
         // for whole functions (diagnostic bisection aid).
         if let Some(skip) = std::env::var("CCC_MI_SKIP_FUNC").ok() {
-            if skip.split(',').any(|n| n == self.state.current_func_name.as_str()) {
+            if skip
+                .split(',')
+                .any(|n| n == self.state.current_func_name.as_str())
+            {
                 return false;
             }
         }
@@ -3644,8 +3728,14 @@ impl ArchCodegen for X86Codegen {
         use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 
         if std::env::var("CCC_MI_STREAM").is_ok() {
-            eprintln!("### MI-STREAM fn={} n={}", self.state.current_func_name, self.machinst_buf.len());
-            for mi in &self.machinst_buf { eprintln!("  {mi:?}"); }
+            eprintln!(
+                "### MI-STREAM fn={} n={}",
+                self.state.current_func_name,
+                self.machinst_buf.len()
+            );
+            for mi in &self.machinst_buf {
+                eprintln!("  {mi:?}");
+            }
         }
         let resolved: Vec<MachInst> = self
             .machinst_buf
@@ -3658,7 +3748,10 @@ impl ArchCodegen for X86Codegen {
             .any(|mi| has_unresolvable_vreg(mi, &self.reg_assignments));
         if has_bad {
             if std::env::var("CCC_MI_DEBUG").is_ok() {
-                eprintln!("[MI-FALLBACK] {} instructions -> default path", self.machinst_buf_ir.len());
+                eprintln!(
+                    "[MI-FALLBACK] {} instructions -> default path",
+                    self.machinst_buf_ir.len()
+                );
                 for mi in &resolved {
                     if has_unresolvable_vreg(mi, &self.reg_assignments) {
                         eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
@@ -3698,8 +3791,7 @@ impl ArchCodegen for X86Codegen {
                 self.state.current_program_point += 1;
             }
             assert_eq!(
-                self.state.current_program_point,
-                replay_endpoint,
+                self.state.current_program_point, replay_endpoint,
                 "MachInst replay changed the IR program-point endpoint"
             );
             self.machinst_buf.clear();
@@ -3958,7 +4050,8 @@ impl ArchCodegen for X86Codegen {
         // nothing and the address math reads a stale scratch (the exact i686
         // emit_leaq_base_index bug class, fixed there in session 20).
         let name = phys_reg_name(reg);
-        self.state.emit_fmt(format_args!("    movq %{}, %rax", name));
+        self.state
+            .emit_fmt(format_args!("    movq %{}, %rax", name));
         self.state.reg_cache.invalidate_acc();
     }
 
@@ -3981,11 +4074,14 @@ impl ArchCodegen for X86Codegen {
                 let d_name = phys_reg_name(dr);
                 if offset == 0 {
                     if br != dr {
-                        self.state.emit_fmt(format_args!("    movq %{}, %{}", b_name, d_name));
+                        self.state
+                            .emit_fmt(format_args!("    movq %{}, %{}", b_name, d_name));
                     }
                 } else {
-                    self.state
-                        .emit_fmt(format_args!("    leaq {}(%{}), %{}", offset, b_name, d_name));
+                    self.state.emit_fmt(format_args!(
+                        "    leaq {}(%{}), %{}",
+                        offset, b_name, d_name
+                    ));
                 }
                 self.state.reg_cache.invalidate_acc();
                 return true;
@@ -3993,7 +4089,8 @@ impl ArchCodegen for X86Codegen {
         }
         // Slot-only dest: stage through %rax, then store to the home.
         if offset == 0 {
-            self.state.emit_fmt(format_args!("    movq %{}, %rax", b_name));
+            self.state
+                .emit_fmt(format_args!("    movq %{}, %rax", b_name));
         } else {
             self.state
                 .emit_fmt(format_args!("    leaq {}(%{}), %rax", offset, b_name));
@@ -4032,11 +4129,27 @@ impl ArchCodegen for X86Codegen {
 
                 // Coalesced loop-carried vectors already occupy the same
                 // physical SIMD register; their entry/backedge copies vanish.
-                let src_reg = self.reg_assignments.get(&v.0).copied().filter(|r| is_xmm_reg(*r));
-                let dest_reg = self.reg_assignments.get(&dest.0).copied().filter(|r| is_xmm_reg(*r));
+                let src_reg = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
+                let dest_reg = self
+                    .reg_assignments
+                    .get(&dest.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r));
                 if let (Some(s), Some(d)) = (src_reg, dest_reg) {
-                    let held = if is_128 { phys_reg_name(s) } else { phys_reg_name_256(s) };
-                    let target = if is_128 { phys_reg_name(d) } else { phys_reg_name_256(d) };
+                    let held = if is_128 {
+                        phys_reg_name(s)
+                    } else {
+                        phys_reg_name_256(s)
+                    };
+                    let target = if is_128 {
+                        phys_reg_name(d)
+                    } else {
+                        phys_reg_name_256(d)
+                    };
                     if s != d {
                         let mov = if is_128 { "movdqa" } else { "vmovdqa" };
                         self.state
@@ -4097,9 +4210,12 @@ impl ArchCodegen for X86Codegen {
                         // are dead for scalar F64/F32) without the reg-reg
                         // movsd merge form's false dependency on the old
                         // destination value.
-                        self.state.emit_fmt(format_args!("    movapd %{}, %{}", s_name, d_name));
+                        self.state
+                            .emit_fmt(format_args!("    movapd %{}, %{}", s_name, d_name));
                     } else {
-                        self.state.out.emit_instr_reg_reg("    movq", s_name, d_name);
+                        self.state
+                            .out
+                            .emit_instr_reg_reg("    movq", s_name, d_name);
                     }
                 }
                 self.state.reg_cache.invalidate_acc();
@@ -4140,9 +4256,16 @@ impl ArchCodegen for X86Codegen {
                 // accumulator cache stays valid.
                 if let Operand::Value(v) = src {
                     if let Some(s) = src_phys {
-                        if is_xmm_reg(s) && !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
+                        if is_xmm_reg(s)
+                            && !self.state.is_alloca(dest.0)
+                            && !self.state.vector_values.contains(&dest.0)
+                        {
                             if let Some(slot) = self.state.get_slot(dest.0) {
-                                self.state.out.emit_instr_reg_rbp("    movsd", phys_reg_name(s), slot.0);
+                                self.state.out.emit_instr_reg_rbp(
+                                    "    movsd",
+                                    phys_reg_name(s),
+                                    slot.0,
+                                );
                                 return;
                             }
                         }
@@ -4235,7 +4358,9 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_reg_to_addr(&mut self, reg: PhysReg) {
         self.state.reg_cache.invalidate_sec();
-        self.state.out.emit_instr_reg_reg("    movq", phys_reg_name(reg), "rcx");
+        self.state
+            .out
+            .emit_instr_reg_reg("    movq", phys_reg_name(reg), "rcx");
     }
 
     fn function_alignment_log2(&self) -> Option<u32> {
@@ -4423,8 +4548,8 @@ impl Default for X86Codegen {
 
 #[cfg(test)]
 mod machinst_resolution_tests {
-    use super::*;
     use super::super::machinst::{MachInst, MachReg, OpSize};
+    use super::*;
 
     #[test]
     fn vreg_is_unresolved_even_if_main_map_has_xmm_assignment() {

@@ -6,10 +6,18 @@ impl super::InstructionEncoder {
     /// Build a REX prefix byte.
     pub(crate) fn rex(&self, w: bool, r: bool, x: bool, b: bool) -> u8 {
         let mut rex = 0x40u8;
-        if w { rex |= 0x08; }
-        if r { rex |= 0x04; }
-        if x { rex |= 0x02; }
-        if b { rex |= 0x01; }
+        if w {
+            rex |= 0x08;
+        }
+        if r {
+            rex |= 0x04;
+        }
+        if x {
+            rex |= 0x02;
+        }
+        if b {
+            rex |= 0x01;
+        }
         rex
     }
 
@@ -141,7 +149,11 @@ impl super::InstructionEncoder {
         false
     }
 
-    pub(crate) fn encode_modrm_mem(&mut self, reg_field: u8, mem: &MemoryOperand) -> Result<(), String> {
+    pub(crate) fn encode_modrm_mem(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+    ) -> Result<(), String> {
         let folded = fold_scale1_index(mem);
         let mem = folded.as_ref().unwrap_or(mem);
 
@@ -199,8 +211,7 @@ impl super::InstructionEncoder {
                     Displacement::Integer(val) => {
                         self.bytes.extend_from_slice(&(*val as i32).to_le_bytes());
                     }
-                    Displacement::SymbolDiff(a, b)
-                    | Displacement::SymbolDiffAddend(a, b, _) => {
+                    Displacement::SymbolDiff(a, b) | Displacement::SymbolDiffAddend(a, b, _) => {
                         return Err(format!(
                             "symbol-difference displacement `{} - {}` is not valid with RIP-relative addressing", a, b));
                     }
@@ -219,9 +230,7 @@ impl super::InstructionEncoder {
         let (disp_val, has_symbol, deferred_reloc) = match &mem.displacement {
             Displacement::None => (0i64, false, None),
             Displacement::Integer(v) => (*v, false, None),
-            Displacement::Symbol(sym) => {
-                (0i64, true, Some((sym.clone(), R_X86_64_32S, 0i64)))
-            }
+            Displacement::Symbol(sym) => (0i64, true, Some((sym.clone(), R_X86_64_32S, 0i64))),
             Displacement::SymbolAddend(sym, addend) => {
                 (0i64, true, Some((sym.clone(), R_X86_64_32S, *addend)))
             }
@@ -261,12 +270,17 @@ impl super::InstructionEncoder {
                     None => self.add_relocation(&sym, reloc_type, addend),
                 }
             }
-            self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+            self.bytes
+                .extend_from_slice(&(disp_val as i32).to_le_bytes());
             return Ok(());
         }
 
         let base_reg = base.map(|r| &r.name as &str).unwrap_or("");
-        let base_num = if !base_reg.is_empty() { reg_num(base_reg).unwrap_or(0) } else { 5 };
+        let base_num = if !base_reg.is_empty() {
+            reg_num(base_reg).unwrap_or(0)
+        } else {
+            5
+        };
 
         // Determine if we need SIB
         let need_sib = index.is_some()
@@ -300,7 +314,8 @@ impl super::InstructionEncoder {
                         None => self.add_relocation(&sym, reloc_type, addend),
                     }
                 }
-                self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes());
+                self.bytes
+                    .extend_from_slice(&(disp_val as i32).to_le_bytes());
             } else {
                 self.bytes.push(self.modrm(mod_bits, reg_field, 4));
                 self.bytes.push(self.sib(scale, idx_num, base_num));
@@ -313,7 +328,9 @@ impl super::InstructionEncoder {
                 match disp_size {
                     0 => {}
                     1 => self.bytes.push(disp_val as u8),
-                    4 => self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes()),
+                    4 => self
+                        .bytes
+                        .extend_from_slice(&(disp_val as i32).to_le_bytes()),
                     _ => unreachable!(),
                 }
             }
@@ -328,7 +345,9 @@ impl super::InstructionEncoder {
             match disp_size {
                 0 => {}
                 1 => self.bytes.push(disp_val as u8),
-                4 => self.bytes.extend_from_slice(&(disp_val as i32).to_le_bytes()),
+                4 => self
+                    .bytes
+                    .extend_from_slice(&(disp_val as i32).to_le_bytes()),
                 _ => unreachable!(),
             }
         }
@@ -341,7 +360,11 @@ impl super::InstructionEncoder {
         // Strip @PLT suffix from symbol names - the suffix only affects relocation type,
         // not the symbol name in the ELF symbol table. Use PLT32 reloc when @PLT is present.
         let (sym, rtype) = if let Some(base) = symbol.strip_suffix("@PLT") {
-            let plt_type = if reloc_type == R_X86_64_PC32 { R_X86_64_PLT32 } else { reloc_type };
+            let plt_type = if reloc_type == R_X86_64_PC32 {
+                R_X86_64_PLT32
+            } else {
+                reloc_type
+            };
             (base, plt_type)
         } else {
             (symbol, reloc_type)
@@ -360,7 +383,13 @@ impl super::InstructionEncoder {
     /// constant `a - b + addend`; otherwise the writer converts to a
     /// PC-relative reloc against `a` with the addend adjusted by `b`'s
     /// position (GAS semantics for `$sym - 0b`).
-    pub(crate) fn add_diff_relocation(&mut self, symbol: &str, diff: &str, reloc_type: u32, addend: i64) {
+    pub(crate) fn add_diff_relocation(
+        &mut self,
+        symbol: &str,
+        diff: &str,
+        reloc_type: u32,
+        addend: i64,
+    ) {
         self.relocations.push(Relocation {
             offset: self.bytes.len() as u64,
             symbol: symbol.to_string(),
@@ -383,7 +412,11 @@ impl super::InstructionEncoder {
     /// `reloc_count_before` is the length of `self.relocations` before
     /// `encode_modrm_mem` was called. This ensures we only adjust the relocation
     /// that was emitted by `encode_modrm_mem`, not any subsequent ones.
-    pub(crate) fn adjust_rip_reloc_addend(&mut self, reloc_count_before: usize, trailing_bytes: i64) {
+    pub(crate) fn adjust_rip_reloc_addend(
+        &mut self,
+        reloc_count_before: usize,
+        trailing_bytes: i64,
+    ) {
         // Only adjust if encode_modrm_mem added a relocation
         if self.relocations.len() > reloc_count_before {
             let reloc = &mut self.relocations[reloc_count_before];

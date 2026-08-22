@@ -1,16 +1,22 @@
 //! X86Codegen: cast operations.
 
-use crate::ir::reexports::{IrConst, Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::generation::is_i128_type;
 use super::emit::X86Codegen;
+use crate::backend::generation::is_i128_type;
+use crate::common::types::IrType;
+use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl X86Codegen {
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
         self.emit_cast_instrs_x86(from_ty, to_ty);
     }
 
-    pub(super) fn emit_cast_impl(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) {
+    pub(super) fn emit_cast_impl(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) {
         // Flag-fusion forwarding: this cast's destination is never read (the
         // fused consumer uses the live Cmp flags), and its source is the
         // never-materialized boolean — emitting it would read a stale register.
@@ -49,8 +55,12 @@ impl X86Codegen {
                         (self.state.get_slot(v.0), self.state.get_slot(dest.0))
                     {
                         if src_slot.0 != dest_slot.0 {
-                            self.state.out.emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
-                            self.state.out.emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
+                            self.state
+                                .out
+                                .emit_instr_rbp_reg("    movdqu", src_slot.0, "xmm0");
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movdqu", "xmm0", dest_slot.0);
                         }
                     }
                     return;
@@ -101,9 +111,15 @@ impl X86Codegen {
                     self.state.emit("    fildq (%rsp)");
                     self.state.emit("    addq $8, %rsp");
                     self.state.emit("    subq $16, %rsp");
-                    self.state.out.emit_instr_imm_reg("    movabsq", -9223372036854775808i64, "rax");
+                    self.state.out.emit_instr_imm_reg(
+                        "    movabsq",
+                        -9223372036854775808i64,
+                        "rax",
+                    );
                     self.state.emit("    movq %rax, (%rsp)");
-                    self.state.out.emit_instr_imm_reg("    movq", 0x403Fi64, "rax");
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", 0x403Fi64, "rax");
                     self.state.emit("    movq %rax, 8(%rsp)");
                     self.state.emit("    fldt (%rsp)");
                     self.state.emit("    addq $16, %rsp");
@@ -164,9 +180,13 @@ impl X86Codegen {
                 self.state.emit("    subq $16, %rsp");
                 let lo = u64::from_le_bytes(x87[0..8].try_into().unwrap());
                 let hi = u16::from_le_bytes(x87[8..10].try_into().unwrap());
-                self.state.out.emit_instr_imm_reg("    movabsq", lo as i64, "rax");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movabsq", lo as i64, "rax");
                 self.state.emit("    movq %rax, (%rsp)");
-                self.state.out.emit_instr_imm_reg("    movq", hi as i64, "rax");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", hi as i64, "rax");
                 self.state.emit("    movq %rax, 8(%rsp)");
                 self.state.emit("    fldt (%rsp)");
                 self.state.emit("    addq $16, %rsp");
@@ -178,8 +198,10 @@ impl X86Codegen {
         // Register-direct integer casts: bypass the accumulator when the destination
         // has a physical register. Instead of load→cast→store through %rax, emit the
         // cast instruction directly targeting the destination register.
-        if !from_ty.is_float() && !to_ty.is_float()
-            && !is_i128_type(from_ty) && !is_i128_type(to_ty)
+        if !from_ty.is_float()
+            && !to_ty.is_float()
+            && !is_i128_type(from_ty)
+            && !is_i128_type(to_ty)
         {
             if let Some(dest_phys) = self.dest_reg(dest) {
                 if !super::emit::is_xmm_reg(dest_phys) {
@@ -221,9 +243,11 @@ impl X86Codegen {
                         self.emit_sign_extend_to_rax(from_ty);
                     }
                     if to_ty == IrType::F64 {
-                        self.state.emit_fmt(format_args!("    cvtsi2sdq %rax, %{}", dname));
+                        self.state
+                            .emit_fmt(format_args!("    cvtsi2sdq %rax, %{}", dname));
                     } else {
-                        self.state.emit_fmt(format_args!("    cvtsi2ssq %rax, %{}", dname));
+                        self.state
+                            .emit_fmt(format_args!("    cvtsi2ssq %rax, %{}", dname));
                     }
                     self.state.reg_cache.invalidate_acc();
                     return;
@@ -233,8 +257,10 @@ impl X86Codegen {
 
         // Scalar FP casts: stage FP sources directly in XMM registers and keep
         // FP results in the SSE domain instead of round-tripping through %rax.
-        if !is_i128_type(from_ty) && !is_i128_type(to_ty)
-            && from_ty != IrType::F128 && to_ty != IrType::F128
+        if !is_i128_type(from_ty)
+            && !is_i128_type(to_ty)
+            && from_ty != IrType::F128
+            && to_ty != IrType::F128
             && (from_ty.is_float() || to_ty.is_float())
         {
             if self.try_emit_scalar_fp_cast(dest, src, from_ty, to_ty) {
@@ -250,7 +276,13 @@ impl X86Codegen {
     /// end-to-end. Returns true if the cast was emitted, false to fall through.
     /// Mirrors the instruction sequences of emit_generic_cast in f128.rs, but
     /// takes FP inputs directly in %xmm0 and stores FP results via store_xmm_to.
-    fn try_emit_scalar_fp_cast(&mut self, dest: &Value, src: &Operand, from_ty: IrType, to_ty: IrType) -> bool {
+    fn try_emit_scalar_fp_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
         use crate::backend::cast::{classify_cast, CastKind};
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop if from_ty.is_float() && to_ty.is_float() => {
@@ -269,7 +301,10 @@ impl X86Codegen {
                 self.store_xmm_to(dest, "xmm0", to_ty);
                 true
             }
-            CastKind::SignedToFloat { to_f64, from_ty: ft } => {
+            CastKind::SignedToFloat {
+                to_f64,
+                from_ty: ft,
+            } => {
                 self.operand_to_rax(src);
                 // Sign-extend sub-64-bit sources to 64 bits (Noop for I64).
                 self.emit_cast_instrs_x86(ft, IrType::I64);
@@ -281,7 +316,10 @@ impl X86Codegen {
                 self.store_xmm_to(dest, "xmm0", to_ty);
                 true
             }
-            CastKind::UnsignedToFloat { to_f64, from_ty: ft } => {
+            CastKind::UnsignedToFloat {
+                to_f64,
+                from_ty: ft,
+            } => {
                 self.operand_to_rax(src);
                 if ft == IrType::U64 {
                     // U64: handle values >= 2^63 via shift+round (mirrors
@@ -386,8 +424,8 @@ impl X86Codegen {
         to_ty: IrType,
         dest_phys: crate::backend::regalloc::PhysReg,
     ) -> bool {
-        use crate::backend::cast::{classify_cast, CastKind};
         use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+        use crate::backend::cast::{classify_cast, CastKind};
 
         let dest_64 = phys_reg_name(dest_phys);
         let dest_32 = phys_reg_name_32(dest_phys);
@@ -423,20 +461,37 @@ impl X86Codegen {
                     let src_typed = typed_phys_reg_name(src_reg, ft);
                     if ft.is_signed() {
                         match ft.size() {
-                            1 => self.state.emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
-                            2 => self.state.emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
-                            4 => self.state.emit_fmt(format_args!("    movslq %{}, %{}", phys_reg_name_32(src_reg), dest_64)),
-                            _ => { self.operand_to_callee_reg(src, dest_phys); }
+                            1 => self
+                                .state
+                                .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
+                            2 => self
+                                .state
+                                .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
+                            4 => self.state.emit_fmt(format_args!(
+                                "    movslq %{}, %{}",
+                                phys_reg_name_32(src_reg),
+                                dest_64
+                            )),
+                            _ => {
+                                self.operand_to_callee_reg(src, dest_phys);
+                            }
                         }
                     } else {
                         match ft.size() {
-                            1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
-                            2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                            1 => self
+                                .state
+                                .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                            2 => self
+                                .state
+                                .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
                             4 => {
                                 let src_32 = phys_reg_name_32(src_reg);
-                                self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                                self.state
+                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
                             }
-                            _ => { self.operand_to_callee_reg(src, dest_phys); }
+                            _ => {
+                                self.operand_to_callee_reg(src, dest_phys);
+                            }
                         }
                     }
                 } else if let Some(slot_off) = src_slot {
@@ -444,17 +499,41 @@ impl X86Codegen {
                     // Uses emit_instr_rbp_reg which handles rbp/rsp addressing automatically.
                     if ft.is_signed() {
                         match ft.size() {
-                            1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
-                            2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
-                            4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
-                            _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                            1 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+                            2 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+                            4 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+                            _ => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                         }
                     } else {
                         match ft.size() {
-                            1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-                            2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-                            4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
-                            _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                            1 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                            2 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                            4 => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                            _ => self
+                                .state
+                                .out
+                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                         }
                     }
                 } else {
@@ -474,25 +553,45 @@ impl X86Codegen {
                             if t.is_unsigned() {
                                 // U32 narrowing: movl truncates to 32 bits and zero-extends.
                                 let src_32 = phys_reg_name_32(src_reg);
-                                self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                                self.state
+                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
                             } else {
                                 // I32 narrowing: movslq truncates to 32 bits and sign-extends
                                 // to 64 bits, preserving negative values.
                                 let src_32 = phys_reg_name_32(src_reg);
-                                self.state.emit_fmt(format_args!("    movslq %{}, %{}", src_32, dest_64));
+                                self.state
+                                    .emit_fmt(format_args!("    movslq %{}, %{}", src_32, dest_64));
                             }
                         }
-                        2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
-                        1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
-                        _ => { self.operand_to_callee_reg(src, dest_phys); }
+                        2 => self
+                            .state
+                            .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                        1 => self
+                            .state
+                            .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                        _ => {
+                            self.operand_to_callee_reg(src, dest_phys);
+                        }
                     }
                 } else if let Some(slot_off) = src_slot {
                     // For narrowing from stack: just load the narrower size.
                     match t.size() {
-                        4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
-                        2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-                        1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-                        _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                        4 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                     }
                 } else {
                     return false;
@@ -506,18 +605,41 @@ impl X86Codegen {
                     match t.size() {
                         4 => {
                             let src_32 = phys_reg_name_32(src_reg);
-                            self.state.emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                            self.state
+                                .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
                         }
-                        2 => self.state.emit_fmt(format_args!("    movzwl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
-                        1 => self.state.emit_fmt(format_args!("    movzbl %{}, %{}", typed_phys_reg_name(src_reg, t), dest_32)),
-                        _ => { self.operand_to_callee_reg(src, dest_phys); }
+                        2 => self.state.emit_fmt(format_args!(
+                            "    movzwl %{}, %{}",
+                            typed_phys_reg_name(src_reg, t),
+                            dest_32
+                        )),
+                        1 => self.state.emit_fmt(format_args!(
+                            "    movzbl %{}, %{}",
+                            typed_phys_reg_name(src_reg, t),
+                            dest_32
+                        )),
+                        _ => {
+                            self.operand_to_callee_reg(src, dest_phys);
+                        }
                     }
                 } else if let Some(slot_off) = src_slot {
                     match t.size() {
-                        4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
-                        2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-                        1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-                        _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                        4 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                        2 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                        1 => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                        _ => self
+                            .state
+                            .out
+                            .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                     }
                 } else {
                     return false;

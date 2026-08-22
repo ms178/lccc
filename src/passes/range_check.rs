@@ -55,7 +55,10 @@ fn canonicalize(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option
     if !ty.is_integer() {
         return None;
     }
-    let signed = matches!(op, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
+    let signed = matches!(
+        op,
+        IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge
+    );
     // (value, const) with the const on the RHS, swapping the operator when the
     // constant was on the LHS.
     let (value, bound, op) = match (lhs, rhs) {
@@ -70,7 +73,13 @@ fn canonicalize(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option
         IrCmpOp::Slt | IrCmpOp::Ult => BoundKind::ExclUpper,
         IrCmpOp::Eq | IrCmpOp::Ne => return None,
     };
-    Some(Bound { value, bound, ty, kind, signed })
+    Some(Bound {
+        value,
+        bound,
+        ty,
+        kind,
+        signed,
+    })
 }
 
 fn swap(op: IrCmpOp) -> IrCmpOp {
@@ -116,7 +125,10 @@ struct Range {
 /// (from_ty, to_ty) steps. Two operands are the same comparison operand iff
 /// their root AND their full cast chain match (an i8→i32 zero-extension is
 /// not the same operand as an i16→i32 sign-extension).
-fn follow_casts(mut v: Value, cast_defs: &[Option<(Operand, IrType, IrType)>]) -> (Value, Vec<(IrType, IrType)>) {
+fn follow_casts(
+    mut v: Value,
+    cast_defs: &[Option<(Operand, IrType, IrType)>],
+) -> (Value, Vec<(IrType, IrType)>) {
     let mut chain = Vec::with_capacity(16);
     loop {
         let idx = v.0 as usize;
@@ -167,7 +179,12 @@ fn extract_range(
     if lo > hi {
         return None;
     }
-    Some(Range { lo, hi, value: a.value, ty: a.ty })
+    Some(Range {
+        lo,
+        hi,
+        value: a.value,
+        ty: a.ty,
+    })
 }
 
 /// Fold one `Select` into a range check when it matches. Returns the
@@ -179,7 +196,14 @@ fn try_fold_select(
     cast_defs: &[Option<(Operand, IrType, IrType)>],
     next_id: &mut u32,
 ) -> Option<Vec<Instruction>> {
-    let Instruction::Select { dest, cond, true_val, false_val, ty } = inst else {
+    let Instruction::Select {
+        dest,
+        cond,
+        true_val,
+        false_val,
+        ty,
+    } = inst
+    else {
         return None;
     };
     if !ty.is_integer() {
@@ -300,13 +324,24 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Cmp { dest, op, lhs, rhs, ty } => {
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
                     let idx = dest.0 as usize;
                     if idx < cmp_defs.len() {
                         cmp_defs[idx] = Some((*op, *lhs, *rhs, *ty));
                     }
                 }
-                Instruction::Cast { dest, src, from_ty, to_ty } => {
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
                     let idx = dest.0 as usize;
                     if idx < cast_defs.len() {
                         cast_defs[idx] = Some((*src, *from_ty, *to_ty));
@@ -321,7 +356,8 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     for block in &mut func.blocks {
         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         for inst in block.instructions.drain(..) {
-            if let Some(replacements) = try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id) {
+            if let Some(replacements) = try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id)
+            {
                 changes += 1;
                 new_insts.extend(replacements);
             } else {
@@ -362,8 +398,20 @@ mod tests {
     fn extract_and_range() {
         let x = Value(1);
         let no_casts: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 8];
-        let lo = Bound { value: x, bound: 97, ty: IrType::I32, kind: BoundKind::InclLower, signed: true };
-        let hi = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
+        let lo = Bound {
+            value: x,
+            bound: 97,
+            ty: IrType::I32,
+            kind: BoundKind::InclLower,
+            signed: true,
+        };
+        let hi = Bound {
+            value: x,
+            bound: 122,
+            ty: IrType::I32,
+            kind: BoundKind::InclUpper,
+            signed: true,
+        };
         let r = extract_range(&lo, &hi, true, &no_casts).unwrap();
         assert_eq!((r.lo, r.hi), (97, 122));
 
@@ -373,12 +421,30 @@ mod tests {
 
         // Reversed range (lo > hi) is not a valid inclusive range:
         // x >= 122 && x <= 97 is empty, so it must not fold.
-        let bad = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclLower, signed: true };
-        let low_hi = Bound { value: x, bound: 97, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
+        let bad = Bound {
+            value: x,
+            bound: 122,
+            ty: IrType::I32,
+            kind: BoundKind::InclLower,
+            signed: true,
+        };
+        let low_hi = Bound {
+            value: x,
+            bound: 97,
+            ty: IrType::I32,
+            kind: BoundKind::InclUpper,
+            signed: true,
+        };
         assert!(extract_range(&bad, &low_hi, true, &no_casts).is_none());
 
         // A collapsed range (x >= 122 && x <= 122) IS foldable (== 122).
-        let both = Bound { value: x, bound: 122, ty: IrType::I32, kind: BoundKind::InclUpper, signed: true };
+        let both = Bound {
+            value: x,
+            bound: 122,
+            ty: IrType::I32,
+            kind: BoundKind::InclUpper,
+            signed: true,
+        };
         let r3 = extract_range(&bad, &both, true, &no_casts).unwrap();
         assert_eq!((r3.lo, r3.hi), (122, 122));
     }
@@ -390,10 +456,16 @@ mod tests {
         let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 16];
         cast_defs[4] = Some((Operand::Value(x), IrType::U8, IrType::I32));
         cast_defs[8] = Some((Operand::Value(x), IrType::U8, IrType::I32));
-        assert_eq!(follow_casts(Value(4), &cast_defs), follow_casts(Value(8), &cast_defs));
+        assert_eq!(
+            follow_casts(Value(4), &cast_defs),
+            follow_casts(Value(8), &cast_defs)
+        );
 
         // A different cast chain (i16->i32) is a different operand.
         cast_defs[8] = Some((Operand::Value(x), IrType::I16, IrType::I32));
-        assert_ne!(follow_casts(Value(4), &cast_defs), follow_casts(Value(8), &cast_defs));
+        assert_ne!(
+            follow_casts(Value(4), &cast_defs),
+            follow_casts(Value(8), &cast_defs)
+        );
     }
 }

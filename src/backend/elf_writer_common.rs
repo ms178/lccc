@@ -16,17 +16,14 @@
 //! framework). These are handled as optional extensions controlled by
 //! the `supports_deferred_skips()` trait method.
 
-use crate::common::fx_hash::FxHashMap;
-use crate::backend::x86::assembler::parser::*;
-use crate::backend::elf::{self as elf_mod,
-    SHT_PROGBITS,
-    SHF_ALLOC, SHF_EXECINSTR,
-    STB_LOCAL, STB_GLOBAL, STB_WEAK,
-    STT_NOTYPE, STT_OBJECT, STT_FUNC, STT_TLS, STT_GNU_IFUNC,
-    STV_DEFAULT, STV_INTERNAL, STV_HIDDEN, STV_PROTECTED,
-    resolve_numeric_labels, parse_section_flags,
-    ElfConfig, ObjSection, ObjSymbol, ObjReloc, SymbolTableInput,
+use crate::backend::elf::{
+    self as elf_mod, parse_section_flags, resolve_numeric_labels, ElfConfig, ObjReloc, ObjSection,
+    ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, STB_GLOBAL, STB_LOCAL,
+    STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN,
+    STV_INTERNAL, STV_PROTECTED,
 };
+use crate::backend::x86::assembler::parser::*;
+use crate::common::fx_hash::FxHashMap;
 
 // ─── Architecture trait ───────────────────────────────────────────────
 
@@ -47,7 +44,9 @@ pub trait X86Arch {
     /// ELF class (ELFCLASS64 or ELFCLASS32).
     fn elf_class() -> u8;
     /// ELF flags (typically 0 for both).
-    fn elf_flags() -> u32 { 0 }
+    fn elf_flags() -> u32 {
+        0
+    }
 
     /// Absolute relocation type for data (R_X86_64_32/R_X86_64_64 or R_386_32).
     fn reloc_abs(size: usize) -> u32;
@@ -75,33 +74,49 @@ pub trait X86Arch {
 
     /// Optional: PC8 internal relocation type for loop/jrcxz instructions.
     /// Only x86-64 has this; i686 returns None.
-    fn reloc_pc8_internal() -> Option<u32> { None }
+    fn reloc_pc8_internal() -> Option<u32> {
+        None
+    }
     /// 16-bit PC-relative type (R_386_PC16 / R_X86_64_PC16) for rel16
     /// branch fields in real-mode (.code16) code. None = never emitted.
-    fn reloc_pc16() -> Option<u32> { None }
+    fn reloc_pc16() -> Option<u32> {
+        None
+    }
     /// Real 8-bit PC-relative ELF type (R_X86_64_PC8=15 / R_386_PC8=23) for
     /// cross-section `.byte a - b` (header.S short-jump displacement).
-    fn reloc_pc8() -> Option<u32> { None }
+    fn reloc_pc8() -> Option<u32> {
+        None
+    }
     /// Patch width for a relocation type: 16-bit reloc types own 2-byte
     /// fields; writing 4 bytes would clobber the neighbors.
-    fn reloc_patch_size(_reloc_type: u32) -> u8 { 4 }
+    fn reloc_patch_size(_reloc_type: u32) -> u8 {
+        4
+    }
 
     /// Optional: absolute 32-bit relocation for local symbol references.
     /// Only x86-64 uses R_X86_64_32 this way; i686 returns None since
     /// its R_386_32 is handled by the general abs path.
-    fn reloc_abs32_for_internal() -> Option<u32> { None }
+    fn reloc_abs32_for_internal() -> Option<u32> {
+        None
+    }
 
     /// Whether `.skip` expressions with label arithmetic are supported.
     /// Both x86-64 and i686 enable this for the Linux kernel's ALTERNATIVES macros.
-    fn supports_deferred_skips() -> bool { false }
+    fn supports_deferred_skips() -> bool {
+        false
+    }
 
     /// Whether `.set` alias resolution for label-difference expressions
     /// should be done during data value emission. Both x86-64 and i686
     /// enable this for DWARF debug info `.set .Lset0, .LECIE-.LSCIE` patterns.
-    fn resolve_set_aliases_in_data() -> bool { false }
+    fn resolve_set_aliases_in_data() -> bool {
+        false
+    }
 
     /// Default code mode for this architecture (64 for x86-64, 32 for i686).
-    fn default_code_mode() -> u8 { 64 }
+    fn default_code_mode() -> u8 {
+        64
+    }
 
     /// Encode an instruction in 64-bit mode. Used by the i686 assembler when
     /// encountering `.code64` sections (e.g. kernel realmode trampoline code).
@@ -273,17 +288,19 @@ struct SymbolInfo {
 /// immediately before a loop header executed millions of times — so
 /// single-byte fill burns issue slots in the hottest code in the program.
 const NOP_PATTERNS: [&[u8]; 11] = [
-    &[0x90],                                                        // nop
-    &[0x66, 0x90],                                                  // xchg %ax,%ax
-    &[0x0F, 0x1F, 0x00],                                            // nopl (%rax)
-    &[0x0F, 0x1F, 0x40, 0x00],                                      // nopl 0(%rax)
-    &[0x0F, 0x1F, 0x44, 0x00, 0x00],                                // nopl 0(%rax,%rax,1)
-    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                          // nopw 0(%rax,%rax,1)
-    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],                    // nopl 0L(%rax)
-    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],              // nopl 0L(%rax,%rax,1)
-    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],        // nopw 0L(%rax,%rax,1)
-    &[0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],  // nopw %cs:0L(...)
-    &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+    &[0x90],                                                       // nop
+    &[0x66, 0x90],                                                 // xchg %ax,%ax
+    &[0x0F, 0x1F, 0x00],                                           // nopl (%rax)
+    &[0x0F, 0x1F, 0x40, 0x00],                                     // nopl 0(%rax)
+    &[0x0F, 0x1F, 0x44, 0x00, 0x00],                               // nopl 0(%rax,%rax,1)
+    &[0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],                         // nopw 0(%rax,%rax,1)
+    &[0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],                   // nopl 0L(%rax)
+    &[0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],             // nopl 0L(%rax,%rax,1)
+    &[0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],       // nopw 0L(%rax,%rax,1)
+    &[0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00], // nopw %cs:0L(...)
+    &[
+        0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
 ];
 
 /// The largest single NOP we will emit (matches GAS's `alt_patt` limit).
@@ -400,29 +417,72 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
 
     while i < bytes.len() {
         match bytes[i] {
-            b' ' | b'\t' => { i += 1; }
-            b'+' => { tokens.push(ExprToken::Plus); i += 1; }
-            b'-' => { tokens.push(ExprToken::Minus); i += 1; }
-            b'*' => { tokens.push(ExprToken::Star); i += 1; }
-            b'(' => { tokens.push(ExprToken::LParen); i += 1; }
-            b')' => { tokens.push(ExprToken::RParen); i += 1; }
-            b'<' => { tokens.push(ExprToken::Lt); i += 1; }
-            b'>' => { tokens.push(ExprToken::Gt); i += 1; }
-            b'&' => { tokens.push(ExprToken::And); i += 1; }
-            b'|' => { tokens.push(ExprToken::Or); i += 1; }
-            b'^' => { tokens.push(ExprToken::Xor); i += 1; }
-            b'~' => { tokens.push(ExprToken::Not); i += 1; }
+            b' ' | b'\t' => {
+                i += 1;
+            }
+            b'+' => {
+                tokens.push(ExprToken::Plus);
+                i += 1;
+            }
+            b'-' => {
+                tokens.push(ExprToken::Minus);
+                i += 1;
+            }
+            b'*' => {
+                tokens.push(ExprToken::Star);
+                i += 1;
+            }
+            b'(' => {
+                tokens.push(ExprToken::LParen);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(ExprToken::RParen);
+                i += 1;
+            }
+            b'<' => {
+                tokens.push(ExprToken::Lt);
+                i += 1;
+            }
+            b'>' => {
+                tokens.push(ExprToken::Gt);
+                i += 1;
+            }
+            b'&' => {
+                tokens.push(ExprToken::And);
+                i += 1;
+            }
+            b'|' => {
+                tokens.push(ExprToken::Or);
+                i += 1;
+            }
+            b'^' => {
+                tokens.push(ExprToken::Xor);
+                i += 1;
+            }
+            b'~' => {
+                tokens.push(ExprToken::Not);
+                i += 1;
+            }
             b'0'..=b'9' => {
                 let start = i;
-                if i + 1 < bytes.len() && bytes[i] == b'0' && (bytes[i+1] == b'x' || bytes[i+1] == b'X') {
+                if i + 1 < bytes.len()
+                    && bytes[i] == b'0'
+                    && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+                {
                     i += 2;
-                    while i < bytes.len() && bytes[i].is_ascii_hexdigit() { i += 1; }
+                    while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                        i += 1;
+                    }
                 } else {
-                    while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
                 }
                 // Check for numeric label references: digits followed by 'b' or 'f'
                 // (e.g., "0b" = backward ref to label 0, "1f" = forward ref to label 1)
-                if i < bytes.len() && (bytes[i] == b'b' || bytes[i] == b'f')
+                if i < bytes.len()
+                    && (bytes[i] == b'b' || bytes[i] == b'f')
                     && (i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
                 {
                     i += 1; // include the 'b' or 'f' suffix
@@ -433,7 +493,8 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
                         i64::from_str_radix(&num_str[2..], 16)
                             .map_err(|_| format!("bad hex number: {}", num_str))?
                     } else {
-                        num_str.parse::<i64>()
+                        num_str
+                            .parse::<i64>()
                             .map_err(|_| format!("bad number: {}", num_str))?
                     };
                     tokens.push(ExprToken::Number(val));
@@ -441,12 +502,19 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'.' => {
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+                {
                     i += 1;
                 }
                 tokens.push(ExprToken::Symbol(expr[start..i].to_string()));
             }
-            c => return Err(format!("unexpected character in expression: '{}' (0x{:02x})", c as char, c)),
+            c => {
+                return Err(format!(
+                    "unexpected character in expression: '{}' (0x{:02x})",
+                    c as char, c
+                ))
+            }
         }
     }
 
@@ -572,7 +640,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.emit_elf()
     }
 
-    fn get_or_create_section(&mut self, name: &str, section_type: u32, flags: u64, comdat_group: Option<String>) -> usize {
+    fn get_or_create_section(
+        &mut self,
+        name: &str,
+        section_type: u32,
+        flags: u64,
+        comdat_group: Option<String>,
+    ) -> usize {
         if let Some(&idx) = self.section_map.get(name) {
             return idx;
         }
@@ -609,8 +683,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn switch_section(&mut self, dir: &SectionDirective) {
-        let (section_type, flags) = parse_section_flags(&dir.name, dir.flags.as_deref(), dir.section_type.as_deref());
-        let idx = self.get_or_create_section(&dir.name, section_type, flags, dir.comdat_group.clone());
+        let (section_type, flags) =
+            parse_section_flags(&dir.name, dir.flags.as_deref(), dir.section_type.as_deref());
+        let idx =
+            self.get_or_create_section(&dir.name, section_type, flags, dir.comdat_group.clone());
         self.previous_section = self.current_section;
         self.current_section = Some(idx);
     }
@@ -650,7 +726,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 self.switch_section(dir);
             }
             AsmItem::PushSection(dir) => {
-                self.section_stack.push((self.current_section, self.previous_section));
+                self.section_stack
+                    .push((self.current_section, self.previous_section));
                 self.switch_section(dir);
             }
             AsmItem::PopSection => {
@@ -699,7 +776,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         if let Some(sec_idx) = self.current_section {
                             let current_off = self.sections[sec_idx].data.len() as u64;
                             let end_label = format!(".Lsize_end_{}", name);
-                            self.label_positions.insert(end_label.clone(), (sec_idx, current_off));
+                            self.label_positions
+                                .insert(end_label.clone(), (sec_idx, current_off));
                             SizeExpr::SymbolDiff(end_label, start_sym.clone())
                         } else {
                             expr.clone()
@@ -745,7 +823,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         });
                     }
                     let is_exec = section.flags & SHF_EXECINSTR != 0;
-                    section.data
+                    section
+                        .data
                         .extend_from_slice(&section_padding(padding, is_exec, after_insn));
                 }
             }
@@ -793,13 +872,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         section.data.extend(std::iter::repeat_n(*fill, n));
                     } else {
                         let offset = self.sections[sec_idx].data.len();
-                        self.deferred_skips.push((sec_idx, offset, expr.clone(), *fill));
+                        self.deferred_skips
+                            .push((sec_idx, offset, expr.clone(), *fill));
                     }
                 } else {
                     // Simple integer parse for architectures without deferred skip support
                     if let Ok(val) = expr.trim().parse::<u64>() {
                         let section = self.current_section_mut()?;
-                        section.data.extend(std::iter::repeat_n(*fill, val as usize));
+                        section
+                            .data
+                            .extend(std::iter::repeat_n(*fill, val as usize));
                     } else {
                         return Err(format!("unsupported .skip expression: {}", expr));
                     }
@@ -830,7 +912,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // the alias-attribute lowering) must stay a symbolic alias —
                 // folding it to a section offset redirects calls to an
                 // absolute address (asm_label_alias regression, SIGSEGV).
-                let is_arithmetic = target.contains(|c: char| matches!(c, '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'));
+                let is_arithmetic = target.contains(|c: char| {
+                    matches!(
+                        c,
+                        '+' | '-' | '*' | '/' | '&' | '|' | '^' | '~' | '(' | '<' | '>'
+                    )
+                });
                 if is_arithmetic {
                     if let Some((sec_idx, substituted)) = self.substitute_dot(target) {
                         if substituted.contains(".Ldotpos_") {
@@ -838,14 +925,21 @@ impl<A: X86Arch> ElfWriterCore<A> {
                             // jump relaxation moves everything after this
                             // point (SYM_FUNC_END sizes were 66 bytes too
                             // large when evaluated eagerly).
-                            self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
+                            self.pending_set_exprs
+                                .push((alias.clone(), substituted, sec_idx));
                             self.aliases.insert(alias.clone(), target.clone());
                         } else {
                             match self.eval_label_expr(&substituted, sec_idx) {
-                                Some(val) => { self.set_values.insert(alias.clone(), val); }
+                                Some(val) => {
+                                    self.set_values.insert(alias.clone(), val);
+                                }
                                 None => {
                                     // Forward label refs: retry after layout.
-                                    self.pending_set_exprs.push((alias.clone(), substituted, sec_idx));
+                                    self.pending_set_exprs.push((
+                                        alias.clone(),
+                                        substituted,
+                                        sec_idx,
+                                    ));
                                     self.aliases.insert(alias.clone(), target.clone());
                                 }
                             }
@@ -884,11 +978,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let data = std::fs::read(path)
                     .map_err(|e| format!(".incbin: failed to read '{}': {}", path, e))?;
                 let skip = *skip as usize;
-                let data = if skip < data.len() { &data[skip..] } else { &[] };
+                let data = if skip < data.len() {
+                    &data[skip..]
+                } else {
+                    &[]
+                };
                 let data = match count {
                     Some(c) => {
                         let c = *c as usize;
-                        if c < data.len() { &data[..c] } else { data }
+                        if c < data.len() {
+                            &data[..c]
+                        } else {
+                            data
+                        }
                     }
                     None => data,
                 };
@@ -904,8 +1006,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // .code16gcc/.code32/.code64 across .text/.text32/.text64 sections).
                 self.code_mode = *bits;
             }
-            AsmItem::Cfi(_) | AsmItem::File(_, _) | AsmItem::Loc(_, _, _)
-            | AsmItem::OptionDirective(_) | AsmItem::Empty => {}
+            AsmItem::Cfi(_)
+            | AsmItem::File(_, _)
+            | AsmItem::Loc(_, _, _)
+            | AsmItem::OptionDirective(_)
+            | AsmItem::Empty => {}
         }
         Ok(())
     }
@@ -931,7 +1036,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
             } else {
                 return Err(format!(".org symbol {} not in current section", sym));
             }
-        } else if let Some((label_sec, label_off)) = self.resolve_numeric_label(sym, current, sec_idx) {
+        } else if let Some((label_sec, label_off)) =
+            self.resolve_numeric_label(sym, current, sec_idx)
+        {
             if label_sec == sec_idx {
                 (label_off as i64 + offset) as u64
             } else {
@@ -940,7 +1047,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
         } else {
             return Err(format!(".org: unknown symbol {}", sym));
         };
-        let padding = if target > current { (target - current) as usize } else { 0 };
+        let padding = if target > current {
+            (target - current) as usize
+        } else {
+            0
+        };
         // Record .org marker for post-relaxation fixup (even when padding == 0,
         // because code before it may shrink during jump relaxation)
         if !sym.is_empty() {
@@ -969,7 +1080,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     fn ensure_section(&mut self) -> Result<(), String> {
         if self.current_section.is_none() {
-            let idx = self.get_or_create_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, None);
+            let idx =
+                self.get_or_create_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, None);
             self.current_section = Some(idx);
         }
         Ok(())
@@ -1045,12 +1157,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         if let Some(target) = self.aliases.get(sym).cloned() {
                             if let Some(pos) = target.find('-') {
                                 let a = target[..pos].trim().to_string();
-                                let b = target[pos+1..].trim().to_string();
+                                let b = target[pos + 1..].trim().to_string();
                                 let offset = self.sections[sec_idx].data.len() as u64;
                                 self.sections[sec_idx].relocations.push(ElfRelocation {
                                     offset,
                                     symbol: a,
-                                    reloc_type: if size <= 4 { A::reloc_pc32() } else { A::reloc_abs64() },
+                                    reloc_type: if size <= 4 {
+                                        A::reloc_pc32()
+                                    } else {
+                                        A::reloc_abs64()
+                                    },
                                     addend: 0,
                                     diff_symbol: Some(b),
                                     patch_size: size as u8,
@@ -1103,13 +1219,15 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     let here = self.sections[sec_idx].data.len() as u64;
                     let dot_name = format!(".Ldot_{}_{}", sec_idx, here);
                     let a_res = if a == "." {
-                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
+                        self.label_positions
+                            .insert(dot_name.clone(), (sec_idx, here));
                         dot_name.clone()
                     } else {
                         self.aliases.get(a).cloned().unwrap_or_else(|| a.clone())
                     };
                     let b_res = if b == "." {
-                        self.label_positions.insert(dot_name.clone(), (sec_idx, here));
+                        self.label_positions
+                            .insert(dot_name.clone(), (sec_idx, here));
                         dot_name.clone()
                     } else {
                         self.aliases.get(b).cloned().unwrap_or_else(|| b.clone())
@@ -1132,7 +1250,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
         Ok(())
     }
 
-    fn emit_symbol_diff(&mut self, sec_idx: usize, a: &str, b: &str, size: usize, addend: i64) -> Result<(), String> {
+    fn emit_symbol_diff(
+        &mut self,
+        sec_idx: usize,
+        a: &str,
+        b: &str,
+        size: usize,
+        addend: i64,
+    ) -> Result<(), String> {
         /// `123b` / `7f` -- a GAS numeric local-label reference. Unlike a
         /// named symbol, this never becomes an ELF symbol table entry, so a
         /// relocation naming it can never be resolved by anything downstream
@@ -1147,8 +1272,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         let offset = self.sections[sec_idx].data.len() as u64;
-        let a_resolved = self.aliases.get(a).cloned().unwrap_or_else(|| a.to_string());
-        let b_resolved = self.aliases.get(b).cloned().unwrap_or_else(|| b.to_string());
+        let a_resolved = self
+            .aliases
+            .get(a)
+            .cloned()
+            .unwrap_or_else(|| a.to_string());
+        let b_resolved = self
+            .aliases
+            .get(b)
+            .cloned()
+            .unwrap_or_else(|| b.to_string());
 
         if b_resolved == "." {
             // `sym - .` means PC-relative. The relocation WIDTH must match
@@ -1160,7 +1293,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
                 symbol: a_resolved,
-                reloc_type: if size == 8 { A::reloc_pc64() } else { A::reloc_pc32() },
+                reloc_type: if size == 8 {
+                    A::reloc_pc64()
+                } else {
+                    A::reloc_pc32()
+                },
                 addend,
                 diff_symbol: None,
                 patch_size: size as u8,
@@ -1181,21 +1318,39 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // after jump relaxation and `.skip` sizing have settled the
             // final layout, exactly like the existing `size <= 2` path.
             let offset_usize = self.sections[sec_idx].data.len();
-            self.deferred_byte_diffs.push((sec_idx, offset_usize, a_resolved, b_resolved, size, addend));
+            self.deferred_byte_diffs.push((
+                sec_idx,
+                offset_usize,
+                a_resolved,
+                b_resolved,
+                size,
+                addend,
+            ));
             let section = &mut self.sections[sec_idx];
             section.data.extend(std::iter::repeat_n(0, size));
         } else if size <= 2 && A::supports_deferred_skips() {
             // For byte/short-sized diffs, defer resolution until after
             // deferred skips are inserted (skip insertion shifts offsets).
             let offset_usize = self.sections[sec_idx].data.len();
-            self.deferred_byte_diffs.push((sec_idx, offset_usize, a_resolved, b_resolved, size, addend));
+            self.deferred_byte_diffs.push((
+                sec_idx,
+                offset_usize,
+                a_resolved,
+                b_resolved,
+                size,
+                addend,
+            ));
             let section = &mut self.sections[sec_idx];
             section.data.extend(std::iter::repeat_n(0, size));
         } else {
             self.sections[sec_idx].relocations.push(ElfRelocation {
                 offset,
                 symbol: a_resolved,
-                reloc_type: if size == 4 { A::reloc_pc32() } else { A::reloc_abs64() },
+                reloc_type: if size == 4 {
+                    A::reloc_pc32()
+                } else {
+                    A::reloc_abs64()
+                },
                 addend,
                 diff_symbol: Some(b_resolved),
                 patch_size: size as u8,
@@ -1229,13 +1384,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
                 DataValue::SymbolDiffScaled(..) => {
                     return Err(
-                        "scaled symbol difference in .uleb128/.sleb128 is unsupported"
-                            .to_string(),
+                        "scaled symbol difference in .uleb128/.sleb128 is unsupported".to_string(),
                     );
                 }
                 DataValue::Symbol(sym) | DataValue::SymbolOffset(sym, _) => {
                     return Err(format!(
-                        "unsupported symbol reference {} in .uleb128/.sleb128", sym
+                        "unsupported symbol reference {} in .uleb128/.sleb128",
+                        sym
                     ));
                 }
             }
@@ -1244,10 +1399,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
     }
 
     fn defer_leb_diff(
-        &mut self, sec_idx: usize, a: &str, b: &str, addend: i64, signed: bool,
+        &mut self,
+        sec_idx: usize,
+        a: &str,
+        b: &str,
+        addend: i64,
+        signed: bool,
     ) -> Result<(), String> {
-        let a_resolved = self.aliases.get(a).cloned().unwrap_or_else(|| a.to_string());
-        let b_resolved = self.aliases.get(b).cloned().unwrap_or_else(|| b.to_string());
+        let a_resolved = self
+            .aliases
+            .get(a)
+            .cloned()
+            .unwrap_or_else(|| a.to_string());
+        let b_resolved = self
+            .aliases
+            .get(b)
+            .cloned()
+            .unwrap_or_else(|| b.to_string());
         let offset = self.sections[sec_idx].data.len();
         if b_resolved == "." {
             return Err("symbol minus current position in .uleb128 is unsupported".to_string());
@@ -1255,8 +1423,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
         // Forward references are fine: resolution happens after all items
         // are processed and every label position is known. Reserve the
         // maximum LEB128 width (10 bytes for u64); resolve shrinks to fit.
-        self.deferred_leb_diffs.push((sec_idx, offset, a_resolved, b_resolved, addend, signed));
-        self.sections[sec_idx].data.extend(std::iter::repeat_n(0, 10));
+        self.deferred_leb_diffs
+            .push((sec_idx, offset, a_resolved, b_resolved, addend, signed));
+        self.sections[sec_idx]
+            .data
+            .extend(std::iter::repeat_n(0, 10));
         Ok(())
     }
 
@@ -1284,7 +1455,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
             // machine code, so reject loudly instead.
             return Err(format!(
                 ".code16 in 64-bit assembly is not supported; compile real-mode \
-                 code with -m16 (instruction: {})", instr.mnemonic));
+                 code with -m16 (instruction: {})",
+                instr.mnemonic
+            ));
         } else {
             A::encode_instruction(instr, base_offset)?
         };
@@ -1339,10 +1512,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     fn get_jump_target_label(&self, instr: &Instruction) -> Option<String> {
         let mnem = &instr.mnemonic;
-        let is_jump = mnem == "jmp" || mnem == "loop"
-            || (mnem.starts_with('j') && mnem.len() >= 2);
-        if !is_jump { return None; }
-        if instr.operands.len() != 1 { return None; }
+        let is_jump = mnem == "jmp" || mnem == "loop" || (mnem.starts_with('j') && mnem.len() >= 2);
+        if !is_jump {
+            return None;
+        }
+        if instr.operands.len() != 1 {
+            return None;
+        }
         if let Operand::Label(label) = &instr.operands[0] {
             Some(label.clone())
         } else {
@@ -1359,17 +1535,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
         for (sec_idx, offset, expr, fill) in &skips {
             // Temporarily insert "." (current position) into label_positions so
             // expressions like "0b + 16 - ." can reference the directive's offset.
-            self.label_positions.insert(".".to_string(), (*sec_idx, *offset as u64));
+            self.label_positions
+                .insert(".".to_string(), (*sec_idx, *offset as u64));
             // Pre-resolve numeric label references (e.g. "0b", "1f") in the expression
             let resolved_expr = self.resolve_numeric_labels_in_expr(expr, *offset as u64, *sec_idx);
             let val = self.evaluate_expr(&resolved_expr);
             self.label_positions.remove(".");
             let val = val?;
             let count = if val < 0 { 0usize } else { val as usize };
-            if count == 0 { continue; }
+            if count == 0 {
+                continue;
+            }
 
             let fill_bytes: Vec<u8> = vec![*fill; count];
-            self.sections[*sec_idx].data.splice(*offset..*offset, fill_bytes);
+            self.sections[*sec_idx]
+                .data
+                .splice(*offset..*offset, fill_bytes);
 
             // Adjust label positions
             for (_, (lsec, loff)) in self.label_positions.iter_mut() {
@@ -1465,9 +1646,13 @@ impl<A: X86Arch> ElfWriterCore<A> {
         leb_diffs.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         let mut diffs = std::mem::take(&mut self.deferred_byte_diffs);
         for (sec_idx, offset, sym_a, sym_b, addend, signed) in &leb_diffs {
-            let pos_a = self.label_positions.get(sym_a)
+            let pos_a = self
+                .label_positions
+                .get(sym_a)
                 .ok_or_else(|| format!("undefined label in .uleb128 diff: {}", sym_a))?;
-            let pos_b = self.label_positions.get(sym_b)
+            let pos_b = self
+                .label_positions
+                .get(sym_b)
                 .ok_or_else(|| format!("undefined label in .uleb128 diff: {}", sym_b))?;
             let diff = (pos_a.1 as i64) - (pos_b.1 as i64) + addend;
             let mut encoded: Vec<u8> = Vec::new();
@@ -1480,7 +1665,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
             if *offset + PLACE > self.sections[*sec_idx].data.len() {
                 return Err("internal: .uleb128 diff placeholder overflow".to_string());
             }
-            self.sections[*sec_idx].data.splice(*offset..*offset + PLACE, encoded.iter().copied());
+            self.sections[*sec_idx]
+                .data
+                .splice(*offset..*offset + PLACE, encoded.iter().copied());
             let delta = PLACE - encoded.len();
             if delta > 0 {
                 let from = *offset + encoded.len();
@@ -1528,8 +1715,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 if len >= 2 {
                     let suffix = sym.as_bytes()[len - 1];
                     let num = &sym[..len - 1];
-                    if (suffix == b'b' || suffix == b'f')
-                        && num.bytes().all(|c| c.is_ascii_digit())
+                    if (suffix == b'b' || suffix == b'f') && num.bytes().all(|c| c.is_ascii_digit())
                     {
                         if let Some(list) = me.numeric_label_positions.get(num) {
                             return if suffix == b'b' {
@@ -1612,14 +1798,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
         while i < bytes.len() {
             if bytes[i].is_ascii_digit() {
                 let start = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
-                if i < bytes.len() && (bytes[i] == b'b' || bytes[i] == b'f')
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i < bytes.len()
+                    && (bytes[i] == b'b' || bytes[i] == b'f')
                     && (i + 1 >= bytes.len() || !bytes[i + 1].is_ascii_alphanumeric())
                 {
                     // This is a numeric label reference like "0b" or "1f"
                     let label_ref = &expr[start..=i];
                     i += 1;
-                    if let Some((_, label_off)) = self.resolve_numeric_label(label_ref, offset, sec_idx) {
+                    if let Some((_, label_off)) =
+                        self.resolve_numeric_label(label_ref, offset, sec_idx)
+                    {
                         result.push_str(&label_off.to_string());
                     } else {
                         // Can't resolve - keep the original text (will error during eval)
@@ -1645,7 +1836,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut pos = 0;
         let result = self.parse_expr_or(&tokens, &mut pos)?;
         if pos < tokens.len() {
-            return Err(format!("unexpected token in expression at position {}: {:?}", pos, tokens.get(pos)));
+            return Err(format!(
+                "unexpected token in expression at position {}: {:?}",
+                pos,
+                tokens.get(pos)
+            ));
         }
         Ok(result)
     }
@@ -1654,7 +1849,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut val = self.parse_expr_xor(tokens, pos)?;
         while *pos < tokens.len() {
             match tokens[*pos] {
-                ExprToken::Or => { *pos += 1; val |= self.parse_expr_xor(tokens, pos)?; }
+                ExprToken::Or => {
+                    *pos += 1;
+                    val |= self.parse_expr_xor(tokens, pos)?;
+                }
                 _ => break,
             }
         }
@@ -1665,7 +1863,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut val = self.parse_expr_and(tokens, pos)?;
         while *pos < tokens.len() {
             match tokens[*pos] {
-                ExprToken::Xor => { *pos += 1; val ^= self.parse_expr_and(tokens, pos)?; }
+                ExprToken::Xor => {
+                    *pos += 1;
+                    val ^= self.parse_expr_and(tokens, pos)?;
+                }
                 _ => break,
             }
         }
@@ -1676,7 +1877,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut val = self.parse_expr_cmp(tokens, pos)?;
         while *pos < tokens.len() {
             match tokens[*pos] {
-                ExprToken::And => { *pos += 1; val &= self.parse_expr_cmp(tokens, pos)?; }
+                ExprToken::And => {
+                    *pos += 1;
+                    val &= self.parse_expr_cmp(tokens, pos)?;
+                }
                 _ => break,
             }
         }
@@ -1707,8 +1911,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut val = self.parse_expr_mul(tokens, pos)?;
         while *pos < tokens.len() {
             match tokens[*pos] {
-                ExprToken::Plus => { *pos += 1; val = val.wrapping_add(self.parse_expr_mul(tokens, pos)?); }
-                ExprToken::Minus => { *pos += 1; val = val.wrapping_sub(self.parse_expr_mul(tokens, pos)?); }
+                ExprToken::Plus => {
+                    *pos += 1;
+                    val = val.wrapping_add(self.parse_expr_mul(tokens, pos)?);
+                }
+                ExprToken::Minus => {
+                    *pos += 1;
+                    val = val.wrapping_sub(self.parse_expr_mul(tokens, pos)?);
+                }
                 _ => break,
             }
         }
@@ -1719,7 +1929,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut val = self.parse_expr_unary(tokens, pos)?;
         while *pos < tokens.len() {
             match tokens[*pos] {
-                ExprToken::Star => { *pos += 1; val = val.wrapping_mul(self.parse_expr_unary(tokens, pos)?); }
+                ExprToken::Star => {
+                    *pos += 1;
+                    val = val.wrapping_mul(self.parse_expr_unary(tokens, pos)?);
+                }
                 _ => break,
             }
         }
@@ -1936,8 +2149,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     && !self.pending_globals.contains(&reloc.symbol)
                     && !self.pending_weaks.contains(&reloc.symbol);
                 let (sym_name, mut addend) = if is_foldable_local {
-                    let &(target_sec, target_off) = self.label_positions.get(&reloc.symbol).unwrap();
-                    (section_names[target_sec].clone(), reloc.addend + target_off as i64)
+                    let &(target_sec, target_off) =
+                        self.label_positions.get(&reloc.symbol).unwrap();
+                    (
+                        section_names[target_sec].clone(),
+                        reloc.addend + target_off as i64,
+                    )
                 } else {
                     (reloc.symbol.clone(), reloc.addend)
                 };
@@ -1957,13 +2174,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     let off = reloc.offset as usize;
                     let patch16 = reloc.patch_size == 2;
                     if patch16 && off + 2 <= data.len() {
-                        let existing = i16::from_le_bytes([data[off], data[off+1]]);
+                        let existing = i16::from_le_bytes([data[off], data[off + 1]]);
                         let patched = existing.wrapping_add(addend as i16);
-                        data[off..off+2].copy_from_slice(&patched.to_le_bytes());
+                        data[off..off + 2].copy_from_slice(&patched.to_le_bytes());
                     } else if !patch16 && off + 4 <= data.len() {
-                        let existing = i32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                        let existing = i32::from_le_bytes([
+                            data[off],
+                            data[off + 1],
+                            data[off + 2],
+                            data[off + 3],
+                        ]);
                         let patched = existing.wrapping_add(addend as i32);
-                        data[off..off+4].copy_from_slice(&patched.to_le_bytes());
+                        data[off..off + 4].copy_from_slice(&patched.to_le_bytes());
                     }
                     relocs.push(ObjReloc {
                         offset: reloc.offset,
@@ -1981,32 +2203,43 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
             }
 
-            shared_sections.insert(sec.name.clone(), ObjSection {
-                name: sec.name.clone(),
-                sh_type: sec.section_type,
-                sh_flags: sec.flags,
-                data,
-                sh_addralign: sec.alignment,
-                relocs,
-                comdat_group: sec.comdat_group.clone(),
-            });
+            shared_sections.insert(
+                sec.name.clone(),
+                ObjSection {
+                    name: sec.name.clone(),
+                    sh_type: sec.section_type,
+                    sh_flags: sec.flags,
+                    data,
+                    sh_addralign: sec.alignment,
+                    relocs,
+                    comdat_group: sec.comdat_group.clone(),
+                },
+            );
         }
 
         // Convert label positions
-        let labels: FxHashMap<String, (String, u64)> = self.label_positions.iter()
+        let labels: FxHashMap<String, (String, u64)> = self
+            .label_positions
+            .iter()
             .map(|(name, &(sec_idx, offset))| {
                 (name.clone(), (section_names[sec_idx].clone(), offset))
             })
             .collect();
 
-        let global_symbols: FxHashMap<String, bool> = self.pending_globals.iter()
+        let global_symbols: FxHashMap<String, bool> = self
+            .pending_globals
+            .iter()
             .map(|s| (s.clone(), true))
             .collect();
-        let weak_symbols: FxHashMap<String, bool> = self.pending_weaks.iter()
+        let weak_symbols: FxHashMap<String, bool> = self
+            .pending_weaks
+            .iter()
             .map(|s| (s.clone(), true))
             .collect();
 
-        let symbol_types: FxHashMap<String, u8> = self.pending_types.iter()
+        let symbol_types: FxHashMap<String, u8> = self
+            .pending_types
+            .iter()
             .map(|(name, kind)| {
                 let stt = match kind {
                     SymbolKind::Function => STT_FUNC,
@@ -2020,7 +2253,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
             .collect();
 
         // Resolve pending_sizes to concrete u64 values
-        let symbol_sizes: FxHashMap<String, u64> = self.pending_sizes.iter()
+        let symbol_sizes: FxHashMap<String, u64> = self
+            .pending_sizes
+            .iter()
             .map(|(name, expr)| {
                 let size = match expr {
                     SizeExpr::Constant(v) => *v,
@@ -2033,8 +2268,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         }
                     }
                     SizeExpr::SymbolDiff(end_label, start_label) => {
-                        let end_off = self.label_positions.get(end_label).map(|p| p.1).unwrap_or(0);
-                        let start_off = self.label_positions.get(start_label).map(|p| p.1).unwrap_or(0);
+                        let end_off = self
+                            .label_positions
+                            .get(end_label)
+                            .map(|p| p.1)
+                            .unwrap_or(0);
+                        let start_off = self
+                            .label_positions
+                            .get(start_label)
+                            .map(|p| p.1)
+                            .unwrap_or(0);
                         end_off.wrapping_sub(start_off)
                     }
                     SizeExpr::SymbolRef(sym_ref) => {
@@ -2052,12 +2295,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         if let Some(alias_target) = self.aliases.get(sym_ref) {
                             let normalized = alias_target.replace(' ', "");
                             if let Some(rest) = normalized.strip_prefix(".-") {
-                                if let Some(&(sec_idx, start_off)) = self.label_positions.get(rest) {
+                                if let Some(&(sec_idx, start_off)) = self.label_positions.get(rest)
+                                {
                                     let end = self.sections[sec_idx].data.len() as u64;
                                     end - start_off
-                                } else { 0 }
-                            } else { 0 }
-                        } else { 0 }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
                     }
                 };
                 (name.clone(), size)
@@ -2122,19 +2372,31 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Numeric label resolution ─────────────────────────────────────
 
-    fn resolve_numeric_label(&self, symbol: &str, reloc_offset: u64, sec_idx: usize) -> Option<(usize, u64)> {
+    fn resolve_numeric_label(
+        &self,
+        symbol: &str,
+        reloc_offset: u64,
+        sec_idx: usize,
+    ) -> Option<(usize, u64)> {
         let len = symbol.len();
-        if len < 2 { return None; }
+        if len < 2 {
+            return None;
+        }
         let suffix = symbol.as_bytes()[len - 1];
-        if suffix != b'b' && suffix != b'f' { return None; }
+        if suffix != b'b' && suffix != b'f' {
+            return None;
+        }
         let label_num = &symbol[..len - 1];
-        if !label_num.chars().all(|c| c.is_ascii_digit()) { return None; }
+        if !label_num.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
 
         let positions = self.numeric_label_positions.get(label_num)?;
         if suffix == b'b' {
             let mut best: Option<(usize, u64)> = None;
             for &(s_idx, off) in positions {
-                if s_idx == sec_idx && off <= reloc_offset
+                if s_idx == sec_idx
+                    && off <= reloc_offset
                     && (best.is_none() || off > best.unwrap().1)
                 {
                     best = Some((s_idx, off));
@@ -2144,7 +2406,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
         } else {
             let mut best: Option<(usize, u64)> = None;
             for &(s_idx, off) in positions {
-                if s_idx == sec_idx && off > reloc_offset
+                if s_idx == sec_idx
+                    && off > reloc_offset
                     && (best.is_none() || off < best.unwrap().1)
                 {
                     best = Some((s_idx, off));
@@ -2199,13 +2462,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let mut actions: Vec<(usize, Action)> = Vec::new();
                 let dbg = std::env::var("CCC_DEBUG_RELAX").is_ok();
                 for (j_idx, jump) in self.sections[sec_idx].jumps.iter().enumerate() {
-                    let target_off_opt = local_labels
-                        .get(&jump.target)
-                        .copied()
-                        .or_else(|| {
-                            self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
-                                .map(|(_, off)| off as usize)
-                        });
+                    let target_off_opt = local_labels.get(&jump.target).copied().or_else(|| {
+                        self.resolve_numeric_label(&jump.target, jump.offset as u64, sec_idx)
+                            .map(|(_, off)| off as usize)
+                    });
                     if dbg {
                         eprintln!(
                             "[RELAX] sec{} j{} off={} len={} cond={} target={:?} target_off={:?} relaxed={} growable={}",
@@ -2363,7 +2623,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                 offset: reloc_pos,
                                 symbol: target.clone(),
                                 reloc_type: if rel16 {
-                                    A::reloc_pc16().expect("rel16 branch without architecture relocation")
+                                    A::reloc_pc16()
+                                        .expect("rel16 branch without architecture relocation")
                                 } else {
                                     A::reloc_pc32()
                                 },
@@ -2474,7 +2735,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
         }
 
         // Sort by offset to ensure front-to-back processing
-        self.sections[sec_idx].align_markers.sort_by_key(|m| m.offset);
+        self.sections[sec_idx]
+            .align_markers
+            .sort_by_key(|m| m.offset);
 
         let is_exec = self.sections[sec_idx].flags & SHF_EXECINSTR != 0;
 
@@ -2484,12 +2747,17 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 break;
             }
             let current_offset = self.sections[sec_idx].align_markers[marker_idx].offset;
-            let kind = self.sections[sec_idx].align_markers[marker_idx].kind.clone();
+            let kind = self.sections[sec_idx].align_markers[marker_idx]
+                .kind
+                .clone();
 
             let needed_end = match &kind {
                 AlignMarkerKind::Align(align) => {
                     let a = *align as usize;
-                    if a <= 1 { marker_idx += 1; continue; }
+                    if a <= 1 {
+                        marker_idx += 1;
+                        continue;
+                    }
                     (current_offset + a - 1) & !(a - 1)
                 }
                 AlignMarkerKind::Org { label, addend } => {
@@ -2499,10 +2767,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         if l_sec == sec_idx {
                             (l_off as i64 + *addend) as usize
                         } else {
-                            marker_idx += 1; continue;
+                            marker_idx += 1;
+                            continue;
                         }
                     } else {
-                        marker_idx += 1; continue;
+                        marker_idx += 1;
+                        continue;
                     }
                 }
             };
@@ -2523,7 +2793,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let new_bytes = section_padding(needed_padding, is_exec, after_insn);
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 if old_end <= self.sections[sec_idx].data.len() {
-                    self.sections[sec_idx].data.splice(start..old_end, new_bytes);
+                    self.sections[sec_idx]
+                        .data
+                        .splice(start..old_end, new_bytes);
                     let delta = needed_padding as i64 - existing_padding as i64;
                     if delta != 0 {
                         // Anchor the shift at the run's END so a label sitting
@@ -2542,8 +2814,16 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     /// Shift all labels, relocations, jumps, alignment markers, deferred skips,
     /// and deferred byte diffs in a section after an insertion or removal at `at_offset`.
-    fn shift_offsets_after(&mut self, sec_idx: usize, at_offset: usize, delta: i64, current_marker_idx: usize) {
-        if delta == 0 { return; }
+    fn shift_offsets_after(
+        &mut self,
+        sec_idx: usize,
+        at_offset: usize,
+        delta: i64,
+        current_marker_idx: usize,
+    ) {
+        if delta == 0 {
+            return;
+        }
         for (_, pos) in self.label_positions.iter_mut() {
             if pos.0 == sec_idx && (pos.1 as usize) >= at_offset {
                 pos.1 = (pos.1 as i64 + delta) as u64;
@@ -2588,10 +2868,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
     // ─── Symbol locality check ────────────────────────────────────────
 
     fn is_local_symbol(&self, name: &str) -> bool {
-        if name.starts_with('.') { return true; }
+        if name.starts_with('.') {
+            return true;
+        }
         if name.len() >= 2 {
             let last = name.as_bytes()[name.len() - 1];
-            if (last == b'f' || last == b'b') && name[..name.len()-1].chars().all(|c| c.is_ascii_digit()) {
+            if (last == b'f' || last == b'b')
+                && name[..name.len() - 1].chars().all(|c| c.is_ascii_digit())
+            {
                 return true;
             }
         }
@@ -2621,12 +2905,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
         let mut label_name = String::new();
         for (i, &b) in bytes.iter().enumerate() {
             if b == b'.' {
-                let prev_ok = i == 0 || !(bytes[i-1].is_ascii_alphanumeric() || bytes[i-1] == b'_' || bytes[i-1] == b'.');
-                let next_ok = i + 1 >= bytes.len() || !(bytes[i+1].is_ascii_alphanumeric() || bytes[i+1] == b'_' || bytes[i+1] == b'.');
+                let prev_ok = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'.');
+                let next_ok = i + 1 >= bytes.len()
+                    || !(bytes[i + 1].is_ascii_alphanumeric()
+                        || bytes[i + 1] == b'_'
+                        || bytes[i + 1] == b'.');
                 if prev_ok && next_ok {
                     if !label_made {
                         label_name = format!(".Ldotpos_{}_{}", sec_idx, offset);
-                        self.label_positions.insert(label_name.clone(), (sec_idx, offset));
+                        self.label_positions
+                            .insert(label_name.clone(), (sec_idx, offset));
                         label_made = true;
                     }
                     out.push_str(&label_name);
@@ -2658,7 +2949,12 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
             if b.is_ascii_alphabetic() || b == b'_' || b == b'.' {
                 let start = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.' || bytes[i] == b'$') {
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'.'
+                        || bytes[i] == b'$')
+                {
                     i += 1;
                 }
                 let ident = &expr[start..i];
@@ -2710,10 +3006,18 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         let off = reloc.offset as usize;
                         let data = &mut self.sections[sec_idx].data;
                         match reloc.patch_size {
-                            1 => { data[off] = v as u8; }
-                            2 => { data[off..off+2].copy_from_slice(&(v as i16).to_le_bytes()); }
-                            8 => { data[off..off+8].copy_from_slice(&v.to_le_bytes()); }
-                            _ => { data[off..off+4].copy_from_slice(&(v as i32).to_le_bytes()); }
+                            1 => {
+                                data[off] = v as u8;
+                            }
+                            2 => {
+                                data[off..off + 2].copy_from_slice(&(v as i16).to_le_bytes());
+                            }
+                            8 => {
+                                data[off..off + 8].copy_from_slice(&v.to_le_bytes());
+                            }
+                            _ => {
+                                data[off..off + 4].copy_from_slice(&(v as i32).to_le_bytes());
+                            }
                         }
                         continue;
                     }
@@ -2748,14 +3052,24 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // Either side may be a NUMERIC local label (`0b` in
                         // relocate_kernel_64.S `$identity_mapped - 0b`);
                         // label_positions only holds named labels.
-                        let a_pos = self.label_positions.get(&reloc.symbol).copied()
-                            .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
-                        let b_pos = self.label_positions.get(diff_sym).copied()
-                            .or_else(|| self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx));
+                        let a_pos =
+                            self.label_positions
+                                .get(&reloc.symbol)
+                                .copied()
+                                .or_else(|| {
+                                    self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx)
+                                });
+                        let b_pos = self.label_positions.get(diff_sym).copied().or_else(|| {
+                            self.resolve_numeric_label(diff_sym, reloc.offset, sec_idx)
+                        });
                         if let (Some((a_sec, a_off)), Some((b_sec, b_off))) = (a_pos, b_pos) {
                             if a_sec == b_sec {
                                 let val = a_off as i64 - b_off as i64 + reloc.addend;
-                                resolved.push((reloc.offset as usize, val, reloc.patch_size as usize));
+                                resolved.push((
+                                    reloc.offset as usize,
+                                    val,
+                                    reloc.patch_size as usize,
+                                ));
                                 continue;
                             }
                         }
@@ -2784,7 +3098,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     continue;
                 }
 
-                let label_pos = self.label_positions.get(&reloc.symbol).copied()
+                let label_pos = self
+                    .label_positions
+                    .get(&reloc.symbol)
+                    .copied()
                     .or_else(|| self.resolve_numeric_label(&reloc.symbol, reloc.offset, sec_idx));
 
                 if let Some((target_sec, target_off)) = label_pos {
@@ -2812,8 +3129,10 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         }
                     }
 
-                    if target_sec == sec_idx && is_local
-                        && (reloc.reloc_type == A::reloc_pc32() || reloc.reloc_type == A::reloc_plt32()
+                    if target_sec == sec_idx
+                        && is_local
+                        && (reloc.reloc_type == A::reloc_pc32()
+                            || reloc.reloc_type == A::reloc_plt32()
                             || (reloc.reloc_type == A::reloc_pc64() && reloc.patch_size == 8))
                     {
                         let rel = (target_off as i64) + reloc.addend - (reloc.offset as i64);

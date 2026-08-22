@@ -9,17 +9,14 @@
 //! - Address space detection for segment-override operands
 //! - Goto label resolution
 
-use crate::frontend::parser::ast::{AsmOperand, Expr};
-use crate::ir::reexports::{
-    BlockId,
-    Instruction,
-    Operand,
-    Value,
+use super::definitions::LValue;
+use super::lower::Lowerer;
+use crate::backend::inline_asm::{
+    constraint_has_immediate_alt, constraint_is_memory_only, constraint_needs_address,
 };
 use crate::common::types::{AddressSpace, IrType};
-use super::lower::Lowerer;
-use super::definitions::LValue;
-use crate::backend::inline_asm::{constraint_has_immediate_alt, constraint_is_memory_only, constraint_needs_address};
+use crate::frontend::parser::ast::{AsmOperand, Expr};
+use crate::ir::reexports::{BlockId, Instruction, Operand, Value};
 
 impl Lowerer {
     pub(super) fn lower_inline_asm_stmt(
@@ -47,7 +44,10 @@ impl Lowerer {
                 if let Some(asm_reg) = self.get_asm_register(var_name) {
                     let stripped = constraint.trim_start_matches(['=', '+', '&', '%']);
                     if stripped.contains('r') || stripped == "g" {
-                        let prefix: String = constraint.chars().take_while(|c| *c == '=' || *c == '+' || *c == '&' || *c == '%').collect();
+                        let prefix: String = constraint
+                            .chars()
+                            .take_while(|c| *c == '=' || *c == '+' || *c == '&' || *c == '%')
+                            .collect();
                         constraint = format!("{}{{{}}}", prefix, asm_reg);
                     }
                 }
@@ -82,8 +82,12 @@ impl Lowerer {
                 if self.get_asm_register(var_name).is_some() {
                     let tmp = self.fresh_value();
                     self.emit(Instruction::Alloca {
-                        dest: tmp, ty: out_ty, size: out_ty.size(),
-                        align: out_ty.align(), volatile: false, semantic_volatile: false,
+                        dest: tmp,
+                        ty: out_ty,
+                        size: out_ty.size(),
+                        align: out_ty.align(),
+                        volatile: false,
+                        semantic_volatile: false,
                     });
                     tmp
                 } else {
@@ -97,8 +101,12 @@ impl Lowerer {
                 // the template would not be substituted.
                 let tmp = self.fresh_value();
                 self.emit(Instruction::Alloca {
-                    dest: tmp, ty: out_ty, size: out_ty.size(),
-                    align: out_ty.align(), volatile: false, semantic_volatile: false,
+                    dest: tmp,
+                    ty: out_ty,
+                    size: out_ty.size(),
+                    align: out_ty.align(),
+                    volatile: false,
+                    semantic_volatile: false,
                 });
                 tmp
             };
@@ -115,19 +123,27 @@ impl Lowerer {
                 // programmer may have assigned a value via `tos = expr;` and expects
                 // the inline asm to see that value, not a stale hardware register.
                 let is_global_reg = if let Expr::Identifier(ref var_name, _) = out.expr {
-                    self.get_asm_register(var_name).is_some() && self.lower_lvalue(&out.expr).is_none()
+                    self.get_asm_register(var_name).is_some()
+                        && self.lower_lvalue(&out.expr).is_none()
                 } else {
                     false
                 };
                 let stripped_for_mem_check = constraint.replace('+', "");
-                let needs_address = constraint_needs_address(&stripped_for_mem_check, self.is_riscv(), self.is_arm());
+                let needs_address = constraint_needs_address(
+                    &stripped_for_mem_check,
+                    self.is_riscv(),
+                    self.is_arm(),
+                );
                 let input_operand = if is_global_reg {
                     if let Expr::Identifier(ref var_name, _) = &out.expr {
-                        let asm_reg = self.get_asm_register(var_name)
+                        let asm_reg = self
+                            .get_asm_register(var_name)
                             .expect("global register variable must have an asm register");
                         self.read_global_register(&asm_reg, out_ty)
                     } else {
-                        unreachable!("asm output for global register variable must be an identifier")
+                        unreachable!(
+                            "asm output for global register variable must be an identifier"
+                        )
                     }
                 } else if needs_address {
                     // For "+m" (memory-only read-write) and "+A" (RISC-V address for
@@ -145,7 +161,10 @@ impl Lowerer {
                     //
                     // We still need a placeholder operand for correct operand numbering.
                     Operand::Value(ptr)
-                } else if matches!(self.expr_ctype(&out.expr), crate::common::types::CType::Vector(_, _)) {
+                } else if matches!(
+                    self.expr_ctype(&out.expr),
+                    crate::common::types::CType::Vector(_, _)
+                ) {
                     // For "+x" read-write constraints on vector types, pass the alloca pointer
                     // directly instead of emitting a Load instruction. Vector types (e.g.,
                     // __attribute__((vector_size(16)))) are 128 bits but IrType::Ptr is only
@@ -156,10 +175,20 @@ impl Lowerer {
                     Operand::Value(ptr)
                 } else {
                     let cur_val = self.fresh_value();
-                    self.emit(Instruction::Load { volatile: false, dest: cur_val, ptr, ty: out_ty, seg_override: out_seg });
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest: cur_val,
+                        ptr,
+                        ty: out_ty,
+                        seg_override: out_seg,
+                    });
                     Operand::Value(cur_val)
                 };
-                ir_inputs.push((constraint.replace('+', "").to_string(), input_operand, name.clone()));
+                ir_inputs.push((
+                    constraint.replace('+', "").to_string(),
+                    input_operand,
+                    name.clone(),
+                ));
                 plus_input_types.push(out_ty);
                 plus_input_segs.push(out_seg);
                 // For "+m" constraints, extract the symbol name so the backend can emit
@@ -215,7 +244,8 @@ impl Lowerer {
                     let dest = self.fresh_value();
                     self.emit(Instruction::GlobalAddr { dest, name: label });
                     Operand::Value(dest)
-                } else if let Some(const_op) = self.try_recover_local_const(&inp.expr, &constraint) {
+                } else if let Some(const_op) = self.try_recover_local_const(&inp.expr, &constraint)
+                {
                     // For immediate-alternative constraints like "rK", try to recover the
                     // constant value of a local variable by scanning recent Store instructions.
                     // This handles the common kernel pattern:
@@ -263,7 +293,13 @@ impl Lowerer {
                     if let Some(alloca) = self.get_local_alloca(var_name) {
                         if self.get_asm_register(var_name).is_some() {
                             let dest = self.fresh_value();
-                            self.emit(Instruction::Load { volatile: false, dest, ptr: alloca, ty: inp_ty, seg_override: inp_seg });
+                            self.emit(Instruction::Load {
+                                volatile: false,
+                                dest,
+                                ptr: alloca,
+                                ty: inp_ty,
+                                seg_override: inp_seg,
+                            });
                             Operand::Value(dest)
                         } else {
                             self.lower_expr(&inp.expr)
@@ -282,10 +318,13 @@ impl Lowerer {
         }
 
         // Resolve goto labels
-        let ir_goto_labels: Vec<(String, BlockId)> = goto_labels.iter().map(|name| {
-            let block = self.get_or_create_user_label(name);
-            (name.clone(), block)
-        }).collect();
+        let ir_goto_labels: Vec<(String, BlockId)> = goto_labels
+            .iter()
+            .map(|name| {
+                let block = self.get_or_create_user_label(name);
+                (name.clone(), block)
+            })
+            .collect();
 
         self.emit(Instruction::InlineAsm {
             template: template.to_string(),
@@ -335,7 +374,9 @@ impl Lowerer {
         // An input reads from an alloca if:
         //   - It's Operand::Value(v) where v == alloca (direct reference)
         //   - It's Operand::Value(v) where v is a Load from the alloca (found via recent instrs)
-        let fs = self.func_state.as_ref()
+        let fs = self
+            .func_state
+            .as_ref()
             .expect("func_state must exist during asm lowering");
         let mut alloca_read_by_input: Vec<bool> = vec![false; writeonly_allocas.len()];
 
@@ -374,7 +415,9 @@ impl Lowerer {
         }
 
         // For each unread output alloca, find and remove the preceding dead store
-        let fs = self.func_state.as_mut()
+        let fs = self
+            .func_state
+            .as_mut()
             .expect("func_state must exist during asm lowering");
         let instrs_len = fs.instrs.len();
         // The InlineAsm is at instrs[instrs_len - 1], scan backwards from instrs_len - 2
@@ -385,7 +428,11 @@ impl Lowerer {
             let target_alloca = writeonly_allocas[i];
             // Scan backwards (skip the InlineAsm itself)
             // Stop at function calls, other inline asm, or after 30 instructions
-            let start = if instrs_len >= 2 { instrs_len - 2 } else { continue };
+            let start = if instrs_len >= 2 {
+                instrs_len - 2
+            } else {
+                continue;
+            };
             let limit = start.saturating_sub(30);
             for idx in (limit..=start).rev() {
                 match &fs.instrs[idx] {
@@ -485,8 +532,11 @@ impl Lowerer {
             // Member access on a global struct
             Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
                 // Try to resolve the full expression as a global address (will include offset)
-                self.extract_symbol_from_global_addr_expr(&Expr::AddressOf(Box::new(expr.clone()), expr.span()))
-                    .or_else(|| self.extract_mem_operand_symbol(base))
+                self.extract_symbol_from_global_addr_expr(&Expr::AddressOf(
+                    Box::new(expr.clone()),
+                    expr.span(),
+                ))
+                .or_else(|| self.extract_mem_operand_symbol(base))
             }
             _ => None,
         }
@@ -555,10 +605,18 @@ impl Lowerer {
         // with a constant value. Limit the scan to avoid performance issues.
         for inst in fs.instrs.iter().rev().take(20) {
             match inst {
-                Instruction::Store { val: Operand::Const(c), ptr, .. } if *ptr == alloca => {
+                Instruction::Store {
+                    val: Operand::Const(c),
+                    ptr,
+                    ..
+                } if *ptr == alloca => {
                     return Some(Operand::Const(*c));
                 }
-                Instruction::Store { val: Operand::Value(v), ptr, .. } if *ptr == alloca => {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ptr,
+                    ..
+                } if *ptr == alloca => {
                     // The store holds a Value, not a direct constant. This commonly
                     // happens with casts like `(unsigned long)(5)` which produce:
                     //   Cast { dest: vN, src: Const(5), from_ty: I64, to_ty: U64 }
@@ -568,14 +626,17 @@ impl Lowerer {
                     let defining = *v;
                     for def_inst in fs.instrs.iter().rev().take(20) {
                         match def_inst {
-                            Instruction::Cast { dest, src: Operand::Const(c), .. }
-                                if *dest == defining =>
-                            {
+                            Instruction::Cast {
+                                dest,
+                                src: Operand::Const(c),
+                                ..
+                            } if *dest == defining => {
                                 return Some(Operand::Const(*c));
                             }
-                            Instruction::Copy { dest, src: Operand::Const(c) }
-                                if *dest == defining =>
-                            {
+                            Instruction::Copy {
+                                dest,
+                                src: Operand::Const(c),
+                            } if *dest == defining => {
                                 return Some(Operand::Const(*c));
                             }
                             _ => {}
@@ -599,14 +660,17 @@ impl Lowerer {
     /// Checks local variables first, then global register variables.
     pub(super) fn get_asm_register(&self, name: &str) -> Option<String> {
         // Check locals first
-        if let Some(reg) = self.func_state.as_ref()
+        if let Some(reg) = self
+            .func_state
+            .as_ref()
             .and_then(|fs| fs.locals.get(name))
             .and_then(|info| info.asm_register.clone())
         {
             return Some(reg);
         }
         // Check globals (for global register variables like `current_stack_pointer`)
-        self.globals.get(name)
+        self.globals
+            .get(name)
             .and_then(|info| info.asm_register.clone())
     }
 
@@ -614,7 +678,8 @@ impl Lowerer {
     /// Returns None for global variables (including global register variables)
     /// and for unknown variable names.
     fn get_local_alloca(&self, name: &str) -> Option<Value> {
-        self.func_state.as_ref()
+        self.func_state
+            .as_ref()
             .and_then(|fs| fs.locals.get(name))
             .map(|info| info.alloca)
     }

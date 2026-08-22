@@ -28,8 +28,16 @@ pub(crate) fn encode_fence(operands: &[Operand]) -> Result<EncodeResult, String>
 /// If 1 operand: sfence.vma rs1, zero
 /// If 2 operands: sfence.vma rs1, rs2
 pub(crate) fn encode_sfence_vma(operands: &[Operand]) -> Result<EncodeResult, String> {
-    let rs1 = if operands.is_empty() { 0 } else { get_reg(operands, 0)? };
-    let rs2 = if operands.len() < 2 { 0 } else { get_reg(operands, 1)? };
+    let rs1 = if operands.is_empty() {
+        0
+    } else {
+        get_reg(operands, 0)?
+    };
+    let rs2 = if operands.len() < 2 {
+        0
+    } else {
+        get_reg(operands, 1)?
+    };
     // sfence.vma is encoded as: funct7=0001001(0x09) | rs2 | rs1 | 000 | 00000 | SYSTEM(1110011)
     let word = encode_r(OP_SYSTEM, 0, 0b000, rs1, rs2, 0b0001001);
     Ok(EncodeResult::Word(word))
@@ -47,10 +55,14 @@ pub(crate) fn encode_csr(operands: &[Operand], funct3: u32) -> Result<EncodeResu
         let zimm = get_imm(operands, 2)? as u32;
         let rs1 = zimm & 0x1F;
         let imm_funct3 = funct3 | 0b100; // 001->101, 010->110, 011->111
-        return Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, imm_funct3, rs1, csr as i32)));
+        return Ok(EncodeResult::Word(encode_i(
+            OP_SYSTEM, rd, imm_funct3, rs1, csr as i32,
+        )));
     }
     let rs1 = get_reg(operands, 2)?;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, funct3, rs1, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, rd, funct3, rs1, csr as i32,
+    )))
 }
 
 pub(crate) fn encode_csri(operands: &[Operand], funct3: u32) -> Result<EncodeResult, String> {
@@ -58,7 +70,9 @@ pub(crate) fn encode_csri(operands: &[Operand], funct3: u32) -> Result<EncodeRes
     let csr = get_csr_num(operands, 1)?;
     let zimm = get_imm(operands, 2)? as u32;
     let rs1 = zimm & 0x1F;
-    Ok(EncodeResult::Word(encode_i(OP_SYSTEM, rd, funct3, rs1, csr as i32)))
+    Ok(EncodeResult::Word(encode_i(
+        OP_SYSTEM, rd, funct3, rs1, csr as i32,
+    )))
 }
 
 pub(crate) fn get_csr_num(operands: &[Operand], idx: usize) -> Result<u32, String> {
@@ -105,8 +119,7 @@ pub(crate) fn csr_name_to_num(name: &str) -> Result<u32, String> {
             if let Ok(v) = name.parse::<u32>() {
                 Ok(v)
             } else if let Some(hex) = name.strip_prefix("0x") {
-                u32::from_str_radix(hex, 16)
-                    .map_err(|_| format!("invalid CSR: {}", name))
+                u32::from_str_radix(hex, 16).map_err(|_| format!("invalid CSR: {}", name))
             } else {
                 Err(format!("unknown CSR: {}", name))
             }

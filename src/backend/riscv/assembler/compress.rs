@@ -29,18 +29,24 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
         0b0110111 => {
             // C.LUI: lui rd, imm  where rd != {x0, x2}
             // imm[17:12] from word[31:12]
-            if rd == 0 || rd == 2 { return None; }
+            if rd == 0 || rd == 2 {
+                return None;
+            }
             let imm20 = (word >> 12) as i32;
             // Sign-extend the 20-bit value
             let imm20 = (imm20 << 12) >> 12; // sign-extend from 20 bits
-            // C.LUI uses imm[17:12], so the actual nzimm is bits 17:12
-            // which is imm20[5:0] (since LUI loads imm into [31:12])
-            // C.LUI constraint: nzimm != 0, and it's sign-extended from 6 bits
+                                             // C.LUI uses imm[17:12], so the actual nzimm is bits 17:12
+                                             // which is imm20[5:0] (since LUI loads imm into [31:12])
+                                             // C.LUI constraint: nzimm != 0, and it's sign-extended from 6 bits
             let nzimm = imm20; // this is the full 20-bit value
-            // C.LUI stores bits [17:12] = nzimm[5:0], sign-extended from bit 17
-            // So nzimm must fit in signed 6-bit range: -32..31 (but not 0)
-            if nzimm == 0 { return None; }
-            if !(-32..=31).contains(&nzimm) { return None; }
+                               // C.LUI stores bits [17:12] = nzimm[5:0], sign-extended from bit 17
+                               // So nzimm must fit in signed 6-bit range: -32..31 (but not 0)
+            if nzimm == 0 {
+                return None;
+            }
+            if !(-32..=31).contains(&nzimm) {
+                return None;
+            }
             let nzimm = nzimm as u32;
             let bit17 = (nzimm >> 5) & 1;
             let bits16_12 = nzimm & 0x1F;
@@ -60,12 +66,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 let nzimm = imm as u32;
                 let bit5 = (nzimm >> 5) & 1;
                 let bits4_0 = nzimm & 0x1F;
-                Some((0b000_0_00000_00000_01
-                    | (bit5 << 12)
-                    | (rd << 7)
-                    | (bits4_0 << 2)) as u16)
-            } else if rd == 2 && rs1 == 2 && imm != 0 && (imm % 16) == 0
-                && (-512..=496).contains(&imm) {
+                Some((0b000_0_00000_00000_01 | (bit5 << 12) | (rd << 7) | (bits4_0 << 2)) as u16)
+            } else if rd == 2
+                && rs1 == 2
+                && imm != 0
+                && (imm % 16) == 0
+                && (-512..=496).contains(&imm)
+            {
                 // C.ADDI16SP: addi x2, x2, imm (for larger imm not fitting C.ADDI)
                 let uimm = imm as u32;
                 let bit9 = (uimm >> 9) & 1;
@@ -73,14 +80,22 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 let bit6 = (uimm >> 6) & 1;
                 let bits8_7 = (uimm >> 7) & 0x3;
                 let bit5 = (uimm >> 5) & 1;
-                Some((0b011_0_00010_00000_01
-                    | (bit9 << 12)
-                    | (bit4 << 6)
-                    | (bit6 << 5)
-                    | (bits8_7 << 3)
-                    | (bit5 << 2)) as u16)
-            } else if rs1 == 2 && rd != 0 && rd != 2
-                && is_creg(rd) && imm > 0 && (imm % 4) == 0 && imm <= 1020 {
+                Some(
+                    (0b011_0_00010_00000_01
+                        | (bit9 << 12)
+                        | (bit4 << 6)
+                        | (bit6 << 5)
+                        | (bits8_7 << 3)
+                        | (bit5 << 2)) as u16,
+                )
+            } else if rs1 == 2
+                && rd != 0
+                && rd != 2
+                && is_creg(rd)
+                && imm > 0
+                && (imm % 4) == 0
+                && imm <= 1020
+            {
                 // C.ADDI4SPN: addi rd', x2, uimm
                 let uimm = imm as u32;
                 let rd_prime = creg_num(rd);
@@ -88,21 +103,19 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 let bits9_6 = (uimm >> 6) & 0xF;
                 let bit2 = (uimm >> 2) & 1;
                 let bit3 = (uimm >> 3) & 1;
-                Some(((bits5_4 << 11)
-                    | (bits9_6 << 7)
-                    | (bit2 << 6)
-                    | (bit3 << 5)
-                    | (rd_prime << 2)) as u16)
+                Some(
+                    ((bits5_4 << 11) | (bits9_6 << 7) | (bit2 << 6) | (bit3 << 5) | (rd_prime << 2))
+                        as u16,
+                )
             } else if rs1 == 0 && rd != 0 {
                 // C.LI: addi rd, x0, imm  (li rd, imm)
-                if !(-32..=31).contains(&imm) { return None; }
+                if !(-32..=31).contains(&imm) {
+                    return None;
+                }
                 let imm_u = imm as u32;
                 let bit5 = (imm_u >> 5) & 1;
                 let bits4_0 = imm_u & 0x1F;
-                Some((0b010_0_00000_00000_01
-                    | (bit5 << 12)
-                    | (rd << 7)
-                    | (bits4_0 << 2)) as u16)
+                Some((0b010_0_00000_00000_01 | (bit5 << 12) | (rd << 7) | (bits4_0 << 2)) as u16)
             } else {
                 None
             }
@@ -113,14 +126,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
             let imm = (word as i32) >> 20;
             if rd == rs1 && rd != 0 {
                 // C.ADDIW: addiw rd, rd, imm  (imm can be 0 for sext.w)
-                if !(-32..=31).contains(&imm) { return None; }
+                if !(-32..=31).contains(&imm) {
+                    return None;
+                }
                 let imm_u = imm as u32;
                 let bit5 = (imm_u >> 5) & 1;
                 let bits4_0 = imm_u & 0x1F;
-                Some((0b001_0_00000_00000_01
-                    | (bit5 << 12)
-                    | (rd << 7)
-                    | (bits4_0 << 2)) as u16)
+                Some((0b001_0_00000_00000_01 | (bit5 << 12) | (rd << 7) | (bits4_0 << 2)) as u16)
             } else if rs1 == 0 && rd != 0 {
                 // addiw rd, x0, imm => also C.ADDIW if we treat rd as rd/rs1
                 // Actually this would be `sext.w rd` which is `addiw rd, rd, 0`
@@ -139,10 +151,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 // C.SLLI: slli rd, rd, shamt
                 let bit5 = (shamt >> 5) & 1;
                 let bits4_0 = shamt & 0x1F;
-                Some((0b000_0_00000_00000_10
-                    | (bit5 << 12)
-                    | (rd << 7)
-                    | (bits4_0 << 2)) as u16)
+                Some((0b000_0_00000_00000_10 | (bit5 << 12) | (rd << 7) | (bits4_0 << 2)) as u16)
             } else {
                 None
             }
@@ -158,16 +167,16 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 let bits4_0 = shamt & 0x1F;
                 if is_srai {
                     // C.SRAI
-                    Some((0b100_0_01_000_00000_01
-                        | (bit5 << 12)
-                        | (rd_prime << 7)
-                        | (bits4_0 << 2)) as u16)
+                    Some(
+                        (0b100_0_01_000_00000_01 | (bit5 << 12) | (rd_prime << 7) | (bits4_0 << 2))
+                            as u16,
+                    )
                 } else {
                     // C.SRLI
-                    Some((0b100_0_00_000_00000_01
-                        | (bit5 << 12)
-                        | (rd_prime << 7)
-                        | (bits4_0 << 2)) as u16)
+                    Some(
+                        (0b100_0_00_000_00000_01 | (bit5 << 12) | (rd_prime << 7) | (bits4_0 << 2))
+                            as u16,
+                    )
                 }
             } else {
                 None
@@ -178,16 +187,18 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
         0b0010011 if funct3 == 0b111 => {
             let imm = (word as i32) >> 20;
             if rd == rs1 && is_creg(rd) {
-                if !(-32..=31).contains(&imm) { return None; }
+                if !(-32..=31).contains(&imm) {
+                    return None;
+                }
                 let rd_prime = creg_num(rd);
                 let imm_u = imm as u32;
                 let bit5 = (imm_u >> 5) & 1;
                 let bits4_0 = imm_u & 0x1F;
                 // C.ANDI
-                Some((0b100_0_10_000_00000_01
-                    | (bit5 << 12)
-                    | (rd_prime << 7)
-                    | (bits4_0 << 2)) as u16)
+                Some(
+                    (0b100_0_10_000_00000_01 | (bit5 << 12) | (rd_prime << 7) | (bits4_0 << 2))
+                        as u16,
+                )
             } else {
                 None
             }
@@ -200,14 +211,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                 (0b0000000, 0b000) => {
                     if rd == rs1 && rd != 0 && rs2 != 0 {
                         // C.ADD: add rd, rd, rs2
-                        Some((0b100_1_00000_00000_10
-                            | (rd << 7)
-                            | (rs2 << 2)) as u16)
+                        Some((0b100_1_00000_00000_10 | (rd << 7) | (rs2 << 2)) as u16)
                     } else if rs1 == 0 && rd != 0 && rs2 != 0 {
                         // C.MV: add rd, x0, rs2  (mv rd, rs2)
-                        Some((0b100_0_00000_00000_10
-                            | (rd << 7)
-                            | (rs2 << 2)) as u16)
+                        Some((0b100_0_00000_00000_10 | (rd << 7) | (rs2 << 2)) as u16)
                     } else {
                         None
                     }
@@ -218,9 +225,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.SUB
-                        Some((0b100_0_11_000_00_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_0_11_000_00_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -231,9 +236,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.XOR
-                        Some((0b100_0_11_000_01_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_0_11_000_01_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -244,9 +247,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.OR
-                        Some((0b100_0_11_000_10_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_0_11_000_10_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -257,9 +258,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.AND
-                        Some((0b100_0_11_000_11_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_0_11_000_11_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -277,9 +276,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.ADDW
-                        Some((0b100_1_11_000_01_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_1_11_000_01_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -290,9 +287,7 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                         let rd_prime = creg_num(rd);
                         let rs2_prime = creg_num(rs2);
                         // C.SUBW
-                        Some((0b100_1_11_000_00_000_01
-                            | (rd_prime << 7)
-                            | (rs2_prime << 2)) as u16)
+                        Some((0b100_1_11_000_00_000_01 | (rd_prime << 7) | (rs2_prime << 2)) as u16)
                     } else {
                         None
                     }
@@ -313,11 +308,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let bit5 = (uoff >> 5) & 1;
                     let bits4_3 = (uoff >> 3) & 0x3;
                     let bits8_6 = (uoff >> 6) & 0x7;
-                    Some((0b011_0_00000_00000_10
-                        | (bit5 << 12)
-                        | (rd << 7)
-                        | (bits4_3 << 5)
-                        | (bits8_6 << 2)) as u16)
+                    Some(
+                        (0b011_0_00000_00000_10
+                            | (bit5 << 12)
+                            | (rd << 7)
+                            | (bits4_3 << 5)
+                            | (bits8_6 << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -331,11 +328,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     // Encoding: 011 | uimm[5:3] | rs1' | uimm[7:6] | rd' | 00
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b011_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bits7_6 << 5)
-                        | (rd_prime << 2)) as u16)
+                    Some(
+                        (0b011_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bits7_6 << 5)
+                            | (rd_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -356,11 +355,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let bit5 = (uoff >> 5) & 1;
                     let bits4_2 = (uoff >> 2) & 0x7;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b010_0_00000_00000_10
-                        | (bit5 << 12)
-                        | (rd << 7)
-                        | (bits4_2 << 4)
-                        | (bits7_6 << 2)) as u16)
+                    Some(
+                        (0b010_0_00000_00000_10
+                            | (bit5 << 12)
+                            | (rd << 7)
+                            | (bits4_2 << 4)
+                            | (bits7_6 << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -375,12 +376,14 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bit2 = (uoff >> 2) & 1;
                     let bit6 = (uoff >> 6) & 1;
-                    Some((0b010_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bit2 << 6)
-                        | (bit6 << 5)
-                        | (rd_prime << 2)) as u16)
+                    Some(
+                        (0b010_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bit2 << 6)
+                            | (bit6 << 5)
+                            | (rd_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -404,10 +407,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     // Encoding: 111 | uimm[5:3|8:6] | rs2 | 10
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits8_6 = (uoff >> 6) & 0x7;
-                    Some((0b111_000000_00000_10
-                        | (bits5_3 << 10)
-                        | (bits8_6 << 7)
-                        | (rs2 << 2)) as u16)
+                    Some(
+                        (0b111_000000_00000_10 | (bits5_3 << 10) | (bits8_6 << 7) | (rs2 << 2))
+                            as u16,
+                    )
                 } else {
                     None
                 }
@@ -420,11 +423,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     // Encoding: 111 | uimm[5:3] | rs1' | uimm[7:6] | rs2' | 00
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b111_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bits7_6 << 5)
-                        | (rs2_prime << 2)) as u16)
+                    Some(
+                        (0b111_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bits7_6 << 5)
+                            | (rs2_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -447,10 +452,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     // Encoding: 110 | uimm[5:2|7:6] | rs2 | 10
                     let bits5_2 = (uoff >> 2) & 0xF;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b110_000000_00000_10
-                        | (bits5_2 << 9)
-                        | (bits7_6 << 7)
-                        | (rs2 << 2)) as u16)
+                    Some(
+                        (0b110_000000_00000_10 | (bits5_2 << 9) | (bits7_6 << 7) | (rs2 << 2))
+                            as u16,
+                    )
                 } else {
                     None
                 }
@@ -464,12 +469,14 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bit2 = (uoff >> 2) & 1;
                     let bit6 = (uoff >> 6) & 1;
-                    Some((0b110_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bit2 << 6)
-                        | (bit6 << 5)
-                        | (rs2_prime << 2)) as u16)
+                    Some(
+                        (0b110_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bit2 << 6)
+                            | (bit6 << 5)
+                            | (rs2_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -489,11 +496,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let bit5 = (uoff >> 5) & 1;
                     let bits4_3 = (uoff >> 3) & 0x3;
                     let bits8_6 = (uoff >> 6) & 0x7;
-                    Some((0b001_0_00000_00000_10
-                        | (bit5 << 12)
-                        | (rd << 7)
-                        | (bits4_3 << 5)
-                        | (bits8_6 << 2)) as u16)
+                    Some(
+                        (0b001_0_00000_00000_10
+                            | (bit5 << 12)
+                            | (rd << 7)
+                            | (bits4_3 << 5)
+                            | (bits8_6 << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -506,11 +515,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let rd_prime = creg_num(rd);
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b001_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bits7_6 << 5)
-                        | (rd_prime << 2)) as u16)
+                    Some(
+                        (0b001_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bits7_6 << 5)
+                            | (rd_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -532,10 +543,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let uoff = imm as u32;
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits8_6 = (uoff >> 6) & 0x7;
-                    Some((0b101_000000_00000_10
-                        | (bits5_3 << 10)
-                        | (bits8_6 << 7)
-                        | (rs2 << 2)) as u16)
+                    Some(
+                        (0b101_000000_00000_10 | (bits5_3 << 10) | (bits8_6 << 7) | (rs2 << 2))
+                            as u16,
+                    )
                 } else {
                     None
                 }
@@ -547,11 +558,13 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     let rs2_prime = creg_num(rs2);
                     let bits5_3 = (uoff >> 3) & 0x7;
                     let bits7_6 = (uoff >> 6) & 0x3;
-                    Some((0b101_000_000_00_000_00
-                        | (bits5_3 << 10)
-                        | (rs1_prime << 7)
-                        | (bits7_6 << 5)
-                        | (rs2_prime << 2)) as u16)
+                    Some(
+                        (0b101_000_000_00_000_00
+                            | (bits5_3 << 10)
+                            | (rs1_prime << 7)
+                            | (bits7_6 << 5)
+                            | (rs2_prime << 2)) as u16,
+                    )
                 } else {
                     None
                 }
@@ -566,12 +579,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
             if imm == 0 && rs2 == 0 {
                 if rd == 0 && rs1 != 0 {
                     // C.JR: jalr x0, 0(rs1)
-                    Some((0b100_0_00000_00000_10
-                        | (rs1 << 7)) as u16)
+                    Some((0b100_0_00000_00000_10 | (rs1 << 7)) as u16)
                 } else if rd == 1 && rs1 != 0 {
                     // C.JALR: jalr x1, 0(rs1)
-                    Some((0b100_1_00000_00000_10
-                        | (rs1 << 7)) as u16)
+                    Some((0b100_1_00000_00000_10 | (rs1 << 7)) as u16)
                 } else {
                     None
                 }
@@ -675,9 +686,7 @@ pub fn compress_section(
             continue;
         }
 
-        let word = u32::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-        ]);
+        let word = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
 
         if let Some(halfword) = try_compress_rv64(word) {
             new_data.extend_from_slice(&halfword.to_le_bytes());
@@ -726,7 +735,11 @@ mod tests {
         let result = try_compress_rv64(0xfd010113);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x7179, "c.addi sp, -48 should be 0x7179, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x7179,
+            "c.addi sp, -48 should be 0x7179, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -735,7 +748,11 @@ mod tests {
         let result = try_compress_rv64(0x02113423);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0xf406, "c.sdsp ra, 40(sp) should be 0xf406, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0xf406,
+            "c.sdsp ra, 40(sp) should be 0xf406, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -744,7 +761,11 @@ mod tests {
         let result = try_compress_rv64(0x02813023);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0xf022, "c.sdsp s0, 32(sp) should be 0xf022, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0xf022,
+            "c.sdsp s0, 32(sp) should be 0xf022, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -756,7 +777,11 @@ mod tests {
         let result = try_compress_rv64(0x03010413);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x1800, "c.addi4spn s0, sp, 48 should be 0x1800, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x1800,
+            "c.addi4spn s0, sp, 48 should be 0x1800, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -775,7 +800,11 @@ mod tests {
         let result = try_compress_rv64(0x02813083);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x70a2, "c.ldsp ra, 40(sp) should be 0x70a2, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x70a2,
+            "c.ldsp ra, 40(sp) should be 0x70a2, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -784,7 +813,11 @@ mod tests {
         let result = try_compress_rv64(0x02013403);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x7402, "c.ldsp s0, 32(sp) should be 0x7402, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x7402,
+            "c.ldsp s0, 32(sp) should be 0x7402, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -793,7 +826,11 @@ mod tests {
         let result = try_compress_rv64(0x03010113);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x6145, "c.addi16sp 48 should be 0x6145, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x6145,
+            "c.addi16sp 48 should be 0x6145, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -802,7 +839,11 @@ mod tests {
         let result = try_compress_rv64(0x00008067);
         assert!(result.is_some());
         let hw = result.unwrap();
-        assert_eq!(hw, 0x8082, "c.jr ra (ret) should be 0x8082, got 0x{:04x}", hw);
+        assert_eq!(
+            hw, 0x8082,
+            "c.jr ra (ret) should be 0x8082, got 0x{:04x}",
+            hw
+        );
     }
 
     #[test]
@@ -834,7 +875,11 @@ mod tests {
         // a0 = x10, imm = 5
         // 010 | 0 | 01010 | 00101 | 01
         let expected: u16 = 0b0100_0101_0001_0101;
-        assert_eq!(hw, expected, "c.li a0, 5 = 0x{:04x}, expected 0x{:04x}", hw, expected);
+        assert_eq!(
+            hw, expected,
+            "c.li a0, 5 = 0x{:04x}, expected 0x{:04x}",
+            hw, expected
+        );
     }
 
     #[test]

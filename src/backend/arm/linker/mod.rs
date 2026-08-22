@@ -27,14 +27,14 @@
 
 #[allow(dead_code)] // Re-exports ELF constants/types; not all constants used by every linker path
 pub mod elf;
-pub mod reloc;
-pub mod types;
-mod input;
-mod plt_got;
-mod link;
 mod emit_dynamic;
 mod emit_shared;
 mod emit_static;
+mod input;
+mod link;
+mod plt_got;
+pub mod reloc;
+pub mod types;
 
 #[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;

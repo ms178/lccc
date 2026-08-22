@@ -123,7 +123,11 @@ mod tests {
             name_idx: 0,
             name: name.to_string(),
             sh_type,
-            flags: if sh_type == SHT_PROGBITS { SHF_ALLOC | SHF_EXECINSTR } else { 0 },
+            flags: if sh_type == SHT_PROGBITS {
+                SHF_ALLOC | SHF_EXECINSTR
+            } else {
+                0
+            },
             addr: 0,
             offset: 0,
             size,
@@ -199,7 +203,10 @@ mod tests {
         ];
         let plan = plan_comdat(&objs);
         assert_eq!(plan.groups_discarded, 0);
-        assert!(plan.dead.is_empty(), "different signatures are different entities");
+        assert!(
+            plan.dead.is_empty(),
+            "different signatures are different entities"
+        );
     }
 
     /// A group without `GRP_COMDAT` is a plain section group (used for
@@ -213,8 +220,10 @@ mod tests {
         ];
         let plan = plan_comdat(&objs);
         assert_eq!(plan.groups_discarded, 0);
-        assert!(plan.dead.is_empty(),
-                "only GRP_COMDAT groups are interchangeable");
+        assert!(
+            plan.dead.is_empty(),
+            "only GRP_COMDAT groups are interchangeable"
+        );
     }
 
     #[test]
@@ -229,12 +238,14 @@ mod tests {
     /// link order alone, so repeated runs agree.
     #[test]
     fn plan_is_deterministic() {
-        let build = || vec![
-            comdat_object("s1", &[8, 8], true),
-            comdat_object("s2", &[8], true),
-            comdat_object("s1", &[8, 8], true),
-            comdat_object("s2", &[8], true),
-        ];
+        let build = || {
+            vec![
+                comdat_object("s1", &[8, 8], true),
+                comdat_object("s2", &[8], true),
+                comdat_object("s1", &[8, 8], true),
+                comdat_object("s2", &[8], true),
+            ]
+        };
         let first = plan_comdat(&build());
         for _ in 0..8 {
             let again = plan_comdat(&build());

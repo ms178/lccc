@@ -14,7 +14,10 @@ pub(super) fn resolve_symbols(
     _output_sections: &[OutputSection],
     section_map: &SectionMap,
     dynlib_syms: &FxHashMap<String, (String, u8, u32, Option<String>, bool, u8)>,
-) -> (FxHashMap<String, LinkerSymbol>, FxHashMap<(usize, usize), String>) {
+) -> (
+    FxHashMap<String, LinkerSymbol>,
+    FxHashMap<(usize, usize), String>,
+) {
     let mut global_symbols: FxHashMap<String, LinkerSymbol> = FxHashMap::default();
     let mut sym_resolution: FxHashMap<(usize, usize), String> = FxHashMap::default();
 
@@ -24,14 +27,19 @@ pub(super) fn resolve_symbols(
             if sym.name.is_empty() || sym.sym_type == STT_FILE || sym.sym_type == STT_SECTION {
                 continue;
             }
-            if sym.section_index == SHN_UNDEF { continue; }
+            if sym.section_index == SHN_UNDEF {
+                continue;
+            }
 
-            let (out_sec_idx, sec_offset) = if sym.section_index != SHN_ABS && sym.section_index != SHN_COMMON {
-                section_map.get(&(obj_idx, sym.section_index as usize))
-                    .copied().unwrap_or((usize::MAX, 0))
-            } else {
-                (usize::MAX, 0)
-            };
+            let (out_sec_idx, sec_offset) =
+                if sym.section_index != SHN_ABS && sym.section_index != SHN_COMMON {
+                    section_map
+                        .get(&(obj_idx, sym.section_index as usize))
+                        .copied()
+                        .unwrap_or((usize::MAX, 0))
+                } else {
+                    (usize::MAX, 0)
+                };
 
             let new_sym = LinkerSymbol {
                 address: 0,
@@ -71,7 +79,8 @@ pub(super) fn resolve_symbols(
                     // file must not shadow a global "data" in another).
                     if sym.binding == STB_LOCAL {
                         // Already have a definition; keep it.
-                    } else if sym.binding == STB_GLOBAL && (existing.binding == STB_WEAK || existing.binding == STB_LOCAL)
+                    } else if sym.binding == STB_GLOBAL
+                        && (existing.binding == STB_WEAK || existing.binding == STB_LOCAL)
                         || (!existing.is_defined && new_sym.is_defined)
                     {
                         global_symbols.insert(sym.name.to_string(), new_sym);
@@ -86,55 +95,66 @@ pub(super) fn resolve_symbols(
     // Second pass: resolve undefined references against dynamic libraries
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for (sym_idx, sym) in obj.symbols.iter().enumerate() {
-            if sym.name.is_empty() || sym.sym_type == STT_FILE { continue; }
+            if sym.name.is_empty() || sym.sym_type == STT_FILE {
+                continue;
+            }
             sym_resolution.insert((obj_idx, sym_idx), sym.name.clone());
 
             if sym.section_index == SHN_UNDEF {
-                if global_symbols.contains_key(sym.name.as_str()) { continue; }
+                if global_symbols.contains_key(sym.name.as_str()) {
+                    continue;
+                }
 
-                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) = dynlib_syms.get(sym.name.as_str()) {
+                if let Some((lib, dyn_sym_type, dyn_size, dyn_ver, _is_default, dyn_binding)) =
+                    dynlib_syms.get(sym.name.as_str())
+                {
                     let is_func = *dyn_sym_type == STT_FUNC || *dyn_sym_type == STT_GNU_IFUNC;
-                    global_symbols.insert(sym.name.to_string(), LinkerSymbol {
-                        address: 0,
-                        size: *dyn_size,
-                        sym_type: *dyn_sym_type,
-                        binding: *dyn_binding,
-                        visibility: STV_DEFAULT,
-                        is_defined: false,
-                        needs_plt: is_func,
-                        needs_got: is_func,
-                        output_section: usize::MAX,
-                        section_offset: 0,
-                        plt_index: 0,
-                        got_index: 0,
-                        is_dynamic: true,
-                        dynlib: lib.clone(),
-                        needs_copy: !is_func,
-                        copy_addr: 0,
-                        version: dyn_ver.clone(),
-                        uses_textrel: false,
-                    });
+                    global_symbols.insert(
+                        sym.name.to_string(),
+                        LinkerSymbol {
+                            address: 0,
+                            size: *dyn_size,
+                            sym_type: *dyn_sym_type,
+                            binding: *dyn_binding,
+                            visibility: STV_DEFAULT,
+                            is_defined: false,
+                            needs_plt: is_func,
+                            needs_got: is_func,
+                            output_section: usize::MAX,
+                            section_offset: 0,
+                            plt_index: 0,
+                            got_index: 0,
+                            is_dynamic: true,
+                            dynlib: lib.clone(),
+                            needs_copy: !is_func,
+                            copy_addr: 0,
+                            version: dyn_ver.clone(),
+                            uses_textrel: false,
+                        },
+                    );
                 } else {
-                    global_symbols.entry(sym.name.clone()).or_insert(LinkerSymbol {
-                        address: 0,
-                        size: 0,
-                        sym_type: sym.sym_type,
-                        binding: sym.binding,
-                        visibility: STV_DEFAULT,
-                        is_defined: false,
-                        needs_plt: false,
-                        needs_got: false,
-                        output_section: usize::MAX,
-                        section_offset: 0,
-                        plt_index: 0,
-                        got_index: 0,
-                        is_dynamic: false,
-                        dynlib: String::new(),
-                        needs_copy: false,
-                        copy_addr: 0,
-                        version: None,
-                        uses_textrel: false,
-                    });
+                    global_symbols
+                        .entry(sym.name.clone())
+                        .or_insert(LinkerSymbol {
+                            address: 0,
+                            size: 0,
+                            sym_type: sym.sym_type,
+                            binding: sym.binding,
+                            visibility: STV_DEFAULT,
+                            is_defined: false,
+                            needs_plt: false,
+                            needs_got: false,
+                            output_section: usize::MAX,
+                            section_offset: 0,
+                            plt_index: 0,
+                            got_index: 0,
+                            is_dynamic: false,
+                            dynlib: String::new(),
+                            needs_copy: false,
+                            copy_addr: 0,
+                            version: None,
+                            uses_textrel: false,
+                        });
                 }
             }
         }
@@ -144,8 +164,10 @@ pub(super) fn resolve_symbols(
     for (obj_idx, obj) in inputs.iter().enumerate() {
         for (sym_idx, sym) in obj.symbols.iter().enumerate() {
             if sym.sym_type == STT_SECTION && sym.section_index != SHN_UNDEF {
-                sym_resolution.insert((obj_idx, sym_idx),
-                    format!("__section_{}_{}", obj_idx, sym.section_index));
+                sym_resolution.insert(
+                    (obj_idx, sym_idx),
+                    format!("__section_{}_{}", obj_idx, sym.section_index),
+                );
             }
         }
     }
@@ -191,7 +213,9 @@ pub(super) fn allocate_common_symbols(
         }
     }
 
-    if common_syms.is_empty() { return; }
+    if common_syms.is_empty() {
+        return;
+    }
 
     // Find or create .bss section
     let bss_idx = if let Some(&idx) = section_name_to_idx.get(".bss") {
@@ -248,9 +272,13 @@ pub(super) fn mark_plt_got_needs(
             for &(_, rel_type, sym_idx, _) in &sec.relocations {
                 let sym = if (sym_idx as usize) < obj.symbols.len() {
                     &obj.symbols[sym_idx as usize]
-                } else { continue; };
+                } else {
+                    continue;
+                };
 
-                if sym.sym_type == STT_SECTION || sym.name.is_empty() { continue; }
+                if sym.sym_type == STT_SECTION || sym.name.is_empty() {
+                    continue;
+                }
 
                 match rel_type {
                     R_386_PLT32 => {
@@ -278,16 +306,29 @@ pub(super) fn mark_plt_got_needs(
     }
 }
 
-pub(super) fn check_undefined_symbols(global_symbols: &FxHashMap<String, LinkerSymbol>) -> Result<(), String> {
-    let truly_undefined: Vec<&String> = global_symbols.iter()
-        .filter(|(n, s)| !s.is_defined && !s.is_dynamic && s.binding != STB_WEAK
-            && !linker_common::is_linker_defined_symbol(n))
+pub(super) fn check_undefined_symbols(
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
+) -> Result<(), String> {
+    let truly_undefined: Vec<&String> = global_symbols
+        .iter()
+        .filter(|(n, s)| {
+            !s.is_defined
+                && !s.is_dynamic
+                && s.binding != STB_WEAK
+                && !linker_common::is_linker_defined_symbol(n)
+        })
         .map(|(n, _)| n)
         .collect();
 
     if !truly_undefined.is_empty() {
-        return Err(format!("undefined symbols: {}", truly_undefined.iter()
-            .map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        return Err(format!(
+            "undefined symbols: {}",
+            truly_undefined
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     Ok(())
 }
@@ -339,15 +380,24 @@ pub(super) fn build_plt_got_lists(
 
     let num_plt = plt_symbols.len();
     let num_got_total = plt_symbols.len() + got_dyn_symbols.len() + got_local_symbols.len();
-    (plt_symbols, got_dyn_symbols, got_local_symbols, num_plt, num_got_total)
+    (
+        plt_symbols,
+        got_dyn_symbols,
+        got_local_symbols,
+        num_plt,
+        num_got_total,
+    )
 }
 
 pub(super) fn collect_ifunc_symbols(
     global_symbols: &FxHashMap<String, LinkerSymbol>,
     is_static: bool,
 ) -> Vec<String> {
-    if !is_static { return Vec::new(); }
-    let mut ifunc_symbols: Vec<String> = global_symbols.iter()
+    if !is_static {
+        return Vec::new();
+    }
+    let mut ifunc_symbols: Vec<String> = global_symbols
+        .iter()
         .filter(|(_, s)| s.is_defined && s.sym_type == STT_GNU_IFUNC)
         .map(|(n, _)| n.clone())
         .collect();

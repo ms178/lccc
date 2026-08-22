@@ -37,14 +37,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::reexports::{
-    BasicBlock,
-    BlockId,
-    Instruction,
-    IrFunction,
-    IrModule,
-    Operand,
-    Terminator,
-    Value,
+    BasicBlock, BlockId, Instruction, IrFunction, IrModule, Operand, Terminator, Value,
 };
 
 /// Eliminate all phi nodes in the module by lowering them to copies.
@@ -60,7 +53,10 @@ pub fn eliminate_phis(module: &mut IrModule) {
         }
     }
     if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-        eprintln!("[PHI] Starting phi_eliminate with next_block_id = {}", next_block_id);
+        eprintln!(
+            "[PHI] Starting phi_eliminate with next_block_id = {}",
+            next_block_id
+        );
     }
 
     for func in &mut module.functions {
@@ -68,13 +64,20 @@ pub fn eliminate_phis(module: &mut IrModule) {
             continue;
         }
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-            eprintln!("[PHI] Processing function {}, current labels: {:?}", func.name,
-                      func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>());
+            eprintln!(
+                "[PHI] Processing function {}, current labels: {:?}",
+                func.name,
+                func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>()
+            );
         }
         eliminate_phis_in_function(func, &mut next_block_id);
         if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-            eprintln!("[PHI] After processing {}, labels: {:?}, next_block_id now {}", func.name,
-                      func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>(), next_block_id);
+            eprintln!(
+                "[PHI] After processing {}, labels: {:?}, next_block_id now {}",
+                func.name,
+                func.blocks.iter().map(|b| b.label.0).collect::<Vec<_>>(),
+                next_block_id
+            );
         }
     }
 }
@@ -85,18 +88,30 @@ fn successor_count(block: &BasicBlock) -> usize {
     let mut seen: Vec<BlockId> = Vec::new();
     match &block.terminator {
         Terminator::Return(_) | Terminator::Unreachable => {}
-        Terminator::Branch(label) => { seen.push(*label); }
-        Terminator::CondBranch { true_label, false_label, .. } => {
-            seen.push(*true_label);
-            if true_label != false_label { seen.push(*false_label); }
+        Terminator::Branch(label) => {
+            seen.push(*label);
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            seen.push(*true_label);
+            if true_label != false_label {
+                seen.push(*false_label);
+            }
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
             seen.extend_from_slice(possible_targets);
         }
         Terminator::Switch { cases, default, .. } => {
             seen.push(*default);
             for &(_, label) in cases {
-                if !seen.contains(&label) { seen.push(label); }
+                if !seen.contains(&label) {
+                    seen.push(label);
+                }
             }
         }
     }
@@ -104,7 +119,9 @@ fn successor_count(block: &BasicBlock) -> usize {
     for inst in &block.instructions {
         if let Instruction::InlineAsm { goto_labels, .. } = inst {
             for (_, label) in goto_labels {
-                if !seen.contains(label) { seen.push(*label); }
+                if !seen.contains(label) {
+                    seen.push(*label);
+                }
             }
         }
     }
@@ -121,7 +138,11 @@ fn retarget_block_edge_once(block: &mut BasicBlock, old_target: BlockId, new_tar
                 return;
             }
         }
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             // Only retarget one edge to avoid changing both sides of a diamond
             if *true_label == old_target {
                 *true_label = new_target;
@@ -131,7 +152,9 @@ fn retarget_block_edge_once(block: &mut BasicBlock, old_target: BlockId, new_tar
                 return;
             }
         }
-        Terminator::IndirectBranch { possible_targets, .. } => {
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => {
             for t in possible_targets.iter_mut() {
                 if *t == old_target {
                     *t = new_target;
@@ -189,7 +212,11 @@ fn get_or_create_trampoline(
             let idx = trampolines.len();
             let label = BlockId(*next_block_id);
             if std::env::var("LCCC_DEBUG_LABELS").is_ok() {
-                eprintln!("[PHI] Creating trampoline block with BlockId({}), next will be {}", label.0, *next_block_id + 1);
+                eprintln!(
+                    "[PHI] Creating trampoline block with BlockId({}), next will be {}",
+                    label.0,
+                    *next_block_id + 1
+                );
             }
             *next_block_id += 1;
             trampolines.push(TrampolineBlock {
@@ -235,9 +262,8 @@ fn find_conflicting_phis(copies: &[(u32, Option<u32>)]) -> FxHashSet<usize> {
     // whose destination is read but already saved by another temp), but
     // correctness is paramount.
     if !needs_temp.is_empty() {
-        let conflicting_sources: FxHashSet<u32> = needs_temp.iter()
-            .filter_map(|&i| copies[i].1)
-            .collect();
+        let conflicting_sources: FxHashSet<u32> =
+            needs_temp.iter().filter_map(|&i| copies[i].1).collect();
         for (j, &(dest_j, _)) in copies.iter().enumerate() {
             if conflicting_sources.contains(&dest_j) {
                 needs_temp.insert(j);
@@ -269,16 +295,28 @@ struct PhiElimCtx<'a> {
 
 fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
     let mut ctx = PhiElimCtx {
-        label_to_idx: func.blocks.iter().enumerate().map(|(i, b)| (b.label, i)).collect(),
+        label_to_idx: func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label, i))
+            .collect(),
         multi_succ: func.blocks.iter().map(|b| successor_count(b) > 1).collect(),
-        is_indirect_branch: func.blocks.iter()
-            .map(|b| matches!(&b.terminator, Terminator::IndirectBranch { .. })).collect(),
+        is_indirect_branch: func
+            .blocks
+            .iter()
+            .map(|b| matches!(&b.terminator, Terminator::IndirectBranch { .. }))
+            .collect(),
         pred_copies: FxHashMap::default(),
         target_copies: vec![Vec::new(); func.blocks.len()],
         trampolines: Vec::new(),
         trampoline_map: FxHashMap::default(),
         next_block_id,
-        next_value: if func.next_value_id > 0 { func.next_value_id } else { func.max_value_id() + 1 },
+        next_value: if func.next_value_id > 0 {
+            func.next_value_id
+        } else {
+            func.max_value_id() + 1
+        },
     };
 
     let block_phis = collect_block_phis(func);
@@ -301,15 +339,25 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
 
 /// Collect PhiInfo from all blocks.
 fn collect_block_phis(func: &IrFunction) -> Vec<Vec<PhiInfo>> {
-    func.blocks.iter().map(|block| {
-        block.instructions.iter().filter_map(|inst| {
-            if let Instruction::Phi { dest, incoming, .. } = inst {
-                Some(PhiInfo { dest: *dest, incoming: incoming.clone() })
-            } else {
-                None
-            }
-        }).collect()
-    }).collect()
+    func.blocks
+        .iter()
+        .map(|block| {
+            block
+                .instructions
+                .iter()
+                .filter_map(|inst| {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        Some(PhiInfo {
+                            dest: *dest,
+                            incoming: incoming.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Emit copies for a block with a single phi (no temporaries needed).
@@ -325,7 +373,10 @@ fn emit_single_phi_copies(phi: &PhiInfo, target_block_id: BlockId, ctx: &mut Phi
                 continue;
             }
         }
-        let copy_inst = Instruction::Copy { dest: phi.dest, src: *src };
+        let copy_inst = Instruction::Copy {
+            dest: phi.dest,
+            src: *src,
+        };
         place_copy(ctx, pred_idx, target_block_id, copy_inst);
     }
 }
@@ -333,7 +384,9 @@ fn emit_single_phi_copies(phi: &PhiInfo, target_block_id: BlockId, ctx: &mut Phi
 /// Emit copies for a block with multiple phis, using smart temporary allocation.
 /// Shared temporaries are only allocated for phis involved in copy cycles.
 fn emit_multi_phi_copies(
-    phis: &[PhiInfo], block_idx: usize, target_block_id: BlockId,
+    phis: &[PhiInfo],
+    block_idx: usize,
+    target_block_id: BlockId,
     ctx: &mut PhiElimCtx,
 ) {
     // Collect unique predecessor labels.
@@ -348,14 +401,14 @@ fn emit_multi_phi_copies(
     }
 
     // Precompute per-phi source lookup tables.
-    let phi_src_maps: Vec<FxHashMap<BlockId, &Operand>> = phis.iter()
+    let phi_src_maps: Vec<FxHashMap<BlockId, &Operand>> = phis
+        .iter()
         .map(|phi| phi.incoming.iter().map(|(src, pl)| (*pl, src)).collect())
         .collect();
 
     // Find which phis are globally conflicting (need temporaries on any edge).
-    let globally_needs_temp = find_globally_conflicting_phis(
-        phis, &pred_labels, &phi_src_maps, &ctx.label_to_idx,
-    );
+    let globally_needs_temp =
+        find_globally_conflicting_phis(phis, &pred_labels, &phi_src_maps, &ctx.label_to_idx);
 
     // Allocate shared temporaries.
     let mut phi_temps: Vec<Option<Value>> = vec![None; phis.len()];
@@ -397,12 +450,20 @@ fn find_globally_conflicting_phis(
         if !label_to_idx.contains_key(pred_label) {
             continue;
         }
-        let copies_info: Vec<(u32, Option<u32>)> = phis.iter().enumerate().map(|(i, phi)| {
-            let src_val_id = phi_src_maps[i].get(pred_label).and_then(|s| {
-                if let Operand::Value(v) = *s { Some(v.0) } else { None }
-            });
-            (phi.dest.0, src_val_id)
-        }).collect();
+        let copies_info: Vec<(u32, Option<u32>)> = phis
+            .iter()
+            .enumerate()
+            .map(|(i, phi)| {
+                let src_val_id = phi_src_maps[i].get(pred_label).and_then(|s| {
+                    if let Operand::Value(v) = *s {
+                        Some(v.0)
+                    } else {
+                        None
+                    }
+                });
+                (phi.dest.0, src_val_id)
+            })
+            .collect();
         for &i in &find_conflicting_phis(&copies_info) {
             globally_needs_temp.insert(i);
         }
@@ -424,7 +485,10 @@ fn build_edge_copies(
     for (i, _phi) in phis.iter().enumerate() {
         if let Some(tmp) = phi_temps[i] {
             if let Some(src) = phi_src_maps[i].get(pred_label) {
-                copies.push(Instruction::Copy { dest: tmp, src: *(*src) });
+                copies.push(Instruction::Copy {
+                    dest: tmp,
+                    src: *(*src),
+                });
             }
         }
     }
@@ -434,9 +498,14 @@ fn build_edge_copies(
         if phi_temps[i].is_none() {
             if let Some(src) = phi_src_maps[i].get(pred_label) {
                 if let Operand::Value(v) = *src {
-                    if v.0 == phi.dest.0 { continue; } // skip self-copy
+                    if v.0 == phi.dest.0 {
+                        continue;
+                    } // skip self-copy
                 }
-                copies.push(Instruction::Copy { dest: phi.dest, src: *(*src) });
+                copies.push(Instruction::Copy {
+                    dest: phi.dest,
+                    src: *(*src),
+                });
             }
         }
     }
@@ -445,11 +514,19 @@ fn build_edge_copies(
 }
 
 /// Place a single copy instruction, using trampolines for critical edges.
-fn place_copy(ctx: &mut PhiElimCtx, pred_idx: usize, target_block_id: BlockId, copy_inst: Instruction) {
+fn place_copy(
+    ctx: &mut PhiElimCtx,
+    pred_idx: usize,
+    target_block_id: BlockId,
+    copy_inst: Instruction,
+) {
     if ctx.multi_succ[pred_idx] && !ctx.is_indirect_branch[pred_idx] {
         let tramp_idx = get_or_create_trampoline(
-            &mut ctx.trampoline_map, &mut ctx.trampolines,
-            pred_idx, target_block_id, ctx.next_block_id,
+            &mut ctx.trampoline_map,
+            &mut ctx.trampolines,
+            pred_idx,
+            target_block_id,
+            ctx.next_block_id,
         );
         ctx.trampolines[tramp_idx].copies.push(copy_inst);
     } else {
@@ -458,12 +535,22 @@ fn place_copy(ctx: &mut PhiElimCtx, pred_idx: usize, target_block_id: BlockId, c
 }
 
 /// Place multiple copy instructions, using trampolines for critical edges.
-fn place_copies(ctx: &mut PhiElimCtx, pred_idx: usize, target_block_id: BlockId, copies: Vec<Instruction>) {
-    if copies.is_empty() { return; }
+fn place_copies(
+    ctx: &mut PhiElimCtx,
+    pred_idx: usize,
+    target_block_id: BlockId,
+    copies: Vec<Instruction>,
+) {
+    if copies.is_empty() {
+        return;
+    }
     if ctx.multi_succ[pred_idx] && !ctx.is_indirect_branch[pred_idx] {
         let tramp_idx = get_or_create_trampoline(
-            &mut ctx.trampoline_map, &mut ctx.trampolines,
-            pred_idx, target_block_id, ctx.next_block_id,
+            &mut ctx.trampoline_map,
+            &mut ctx.trampolines,
+            pred_idx,
+            target_block_id,
+            ctx.next_block_id,
         );
         ctx.trampolines[tramp_idx].copies.extend(copies);
     } else {
@@ -479,12 +566,17 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
         if !block.source_spans.is_empty() {
             let mut span_idx = 0;
             block.source_spans.retain(|_| {
-                let keep = !matches!(block.instructions.get(span_idx), Some(Instruction::Phi { .. }));
+                let keep = !matches!(
+                    block.instructions.get(span_idx),
+                    Some(Instruction::Phi { .. })
+                );
                 span_idx += 1;
                 keep
             });
         }
-        block.instructions.retain(|inst| !matches!(inst, Instruction::Phi { .. }));
+        block
+            .instructions
+            .retain(|inst| !matches!(inst, Instruction::Phi { .. }));
 
         // Prepend target copies (these go at the start, replacing the phis)
         if !ctx.target_copies[block_idx].is_empty() {
@@ -504,7 +596,10 @@ fn apply_phi_transformations(func: &mut IrFunction, ctx: &mut PhiElimCtx) {
             let num_copies = copies.len();
             block.instructions.extend(copies);
             if !block.source_spans.is_empty() {
-                block.source_spans.extend(std::iter::repeat_n(crate::common::source::Span::dummy(), num_copies));
+                block.source_spans.extend(std::iter::repeat_n(
+                    crate::common::source::Span::dummy(),
+                    num_copies,
+                ));
             }
         }
     }
@@ -539,7 +634,10 @@ mod tests {
         // a = 1, b = 2 — no overlap between dests and sources
         let copies = vec![(10, Some(1)), (20, Some(2))];
         let result = find_conflicting_phis(&copies);
-        assert!(result.is_empty(), "Independent phis should have no conflicts");
+        assert!(
+            result.is_empty(),
+            "Independent phis should have no conflicts"
+        );
     }
 
     #[test]
@@ -547,8 +645,14 @@ mod tests {
         // a = b, b = a — classic swap cycle
         let copies = vec![(10, Some(20)), (20, Some(10))];
         let result = find_conflicting_phis(&copies);
-        assert!(result.contains(&0), "First phi in swap should be conflicting");
-        assert!(result.contains(&1), "Second phi in swap should be conflicting");
+        assert!(
+            result.contains(&0),
+            "First phi in swap should be conflicting"
+        );
+        assert!(
+            result.contains(&1),
+            "Second phi in swap should be conflicting"
+        );
     }
 
     #[test]
@@ -556,7 +660,11 @@ mod tests {
         // a = b, b = c, c = a — three-way rotation
         let copies = vec![(10, Some(20)), (20, Some(30)), (30, Some(10))];
         let result = find_conflicting_phis(&copies);
-        assert_eq!(result.len(), 3, "All three phis in a 3-way cycle should be conflicting");
+        assert_eq!(
+            result.len(),
+            3,
+            "All three phis in a 3-way cycle should be conflicting"
+        );
     }
 
     #[test]
@@ -566,7 +674,10 @@ mod tests {
         let result = find_conflicting_phis(&copies);
         assert!(result.contains(&0));
         assert!(result.contains(&1));
-        assert!(!result.contains(&2), "Independent phi should not be marked conflicting");
+        assert!(
+            !result.contains(&2),
+            "Independent phi should not be marked conflicting"
+        );
     }
 
     #[test]
@@ -582,7 +693,10 @@ mod tests {
         // a = <const>, b = <const> — None sources (constants)
         let copies = vec![(10, None), (20, None)];
         let result = find_conflicting_phis(&copies);
-        assert!(result.is_empty(), "Constant sources should have no conflicts");
+        assert!(
+            result.is_empty(),
+            "Constant sources should have no conflicts"
+        );
     }
 
     #[test]
@@ -593,7 +707,13 @@ mod tests {
         // of a conflicting phi.
         let copies = vec![(10, Some(20)), (20, Some(30))];
         let result = find_conflicting_phis(&copies);
-        assert!(result.contains(&0), "Chain phi reading overwritten dest should be conflicting");
-        assert!(result.contains(&1), "Chain phi whose dest is read by conflicting phi should also be marked");
+        assert!(
+            result.contains(&0),
+            "Chain phi reading overwritten dest should be conflicting"
+        );
+        assert!(
+            result.contains(&1),
+            "Chain phi whose dest is read by conflicting phi should also be marked"
+        );
     }
 }

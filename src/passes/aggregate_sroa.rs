@@ -126,7 +126,9 @@ fn scan(func: &IrFunction) -> Scan {
                 Instruction::Alloca { dest, size, .. } => {
                     s.alloca_size.insert(dest.0, *size as i64);
                 }
-                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => {
                     if let Some(off) = const_i64(offset) {
                         s.gep.insert(dest.0, (base.0, off));
                     }
@@ -136,19 +138,26 @@ fn scan(func: &IrFunction) -> Scan {
                 // struct pointer through a temporary (e.g. `tmp = sret;
                 // memcpy(dst, tmp)`), which otherwise defeats copy-buffer
                 // detection and store-only analysis.
-                Instruction::Copy { dest, src: Operand::Value(v) } => {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } => {
                     s.gep.insert(dest.0, (v.0, 0));
                 }
                 Instruction::Memcpy { dest, src, size } => {
                     s.memcpy.push((bi, ii, dest.0, src.0, *size as i64));
                 }
-                Instruction::Store { val: Operand::Value(v), .. } => {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ..
+                } => {
                     s.escapes.insert(v.0); // a pointer stored to memory escapes
                 }
                 _ => {}
             }
         }
-        if let crate::ir::reexports::Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+        if let crate::ir::reexports::Terminator::Return(Some(Operand::Value(v))) = &block.terminator
+        {
             s.escapes.insert(v.0);
         }
     }
@@ -206,7 +215,10 @@ fn scan(func: &IrFunction) -> Scan {
                             s.escapes.insert(v.0);
                         }
                     });
-                    if let Instruction::Intrinsic { dest_ptr: Some(p), .. } = other {
+                    if let Instruction::Intrinsic {
+                        dest_ptr: Some(p), ..
+                    } = other
+                    {
                         s.escapes.insert(p.0);
                     }
                 }
@@ -216,14 +228,17 @@ fn scan(func: &IrFunction) -> Scan {
     s
 }
 
-
 /// Branch targets of a block's terminator. Used to reject blocks that a back
 /// edge can re-enter, where a single-pass store/copy-out shape is not valid.
 fn block_targets(b: &crate::ir::reexports::BasicBlock) -> Vec<usize> {
     use crate::ir::reexports::Terminator;
     match &b.terminator {
         Terminator::Branch(t) => vec![t.0 as usize],
-        Terminator::CondBranch { true_label, false_label, .. } => {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
             vec![true_label.0 as usize, false_label.0 as usize]
         }
         Terminator::Switch { default, cases, .. } => {
@@ -264,7 +279,10 @@ enum PtrUse {
     Other,
 }
 
-fn pointer_uses(func: &IrFunction, gep: &FxHashMap<u32, (u32, i64)>) -> FxHashMap<u32, Vec<PtrUse>> {
+fn pointer_uses(
+    func: &IrFunction,
+    gep: &FxHashMap<u32, (u32, i64)>,
+) -> FxHashMap<u32, Vec<PtrUse>> {
     let mut m: FxHashMap<u32, Vec<PtrUse>> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -657,7 +675,9 @@ fn run_function(func: &mut IrFunction) -> usize {
                             match home {
                                 None => home = Some(bi),
                                 Some(h) if h == bi => {}
-                                _ => { ok_shape = false; }
+                                _ => {
+                                    ok_shape = false;
+                                }
                             }
                         }
                     }
@@ -756,7 +776,8 @@ fn run_function(func: &mut IrFunction) -> usize {
                     if let Instruction::Store { ptr, .. } = inst {
                         let (sr, soff) = resolve(&s.gep, ptr.0);
                         if sr == r {
-                            if let Some(&(_, _, a)) = field_allocas.iter().find(|&&(o, _, _)| o == soff)
+                            if let Some(&(_, _, a)) =
+                                field_allocas.iter().find(|&&(o, _, _)| o == soff)
                             {
                                 plan.store_ptr.push((bi, ii, a));
                             }
@@ -769,15 +790,16 @@ fn run_function(func: &mut IrFunction) -> usize {
                 let reads = load_reads.get(&d).cloned().unwrap_or_default();
                 let mut new_insts: Vec<Instruction> = Vec::new();
                 for &(off, ty, a) in &field_allocas {
-                    let needed = reads.iter().any(|&(ro, rt)| {
-                        off < ro + ty_size(rt) && ro < off + ty_size(ty)
-                    });
+                    let needed = reads
+                        .iter()
+                        .any(|&(ro, rt)| off < ro + ty_size(rt) && ro < off + ty_size(ty));
                     if !needed {
                         continue;
                     }
                     let ld = next;
                     next += 1;
-                    new_insts.push(Instruction::Load { volatile: false,
+                    new_insts.push(Instruction::Load {
+                        volatile: false,
                         dest: Value(ld),
                         ptr: Value(a),
                         ty,
@@ -791,7 +813,8 @@ fn run_function(func: &mut IrFunction) -> usize {
                         offset: Operand::Const(IrConst::ptr_int(off)),
                         ty: IrType::Ptr,
                     });
-                    new_insts.push(Instruction::Store { volatile: false,
+                    new_insts.push(Instruction::Store {
+                        volatile: false,
                         val: Operand::Value(Value(ld)),
                         ptr: Value(gd),
                         ty,
@@ -801,7 +824,11 @@ fn run_function(func: &mut IrFunction) -> usize {
                 plan.remove.push((bi, ii));
                 // Insert the field copies where the memcpy was.
                 for (k, ins) in new_insts.into_iter().enumerate() {
-                    plan.insert.push(Insert { block: bi, at: ii + k, inst: ins });
+                    plan.insert.push(Insert {
+                        block: bi,
+                        at: ii + k,
+                        inst: ins,
+                    });
                 }
                 changed += 1;
             }
@@ -848,15 +875,21 @@ fn run_function(func: &mut IrFunction) -> usize {
     {
         let mut ins_by_block: FxHashMap<usize, Vec<(usize, Instruction)>> = FxHashMap::default();
         for ins in plan.insert {
-            ins_by_block.entry(ins.block).or_default().push((ins.at, ins.inst));
+            ins_by_block
+                .entry(ins.block)
+                .or_default()
+                .push((ins.at, ins.inst));
         }
         let mut rm_by_block: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
         for &(bi, ii) in &plan.remove {
             rm_by_block.entry(bi).or_default().insert(ii);
         }
 
-        let touched: FxHashSet<usize> =
-            ins_by_block.keys().chain(rm_by_block.keys()).copied().collect();
+        let touched: FxHashSet<usize> = ins_by_block
+            .keys()
+            .chain(rm_by_block.keys())
+            .copied()
+            .collect();
         for bi in touched {
             if bi >= func.blocks.len() {
                 continue;
@@ -944,7 +977,9 @@ fn run_function(func: &mut IrFunction) -> usize {
                         referenced.insert(dest.0);
                         referenced.insert(src.0);
                     }
-                    Instruction::Intrinsic { dest_ptr: Some(p), .. } => {
+                    Instruction::Intrinsic {
+                        dest_ptr: Some(p), ..
+                    } => {
                         referenced.insert(p.0);
                     }
                     _ => {}
@@ -991,8 +1026,7 @@ fn run_function(func: &mut IrFunction) -> usize {
     // repaired by padding with the trailing span so downstream passes that
     // index `source_spans[inst_idx]` (mem2reg) never go out of bounds.
     for block in &mut func.blocks {
-        if !block.source_spans.is_empty() && block.source_spans.len() != block.instructions.len()
-        {
+        if !block.source_spans.is_empty() && block.source_spans.len() != block.instructions.len() {
             let last = block
                 .source_spans
                 .last()

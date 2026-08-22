@@ -124,7 +124,9 @@ fn asm_symbol_basename(sym: &str) -> &str {
     loop {
         let mut next = s;
         if let Some(i) = next.rfind('+') {
-            if i > 0 && !next[i + 1..].is_empty() && next[i + 1..].bytes().all(|b| b.is_ascii_digit())
+            if i > 0
+                && !next[i + 1..].is_empty()
+                && next[i + 1..].bytes().all(|b| b.is_ascii_digit())
             {
                 next = &next[..i];
             }
@@ -291,7 +293,10 @@ fn base_is_fold_stable(
 
 /// Unique defining instruction of each single-def value. Multi-def (post-phi)
 /// values are omitted — inspecting a non-unique def is unsafe.
-fn index_single_defs<'a>(func: &'a IrFunction, stab: &BaseStability) -> FxHashMap<u32, &'a Instruction> {
+fn index_single_defs<'a>(
+    func: &'a IrFunction,
+    stab: &BaseStability,
+) -> FxHashMap<u32, &'a Instruction> {
     let mut index = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -459,7 +464,12 @@ fn retain_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, GepFoldInfo>
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Load { ptr, ty, seg_override, .. } => {
+                    Instruction::Load {
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
+                    } => {
                         if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
                             mark(ptr.0);
                         }
@@ -542,7 +552,12 @@ fn retain_indexed_ptr_only_uses(func: &IrFunction, map: &mut FxHashMap<u32, Inde
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Load { ptr, ty, seg_override, .. } => {
+                Instruction::Load {
+                    ptr,
+                    ty,
+                    seg_override,
+                    ..
+                } => {
                     if !is_foldable_mem_ty(*ty) || *seg_override != AddressSpace::Default {
                         mark(ptr.0);
                     }
@@ -1218,9 +1233,7 @@ pub fn build_rematerializable_global_addr_set_for(
         return roots;
     }
 
-    let op_is_root = |op: &Operand, id: u32| {
-        matches!(op, Operand::Value(v) if v.0 == id)
-    };
+    let op_is_root = |op: &Operand, id: u32| matches!(op, Operand::Value(v) if v.0 == id);
     let op_uses_root = |op: &Operand, id: u32| op_is_root(op, id);
 
     let candidates: Vec<u32> = roots.iter().copied().collect();
@@ -1233,14 +1246,21 @@ pub fn build_rematerializable_global_addr_set_for(
                 }
                 let allowed = match inst {
                     Instruction::Load {
-                        ptr, ty, seg_override, ..
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
                     } => {
                         ptr.0 == id
                             && *seg_override == AddressSpace::Default
                             && is_foldable_mem_ty(*ty)
                     }
                     Instruction::Store {
-                        val, ptr, ty, seg_override, ..
+                        val,
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
                     } => {
                         ptr.0 == id
                             && !op_uses_root(val, id)
@@ -1506,11 +1526,11 @@ fn detect_cmp_branch_fusion(
             Instruction::Cmp { dest, .. } if dest.0 == wanted => {
                 break (scan, FusedBranchKind::Cmp)
             }
-            Instruction::BinOp { dest, op: IrBinOp::BitTest, .. }
-                if fuse_bt && dest.0 == wanted =>
-            {
-                break (scan, FusedBranchKind::BitTest)
-            }
+            Instruction::BinOp {
+                dest,
+                op: IrBinOp::BitTest,
+                ..
+            } if fuse_bt && dest.0 == wanted => break (scan, FusedBranchKind::BitTest),
             Instruction::Copy {
                 dest,
                 src: Operand::Value(src),
@@ -1539,7 +1559,12 @@ fn detect_cmp_branch_fusion(
 
     let (cmp_dest, ty) = match &block.instructions[cmp_idx] {
         Instruction::Cmp { dest, ty, .. } => (dest.0, ty),
-        Instruction::BinOp { dest, op: IrBinOp::BitTest, ty, .. } => (dest.0, ty),
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::BitTest,
+            ty,
+            ..
+        } => (dest.0, ty),
         _ => unreachable!(),
     };
     if wanted != cmp_dest
@@ -1652,11 +1677,22 @@ fn detect_load_cmp_mem_fold(
         // Foldable widths map 1:1 onto cmpb/cmpw/cmpl; anything else (wide
         // pairs, floats, vectors, i128) is excluded.
         match ty {
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 | IrType::Ptr => {}
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::Ptr => {}
             _ => continue,
         }
         // The load's only consumer is the compare.
-        if use_counts.get(load_dest as usize).copied().unwrap_or(u32::MAX) != 1 {
+        if use_counts
+            .get(load_dest as usize)
+            .copied()
+            .unwrap_or(u32::MAX)
+            != 1
+        {
             continue;
         }
         let (op, lhs, rhs, cmp_ty) = match &block.instructions[i + 1] {
@@ -1671,9 +1707,17 @@ fn detect_load_cmp_mem_fold(
         if !matches!(lhs, Operand::Value(v) if v.0 == load_dest) {
             continue;
         }
-        let Some(imm) = cmp_fold_imm(rhs, ty) else { continue };
+        let Some(imm) = cmp_fold_imm(rhs, ty) else {
+            continue;
+        };
         match cmp_ty {
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 | IrType::Ptr => {}
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::Ptr => {}
             _ => continue,
         }
         out.insert(load_dest, (ptr, ty, imm));
@@ -1717,7 +1761,9 @@ pub(crate) fn build_folded_value_set(
         // (2) fused compare-and-branch: the boolean (and any Copy/Cast chain)
         // feeding the CondBranch never materializes. Integer compares only —
         // FP fusion is backend-gated (false on i686, where this set is used).
-        if let Some((cmp_idx, chain_end, _)) = detect_cmp_branch_fusion(block, &use_counts, false, true) {
+        if let Some((cmp_idx, chain_end, _)) =
+            detect_cmp_branch_fusion(block, &use_counts, false, true)
+        {
             let end = chain_end.unwrap_or(cmp_idx);
             for inst in &block.instructions[cmp_idx..=end] {
                 if let Some(dest) = inst.dest() {
@@ -1890,9 +1936,7 @@ fn detect_mul_add_fusions(
         if !mul_is_lhs && !mul_is_rhs {
             continue;
         }
-        let defined_between = |op: &Operand| {
-            matches!(op, Operand::Value(v) if skipped_defs[..skipped_count].contains(&v.0))
-        };
+        let defined_between = |op: &Operand| matches!(op, Operand::Value(v) if skipped_defs[..skipped_count].contains(&v.0));
         if defined_between(add_lhs) || defined_between(add_rhs) || mul_ty != add_ty {
             continue;
         }
@@ -1920,7 +1964,9 @@ fn detect_shifted_logical_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxH
             }
             _ => continue,
         };
-        let Some(k) = shift_amt.to_i64() else { continue };
+        let Some(k) = shift_amt.to_i64() else {
+            continue;
+        };
         let max_shift = if matches!(shift_ty, IrType::I64 | IrType::U64) {
             63
         } else {
@@ -1956,8 +2002,9 @@ fn detect_and_not_fusions(block: &BasicBlock, use_counts: &[u32]) -> FxHashSet<u
                 op: crate::ir::reexports::IrUnaryOp::Not,
                 ty,
                 ..
-            } if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) =>
-                (*dest, *ty),
+            } if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) => {
+                (*dest, *ty)
+            }
             _ => continue,
         };
         if use_counts.get(not_dest.0 as usize).copied().unwrap_or(0) != 1 {
@@ -2196,11 +2243,8 @@ fn build_and_emit_dwarf_file_table(
         let mut entries: Vec<(&String, &u32)> = table.iter().collect();
         entries.sort_by_key(|(_name, id)| *id);
         for (name, id) in entries {
-            cg.state().emit_fmt(format_args!(
-                ".file {} \"{}\"",
-                id,
-                escape_dwarf_path(name)
-            ));
+            cg.state()
+                .emit_fmt(format_args!(".file {} \"{}\"", id, escape_dwarf_path(name)));
         }
     }
     table
@@ -2398,8 +2442,8 @@ fn emit_init_fini_arrays(
 /// listed: it matches `fpsr` / `__fp16` and wrongly forces a frame pointer.
 fn template_mentions_frame_pointer(template: &str) -> bool {
     const NEEDLES: &[&str] = &[
-        "%rbp", "{rbp}", "%%rbp", "%ebp", "{ebp}", "%%ebp", "x29", "{x29}", "%x29", "%fp",
-        "{fp}", "%%fp",
+        "%rbp", "{rbp}", "%%rbp", "%ebp", "{ebp}", "%%ebp", "x29", "{x29}", "%x29", "%fp", "{fp}",
+        "%%fp",
     ];
     NEEDLES.iter().any(|n| template.contains(n))
 }
@@ -2606,10 +2650,8 @@ fn generate_function(
     // gate; previously the CLI flag was dropped entirely (so
     // `-fno-omit-frame-pointer` silently did nothing) and variadic functions
     // were unconditionally pinned to a frame pointer.
-    cg.state().omit_frame_pointer = cg.state().fpo_requested
-        && !has_dyn_alloca
-        && !has_inline_asm_fp
-        && !has_vector_intrinsics;
+    cg.state().omit_frame_pointer =
+        cg.state().fpo_requested && !has_dyn_alloca && !has_inline_asm_fp && !has_vector_intrinsics;
 
     cg.state().current_func_name = func.name.clone();
     let raw_space = cg.calculate_stack_space(func);
@@ -2891,11 +2933,21 @@ fn generate_function(
 
             // Exact F128 load->store is a 16-byte copy; bypass x87/f64
             // approximation and intermediate homes on every backend.
-            if let Instruction::Load { dest, ptr: src, ty: IrType::F128, volatile: false, .. } = inst {
+            if let Instruction::Load {
+                dest,
+                ptr: src,
+                ty: IrType::F128,
+                volatile: false,
+                ..
+            } = inst
+            {
                 if value_use_counts.get(dest.0 as usize).copied() == Some(1) {
                     if let Some(Instruction::Store {
-                        val: Operand::Value(v), ptr: dst, ty: IrType::F128,
-                        volatile: false, ..
+                        val: Operand::Value(v),
+                        ptr: dst,
+                        ty: IrType::F128,
+                        volatile: false,
+                        ..
                     }) = block.instructions.get(idx + 1)
                     {
                         if v == dest
@@ -2918,16 +2970,22 @@ fn generate_function(
             // can fold against alloca+c1+c2.
             if let Some(dest) = inst.dest() {
                 if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                    eprintln!("[FOLD] inst dest={} in_gep_map={} in_idx_map={} dead_gaddr={}",
-                        dest.0, gep_fold_map.get(&dest.0).is_some(),
+                    eprintln!(
+                        "[FOLD] inst dest={} in_gep_map={} in_idx_map={} dead_gaddr={}",
+                        dest.0,
+                        gep_fold_map.get(&dest.0).is_some(),
                         indexed_gep_map.get(&dest.0).is_some(),
-                        dead_global_addrs.contains(&dest.0));
+                        dead_global_addrs.contains(&dest.0)
+                    );
                 }
                 if let Some(info) = gep_fold_map.get(&dest.0) {
                     if can_const_addr_fold(cg, info) {
                         cg.state().folded_gep_values.insert(dest.0);
                         if std::env::var_os("LCCC_DBG_FOLD").is_some() {
-                            eprintln!("[FOLD] SKIPPED dest={} base={} off={}", dest.0, info.base.0, info.offset);
+                            eprintln!(
+                                "[FOLD] SKIPPED dest={} base={} off={}",
+                                dest.0, info.base.0, info.offset
+                            );
                         }
                         cg.state().current_program_point += 1;
                         continue;
@@ -3028,12 +3086,8 @@ fn generate_function(
             } = inst
             {
                 if and_not_fusions.contains(&(idx + 1)) {
-                    if let Some(Instruction::BinOp {
-                        dest,
-                        lhs,
-                        rhs,
-                        ..
-                    }) = block.instructions.get(idx + 1)
+                    if let Some(Instruction::BinOp { dest, lhs, rhs, .. }) =
+                        block.instructions.get(idx + 1)
                     {
                         let not_is_lhs = matches!(lhs, Operand::Value(v) if v == not_dest);
                         let other = if not_is_lhs { rhs } else { lhs };
@@ -3043,14 +3097,7 @@ fn generate_function(
                                 Terminator::Return(Some(Operand::Value(value))) if value == dest
                             );
                         cg.flush_machinst();
-                        cg.emit_and_not(
-                            not_dest,
-                            not_src,
-                            other,
-                            dest,
-                            *ty,
-                            direct_return,
-                        );
+                        cg.emit_and_not(not_dest, not_src, other, dest, *ty, direct_return);
                         skip_fused_and_not = true;
                         cg.state().current_program_point += 1;
                         continue;
@@ -3141,11 +3188,12 @@ fn generate_function(
                     // not block the fold; const-folded / global ptrs are
                     // still skipped producers the cmp cannot resolve.
                     if !gep_fold_map.contains_key(&ptr.0)
-                        && (!indexed_gep_map.contains_key(&ptr.0)
-                            || load_cmp_ptrs.contains(&ptr.0))
+                        && (!indexed_gep_map.contains_key(&ptr.0) || load_cmp_ptrs.contains(&ptr.0))
                         && !global_addr_map.contains_key(&ptr.0)
                     {
-                        cg.state().pending_load_cmp.insert(dest.0, (ptr.0, *ty, *imm));
+                        cg.state()
+                            .pending_load_cmp
+                            .insert(dest.0, (ptr.0, *ty, *imm));
                         cg.state().current_program_point += 1;
                         continue;
                     }
@@ -3177,17 +3225,28 @@ fn generate_function(
             } = &block.terminator
             {
                 match (kind, &block.instructions[fi]) {
-                    (FusedBranchKind::Cmp, Instruction::Cmp { op, lhs, rhs, ty, .. }) => {
+                    (
+                        FusedBranchKind::Cmp,
+                        Instruction::Cmp {
+                            op, lhs, rhs, ty, ..
+                        },
+                    ) => {
                         cg.emit_fused_cmp_branch_blocks(
-                            *op, lhs, rhs, *ty, *true_label, *false_label,
+                            *op,
+                            lhs,
+                            rhs,
+                            *ty,
+                            *true_label,
+                            *false_label,
                         );
                     }
-                    (
-                        FusedBranchKind::BitTest,
-                        Instruction::BinOp { lhs, rhs, ty, .. },
-                    ) => {
+                    (FusedBranchKind::BitTest, Instruction::BinOp { lhs, rhs, ty, .. }) => {
                         cg.emit_fused_bit_test_branch_blocks(
-                            lhs, rhs, *ty, *true_label, *false_label,
+                            lhs,
+                            rhs,
+                            *ty,
+                            *true_label,
+                            *false_label,
                         );
                     }
                     _ => unreachable!("fuse_idx anchored on a non-fusable instruction"),
@@ -3287,7 +3346,7 @@ pub(super) fn generate_instruction(
             ptr,
             ty,
             seg_override,
-                volatile,
+            volatile,
         } => {
             generate_load(
                 cg,
@@ -3370,9 +3429,9 @@ pub(super) fn generate_instruction(
             dest, base, offset, ..
         } => {
             if remat_global_addrs.contains(&base.0) {
-                let sym = global_addr_map.get(&base.0).expect(
-                    "rematerializable GlobalAddr must retain its legal symbol identity",
-                );
+                let sym = global_addr_map
+                    .get(&base.0)
+                    .expect("rematerializable GlobalAddr must retain its legal symbol identity");
                 assert!(
                     cg.emit_rematerialized_global_addr(dest, sym, offset, false),
                     "backend accepted GlobalAddr rematerialisation but refused its audited GEP"
@@ -3695,7 +3754,9 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
                     crate::backend::state::SlotAddr::Direct(slot) => {
                         cg.emit_gep_direct_const(slot, 0);
                     }
-                    crate::backend::state::SlotAddr::Indirect(_) => { unreachable!("alloca address cannot use an indirect slot"); }
+                    crate::backend::state::SlotAddr::Indirect(_) => {
+                        unreachable!("alloca address cannot use an indirect slot");
+                    }
                     crate::backend::state::SlotAddr::Reg(reg) => cg.emit_reg_to_acc(reg),
                 }
                 cg.state().reg_cache.set_acc(src_val.0, true);

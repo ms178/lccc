@@ -13,7 +13,9 @@ impl super::InstructionEncoder {
 
         // Handle zero-operand form (implicit operands)
         if ops.is_empty() {
-            if size == 2 { self.bytes.push(0x66); }
+            if size == 2 {
+                self.bytes.push(0x66);
+            }
             self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
             return Ok(());
         }
@@ -28,19 +30,25 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(_), Operand::Register(_)) => {
                 // outb %al, %dx  =>  0xEE (byte) or 0xEF (word/dword)
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
             (Operand::Register(_), Operand::Memory(_)) => {
                 // outl %eax, (%dx)  =>  same encoding as register form
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEE } else { 0xEF });
                 Ok(())
             }
             (Operand::Register(_), Operand::Immediate(ImmediateValue::Integer(val))) => {
                 // outb %al, $imm8  =>  0xE6 ib (byte) or 0xE7 ib (word/dword)
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xE6 } else { 0xE7 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -61,7 +69,9 @@ impl super::InstructionEncoder {
 
         // Handle zero-operand form (implicit operands)
         if ops.is_empty() {
-            if size == 2 { self.bytes.push(0x66); }
+            if size == 2 {
+                self.bytes.push(0x66);
+            }
             self.bytes.push(if size == 1 { 0xEC } else { 0xED });
             return Ok(());
         }
@@ -76,19 +86,25 @@ impl super::InstructionEncoder {
         match (&ops[0], &ops[1]) {
             (Operand::Register(_), Operand::Register(_)) => {
                 // inb %dx, %al  =>  0xEC (byte) or 0xED (word/dword)
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
             (Operand::Memory(_), Operand::Register(_)) => {
                 // inl (%dx), %eax  =>  same encoding as register form
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xEC } else { 0xED });
                 Ok(())
             }
             (Operand::Immediate(ImmediateValue::Integer(val)), Operand::Register(_)) => {
                 // inb $imm8, %al  =>  0xE4 ib (byte) or 0xE5 ib (word/dword)
-                if size == 2 { self.bytes.push(0x66); }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
                 self.bytes.push(if size == 1 { 0xE4 } else { 0xE5 });
                 self.bytes.push(*val as u8);
                 Ok(())
@@ -144,9 +160,15 @@ impl super::InstructionEncoder {
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
                 // Need REX prefix for r8-r15 or for cr8
                 let mut rex = 0u8;
-                if cr_num >= 8 { rex |= 0x44; } // REX.R
-                if needs_rex_ext(&gp.name) { rex |= 0x41; } // REX.B
-                if rex != 0 { self.bytes.push(rex); }
+                if cr_num >= 8 {
+                    rex |= 0x44;
+                } // REX.R
+                if needs_rex_ext(&gp.name) {
+                    rex |= 0x41;
+                } // REX.B
+                if rex != 0 {
+                    self.bytes.push(rex);
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x20]);
                 self.bytes.push(self.modrm(3, cr_num & 7, gp_num));
                 Ok(())
@@ -156,9 +178,15 @@ impl super::InstructionEncoder {
                 let cr_num = control_reg_num(&cr.name).ok_or("bad control register")?;
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
                 let mut rex = 0u8;
-                if cr_num >= 8 { rex |= 0x44; } // REX.R
-                if needs_rex_ext(&gp.name) { rex |= 0x41; } // REX.B
-                if rex != 0 { self.bytes.push(rex); }
+                if cr_num >= 8 {
+                    rex |= 0x44;
+                } // REX.R
+                if needs_rex_ext(&gp.name) {
+                    rex |= 0x41;
+                } // REX.B
+                if rex != 0 {
+                    self.bytes.push(rex);
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x22]);
                 self.bytes.push(self.modrm(3, cr_num & 7, gp_num));
                 Ok(())
@@ -178,8 +206,12 @@ impl super::InstructionEncoder {
                 let dr_num = debug_reg_num(&dr.name).ok_or("bad debug register")?;
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
                 let mut rex = 0u8;
-                if needs_rex_ext(&gp.name) { rex |= 0x41; } // REX.B
-                if rex != 0 { self.bytes.push(rex); }
+                if needs_rex_ext(&gp.name) {
+                    rex |= 0x41;
+                } // REX.B
+                if rex != 0 {
+                    self.bytes.push(rex);
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x21]);
                 self.bytes.push(self.modrm(3, dr_num, gp_num));
                 Ok(())
@@ -189,8 +221,12 @@ impl super::InstructionEncoder {
                 let dr_num = debug_reg_num(&dr.name).ok_or("bad debug register")?;
                 let gp_num = reg_num(&gp.name).ok_or("bad register")?;
                 let mut rex = 0u8;
-                if needs_rex_ext(&gp.name) { rex |= 0x41; } // REX.B
-                if rex != 0 { self.bytes.push(rex); }
+                if needs_rex_ext(&gp.name) {
+                    rex |= 0x41;
+                } // REX.B
+                if rex != 0 {
+                    self.bytes.push(rex);
+                }
                 self.bytes.extend_from_slice(&[0x0F, 0x23]);
                 self.bytes.push(self.modrm(3, dr_num, gp_num));
                 Ok(())
@@ -201,7 +237,11 @@ impl super::InstructionEncoder {
 
     /// Encode SGDT/SIDT/LGDT/LIDT: 0F 01 /N (memory operand)
     /// Handles suffixed forms (sgdtl, lgdtq, etc.) and label operands.
-    pub(crate) fn encode_system_table(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+    pub(crate) fn encode_system_table(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 operand", mnemonic));
         }
@@ -295,7 +335,12 @@ impl super::InstructionEncoder {
 
     /// Encode system register instructions (LLDT, LTR, STR, SLDT): opcode /ext
     /// These take a 16-bit register or memory operand.
-    pub(crate) fn encode_system_reg(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_system_reg(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("system register instruction requires 1 operand".to_string());
         }
@@ -320,7 +365,12 @@ impl super::InstructionEncoder {
     }
 
     /// Encode memory-only instructions (INVLPG, FXSAVE, FXRSTOR, etc.): opcode /ext
-    pub(crate) fn encode_mem_only(&mut self, ops: &[Operand], opcode: &[u8], ext: u8) -> Result<(), String> {
+    pub(crate) fn encode_mem_only(
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("instruction requires 1 memory operand".to_string());
         }
@@ -344,7 +394,11 @@ impl super::InstructionEncoder {
     ///   xrstors m     0F C7 /3      xrstors64 m   REX.W 0F C7 /3
     ///   fxrstor m     0F AE /1
     pub(crate) fn encode_xsave_family(
-        &mut self, ops: &[Operand], opcode: &[u8], ext: u8, force_rex_w: bool,
+        &mut self,
+        ops: &[Operand],
+        opcode: &[u8],
+        ext: u8,
+        force_rex_w: bool,
     ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err("instruction requires 1 memory operand".to_string());
@@ -419,7 +473,11 @@ impl super::InstructionEncoder {
     }
 
     /// Encode RDFSBASE/RDGSBASE/WRFSBASE/WRGSBASE: F3 0F AE /N
-    pub(crate) fn encode_fsgsbase(&mut self, ops: &[Operand], mnemonic: &str) -> Result<(), String> {
+    pub(crate) fn encode_fsgsbase(
+        &mut self,
+        ops: &[Operand],
+        mnemonic: &str,
+    ) -> Result<(), String> {
         if ops.len() != 1 {
             return Err(format!("{} requires 1 register operand", mnemonic));
         }
@@ -462,7 +520,11 @@ impl super::InstructionEncoder {
                         _ => return Err("lcall indirect requires memory operand".to_string()),
                     },
                     Operand::Memory(mem) => mem,
-                    _ => return Err("lcall requires indirect memory or segment:offset operands".to_string()),
+                    _ => {
+                        return Err(
+                            "lcall requires indirect memory or segment:offset operands".to_string()
+                        )
+                    }
                 };
                 // `lcalll *mem` keeps the default 32-bit operand size
                 // (m16:32 far pointer) — the form the kernel's EFI mixed-mode
@@ -476,26 +538,36 @@ impl super::InstructionEncoder {
                 self.bytes.push(0xFF);
                 self.encode_modrm_mem(3, mem)
             }
-            2 => {
-                match (&ops[0], &ops[1]) {
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
-                        self.bytes.push(0x9A);
-                        self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) |
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _))) => {
-                        let addend = match &ops[1] { Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a, _ => 0 };
-                        self.bytes.push(0x9A);
-                        self.add_relocation(sym, R_X86_64_32, addend);
-                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
-                        self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
-                        Ok(())
-                    }
-                    _ => Err("lcall requires $segment, $offset operands".to_string()),
+            2 => match (&ops[0], &ops[1]) {
+                (
+                    Operand::Immediate(ImmediateValue::Integer(seg)),
+                    Operand::Immediate(ImmediateValue::Integer(off)),
+                ) => {
+                    self.bytes.push(0x9A);
+                    self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
+                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                    Ok(())
                 }
-            }
+                (
+                    Operand::Immediate(ImmediateValue::Integer(seg)),
+                    Operand::Immediate(ImmediateValue::Symbol(sym)),
+                )
+                | (
+                    Operand::Immediate(ImmediateValue::Integer(seg)),
+                    Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)),
+                ) => {
+                    let addend = match &ops[1] {
+                        Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a,
+                        _ => 0,
+                    };
+                    self.bytes.push(0x9A);
+                    self.add_relocation(sym, R_X86_64_32, addend);
+                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
+                    Ok(())
+                }
+                _ => Err("lcall requires $segment, $offset operands".to_string()),
+            },
             _ => Err("lcall requires 1 or 2 operands".to_string()),
         }
     }
@@ -506,45 +578,60 @@ impl super::InstructionEncoder {
             // ljmpl *mem - indirect far jump through memory
             1 => {
                 match &ops[0] {
-                    Operand::Indirect(inner) => {
-                        match inner.as_ref() {
-                            Operand::Memory(mem) => {
-                                self.emit_rex_rm(0, "", mem);
-                                self.bytes.push(0xFF);
-                                self.encode_modrm_mem(5, mem)
-                            }
-                            _ => Err("ljmp indirect requires memory operand".to_string()),
+                    Operand::Indirect(inner) => match inner.as_ref() {
+                        Operand::Memory(mem) => {
+                            self.emit_rex_rm(0, "", mem);
+                            self.bytes.push(0xFF);
+                            self.encode_modrm_mem(5, mem)
                         }
-                    }
+                        _ => Err("ljmp indirect requires memory operand".to_string()),
+                    },
                     Operand::Memory(mem) => {
                         // ljmp *mem (without explicit indirect prefix)
                         self.emit_rex_rm(0, "", mem);
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(5, mem)
                     }
-                    _ => Err("ljmp requires indirect memory or segment:offset operands".to_string()),
+                    _ => {
+                        Err("ljmp requires indirect memory or segment:offset operands".to_string())
+                    }
                 }
             }
             // ljmpl $segment, $offset - direct far jump (opcode 0xEA, valid in 32-bit/16-bit mode only;
             // used by kernel realmode trampoline code compiled with gcc_m16)
             2 => {
                 match (&ops[0], &ops[1]) {
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Integer(off))) => {
+                    (
+                        Operand::Immediate(ImmediateValue::Integer(seg)),
+                        Operand::Immediate(ImmediateValue::Integer(off)),
+                    ) => {
                         self.bytes.push(0xEA);
                         self.bytes.extend_from_slice(&(*off as u32).to_le_bytes());
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::Symbol(sym))) |
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _))) => {
-                        let addend = match &ops[1] { Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a, _ => 0 };
+                    (
+                        Operand::Immediate(ImmediateValue::Integer(seg)),
+                        Operand::Immediate(ImmediateValue::Symbol(sym)),
+                    )
+                    | (
+                        Operand::Immediate(ImmediateValue::Integer(seg)),
+                        Operand::Immediate(ImmediateValue::SymbolPlusOffset(sym, _)),
+                    ) => {
+                        let addend = match &ops[1] {
+                            Operand::Immediate(ImmediateValue::SymbolPlusOffset(_, a)) => *a,
+                            _ => 0,
+                        };
                         self.bytes.push(0xEA);
                         self.add_relocation(sym, R_X86_64_32, addend);
                         self.bytes.extend_from_slice(&[0, 0, 0, 0]);
                         self.bytes.extend_from_slice(&(*seg as u16).to_le_bytes());
                         Ok(())
                     }
-                    (Operand::Immediate(ImmediateValue::Integer(seg)), Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff))) => {
+                    (
+                        Operand::Immediate(ImmediateValue::Integer(seg)),
+                        Operand::Immediate(ImmediateValue::SymbolDiff(sym, diff)),
+                    ) => {
                         // la57toggle.S: `ljmpl $__KERNEL_CS, $(.Lret -
                         // trampoline_32bit_src)` — the offset is a
                         // same-section label difference that resolves to a
@@ -601,9 +688,17 @@ impl super::InstructionEncoder {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 // 16-bit operand size prefix
-                if src.name.starts_with('w') || src.name.len() == 2 && src.name.ends_with('x') || src.name.ends_with('i') && !src.name.starts_with('e') && !src.name.starts_with('r') {
+                if src.name.starts_with('w')
+                    || src.name.len() == 2 && src.name.ends_with('x')
+                    || src.name.ends_with('i')
+                        && !src.name.starts_with('e')
+                        && !src.name.starts_with('r')
+                {
                     // Heuristic: check if it's 16-bit register
-                    let is_16 = matches!(src.name.as_str(), "ax"|"bx"|"cx"|"dx"|"si"|"di"|"sp"|"bp");
+                    let is_16 = matches!(
+                        src.name.as_str(),
+                        "ax" | "bx" | "cx" | "dx" | "si" | "di" | "sp" | "bp"
+                    );
                     if is_16 {
                         self.bytes.push(0x66);
                     }

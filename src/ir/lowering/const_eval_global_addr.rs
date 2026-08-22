@@ -12,23 +12,20 @@
 //! - `&((type*)0)->member` patterns (resolved via offsetof in const_eval.rs)
 //! - Pointer arithmetic on global addresses (`&x + n`, `arr - n`)
 
-use crate::frontend::parser::ast::{
-    BinOp,
-    Expr,
-    Initializer,
-    TypeSpecifier,
-    UnaryOp,
-};
-use crate::ir::reexports::{GlobalInit, IrConst};
-use crate::common::types::{CType, StructLayout};
 use super::lower::Lowerer;
+use crate::common::types::{CType, StructLayout};
+use crate::frontend::parser::ast::{BinOp, Expr, Initializer, TypeSpecifier, UnaryOp};
+use crate::ir::reexports::{GlobalInit, IrConst};
 
 impl Lowerer {
     /// Try to extract a global address from an initializer.
     /// Recurses into brace-wrapped lists to find the first pointer/address value.
     /// This handles compound literals like `((struct Wrap) {inc_global})` where
     /// the inner initializer contains a function pointer or global address.
-    pub(super) fn eval_global_addr_from_initializer(&self, init: &Initializer) -> Option<GlobalInit> {
+    pub(super) fn eval_global_addr_from_initializer(
+        &self,
+        init: &Initializer,
+    ) -> Option<GlobalInit> {
         match init {
             Initializer::Expr(expr) => self.eval_global_addr_expr(expr),
             Initializer::List(items) => {
@@ -86,13 +83,9 @@ impl Lowerer {
                         None
                     }
                     // &arr[i] or &arr[i][j][k] -> GlobalAddrOffset("arr", total_offset)
-                    Expr::ArraySubscript(_, _, _) => {
-                        self.resolve_chained_array_subscript(inner)
-                    }
+                    Expr::ArraySubscript(_, _, _) => self.resolve_chained_array_subscript(inner),
                     // &s.field or &s.a.b.c or &arr[i].field -> GlobalAddrOffset
-                    Expr::MemberAccess(_, _, _) => {
-                        self.resolve_chained_member_access(inner)
-                    }
+                    Expr::MemberAccess(_, _, _) => self.resolve_chained_member_access(inner),
                     // &(base->field) where base is pointer arithmetic on a global array
                     // e.g., &((Upgrade_items + 1)->uaattrid)
                     Expr::PointerMemberAccess(base, field, _) => {
@@ -101,7 +94,8 @@ impl Lowerer {
                     // &(compound_literal) - look up previously materialized compound literal
                     Expr::CompoundLiteral(_, _, _) => {
                         let key = inner.as_ref() as *const Expr as usize;
-                        self.materialized_compound_literals.get(&key)
+                        self.materialized_compound_literals
+                            .get(&key)
                             .map(|label| GlobalInit::GlobalAddr(label.clone()))
                     }
                     _ => None,
@@ -142,20 +136,14 @@ impl Lowerer {
             //   .ptr = regs[3]   // regs[3] is u8[16], decays to u8*
             // This resolves to GlobalAddrOffset("regs", 3*16).
             // Critical for Linux kernel's clk_alpha_pll_regs patterns.
-            Expr::ArraySubscript(_, _, _) => {
-                self.resolve_array_subscript_decay(expr)
-            }
+            Expr::ArraySubscript(_, _, _) => self.resolve_array_subscript_decay(expr),
             // Member access on a global struct where the field is an array:
             // e.g., `global_struct.array_field` decays to &global_struct.array_field[0]
             // This handles patterns like `init_files.open_fds_init` in the Linux kernel
             // where open_fds_init is an `unsigned long[1]` field.
-            Expr::MemberAccess(_, _, _) => {
-                self.resolve_member_access_array_decay(expr)
-            }
+            Expr::MemberAccess(_, _, _) => self.resolve_member_access_array_decay(expr),
             // (type *)expr -> try evaluating the inner expression
-            Expr::Cast(_, inner, _) => {
-                self.eval_global_addr_expr(inner)
-            }
+            Expr::Cast(_, inner, _) => self.eval_global_addr_expr(inner),
             // Compound literal -> check if it was materialized as an anonymous global
             // by materialize_compound_literals_in_expr(), then fall back to trying
             // to extract a global address from the initializer content.
@@ -230,10 +218,15 @@ impl Lowerer {
                 // Try normal scalar constant evaluation of the condition first.
                 // If that fails (e.g., condition involves a function pointer
                 // comparison like `fn == NULL`), try address-aware evaluation.
-                let cond_val = self.eval_const_expr(cond)
+                let cond_val = self
+                    .eval_const_expr(cond)
                     .or_else(|| self.eval_addr_comparison_cond(cond));
                 let cond_val = cond_val?;
-                let selected = if cond_val.is_nonzero() { then_e } else { else_e };
+                let selected = if cond_val.is_nonzero() {
+                    then_e
+                } else {
+                    else_e
+                };
                 // Try the selected branch as a global address first
                 if let Some(addr) = self.eval_global_addr_expr(selected) {
                     return Some(addr);
@@ -255,7 +248,11 @@ impl Lowerer {
     }
 
     /// Helper for pointer arithmetic: base_expr + offset_expr where base is an address
-    fn eval_global_addr_base_and_offset(&self, base_expr: &Expr, offset_expr: &Expr) -> Option<GlobalInit> {
+    fn eval_global_addr_base_and_offset(
+        &self,
+        base_expr: &Expr,
+        offset_expr: &Expr,
+    ) -> Option<GlobalInit> {
         let base_init = self.eval_global_addr_expr(base_expr)?;
         let offset_val = self.eval_const_expr(offset_expr)?;
         let offset = self.const_to_i64(&offset_val)?;
@@ -418,14 +415,18 @@ impl Lowerer {
                     let mut current_layout = start_layout;
                     let mut final_field_ty: Option<CType> = None;
                     for field_name in fields.iter().rev() {
-                        if let Some((foff, fty)) = current_layout.field_offset(field_name, &*self.types.borrow_struct_layouts()) {
+                        if let Some((foff, fty)) = current_layout
+                            .field_offset(field_name, &*self.types.borrow_struct_layouts())
+                        {
                             member_offset += foff as i64;
                             final_field_ty = Some(fty.clone());
                             current_layout = match &fty {
-                                CType::Struct(key) | CType::Union(key) => {
-                                    self.types.borrow_struct_layouts().get(&**key).cloned()
-                                        .unwrap_or_else(StructLayout::empty_rc)
-                                }
+                                CType::Struct(key) | CType::Union(key) => self
+                                    .types
+                                    .borrow_struct_layouts()
+                                    .get(&**key)
+                                    .cloned()
+                                    .unwrap_or_else(StructLayout::empty_rc),
                                 _ => StructLayout::empty_rc(),
                             };
                         } else {
@@ -553,7 +554,8 @@ impl Lowerer {
                 // Look up the struct layout to get the field offset
                 let ginfo = self.globals.get(&global_name)?;
                 let layout = ginfo.struct_layout.clone()?;
-                let (field_offset, _field_ty) = layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+                let (field_offset, _field_ty) =
+                    layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
                 let total = base_off + field_offset as i64;
                 if total == 0 {
                     Some(GlobalInit::GlobalAddr(global_name))
@@ -562,13 +564,9 @@ impl Lowerer {
                 }
             }
             // AddressOf(&x) -> address of x
-            Expr::AddressOf(_inner, _) => {
-                self.eval_global_addr_expr(expr)
-            }
+            Expr::AddressOf(_inner, _) => self.eval_global_addr_expr(expr),
             // Cast preserves the address
-            Expr::Cast(_, inner, _) => {
-                self.resolve_inner_as_global_addr(inner)
-            }
+            Expr::Cast(_, inner, _) => self.resolve_inner_as_global_addr(inner),
             _ => None,
         }
     }
@@ -582,7 +580,8 @@ impl Lowerer {
         // Use resolve_inner_as_global_addr to get the address of the field,
         // falling back to resolve_chained_member_access for complex chains
         // involving PointerMemberAccess (e.g., (&g.member)->field.array_field)
-        let addr = self.resolve_inner_as_global_addr(expr)
+        let addr = self
+            .resolve_inner_as_global_addr(expr)
             .or_else(|| self.resolve_chained_member_access(expr))?;
         // Now check if the field type is an array (needs decay)
         // Walk the member access chain to find the final field type
@@ -602,7 +601,8 @@ impl Lowerer {
             Expr::MemberAccess(base, field, _) => {
                 // Get the struct layout of the base expression
                 let layout = self.get_struct_layout_of_expr(base)?;
-                let (_offset, field_ty) = layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+                let (_offset, field_ty) =
+                    layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
                 Some(field_ty)
             }
             _ => None,
@@ -621,11 +621,14 @@ impl Lowerer {
                 // For chained access s.a.b: get layout of s, find field a's type,
                 // then get layout of a's type (must be struct/union)
                 let base_layout = self.get_struct_layout_of_expr(base)?;
-                let (_offset, field_ty) = base_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+                let (_offset, field_ty) =
+                    base_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
                 match &field_ty {
-                    CType::Struct(key) | CType::Union(key) => {
-                        self.types.borrow_struct_layouts().get(&**key).map(|rc| (**rc).clone())
-                    }
+                    CType::Struct(key) | CType::Union(key) => self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&**key)
+                        .map(|rc| (**rc).clone()),
                     _ => None,
                 }
             }
@@ -659,11 +662,14 @@ impl Lowerer {
                     Expr::AddressOf(inner, _) => self.get_struct_layout_of_expr(inner)?,
                     _ => return None,
                 };
-                let (_offset, field_ty) = pointee_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+                let (_offset, field_ty) =
+                    pointee_layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
                 match &field_ty {
-                    CType::Struct(key) | CType::Union(key) => {
-                        self.types.borrow_struct_layouts().get(&**key).map(|rc| (**rc).clone())
-                    }
+                    CType::Struct(key) | CType::Union(key) => self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&**key)
+                        .map(|rc| (**rc).clone()),
                     _ => None,
                 }
             }
@@ -689,7 +695,12 @@ impl Lowerer {
                     let ginfo = self.globals.get(&global_name)?;
                     let base_offset: i64 = 0;
                     let start_layout = ginfo.struct_layout.clone()?;
-                    return self.apply_field_chain_offsets(&global_name, base_offset, &start_layout, &fields);
+                    return self.apply_field_chain_offsets(
+                        &global_name,
+                        base_offset,
+                        &start_layout,
+                        &fields,
+                    );
                 }
                 // Handle &arr[i].field - ArraySubscript as base of member chain
                 // Also handles &global.member[i][j].field (member access + subscripts)
@@ -724,7 +735,12 @@ impl Lowerer {
                                     base_offset += idx * stride;
                                 }
                                 let start_layout = ginfo.struct_layout.clone()?;
-                                return self.apply_field_chain_offsets(&global_name, base_offset, &start_layout, &fields);
+                                return self.apply_field_chain_offsets(
+                                    &global_name,
+                                    base_offset,
+                                    &start_layout,
+                                    &fields,
+                                );
                             }
                         }
                         // Handle global.member[i][j].field pattern:
@@ -751,14 +767,19 @@ impl Lowerer {
                                         let mut current_layout = start_layout;
                                         let mut final_field_ty: Option<CType> = None;
                                         for field_name in member_fields.iter().rev() {
-                                            let (foff, fty) = current_layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
+                                            let (foff, fty) = current_layout.field_offset(
+                                                field_name,
+                                                &*self.types.borrow_struct_layouts(),
+                                            )?;
                                             member_offset += foff as i64;
                                             final_field_ty = Some(fty.clone());
                                             current_layout = match &fty {
-                                                CType::Struct(key) | CType::Union(key) => {
-                                                    self.types.borrow_struct_layouts().get(&**key).cloned()
-                                                        .unwrap_or_else(StructLayout::empty_rc)
-                                                }
+                                                CType::Struct(key) | CType::Union(key) => self
+                                                    .types
+                                                    .borrow_struct_layouts()
+                                                    .get(&**key)
+                                                    .cloned()
+                                                    .unwrap_or_else(StructLayout::empty_rc),
                                                 _ => StructLayout::empty_rc(),
                                             };
                                         }
@@ -784,13 +805,20 @@ impl Lowerer {
                                         // Now arr_ty is the element type after all subscripts.
                                         // Get its struct layout for applying remaining field chain.
                                         let elem_layout = match &arr_ty {
-                                            CType::Struct(key) | CType::Union(key) => {
-                                                self.types.borrow_struct_layouts().get(&**key).cloned()?
-                                            }
+                                            CType::Struct(key) | CType::Union(key) => self
+                                                .types
+                                                .borrow_struct_layouts()
+                                                .get(&**key)
+                                                .cloned()?,
                                             _ => return None,
                                         };
 
-                                        return self.apply_field_chain_offsets(&global_name, total_offset, &elem_layout, &fields);
+                                        return self.apply_field_chain_offsets(
+                                            &global_name,
+                                            total_offset,
+                                            &elem_layout,
+                                            &fields,
+                                        );
                                     }
                                     _ => return None,
                                 }
@@ -814,7 +842,12 @@ impl Lowerer {
                                     let ginfo = self.globals.get(&global_name)?;
                                     let base_offset: i64 = 0;
                                     let start_layout = ginfo.struct_layout.clone()?;
-                                    return self.apply_field_chain_offsets(&global_name, base_offset, &start_layout, &fields);
+                                    return self.apply_field_chain_offsets(
+                                        &global_name,
+                                        base_offset,
+                                        &start_layout,
+                                        &fields,
+                                    );
                                 }
                                 // Handle &(g.member)->field pattern:
                                 // e.g., (&(g._main_interpreter))->dtoa.preallocated
@@ -824,18 +857,27 @@ impl Lowerer {
                                     if let Some(init) = self.resolve_chained_member_access(inner) {
                                         let (global_name, base_off) = match &init {
                                             GlobalInit::GlobalAddr(name) => (name.clone(), 0i64),
-                                            GlobalInit::GlobalAddrOffset(name, off) => (name.clone(), *off),
+                                            GlobalInit::GlobalAddrOffset(name, off) => {
+                                                (name.clone(), *off)
+                                            }
                                             _ => return None,
                                         };
                                         // Get the struct layout for the member access result type
                                         let member_ty = self.get_member_access_field_type(inner)?;
                                         let start_layout = match &member_ty {
-                                            CType::Struct(key) | CType::Union(key) => {
-                                                self.types.borrow_struct_layouts().get(&**key).cloned()?
-                                            }
+                                            CType::Struct(key) | CType::Union(key) => self
+                                                .types
+                                                .borrow_struct_layouts()
+                                                .get(&**key)
+                                                .cloned()?,
                                             _ => return None,
                                         };
-                                        return self.apply_field_chain_offsets(&global_name, base_off, &start_layout, &fields);
+                                        return self.apply_field_chain_offsets(
+                                            &global_name,
+                                            base_off,
+                                            &start_layout,
+                                            &fields,
+                                        );
                                     }
                                     return None;
                                 }
@@ -866,13 +908,17 @@ impl Lowerer {
         for field_name in fields.iter().rev() {
             let mut found = false;
             // Try field_offset which handles anonymous structs/unions
-            if let Some((foff, fty)) = current_layout.field_offset(field_name, &*self.types.borrow_struct_layouts()) {
+            if let Some((foff, fty)) =
+                current_layout.field_offset(field_name, &*self.types.borrow_struct_layouts())
+            {
                 total_offset += foff as i64;
                 current_layout = match &fty {
-                    CType::Struct(key) | CType::Union(key) => {
-                        self.types.borrow_struct_layouts().get(&**key).cloned()
-                            .unwrap_or_else(StructLayout::empty_rc)
-                    }
+                    CType::Struct(key) | CType::Union(key) => self
+                        .types
+                        .borrow_struct_layouts()
+                        .get(&**key)
+                        .cloned()
+                        .unwrap_or_else(StructLayout::empty_rc),
                     _ => StructLayout::empty_rc(),
                 };
                 found = true;
@@ -884,7 +930,10 @@ impl Lowerer {
         if total_offset == 0 {
             Some(GlobalInit::GlobalAddr(global_name.to_string()))
         } else {
-            Some(GlobalInit::GlobalAddrOffset(global_name.to_string(), total_offset))
+            Some(GlobalInit::GlobalAddrOffset(
+                global_name.to_string(),
+                total_offset,
+            ))
         }
     }
 
@@ -904,7 +953,8 @@ impl Lowerer {
         // The global should be an array of structs.
         let ginfo = self.globals.get(&global_name)?;
         let layout = ginfo.struct_layout.clone()?;
-        let (field_offset, _field_ty) = layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
+        let (field_offset, _field_ty) =
+            layout.field_offset(field, &*self.types.borrow_struct_layouts())?;
         let total_offset = base_offset + field_offset as i64;
         if total_offset == 0 {
             Some(GlobalInit::GlobalAddr(global_name))

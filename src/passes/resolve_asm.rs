@@ -23,14 +23,7 @@
 //! - Extended Arithmetic Coverage: Resolves `GlobalAddr`, `GEP`, `Add`, `Sub`, `Cast`,
 //!   `Copy`, and constant-valued `Value` operands with overflow protection.
 
-use crate::ir::reexports::{
-    Instruction,
-    IrBinOp,
-    IrFunction,
-    IrModule,
-    Operand,
-    Value,
-};
+use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrModule, Operand, Value};
 
 /// Resolve InlineAsm input symbols across all functions in the module.
 pub(crate) fn resolve_inline_asm_symbols(module: &mut IrModule) {
@@ -67,7 +60,12 @@ fn resolve_in_function(func: &mut IrFunction) {
     let mut has_unresolved_asm = false;
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::InlineAsm { inputs, input_symbols, .. } = inst {
+            if let Instruction::InlineAsm {
+                inputs,
+                input_symbols,
+                ..
+            } = inst
+            {
                 for (i, (constraint, operand, _)) in inputs.iter().enumerate() {
                     if i < input_symbols.len()
                         && input_symbols[i].is_none()
@@ -105,12 +103,16 @@ fn resolve_in_function(func: &mut IrFunction) {
                         defs[dest.0 as usize] = Some(DefRef::GlobalAddr(name.as_str()));
                     }
                 }
-                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => {
                     if (dest.0 as usize) <= max_id {
                         defs[dest.0 as usize] = Some(DefRef::Gep(*base, *offset));
                     }
                 }
-                Instruction::BinOp { dest, op, lhs, rhs, .. } => {
+                Instruction::BinOp {
+                    dest, op, lhs, rhs, ..
+                } => {
                     if (dest.0 as usize) <= max_id {
                         match op {
                             IrBinOp::Add => defs[dest.0 as usize] = Some(DefRef::Add(*lhs, *rhs)),
@@ -146,7 +148,12 @@ fn resolve_in_function(func: &mut IrFunction) {
     let mut resolutions: Vec<(usize, usize, usize, String)> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::InlineAsm { inputs, input_symbols, .. } = inst {
+            if let Instruction::InlineAsm {
+                inputs,
+                input_symbols,
+                ..
+            } = inst
+            {
                 for (i, (constraint, operand, _)) in inputs.iter().enumerate() {
                     if i >= input_symbols.len() {
                         break;
@@ -168,8 +175,11 @@ fn resolve_in_function(func: &mut IrFunction) {
     }
     drop(defs);
     for (bi, ii, i, sym) in resolutions {
-        if let Some(Instruction::InlineAsm { input_symbols, .. }) =
-            func.blocks.get_mut(bi).and_then(|b| b.instructions.get_mut(ii)) {
+        if let Some(Instruction::InlineAsm { input_symbols, .. }) = func
+            .blocks
+            .get_mut(bi)
+            .and_then(|b| b.instructions.get_mut(ii))
+        {
             if i < input_symbols.len() {
                 input_symbols[i] = Some(sym);
             }
@@ -262,7 +272,9 @@ fn try_resolve_global_with_offset<'a>(
             if let Operand::Value(base) = lhs {
                 if let Some(off) = eval_const_operand(rhs, defs, 0) {
                     if let Some(new_offset) = accum_offset.checked_add(off) {
-                        if let Some(res) = try_resolve_global_with_offset(base, defs, new_offset, depth + 1) {
+                        if let Some(res) =
+                            try_resolve_global_with_offset(base, defs, new_offset, depth + 1)
+                        {
                             return Some(res);
                         }
                     }
@@ -272,7 +284,9 @@ fn try_resolve_global_with_offset<'a>(
             if let Operand::Value(base) = rhs {
                 if let Some(off) = eval_const_operand(lhs, defs, 0) {
                     if let Some(new_offset) = accum_offset.checked_add(off) {
-                        if let Some(res) = try_resolve_global_with_offset(base, defs, new_offset, depth + 1) {
+                        if let Some(res) =
+                            try_resolve_global_with_offset(base, defs, new_offset, depth + 1)
+                        {
                             return Some(res);
                         }
                     }
@@ -290,12 +304,10 @@ fn try_resolve_global_with_offset<'a>(
             }
             None
         }
-        DefRef::Cast(src) => {
-            match src {
-                Operand::Value(v) => try_resolve_global_with_offset(v, defs, accum_offset, depth + 1),
-                _ => None,
-            }
-        }
+        DefRef::Cast(src) => match src {
+            Operand::Value(v) => try_resolve_global_with_offset(v, defs, accum_offset, depth + 1),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -339,8 +351,8 @@ mod tests {
     }
 
     fn get_symbol(func: &IrFunction, block: usize, inst: usize) -> Option<String> {
-        if let Instruction::InlineAsm { input_symbols, .. } =
-            &func.blocks[block].instructions[inst] {
+        if let Instruction::InlineAsm { input_symbols, .. } = &func.blocks[block].instructions[inst]
+        {
             input_symbols[0].clone()
         } else {
             panic!("expected InlineAsm at block {} inst {}", block, inst);
@@ -351,7 +363,10 @@ mod tests {
     fn resolve_gep_chain() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "boot_cpu_data".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "boot_cpu_data".to_string(),
+            },
             Instruction::GetElementPtr {
                 dest: Value(2),
                 base: Value(1),
@@ -363,14 +378,20 @@ mod tests {
         func.next_value_id = 3;
 
         resolve_in_function(&mut func);
-        assert_eq!(get_symbol(&func, 0, 2), Some("boot_cpu_data+74".to_string()));
+        assert_eq!(
+            get_symbol(&func, 0, 2),
+            Some("boot_cpu_data+74".to_string())
+        );
     }
 
     #[test]
     fn resolve_add_sub_cast_chain() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "kernel_table".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "kernel_table".to_string(),
+            },
             Instruction::Cast {
                 dest: Value(2),
                 src: Operand::Value(Value(1)),
@@ -403,7 +424,10 @@ mod tests {
     fn resolve_commuted_add() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "commuted_sym".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "commuted_sym".to_string(),
+            },
             Instruction::BinOp {
                 dest: Value(2),
                 op: IrBinOp::Add,
@@ -423,7 +447,10 @@ mod tests {
     fn resolve_negative_offset() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "data_block".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "data_block".to_string(),
+            },
             Instruction::BinOp {
                 dest: Value(2),
                 op: IrBinOp::Sub,
@@ -443,7 +470,10 @@ mod tests {
     fn resolve_zero_offset_bare_symbol() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "base_sym".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "base_sym".to_string(),
+            },
             Instruction::GetElementPtr {
                 dest: Value(2),
                 base: Value(1),
@@ -462,8 +492,14 @@ mod tests {
     fn resolve_value_constant_operand() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "table_sym".to_string() },
-            Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(32)) },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "table_sym".to_string(),
+            },
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Const(IrConst::I64(32)),
+            },
             Instruction::BinOp {
                 dest: Value(3),
                 op: IrBinOp::Add,
@@ -484,8 +520,14 @@ mod tests {
         // GEP(base, idx << 3) with constant idx: offset = 5 << 3 = 40
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "arr8".to_string() },
-            Instruction::Copy { dest: Value(2), src: Operand::Const(IrConst::I64(5)) },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "arr8".to_string(),
+            },
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Const(IrConst::I64(5)),
+            },
             Instruction::BinOp {
                 dest: Value(3),
                 op: IrBinOp::Shl,
@@ -511,14 +553,20 @@ mod tests {
     fn ignore_non_immediate_constraint() {
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "data_sym".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "data_sym".to_string(),
+            },
             make_asm("r", Operand::Value(Value(1))),
         ];
         func.next_value_id = 2;
 
         resolve_in_function(&mut func);
-        assert_eq!(get_symbol(&func, 0, 1), None,
-            "register constraints must not be symbol-resolved");
+        assert_eq!(
+            get_symbol(&func, 0, 1),
+            None,
+            "register constraints must not be symbol-resolved"
+        );
     }
 
     #[test]
@@ -530,7 +578,10 @@ mod tests {
             input_symbols[0] = Some("preset".to_string());
         }
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "other_sym".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "other_sym".to_string(),
+            },
             asm,
         ];
         func.next_value_id = 2;
@@ -550,7 +601,10 @@ mod tests {
             source_spans: Vec::new(),
         });
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "xsym".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "xsym".to_string(),
+            },
             Instruction::GetElementPtr {
                 dest: Value(2),
                 base: Value(1),
@@ -570,8 +624,14 @@ mod tests {
         // Functions without InlineAsm must be untouched (fast path).
         let mut func = make_test_func();
         func.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(1), name: "g".to_string() },
-            Instruction::Copy { dest: Value(2), src: Operand::Value(Value(1)) },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "g".to_string(),
+            },
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Value(Value(1)),
+            },
         ];
         func.next_value_id = 3;
         let before = format!("{:?}", func.blocks[0].instructions);

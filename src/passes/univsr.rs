@@ -22,15 +22,7 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{
-    BlockId,
-    Instruction,
-    IrBinOp,
-    IrConst,
-    IrFunction,
-    Operand,
-    Value,
-};
+use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Information about an IVSR-created pointer IV that should be reverted to indexed form.
 #[derive(Debug, Clone)]
@@ -81,7 +73,11 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     let debug = std::env::var("LCCC_DEBUG_UNIVSR").is_ok();
     let ivsr_pointers = detect_ivsr_pointer_ivs(func);
     if debug {
-        eprintln!("[univsr] {}: {} candidate pointer IVs", func.name, ivsr_pointers.len());
+        eprintln!(
+            "[univsr] {}: {} candidate pointer IVs",
+            func.name,
+            ivsr_pointers.len()
+        );
     }
     if ivsr_pointers.is_empty() {
         return 0;
@@ -91,16 +87,26 @@ pub(crate) fn run_univsr(func: &mut IrFunction) -> usize {
     for ptr_iv in &ivsr_pointers {
         if !is_valid_sib_scale(ptr_iv.stride) {
             if debug {
-                eprintln!("[univsr]   skip: stride {} not SIB-encodable", ptr_iv.stride);
+                eprintln!(
+                    "[univsr]   skip: stride {} not SIB-encodable",
+                    ptr_iv.stride
+                );
             }
             continue;
         }
 
         let ok = revert_pointer_iv(func, ptr_iv);
         if debug {
-            eprintln!("[univsr]   phi v{} stride {} -> {}",
-                ptr_iv.ptr_phi_dest.0, ptr_iv.stride,
-                if ok { "REVERTED" } else { "rejected (uses/safety)" });
+            eprintln!(
+                "[univsr]   phi v{} stride {} -> {}",
+                ptr_iv.ptr_phi_dest.0,
+                ptr_iv.stride,
+                if ok {
+                    "REVERTED"
+                } else {
+                    "rejected (uses/safety)"
+                }
+            );
         }
         if ok {
             num_reverted += 1;
@@ -184,7 +190,10 @@ fn analyze_pointer_phi(
 fn find_gep_with_const_offset(func: &IrFunction, val_id: u32) -> Option<(Value, i64)> {
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+            if let Instruction::GetElementPtr {
+                dest, base, offset, ..
+            } = inst
+            {
                 if dest.0 == val_id {
                     let stride = match offset {
                         Operand::Const(c) => c.to_i64()?,
@@ -205,7 +214,10 @@ fn extract_base_from_init(func: &IrFunction, init_op: &Operand) -> Option<(Value
             // Check if init value is a GEP (e.g. %init = GEP(%arr, 0) or GEP(%arr, offset))
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    if let Instruction::GetElementPtr { dest, base, offset, .. } = inst {
+                    if let Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } = inst
+                    {
                         if dest.0 == v.0 {
                             let init_offset = match offset {
                                 Operand::Const(c) => c.to_i64().unwrap_or(0),
@@ -254,7 +266,11 @@ fn find_index_iv_in_header(func: &IrFunction, header: BlockId) -> Option<Value> 
 }
 
 /// Check that a Phi is a canonical counter: init == 0 and backedge = phi + 1.
-fn is_canonical_counter_iv(func: &IrFunction, dest: &Value, incoming: &[(Operand, BlockId)]) -> bool {
+fn is_canonical_counter_iv(
+    func: &IrFunction,
+    dest: &Value,
+    incoming: &[(Operand, BlockId)],
+) -> bool {
     let mut has_unit_increment = false;
     let mut has_zero_init = false;
 
@@ -279,29 +295,46 @@ fn is_canonical_counter_iv(func: &IrFunction, dest: &Value, incoming: &[(Operand
 }
 
 /// Check if `val` is defined as `Add(%phi, 1)`, possibly through Copy/Cast chains.
-fn is_value_unit_increment_of(func: &IrFunction, val: Value, phi_dest: Value, depth: usize) -> bool {
+fn is_value_unit_increment_of(
+    func: &IrFunction,
+    val: Value,
+    phi_dest: Value,
+    depth: usize,
+) -> bool {
     if depth > 8 {
         return false;
     }
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::BinOp { dest: bd, op: IrBinOp::Add, lhs, rhs, .. } if bd.0 == val.0 => {
-                    match (lhs, rhs) {
-                        (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => {
-                            if v.0 == phi_dest.0 && c.to_i64() == Some(1) {
-                                return true;
-                            }
+                Instruction::BinOp {
+                    dest: bd,
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } if bd.0 == val.0 => match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(c))
+                    | (Operand::Const(c), Operand::Value(v)) => {
+                        if v.0 == phi_dest.0 && c.to_i64() == Some(1) {
+                            return true;
                         }
-                        _ => {}
                     }
-                }
-                Instruction::Copy { dest: cd, src: Operand::Value(v) } if cd.0 == val.0 => {
+                    _ => {}
+                },
+                Instruction::Copy {
+                    dest: cd,
+                    src: Operand::Value(v),
+                } if cd.0 == val.0 => {
                     if is_value_unit_increment_of(func, *v, phi_dest, depth + 1) {
                         return true;
                     }
                 }
-                Instruction::Cast { dest: cd, src: Operand::Value(v), .. } if cd.0 == val.0 => {
+                Instruction::Cast {
+                    dest: cd,
+                    src: Operand::Value(v),
+                    ..
+                } if cd.0 == val.0 => {
                     if is_value_unit_increment_of(func, *v, phi_dest, depth + 1) {
                         return true;
                     }
@@ -364,18 +397,29 @@ fn validate_transformation_safety(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> 
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::GetElementPtr { dest, base, offset: Operand::Const(_), .. }
-                        if base.0 == cur && dest.0 != gep_id => {
+                    Instruction::GetElementPtr {
+                        dest,
+                        base,
+                        offset: Operand::Const(_),
+                        ..
+                    } if base.0 == cur && dest.0 != gep_id => {
                         if derived.insert(dest.0) {
                             worklist.push(dest.0);
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(v) } if v.0 == cur => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(v),
+                    } if v.0 == cur => {
                         if derived.insert(dest.0) {
                             worklist.push(dest.0);
                         }
                     }
-                    Instruction::Cast { dest, src: Operand::Value(v), .. } if v.0 == cur => {
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(v),
+                        ..
+                    } if v.0 == cur => {
                         if derived.insert(dest.0) {
                             worklist.push(dest.0);
                         }
@@ -398,16 +442,16 @@ fn validate_transformation_safety(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> 
                 // A tracked value STORED AS DATA escapes - reject.
                 Instruction::Store { val, .. } => op_is_tracked(val),
                 // The derived chain itself.
-                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => {
                     // Any GEP consuming a tracked value as its base must be
                     // itself tracked (or be the increment GEP); a tracked
                     // value used as a GEP OFFSET escapes.
                     (is_tracked(base.0) && !is_tracked(dest.0) && dest.0 != gep_id)
                         || op_is_tracked(offset)
                 }
-                Instruction::Copy { dest, src } => {
-                    op_is_tracked(src) && !derived.contains(&dest.0)
-                }
+                Instruction::Copy { dest, src } => op_is_tracked(src) && !derived.contains(&dest.0),
                 Instruction::Cast { dest, src, .. } => {
                     op_is_tracked(src) && !derived.contains(&dest.0)
                 }
@@ -444,9 +488,18 @@ fn validate_transformation_safety(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> 
         use crate::ir::reexports::Terminator;
         match &block.terminator {
             Terminator::Return(Some(Operand::Value(v))) if is_tracked(v.0) => return false,
-            Terminator::CondBranch { cond: Operand::Value(v), .. } if is_tracked(v.0) => return false,
-            Terminator::Switch { val: Operand::Value(v), .. } if is_tracked(v.0) => return false,
-            Terminator::IndirectBranch { target: Operand::Value(v), .. } if is_tracked(v.0) => return false,
+            Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            } if is_tracked(v.0) => return false,
+            Terminator::Switch {
+                val: Operand::Value(v),
+                ..
+            } if is_tracked(v.0) => return false,
+            Terminator::IndirectBranch {
+                target: Operand::Value(v),
+                ..
+            } if is_tracked(v.0) => return false,
             _ => {}
         }
     }
@@ -507,7 +560,9 @@ fn find_transitive_ptr_uses(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> Vec<Pt
                             use_val_id: val_to_check.0,
                         });
                     }
-                    Instruction::GetElementPtr { dest, base, offset, .. } if base.0 == val_to_check.0 => {
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } if base.0 == val_to_check.0 => {
                         // Skip the loop backedge increment GEP
                         if dest.0 != ptr_iv.increment_gep_dest.0 {
                             if let Operand::Const(c) = offset {
@@ -519,12 +574,19 @@ fn find_transitive_ptr_uses(func: &IrFunction, ptr_iv: &IvsrPointerIV) -> Vec<Pt
                             }
                         }
                     }
-                    Instruction::Copy { dest, src: Operand::Value(v) } if v.0 == val_to_check.0 => {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(v),
+                    } if v.0 == val_to_check.0 => {
                         if visited_values.insert(dest.0) {
                             worklist.push((*dest, current_offset));
                         }
                     }
-                    Instruction::Cast { dest, src: Operand::Value(v), .. } if v.0 == val_to_check.0 => {
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(v),
+                        ..
+                    } if v.0 == val_to_check.0 => {
                         if visited_values.insert(dest.0) {
                             worklist.push((*dest, current_offset));
                         }
@@ -804,7 +866,9 @@ impl DestValue for Instruction {
             | Instruction::AtomicRmw { dest, .. }
             | Instruction::AtomicCmpxchg { dest, .. }
             | Instruction::AtomicLoad { dest, .. }
-            | Instruction::Intrinsic { dest: Some(dest), .. }
+            | Instruction::Intrinsic {
+                dest: Some(dest), ..
+            }
             | Instruction::Select { dest, .. }
             | Instruction::LabelAddr { dest, .. }
             | Instruction::GetReturnF64Second { dest }
@@ -853,15 +917,21 @@ mod tests {
     }
 
     fn load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Load { volatile: false,
-            dest: Value(dest), ptr: Value(ptr), ty,
+        Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
             seg_override: AddressSpace::Default,
         }
     }
 
     fn store_val(val: u32, ptr: u32, ty: IrType) -> Instruction {
-        Instruction::Store { volatile: false,
-            val: Operand::Value(Value(val)), ptr: Value(ptr), ty,
+        Instruction::Store {
+            volatile: false,
+            val: Operand::Value(Value(val)),
+            ptr: Value(ptr),
+            ty,
             seg_override: AddressSpace::Default,
         }
     }
@@ -917,9 +987,10 @@ mod tests {
     ///         %7 = gep %2, stride
     fn build_canonical(stride: i64, load_ty: IrType) -> IrFunction {
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
@@ -938,21 +1009,40 @@ mod tests {
         assert_eq!(count, 1);
 
         // The load must no longer address the (now dead) pointer phi.
-        let load_ptr = func.blocks[1].instructions.iter().find_map(|inst| {
-            if let Instruction::Load { ptr, .. } = inst { Some(ptr.0) } else { None }
-        }).expect("load survived");
-        assert_ne!(load_ptr, 2, "load must be rewritten away from the pointer phi");
+        let load_ptr = func.blocks[1]
+            .instructions
+            .iter()
+            .find_map(|inst| {
+                if let Instruction::Load { ptr, .. } = inst {
+                    Some(ptr.0)
+                } else {
+                    None
+                }
+            })
+            .expect("load survived");
+        assert_ne!(
+            load_ptr, 2,
+            "load must be rewritten away from the pointer phi"
+        );
 
         // Stride 4 -> a Shl by 2 must exist.
         let has_shl = func.blocks[1].instructions.iter().any(|inst| {
-            matches!(inst, Instruction::BinOp { op: IrBinOp::Shl, .. })
+            matches!(
+                inst,
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    ..
+                }
+            )
         });
         assert!(has_shl, "stride 4 must scale the index with Shl");
 
         // The pointer IV cycle is broken: phi and increment GEP became Copies.
-        let copies = func.blocks[1].instructions.iter().filter(|inst| {
-            matches!(inst, Instruction::Copy { .. })
-        }).count();
+        let copies = func.blocks[1]
+            .instructions
+            .iter()
+            .filter(|inst| matches!(inst, Instruction::Copy { .. }))
+            .count();
         assert_eq!(copies, 2, "phi + increment GEP must both become Copy(base)");
     }
 
@@ -963,7 +1053,13 @@ mod tests {
         assert_eq!(count, 1);
 
         let has_shl = func.blocks[1].instructions.iter().any(|inst| {
-            matches!(inst, Instruction::BinOp { op: IrBinOp::Shl, .. })
+            matches!(
+                inst,
+                Instruction::BinOp {
+                    op: IrBinOp::Shl,
+                    ..
+                }
+            )
         });
         assert!(!has_shl, "stride 1 must not emit a Shl");
     }
@@ -980,17 +1076,18 @@ mod tests {
         // Loop body accesses p[0] and p[1] (via +4 GEP): the derived access
         // must keep its +4 displacement after reversion.
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
             load(3, 2, IrType::I32),
-            gep_const(4, 2, 4),          // q = p + 4 bytes
+            gep_const(4, 2, 4), // q = p + 4 bytes
             load(5, 4, IrType::I32),
             counter_inc(6, 1),
-            gep_const(7, 2, 8),          // stride 8
+            gep_const(7, 2, 8), // stride 8
         ];
         f.next_value_id = 11;
 
@@ -1002,7 +1099,10 @@ mod tests {
                 Instruction::BinOp { op: IrBinOp::Add, rhs: Operand::Const(c), .. }
                     if c.to_i64() == Some(4))
         });
-        assert!(has_add4, "the +4 displacement of the second access must be preserved");
+        assert!(
+            has_add4,
+            "the +4 displacement of the second access must be preserved"
+        );
     }
 
     #[test]
@@ -1010,9 +1110,10 @@ mod tests {
         // Three accesses through the same pointer in one block: exactly one
         // Shl (scale computation) may be emitted.
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
@@ -1025,9 +1126,19 @@ mod tests {
         f.next_value_id = 11;
 
         assert_eq!(run_univsr(&mut f), 1);
-        let shl_count = f.blocks[1].instructions.iter().filter(|inst| {
-            matches!(inst, Instruction::BinOp { op: IrBinOp::Shl, .. })
-        }).count();
+        let shl_count = f.blocks[1]
+            .instructions
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst,
+                    Instruction::BinOp {
+                        op: IrBinOp::Shl,
+                        ..
+                    }
+                )
+            })
+            .count();
         assert_eq!(shl_count, 1, "scale computation must be CSE'd per block");
     }
 
@@ -1052,15 +1163,16 @@ mod tests {
         // Counter starts at 5, not 0: base + i*stride would address the
         // wrong element. Must be rejected.
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             Instruction::Phi {
                 dest: Value(1),
                 ty: IrType::I64,
                 incoming: vec![
-                    (Operand::Const(IrConst::I64(5)), BlockId(0)),   // init 5!
+                    (Operand::Const(IrConst::I64(5)), BlockId(0)), // init 5!
                     (Operand::Value(Value(6)), BlockId(1)),
                 ],
             },
@@ -1070,7 +1182,11 @@ mod tests {
             gep_const(7, 2, 4),
         ];
         f.next_value_id = 11;
-        assert_eq!(run_univsr(&mut f), 0, "counter with init!=0 must be rejected");
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "counter with init!=0 must be rejected"
+        );
     }
 
     #[test]
@@ -1078,9 +1194,10 @@ mod tests {
         // Counter steps by 2: pointer moves stride bytes per iteration but
         // the index moves 2 - the products diverge. Must be rejected.
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
@@ -1089,13 +1206,17 @@ mod tests {
                 dest: Value(6),
                 op: IrBinOp::Add,
                 lhs: Operand::Value(Value(1)),
-                rhs: Operand::Const(IrConst::I64(2)),   // step 2!
+                rhs: Operand::Const(IrConst::I64(2)), // step 2!
                 ty: IrType::I64,
             },
             gep_const(7, 2, 4),
         ];
         f.next_value_id = 11;
-        assert_eq!(run_univsr(&mut f), 0, "counter with step!=1 must be rejected");
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "counter with step!=1 must be rejected"
+        );
     }
 
     #[test]
@@ -1105,8 +1226,14 @@ mod tests {
         // condition never advance -> infinite loop. Must be rejected.
         let mut f = make_test_function();
         f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-            Instruction::GlobalAddr { dest: Value(11), name: "end".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(10),
+                name: "arr".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(11),
+                name: "end".to_string(),
+            },
         ];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
@@ -1117,22 +1244,26 @@ mod tests {
             Instruction::Cmp {
                 dest: Value(8),
                 op: IrCmpOp::Ne,
-                lhs: Operand::Value(Value(7)),   // increment GEP in compare!
+                lhs: Operand::Value(Value(7)), // increment GEP in compare!
                 rhs: Operand::Value(Value(11)),
                 ty: IrType::Ptr,
             },
         ];
         f.next_value_id = 12;
-        assert_eq!(run_univsr(&mut f), 0,
-            "pointer-exit-condition loops must not be reverted");
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "pointer-exit-condition loops must not be reverted"
+        );
     }
 
     #[test]
     fn reject_pointer_escaping_to_call() {
         let mut f = make_test_function();
-        f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-        ];
+        f.blocks[0].instructions = vec![Instruction::GlobalAddr {
+            dest: Value(10),
+            name: "arr".to_string(),
+        }];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
@@ -1142,30 +1273,44 @@ mod tests {
                 // stays robust against new ABI metadata fields.
                 let mut info: crate::ir::reexports::CallInfo = Default::default();
                 info.dest = None;
-                info.args = vec![Operand::Value(Value(2))];   // phi escapes!
+                info.args = vec![Operand::Value(Value(2))]; // phi escapes!
                 info.arg_types = vec![IrType::Ptr];
                 info.return_type = IrType::Void;
-                Instruction::Call { func: "consume".to_string(), info }
+                Instruction::Call {
+                    func: "consume".to_string(),
+                    info,
+                }
             },
             counter_inc(6, 1),
             gep_const(7, 2, 4),
         ];
         f.next_value_id = 11;
-        assert_eq!(run_univsr(&mut f), 0, "pointer escaping to a call must be rejected");
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "pointer escaping to a call must be rejected"
+        );
     }
 
     #[test]
     fn reject_pointer_stored_as_data() {
         let mut f = make_test_function();
         f.blocks[0].instructions = vec![
-            Instruction::GlobalAddr { dest: Value(10), name: "arr".to_string() },
-            Instruction::GlobalAddr { dest: Value(11), name: "slot".to_string() },
+            Instruction::GlobalAddr {
+                dest: Value(10),
+                name: "arr".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(11),
+                name: "slot".to_string(),
+            },
         ];
         f.blocks[1].instructions = vec![
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
-            Instruction::Store { volatile: false,
-                val: Operand::Value(Value(2)),   // phi stored as DATA!
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(2)), // phi stored as DATA!
                 ptr: Value(11),
                 ty: IrType::Ptr,
                 seg_override: AddressSpace::Default,
@@ -1174,16 +1319,17 @@ mod tests {
             gep_const(7, 2, 4),
         ];
         f.next_value_id = 12;
-        assert_eq!(run_univsr(&mut f), 0, "pointer stored as data must be rejected");
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "pointer stored as data must be rejected"
+        );
     }
 
     #[test]
     fn no_ptr_phi_fast_path() {
         let mut f = make_test_function();
-        f.blocks[1].instructions = vec![
-            counter_phi(1, 6),
-            counter_inc(6, 1),
-        ];
+        f.blocks[1].instructions = vec![counter_phi(1, 6), counter_inc(6, 1)];
         f.next_value_id = 7;
         assert_eq!(run_univsr(&mut f), 0);
     }

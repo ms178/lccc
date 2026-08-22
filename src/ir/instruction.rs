@@ -789,7 +789,6 @@ impl Instruction {
         }
     }
 
-    
     /// Mutably visit every Operand stored in this instruction.
     ///
     /// This is the mutation counterpart to `for_each_used_value`. Keeping the
@@ -807,8 +806,7 @@ impl Instruction {
             | Instruction::AtomicInc { ptr: size, .. } => f(size),
             Instruction::PgoCounterInc { .. } => {}
             Instruction::Store { val, .. } => f(val),
-            Instruction::BinOp { lhs, rhs, .. }
-            | Instruction::Cmp { lhs, rhs, .. } => {
+            Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
                 f(lhs);
                 f(rhs);
             }

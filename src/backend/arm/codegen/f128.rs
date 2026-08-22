@@ -14,13 +14,13 @@
 //! - f128_load_sources tracks which alloca/offset each F128 value was loaded
 //!   from, enabling full-precision reloads for comparisons and casts.
 
-use crate::ir::reexports::{Operand, Value};
-use crate::common::types::IrType;
-use crate::backend::state::{StackSlot, SlotAddr};
-use crate::backend::regalloc::PhysReg;
-use crate::backend::traits::ArchCodegen;
+use super::emit::{callee_saved_name, ArmCodegen};
 use crate::backend::f128_softfloat::F128SoftFloat;
-use super::emit::{ArmCodegen, callee_saved_name};
+use crate::backend::regalloc::PhysReg;
+use crate::backend::state::{SlotAddr, StackSlot};
+use crate::backend::traits::ArchCodegen;
+use crate::common::types::IrType;
+use crate::ir::reexports::{Operand, Value};
 
 impl F128SoftFloat for ArmCodegen {
     fn state(&mut self) -> &mut crate::backend::state::CodegenState {
@@ -65,7 +65,8 @@ impl F128SoftFloat for ArmCodegen {
 
     fn f128_add_offset_to_addr_reg(&mut self, offset: i64) {
         if offset > 0 && offset <= 4095 {
-            self.state.emit_fmt(format_args!("    add x17, x17, #{}", offset));
+            self.state
+                .emit_fmt(format_args!("    add x17, x17, #{}", offset));
         } else {
             self.load_large_imm("x16", offset);
             self.state.emit("    add x17, x17, x16");
@@ -213,14 +214,18 @@ impl F128SoftFloat for ArmCodegen {
     fn f128_move_callee_reg_to_addr_reg(&mut self, val_id: u32) -> bool {
         if let Some(&reg) = self.reg_assignments.get(&val_id) {
             let reg_name = callee_saved_name(reg);
-            self.state.emit_fmt(format_args!("    mov x17, {}", reg_name));
+            self.state
+                .emit_fmt(format_args!("    mov x17, {}", reg_name));
             true
         } else {
             false
         }
     }
 
-    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg) { self.state.emit_fmt(format_args!("    mov x17, {}", callee_saved_name(reg))); }
+    fn f128_move_phys_to_addr_reg(&mut self, reg: PhysReg) {
+        self.state
+            .emit_fmt(format_args!("    mov x17, {}", callee_saved_name(reg)));
+    }
 
     fn f128_move_aligned_to_addr_reg(&mut self) {
         // x9 is the alloca-aligned address register, x17 is the F128 addr register

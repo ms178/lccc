@@ -4,30 +4,29 @@
 //! Handles 32-bit x86 registers (eax, ebx, ecx, edx, esi, edi) and i686
 //! calling conventions (cdecl, ILP32).
 
-use std::borrow::Cow;
-use crate::ir::reexports::{
-    BlockId,
-    IrConst,
-    Operand,
-    Value,
-};
-use crate::common::types::IrType;
-use crate::backend::state::CodegenState;
-use crate::backend::inline_asm::{InlineAsmEmitter, AsmOperandKind, AsmOperand};
-use crate::emit;
 use super::emit::I686Codegen;
+use crate::backend::inline_asm::{AsmOperand, AsmOperandKind, InlineAsmEmitter};
+use crate::backend::state::CodegenState;
+use crate::common::types::IrType;
+use crate::emit;
+use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
+use std::borrow::Cow;
 
 /// i686 scratch XMM registers (SSE available on most i686 targets).
-const I686_XMM_SCRATCH: &[&str] = &["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"];
+const I686_XMM_SCRATCH: &[&str] = &[
+    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+];
 
 impl InlineAsmEmitter for I686Codegen {
-    fn asm_state(&mut self) -> &mut CodegenState { &mut self.state }
+    fn asm_state(&mut self) -> &mut CodegenState {
+        &mut self.state
+    }
 
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint: {regname}
         if c.starts_with('{') && c.ends_with('}') {
-            let reg_name = &c[1..c.len()-1];
+            let reg_name = &c[1..c.len() - 1];
             return AsmOperandKind::Specific(reg_name.to_string());
         }
         // GCC condition code output: =@cc<cond>
@@ -58,10 +57,16 @@ impl InlineAsmEmitter for I686Codegen {
         for ch in c.chars() {
             match ch {
                 'r' | 'q' | 'R' | 'Q' | 'l' => has_gp = true,
-                'g' => { has_gp = true; has_mem = true; has_imm = true; }
+                'g' => {
+                    has_gp = true;
+                    has_mem = true;
+                    has_imm = true;
+                }
                 'x' | 'v' | 'Y' => has_fp = true,
                 'm' | 'o' | 'V' | 'p' => has_mem = true,
-                'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O' => has_imm = true,
+                'i' | 'I' | 'n' | 'N' | 'e' | 'E' | 'K' | 'M' | 'G' | 'H' | 'J' | 'L' | 'O' => {
+                    has_imm = true
+                }
                 'a' if specific.is_none() => specific = Some("eax".to_string()),
                 'b' if specific.is_none() => specific = Some("ebx".to_string()),
                 'c' if specific.is_none() => specific = Some("ecx".to_string()),
@@ -110,7 +115,12 @@ impl InlineAsmEmitter for I686Codegen {
         }
     }
 
-    fn resolve_memory_operand(&mut self, op: &mut AsmOperand, val: &Operand, excluded: &[String]) -> bool {
+    fn resolve_memory_operand(
+        &mut self,
+        op: &mut AsmOperand,
+        val: &Operand,
+        excluded: &[String],
+    ) -> bool {
         if !op.mem_addr.is_empty() {
             return false;
         }
@@ -212,7 +222,8 @@ impl InlineAsmEmitter for I686Codegen {
                             _ => "fldl", // F64 and default
                         };
                         let sr = self.slot_ref(slot);
-                        self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}", fld_instr, sr));
                     }
                 }
                 Operand::Const(c) => {
@@ -229,15 +240,18 @@ impl InlineAsmEmitter for I686Codegen {
                     };
                     if ty == IrType::F32 {
                         self.state.emit("    subl $4, %esp");
-                        self.state.emit_fmt(format_args!("    movl ${}, (%esp)", bits as u32));
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, (%esp)", bits as u32));
                         self.state.emit("    flds (%esp)");
                         self.state.emit("    addl $4, %esp");
                     } else {
                         let lo = bits as u32;
                         let hi = (bits >> 32) as u32;
                         self.state.emit("    subl $8, %esp");
-                        self.state.emit_fmt(format_args!("    movl ${}, (%esp)", lo));
-                        self.state.emit_fmt(format_args!("    movl ${}, 4(%esp)", hi));
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, (%esp)", lo));
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, 4(%esp)", hi));
                         self.state.emit("    fldl (%esp)");
                         self.state.emit("    addl $8, %esp");
                     }
@@ -258,11 +272,13 @@ impl InlineAsmEmitter for I686Codegen {
                             IrType::F64 => "movsd",
                             _ => "movdqu",
                         };
-                        self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
                     }
                 }
                 Operand::Const(_) => {
-                    self.state.emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
+                    self.state
+                        .emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
                 }
             }
             return;
@@ -283,21 +299,33 @@ impl InlineAsmEmitter for I686Codegen {
                     let lo = imm as u32;
                     let hi = (imm as u64 >> 32) as u32;
                     if lo == 0 {
-                        self.state.emit_fmt(format_args!("    xorl %{}, %{}", reg, reg));
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{}, %{}", reg, reg));
                     } else {
-                        self.state.emit_fmt(format_args!("    movl ${}, %{}", lo as i32, reg));
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, %{}", lo as i32, reg));
                     }
                     if hi == 0 {
-                        self.state.emit_fmt(format_args!("    xorl %{}, %{}", reg_hi, reg_hi));
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{}, %{}", reg_hi, reg_hi));
                     } else {
-                        self.state.emit_fmt(format_args!("    movl ${}, %{}", hi as i32, reg_hi));
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, %{}", hi as i32, reg_hi));
                     }
                 } else {
                     let imm32 = imm as i32;
                     if imm32 == 0 {
-                        self.state.emit_fmt(format_args!("    xorl %{}, %{}", Self::reg_to_32(reg), Self::reg_to_32(reg)));
+                        self.state.emit_fmt(format_args!(
+                            "    xorl %{}, %{}",
+                            Self::reg_to_32(reg),
+                            Self::reg_to_32(reg)
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    movl ${}, %{}", imm32, Self::reg_to_32(reg)));
+                        self.state.emit_fmt(format_args!(
+                            "    movl ${}, %{}",
+                            imm32,
+                            Self::reg_to_32(reg)
+                        ));
                     }
                 }
             }
@@ -306,16 +334,25 @@ impl InlineAsmEmitter for I686Codegen {
                     let sr = self.slot_ref(slot);
                     if self.state.is_alloca(v.0) {
                         if let Some(align) = self.state.alloca_over_align(v.0) {
-                            self.state.emit_fmt(format_args!("    leal {}, %{}", sr, reg));
-                            self.state.emit_fmt(format_args!("    addl ${}, %{}", align - 1, reg));
-                            self.state.emit_fmt(format_args!("    andl ${}, %{}", -(align as i32), reg));
+                            self.state
+                                .emit_fmt(format_args!("    leal {}, %{}", sr, reg));
+                            self.state
+                                .emit_fmt(format_args!("    addl ${}, %{}", align - 1, reg));
+                            self.state.emit_fmt(format_args!(
+                                "    andl ${}, %{}",
+                                -(align as i32),
+                                reg
+                            ));
                         } else {
-                            self.state.emit_fmt(format_args!("    leal {}, %{}", sr, reg));
+                            self.state
+                                .emit_fmt(format_args!("    leal {}, %{}", sr, reg));
                         }
                     } else if is_pair {
                         let sr4 = self.slot_ref_offset(slot, 4);
-                        self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
-                        self.state.emit_fmt(format_args!("    movl {}, %{}", sr4, reg_hi));
+                        self.state
+                            .emit_fmt(format_args!("    movl {}, %{}", sr, reg));
+                        self.state
+                            .emit_fmt(format_args!("    movl {}, %{}", sr4, reg_hi));
                     } else {
                         let load_instr = Self::i686_mov_load_for_type(ty);
                         let dest = if Self::is_extending_load(load_instr) {
@@ -323,7 +360,8 @@ impl InlineAsmEmitter for I686Codegen {
                         } else {
                             Self::dest_reg_for_type(reg, ty)
                         };
-                        self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
                     }
                 }
             }
@@ -342,13 +380,15 @@ impl InlineAsmEmitter for I686Codegen {
                 };
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
-                    self.state.emit_fmt(format_args!("    {} {}", fld_instr, sr));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}", fld_instr, sr));
                 } else {
                     self.state.emit("    pushl %ecx");
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
                     self.state.emit_fmt(format_args!("    movl {}, %ecx", sr));
-                    self.state.emit_fmt(format_args!("    {} (%ecx)", fld_instr));
+                    self.state
+                        .emit_fmt(format_args!("    {} (%ecx)", fld_instr));
                     self.state.emit("    popl %ecx");
                     self.esp_adjust -= 4;
                 }
@@ -369,11 +409,14 @@ impl InlineAsmEmitter for I686Codegen {
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, reg));
                 } else if is_pair {
                     let sr4 = self.slot_ref_offset(slot, 4);
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr4, reg_hi));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr4, reg_hi));
                 } else {
                     let load_instr = Self::i686_mov_load_for_type(ty);
                     let dest = if Self::is_extending_load(load_instr) {
@@ -381,14 +424,18 @@ impl InlineAsmEmitter for I686Codegen {
                     } else {
                         Self::dest_reg_for_type(reg, ty)
                     };
-                    self.state.emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, %{}", load_instr, sr, dest));
                 }
             } else {
                 // Indirect slot: the slot contains a pointer to the live storage.
                 if is_pair {
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
-                    self.state.emit_fmt(format_args!("    movl 4(%{}), %{}", reg, reg_hi));
-                    self.state.emit_fmt(format_args!("    movl (%{}), %{}", reg, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movl 4(%{}), %{}", reg, reg_hi));
+                    self.state
+                        .emit_fmt(format_args!("    movl (%{}), %{}", reg, reg));
                 } else if is_xmm {
                     let load_instr = match ty {
                         IrType::F32 => "movss",
@@ -398,41 +445,60 @@ impl InlineAsmEmitter for I686Codegen {
                     self.state.emit("    pushl %ecx");
                     self.esp_adjust += 4;
                     self.state.emit_fmt(format_args!("    movl {}, %ecx", sr));
-                    self.state.emit_fmt(format_args!("    {} (%ecx), %{}", load_instr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    {} (%ecx), %{}", load_instr, reg));
                     self.state.emit("    popl %ecx");
                     self.esp_adjust -= 4;
                 } else {
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr, reg));
                     let load_instr = Self::i686_mov_load_for_type(ty);
                     let dest = if Self::is_extending_load(load_instr) {
                         Self::reg_to_32(reg)
                     } else {
                         Self::dest_reg_for_type(reg, ty)
                     };
-                    self.state.emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, dest));
+                    self.state
+                        .emit_fmt(format_args!("    {} (%{}), %{}", load_instr, reg, dest));
                 }
             }
         }
     }
 
-    fn substitute_template_line(&self, line: &str, operands: &[AsmOperand], gcc_to_internal: &[usize], operand_types: &[IrType], goto_labels: &[(String, BlockId)]) -> String {
+    fn substitute_template_line(
+        &self,
+        line: &str,
+        operands: &[AsmOperand],
+        gcc_to_internal: &[usize],
+        operand_types: &[IrType],
+        goto_labels: &[(String, BlockId)],
+    ) -> String {
         let op_regs: Vec<String> = operands.iter().map(|o| o.reg.clone()).collect();
         let op_names: Vec<Option<String>> = operands.iter().map(|o| o.name.clone()).collect();
-        let op_is_memory: Vec<bool> = operands.iter().map(|o| matches!(o.kind, AsmOperandKind::Memory)).collect();
-        let op_mem_addrs: Vec<String> = operands.iter().map(|o| {
-            if o.seg_prefix.is_empty() {
-                o.mem_addr.clone()
-            } else {
-                format!("{}{}", o.seg_prefix, o.mem_addr)
-            }
-        }).collect();
+        let op_is_memory: Vec<bool> = operands
+            .iter()
+            .map(|o| matches!(o.kind, AsmOperandKind::Memory))
+            .collect();
+        let op_mem_addrs: Vec<String> = operands
+            .iter()
+            .map(|o| {
+                if o.seg_prefix.is_empty() {
+                    o.mem_addr.clone()
+                } else {
+                    format!("{}{}", o.seg_prefix, o.mem_addr)
+                }
+            })
+            .collect();
         let op_imm_values: Vec<Option<i64>> = operands.iter().map(|o| o.imm_value).collect();
-        let op_imm_symbols: Vec<Option<String>> = operands.iter().map(|o| o.imm_symbol.clone()).collect();
+        let op_imm_symbols: Vec<Option<String>> =
+            operands.iter().map(|o| o.imm_symbol.clone()).collect();
 
         let total = operands.len();
         let mut op_types: Vec<IrType> = vec![IrType::I32; total];
         for (i, ty) in operand_types.iter().enumerate() {
-            if i < total { op_types[i] = *ty; }
+            if i < total {
+                op_types[i] = *ty;
+            }
         }
         for (i, op) in operands.iter().enumerate() {
             if let AsmOperandKind::Tied(tied_to) = &op.kind {
@@ -442,10 +508,27 @@ impl InlineAsmEmitter for I686Codegen {
             }
         }
 
-        Self::substitute_i686_asm_operands(line, &op_regs, &op_names, &op_is_memory, &op_mem_addrs, &op_types, gcc_to_internal, goto_labels, &op_imm_values, &op_imm_symbols)
+        Self::substitute_i686_asm_operands(
+            line,
+            &op_regs,
+            &op_names,
+            &op_is_memory,
+            &op_mem_addrs,
+            &op_types,
+            gcc_to_internal,
+            goto_labels,
+            &op_imm_values,
+            &op_imm_symbols,
+        )
     }
 
-    fn store_output_from_reg(&mut self, op: &AsmOperand, ptr: &Value, _constraint: &str, _all_output_regs: &[&str]) {
+    fn store_output_from_reg(
+        &mut self,
+        op: &AsmOperand,
+        ptr: &Value,
+        _constraint: &str,
+        _all_output_regs: &[&str],
+    ) {
         if matches!(op.kind, AsmOperandKind::Memory) {
             return;
         }
@@ -460,13 +543,15 @@ impl InlineAsmEmitter for I686Codegen {
                 };
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
-                    self.state.emit_fmt(format_args!("    {} {}", fstp_instr, sr));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}", fstp_instr, sr));
                 } else {
                     self.state.emit("    pushl %ecx");
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
                     self.state.emit_fmt(format_args!("    movl {}, %ecx", sr));
-                    self.state.emit_fmt(format_args!("    {} (%ecx)", fstp_instr));
+                    self.state
+                        .emit_fmt(format_args!("    {} (%ecx)", fstp_instr));
                     self.state.emit("    popl %ecx");
                     self.esp_adjust -= 4;
                 }
@@ -478,24 +563,32 @@ impl InlineAsmEmitter for I686Codegen {
             let reg = &op.reg;
             let reg8 = Self::reg_to_8l(reg);
             let x86_cond = Self::gcc_cc_to_x86(cond);
-            self.state.emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
-            self.state.emit_fmt(format_args!("    movzbl %{}, %{}", reg8, Self::reg_to_32(reg)));
+            self.state
+                .emit_fmt(format_args!("    set{} %{}", x86_cond, reg8));
+            self.state.emit_fmt(format_args!(
+                "    movzbl %{}, %{}",
+                reg8,
+                Self::reg_to_32(reg)
+            ));
             if let Some(slot) = self.state.get_slot(ptr.0) {
                 let ty = op.operand_type;
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
                     let store_instr = Self::i686_mov_store_for_type(ty);
                     let src = Self::src_reg_for_type(reg, ty);
-                    self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
                 } else {
                     let scratch = if reg != "ecx" { "ecx" } else { "edx" };
                     self.state.emit_fmt(format_args!("    pushl %{}", scratch));
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
                     let store_instr = Self::i686_mov_store_for_type(ty);
                     let src = Self::src_reg_for_type(reg, ty);
-                    self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, src, scratch));
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, (%{})", store_instr, src, scratch));
                     self.state.emit_fmt(format_args!("    popl %{}", scratch));
                     self.esp_adjust -= 4;
                 }
@@ -517,7 +610,8 @@ impl InlineAsmEmitter for I686Codegen {
                         IrType::F64 => "movsd",
                         _ => "movdqu",
                     };
-                    self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, reg, sr));
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, reg, sr));
                 } else {
                     let store_instr = match ty {
                         IrType::F32 => "movss",
@@ -528,7 +622,8 @@ impl InlineAsmEmitter for I686Codegen {
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
                     self.state.emit_fmt(format_args!("    movl {}, %ecx", sr));
-                    self.state.emit_fmt(format_args!("    {} %{}, (%ecx)", store_instr, reg));
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, (%ecx)", store_instr, reg));
                     self.state.emit("    popl %ecx");
                     self.esp_adjust -= 4;
                 }
@@ -536,18 +631,27 @@ impl InlineAsmEmitter for I686Codegen {
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
                     let sr4 = self.slot_ref_offset(slot, 4);
-                    self.state.emit_fmt(format_args!("    movl %{}, {}", reg, sr));
-                    self.state.emit_fmt(format_args!("    movl %{}, {}", reg_hi, sr4));
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, {}", reg, sr));
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, {}", reg_hi, sr4));
                 } else {
-                    let scratch = if reg != "ecx" && reg_hi != "ecx" { "ecx" }
-                        else if reg != "edx" && reg_hi != "edx" { "edx" }
-                        else { "esi" };
+                    let scratch = if reg != "ecx" && reg_hi != "ecx" {
+                        "ecx"
+                    } else if reg != "edx" && reg_hi != "edx" {
+                        "edx"
+                    } else {
+                        "esi"
+                    };
                     self.state.emit_fmt(format_args!("    pushl %{}", scratch));
                     self.esp_adjust += 4;
                     let sr = self.slot_ref(slot);
-                    self.state.emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
-                    self.state.emit_fmt(format_args!("    movl %{}, (%{})", reg, scratch));
-                    self.state.emit_fmt(format_args!("    movl %{}, 4(%{})", reg_hi, scratch));
+                    self.state
+                        .emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, (%{})", reg, scratch));
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, 4(%{})", reg_hi, scratch));
                     self.state.emit_fmt(format_args!("    popl %{}", scratch));
                     self.esp_adjust -= 4;
                 }
@@ -555,16 +659,19 @@ impl InlineAsmEmitter for I686Codegen {
                 let sr = self.slot_ref(slot);
                 let store_instr = Self::i686_mov_store_for_type(ty);
                 let src = Self::src_reg_for_type(reg, ty);
-                self.state.emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
             } else {
                 let scratch = if reg != "ecx" { "ecx" } else { "edx" };
                 self.state.emit_fmt(format_args!("    pushl %{}", scratch));
                 self.esp_adjust += 4;
                 let sr = self.slot_ref(slot);
-                self.state.emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
+                self.state
+                    .emit_fmt(format_args!("    movl {}, %{}", sr, scratch));
                 let store_instr = Self::i686_mov_store_for_type(ty);
                 let src = Self::src_reg_for_type(reg, ty);
-                self.state.emit_fmt(format_args!("    {} %{}, (%{})", store_instr, src, scratch));
+                self.state
+                    .emit_fmt(format_args!("    {} %{}, (%{})", store_instr, src, scratch));
                 self.state.emit_fmt(format_args!("    popl %{}", scratch));
                 self.esp_adjust -= 4;
             }

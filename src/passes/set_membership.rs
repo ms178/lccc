@@ -137,12 +137,21 @@ fn suffix_parses(insts: &[Instruction]) -> bool {
             }
             if !matches!(
                 insts.get(idx),
-                Some(Instruction::BinOp { op: IrBinOp::Sub, .. })
+                Some(Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    ..
+                })
             ) {
                 return false;
             }
             idx += 1;
-            if !matches!(insts.get(idx), Some(Instruction::Cmp { op: IrCmpOp::Ule, .. })) {
+            if !matches!(
+                insts.get(idx),
+                Some(Instruction::Cmp {
+                    op: IrCmpOp::Ule,
+                    ..
+                })
+            ) {
                 return false;
             }
             idx += 1;
@@ -172,7 +181,13 @@ fn parse_member(
     // Tail value block: `Cmp <op> x, C ; Branch(join)`.
     if insts.len() == 1 {
         if let (
-            Instruction::Cmp { dest, op, lhs, rhs, ty },
+            Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            },
             Terminator::Branch(t),
         ) = (&insts[0], &block.terminator)
         {
@@ -207,8 +222,11 @@ fn parse_member(
         }
     }
 
-    let Terminator::CondBranch { cond: Operand::Value(cv), true_label, false_label } =
-        &block.terminator
+    let Terminator::CondBranch {
+        cond: Operand::Value(cv),
+        true_label,
+        false_label,
+    } = &block.terminator
     else {
         return None;
     };
@@ -244,7 +262,14 @@ fn parse_member(
 
     // Single-compare test: Eq -> maskable, anything else -> Skip.
     if insts.len() == 1 {
-        let Instruction::Cmp { dest, op, lhs, rhs, ty } = &insts[0] else {
+        let Instruction::Cmp {
+            dest,
+            op,
+            lhs,
+            rhs,
+            ty,
+        } = &insts[0]
+        else {
             return None;
         };
         if dest.0 != cv.0 || !root_ty_ok(*ty) {
@@ -286,7 +311,13 @@ fn parse_member(
     let mut idx = 0usize;
     let mut cast_dest: Option<u32> = None;
     let mut root_val: Option<(u32, IrType)> = None;
-    if let Instruction::Cast { dest, src: Operand::Value(s), from_ty, to_ty } = &insts[idx] {
+    if let Instruction::Cast {
+        dest,
+        src: Operand::Value(s),
+        from_ty,
+        to_ty,
+    } = &insts[idx]
+    {
         // Only ZERO-extending widenings keep the unsigned domain aligned
         // with norm_const; a signed narrow source would sign-extend.
         if matches!(from_ty, IrType::U8 | IrType::U16)
@@ -298,7 +329,13 @@ fn parse_member(
             idx += 1;
         }
     }
-    let Some(Instruction::BinOp { dest: sub_d, op: IrBinOp::Sub, lhs, rhs, .. }) = insts.get(idx)
+    let Some(Instruction::BinOp {
+        dest: sub_d,
+        op: IrBinOp::Sub,
+        lhs,
+        rhs,
+        ..
+    }) = insts.get(idx)
     else {
         return None;
     };
@@ -317,8 +354,13 @@ fn parse_member(
         },
         _ => return None,
     }
-    let Some(Instruction::Cmp { dest: cmp_d, op: IrCmpOp::Ule, lhs: cl, rhs: cr, .. }) =
-        insts.get(idx)
+    let Some(Instruction::Cmp {
+        dest: cmp_d,
+        op: IrCmpOp::Ule,
+        lhs: cl,
+        rhs: cr,
+        ..
+    }) = insts.get(idx)
     else {
         return None;
     };
@@ -334,7 +376,12 @@ fn parse_member(
         return None;
     }
     let mut cond_src = cmp_d.0;
-    if let Some(Instruction::Cast { dest, src: Operand::Value(s), .. }) = insts.get(idx) {
+    if let Some(Instruction::Cast {
+        dest,
+        src: Operand::Value(s),
+        ..
+    }) = insts.get(idx)
+    {
         if s.0 == cmp_d.0 {
             cond_src = dest.0;
             idx += 1;
@@ -381,7 +428,11 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         let mut bump = |b: BlockId| *pred_count.entry(b.0).or_insert(0) += 1;
         match &block.terminator {
             Terminator::Branch(t) => bump(*t),
-            Terminator::CondBranch { true_label, false_label, .. } => {
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
                 bump(*true_label);
                 bump(*false_label);
             }
@@ -391,7 +442,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 }
                 bump(*default);
             }
-            Terminator::IndirectBranch { possible_targets, .. } => {
+            Terminator::IndirectBranch {
+                possible_targets, ..
+            } => {
                 for t in possible_targets {
                     bump(*t);
                 }
@@ -399,8 +452,12 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             Terminator::Return(_) | Terminator::Unreachable => {}
         }
     }
-    let label_to_idx: FxHashMap<u32, usize> =
-        func.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+    let label_to_idx: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, i))
+        .collect();
 
     // value id → blocks that use it (terminator + phi uses included).
     let mut use_sites: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
@@ -424,30 +481,31 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
 
     // Every def of a member block must be used only inside that block; the
     // tail's condition may additionally be used exactly by the join phi.
-    let defs_local = |func: &IrFunction,
-                      bi: usize,
-                      skip_prefix: usize,
-                      allow: Option<(u32, usize)>|
-     -> bool {
-        for inst in func.blocks[bi].instructions.iter().skip(skip_prefix) {
-            if let Some(d) = inst.dest() {
-                if let Some(uses) = use_sites.get(&d.0) {
-                    for &ub in uses {
-                        if ub == bi {
-                            continue;
-                        }
-                        match allow {
-                            Some((v, j)) if v == d.0 && ub == j => continue,
-                            _ => return false,
+    let defs_local =
+        |func: &IrFunction, bi: usize, skip_prefix: usize, allow: Option<(u32, usize)>| -> bool {
+            for inst in func.blocks[bi].instructions.iter().skip(skip_prefix) {
+                if let Some(d) = inst.dest() {
+                    if let Some(uses) = use_sites.get(&d.0) {
+                        for &ub in uses {
+                            if ub == bi {
+                                continue;
+                            }
+                            match allow {
+                                Some((v, j)) if v == d.0 && ub == j => continue,
+                                _ => return false,
+                            }
                         }
                     }
                 }
             }
-        }
-        true
-    };
+            true
+        };
 
-    let max_span: i64 = if crate::common::types::target_is_32bit() { 31 } else { 63 };
+    let max_span: i64 = if crate::common::types::target_is_32bit() {
+        31
+    } else {
+        63
+    };
 
     let mut changes = 0usize;
     let mut bi = 0usize;
@@ -490,9 +548,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             continue;
         }
         let const1_from = |label: BlockId| {
-            phi_incoming
-                .iter()
-                .any(|(op, b)| *b == label && matches!(op, Operand::Const(c) if c.to_i64() == Some(1)))
+            phi_incoming.iter().any(|(op, b)| {
+                *b == label && matches!(op, Operand::Const(c) if c.to_i64() == Some(1))
+            })
         };
         if !const1_from(first.label) || !defs_local(func, first.bi, first.prelude_len, None) {
             bi += 1;
@@ -504,7 +562,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         loop {
             let last = chain.last().unwrap();
             let Some(miss) = last.miss else { break };
-            let Some(&next_idx) = label_to_idx.get(&miss.0) else { break };
+            let Some(&next_idx) = label_to_idx.get(&miss.0) else {
+                break;
+            };
             if pred_count.get(&miss.0).copied().unwrap_or(0) != 1 {
                 break;
             }
@@ -533,17 +593,24 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         {
             let mut fold: Option<(usize, usize, i64, i64)> = None; // (early, late, a, b)
             'search: for i in 0..chain.len() {
-                let Kind::Range(a1, b1) = chain[i].kind else { continue };
+                let Kind::Range(a1, b1) = chain[i].kind else {
+                    continue;
+                };
                 if chain[i].is_tail {
                     continue;
                 }
                 for j in i + 1..chain.len() {
-                    let Kind::Range(a2, b2) = chain[j].kind else { continue };
+                    let Kind::Range(a2, b2) = chain[j].kind else {
+                        continue;
+                    };
                     if chain[j].is_tail {
                         continue;
                     }
-                    let (lo_a, lo_b, hi_a, hi_b) =
-                        if a1 < a2 { (a1, b1, a2, b2) } else { (a2, b2, a1, b1) };
+                    let (lo_a, lo_b, hi_a, hi_b) = if a1 < a2 {
+                        (a1, b1, a2, b2)
+                    } else {
+                        (a2, b2, a1, b1)
+                    };
                     if hi_a == lo_a + 32
                         && hi_b == lo_b + 32
                         && (lo_a & 32) == 0
@@ -693,8 +760,16 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             continue;
         }
         let absorbed = best;
-        let lo = absorbed.iter().map(|&i| bounds(chain[i].kind).0).min().unwrap();
-        let hi = absorbed.iter().map(|&i| bounds(chain[i].kind).1).max().unwrap();
+        let lo = absorbed
+            .iter()
+            .map(|&i| bounds(chain[i].kind).0)
+            .min()
+            .unwrap();
+        let hi = absorbed
+            .iter()
+            .map(|&i| bounds(chain[i].kind).1)
+            .max()
+            .unwrap();
         let span = hi - lo;
         let mut mask: u64 = 0;
         for &i in &absorbed {
@@ -763,9 +838,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                 continue; // tail has no miss edge
             }
             let target = next_target_after(li);
-            let is_last_live_after_head = tail_absorbed
-                && Some(li) == last_live_pos
-                && li > head;
+            let is_last_live_after_head = tail_absorbed && Some(li) == last_live_pos && li > head;
             let m_bi = chain[li].bi;
             if target.is_none() && is_last_live_after_head {
                 // Convert to value-carrying tail: Branch(join), phi takes
@@ -853,8 +926,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
 
         // Remove ALL absorbed members' phi entries (head included — its hit
         // now comes from B2).
-        if let Instruction::Phi { incoming, .. } =
-            &mut func.blocks[join_idx].instructions[phi_pos]
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[join_idx].instructions[phi_pos]
         {
             incoming.retain(|(_, b)| !absorbed.iter().any(|&i| chain[i].label == *b));
         }
@@ -900,8 +972,7 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         };
 
         let keep = chain[head].prelude_len;
-        let mut head_insts: Vec<Instruction> =
-            func.blocks[head_bi].instructions[..keep].to_vec();
+        let mut head_insts: Vec<Instruction> = func.blocks[head_bi].instructions[..keep].to_vec();
         head_insts.extend(b1);
         func.blocks[head_bi].instructions = head_insts;
         func.blocks[head_bi].source_spans.clear();
@@ -1041,7 +1112,11 @@ mod tests {
     fn join_block(label: u32, phi: Value, incoming: Vec<(Operand, BlockId)>) -> BasicBlock {
         BasicBlock {
             label: BlockId(label),
-            instructions: vec![Instruction::Phi { dest: phi, ty: IrType::I64, incoming }],
+            instructions: vec![Instruction::Phi {
+                dest: phi,
+                ty: IrType::I64,
+                incoming,
+            }],
             terminator: Terminator::Return(Some(Operand::Value(phi))),
             source_spans: vec![],
         }
@@ -1059,8 +1134,12 @@ mod tests {
     /// Interpret the rewritten function for one byte value: returns the
     /// phi result (0/1). Follows CondBranch/Branch chains from block 0.
     fn eval(f: &IrFunction, x: u8) -> i64 {
-        let idx: FxHashMap<u32, usize> =
-            f.blocks.iter().enumerate().map(|(i, b)| (b.label.0, i)).collect();
+        let idx: FxHashMap<u32, usize> = f
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label.0, i))
+            .collect();
         let mut vals: FxHashMap<u32, i64> = FxHashMap::default();
         vals.insert(1, x as i64); // root value id used by the test builders
         let mut cur = 0usize;
@@ -1069,11 +1148,17 @@ mod tests {
             let block = &f.blocks[cur];
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Cast { dest, src: Operand::Value(s), .. } => {
+                    Instruction::Cast {
+                        dest,
+                        src: Operand::Value(s),
+                        ..
+                    } => {
                         let v = *vals.get(&s.0).unwrap();
                         vals.insert(dest.0, v);
                     }
-                    Instruction::BinOp { dest, op, lhs, rhs, .. } => {
+                    Instruction::BinOp {
+                        dest, op, lhs, rhs, ..
+                    } => {
                         let l = match lhs {
                             Operand::Value(v) => *vals.get(&v.0).unwrap(),
                             Operand::Const(c) => c.to_i64().unwrap(),
@@ -1090,7 +1175,9 @@ mod tests {
                         };
                         vals.insert(dest.0, res);
                     }
-                    Instruction::Cmp { dest, op, lhs, rhs, .. } => {
+                    Instruction::Cmp {
+                        dest, op, lhs, rhs, ..
+                    } => {
                         let l = match lhs {
                             Operand::Value(v) => *vals.get(&v.0).unwrap(),
                             Operand::Const(c) => c.to_i64().unwrap(),
@@ -1137,7 +1224,11 @@ mod tests {
                     prev_label = Some(block.label);
                     cur = idx[&t.0];
                 }
-                Terminator::CondBranch { cond, true_label, false_label } => {
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
                     let c = match cond {
                         Operand::Value(v) => *vals.get(&v.0).unwrap(),
                         Operand::Const(c) => c.to_i64().unwrap(),
@@ -1159,14 +1250,14 @@ mod tests {
         let phi = Value(50);
         let mut f = IrFunction::new("f".into(), IrType::I64, vec![], false);
         f.blocks = vec![
-            range_block(0, x, 97, 25, 90, 1, 60), // a-z
-            range_block(1, x, 65, 25, 90, 2, 66), // A-Z
-            eq_block(2, x, 95, 90, 3, Value(70)), // _
-            eq_block(3, x, 58, 90, 4, Value(71)), // :
+            range_block(0, x, 97, 25, 90, 1, 60),      // a-z
+            range_block(1, x, 65, 25, 90, 2, 66),      // A-Z
+            eq_block(2, x, 95, 90, 3, Value(70)),      // _
+            eq_block(3, x, 58, 90, 4, Value(71)),      // :
             skip_block(4, x, -62i8, 90, 5, Value(72)), // >= 0xc2
-            range_block(5, x, 48, 9, 90, 6, 74),  // 0-9
-            eq_block(6, x, 45, 90, 7, Value(78)), // -
-            tail_block(7, x, 46, 90, Value(79)),  // .
+            range_block(5, x, 48, 9, 90, 6, 74),       // 0-9
+            eq_block(6, x, 45, 90, 7, Value(78)),      // -
+            tail_block(7, x, 46, 90, Value(79)),       // .
             join_block(
                 90,
                 phi,
@@ -1210,14 +1301,21 @@ mod tests {
             }
             total += n;
         }
-        assert!(total >= 2, "case-fold + cluster expected, got {total} changes");
+        assert!(
+            total >= 2,
+            "case-fold + cluster expected, got {total} changes"
+        );
         // Case-fold happened: some block computes x & ~32.
         assert!(
-            f.blocks.iter().any(|b| b.instructions.iter().any(|i| matches!(
+            f.blocks
+                .iter()
+                .any(|b| {
+                    b.instructions.iter().any(|i| matches!(
                 i,
                 Instruction::BinOp { op: IrBinOp::And, rhs: Operand::Const(IrConst::I32(c)), .. }
                     if *c == !32
-            ))),
+            ))
+                }),
             "expected the ASCII case-fold And"
         );
         // ONE BitTest cluster (not two): count BitTest instructions.
@@ -1225,9 +1323,20 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.instructions)
-            .filter(|i| matches!(i, Instruction::BinOp { op: IrBinOp::BitTest, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::BitTest,
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(bt_count, 1, "skip-tolerant collection must build ONE cluster");
+        assert_eq!(
+            bt_count, 1,
+            "skip-tolerant collection must build ONE cluster"
+        );
         // Exhaustive 0..255 equivalence.
         for x in 0..=255u8 {
             assert_eq!(eval(&f, x), reference(x), "mismatch at byte {x}");
@@ -1257,10 +1366,15 @@ mod tests {
         f.next_value_id = 100;
         run_function(&mut f);
         assert!(
-            !f.blocks.iter().any(|b| b.instructions.iter().any(|i| matches!(
-                i,
-                Instruction::BinOp { op: IrBinOp::And, .. }
-            ))),
+            !f.blocks
+                .iter()
+                .any(|b| b.instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::And,
+                        ..
+                    }
+                ))),
             "case-fold must not fire without the bit-5 invariant"
         );
     }
@@ -1295,7 +1409,15 @@ mod tests {
             .blocks
             .iter()
             .flat_map(|b| &b.instructions)
-            .filter(|i| matches!(i, Instruction::BinOp { op: IrBinOp::BitTest, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::BitTest,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(bt_count, 1);
         for x in 0..=255u8 {

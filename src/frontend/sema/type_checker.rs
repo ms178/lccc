@@ -14,24 +14,15 @@
 //! The `ExprTypeChecker` operates on immutable references and does not modify
 //! any state. It is designed to be called from `SemanticAnalyzer::analyze_expr`.
 
-use crate::common::types::{AddressSpace, CType, FunctionType};
-use crate::common::symbol_table::SymbolTable;
-use crate::common::fx_hash::FxHashMap;
-use crate::frontend::parser::ast::{
-    BinOp,
-    BlockItem,
-    CompoundStmt,
-    DerivedDeclarator,
-    Expr,
-    ExprId,
-    GenericAssociation,
-    Stmt,
-    StructFieldDecl,
-    TypeSpecifier,
-    UnaryOp,
-};
-use super::type_context::TypeContext;
 use super::analysis::FunctionInfo;
+use super::type_context::TypeContext;
+use crate::common::fx_hash::FxHashMap;
+use crate::common::symbol_table::SymbolTable;
+use crate::common::types::{AddressSpace, CType, FunctionType};
+use crate::frontend::parser::ast::{
+    BinOp, BlockItem, CompoundStmt, DerivedDeclarator, Expr, ExprId, GenericAssociation, Stmt,
+    StructFieldDecl, TypeSpecifier, UnaryOp,
+};
 
 /// Determine the C type of an enum constant value, following GCC's promotion rules.
 /// GCC uses the progression: int -> unsigned int -> long long -> unsigned long long.
@@ -143,9 +134,16 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::ImaginaryLiteral(_, _) => Some(CType::ComplexDouble),
             Expr::ImaginaryLiteralF32(_, _) => Some(CType::ComplexFloat),
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
-            Expr::StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default)),
-            Expr::WideStringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default)),
-            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(Box::new(CType::UShort), AddressSpace::Default)),
+            Expr::StringLiteral(_, _) => {
+                Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))
+            }
+            Expr::WideStringLiteral(_, _) => {
+                Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
+            }
+            Expr::Char16StringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(CType::UShort),
+                AddressSpace::Default,
+            )),
 
             // Identifiers: look up in symbol table or enum constants
             Expr::Identifier(name, _) => {
@@ -170,13 +168,14 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Cast: type is the target type
-            Expr::Cast(type_spec, _, _) => {
-                Some(self.resolve_type_spec(type_spec))
-            }
+            Expr::Cast(type_spec, _, _) => Some(self.resolve_type_spec(type_spec)),
 
             // Sizeof and Alignof always produce size_t (unsigned long on 64-bit)
-            Expr::Sizeof(_, _) | Expr::Alignof(_, _) | Expr::AlignofExpr(_, _)
-            | Expr::GnuAlignof(_, _) | Expr::GnuAlignofExpr(_, _) => Some(CType::ULong),
+            Expr::Sizeof(_, _)
+            | Expr::Alignof(_, _)
+            | Expr::AlignofExpr(_, _)
+            | Expr::GnuAlignof(_, _)
+            | Expr::GnuAlignofExpr(_, _) => Some(CType::ULong),
 
             // Address-of wraps in Pointer
             Expr::AddressOf(inner, _) => {
@@ -233,34 +232,30 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Unary operators
-            Expr::UnaryOp(op, inner, _) => {
-                match op {
-                    UnaryOp::LogicalNot => Some(CType::Int),
-                    UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
-                        if let Some(inner_ct) = self.infer_expr_ctype(inner) {
-                            if inner_ct.is_integer() {
-                                Some(inner_ct.integer_promoted())
-                            } else {
-                                Some(inner_ct)
-                            }
+            Expr::UnaryOp(op, inner, _) => match op {
+                UnaryOp::LogicalNot => Some(CType::Int),
+                UnaryOp::Neg | UnaryOp::Plus | UnaryOp::BitNot => {
+                    if let Some(inner_ct) = self.infer_expr_ctype(inner) {
+                        if inner_ct.is_integer() {
+                            Some(inner_ct.integer_promoted())
                         } else {
-                            None
+                            Some(inner_ct)
                         }
-                    }
-                    UnaryOp::PreInc | UnaryOp::PreDec => self.infer_expr_ctype(inner),
-                    UnaryOp::RealPart | UnaryOp::ImagPart => {
-                        self.infer_expr_ctype(inner).map(|inner_ct| inner_ct.complex_component_type())
+                    } else {
+                        None
                     }
                 }
-            }
+                UnaryOp::PreInc | UnaryOp::PreDec => self.infer_expr_ctype(inner),
+                UnaryOp::RealPart | UnaryOp::ImagPart => self
+                    .infer_expr_ctype(inner)
+                    .map(|inner_ct| inner_ct.complex_component_type()),
+            },
 
             // Postfix operators preserve the operand type
             Expr::PostfixOp(_, inner, _) => self.infer_expr_ctype(inner),
 
             // Binary operators
-            Expr::BinaryOp(op, lhs, rhs, _) => {
-                self.infer_binop_ctype(op, lhs, rhs)
-            }
+            Expr::BinaryOp(op, lhs, rhs, _) => self.infer_binop_ctype(op, lhs, rhs),
 
             // Assignment: type of the left-hand side
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
@@ -308,9 +303,9 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // VaArg and CompoundLiteral: type from type specifier
-            Expr::VaArg(_, type_spec, _) | Expr::ConvertVector(_, type_spec, _) | Expr::CompoundLiteral(type_spec, _, _) => {
-                Some(self.resolve_type_spec(type_spec))
-            }
+            Expr::VaArg(_, type_spec, _)
+            | Expr::ConvertVector(_, type_spec, _)
+            | Expr::CompoundLiteral(type_spec, _, _) => Some(self.resolve_type_spec(type_spec)),
 
             // Statement expression: type of the last expression statement
             Expr::StmtExpr(compound, _) => {
@@ -337,7 +332,9 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Label address: void*
-            Expr::LabelAddr(_, _) => Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default)),
+            Expr::LabelAddr(_, _) => {
+                Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
+            }
 
             // __builtin_types_compatible_p: int
             Expr::BuiltinTypesCompatibleP(_, _, _) => Some(CType::Int),
@@ -352,8 +349,14 @@ impl<'a> ExprTypeChecker<'a> {
     fn infer_binop_ctype(&self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Option<CType> {
         // Comparison and logical operators always produce int
         match op {
-            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-            | BinOp::LogicalAnd | BinOp::LogicalOr => {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::LogicalAnd
+            | BinOp::LogicalOr => {
                 return Some(CType::Int);
             }
             _ => {}
@@ -403,7 +406,9 @@ impl<'a> ExprTypeChecker<'a> {
                 if let Some(ref r) = rct {
                     match r {
                         CType::Pointer(_, _) => return rct,
-                        CType::Array(elem, _) => return Some(CType::Pointer(elem.clone(), AddressSpace::Default)),
+                        CType::Array(elem, _) => {
+                            return Some(CType::Pointer(elem.clone(), AddressSpace::Default))
+                        }
                         _ => {}
                     }
                 }
@@ -413,10 +418,14 @@ impl<'a> ExprTypeChecker<'a> {
         // GCC vector extensions: if either operand is a vector type, the result
         // is that vector type.  usual_arithmetic_conversion doesn't handle vectors.
         if let Some(ref l) = lct {
-            if l.is_vector() { return lct; }
+            if l.is_vector() {
+                return lct;
+            }
         }
         if let Some(ref r) = rct {
-            if r.is_vector() { return rct; }
+            if r.is_vector() {
+                return rct;
+            }
         }
 
         // Arithmetic/bitwise: usual arithmetic conversions
@@ -478,7 +487,12 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Infer the CType of a struct/union field access.
-    fn infer_field_ctype(&self, base_expr: &Expr, field_name: &str, is_pointer: bool) -> Option<CType> {
+    fn infer_field_ctype(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Option<CType> {
         let base_ctype = if is_pointer {
             match self.infer_expr_ctype(base_expr)? {
                 CType::Pointer(inner, _) => *inner,
@@ -504,13 +518,19 @@ impl<'a> ExprTypeChecker<'a> {
     }
 
     /// Resolve a _Generic selection based on the controlling expression's type.
-    fn infer_generic_selection_ctype(&self, controlling: &Expr, associations: &[GenericAssociation]) -> Option<CType> {
+    fn infer_generic_selection_ctype(
+        &self,
+        controlling: &Expr,
+        associations: &[GenericAssociation],
+    ) -> Option<CType> {
         let controlling_ct = self.infer_expr_ctype(controlling);
         let mut default_expr: Option<&Expr> = None;
 
         for assoc in associations {
             match &assoc.type_spec {
-                None => { default_expr = Some(&assoc.expr); }
+                None => {
+                    default_expr = Some(&assoc.expr);
+                }
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
                     if let Some(ref ctrl_ct) = controlling_ct {
@@ -629,7 +649,9 @@ impl<'a> ExprTypeChecker<'a> {
                     Vec::new()
                 };
                 // Determine smallest type that fits all values
-                let fits_int = values.iter().all(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64);
+                let fits_int = values
+                    .iter()
+                    .all(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64);
                 if fits_int {
                     return CType::Int;
                 }
@@ -638,7 +660,11 @@ impl<'a> ExprTypeChecker<'a> {
                     return CType::UInt;
                 }
                 let has_negative = values.iter().any(|v| *v < 0);
-                if has_negative { CType::LongLong } else { CType::ULongLong }
+                if has_negative {
+                    CType::LongLong
+                } else {
+                    CType::ULongLong
+                }
             }
             TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
                 if let Some(tag) = tag {
@@ -648,7 +674,13 @@ impl<'a> ExprTypeChecker<'a> {
                     // struct layout so member access resolution works correctly
                     // (e.g., kernel get_unaligned() macro pattern with packed structs
                     // inside statement expressions).
-                    self.resolve_anon_struct_or_union(fs, false, *is_packed, *pragma_pack, *struct_aligned)
+                    self.resolve_anon_struct_or_union(
+                        fs,
+                        false,
+                        *is_packed,
+                        *pragma_pack,
+                        *struct_aligned,
+                    )
                 } else {
                     // Anonymous forward declaration (no tag, no fields)
                     CType::Int
@@ -659,7 +691,13 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Union(format!("union.{}", tag).into())
                 } else if let Some(fs) = fields {
                     // Same as struct: register anonymous union layout for member access
-                    self.resolve_anon_struct_or_union(fs, true, *is_packed, *pragma_pack, *struct_aligned)
+                    self.resolve_anon_struct_or_union(
+                        fs,
+                        true,
+                        *is_packed,
+                        *pragma_pack,
+                        *struct_aligned,
+                    )
                 } else {
                     // Anonymous forward declaration (no tag, no fields)
                     CType::Int
@@ -672,14 +710,18 @@ impl<'a> ExprTypeChecker<'a> {
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic) => {
                 let ret_ct = self.resolve_type_spec(ret);
-                let param_cts: Vec<(CType, Option<String>)> = params.iter().map(|p| {
-                    (self.resolve_type_spec(&p.type_spec), p.name.clone())
-                }).collect();
-                CType::Pointer(Box::new(CType::Function(Box::new(FunctionType {
-                    return_type: ret_ct,
-                    params: param_cts,
-                    variadic: *variadic,
-                }))), AddressSpace::Default)
+                let param_cts: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| (self.resolve_type_spec(&p.type_spec), p.name.clone()))
+                    .collect();
+                CType::Pointer(
+                    Box::new(CType::Function(Box::new(FunctionType {
+                        return_type: ret_ct,
+                        params: param_cts,
+                        variadic: *variadic,
+                    }))),
+                    AddressSpace::Default,
+                )
             }
             // TODO: handle remaining TypeSpecifier variants
             _ => CType::Int,
@@ -713,30 +755,43 @@ impl<'a> ExprTypeChecker<'a> {
     ) -> CType {
         use crate::common::types::{StructField, StructLayout};
 
-        let struct_fields: Vec<StructField> = fields.iter().map(|f| {
-            let mut ty = self.resolve_field_ctype(f);
-            // GCC treats enum bitfields as unsigned
-            if f.bit_width.is_some()
-                && matches!(&f.type_spec, TypeSpecifier::Enum(..))
-                    && ty == CType::Int {
-                        ty = CType::UInt;
-                    }
-            StructField {
-                name: f.name.clone().unwrap_or_default(),
-                ty,
-                bit_width: f.bit_width.as_ref().and_then(|bw| {
-                    self.eval_const_expr(bw).map(|v| v as u32)
-                }),
-                alignment: f.alignment,
-                is_packed: f.is_packed,
-            }
-        }).collect();
+        let struct_fields: Vec<StructField> = fields
+            .iter()
+            .map(|f| {
+                let mut ty = self.resolve_field_ctype(f);
+                // GCC treats enum bitfields as unsigned
+                if f.bit_width.is_some()
+                    && matches!(&f.type_spec, TypeSpecifier::Enum(..))
+                    && ty == CType::Int
+                {
+                    ty = CType::UInt;
+                }
+                StructField {
+                    name: f.name.clone().unwrap_or_default(),
+                    ty,
+                    bit_width: f
+                        .bit_width
+                        .as_ref()
+                        .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32)),
+                    alignment: f.alignment,
+                    is_packed: f.is_packed,
+                }
+            })
+            .collect();
 
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
         let mut layout = if is_union {
-            StructLayout::for_union_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+            StructLayout::for_union_with_packing(
+                &struct_fields,
+                max_field_align,
+                &*self.types.borrow_struct_layouts(),
+            )
         } else {
-            StructLayout::for_struct_with_packing(&struct_fields, max_field_align, &*self.types.borrow_struct_layouts())
+            StructLayout::for_struct_with_packing(
+                &struct_fields,
+                max_field_align,
+                &*self.types.borrow_struct_layouts(),
+            )
         };
 
         // Apply struct-level __attribute__((aligned(N)))
@@ -750,7 +805,8 @@ impl<'a> ExprTypeChecker<'a> {
 
         let id = self.types.next_anon_struct_id();
         let key = format!("__anon_struct_{}", id);
-        self.types.insert_struct_layout_scoped_from_ref(&key, layout);
+        self.types
+            .insert_struct_layout_scoped_from_ref(&key, layout);
         if is_union {
             CType::Union(key.into())
         } else {
@@ -785,41 +841,85 @@ impl<'a> ExprTypeChecker<'a> {
     fn builtin_return_ctype(name: &str) -> Option<CType> {
         match name {
             // Float-returning builtins
-            "__builtin_inf" | "__builtin_huge_val"
-            | "__builtin_nan" | "__builtin_fabs" | "__builtin_sqrt"
-            | "__builtin_sin" | "__builtin_cos" | "__builtin_log"
-            | "__builtin_log2" | "__builtin_exp" | "__builtin_pow"
-            | "__builtin_floor" | "__builtin_ceil" | "__builtin_round"
-            | "__builtin_fmin" | "__builtin_fmax" | "__builtin_copysign"
+            "__builtin_inf"
+            | "__builtin_huge_val"
+            | "__builtin_nan"
+            | "__builtin_fabs"
+            | "__builtin_sqrt"
+            | "__builtin_sin"
+            | "__builtin_cos"
+            | "__builtin_log"
+            | "__builtin_log2"
+            | "__builtin_exp"
+            | "__builtin_pow"
+            | "__builtin_floor"
+            | "__builtin_ceil"
+            | "__builtin_round"
+            | "__builtin_fmin"
+            | "__builtin_fmax"
+            | "__builtin_copysign"
             | "__builtin_nextafter" => Some(CType::Double),
 
-            "__builtin_inff" | "__builtin_huge_valf"
-            | "__builtin_nanf" | "__builtin_fabsf" | "__builtin_sqrtf"
-            | "__builtin_sinf" | "__builtin_cosf" | "__builtin_logf"
-            | "__builtin_expf" | "__builtin_powf" | "__builtin_floorf"
-            | "__builtin_ceilf" | "__builtin_roundf"
+            "__builtin_inff"
+            | "__builtin_huge_valf"
+            | "__builtin_nanf"
+            | "__builtin_fabsf"
+            | "__builtin_sqrtf"
+            | "__builtin_sinf"
+            | "__builtin_cosf"
+            | "__builtin_logf"
+            | "__builtin_expf"
+            | "__builtin_powf"
+            | "__builtin_floorf"
+            | "__builtin_ceilf"
+            | "__builtin_roundf"
             | "__builtin_copysignf"
             | "__builtin_nextafterf" => Some(CType::Float),
 
-            "__builtin_infl" | "__builtin_huge_vall"
-            | "__builtin_nanl" | "__builtin_fabsl"
+            "__builtin_infl"
+            | "__builtin_huge_vall"
+            | "__builtin_nanl"
+            | "__builtin_fabsl"
             | "__builtin_nextafterl" => Some(CType::LongDouble),
 
             // Integer-returning builtins
-            "__builtin_fpclassify" | "__builtin_isnan" | "__builtin_isinf"
-            | "__builtin_isfinite" | "__builtin_isnormal" | "__builtin_signbit"
-            | "__builtin_signbitf" | "__builtin_signbitl" | "__builtin_isinf_sign"
-            | "__builtin_isgreater" | "__builtin_isgreaterequal"
-            | "__builtin_isless" | "__builtin_islessequal"
-            | "__builtin_islessgreater" | "__builtin_isunordered"
-            | "__builtin_clz" | "__builtin_clzl" | "__builtin_clzll"
-            | "__builtin_ctz" | "__builtin_ctzl" | "__builtin_ctzll"
-            | "__builtin_clrsb" | "__builtin_clrsbl" | "__builtin_clrsbll"
-            | "__builtin_popcount" | "__builtin_popcountl" | "__builtin_popcountll"
-            | "__builtin_parity" | "__builtin_parityl" | "__builtin_parityll"
-            | "__builtin_ffs" | "__builtin_ffsl" | "__builtin_ffsll"
-            | "__builtin_types_compatible_p" | "__builtin_classify_type"
-            | "__builtin_constant_p" | "__builtin_object_size" => Some(CType::Int),
+            "__builtin_fpclassify"
+            | "__builtin_isnan"
+            | "__builtin_isinf"
+            | "__builtin_isfinite"
+            | "__builtin_isnormal"
+            | "__builtin_signbit"
+            | "__builtin_signbitf"
+            | "__builtin_signbitl"
+            | "__builtin_isinf_sign"
+            | "__builtin_isgreater"
+            | "__builtin_isgreaterequal"
+            | "__builtin_isless"
+            | "__builtin_islessequal"
+            | "__builtin_islessgreater"
+            | "__builtin_isunordered"
+            | "__builtin_clz"
+            | "__builtin_clzl"
+            | "__builtin_clzll"
+            | "__builtin_ctz"
+            | "__builtin_ctzl"
+            | "__builtin_ctzll"
+            | "__builtin_clrsb"
+            | "__builtin_clrsbl"
+            | "__builtin_clrsbll"
+            | "__builtin_popcount"
+            | "__builtin_popcountl"
+            | "__builtin_popcountll"
+            | "__builtin_parity"
+            | "__builtin_parityl"
+            | "__builtin_parityll"
+            | "__builtin_ffs"
+            | "__builtin_ffsl"
+            | "__builtin_ffsll"
+            | "__builtin_types_compatible_p"
+            | "__builtin_classify_type"
+            | "__builtin_constant_p"
+            | "__builtin_object_size" => Some(CType::Int),
 
             // Byte-swap builtins return unsigned types (GCC behavior)
             "__builtin_bswap16" | "__builtin_bswap32" => Some(CType::UInt),
@@ -831,7 +931,9 @@ impl<'a> ExprTypeChecker<'a> {
             // Complex component extraction
             "creal" | "__builtin_creal" | "cimag" | "__builtin_cimag" => Some(CType::Double),
             "crealf" | "__builtin_crealf" | "cimagf" | "__builtin_cimagf" => Some(CType::Float),
-            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => Some(CType::LongDouble),
+            "creall" | "__builtin_creall" | "cimagl" | "__builtin_cimagl" => {
+                Some(CType::LongDouble)
+            }
             "cabs" | "__builtin_cabs" => Some(CType::Double),
             "cabsf" | "__builtin_cabsf" => Some(CType::Float),
             "cabsl" | "__builtin_cabsl" => Some(CType::LongDouble),
@@ -839,17 +941,26 @@ impl<'a> ExprTypeChecker<'a> {
             "cargf" | "__builtin_cargf" => Some(CType::Float),
 
             // Memory/string builtins returning pointers
-            "__builtin_memcpy" | "__builtin_memmove" | "__builtin_memset"
-            | "__builtin_alloca" | "__builtin_alloca_with_align"
-            | "__builtin_frame_address" | "__builtin_return_address"
+            "__builtin_memcpy"
+            | "__builtin_memmove"
+            | "__builtin_memset"
+            | "__builtin_alloca"
+            | "__builtin_alloca_with_align"
+            | "__builtin_frame_address"
+            | "__builtin_return_address"
             | "__builtin_thread_pointer" => {
                 Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
             }
 
             // Void-returning builtins
-            "__builtin_va_start" | "__builtin_va_end" | "__builtin_va_copy"
-            | "__builtin_abort" | "__builtin_exit" | "__builtin_trap"
-            | "__builtin_unreachable" | "__builtin_prefetch"
+            "__builtin_va_start"
+            | "__builtin_va_end"
+            | "__builtin_va_copy"
+            | "__builtin_abort"
+            | "__builtin_exit"
+            | "__builtin_trap"
+            | "__builtin_unreachable"
+            | "__builtin_prefetch"
             | "__builtin___clear_cache"
             | "__builtin_cpu_init" => Some(CType::Void),
 
@@ -866,7 +977,11 @@ impl<'a> ExprTypeChecker<'a> {
     /// expressions referencing earlier declarations can be resolved. This handles
     /// patterns like: `({ typeof(&s->field) p = ...; __typeof__(*p) ret = ...; ret; })`
     /// where `__typeof__(*p)` must resolve `p` from the same compound statement.
-    fn resolve_var_from_compound(&self, compound: &CompoundStmt, target_name: &str) -> Option<CType> {
+    fn resolve_var_from_compound(
+        &self,
+        compound: &CompoundStmt,
+        target_name: &str,
+    ) -> Option<CType> {
         let mut local_scope: FxHashMap<String, CType> = FxHashMap::default();
 
         for item in &compound.items {
@@ -877,7 +992,8 @@ impl<'a> ExprTypeChecker<'a> {
                     }
                     // Resolve this declaration's type, using the local scope
                     // for typeof expressions referencing earlier declarations.
-                    let mut ctype = self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
+                    let mut ctype =
+                        self.resolve_type_spec_with_scope(&decl.type_spec, &local_scope);
                     for derived in &declarator.derived {
                         match derived {
                             DerivedDeclarator::Pointer => {
@@ -905,7 +1021,11 @@ impl<'a> ExprTypeChecker<'a> {
 
     /// Resolve a TypeSpecifier to a CType, using a supplementary local scope
     /// for typeof expressions that reference variables not in the symbol table.
-    fn resolve_type_spec_with_scope(&self, ts: &TypeSpecifier, scope: &FxHashMap<String, CType>) -> CType {
+    fn resolve_type_spec_with_scope(
+        &self,
+        ts: &TypeSpecifier,
+        scope: &FxHashMap<String, CType>,
+    ) -> CType {
         match ts {
             TypeSpecifier::Typeof(expr) => {
                 // Try normal resolution first
@@ -919,9 +1039,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // TODO: report diagnostic for unresolved typeof expression
                 CType::Int // fallback
             }
-            TypeSpecifier::TypeofType(inner) => {
-                self.resolve_type_spec_with_scope(inner, scope)
-            }
+            TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_with_scope(inner, scope),
             _ => self.resolve_type_spec(ts),
         }
     }
@@ -930,13 +1048,16 @@ impl<'a> ExprTypeChecker<'a> {
     /// for identifiers not found in the symbol table.
     /// Handles common typeof patterns (identifier, deref, address-of).
     /// More complex expressions (member access, subscript, etc.) are not supported.
-    fn infer_expr_ctype_with_scope(&self, expr: &Expr, scope: &FxHashMap<String, CType>) -> Option<CType> {
+    fn infer_expr_ctype_with_scope(
+        &self,
+        expr: &Expr,
+        scope: &FxHashMap<String, CType>,
+    ) -> Option<CType> {
         match expr {
-            Expr::Identifier(name, _) => {
-                scope.get(name.as_str()).cloned()
-            }
+            Expr::Identifier(name, _) => scope.get(name.as_str()).cloned(),
             Expr::Deref(inner, _) => {
-                let inner_ct = self.infer_expr_ctype(inner)
+                let inner_ct = self
+                    .infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
                 match inner_ct {
                     CType::Pointer(pointee, _) => Some(*pointee),
@@ -945,7 +1066,8 @@ impl<'a> ExprTypeChecker<'a> {
                 }
             }
             Expr::AddressOf(inner, _) => {
-                let inner_ct = self.infer_expr_ctype(inner)
+                let inner_ct = self
+                    .infer_expr_ctype(inner)
                     .or_else(|| self.infer_expr_ctype_with_scope(inner, scope))?;
                 Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default))
             }

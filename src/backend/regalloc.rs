@@ -51,32 +51,48 @@ pub fn analyze_accumulator_assignments(
     let candidates = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
         func, lhs_first,
     );
-    if candidates.is_empty() { return Vec::new(); }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
 
     let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
     let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut pp = 0u32;
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Some(dest) = inst.dest() { defs.insert(dest.0, pp); }
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest.0, pp);
+            }
             inst.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
             pp += 1;
         }
-        block.terminator.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+        block
+            .terminator
+            .for_each_used_value(|id| uses.entry(id).or_default().push(pp));
         pp += 1;
     }
     let mut out = Vec::new();
     for value_id in candidates {
-        let (Some(&def_point), Some(points)) = (defs.get(&value_id), uses.get(&value_id)) else { continue; };
-        if points.len() != 1 || points[0] != def_point + 1 { continue; }
+        let (Some(&def_point), Some(points)) = (defs.get(&value_id), uses.get(&value_id)) else {
+            continue;
+        };
+        if points.len() != 1 || points[0] != def_point + 1 {
+            continue;
+        }
         // 64-bit targets do not consume scalar returns from the accumulator.
         if !policy.return_consumes_accumulator {
             let is_return = func.blocks.iter().any(|b| {
                 matches!(&b.terminator, Terminator::Return(Some(Operand::Value(v))) if v.0 == value_id)
             });
-            if is_return { continue; }
+            if is_return {
+                continue;
+            }
         }
-        out.push(AccumulatorAssignment { value_id, def_point, consume_point: points[0] });
+        out.push(AccumulatorAssignment {
+            value_id,
+            def_point,
+            consume_point: points[0],
+        });
     }
     out.sort_unstable_by_key(|a| (a.def_point, a.value_id));
     verify_accumulator_assignments(func, &out);
@@ -84,25 +100,50 @@ pub fn analyze_accumulator_assignments(
 }
 
 fn verify_accumulator_assignments(func: &IrFunction, assignments: &[AccumulatorAssignment]) {
-    if assignments.is_empty() { return; }
+    if assignments.is_empty() {
+        return;
+    }
     let mut defs = FxHashMap::default();
     let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut pp = 0u32;
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Some(dest) = inst.dest() { defs.insert(dest.0, pp); }
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest.0, pp);
+            }
             inst.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
             pp += 1;
         }
-        block.terminator.for_each_used_value(|id| uses.entry(id).or_default().push(pp));
+        block
+            .terminator
+            .for_each_used_value(|id| uses.entry(id).or_default().push(pp));
         pp += 1;
     }
     let mut seen = FxHashSet::default();
     for a in assignments {
-        assert!(seen.insert(a.value_id), "duplicate accumulator assignment for v{}", a.value_id);
-        assert_eq!(defs.get(&a.value_id).copied(), Some(a.def_point), "bad accumulator def point for v{}", a.value_id);
-        assert_eq!(uses.get(&a.value_id).map(Vec::as_slice), Some([a.consume_point].as_slice()), "accumulator value v{} is not single-use", a.value_id);
-        assert_eq!(a.consume_point, a.def_point + 1, "accumulator value v{} is not adjacent", a.value_id);
+        assert!(
+            seen.insert(a.value_id),
+            "duplicate accumulator assignment for v{}",
+            a.value_id
+        );
+        assert_eq!(
+            defs.get(&a.value_id).copied(),
+            Some(a.def_point),
+            "bad accumulator def point for v{}",
+            a.value_id
+        );
+        assert_eq!(
+            uses.get(&a.value_id).map(Vec::as_slice),
+            Some([a.consume_point].as_slice()),
+            "accumulator value v{} is not single-use",
+            a.value_id
+        );
+        assert_eq!(
+            a.consume_point,
+            a.def_point + 1,
+            "accumulator value v{} is not adjacent",
+            a.value_id
+        );
     }
 }
 
@@ -127,15 +168,25 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
     if func.blocks.len() > 1 && func.params.len() > 6 {
         return false;
     }
-    if func.blocks.iter().any(|b| b.instructions.iter().any(|inst| matches!(
-        inst, Instruction::Call { .. } | Instruction::CallIndirect { .. }
-            | Instruction::InlineAsm { .. }
-    ))) {
+    if func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+            )
+        })
+    }) {
         return false;
     }
     for (bi, block) in func.blocks.iter().enumerate() {
         if bi != 0 {
-            if block.instructions.iter().any(|inst| matches!(inst, Instruction::ParamRef { .. })) {
+            if block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::ParamRef { .. }))
+            {
                 return false;
             }
             continue;
@@ -506,7 +557,6 @@ fn unique_load_def_types(func: &IrFunction) -> FxHashMap<u32, (IrType, u32)> {
         .collect()
 }
 
-
 fn build_coalesce_groups(
     func: &IrFunction,
     iv_map: &FxHashMap<u32, (u32, u32)>,
@@ -668,7 +718,10 @@ fn build_coalesce_groups(
                 // with it (skip_atoi: the cast lost %edi and the whole pair
                 // spilled). When the load has another use, it needs a
                 // register regardless, so coalescing is a pure win.
-                let (_, load_uses) = load_def_types.get(&v.0).copied().unwrap_or((IrType::I32, 0));
+                let (_, load_uses) = load_def_types
+                    .get(&v.0)
+                    .copied()
+                    .unwrap_or((IrType::I32, 0));
                 let widen_from_load = crate::common::types::target_is_32bit()
                     && matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
                     && matches!(to_ty, IrType::I32 | IrType::U32)
@@ -789,7 +842,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
         return RegAllocResult {
             assignments: FxHashMap::default(),
-            accumulator_assignments: analyze_accumulator_assignments(func, config.accumulator_policy),
+            accumulator_assignments: analyze_accumulator_assignments(
+                func,
+                config.accumulator_policy,
+            ),
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
             liveness: None,
@@ -839,7 +895,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let iv_map = interval_map(&liveness);
     let call_points = &liveness.call_points;
 
-    let arm_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
+    let arm_fp_pool =
+        config.xmm_regs.first().is_some_and(|r| r.0 == 40) && !env_on("CCC_NO_VECREG");
     let x86_fp_pool = config.xmm_regs.first().is_some_and(|r| r.0 == 20);
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
     // Values consumed as call arguments: their last read happens in the call's
@@ -864,7 +921,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         let weight = block_loop_weight.get(block_idx).copied().unwrap_or(1);
-        let depth = liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
+        let depth = liveness
+            .block_loop_depth
+            .get(block_idx)
+            .copied()
+            .unwrap_or(0);
         for inst in &block.instructions {
             match inst {
                 Instruction::BinOp { dest, ty, .. } | Instruction::UnaryOp { dest, ty, .. } => {
@@ -951,8 +1012,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     remove_ineligible_operands(func, &mut eligible, config);
-    let safe_folded_index_homes =
-        collect_safe_folded_index_homes(func, &config.folded_index_uses);
+    let safe_folded_index_homes = collect_safe_folded_index_homes(func, &config.folded_index_uses);
     for v in &config.never_materialized {
         // A value that is immediately consumed by a Cast/Copy may also be the
         // natural index of a later backend-folded memory access. That hidden
@@ -1059,12 +1119,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let call_spanning: FxHashSet<u32> = {
         let mut acc: FxHashMap<u32, Vec<(u32, u32, u32)>> = FxHashMap::default();
         for seg in &liveness.segments {
-            let def = iv_map.get(&seg.value_id).map(|&(s, _)| s).unwrap_or(seg.start);
+            let def = iv_map
+                .get(&seg.value_id)
+                .map(|&(s, _)| s)
+                .unwrap_or(seg.start);
             let owner = coalesce_member_of
                 .get(&seg.value_id)
                 .copied()
                 .unwrap_or(seg.value_id);
-            acc.entry(owner).or_default().push((seg.start, seg.end, def));
+            acc.entry(owner)
+                .or_default()
+                .push((seg.start, seg.end, def));
         }
         let mut set = FxHashSet::default();
         for (owner, entries) in &acc {
@@ -1085,15 +1150,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         set
     };
 
-    let scan_ivs = collect_gpr_scan_intervals(
-        &liveness,
-        &eligible,
-        &merged_of,
-        &coalesce_member_of,
-    );
+    let scan_ivs =
+        collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges =
-            live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
+        let mut ranges = live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
             &mut ranges,
@@ -1184,7 +1244,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     // Phase 2: caller-saved for non-spanning leftovers (remats welcome here).
     if !config.caller_saved_regs.is_empty() {
-        let i686_pool = config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5));
+        let i686_pool = config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5));
         let hazards: Option<(Vec<u32>, Vec<u32>)> = if i686_pool {
             Some(collect_i686_scratch_hazard_points(
                 func,
@@ -1220,13 +1283,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if env_on("CCC_DEBUG_RA_INTERVALS") {
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
-                    eprintln!("[RA-P2] fn={} reg={:?} candidates={:?}", func.name, reg, cands);
+                    eprintln!(
+                        "[RA-P2] fn={} reg={:?} candidates={:?}",
+                        func.name, reg, cands
+                    );
                 }
                 if intervals.is_empty() {
                     continue;
                 }
-                let ranges =
-                    build_gpr_ranges(&intervals);
+                let ranges = build_gpr_ranges(&intervals);
                 let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
@@ -1240,8 +1305,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             // staging of an earlier argument). They still get r10/r11-class
             // caller-saved registers; everything else uses the full pool.
             if config.call_arg_regs.is_empty() {
-                let phase2_intervals: Vec<LiveInterval> =
-                    scan_ivs.iter().copied().filter(|iv| base_ok(&assignments, iv)).collect();
+                let phase2_intervals: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| base_ok(&assignments, iv))
+                    .collect();
                 if !phase2_intervals.is_empty() {
                     let phase2_ranges = build_gpr_ranges(&phase2_intervals);
                     let mut caller_allocator =
@@ -1253,8 +1321,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     }
                 }
             } else {
-                let arg_reg_set: FxHashSet<u8> =
-                    config.call_arg_regs.iter().map(|r| r.0).collect();
+                let arg_reg_set: FxHashSet<u8> = config.call_arg_regs.iter().map(|r| r.0).collect();
                 let indirect_set: FxHashSet<u8> =
                     config.indirect_target_regs.iter().map(|r| r.0).collect();
                 let no_arg_pool: Vec<PhysReg> = config
@@ -1362,7 +1429,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .collect();
                 if !w4.is_empty() {
                     let ranges = build_gpr_ranges(&w4);
-                    let mut alloc = LinearScanAllocator::new(ranges, config.caller_saved_regs.clone());
+                    let mut alloc =
+                        LinearScanAllocator::new(ranges, config.caller_saved_regs.clone());
                     alloc.run_with_seed(&seeded);
                     for (vid, reg) in alloc.assignments {
                         assignments.insert(vid, reg);
@@ -1379,8 +1447,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .iter()
             .copied()
             .filter(|iv| {
-                !assignments.contains_key(&iv.value_id)
-                    && !call_spanning.contains(&iv.value_id)
+                !assignments.contains_key(&iv.value_id) && !call_spanning.contains(&iv.value_id)
             })
             .collect();
         if !phase2c_intervals.is_empty() {
@@ -1422,7 +1489,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             s.sort_unstable();
             s
         };
-        eprintln!("[RA-FINAL] fn={} assigned={:?} spilled={:?}", func.name, ids, spills);
+        eprintln!(
+            "[RA-FINAL] fn={} assigned={:?} spilled={:?}",
+            func.name, ids, spills
+        );
     }
 
     // Phase 2d (i686): load-hazard refinement.  Phase 2 treated every
@@ -1434,7 +1504,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // set with the real pointer homes and hand the newly hazard-free
     // caller-saved registers to the values Phase 2 had to refuse.
     if !env_on("CCC_NO_LOAD_HAZARD_REFINE")
-        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+        && config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5))
     {
         let mut ecx_clean_ptrs: FxHashSet<u32> = FxHashSet::default();
         {
@@ -1460,8 +1533,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     if let Instruction::Load { ptr, dest, ty, .. } = inst {
                         let gpr32 = matches!(
                             ty,
-                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-                                | IrType::I32 | IrType::U32 | IrType::Ptr
+                            IrType::I8
+                                | IrType::U8
+                                | IrType::I16
+                                | IrType::U16
+                                | IrType::I32
+                                | IrType::U32
+                                | IrType::Ptr
                         );
                         if !gpr32 {
                             continue;
@@ -1485,11 +1563,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
         if !ecx_clean_ptrs.is_empty() {
-            let (ecx_hazards2, edx_hazards2) = collect_i686_scratch_hazard_points(
-                func,
-                &non_gpr_values,
-                &ecx_clean_ptrs,
-            );
+            let (ecx_hazards2, edx_hazards2) =
+                collect_i686_scratch_hazard_points(func, &non_gpr_values, &ecx_clean_ptrs);
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards2), (PhysReg(4), &ecx_hazards2)] {
                 if !config.caller_saved_regs.contains(&reg) {
                     continue;
@@ -1525,8 +1600,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if intervals.is_empty() {
                     continue;
                 }
-                let ranges =
-                    build_gpr_ranges(&intervals);
+                let ranges = build_gpr_ranges(&intervals);
                 let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
                 alloc.run();
                 for (vid, r) in alloc.assignments {
@@ -1557,7 +1631,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     //    the values whose EVERY use is such a position.
     //  * any hazard strictly between def and last use destroys the value.
     if !env_on("CCC_NO_EAX_ALLOC")
-        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+        && config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5))
     {
         let eax_hazards = collect_i686_eax_hazard_points(func);
 
@@ -1580,8 +1657,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::BinOp { lhs, rhs, .. }
-                    | Instruction::Cmp { lhs, rhs, .. } => {
+                    Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
                         mark(lhs, true);
                         mark(rhs, false);
                     }
@@ -1595,8 +1671,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         // (overlapping intervals), so eax survives to the read.
                         mark(&Operand::Value(*ptr), true);
                     }
-                    Instruction::Cast { src, .. }
-                    | Instruction::UnaryOp { src, .. } => {
+                    Instruction::Cast { src, .. } | Instruction::UnaryOp { src, .. } => {
                         mark(src, true);
                     }
                     Instruction::Copy { src, .. } => {
@@ -1617,9 +1692,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             match &block.terminator {
                 Terminator::Return(Some(op)) => mark(op, true),
                 Terminator::CondBranch { cond, .. } => mark(cond, true),
-                _ => for_each_operand_in_terminator(&block.terminator, |op| {
-                    mark(op, false)
-                }),
+                _ => for_each_operand_in_terminator(&block.terminator, |op| mark(op, false)),
             }
         }
 
@@ -1657,8 +1730,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             })
             .collect();
         if !intervals.is_empty() {
-            let ranges =
-                build_gpr_ranges(&intervals);
+            let ranges = build_gpr_ranges(&intervals);
             let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
             alloc.run();
             for (vid, r) in alloc.assignments {
@@ -1684,7 +1756,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // lacks segment data (its fat interval is used as fallback).
     if !env_on("CCC_NO_SEGMENT_FILL")
         && is_32bit
-        && config.caller_saved_regs.iter().any(|r| matches!(r.0, 4 | 5))
+        && config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5))
         && !used_regs_set.is_empty()
     {
         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
@@ -1692,7 +1767,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
         for seg in &liveness.segments {
             let owner = owner_of(seg.value_id);
-            owned_segments.entry(owner).or_default().push((seg.start, seg.end));
+            owned_segments
+                .entry(owner)
+                .or_default()
+                .push((seg.start, seg.end));
         }
         // Coalesced members can contribute overlapping/adjacent pieces. Merge
         // them so the interference test remains linear and deterministic.
@@ -1770,9 +1848,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
         // Hot/high-use values first; for equal pressure prefer shorter
         // envelopes because they consume fewer holes and admit more followers.
-        candidates.sort_unstable_by(|a, b| {
-            b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
-        });
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
         let pool: Vec<PhysReg> = config
             .available_regs
@@ -2038,11 +2114,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 let mut vec_pool: Vec<PhysReg> = (21..=25).map(PhysReg).collect();
                 vec_pool.retain(|r| !assignments.values().any(|a| a.0 == r.0));
                 if !vec_pool.is_empty() {
-                    let vec_intervals = synthetic_vec_intervals(
-                        func,
-                        &vec_candidates,
-                        &liveness.block_loop_depth,
-                    );
+                    let vec_intervals =
+                        synthetic_vec_intervals(func, &vec_candidates, &liveness.block_loop_depth);
                     let vec_intervals: Vec<LiveInterval> = vec_intervals
                         .into_iter()
                         .filter(|iv| !assignments.contains_key(&iv.value_id))
@@ -2103,9 +2176,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if iv.value_id == candidate.backedge_src || iv.value_id == candidate.phi_dest {
                     return false;
                 }
-                assignments.get(&iv.value_id).is_some_and(|&o| {
-                    o.0 == d.0 && intervals_overlap((iv.start, iv.end), src_iv)
-                })
+                assignments
+                    .get(&iv.value_id)
+                    .is_some_and(|&o| o.0 == d.0 && intervals_overlap((iv.start, iv.end), src_iv))
             });
             if !conflict {
                 assignments.insert(candidate.backedge_src, d);
@@ -2174,12 +2247,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     used_regs.sort_by_key(|r| r.0);
 
     if env_on("CCC_VERIFY_REGALLOC") {
-        verify_no_overlap(
-            &liveness,
-            &assignments,
-            &coalesce_member_of,
-            &all_phi_pairs,
-        );
+        verify_no_overlap(&liveness, &assignments, &coalesce_member_of, &all_phi_pairs);
     }
 
     // Session-28 debug: per-value home census (register vs slot) for one
@@ -2194,10 +2262,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     None => "slot".to_string(),
                 };
                 let uc = use_count.get(&iv.value_id).copied().unwrap_or(0);
-                rows.push((iv.start, iv.end, iv.value_id, format!("{} uses={} elig={}", home, uc, eligible.contains(&iv.value_id))));
+                rows.push((
+                    iv.start,
+                    iv.end,
+                    iv.value_id,
+                    format!(
+                        "{} uses={} elig={}",
+                        home,
+                        uc,
+                        eligible.contains(&iv.value_id)
+                    ),
+                ));
             }
             rows.sort();
-            eprintln!("[RA] fn={} values={} assigned={}", func.name, rows.len(), assignments.len());
+            eprintln!(
+                "[RA] fn={} values={} assigned={}",
+                func.name,
+                rows.len(),
+                assignments.len()
+            );
             for (s, e, vid, info) in rows {
                 eprintln!("[RA]   v{:>5} [{:>5}, {:>5}] {}", vid, s, e, info);
             }
@@ -2207,14 +2290,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     if let Ok(filter) = std::env::var("CCC_TRACE_ALLOCSTATS") {
         if filter.is_empty() || filter == "*" || func.name.contains(&filter) {
             let scan_values: FxHashSet<u32> = scan_ivs.iter().map(|iv| iv.value_id).collect();
-            let assigned_scan = scan_values.iter().filter(|v| assignments.contains_key(v)).count();
+            let assigned_scan = scan_values
+                .iter()
+                .filter(|v| assignments.contains_key(v))
+                .count();
             let spilled = scan_values.len().saturating_sub(assigned_scan);
-            let segment_values: FxHashSet<u32> = liveness.segments.iter().map(|s| s.value_id).collect();
+            let segment_values: FxHashSet<u32> =
+                liveness.segments.iter().map(|s| s.value_id).collect();
             let holes = liveness.segments.len().saturating_sub(segment_values.len());
             let caller_ids: FxHashSet<u8> = config.caller_saved_regs.iter().map(|r| r.0).collect();
             let callee_ids: FxHashSet<u8> = config.available_regs.iter().map(|r| r.0).collect();
-            let caller_homes = assignments.values().filter(|r| caller_ids.contains(&r.0)).count();
-            let callee_homes = assignments.values().filter(|r| callee_ids.contains(&r.0)).count();
+            let caller_homes = assignments
+                .values()
+                .filter(|r| caller_ids.contains(&r.0))
+                .count();
+            let callee_homes = assignments
+                .values()
+                .filter(|r| callee_ids.contains(&r.0))
+                .count();
             eprintln!(
                 "[RA-STATS] fn={} eligible={} scan={} assigned={} spilled={} segments={} holes={} callee-homes={} caller-homes={}",
                 func.name, eligible.len(), scan_values.len(), assigned_scan, spilled,
@@ -2263,7 +2356,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    let mut accumulator_assignments = analyze_accumulator_assignments(func, config.accumulator_policy);
+    let mut accumulator_assignments =
+        analyze_accumulator_assignments(func, config.accumulator_policy);
     // A physical assignment is the durable home and always wins. Publishing
     // both locations made downstream behavior depend on insertion order.
     accumulator_assignments.retain(|a| !assignments.contains_key(&a.value_id));
@@ -2653,7 +2747,12 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                         }
                     }
                 }
-                Instruction::Intrinsic { dest_ptr: None, op, args, .. } => {
+                Instruction::Intrinsic {
+                    dest_ptr: None,
+                    op,
+                    args,
+                    ..
+                } => {
                     // No dest_ptr: still poison args unless this is a known
                     // compute op (should not happen for the 128 family).
                     let args_are_vec = is_128_compute(op);
@@ -3010,12 +3109,16 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
 
     let class_of = |op: &O| -> Option<u8> {
         match op {
-            O::VecZeroF32x8 | O::VecLoadF32x8 | O::VecAddF32x8 | O::VecMulF32x8 | O::VecFmaF32x8 => {
-                Some(1)
-            }
-            O::VecZeroF64x4 | O::VecLoadF64x4 | O::VecAddF64x4 | O::VecMulF64x4 | O::VecFmaF64x4 => {
-                Some(2)
-            }
+            O::VecZeroF32x8
+            | O::VecLoadF32x8
+            | O::VecAddF32x8
+            | O::VecMulF32x8
+            | O::VecFmaF32x8 => Some(1),
+            O::VecZeroF64x4
+            | O::VecLoadF64x4
+            | O::VecAddF64x4
+            | O::VecMulF64x4
+            | O::VecFmaF64x4 => Some(2),
             O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
             O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
             _ => None,
@@ -3031,8 +3134,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 op,
                 O::VecAddF64x4 | O::VecMulF64x4 | O::VecFmaF64x4 | O::VecHorizontalAddF64x4
             ),
-            3 => matches!(op, O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4),
-            4 => matches!(op, O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2),
+            3 => matches!(
+                op,
+                O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4
+            ),
+            4 => matches!(
+                op,
+                O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2
+            ),
             _ => false,
         }
     };
@@ -3113,7 +3222,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                         dest,
                         src: Operand::Value(src),
                     } => {
-                        if classes.get(&dest.0) == classes.get(&src.0) && classes.contains_key(&src.0)
+                        if classes.get(&dest.0) == classes.get(&src.0)
+                            && classes.contains_key(&src.0)
                         {
                             allowed.insert(src.0);
                         }
@@ -3617,13 +3727,23 @@ fn collect_i686_scratch_hazard_points(
             if !ecx_clean {
                 ecx.push(point);
                 if env_on("CCC_DEBUG_HAZARDS") {
-                    eprintln!("[HZ] fn={} pt={} ECX-DIRTY {:?}", func.name, point, inst_kind_name(inst));
+                    eprintln!(
+                        "[HZ] fn={} pt={} ECX-DIRTY {:?}",
+                        func.name,
+                        point,
+                        inst_kind_name(inst)
+                    );
                 }
             }
             if !edx_clean {
                 edx.push(point);
                 if env_on("CCC_DEBUG_HAZARDS") {
-                    eprintln!("[HZ] fn={} pt={} EDX-DIRTY {:?}", func.name, point, inst_kind_name(inst));
+                    eprintln!(
+                        "[HZ] fn={} pt={} EDX-DIRTY {:?}",
+                        func.name,
+                        point,
+                        inst_kind_name(inst)
+                    );
                 }
             }
             point += 1;
@@ -4302,13 +4422,7 @@ mod phi_coalesce_tests {
         func.next_value_id = 4;
 
         let liveness = compute_live_intervals(&func);
-        if liveness
-            .block_loop_depth
-            .get(1)
-            .copied()
-            .unwrap_or(0)
-            == 0
-        {
+        if liveness.block_loop_depth.get(1).copied().unwrap_or(0) == 0 {
             return;
         }
         let candidates = detect_phi_coalesce_groups(&func, &liveness);

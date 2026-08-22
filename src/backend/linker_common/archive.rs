@@ -7,29 +7,36 @@
 use crate::common::fx_hash::FxHashMap;
 use std::path::Path;
 
-use crate::backend::elf::{
-    ELF_MAGIC, ET_DYN,
-    STT_SECTION, STT_FILE,
-    read_u16,
-    parse_archive_members, parse_thin_archive_members, is_thin_archive,
-    parse_linker_script_entries, LinkerScriptEntry,
-};
-use super::types::Elf64Object;
-use super::symbols::GlobalSymbolOps;
-use super::parse_object::{parse_elf64_object, parse_elf64_object_at};
 use super::dynamic::register_symbols_elf64;
+use super::parse_object::{parse_elf64_object, parse_elf64_object_at};
 use super::resolve_lib::resolve_lib;
+use super::symbols::GlobalSymbolOps;
+use super::types::Elf64Object;
+use crate::backend::elf::{
+    is_thin_archive, parse_archive_members, parse_linker_script_entries,
+    parse_thin_archive_members, read_u16, LinkerScriptEntry, ELF_MAGIC, ET_DYN, STT_FILE,
+    STT_SECTION,
+};
 
 /// Check if an archive member defines any currently-undefined, non-dynamic symbol.
 fn member_resolves_undefined_generic<G: GlobalSymbolOps>(
-    obj: &Elf64Object, globals: &FxHashMap<String, G>,
+    obj: &Elf64Object,
+    globals: &FxHashMap<String, G>,
 ) -> bool {
     for sym in &obj.symbols {
-        if sym.is_undefined() || sym.is_local() { continue; }
-        if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE { continue; }
-        if sym.name.is_empty() { continue; }
+        if sym.is_undefined() || sym.is_local() {
+            continue;
+        }
+        if sym.sym_type() == STT_SECTION || sym.sym_type() == STT_FILE {
+            continue;
+        }
+        if sym.name.is_empty() {
+            continue;
+        }
         if let Some(existing) = globals.get(sym.name.as_str()) {
-            if !existing.is_defined() && !existing.is_dynamic() { return true; }
+            if !existing.is_defined() && !existing.is_dynamic() {
+                return true;
+            }
         }
     }
     false
@@ -71,16 +78,26 @@ fn resolve_archive_members<G: GlobalSymbolOps>(
 /// (equivalent to GNU ld's `--whole-archive` flag). This is essential for
 /// shared library creation from convenience archives (e.g., libtool).
 pub fn load_archive_elf64<G: GlobalSymbolOps>(
-    data: &[u8], archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
-    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    data: &[u8],
+    archive_path: &str,
+    objects: &mut Vec<Elf64Object>,
+    globals: &mut FxHashMap<String, G>,
+    expected_machine: u16,
+    should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
     // Callers holding the archive in an Arc should use the _shared variant,
     // which avoids re-copying the whole archive here.
     let shared: std::sync::Arc<[u8]> = std::sync::Arc::from(data);
-    load_archive_elf64_shared(&shared, archive_path, objects, globals,
-                              expected_machine, should_replace_extra, whole_archive)
+    load_archive_elf64_shared(
+        &shared,
+        archive_path,
+        objects,
+        globals,
+        expected_machine,
+        should_replace_extra,
+        whole_archive,
+    )
 }
 
 /// Archive loader that shares the caller's buffer.
@@ -88,15 +105,23 @@ pub fn load_archive_elf64<G: GlobalSymbolOps>(
 /// Every member is a window into the one archive allocation, so member
 /// sections alias it directly instead of being copied out (see `secdata.rs`).
 pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
-    buf: &std::sync::Arc<[u8]>, archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
-    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    buf: &std::sync::Arc<[u8]>,
+    archive_path: &str,
+    objects: &mut Vec<Elf64Object>,
+    globals: &mut FxHashMap<String, G>,
+    expected_machine: u16,
+    should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
     load_archive_elf64_backed(
         &crate::backend::linker_common::filemap::FileBacking::owned(std::sync::Arc::clone(buf)),
-        archive_path, objects, globals, expected_machine, should_replace_extra,
-        whole_archive)
+        archive_path,
+        objects,
+        globals,
+        expected_machine,
+        should_replace_extra,
+        whole_archive,
+    )
 }
 
 /// Archive loader over a memory-mapped (or read) archive file.
@@ -105,9 +130,12 @@ pub fn load_archive_elf64_shared<G: GlobalSymbolOps>(
 /// archive, not the members, not their sections. For an archive the linker
 /// only partially consumes, the untouched members are never even faulted in.
 pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
-    buf: &crate::backend::linker_common::filemap::FileBacking, archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
-    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    buf: &crate::backend::linker_common::filemap::FileBacking,
+    archive_path: &str,
+    objects: &mut Vec<Elf64Object>,
+    globals: &mut FxHashMap<String, G>,
+    expected_machine: u16,
+    should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
     let data: &[u8] = buf.as_slice();
@@ -115,14 +143,23 @@ pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
     let mut member_objects: Vec<Elf64Object> = Vec::new();
     for (name, offset, size) in &members {
         let member_data = &data[*offset..*offset + *size];
-        if member_data.len() < 4 || member_data[0..4] != ELF_MAGIC { continue; }
+        if member_data.len() < 4 || member_data[0..4] != ELF_MAGIC {
+            continue;
+        }
         if expected_machine != 0 && member_data.len() >= 20 {
             let e_machine = read_u16(member_data, 18);
-            if e_machine != expected_machine { continue; }
+            if e_machine != expected_machine {
+                continue;
+            }
         }
         let full_name = format!("{}({})", archive_path, name);
         if let Ok(obj) = crate::backend::linker_common::parse_object::parse_elf64_object_backed(
-                buf, *offset, *size, &full_name, expected_machine) {
+            buf,
+            *offset,
+            *size,
+            &full_name,
+            expected_machine,
+        ) {
             member_objects.push(obj);
         }
     }
@@ -144,9 +181,12 @@ pub fn load_archive_elf64_backed<G: GlobalSymbolOps>(
 ///
 /// When `whole_archive` is true, all members are unconditionally included.
 pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
-    data: &[u8], archive_path: &str,
-    objects: &mut Vec<Elf64Object>, globals: &mut FxHashMap<String, G>,
-    expected_machine: u16, should_replace_extra: fn(&G) -> bool,
+    data: &[u8],
+    archive_path: &str,
+    objects: &mut Vec<Elf64Object>,
+    globals: &mut FxHashMap<String, G>,
+    expected_machine: u16,
+    should_replace_extra: fn(&G) -> bool,
     whole_archive: bool,
 ) -> Result<(), String> {
     let member_names = parse_thin_archive_members(data)?;
@@ -158,10 +198,16 @@ pub fn load_thin_archive_elf64<G: GlobalSymbolOps>(
     for name in &member_names {
         let member_path = archive_dir.join(name);
         let member_data = std::fs::read(&member_path).map_err(|e| {
-            format!("thin archive {}: failed to read member '{}': {}",
-                archive_path, member_path.display(), e)
+            format!(
+                "thin archive {}: failed to read member '{}': {}",
+                archive_path,
+                member_path.display(),
+                e
+            )
         })?;
-        if member_data.len() < 4 || member_data[0..4] != ELF_MAGIC { continue; }
+        if member_data.len() < 4 || member_data[0..4] != ELF_MAGIC {
+            continue;
+        }
         let full_name = format!("{}({})", archive_path, name);
         if let Ok(obj) = parse_elf64_object(&member_data, &full_name, expected_machine) {
             member_objects.push(obj);
@@ -207,34 +253,81 @@ pub fn load_file_elf64<G: GlobalSymbolOps>(
 
     // Regular archive
     if data.len() >= 8 && &data[0..8] == b"!<arch>\n" {
-        return load_archive_elf64(&data, path, objects, globals, expected_machine, should_replace_extra, false);
+        return load_archive_elf64(
+            &data,
+            path,
+            objects,
+            globals,
+            expected_machine,
+            should_replace_extra,
+            false,
+        );
     }
 
     // Thin archive
     if is_thin_archive(&data) {
-        return load_thin_archive_elf64(&data, path, objects, globals, expected_machine, should_replace_extra, false);
+        return load_thin_archive_elf64(
+            &data,
+            path,
+            objects,
+            globals,
+            expected_machine,
+            should_replace_extra,
+            false,
+        );
     }
 
     // Not ELF? Try linker script (handles GROUP and INPUT directives)
     if data.len() >= 4 && data[0..4] != ELF_MAGIC {
         if let Ok(text) = std::str::from_utf8(&data) {
             if let Some(entries) = parse_linker_script_entries(text) {
-                let script_dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string());
+                let script_dir = Path::new(path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string());
                 for entry in &entries {
                     match entry {
                         LinkerScriptEntry::Path(lib_path) => {
                             if Path::new(lib_path).exists() {
-                                load_file_elf64(lib_path, objects, globals, expected_machine, lib_paths, prefer_static, should_replace_extra, on_shared_lib)?;
+                                load_file_elf64(
+                                    lib_path,
+                                    objects,
+                                    globals,
+                                    expected_machine,
+                                    lib_paths,
+                                    prefer_static,
+                                    should_replace_extra,
+                                    on_shared_lib,
+                                )?;
                             } else if let Some(ref dir) = script_dir {
                                 let resolved = format!("{}/{}", dir, lib_path);
                                 if Path::new(&resolved).exists() {
-                                    load_file_elf64(&resolved, objects, globals, expected_machine, lib_paths, prefer_static, should_replace_extra, on_shared_lib)?;
+                                    load_file_elf64(
+                                        &resolved,
+                                        objects,
+                                        globals,
+                                        expected_machine,
+                                        lib_paths,
+                                        prefer_static,
+                                        should_replace_extra,
+                                        on_shared_lib,
+                                    )?;
                                 }
                             }
                         }
                         LinkerScriptEntry::Lib(lib_name) => {
-                            if let Some(resolved_path) = resolve_lib(lib_name, lib_paths, prefer_static) {
-                                load_file_elf64(&resolved_path, objects, globals, expected_machine, lib_paths, prefer_static, should_replace_extra, on_shared_lib)?;
+                            if let Some(resolved_path) =
+                                resolve_lib(lib_name, lib_paths, prefer_static)
+                            {
+                                load_file_elf64(
+                                    &resolved_path,
+                                    objects,
+                                    globals,
+                                    expected_machine,
+                                    lib_paths,
+                                    prefer_static,
+                                    should_replace_extra,
+                                    on_shared_lib,
+                                )?;
                             }
                         }
                     }

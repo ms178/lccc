@@ -10,7 +10,11 @@ use super::constants::*;
 /// Returns `(sh_type, sh_flags)` based on well-known section names (`.text`,
 /// `.data`, `.bss`, etc.) and optional explicit flags/type strings from the
 /// `.section` directive.
-pub fn parse_section_flags(name: &str, flags_str: Option<&str>, type_str: Option<&str>) -> (u32, u64) {
+pub fn parse_section_flags(
+    name: &str,
+    flags_str: Option<&str>,
+    type_str: Option<&str>,
+) -> (u32, u64) {
     let (default_type, default_flags) = match name {
         ".text" => (SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
         ".data" => (SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),

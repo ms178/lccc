@@ -1,35 +1,35 @@
-pub(crate) mod asm_expr;        // Shared assembly expression evaluator (arithmetic, bitwise, parens)
-pub(crate) mod asm_preprocess;  // Shared GAS preprocessing: comments, macros, rept, conditionals
+pub(crate) mod asm_expr; // Shared assembly expression evaluator (arithmetic, bitwise, parens)
+pub(crate) mod asm_preprocess; // Shared GAS preprocessing: comments, macros, rept, conditionals
 pub(crate) mod common;
 #[allow(dead_code)] // Defines ELF standard constants/helpers; not all used by every backend
 pub(crate) mod elf;
 pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
-#[cfg_attr(feature = "gcc_linker", allow(dead_code))] // Built-in linker code unused when gcc handles linking
+#[cfg_attr(feature = "gcc_linker", allow(dead_code))]
+// Built-in linker code unused when gcc handles linking
 pub mod linker_common;
 pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word matching, LineStore)
 
 // Shared codegen framework, split into focused modules:
-pub(crate) mod state;       // CodegenState, StackSlot, SlotAddr
-pub(crate) mod traits;      // ArchCodegen trait with default implementations
-pub(crate) mod generation;    // Module/function/instruction dispatch
-pub(crate) mod stack_layout;  // Stack layout: slot assignment, alloca coalescing, regalloc helpers
-pub(crate) mod call_abi;    // Unified ABI classification: call args + callee params, stack computation
-pub(crate) mod cast;        // Cast and float operation classification
+pub(crate) mod call_abi; // Unified ABI classification: call args + callee params, stack computation
+pub(crate) mod cast; // Cast and float operation classification
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
-pub(crate) mod inline_asm;  // InlineAsmEmitter trait and shared framework
-pub(crate) mod x86_common;  // Shared x86/i686 register names, condition codes, asm template parsing
+pub(crate) mod generation; // Module/function/instruction dispatch
+pub(crate) mod inline_asm; // InlineAsmEmitter trait and shared framework
+pub(crate) mod stack_layout; // Stack layout: slot assignment, alloca coalescing, regalloc helpers
+pub(crate) mod state; // CodegenState, StackSlot, SlotAddr
+pub(crate) mod traits; // ArchCodegen trait with default implementations
+pub(crate) mod x86_common; // Shared x86/i686 register names, condition codes, asm template parsing
 
 // Register allocation and liveness analysis
-pub(crate) mod liveness;     // Live interval computation
-pub(crate) mod live_range;   // Linear scan data structures (LiveRange, LinearScanAllocator)
-pub(crate) mod regalloc;     // Linear scan register allocator
+pub(crate) mod live_range; // Linear scan data structures (LiveRange, LinearScanAllocator)
+pub(crate) mod liveness; // Live interval computation
+pub(crate) mod regalloc; // Linear scan register allocator
 pub(crate) mod split_ranges; // Live range splitting for call-spanning values
 
-
-pub mod x86;
-pub(crate) mod i686;
 pub(crate) mod arm;
+pub(crate) mod i686;
 pub(crate) mod riscv;
+pub mod x86;
 
 use crate::ir::reexports::IrModule;
 
@@ -270,7 +270,11 @@ impl Target {
 
     /// Pointer size in bytes for this target.
     pub(crate) fn ptr_size(&self) -> usize {
-        if self.is_32bit() { 4 } else { 8 }
+        if self.is_32bit() {
+            4
+        } else {
+            8
+        }
     }
 
     /// Get the assembler config for this target.
@@ -305,13 +309,13 @@ impl Target {
             Target::X86_64 => common::LinkerConfig {
                 command: "gcc",
                 extra_args: &["-no-pie"],
-                expected_elf_machine: 62,  // EM_X86_64
+                expected_elf_machine: 62, // EM_X86_64
                 arch_name: "x86-64",
             },
             Target::I686 => common::LinkerConfig {
                 command: "i686-linux-gnu-gcc",
                 extra_args: &["-m32", "-no-pie"],
-                expected_elf_machine: 3,   // EM_386
+                expected_elf_machine: 3, // EM_386
                 arch_name: "i686",
             },
             Target::Aarch64 => common::LinkerConfig {
@@ -349,7 +353,12 @@ impl Target {
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
-                let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let raw = generation::generate_module_with_debug(
+                    &mut cg,
+                    module,
+                    opts.debug_info,
+                    source_mgr,
+                );
                 // Escape hatch for bisecting a suspected peephole miscompile:
                 // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
                 if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
@@ -364,7 +373,12 @@ impl Target {
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
-                let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let raw = generation::generate_module_with_debug(
+                    &mut cg,
+                    module,
+                    opts.debug_info,
+                    source_mgr,
+                );
                 // Same bisection escape hatch as x86-64: LCCC_NO_PEEPHOLE=1
                 // emits the pre-peephole assembly verbatim. Without this the
                 // i686 peepholes could not be ruled out when triaging a
@@ -386,7 +400,12 @@ impl Target {
                 cg.state.fpo_requested = opts.omit_frame_pointer;
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
-                let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let raw = generation::generate_module_with_debug(
+                    &mut cg,
+                    module,
+                    opts.debug_info,
+                    source_mgr,
+                );
                 arm::codegen::peephole::peephole_optimize(raw)
             }
             Target::Riscv64 => {
@@ -396,7 +415,12 @@ impl Target {
                 cg.state.function_sections = opts.function_sections;
                 cg.state.data_sections = opts.data_sections;
                 cg.emit_pre_directives();
-                let raw = generation::generate_module_with_debug(&mut cg, module, opts.debug_info, source_mgr);
+                let raw = generation::generate_module_with_debug(
+                    &mut cg,
+                    module,
+                    opts.debug_info,
+                    source_mgr,
+                );
                 riscv::codegen::peephole::peephole_optimize(raw)
             }
         }
@@ -407,7 +431,12 @@ impl Target {
     ///
     /// When the `gcc_assembler` Cargo feature is enabled, uses GCC for assembling
     /// (with a warning). When disabled (default), uses the built-in assembler.
-    pub(crate) fn assemble_with_extra(&self, asm_text: &str, output_path: &str, extra_args: &[String]) -> Result<(), String> {
+    pub(crate) fn assemble_with_extra(
+        &self,
+        asm_text: &str,
+        output_path: &str,
+        extra_args: &[String],
+    ) -> Result<(), String> {
         // When gcc_assembler feature is enabled, use GCC for assembling
         #[cfg(feature = "gcc_assembler")]
         {
@@ -427,7 +456,9 @@ impl Target {
             match self {
                 Target::Aarch64 => arm::assembler::assemble(asm_text, output_path),
                 Target::X86_64 => x86::assembler::assemble(asm_text, output_path),
-                Target::Riscv64 => riscv::assembler::assemble_with_args(asm_text, output_path, extra_args),
+                Target::Riscv64 => {
+                    riscv::assembler::assemble_with_args(asm_text, output_path, extra_args)
+                }
                 Target::I686 => i686::assembler::assemble(asm_text, output_path),
             }
         }
@@ -444,7 +475,12 @@ impl Target {
     /// When the `gcc_linker` Cargo feature is enabled, GCC can be used as a
     /// fallback for operations the built-in linker doesn't support (e.g.,
     /// -shared, -r).
-    pub(crate) fn link_with_args(&self, object_files: &[&str], output_path: &str, user_args: &[String]) -> Result<(), String> {
+    pub(crate) fn link_with_args(
+        &self,
+        object_files: &[&str],
+        output_path: &str,
+        user_args: &[String],
+    ) -> Result<(), String> {
         common::link_with_args(&self.linker_config(), object_files, output_path, user_args)
     }
 }

@@ -64,12 +64,13 @@ pub fn parse_string_literal(s: &str) -> Result<Vec<u8>, String> {
                         for _ in 0..2 {
                             if let Some(&next) = chars.as_str().as_bytes().first() {
                                 if next.is_ascii_hexdigit() {
-                                    val = val * 16 + match next {
-                                        b'0'..=b'9' => (next - b'0') as u32,
-                                        b'a'..=b'f' => (next - b'a' + 10) as u32,
-                                        b'A'..=b'F' => (next - b'A' + 10) as u32,
-                                        _ => unreachable!(),
-                                    };
+                                    val = val * 16
+                                        + match next {
+                                            b'0'..=b'9' => (next - b'0') as u32,
+                                            b'a'..=b'f' => (next - b'a' + 10) as u32,
+                                            b'A'..=b'F' => (next - b'A' + 10) as u32,
+                                            _ => unreachable!(),
+                                        };
                                     chars.next();
                                 } else {
                                     break;

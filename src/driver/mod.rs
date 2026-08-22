@@ -1,6 +1,6 @@
-pub(crate) mod pipeline;
 mod cli;
 mod external_tools;
 mod file_types;
+pub(crate) mod pipeline;
 
-pub use pipeline::{Driver, CompileMode};
+pub use pipeline::{CompileMode, Driver};

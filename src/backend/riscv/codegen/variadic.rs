@@ -1,11 +1,16 @@
 //! RiscvCodegen: va_arg, va_start, va_copy operations.
 
-use crate::ir::reexports::Value;
+use super::emit::{callee_saved_name, RiscvCodegen};
 use crate::common::types::IrType;
-use super::emit::{RiscvCodegen, callee_saved_name};
+use crate::ir::reexports::Value;
 
 impl RiscvCodegen {
-    pub(super) fn emit_va_arg_impl(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) {
+    pub(super) fn emit_va_arg_impl(
+        &mut self,
+        dest: &Value,
+        va_list_ptr: &Value,
+        result_ty: IrType,
+    ) {
         // RISC-V LP64D: va_list is just a void* (pointer to the next arg on stack).
         if self.state.is_alloca(va_list_ptr.0) {
             if let Some(slot) = self.state.get_slot(va_list_ptr.0) {

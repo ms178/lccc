@@ -540,18 +540,45 @@ pub enum IntrinsicOp {
     Permutevar8x32,
 
     // --- AVX-VNNI (VEX, Raptor Lake+) ---
-    Dpbusd128, Dpbusds128, Dpwusd128, Dpwusds128,
-    Dpbusd256, Dpbusds256, Dpwusd256, Dpwusds256,
+    Dpbusd128,
+    Dpbusds128,
+    Dpwusd128,
+    Dpwusds128,
+    Dpbusd256,
+    Dpbusds256,
+    Dpwusd256,
+    Dpwusds256,
     // --- AVX-VNNI-INT8 ---
-    Dpbssd128, Dpbssds128, Dpbsud128, Dpbsuds128, Dpbuud128, Dpbuuds128,
-    Dpbssd256, Dpbssds256, Dpbsud256, Dpbsuds256, Dpbuud256, Dpbuuds256,
+    Dpbssd128,
+    Dpbssds128,
+    Dpbsud128,
+    Dpbsuds128,
+    Dpbuud128,
+    Dpbuuds128,
+    Dpbssd256,
+    Dpbssds256,
+    Dpbsud256,
+    Dpbsuds256,
+    Dpbuud256,
+    Dpbuuds256,
     // --- AVX-VNNI-INT16 (vpdpwusd/s shared with AVX-VNNI) ---
-    Dpwuud128, Dpwuuds128, Dpwssd128, Dpwssds128,
-    Dpwuud256, Dpwuuds256, Dpwssd256, Dpwssds256,
+    Dpwuud128,
+    Dpwuuds128,
+    Dpwssd128,
+    Dpwssds128,
+    Dpwuud256,
+    Dpwuuds256,
+    Dpwssd256,
+    Dpwssds256,
     // --- GFNI ---
-    Gf2p8mulb128, Gf2p8affineqb128, Gf2p8affineinvqb128,
+    Gf2p8mulb128,
+    Gf2p8affineqb128,
+    Gf2p8affineinvqb128,
     // --- VAES 256-bit + VPCLMULQDQ 256-bit ---
-    Aesenc256, Aesenclast256, Aesdec256, Aesdeclast256,
+    Aesenc256,
+    Aesenclast256,
+    Aesdec256,
+    Aesdeclast256,
     Vpclmulqdq256,
 
     // --- SSE2 ops previously left as scalar header loops ---
@@ -972,7 +999,6 @@ pub enum IntrinsicOp {
     FmaPd231v512,
 }
 
-
 impl IntrinsicOp {
     /// Width in bytes of the vector/XMM result produced by this intrinsic:
     /// 128-bit SSE results → Some(16), 256-bit AVX/AVX2 results → Some(32).
@@ -1065,7 +1091,8 @@ impl IntrinsicOp {
     /// Returns true if this intrinsic is a pure function (no side effects, result depends
     /// only on inputs). Pure intrinsics can be dead-code eliminated if their result is unused.
     pub fn is_pure(&self) -> bool {
-        matches!(self,
+        matches!(
+            self,
             IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64 |
             IntrinsicOp::FabsF32 | IntrinsicOp::FabsF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
@@ -1112,29 +1139,56 @@ impl IntrinsicOp {
     /// (as opposed to a scalar).  These values cannot live in a GPR; backends
     /// either home them on the stack or allocate SIMD registers for them.
     pub fn produces_vector_value(&self) -> bool {
-        matches!(self,
-            IntrinsicOp::VecZeroF64x4 | IntrinsicOp::VecZeroF64x2 |
-            IntrinsicOp::VecZeroI32x8 | IntrinsicOp::VecZeroI32x4 |
-            IntrinsicOp::VecZeroF32x8 | IntrinsicOp::VecZeroF32x4 |
-            IntrinsicOp::VecLoadF64x4 | IntrinsicOp::VecLoadF64x2 |
-            IntrinsicOp::VecLoadI32x8 | IntrinsicOp::VecLoadI32x4 |
-            IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 |
-            IntrinsicOp::VecAddF64x4 | IntrinsicOp::VecAddF64x2 |
-            IntrinsicOp::VecAddI32x8 | IntrinsicOp::VecAddI32x4 |
-            IntrinsicOp::VecAddF32x8 | IntrinsicOp::VecAddF32x4 |
-            IntrinsicOp::VecMulF64x4 | IntrinsicOp::VecMulF64x2 |
-            IntrinsicOp::VecBroadcastF64x4 | IntrinsicOp::VecBroadcastF64x2 |
-            IntrinsicOp::VecMulF32x8 | IntrinsicOp::VecMulF32x4 |
-            IntrinsicOp::VecBroadcastF32x8 | IntrinsicOp::VecBroadcastF32x4 |
-            IntrinsicOp::VecFmaF64x4 | IntrinsicOp::VecFmaF32x8 |
-            IntrinsicOp::VecMaddF64x4 | IntrinsicOp::VecMaddF32x8
-            | IntrinsicOp::VecLoadWidenI32ToI64x2 | IntrinsicOp::VecLoadI64x2
-            | IntrinsicOp::VecAddI64x2 | IntrinsicOp::VecMulI64x2
-            | IntrinsicOp::VecStoreI64x2 | IntrinsicOp::VecBroadcastI64x2 | IntrinsicOp::VecZeroI64x2
-            | IntrinsicOp::VecLoadI64x4 | IntrinsicOp::VecAddI64x4 | IntrinsicOp::VecHorizontalAddI64x4 | IntrinsicOp::VecZeroI64x4
-            | IntrinsicOp::VecMulI32x4 | IntrinsicOp::VecMulI32x8 | IntrinsicOp::VecBroadcastI32x4 | IntrinsicOp::VecBroadcastI32x8
-            | IntrinsicOp::VecSadalpI32x4
-            | IntrinsicOp::VecSmlalLoI32x4 | IntrinsicOp::VecSmlalHiI32x4
+        matches!(
+            self,
+            IntrinsicOp::VecZeroF64x4
+                | IntrinsicOp::VecZeroF64x2
+                | IntrinsicOp::VecZeroI32x8
+                | IntrinsicOp::VecZeroI32x4
+                | IntrinsicOp::VecZeroF32x8
+                | IntrinsicOp::VecZeroF32x4
+                | IntrinsicOp::VecLoadF64x4
+                | IntrinsicOp::VecLoadF64x2
+                | IntrinsicOp::VecLoadI32x8
+                | IntrinsicOp::VecLoadI32x4
+                | IntrinsicOp::VecLoadF32x8
+                | IntrinsicOp::VecLoadF32x4
+                | IntrinsicOp::VecAddF64x4
+                | IntrinsicOp::VecAddF64x2
+                | IntrinsicOp::VecAddI32x8
+                | IntrinsicOp::VecAddI32x4
+                | IntrinsicOp::VecAddF32x8
+                | IntrinsicOp::VecAddF32x4
+                | IntrinsicOp::VecMulF64x4
+                | IntrinsicOp::VecMulF64x2
+                | IntrinsicOp::VecBroadcastF64x4
+                | IntrinsicOp::VecBroadcastF64x2
+                | IntrinsicOp::VecMulF32x8
+                | IntrinsicOp::VecMulF32x4
+                | IntrinsicOp::VecBroadcastF32x8
+                | IntrinsicOp::VecBroadcastF32x4
+                | IntrinsicOp::VecFmaF64x4
+                | IntrinsicOp::VecFmaF32x8
+                | IntrinsicOp::VecMaddF64x4
+                | IntrinsicOp::VecMaddF32x8
+                | IntrinsicOp::VecLoadWidenI32ToI64x2
+                | IntrinsicOp::VecLoadI64x2
+                | IntrinsicOp::VecAddI64x2
+                | IntrinsicOp::VecMulI64x2
+                | IntrinsicOp::VecStoreI64x2
+                | IntrinsicOp::VecBroadcastI64x2
+                | IntrinsicOp::VecZeroI64x2
+                | IntrinsicOp::VecLoadI64x4
+                | IntrinsicOp::VecAddI64x4
+                | IntrinsicOp::VecHorizontalAddI64x4
+                | IntrinsicOp::VecZeroI64x4
+                | IntrinsicOp::VecMulI32x4
+                | IntrinsicOp::VecMulI32x8
+                | IntrinsicOp::VecBroadcastI32x4
+                | IntrinsicOp::VecBroadcastI32x8
+                | IntrinsicOp::VecSadalpI32x4
+                | IntrinsicOp::VecSmlalLoI32x4
+                | IntrinsicOp::VecSmlalHiI32x4
         )
     }
 }

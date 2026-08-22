@@ -28,11 +28,11 @@
 //! layout pass can give them the caller block's hotness instead of treating
 //! them as cold (they are new blocks with no profile entries).
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::constants::IrConst;
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, Instruction, IrFunction, IrModule, Operand, Terminator, Value,
 };
-use crate::common::types::IrType;
-use crate::ir::constants::IrConst;
 use crate::pgo::profile;
 
 struct PromoPlan {
@@ -170,7 +170,10 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     if std::env::var("LCCC_DEBUG_PROMOTE").is_ok() {
                         eprintln!(
                             "[PROMOTE] {} site {} sig mismatch: recorded={} actual={}",
-                            f.name, site.ordinal, site.sig, sig_of(info)
+                            f.name,
+                            site.ordinal,
+                            site.sig,
+                            sig_of(info)
                         );
                     }
                     continue;
@@ -359,10 +362,7 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                     join_is.push(Instruction::Phi {
                         dest: d,
                         ty: ret_ty,
-                        incoming: vec![
-                            (Operand::Value(a), lhot),
-                            (Operand::Value(b), lcold),
-                        ],
+                        incoming: vec![(Operand::Value(a), lhot), (Operand::Value(b), lcold)],
                     });
                 }
                 f.blocks.push(BasicBlock {
@@ -412,8 +412,14 @@ pub fn promote_indirect_calls(m: &mut IrModule, u: &str) -> usize {
                 // The label-renumber pass remaps these via
                 // crate::pgo::remap_promoted_hot before layout runs.
                 hot_labels.entry(f.name.clone()).or_default().insert(lhot.0);
-                hot_labels.entry(f.name.clone()).or_default().insert(lcold.0);
-                hot_labels.entry(f.name.clone()).or_default().insert(ljoin.0);
+                hot_labels
+                    .entry(f.name.clone())
+                    .or_default()
+                    .insert(lcold.0);
+                hot_labels
+                    .entry(f.name.clone())
+                    .or_default()
+                    .insert(ljoin.0);
                 promoted += 1;
             }
         }

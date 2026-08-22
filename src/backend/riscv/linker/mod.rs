@@ -24,14 +24,14 @@
 //! - `emit_shared`: Shared library (.so) emission
 
 mod elf_read;
-mod relocations;
-mod input;
-mod sections;
-mod symbols;
-mod reloc;
-mod link;
 mod emit_exec;
 mod emit_shared;
+mod input;
+mod link;
+mod reloc;
+mod relocations;
+mod sections;
+mod symbols;
 
 #[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;

@@ -1,14 +1,13 @@
 //! RiscvCodegen: prologue/epilogue and stack frame operations.
 
-use crate::ir::reexports::IrFunction;
-use crate::common::types::IrType;
-use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
-use crate::backend::call_abi::{ParamClass, classify_params};
 use super::emit::{
-    RiscvCodegen, callee_saved_name,
-    collect_inline_asm_callee_saved_riscv, RISCV_CALLEE_SAVED, CALL_TEMP_CALLEE_SAVED,
-    RISCV_ARG_REGS,
+    callee_saved_name, collect_inline_asm_callee_saved_riscv, RiscvCodegen, CALL_TEMP_CALLEE_SAVED,
+    RISCV_ARG_REGS, RISCV_CALLEE_SAVED,
 };
+use crate::backend::call_abi::{classify_params, ParamClass};
+use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
+use crate::common::types::IrType;
+use crate::ir::reexports::IrFunction;
 
 impl RiscvCodegen {
     // ---- calculate_stack_space ----
@@ -19,12 +18,14 @@ impl RiscvCodegen {
         // This is critical for va_start to correctly point to the first variadic arg.
         if func.is_variadic {
             // For variadic callee, call_abi_config() already has variadic_floats_in_gp: true.
-            let classification = crate::backend::call_abi::classify_params_full(func, &self.call_abi_config_impl());
+            let classification =
+                crate::backend::call_abi::classify_params_full(func, &self.call_abi_config_impl());
             // Use the effective GP register index (includes alignment gaps for I128/F128 pairs)
             // rather than summing gp_reg_count(), so we correctly skip over alignment padding.
             self.va_named_gp_count = classification.int_reg_idx.min(8);
             // Track stack bytes consumed by named params that overflowed to the caller's stack.
-            self.va_named_stack_bytes = crate::backend::call_abi::named_params_stack_bytes(&classification.classes);
+            self.va_named_stack_bytes =
+                crate::backend::call_abi::named_params_stack_bytes(&classification.classes);
             self.is_variadic = true;
         } else {
             self.is_variadic = false;
@@ -51,25 +52,41 @@ impl RiscvCodegen {
             all_available.push(reg);
         }
 
-        let mut available_regs = crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
+        let mut available_regs =
+            crate::backend::generation::filter_available_regs(&all_available, &asm_clobbered_regs);
         if self.state.disable_regalloc {
             available_regs.clear();
         }
-        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) = crate::backend::generation::run_regalloc_and_merge_clobbers(
-            func, available_regs, Vec::new(), &asm_clobbered_regs,
-            &mut self.reg_assignments, &mut self.used_callee_saved,
-            true, // RISC-V asm emitter checks reg_assignments for inline asm operands
-        );
+        let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
+            crate::backend::generation::run_regalloc_and_merge_clobbers(
+                func,
+                available_regs,
+                Vec::new(),
+                &asm_clobbered_regs,
+                &mut self.reg_assignments,
+                &mut self.used_callee_saved,
+                true, // RISC-V asm emitter checks reg_assignments for inline asm operands
+            );
 
-        self.state.ra_accumulator_values = accumulator_assignments.iter().map(|a| a.value_id).collect();
-        let space = calculate_stack_space_common(&mut self.state, func, 16, |space, alloc_size, align| {
-            // RISC-V uses negative offsets from s0 (frame pointer)
-            // Honor alignment: round up space to alignment boundary before allocating
-            let effective_align = if align > 0 { align.max(8) } else { 8 };
-            let alloc = ((alloc_size + 7) & !7).max(8);
-            let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
-            (-new_space, new_space)
-        }, &reg_assigned, &RISCV_CALLEE_SAVED, cached_liveness);
+        self.state.ra_accumulator_values =
+            accumulator_assignments.iter().map(|a| a.value_id).collect();
+        let space = calculate_stack_space_common(
+            &mut self.state,
+            func,
+            16,
+            |space, alloc_size, align| {
+                // RISC-V uses negative offsets from s0 (frame pointer)
+                // Honor alignment: round up space to alignment boundary before allocating
+                let effective_align = if align > 0 { align.max(8) } else { 8 };
+                let alloc = ((alloc_size + 7) & !7).max(8);
+                let new_space =
+                    ((space + alloc + effective_align - 1) / effective_align) * effective_align;
+                (-new_space, new_space)
+            },
+            &reg_assigned,
+            &RISCV_CALLEE_SAVED,
+            cached_liveness,
+        );
 
         // Add space for saving callee-saved registers.
         // Each callee-saved register needs 8 bytes on the stack.
@@ -137,25 +154,30 @@ impl RiscvCodegen {
         self.state.func_is_variadic = func.is_variadic;
 
         // Pre-compute param alloca slots for emit_param_ref
-        self.state.param_alloca_slots = (0..func.params.len()).map(|i| {
-            find_param_alloca(func, i).and_then(|(dest, ty)| {
-                self.state.get_slot(dest.0).map(|slot| (slot, ty))
+        self.state.param_alloca_slots = (0..func.params.len())
+            .map(|i| {
+                find_param_alloca(func, i)
+                    .and_then(|(dest, ty)| self.state.get_slot(dest.0).map(|slot| (slot, ty)))
             })
-        }).collect();
+            .collect();
 
         // Stack-passed params are at positive s0 offsets.
         // For variadic: register save area occupies s0+0..s0+56, stack params at s0+64+.
         let stack_base: i64 = if func.is_variadic { 64 } else { 0 };
 
         // Check if any F128 params exist (need to save all regs before __trunctfdf2).
-        let has_f128_reg_params = param_classes.iter().any(|c| matches!(c, ParamClass::F128GpPair { .. }));
+        let has_f128_reg_params = param_classes
+            .iter()
+            .any(|c| matches!(c, ParamClass::F128GpPair { .. }));
         let f128_save_offset: i64 = if has_f128_reg_params && !func.is_variadic {
             self.state.emit("    addi sp, sp, -128");
             for i in 0..8usize {
-                self.state.emit_fmt(format_args!("    sd {}, {}(sp)", RISCV_ARG_REGS[i], i * 8));
+                self.state
+                    .emit_fmt(format_args!("    sd {}, {}(sp)", RISCV_ARG_REGS[i], i * 8));
             }
             for i in 0..8usize {
-                self.state.emit_fmt(format_args!("    fsd fa{}, {}(sp)", i, 64 + i * 8));
+                self.state
+                    .emit_fmt(format_args!("    fsd fa{}, {}(sp)", i, 64 + i * 8));
             }
             0i64
         } else {
@@ -185,7 +207,8 @@ impl RiscvCodegen {
                     if has_f128_reg_params && !func.is_variadic {
                         let off = f128_save_offset + (reg_idx as i64) * 8;
                         let load_instr = Self::load_for_type(ty);
-                        self.state.emit_fmt(format_args!("    {} t0, {}(sp)", load_instr, off));
+                        self.state
+                            .emit_fmt(format_args!("    {} t0, {}(sp)", load_instr, off));
                         self.emit_store_to_s0("t0", slot.0, "sd");
                     } else if func.is_variadic {
                         // For variadic, load from save area with extending load.
@@ -203,16 +226,20 @@ impl RiscvCodegen {
                         // FP regs were saved to stack; load from save area.
                         let fp_off = f128_save_offset + 64 + (reg_idx as i64) * 8;
                         if ty == IrType::F32 {
-                            self.state.emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
+                            self.state
+                                .emit_fmt(format_args!("    flw ft0, {}(sp)", fp_off));
                             self.state.emit("    fmv.x.w t0, ft0");
                         } else {
-                            self.state.emit_fmt(format_args!("    fld ft0, {}(sp)", fp_off));
+                            self.state
+                                .emit_fmt(format_args!("    fld ft0, {}(sp)", fp_off));
                             self.state.emit("    fmv.x.d t0, ft0");
                         }
                     } else if ty == IrType::F32 {
-                        self.state.emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
+                        self.state
+                            .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
                     } else {
-                        self.state.emit_fmt(format_args!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
+                        self.state
+                            .emit_fmt(format_args!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
                     }
                     self.emit_store_to_s0("t0", slot.0, "sd");
                 }
@@ -227,9 +254,11 @@ impl RiscvCodegen {
                     } else if has_f128_reg_params {
                         let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
                         let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+                        self.state
+                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
                         self.emit_store_to_s0("t0", slot.0, "sd");
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+                        self.state
+                            .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
                         self.emit_store_to_s0("t0", slot.0 + 8, "sd");
                     } else {
                         self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
@@ -239,11 +268,13 @@ impl RiscvCodegen {
                 ParamClass::StructByValReg { base_reg_idx, size } => {
                     if has_f128_reg_params && !func.is_variadic {
                         let lo_off = f128_save_offset + (base_reg_idx as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+                        self.state
+                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
                         self.emit_store_to_s0("t0", slot.0, "sd");
                         if size > 8 {
                             let hi_off = f128_save_offset + ((base_reg_idx + 1) as i64) * 8;
-                            self.state.emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+                            self.state
+                                .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
                             self.emit_store_to_s0("t0", slot.0 + 8, "sd");
                         }
                     } else if func.is_variadic {
@@ -258,11 +289,18 @@ impl RiscvCodegen {
                     } else {
                         self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx], slot.0, "sd");
                         if size > 8 {
-                            self.emit_store_to_s0(RISCV_ARG_REGS[base_reg_idx + 1], slot.0 + 8, "sd");
+                            self.emit_store_to_s0(
+                                RISCV_ARG_REGS[base_reg_idx + 1],
+                                slot.0 + 8,
+                                "sd",
+                            );
                         }
                     }
                 }
-                ParamClass::F128GpPair { lo_reg_idx, hi_reg_idx } => {
+                ParamClass::F128GpPair {
+                    lo_reg_idx,
+                    hi_reg_idx,
+                } => {
                     // F128 in GP register pair: store full 16-byte f128 directly to alloca.
                     // This preserves quad precision (e.g., LDBL_MIN != 0).
                     if func.is_variadic {
@@ -276,9 +314,11 @@ impl RiscvCodegen {
                         // Load from F128 save area.
                         let lo_off = f128_save_offset + (lo_reg_idx as i64) * 8;
                         let hi_off = f128_save_offset + (hi_reg_idx as i64) * 8;
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
+                        self.state
+                            .emit_fmt(format_args!("    ld t0, {}(sp)", lo_off));
                         self.emit_store_to_s0("t0", slot.0, "sd");
-                        self.state.emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
+                        self.state
+                            .emit_fmt(format_args!("    ld t0, {}(sp)", hi_off));
                         self.emit_store_to_s0("t0", slot.0 + 8, "sd");
                     }
                 }
@@ -305,7 +345,8 @@ impl RiscvCodegen {
                     self.emit_load_from_s0("t0", src, load_instr);
                     self.emit_store_to_s0("t0", slot.0, "sd");
                 }
-                ParamClass::StructStack { offset, size } | ParamClass::LargeStructStack { offset, size } => {
+                ParamClass::StructStack { offset, size }
+                | ParamClass::LargeStructStack { offset, size } => {
                     let src = stack_base + offset;
                     let n_dwords = size.div_ceil(8);
                     for qi in 0..n_dwords {
@@ -356,7 +397,11 @@ impl RiscvCodegen {
                         self.emit_store_to_s0("t0", dst_off, "sd");
                     }
                 }
-                ParamClass::StructSplitRegStack { reg_idx, stack_offset, size } => {
+                ParamClass::StructSplitRegStack {
+                    reg_idx,
+                    stack_offset,
+                    size,
+                } => {
                     // RISC-V psABI: first 8 bytes in GP register, remaining bytes on the stack.
                     if func.is_variadic {
                         // Variadic: load first half from register save area
@@ -382,71 +427,137 @@ impl RiscvCodegen {
                     }
                 }
                 // F128 in FP reg doesn't happen on RISC-V.
-                ParamClass::F128FpReg { .. } |
-                ParamClass::F128SseReg { .. } |
-                ParamClass::ZeroSizeSkip => {}
+                ParamClass::F128FpReg { .. }
+                | ParamClass::F128SseReg { .. }
+                | ParamClass::ZeroSizeSkip => {}
 
                 // RISC-V LP64D: struct with float/double fields passed in FP registers.
-                ParamClass::StructSseReg { lo_fp_idx, hi_fp_idx, size } => {
-                    let float_arg_regs_inner = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+                ParamClass::StructSseReg {
+                    lo_fp_idx,
+                    hi_fp_idx,
+                    size,
+                } => {
+                    let float_arg_regs_inner =
+                        ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     // Get the RISC-V float class to determine field sizes
                     let rv_class = func.params[i].riscv_float_class;
                     let (lo_is_double, hi_is_double) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::OneFloat { is_double }) => (is_double, false),
-                        Some(crate::common::types::RiscvFloatClass::TwoFloats { lo_is_double, hi_is_double }) => (lo_is_double, hi_is_double),
+                        Some(crate::common::types::RiscvFloatClass::OneFloat { is_double }) => {
+                            (is_double, false)
+                        }
+                        Some(crate::common::types::RiscvFloatClass::TwoFloats {
+                            lo_is_double,
+                            hi_is_double,
+                        }) => (lo_is_double, hi_is_double),
                         _ => (size > 4, true), // fallback guess
                     };
                     // Store first float/double field
                     if lo_is_double {
-                        self.state.emit_fmt(format_args!("    fsd {}, {}(s0)", float_arg_regs_inner[lo_fp_idx], slot.0));
+                        self.state.emit_fmt(format_args!(
+                            "    fsd {}, {}(s0)",
+                            float_arg_regs_inner[lo_fp_idx], slot.0
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    fsw {}, {}(s0)", float_arg_regs_inner[lo_fp_idx], slot.0));
+                        self.state.emit_fmt(format_args!(
+                            "    fsw {}, {}(s0)",
+                            float_arg_regs_inner[lo_fp_idx], slot.0
+                        ));
                     }
                     // Store second float/double field (if present)
                     if let Some(hi_idx) = hi_fp_idx {
                         let hi_offset = if lo_is_double { 8 } else { 4 };
                         if hi_is_double {
-                            self.state.emit_fmt(format_args!("    fsd {}, {}(s0)", float_arg_regs_inner[hi_idx], slot.0 + hi_offset));
+                            self.state.emit_fmt(format_args!(
+                                "    fsd {}, {}(s0)",
+                                float_arg_regs_inner[hi_idx],
+                                slot.0 + hi_offset
+                            ));
                         } else {
-                            self.state.emit_fmt(format_args!("    fsw {}, {}(s0)", float_arg_regs_inner[hi_idx], slot.0 + hi_offset));
+                            self.state.emit_fmt(format_args!(
+                                "    fsw {}, {}(s0)",
+                                float_arg_regs_inner[hi_idx],
+                                slot.0 + hi_offset
+                            ));
                         }
                     }
                 }
-                ParamClass::StructMixedIntSseReg { int_reg_idx, fp_reg_idx, size: _ } => {
+                ParamClass::StructMixedIntSseReg {
+                    int_reg_idx,
+                    fp_reg_idx,
+                    size: _,
+                } => {
                     // Integer first, float second (in memory layout)
-                    let float_arg_regs_inner = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+                    let float_arg_regs_inner =
+                        ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     let rv_class = func.params[i].riscv_float_class;
                     let (float_is_double, int_size, float_offset) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::IntAndFloat { float_is_double, int_size, float_offset, .. }) => (float_is_double, int_size, float_offset),
+                        Some(crate::common::types::RiscvFloatClass::IntAndFloat {
+                            float_is_double,
+                            int_size,
+                            float_offset,
+                            ..
+                        }) => (float_is_double, int_size, float_offset),
                         _ => (true, 8, 8), // fallback
                     };
                     // Store integer part at beginning of struct
                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
-                    self.state.emit_fmt(format_args!("    {} {}, {}(s0)", int_store, RISCV_ARG_REGS[int_reg_idx], slot.0));
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, {}(s0)",
+                        int_store, RISCV_ARG_REGS[int_reg_idx], slot.0
+                    ));
                     // Store float part at its offset
                     if float_is_double {
-                        self.state.emit_fmt(format_args!("    fsd {}, {}(s0)", float_arg_regs_inner[fp_reg_idx], slot.0 + float_offset as i64));
+                        self.state.emit_fmt(format_args!(
+                            "    fsd {}, {}(s0)",
+                            float_arg_regs_inner[fp_reg_idx],
+                            slot.0 + float_offset as i64
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    fsw {}, {}(s0)", float_arg_regs_inner[fp_reg_idx], slot.0 + float_offset as i64));
+                        self.state.emit_fmt(format_args!(
+                            "    fsw {}, {}(s0)",
+                            float_arg_regs_inner[fp_reg_idx],
+                            slot.0 + float_offset as i64
+                        ));
                     }
                 }
-                ParamClass::StructMixedSseIntReg { fp_reg_idx, int_reg_idx, size: _ } => {
+                ParamClass::StructMixedSseIntReg {
+                    fp_reg_idx,
+                    int_reg_idx,
+                    size: _,
+                } => {
                     // Float first, integer second (in memory layout)
-                    let float_arg_regs_inner = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
+                    let float_arg_regs_inner =
+                        ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                     let rv_class = func.params[i].riscv_float_class;
                     let (float_is_double, int_offset, int_size) = match rv_class {
-                        Some(crate::common::types::RiscvFloatClass::FloatAndInt { float_is_double, int_offset, int_size, .. }) => (float_is_double, int_offset, int_size),
+                        Some(crate::common::types::RiscvFloatClass::FloatAndInt {
+                            float_is_double,
+                            int_offset,
+                            int_size,
+                            ..
+                        }) => (float_is_double, int_offset, int_size),
                         _ => (true, 8, 8), // fallback
                     };
                     // Store float part at beginning of struct
                     if float_is_double {
-                        self.state.emit_fmt(format_args!("    fsd {}, {}(s0)", float_arg_regs_inner[fp_reg_idx], slot.0));
+                        self.state.emit_fmt(format_args!(
+                            "    fsd {}, {}(s0)",
+                            float_arg_regs_inner[fp_reg_idx], slot.0
+                        ));
                     } else {
-                        self.state.emit_fmt(format_args!("    fsw {}, {}(s0)", float_arg_regs_inner[fp_reg_idx], slot.0));
+                        self.state.emit_fmt(format_args!(
+                            "    fsw {}, {}(s0)",
+                            float_arg_regs_inner[fp_reg_idx], slot.0
+                        ));
                     }
                     // Store integer part at its offset
                     let int_store = if int_size <= 4 { "sw" } else { "sd" };
-                    self.state.emit_fmt(format_args!("    {} {}, {}(s0)", int_store, RISCV_ARG_REGS[int_reg_idx], slot.0 + int_offset as i64));
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, {}(s0)",
+                        int_store,
+                        RISCV_ARG_REGS[int_reg_idx],
+                        slot.0 + int_offset as i64
+                    ));
                 }
             }
         }
@@ -459,7 +570,12 @@ impl RiscvCodegen {
 
     /// Sign/zero-extend a GP register value to 64 bits for sub-64-bit types.
     /// For 64-bit or larger types, just moves src to dest.
-    fn emit_extend_reg(state: &mut crate::backend::state::CodegenState, src: &str, dest: &str, ty: IrType) {
+    fn emit_extend_reg(
+        state: &mut crate::backend::state::CodegenState,
+        src: &str,
+        dest: &str,
+        ty: IrType,
+    ) {
         match ty {
             IrType::I8 => {
                 if src != dest {
@@ -505,7 +621,12 @@ impl RiscvCodegen {
 
     // ---- emit_param_ref ----
 
-    pub(super) fn emit_param_ref_impl(&mut self, dest: &crate::ir::reexports::Value, param_idx: usize, ty: IrType) {
+    pub(super) fn emit_param_ref_impl(
+        &mut self,
+        dest: &crate::ir::reexports::Value,
+        param_idx: usize,
+        ty: IrType,
+    ) {
         if param_idx >= self.state.param_classes.len() {
             return;
         }
@@ -528,15 +649,18 @@ impl RiscvCodegen {
 
         match class {
             ParamClass::IntReg { reg_idx } => {
-                self.state.emit_fmt(format_args!("    mv t0, {}", RISCV_ARG_REGS[reg_idx]));
+                self.state
+                    .emit_fmt(format_args!("    mv t0, {}", RISCV_ARG_REGS[reg_idx]));
                 self.store_t0_to(dest);
             }
             ParamClass::FloatReg { reg_idx } => {
                 let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
                 if ty == IrType::F32 {
-                    self.state.emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
+                    self.state
+                        .emit_fmt(format_args!("    fmv.x.w t0, {}", float_arg_regs[reg_idx]));
                 } else {
-                    self.state.emit_fmt(format_args!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
+                    self.state
+                        .emit_fmt(format_args!("    fmv.x.d t0, {}", float_arg_regs[reg_idx]));
                 }
                 self.store_t0_to(dest);
             }
@@ -589,7 +713,11 @@ impl RiscvCodegen {
         // placed ABOVE s0, contiguous with the caller's stack-passed arguments.
         // Layout: s0+0..s0+56 = a0..a7, s0+64+ = caller stack args.
         // This means total_alloc = frame_size + 64 for variadic, but s0 = sp + frame_size.
-        let total_alloc = if self.is_variadic { frame_size + 64 } else { frame_size };
+        let total_alloc = if self.is_variadic {
+            frame_size + 64
+        } else {
+            frame_size
+        };
 
         const PAGE_SIZE: i64 = 4096;
 
@@ -597,12 +725,16 @@ impl RiscvCodegen {
         // -total_alloc (sp adjust), and frame_size (s0 setup).
         if Self::fits_imm12(-total_alloc) && Self::fits_imm12(total_alloc) {
             // Small frame: all offsets fit in 12-bit immediates
-            self.state.emit_fmt(format_args!("    addi sp, sp, -{}", total_alloc));
+            self.state
+                .emit_fmt(format_args!("    addi sp, sp, -{}", total_alloc));
             // ra and s0 are saved relative to s0, which is sp + frame_size
             // (NOT sp + total_alloc for variadic functions!)
-            self.state.emit_fmt(format_args!("    sd ra, {}(sp)", frame_size - 8));
-            self.state.emit_fmt(format_args!("    sd s0, {}(sp)", frame_size - 16));
-            self.state.emit_fmt(format_args!("    addi s0, sp, {}", frame_size));
+            self.state
+                .emit_fmt(format_args!("    sd ra, {}(sp)", frame_size - 8));
+            self.state
+                .emit_fmt(format_args!("    sd s0, {}(sp)", frame_size - 16));
+            self.state
+                .emit_fmt(format_args!("    addi s0, sp, {}", frame_size));
             if self.state.emit_cfi {
                 self.state.emit_fmt(format_args!("    .cfi_def_cfa s0, 0"));
                 self.state.emit("    .cfi_offset ra, -8");
@@ -613,17 +745,21 @@ impl RiscvCodegen {
             // can grow the stack mapping. Without this, a single large sub
             // can skip guard pages and cause a segfault.
             let probe_label = self.state.fresh_label("stack_probe");
-            self.state.emit_fmt(format_args!("    li t1, {}", total_alloc));
-            self.state.emit_fmt(format_args!("    li t2, {}", PAGE_SIZE));
+            self.state
+                .emit_fmt(format_args!("    li t1, {}", total_alloc));
+            self.state
+                .emit_fmt(format_args!("    li t2, {}", PAGE_SIZE));
             self.state.emit_fmt(format_args!("{}:", probe_label));
             self.state.emit("    sub sp, sp, t2");
             self.state.emit("    sd zero, 0(sp)");
             self.state.emit("    sub t1, t1, t2");
-            self.state.emit_fmt(format_args!("    bgt t1, t2, {}", probe_label));
+            self.state
+                .emit_fmt(format_args!("    bgt t1, t2, {}", probe_label));
             self.state.emit("    sub sp, sp, t1");
             self.state.emit("    sd zero, 0(sp)");
             // Compute s0 = sp + frame_size (NOT total_alloc)
-            self.state.emit_fmt(format_args!("    li t0, {}", frame_size));
+            self.state
+                .emit_fmt(format_args!("    li t0, {}", frame_size));
             self.state.emit("    add t0, sp, t0");
             // Save ra and old s0 at s0-8, s0-16
             self.state.emit("    sd ra, -8(t0)");
@@ -636,10 +772,12 @@ impl RiscvCodegen {
             }
         } else {
             // Large frame: use t0 for offsets
-            self.state.emit_fmt(format_args!("    li t0, {}", total_alloc));
+            self.state
+                .emit_fmt(format_args!("    li t0, {}", total_alloc));
             self.state.emit("    sub sp, sp, t0");
             // Compute s0 = sp + frame_size (NOT total_alloc)
-            self.state.emit_fmt(format_args!("    li t0, {}", frame_size));
+            self.state
+                .emit_fmt(format_args!("    li t0, {}", frame_size));
             self.state.emit("    add t0, sp, t0");
             // Save ra and old s0 at s0-8, s0-16
             self.state.emit("    sd ra, -8(t0)");
@@ -655,15 +793,25 @@ impl RiscvCodegen {
 
     /// Emit epilogue: restore ra/s0 and deallocate stack.
     pub(super) fn emit_epilogue_riscv(&mut self, frame_size: i64) {
-        let total_alloc = if self.is_variadic { frame_size + 64 } else { frame_size };
+        let total_alloc = if self.is_variadic {
+            frame_size + 64
+        } else {
+            frame_size
+        };
         // When DynAlloca is used, SP was modified at runtime, so we must restore
         // from s0 (frame pointer) rather than using SP-relative offsets.
-        if !self.state.has_dyn_alloca && Self::fits_imm12(-total_alloc) && Self::fits_imm12(total_alloc) {
+        if !self.state.has_dyn_alloca
+            && Self::fits_imm12(-total_alloc)
+            && Self::fits_imm12(total_alloc)
+        {
             // Small frame: restore from known sp offsets
             // ra/s0 saved at sp + frame_size - 8/16 (relative to current sp)
-            self.state.emit_fmt(format_args!("    ld ra, {}(sp)", frame_size - 8));
-            self.state.emit_fmt(format_args!("    ld s0, {}(sp)", frame_size - 16));
-            self.state.emit_fmt(format_args!("    addi sp, sp, {}", total_alloc));
+            self.state
+                .emit_fmt(format_args!("    ld ra, {}(sp)", frame_size - 8));
+            self.state
+                .emit_fmt(format_args!("    ld s0, {}(sp)", frame_size - 16));
+            self.state
+                .emit_fmt(format_args!("    addi sp, sp, {}", total_alloc));
         } else {
             // Large frame or DynAlloca: restore from s0-relative offsets (always fit in imm12).
             self.state.emit("    ld ra, -8(s0)");
