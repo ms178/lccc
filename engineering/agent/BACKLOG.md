@@ -415,3 +415,35 @@ Agent-patch policy record: Agent C's remat-globaladdr fixes accepted (reworked:
 TLS-before-GOT order, get_defining_instruction reuse); Agent B's bare-alloca
 accepted; Agent B's MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call
 `>0` REJECTED AGAIN — do not resubmit without per-workload A/B evidence.
+
+## §11 Session 2026-08-22 (encoding-superiority + glibc-perf session) — carry-over
+
+- **LK-26 (P0, frontend, WRONG CODE)**: struct member offset INCONSISTENCY in
+  glibc's `struct pthread` TU (anonymous union { tcbhead_t header;
+  void *__padding[24]; } + trailing members). Within ONE compile of
+  sysdeps/nptl/dl-tls_init_tp.c three different layouts are used for
+  `robust_head`: __builtin_offsetof = 736, the &pd->robust_head VALUE GEP
+  = 784, and the pd->robust_head.list STORE-ADDRESS GEP = 1296 **with base
+  = Const 0 instead of pd** (emitted: `xor %r12d,%r12d; mov %rax,0x510(%r12)`
+  → NULL-page store → every external binary dies in __tls_init_tp).
+  Repro: /tmp/tlsinit.i (regen via /tmp/tlspp.sh), probe: /tmp/offprobe.c
+  (lccc -O1 -S, read printf immediates: 728/736/704/704 vs codegen 784/1296).
+  Synthetic simplification NOT yet found (my 704-byte-union model lays out
+  correctly, offsets 1288/1296) — bisect the real TU's include stack; suspect
+  duplicate/forward struct-def merging or get_expr_ctype layout cache
+  divergence, since three SUBSYSTEMS disagree.
+  Blocks: lccc-glibc runtime smoke + perf (ld.so TLS init).
+- **PERF-1 (identified, quantified)**: FP intrinsic result path bounces
+  through slot + GPR (`vroundsd; movsd->slot; movq slot->rax; movq rax->xmm0`)
+  and dead movsd param shuffles: libm_round_family benchmark = 2.99x GCC.
+  Fix direction: XMM-home the intrinsic dest / return-value path movsd
+  slot->xmm0 direct; kill the entry double-shuffle.
+- **PERF-2 (identified, quantified)**: __thread array indexing recomputes the
+  TLS base per access instead of GCC's `%fs:sym@tpoff(,%r,8)` addressing:
+  tls_seg_access = 2.60x GCC (was 5.8x before emit_seg_*_const_addr).
+  Fix direction: TLS-base CSE + tpoff indexed addressing in the backend.
+- **EVEX/AVX-512 assembler support** (mathvec blocker, 108 errors when
+  --enable-mathvec): zmm/mask-register vmovups/vmovaps forms; big-ticket.
+- encdiff status: 10557-insn corpus vs GAS 2.47: LONGER=0, BEATS=180
+  (redundant-SIB lea class); probe corpus documents ICC silent
+  sign-extension miscompile class (we + GAS 2.47 + GCC + Clang all reject).

@@ -3012,6 +3012,45 @@ fn generate_function(
     } else {
         FxHashMap::default()
     };
+    // Values that are link-time integer CONSTANTS (Copy/Cast of Const, and
+    // GEP of such a constant plus a constant offset). Segment-override
+    // loads/stores through them use the direct `movq %fs:OFF` form —
+    // glibc's THREAD_SELF/GETMEM/SETMEM all funnel through this shape, and
+    // the register-indirect fallback costs 3 instructions per access.
+    let const_addr_vals: FxHashMap<u32, i64> = {
+        let mut m: FxHashMap<u32, i64> = FxHashMap::default();
+        let as_const = |op: &Operand, m: &FxHashMap<u32, i64>| -> Option<i64> {
+            match op {
+                Operand::Const(c) => ir_const_as_i64(c),
+                Operand::Value(v) => m.get(&v.0).copied(),
+            }
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy { dest, src } => {
+                        if let Some(v) = as_const(src, &m) {
+                            m.insert(dest.0, v);
+                        }
+                    }
+                    Instruction::Cast { dest, src, .. } => {
+                        if let Some(v) = as_const(src, &m) {
+                            m.insert(dest.0, v);
+                        }
+                    }
+                    Instruction::GetElementPtr { dest, base, offset, .. } => {
+                        if let (Some(b), Some(o)) =
+                            (m.get(&base.0).copied(), as_const(offset, &m))
+                        {
+                            m.insert(dest.0, b.wrapping_add(o));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        m
+    };
 
     let mut global_addr_map = build_global_addr_map(
         func,
@@ -3719,6 +3758,7 @@ fn generate_function(
                 &global_addr_ptr_set,
                 &dead_global_addrs,
                 &remat_global_addrs,
+                &const_addr_vals,
             );
             cg.state().current_program_point += 1;
         }
@@ -3833,6 +3873,7 @@ pub(super) fn generate_instruction(
     global_addr_ptr_set: &FxHashSet<u32>,
     dead_global_addrs: &FxHashSet<u32>,
     remat_global_addrs: &FxHashSet<u32>,
+    const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     match inst {
         Instruction::PgoCounterInc {
@@ -3867,6 +3908,7 @@ pub(super) fn generate_instruction(
                 gep_fold_map,
                 indexed_gep_map,
                 global_addr_map,
+                const_addr_vals,
             );
         }
         Instruction::BinOp {
@@ -3999,6 +4041,7 @@ pub(super) fn generate_instruction(
                 gep_fold_map,
                 indexed_gep_map,
                 global_addr_map,
+                const_addr_vals,
             );
             clobber_after_call_like(cg);
         }
@@ -4319,6 +4362,19 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
     cg.emit_copy_value(dest, src);
 }
 
+
+/// Integer view of an IR constant for address-constant tracking.
+fn ir_const_as_i64(c: &IrConst) -> Option<i64> {
+    match c {
+        IrConst::I8(v) => Some(*v as i64),
+        IrConst::I16(v) => Some(*v as i64),
+        IrConst::I32(v) => Some(*v as i64),
+        IrConst::I64(v) => Some(*v),
+        IrConst::Zero => Some(0),
+        _ => None,
+    }
+}
+
 fn generate_load(
     cg: &mut dyn ArchCodegen,
     dest: &Value,
@@ -4328,11 +4384,18 @@ fn generate_load(
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
+    const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     if seg_override != AddressSpace::Default {
         if let Some(sym) = global_addr_map.get(&ptr.0) {
             if !rip_rel_blocked(cg, sym) {
                 cg.emit_seg_load_symbol(dest, sym, ty, seg_override);
+                return;
+            }
+        }
+        // Constant offset (glibc TLS macros): direct one-instruction form.
+        if let Some(&addr) = const_addr_vals.get(&ptr.0) {
+            if cg.emit_seg_load_const_addr(dest, addr, ty, seg_override) {
                 return;
             }
         }
@@ -4391,11 +4454,18 @@ fn generate_store(
     gep_fold_map: &FxHashMap<u32, GepFoldInfo>,
     indexed_gep_map: &FxHashMap<u32, IndexedGepInfo>,
     global_addr_map: &FxHashMap<u32, String>,
+    const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     if seg_override != AddressSpace::Default {
         if let Some(sym) = global_addr_map.get(&ptr.0) {
             if !rip_rel_blocked(cg, sym) {
                 cg.emit_seg_store_symbol(val, sym, ty, seg_override);
+                return;
+            }
+        }
+        // Constant offset (glibc THREAD_SETMEM): direct one-instruction form.
+        if let Some(&addr) = const_addr_vals.get(&ptr.0) {
+            if cg.emit_seg_store_const_addr(val, addr, ty, seg_override) {
                 return;
             }
         }

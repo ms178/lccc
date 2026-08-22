@@ -120,6 +120,10 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     # WORKLOAD_PROVENANCE.md rather than being hidden in an opaque generator.
     Benchmark("gzip_crc32", "GNU gzip CRC-32 scalar table loop",
               ("gzip_crc32.c",), ("workload", "gzip", "checksum", "memory")),
+    Benchmark("libm_round_family", "glibc libm scalar rounding entry points (vroundsd inline)",
+              ("libm_round_family.c",), ("workload", "glibc", "fp", "libm")),
+    Benchmark("tls_seg_access", "glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment)",
+              ("tls_seg_access.c",), ("workload", "glibc", "tls", "memory")),
     Benchmark("zlib_ng_adler32", "zlib-ng Adler-32 NMAX accumulator",
               ("zlib_ng_adler32.c",), ("workload", "zlib-ng", "checksum", "loop")),
     Benchmark("expat_xml_scan", "Expat UTF-8 XML name-token scan",
