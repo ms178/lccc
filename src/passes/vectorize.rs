@@ -348,6 +348,12 @@ enum ReductionKind {
     Sum,
     /// Dot product: sum += a[i] * b[i]
     DotProduct,
+    /// Maximum: mx = max(mx, arr[i]) — Select-shaped after if-conversion.
+    /// Integer max is associative, commutative and idempotent, so a lane-wise
+    /// NEON smax reduction is bit-identical to the scalar loop; no zero init
+    /// required (the scalar init broadcasts into the vector accumulator).
+    /// NEON-only (levkropp 8b139820, audited port).
+    Max,
 }
 
 /// Pattern matching result for a vectorizable reduction loop.
@@ -419,7 +425,6 @@ struct SecondaryAccumulator {
     /// DotProduct), for the union soundness check.
     loads: Vec<Value>,
 }
-
 
 /// Analyze a loop to detect the vectorizable matmul pattern.
 fn analyze_loop_pattern(
@@ -734,7 +739,10 @@ fn analyze_loop_pattern(
     if let Instruction::BinOp { ty, .. } = fmul_inst {
         if *ty != IrType::F64 {
             if debug {
-                eprintln!("[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)", ty);
+                eprintln!(
+                    "[VEC]   Rejecting matmul: element type {:?} != F64 (only double FMA is supported)",
+                    ty
+                );
             }
             set_reject("matmul element type is not double (only F64 FMA is supported)");
             return None;
@@ -1042,7 +1050,10 @@ fn reduction_pattern_is_sound(
                 | Instruction::InlineAsm { .. }
                 | Instruction::Intrinsic { .. } => {
                     if debug {
-                        eprintln!("[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}", block_idx);
+                        eprintln!(
+                            "[VEC-RED]   Rejecting: foreign side-effect instruction in loop block {}",
+                            block_idx
+                        );
                     }
                     return false;
                 }
@@ -1067,10 +1078,8 @@ fn reduction_pattern_is_sound(
     for &block_idx in loop_blocks {
         let block = &func.blocks[block_idx];
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
-            let is_any_add = block_idx == body_idx
-                && adds
-                    .iter()
-                    .any(|&(add_idx, _)| add_idx == inst_idx);
+            let is_any_add =
+                block_idx == body_idx && adds.iter().any(|&(add_idx, _)| add_idx == inst_idx);
             if is_any_add
                 || matches!(
                     inst,
@@ -1331,25 +1340,121 @@ fn analyze_reduction_pattern(
     }
     let iv_inc_idx = iv_inc_idx?;
 
-    // Find the accumulator phi (scalar sum variable)
-    let mut accumulator_phi = None;
-    let mut accumulator_init_is_zero = false;
-    for inst in &header.instructions {
-        if let Instruction::Phi { dest, incoming, .. } = inst {
-            if incoming.len() == 2 && *dest != iv {
-                // Check if initialized to zero (common for reductions)
-                for (val, _block) in incoming {
-                    if let Operand::Const(c) = val {
-                        if c.to_i64() == Some(0) {
-                            accumulator_init_is_zero = true;
-                        } else if c.to_f64().map(|f| f == 0.0).unwrap_or(false) {
-                            accumulator_init_is_zero = true;
-                        }
+    // Max-reduction form (levkropp 8b139820, audited port): the accumulator
+    // phi's latch incoming is a Select of the loaded element vs the phi
+    // (`mx = x > mx ? x : mx`, if-converted). Detected BEFORE the zero-init
+    // sum search because a max accumulator is NOT zero-initialised (its init
+    // is arr[0] or any seed; the transform broadcasts it). All four compare
+    // polarities are accepted; SIGNED compares only — smax is a signed max,
+    // an unsigned compare (Ugt/Ult) must NOT match (that would need umax).
+    let mut is_max_reduction = false;
+    let mut max_select_val = None;
+    let mut max_accumulator_phi = None;
+    if neon {
+        let latch_label = func.blocks[latch_idx].label;
+        'max_search: for inst in &header.instructions {
+            let Instruction::Phi {
+                dest,
+                incoming,
+                ty: phi_ty,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if *dest == iv || incoming.len() != 2 || *phi_ty != IrType::I32 {
+                continue;
+            }
+            let latch_src = incoming.iter().find_map(|(op, lbl)| {
+                if *lbl == latch_label {
+                    if let Operand::Value(v) = op {
+                        return Some(*v);
                     }
                 }
-                if accumulator_init_is_zero {
-                    accumulator_phi = Some(*dest);
-                    break;
+                None
+            });
+            let Some(sel_val) = latch_src else { continue };
+            for &bi in &loop_info.body {
+                for sinst in &func.blocks[bi].instructions {
+                    let Instruction::Select {
+                        dest: sd,
+                        cond,
+                        true_val,
+                        false_val,
+                        ..
+                    } = sinst
+                    else {
+                        continue;
+                    };
+                    if *sd != sel_val {
+                        continue;
+                    }
+                    let (Operand::Value(cond_v), Operand::Value(tv), Operand::Value(fv)) =
+                        (cond, true_val, false_val)
+                    else {
+                        continue;
+                    };
+                    // Arms must be {the phi, the element X}; cond compares X
+                    // against the phi.
+                    let (x_val, take_x_when_true) = if fv.0 == dest.0 {
+                        (*tv, true)
+                    } else if tv.0 == dest.0 {
+                        (*fv, false)
+                    } else {
+                        continue;
+                    };
+                    let Some(cmp_inst) = func.blocks[bi]
+                        .instructions
+                        .iter()
+                        .find(|i| matches!(i.dest(), Some(d) if d.0 == cond_v.0))
+                    else {
+                        continue;
+                    };
+                    let Instruction::Cmp { op, lhs, rhs, .. } = cmp_inst else {
+                        continue;
+                    };
+                    use crate::ir::reexports::IrCmpOp as C;
+                    let x_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == x_val.0);
+                    let phi_on = |o: &Operand| matches!(o, Operand::Value(v) if v.0 == dest.0);
+                    let is_max_form = match (op, take_x_when_true) {
+                        (C::Sgt | C::Sge, true) if x_on(lhs) && phi_on(rhs) => true,
+                        (C::Slt | C::Sle, false) if x_on(lhs) && phi_on(rhs) => true,
+                        (C::Slt | C::Sle, true) if phi_on(lhs) && x_on(rhs) => true,
+                        (C::Sgt | C::Sge, false) if phi_on(lhs) && x_on(rhs) => true,
+                        _ => false,
+                    };
+                    if is_max_form {
+                        max_accumulator_phi = Some(*dest);
+                        is_max_reduction = true;
+                        max_select_val = Some(sel_val);
+                        break 'max_search;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find the accumulator phi (scalar sum variable)
+    let mut accumulator_phi = max_accumulator_phi;
+    let mut accumulator_init_is_zero = false;
+    if accumulator_phi.is_none() {
+        for inst in &header.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if incoming.len() == 2 && *dest != iv {
+                    // Check if initialized to zero (common for reductions)
+                    for (val, _block) in incoming {
+                        if let Operand::Const(c) = val {
+                            if c.to_i64() == Some(0) {
+                                accumulator_init_is_zero = true;
+                            } else if c.to_f64().map(|f| f == 0.0).unwrap_or(false) {
+                                accumulator_init_is_zero = true;
+                            }
+                        }
+                    }
+                    if accumulator_init_is_zero {
+                        accumulator_phi = Some(*dest);
+                        break;
+                    }
                 }
             }
         }
@@ -1450,6 +1555,18 @@ fn analyze_reduction_pattern(
             }
         }
         for (idx, inst) in block.instructions.iter().enumerate() {
+            // Max reduction: the accumulator update IS the Select.
+            if is_max_reduction {
+                if let Instruction::Select { dest, .. } = inst {
+                    if Some(*dest) == max_select_val {
+                        body_idx = Some(block_idx);
+                        accumulator_add_idx = Some(idx);
+                        add_result = Some(*dest);
+                        break;
+                    }
+                }
+                continue;
+            }
             if let Instruction::BinOp {
                 dest,
                 op: IrBinOp::Add,
@@ -1493,6 +1610,187 @@ fn analyze_reduction_pattern(
     let add_result = add_result?;
     let body = &func.blocks[body_idx];
     let add_inst = &body.instructions[accumulator_add_idx];
+
+    // Max-reduction early return: the update is the Select; the non-phi arm
+    // must be an I32 load whose GEP marches with the IV, and the marching
+    // pointer's preheader init must start exactly at element iv_init
+    // (coverage legality: the vector loop covers [c, c+4*iters), and the
+    // remainder resumes from the marching pointer's position; a pointer
+    // starting anywhere else would silently skip or re-read elements).
+    if is_max_reduction {
+        let Instruction::Select {
+            true_val,
+            false_val,
+            ..
+        } = add_inst
+        else {
+            return None;
+        };
+        let x_val = match (true_val, false_val) {
+            (Operand::Value(tv), Operand::Value(fv)) => {
+                if fv.0 == accumulator_phi.0 {
+                    *tv
+                } else if tv.0 == accumulator_phi.0 {
+                    *fv
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+        let Some(x_inst) = body
+            .instructions
+            .iter()
+            .find(|i| matches!(i.dest(), Some(d) if d.0 == x_val.0))
+        else {
+            return None;
+        };
+        let Instruction::Load {
+            ptr,
+            ty: IrType::I32,
+            ..
+        } = x_inst
+        else {
+            return None;
+        };
+        let array_gep = *ptr;
+        // The access must be either an IV-indexed GEP or a marching-pointer
+        // phi stepping exactly ONE element (4 bytes) per iteration — any
+        // other stride would be silently re-scaled wrong by the vec_width
+        // transform (levkropp's elem_size-extended gep_uses_iv, split into
+        // a dedicated helper here to keep the shared gep_uses_iv signature
+        // and its loop-invariant-base hardening untouched).
+        let marches_one_element = || -> bool {
+            for &bi in &loop_info.body {
+                for pinst in &func.blocks[bi].instructions {
+                    if let Instruction::Phi { dest, incoming, .. } = pinst {
+                        if *dest != array_gep {
+                            continue;
+                        }
+                        for (op, _) in incoming {
+                            if let Operand::Value(v) = op {
+                                let steps =
+                                    func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+                                        matches!(i, Instruction::GetElementPtr {
+                                        dest: d,
+                                        base,
+                                        offset: Operand::Const(c),
+                                        ..
+                                    } if *d == *v && base.0 == array_gep.0
+                                        && c.to_i64() == Some(4))
+                                    });
+                                if steps {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        };
+        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) && !marches_one_element()
+        {
+            if debug {
+                eprintln!("[VEC-RED]   Max-reduction array GEP doesn't use IV");
+            }
+            return None;
+        }
+        let latch_label = func.blocks[latch_idx].label;
+        let mut iv_init = None;
+        for inst in &header.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == iv {
+                    for (op, lbl) in incoming {
+                        if *lbl != latch_label {
+                            if let Operand::Const(c) = op {
+                                iv_init = c.to_i64();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let Some(iv_init) = iv_init else {
+            if debug {
+                eprintln!("[VEC-RED]   Max-reduction IV init is not a constant");
+            }
+            return None;
+        };
+        // STRICT shape requirement (levkropp's original check, kept strict
+        // on purpose): the array access must be a marching-pointer phi whose
+        // preheader incoming is a constant-offset GEP at exactly iv_init*4
+        // bytes (element c). Coverage legality depends on it: the vector
+        // loop covers elements [c, c + 4*iters) via the marching pointer,
+        // and the remainder resumes at (iv_final - c)*4 relative to the
+        // SAME element-c base. A direct IV-indexed GEP would be re-scaled
+        // by vec_width in the transform and start reading at element c*4
+        // instead of c — silently wrong for any c != 0 — so that shape is
+        // rejected outright rather than special-cased.
+        let mut ptr_init_ok = false;
+        for inst in &header.instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest != array_gep {
+                    continue;
+                }
+                for (op, lbl) in incoming {
+                    if *lbl == latch_label {
+                        continue;
+                    }
+                    let Operand::Value(init_v) = op else { continue };
+                    let init_gep = func
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.instructions)
+                        .find_map(|i| {
+                            if let Instruction::GetElementPtr {
+                                dest,
+                                offset: Operand::Const(off),
+                                ..
+                            } = i
+                            {
+                                if *dest == *init_v {
+                                    return off.to_i64();
+                                }
+                            }
+                            None
+                        });
+                    if init_gep == Some(iv_init * 4) {
+                        ptr_init_ok = true;
+                    }
+                }
+            }
+        }
+        if !ptr_init_ok {
+            if debug {
+                eprintln!("[VEC-RED]   Max-reduction pointer/IV init mismatch");
+            }
+            return None;
+        }
+        if debug {
+            eprintln!("[VEC-RED]   Max reduction detected: mx = max(mx, load(arr[iv]))");
+        }
+        return Some(ReductionPattern {
+            kind: ReductionKind::Max,
+            second: None,
+            element_type: IrType::I32,
+            accumulator_type: IrType::I32,
+            header_idx,
+            body_idx,
+            latch_idx,
+            exit_idx,
+            iv,
+            iv_inc_idx,
+            accumulator_phi,
+            array_a_gep: array_gep,
+            array_b_gep: None,
+            accumulator_add_idx,
+            limit,
+            exit_cmp_inst_idx,
+            exit_cmp_dest,
+            loop_blocks: loop_info.body.clone(),
+        });
+    }
 
     // Get the element type from the add instruction
     let element_type = match add_inst {
@@ -1647,7 +1945,10 @@ fn analyze_reduction_pattern(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])", element_type, from_ty);
+                    eprintln!(
+                        "[VEC-RED]   Simple sum pattern with cast detected: {:?} += ({:?})load(arr[iv])",
+                        element_type, from_ty
+                    );
                 }
 
                 // The cast must be a redundant no-op (from_ty == accumulator
@@ -1667,7 +1968,10 @@ fn analyze_reduction_pattern(
                     allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
                 if *from_ty != element_type && !allowed_widen {
                     if debug {
-                        eprintln!("[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)", from_ty, element_type);
+                        eprintln!(
+                            "[VEC-RED]   Rejecting: cast from {:?} to accumulator type {:?} (only redundant casts are vectorizable)",
+                            from_ty, element_type
+                        );
                     }
                     set_reject("widening/narrowing reduction cast not vectorizable");
                     return None;
@@ -1878,9 +2182,7 @@ fn analyze_reduction_pattern(
             if debug {
                 eprintln!("[VEC-RED]   Rejecting unsound reduction");
             }
-            set_reject(
-                "reduction rejected: side effects / control flow / foreign memory in loop",
-            );
+            set_reject("reduction rejected: side effects / control flow / foreign memory in loop");
             return None;
         }
     }
@@ -1913,9 +2215,7 @@ fn analyze_secondary_accumulator(
     // historical behavior (reject the whole loop) is preserved.
     if primary.element_type != primary.accumulator_type {
         if debug {
-            eprintln!(
-                "[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported"
-            );
+            eprintln!("[VEC-RED]   Rejecting multi-reduction: widening accumulator not supported");
         }
         set_reject("multi-reduction widening accumulator not supported");
         return None;
@@ -2044,10 +2344,7 @@ fn analyze_secondary_accumulator(
     // Match the secondary shape to the primary kind.
     let (array_a_gep, array_b_gep, loads): (Value, Option<Value>, Vec<Value>) =
         match (primary.kind, added_inst) {
-            (
-                ReductionKind::Sum,
-                Instruction::Load { ptr, ty, .. },
-            ) => {
+            (ReductionKind::Sum, Instruction::Load { ptr, ty, .. }) => {
                 if *ty != primary.element_type {
                     set_reject("second accumulator element type mismatch");
                     return None;
@@ -2217,10 +2514,7 @@ fn rewrite_reduction_body(
 
     let (a_base, a_off) = match (use_byte_iv, &byte_iv_a) {
         (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
-        _ => (
-            Operand::Value(array_a_gep),
-            Operand::Const(IrConst::I64(0)),
-        ),
+        _ => (Operand::Value(array_a_gep), Operand::Const(IrConst::I64(0))),
     };
     let (b_base, b_off) = match (use_byte_iv, &byte_iv_b) {
         (true, Some((base, off))) => (Operand::Value(*base), Operand::Value(*off)),
@@ -2232,6 +2526,11 @@ fn rewrite_reduction_body(
 
     let body_block = &mut func.blocks[body_idx];
     match kind {
+        // Max never reaches the secondary-accumulator emitter: the Max
+        // detector returns second: None unconditionally.
+        ReductionKind::Max => {
+            unreachable!("max reductions never carry a secondary accumulator")
+        }
         ReductionKind::Sum => {
             let load_inst = Instruction::Intrinsic {
                 dest: Some(vec_load_a),
@@ -3089,8 +3388,16 @@ fn find_exit(func: &IrFunction, loop_info: &loop_analysis::NaturalLoop) -> Optio
                     .unwrap_or(false);
 
                 if debug {
-                    eprintln!("[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
-                        block_idx, true_label.0, true_idx, then_in_loop, false_label.0, false_idx, else_in_loop);
+                    eprintln!(
+                        "[VEC-RED]   Block[{}] CondBranch: true=BlockId({}) [idx={:?}] (in_loop={}), false=BlockId({}) [idx={:?}] (in_loop={})",
+                        block_idx,
+                        true_label.0,
+                        true_idx,
+                        then_in_loop,
+                        false_label.0,
+                        false_idx,
+                        else_in_loop
+                    );
                 }
 
                 if then_in_loop && !else_in_loop {
@@ -3557,7 +3864,7 @@ fn insert_remainder_loop(
         4 => Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::Mul,
-            lhs: Operand::Value(pattern.iv),   // Final 4-element group index
+            lhs: Operand::Value(pattern.iv), // Final 4-element group index
             rhs: Operand::Const(IrConst::I32(4)),
             ty: IrType::I32,
         },
@@ -4035,8 +4342,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     );
 
                     if debug && (lhs_is_iv_derived || rhs_is_8) {
-                        eprintln!("[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
-                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8);
+                        eprintln!(
+                            "[VEC]   Found multiply in block {}: Value({}) = {:?} * {:?}, lhs_is_iv_derived={}, rhs_is_8={}",
+                            block_idx, dest.0, lhs, rhs, lhs_is_iv_derived, rhs_is_8
+                        );
                     }
 
                     if lhs_is_iv_derived && rhs_is_8 {
@@ -4063,7 +4372,9 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
         // Look for pointer increments (ptr + 8) and change them to (ptr + 16)
         if !modified_any_increment {
             if debug {
-                eprintln!("[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments");
+                eprintln!(
+                    "[VEC]   No IV*8 multiplies found, searching for strength-reduced pointer increments"
+                );
             }
 
             // Build a set of pointer values that are used in GEPs for C and B arrays
@@ -4131,8 +4442,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             } else {
                                 false
                             };
-                            eprintln!("[VEC]   Block {} has add by 8: Value({}) = {:?} + 8, is_pointer={}",
-                                block_idx, dest.0, lhs, is_pointer);
+                            eprintln!(
+                                "[VEC]   Block {} has add by 8: Value({}) = {:?} + 8, is_pointer={}",
+                                block_idx, dest.0, lhs, is_pointer
+                            );
                         }
 
                         // Check if this is a pointer increment
@@ -4151,7 +4464,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             changes += 1;
                             modified_any_increment = true;
                             if debug {
-                                eprintln!("[VEC]   -> Changed pointer increment from 8 to 16 for Value({})", dest.0);
+                                eprintln!(
+                                    "[VEC]   -> Changed pointer increment from 8 to 16 for Value({})",
+                                    dest.0
+                                );
                             }
                         }
                     }
@@ -4180,8 +4496,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             if let Operand::Value(offset_val) = offset {
                                 geps_to_modify.push((block_idx, inst_idx, *offset_val, *ty));
                                 if debug {
-                                    eprintln!("[VEC]   Found GEP in block {} inst {}: Value({}) with offset Value({})",
-                                        block_idx, inst_idx, dest.0, offset_val.0);
+                                    eprintln!(
+                                        "[VEC]   Found GEP in block {} inst {}: Value({}) with offset Value({})",
+                                        block_idx, inst_idx, dest.0, offset_val.0
+                                    );
                                 }
                             }
                         }
@@ -4220,8 +4538,10 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     changes += 1;
                     modified_any_increment = true;
                     if debug {
-                        eprintln!("[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 2",
-                            mul_dest.0, offset_val.0);
+                        eprintln!(
+                            "[VEC]   Inserted mul and updated GEP offset: Value({}) = Value({}) * 2",
+                            mul_dest.0, offset_val.0
+                        );
                     }
                 }
             }
@@ -4657,7 +4977,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                         eliminated_mul = true;
                         changes += 1;
                         if debug {
-                            eprintln!("[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)", mul_dest.0);
+                            eprintln!(
+                                "[VEC]   Eliminated IV*8 multiply for Value({}) (IV is now byte offset)",
+                                mul_dest.0
+                            );
                         }
                     }
                 }
@@ -4690,7 +5013,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                         eliminated_mul = true;
                         changes += 1;
                         if debug {
-                            eprintln!("[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)", shl_dest.0);
+                            eprintln!(
+                                "[VEC]   Eliminated IV<<3 shift for Value({}) (IV is now byte offset)",
+                                shl_dest.0
+                            );
                         }
                     }
                 }
@@ -4890,6 +5216,28 @@ fn insert_reduction_remainder_loop(
                 }
             }
         }
+        // Max reductions access through a marching-pointer phi. The remainder
+        // must address relative to the phi's PREHEADER incoming — the pointer
+        // at element c — NOT the phi itself: as an SSA value read in
+        // vec_exit, the phi holds the END-of-vector-loop pointer, so using
+        // it double-counts the vector coverage (observed: reads at element
+        // ~2x the intended index, out-of-bounds for large n).
+        if base.is_none() && pattern.kind == ReductionKind::Max {
+            let latch_label = func.blocks[pattern.latch_idx].label;
+            for inst in &func.blocks[pattern.header_idx].instructions {
+                if let Instruction::Phi { dest, incoming, .. } = inst {
+                    if *dest == pattern.array_a_gep {
+                        for (op, lbl) in incoming {
+                            if *lbl != latch_label {
+                                if let Operand::Value(v) = op {
+                                    base = Some(*v);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let result = base.unwrap_or(pattern.array_a_gep);
         if std::env::var("LCCC_DEBUG_VECTORIZE").is_ok() {
             eprintln!(
@@ -4953,6 +5301,35 @@ fn insert_reduction_remainder_loop(
     *next_val_id += 1;
     let i_rem_start = Value(*next_val_id);
     *next_val_id += 1;
+    // Max-with-shifted-IV temporaries (unused unless max_shift != 0).
+    let i_rem_start_pre = Value(*next_val_id);
+    *next_val_id += 1;
+    let max_limit_adj = Value(*next_val_id);
+    *next_val_id += 1;
+    // Max with IV init c != 0: the vector loop covered elements
+    // [c, c + w*(lim - c)) through the marching pointer, and the remainder
+    // addresses RELATIVE to element c (the pointer's preheader value). Its
+    // start index is w*(iv_final - c) and its limit is n - c.
+    let max_shift: i64 = if pattern.kind == ReductionKind::Max {
+        let latch_label = func.blocks[pattern.latch_idx].label;
+        let mut c = 0i64;
+        for inst in &func.blocks[pattern.header_idx].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == pattern.iv {
+                    for (op, lbl) in incoming {
+                        if *lbl != latch_label {
+                            if let Operand::Const(k) = op {
+                                c = k.to_i64().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        c
+    } else {
+        0
+    };
     let i_rem_iv = Value(*next_val_id);
     *next_val_id += 1;
     let i_rem_iv_next = Value(*next_val_id);
@@ -5120,13 +5497,37 @@ fn insert_reduction_remainder_loop(
             }
         } else {
             Instruction::BinOp {
-                dest: i_rem_start,
+                dest: if max_shift != 0 {
+                    i_rem_start_pre
+                } else {
+                    i_rem_start
+                },
                 op: IrBinOp::Mul,
                 lhs: Operand::Value(pattern.iv),
                 rhs: Operand::Const(IrConst::I32(vec_width as i32)),
                 ty: IrType::I32,
             }
         });
+        // Max with IV init c != 0: start = w*iv_final - w*c (relative to
+        // element c), and a dynamic limit becomes n - c.
+        if max_shift != 0 {
+            instructions.push(Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(i_rem_start_pre),
+                rhs: Operand::Const(IrConst::I32((max_shift * vec_width as i64) as i32)),
+                ty: IrType::I32,
+            });
+            if let Operand::Value(lv) = &pattern.limit {
+                instructions.push(Instruction::BinOp {
+                    dest: max_limit_adj,
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(*lv),
+                    rhs: Operand::Const(IrConst::I32(max_shift as i32)),
+                    ty: IrType::I32,
+                });
+            }
+        }
         BasicBlock {
             label: vec_exit_label,
             instructions,
@@ -5172,7 +5573,21 @@ fn insert_reduction_remainder_loop(
         dest: i_rem_cmp,
         op: IrCmpOp::Slt,
         lhs: Operand::Value(i_rem_iv),
-        rhs: pattern.limit.clone(), // ORIGINAL limit (not divided)
+        rhs: if max_shift != 0 {
+            // Max with IV init c != 0: the remainder counts RELATIVE to
+            // element c, so the bound is n - c (folded for constants, the
+            // vec_exit Sub for dynamic limits).
+            match &pattern.limit {
+                Operand::Const(IrConst::I32(n)) => {
+                    Operand::Const(IrConst::I32(n - max_shift as i32))
+                }
+                Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64(n - max_shift)),
+                Operand::Value(_) => Operand::Value(max_limit_adj),
+                other => other.clone(),
+            }
+        } else {
+            pattern.limit.clone() // ORIGINAL limit (not divided)
+        },
         ty: IrType::I32,
     });
 
@@ -5242,6 +5657,26 @@ fn insert_reduction_remainder_loop(
                 op: IrBinOp::Add,
                 lhs: Operand::Value(sum_rem_phi),
                 rhs: Operand::Value(scalar_a),
+                ty: pattern.accumulator_type,
+            });
+        }
+        ReductionKind::Max => {
+            // mx = max(mx, x) as a scalar Select: take x when x > mx.
+            // Signed compare matches the detector's signed-only gate.
+            let cmp_rem = Value(*next_val_id);
+            *next_val_id += 1;
+            remainder_body_instructions.push(Instruction::Cmp {
+                dest: cmp_rem,
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(scalar_a),
+                rhs: Operand::Value(sum_rem_phi),
+                ty: pattern.accumulator_type,
+            });
+            remainder_body_instructions.push(Instruction::Select {
+                dest: sum_rem_next,
+                cond: Operand::Value(cmp_rem),
+                true_val: Operand::Value(scalar_a),
+                false_val: Operand::Value(sum_rem_phi),
                 ty: pattern.accumulator_type,
             });
         }
@@ -5332,6 +5767,9 @@ fn insert_reduction_remainder_loop(
             },
         ]);
         match pattern.kind {
+            ReductionKind::Max => {
+                unreachable!("max reductions never carry a secondary accumulator")
+            }
             ReductionKind::Sum => {
                 remainder_body_instructions.push(Instruction::BinOp {
                     dest: sum_rem_next2,
@@ -5624,17 +6062,13 @@ fn transform_reduction_avx2(
     // arrays too; otherwise the whole loop uses the element-index scheme
     // (scaled GEP offsets), which is correct but one LEA per access heavier.
     if let Some(sec) = &pattern.second {
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
-        use_byte_iv &= sec_byte_iv_a.is_some()
-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+        use_byte_iv &=
+            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
@@ -5853,6 +6287,12 @@ fn transform_reduction_avx2(
 
     if pattern.second.is_none() {
         match pattern.kind {
+            // Max reductions are NEON-only: the detector gates on `neon`, and
+            // the pipeline routes AArch64 through transform_reduction_sse2.
+            // Reaching the AVX2 transform with Max is a pipeline bug.
+            ReductionKind::Max => {
+                unreachable!("max reductions are NEON-only and never reach the AVX2 transform")
+            }
             ReductionKind::Sum => {
                 // Simple sum: sum += arr[i]
                 // Register-based flow: vec_zero → vec_load → vec_add → horizontal_add
@@ -6006,7 +6446,9 @@ fn transform_reduction_avx2(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)");
+                    eprintln!(
+                        "[VEC-RED]   Transformed sum body: vec_load + vec_add (register-based)"
+                    );
                 }
             }
             ReductionKind::DotProduct => {
@@ -6196,7 +6638,9 @@ fn transform_reduction_avx2(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add");
+                    eprintln!(
+                        "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add"
+                    );
                 }
             }
         }
@@ -6207,39 +6651,62 @@ fn transform_reduction_avx2(
         let (vec_load_op, vec_mul_op, vec_add_op, vec_zero_op, vec_fma_op, use_fma) =
             match (pattern.kind, pattern.element_type) {
                 (ReductionKind::Sum, IrType::F64) => (
-                    IntrinsicOp::VecLoadF64x4, None, IntrinsicOp::VecAddF64x4,
-                    IntrinsicOp::VecZeroF64x4, None, false),
+                    IntrinsicOp::VecLoadF64x4,
+                    None,
+                    IntrinsicOp::VecAddF64x4,
+                    IntrinsicOp::VecZeroF64x4,
+                    None,
+                    false,
+                ),
                 (ReductionKind::Sum, IrType::I32) => (
-                    IntrinsicOp::VecLoadI32x8, None, IntrinsicOp::VecAddI32x8,
-                    IntrinsicOp::VecZeroI32x8, None, false),
+                    IntrinsicOp::VecLoadI32x8,
+                    None,
+                    IntrinsicOp::VecAddI32x8,
+                    IntrinsicOp::VecZeroI32x8,
+                    None,
+                    false,
+                ),
                 (ReductionKind::Sum, IrType::F32) => (
-                    IntrinsicOp::VecLoadF32x8, None, IntrinsicOp::VecAddF32x8,
-                    IntrinsicOp::VecZeroF32x8, None, false),
+                    IntrinsicOp::VecLoadF32x8,
+                    None,
+                    IntrinsicOp::VecAddF32x8,
+                    IntrinsicOp::VecZeroF32x8,
+                    None,
+                    false,
+                ),
                 (ReductionKind::DotProduct, IrType::F64) => (
-                    IntrinsicOp::VecLoadF64x4, Some(IntrinsicOp::VecMulF64x4),
-                    IntrinsicOp::VecAddF64x4, IntrinsicOp::VecZeroF64x4,
-                    Some(IntrinsicOp::VecFmaF64x4), fp_contract_fast),
+                    IntrinsicOp::VecLoadF64x4,
+                    Some(IntrinsicOp::VecMulF64x4),
+                    IntrinsicOp::VecAddF64x4,
+                    IntrinsicOp::VecZeroF64x4,
+                    Some(IntrinsicOp::VecFmaF64x4),
+                    fp_contract_fast,
+                ),
                 (ReductionKind::DotProduct, IrType::F32) => (
-                    IntrinsicOp::VecLoadF32x8, Some(IntrinsicOp::VecMulF32x8),
-                    IntrinsicOp::VecAddF32x8, IntrinsicOp::VecZeroF32x8,
-                    Some(IntrinsicOp::VecFmaF32x8), fp_contract_fast),
+                    IntrinsicOp::VecLoadF32x8,
+                    Some(IntrinsicOp::VecMulF32x8),
+                    IntrinsicOp::VecAddF32x8,
+                    IntrinsicOp::VecZeroF32x8,
+                    Some(IntrinsicOp::VecFmaF32x8),
+                    fp_contract_fast,
+                ),
                 (ReductionKind::DotProduct, IrType::I32) => (
-                    IntrinsicOp::VecLoadI32x8, Some(IntrinsicOp::VecMulI32x8),
-                    IntrinsicOp::VecAddI32x8, IntrinsicOp::VecZeroI32x8,
-                    None, false),
+                    IntrinsicOp::VecLoadI32x8,
+                    Some(IntrinsicOp::VecMulI32x8),
+                    IntrinsicOp::VecAddI32x8,
+                    IntrinsicOp::VecZeroI32x8,
+                    None,
+                    false,
+                ),
                 _ => return 0,
             };
 
         let sec = pattern.second.as_ref().unwrap();
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
 
         let mut order = [
             (
@@ -6291,7 +6758,10 @@ fn transform_reduction_avx2(
                 primary_sum = sum;
             }
         }
-        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
+        debug_assert!(
+            primary_sum.0 != u32::MAX,
+            "primary accumulator not rewritten"
+        );
         vec_sum_value = primary_sum;
     }
 
@@ -6303,7 +6773,7 @@ fn transform_reduction_avx2(
         horizontal_intrinsic,
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        None, // AVX2 path uses a single NEON accumulator
+        None,                    // AVX2 path uses a single NEON accumulator
         pattern.second.as_ref(), // Second independent accumulator, if any
         &mut next_val_id,
         &mut next_label,
@@ -6353,6 +6823,25 @@ fn transform_reduction_sse2(
                 Some(IntrinsicOp::MulF64x2),
                 IntrinsicOp::HorizontalAddF64x2,
             ),
+            // NEON 4-wide i32 max reduction: lane-wise smax + smaxv reduce.
+            IrType::I32 if pattern.kind == ReductionKind::Max => {
+                if !neon {
+                    // No packed max path on the x86 side of this transform
+                    // (pmaxsd exists but the epilogue lacks a horizontal-max;
+                    // detector already gates on neon, this is defense).
+                    if debug {
+                        eprintln!("[VEC-RED] Max reduction requires NEON");
+                    }
+                    return 0;
+                }
+                (
+                    4u64,
+                    IntrinsicOp::VecLoadI32x4,
+                    IntrinsicOp::VecSmaxI32x4,
+                    None,
+                    IntrinsicOp::VecHorizontalMaxI32x4,
+                )
+            }
             // NEON 4-wide i32→i64 forms: sadalp for sums, smlal/smlal2 for dots.
             IrType::I32 if pattern.accumulator_type == IrType::I64 && neon => (
                 4u64,
@@ -6360,6 +6849,7 @@ fn transform_reduction_sse2(
                 match pattern.kind {
                     ReductionKind::Sum => IntrinsicOp::VecSadalpI32x4,
                     ReductionKind::DotProduct => IntrinsicOp::VecSmlalLoI32x4,
+                    ReductionKind::Max => unreachable!("max has an I32 accumulator"),
                 },
                 None,
                 IntrinsicOp::VecHorizontalAddI64x2,
@@ -6457,17 +6947,13 @@ fn transform_reduction_sse2(
     // arrays too; otherwise the whole loop uses the element-index scheme
     // (scaled GEP offsets), which is correct but one LEA per access heavier.
     if let Some(sec) = &pattern.second {
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
-        use_byte_iv &= sec_byte_iv_a.is_some()
-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+        use_byte_iv &=
+            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
@@ -6688,6 +7174,177 @@ fn transform_reduction_sse2(
 
     if pattern.second.is_none() {
         match pattern.kind {
+            // NEON 4-wide i32 max: acc = smax(acc, load4). The scalar init value
+            // (the phi's preheader incoming) is broadcast into the vector
+            // accumulator, so zero vector iterations still reduce to the scalar
+            // init (smaxv of 4 equal lanes = the init).
+            ReductionKind::Max => {
+                let init_bcast = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
+
+                let latch_label = func.blocks[pattern.latch_idx].label;
+
+                // Read the phi edges FIRST (fail-closed: abort before any
+                // mutation if the shape is unexpected), then rewire: backedge ->
+                // smax result, preheader -> broadcast of the scalar init.
+                let mut preheader_label = None;
+                let mut init_operand = None;
+                {
+                    let header_block = &func.blocks[pattern.header_idx];
+                    for inst in &header_block.instructions {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming {
+                                    if *label != latch_label {
+                                        preheader_label = Some(*label);
+                                        init_operand = Some(val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let (Some(preheader_label), Some(init_operand)) = (preheader_label, init_operand)
+                else {
+                    if debug {
+                        eprintln!("[VEC-RED]   Max: no preheader edge on accumulator phi");
+                    }
+                    return changes; // nothing mutated yet
+                };
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(vec_sum_value);
+                                    } else {
+                                        *val = Operand::Value(init_bcast);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Broadcast the scalar init into all 4 lanes, in the preheader
+                // (the init operand dominates that block's terminator).
+                if let Some(pre_idx) = func.blocks.iter().position(|b| b.label == preheader_label) {
+                    func.blocks[pre_idx]
+                        .instructions
+                        .push(Instruction::Intrinsic {
+                            dest: Some(init_bcast),
+                            op: IntrinsicOp::VecBroadcastI32x4,
+                            dest_ptr: None,
+                            args: vec![init_operand],
+                        });
+                    changes += 1;
+                }
+
+                // Body: 4-wide load + lane-wise smax, replacing the Select and
+                // its feeding Cmp. Capture the cmp by VALUE first; remove AFTER
+                // the insert/remove (its index may precede the Select's).
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
+                    let mut sel_cmp_val = None;
+                    if let Instruction::Select {
+                        cond: Operand::Value(cv),
+                        ..
+                    } = &body_block.instructions[pattern.accumulator_add_idx]
+                    {
+                        sel_cmp_val = Some(*cv);
+                    }
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
+                    };
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_load),
+                            op: IntrinsicOp::VecLoadI32x4,
+                            dest_ptr: None,
+                            args: vec![base, off],
+                        },
+                    );
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx + 1,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: IntrinsicOp::VecSmaxI32x4,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                Operand::Value(vec_load),
+                            ],
+                        },
+                    );
+                    // Remove the old Select (now shifted to +2).
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 2);
+                    changes += 2;
+                    if let Some(cv) = sel_cmp_val {
+                        if let Some(cp) = body_block
+                            .instructions
+                            .iter()
+                            .position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0))
+                        {
+                            body_block.instructions.remove(cp);
+                        }
+                    }
+                }
+
+                // Scale the marching pointer's latch step from one element
+                // (4 bytes) to vec_width elements (16): the detector proved the
+                // access is a one-element marching-pointer phi, and the vector
+                // body now consumes 4 lanes per iteration. Without this the
+                // pointer advances 4 bytes per vector iteration and every load
+                // after the first reads 3 stale lanes (find_max returned a[0]-
+                // adjacent garbage instead of the max).
+                {
+                    let mut scaled = false;
+                    for &bi in &pattern.loop_blocks {
+                        let block = &mut func.blocks[bi];
+                        for inst in block.instructions.iter_mut() {
+                            if let Instruction::GetElementPtr {
+                                base,
+                                offset: offset @ Operand::Const(_),
+                                ..
+                            } = inst
+                            {
+                                if base.0 == pattern.array_a_gep.0 {
+                                    if let Operand::Const(c) = offset {
+                                        if c.to_i64() == Some(4) {
+                                            *offset = Operand::Const(IrConst::I64(16));
+                                            scaled = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    debug_assert!(
+                        scaled,
+                        "max transform requires the marching-pointer step GEP"
+                    );
+                    if scaled {
+                        changes += 1;
+                    }
+                }
+
+                if debug {
+                    eprintln!("[VEC-RED]   Transformed max body: load + smax (NEON 4-wide)");
+                }
+            }
             ReductionKind::Sum => {
                 // Simple sum: sum += arr[i]
                 // Map old intrinsics to new register-based intrinsics
@@ -7012,7 +7669,9 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)");
+                    eprintln!(
+                        "[VEC-RED]   Transformed dot product body: load_a + load_b + smlal + smlal2 (NEON 4-wide)"
+                    );
                 }
             }
             ReductionKind::DotProduct => {
@@ -7085,8 +7744,10 @@ fn transform_reduction_sse2(
                 changes += 1;
 
                 if debug {
-                    eprintln!("[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
-                        vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0);
+                    eprintln!(
+                        "[VEC-RED]   Created SSA values: vec_load_a={}, vec_load_b={}, vec_mul={}, vec_sum={}",
+                        vec_load_a.0, vec_load_b.0, vec_mul.0, vec_sum_value.0
+                    );
                 }
 
                 // Update the accumulator PHI to use init_zero_value as the entry predecessor
@@ -7211,11 +7872,12 @@ fn transform_reduction_sse2(
                 }
 
                 if debug {
-                    eprintln!("[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)");
+                    eprintln!(
+                        "[VEC-RED]   Transformed dot product body: load_a + load_b + mul + add (register-based)"
+                    );
                 }
             }
         }
-
     } else {
         // Multi-reduction (SSE2/NEON 2-wide): mirror the AVX2 path, deriving
         // the vector ops from `load_intrinsic` exactly like the single
@@ -7251,15 +7913,11 @@ fn transform_reduction_sse2(
         };
 
         let sec = pattern.second.as_ref().unwrap();
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
 
         let mut order = [
             (
@@ -7311,7 +7969,10 @@ fn transform_reduction_sse2(
                 primary_sum = sum;
             }
         }
-        debug_assert!(primary_sum.0 != u32::MAX, "primary accumulator not rewritten");
+        debug_assert!(
+            primary_sum.0 != u32::MAX,
+            "primary accumulator not rewritten"
+        );
         vec_sum_value = primary_sum;
     }
 
@@ -7323,7 +7984,7 @@ fn transform_reduction_sse2(
         horizontal_intrinsic,
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        second_acc, // Second NEON accumulator phi (smlal2 half), if any
+        second_acc,              // Second NEON accumulator phi (smlal2 half), if any
         pattern.second.as_ref(), // Second independent accumulator, if any
         &mut next_val_id,
         &mut next_label,
@@ -8102,8 +8763,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
         lane_addresses.push((a_addr, b_addr));
     }
     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
-    let a_base = lane_addresses[0].0 .0;
-    let b_base = lane_addresses[0].1 .0;
+    let a_base = lane_addresses[0].0.0;
+    let b_base = lane_addresses[0].1.0;
     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
     for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
         let expected = lane as i64 * elem_size;
@@ -8321,6 +8982,19 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// Passes neon=true so AArch64-only widening forms (sadalp, smlal/smlal2)
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
+}
+
+/// Late AArch64 vectorization (levkropp 8ef1978f concept): reduction loops
+/// whose accumulator update only becomes Select-shaped after the main loop's
+/// if_convert phase (max reductions, conditional sums). The early vectorizer
+/// runs before if-conversion and rejects those loops as "conditional"; this
+/// second pass catches the converted form. Runs the SAME analysis — patterns
+/// already vectorized early contain Vec* intrinsics, which the analyzers
+/// reject structurally (no scalar Load/BinOp/Select shape), so re-running is
+/// idempotent and cannot double-transform.
+pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
 }

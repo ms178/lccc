@@ -540,8 +540,13 @@ fn outline_switch_cases(
             switch_info.cases.iter().map(|(_, bid)| *bid).collect();
 
         if debug {
-            eprintln!("[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
-                func.name, switch_info.cases.len(), switch_info.end_block, *global_max_block_id);
+            eprintln!(
+                "[OUTLINE] function: {}, switch with {} cases, end_block: {:?}, global_max_block_id: {}",
+                func.name,
+                switch_info.cases.len(),
+                switch_info.end_block,
+                *global_max_block_id
+            );
         }
 
         // Analyze each case for outlinability.
@@ -628,8 +633,10 @@ fn outline_switch_cases(
         if debug {
             let total = switch_info.cases.len();
             let outlined = outlinable.len();
-            eprintln!("[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
-                outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args);
+            eprintln!(
+                "[OUTLINE]   {} of {} cases outlinable (skip: {} block_collect, {} empty, {} small, {} return, {} args)",
+                outlined, total, skip_block_collect, skip_empty, skip_small, skip_return, skip_args
+            );
         }
 
         if outlinable.is_empty() {

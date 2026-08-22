@@ -266,6 +266,12 @@ pub enum IntrinsicOp {
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecMulI32x4,
     VecMulI32x8,
+    /// NEON smax: per-lane signed max of two 4xI32 vectors (args[0], args[1]).
+    /// Integer max is associative, commutative, and idempotent, so lane-order
+    /// reduction matches sequential scalar max bit-for-bit (levkropp 8b139820).
+    VecSmaxI32x4,
+    /// NEON smaxv: horizontal signed max of 4xI32 lanes; dest = scalar I32.
+    VecHorizontalMaxI32x4,
     /// Broadcast a scalar I32 to all 4 lanes: %dest_vec = {x, x, x, x}
     /// args[0] = scalar I32 value; dest = result vector
     VecBroadcastI32x4,
@@ -1075,7 +1081,7 @@ impl IntrinsicOp {
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
-            | VecMulI32x4 | VecBroadcastI32x4
+            | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
             | Pminsw128 | Pmaxsw128 | Pmulhuw128 | Paddq128 | Psubq128
@@ -1189,6 +1195,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecSadalpI32x4
                 | IntrinsicOp::VecSmlalLoI32x4
                 | IntrinsicOp::VecSmlalHiI32x4
+                | IntrinsicOp::VecSmaxI32x4
         )
     }
 }

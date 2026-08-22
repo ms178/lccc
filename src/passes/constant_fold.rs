@@ -956,11 +956,7 @@ fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
         }
         IrUnaryOp::Ctz => {
             if src == 0 {
-                if is_32bit {
-                    32
-                } else {
-                    64
-                }
+                if is_32bit { 32 } else { 64 }
             } else if is_32bit {
                 (src as u32).trailing_zeros() as i64
             } else {

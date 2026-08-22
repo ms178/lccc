@@ -1307,15 +1307,13 @@ mod tests {
         );
         // Case-fold happened: some block computes x & ~32.
         assert!(
-            f.blocks
-                .iter()
-                .any(|b| {
-                    b.instructions.iter().any(|i| matches!(
+            f.blocks.iter().any(|b| {
+                b.instructions.iter().any(|i| matches!(
                 i,
                 Instruction::BinOp { op: IrBinOp::And, rhs: Operand::Const(IrConst::I32(c)), .. }
                     if *c == !32
             ))
-                }),
+            }),
             "expected the ASCII case-fold And"
         );
         // ONE BitTest cluster (not two): count BitTest instructions.

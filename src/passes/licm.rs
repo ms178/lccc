@@ -145,7 +145,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
                 // (as the stored data) means its address escapes.
                 Instruction::Store { val, ptr, .. } => {
                     let _ = ptr; // Storing to alloca is fine.
-                                 // If the stored VALUE is an alloca pointer, it's address-taken.
+                    // If the stored VALUE is an alloca pointer, it's address-taken.
                     if let Operand::Value(v) = val {
                         if alloca_values.contains(&v.0) {
                             address_taken.insert(v.0);

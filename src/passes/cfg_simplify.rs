@@ -1653,7 +1653,9 @@ mod tests {
                 );
             }
             Terminator::Branch(_) => {
-                panic!("CondBranch was incorrectly simplified to unconditional Branch, losing phi distinction");
+                panic!(
+                    "CondBranch was incorrectly simplified to unconditional Branch, losing phi distinction"
+                );
             }
             _ => panic!("Unexpected terminator"),
         }

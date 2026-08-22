@@ -197,9 +197,16 @@ fn rewrite_covered_arm_loads(
                     {
                         pending.push((inst_pos, *dest, *covering));
                     } else if debug {
-                        eprintln!("[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
-                            arm_idx, ptr.0, ty,
-                            pred_loads.iter().map(|(p, t, _, d)| (p.0, *t, d.0)).collect::<Vec<_>>());
+                        eprintln!(
+                            "[IFCONV] arm block {} load ptr={} ty={:?} not covered by pred loads {:?}",
+                            arm_idx,
+                            ptr.0,
+                            ty,
+                            pred_loads
+                                .iter()
+                                .map(|(p, t, _, d)| (p.0, *t, d.0))
+                                .collect::<Vec<_>>()
+                        );
                         for b in &func.blocks {
                             for i in &b.instructions {
                                 if i.dest() == Some(*ptr)
@@ -1268,10 +1275,12 @@ mod tests {
         ));
 
         // Merge block should have no phi
-        assert!(!func.blocks[3]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Phi { .. })));
+        assert!(
+            !func.blocks[3]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Phi { .. }))
+        );
     }
 
     #[test]
