@@ -286,24 +286,105 @@ impl IrConst {
     /// Cast a float value (as f64) to the target IR type, producing a new IrConst.
     /// For unsigned integer targets, converts via the unsigned type first to get correct
     /// wrapping behavior (e.g., 200.0 as u8 = 200, not saturated to i8 max).
+    ///
+    /// Integer targets use GCC `-fno-trapping-math` saturation: finite values
+    /// outside the destination range become the destination min/max (so
+    /// `(int)2147483648.0f` is INT_MAX, matching gcc.c-torture 20031003-1).
+    /// NaN and infinities are not folded (they raise the invalid operation
+    /// at runtime under IEEE 754 / `-ftrapping-math`).
     pub fn cast_float_to_target(fv: f64, target: IrType) -> Option<IrConst> {
         Some(match target {
             IrType::F64 => IrConst::F64(fv),
             IrType::F128 => IrConst::long_double(fv),
             IrType::F32 => IrConst::F32(fv as f32),
-            IrType::I8 => IrConst::I8(fv as i8),
-            IrType::U8 => IrConst::I8(fv as u8 as i8),
-            IrType::I16 => IrConst::I16(fv as i16),
-            IrType::U16 => IrConst::I16(fv as u16 as i16),
-            IrType::I32 => IrConst::I32(fv as i32),
-            IrType::U32 => IrConst::I64(fv as u32 as i64),
-            IrType::I64 => IrConst::I64(fv as i64),
-            IrType::Ptr => IrConst::ptr_int(fv as i64),
-            IrType::U64 => IrConst::I64(fv as u64 as i64),
-            IrType::I128 => IrConst::I128(fv as i128),
-            IrType::U128 => IrConst::I128(fv as u128 as i128),
+            IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+            | IrType::Ptr
+            | IrType::I128
+            | IrType::U128 => return Self::saturate_float_to_int(fv, target),
             _ => return None,
         })
+    }
+
+    /// Saturating float-to-integer conversion for finite values.
+    /// Returns None for NaN/Inf so callers can leave the cast unfolded.
+    pub fn saturate_float_to_int(fv: f64, target: IrType) -> Option<IrConst> {
+        if !fv.is_finite() {
+            return None;
+        }
+        match target {
+            IrType::I8 => {
+                let sat = fv.clamp(i8::MIN as f64, i8::MAX as f64);
+                Some(IrConst::I8(sat as i8))
+            }
+            IrType::U8 => {
+                let sat = fv.clamp(0.0, u8::MAX as f64);
+                Some(IrConst::I8(sat as u8 as i8))
+            }
+            IrType::I16 => {
+                let sat = fv.clamp(i16::MIN as f64, i16::MAX as f64);
+                Some(IrConst::I16(sat as i16))
+            }
+            IrType::U16 => {
+                let sat = fv.clamp(0.0, u16::MAX as f64);
+                Some(IrConst::I16(sat as u16 as i16))
+            }
+            IrType::I32 => {
+                let sat = fv.clamp(i32::MIN as f64, i32::MAX as f64);
+                Some(IrConst::I32(sat as i32))
+            }
+            IrType::U32 => {
+                let sat = fv.clamp(0.0, u32::MAX as f64);
+                Some(IrConst::I64(sat as u32 as i64))
+            }
+            IrType::I64 | IrType::Ptr => {
+                // 2^63 is the first value that cannot be represented as i64.
+                // i64::MAX is not exactly representable in f64, so compare
+                // against 2^63 rather than `i64::MAX as f64`.
+                if fv >= 9223372036854775808.0 {
+                    Some(IrConst::from_i64(i64::MAX, target))
+                } else if fv < -9223372036854775808.0 {
+                    Some(IrConst::from_i64(i64::MIN, target))
+                } else {
+                    Some(IrConst::from_i64(fv as i64, target))
+                }
+            }
+            IrType::U64 => {
+                if fv >= 18446744073709551616.0 {
+                    Some(IrConst::I64(-1))
+                } else if fv <= 0.0 {
+                    Some(IrConst::I64(0))
+                } else {
+                    Some(IrConst::I64(fv as u64 as i64))
+                }
+            }
+            IrType::I128 => {
+                // 2^127 ~ 1.7014118346046923e38
+                if fv >= 170141183460469231731687303715884105728.0 {
+                    Some(IrConst::I128(i128::MAX))
+                } else if fv < -170141183460469231731687303715884105728.0 {
+                    Some(IrConst::I128(i128::MIN))
+                } else {
+                    Some(IrConst::I128(fv as i128))
+                }
+            }
+            IrType::U128 => {
+                if fv >= 340282366920938463463374607431768211456.0 {
+                    Some(IrConst::I128(-1))
+                } else if fv <= 0.0 {
+                    Some(IrConst::I128(0))
+                } else {
+                    Some(IrConst::I128(fv as u128 as i128))
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Cast a long double (with f128 bytes) to the target IR type.

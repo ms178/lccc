@@ -89,6 +89,11 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     // and bitwise And/Or/Xor of boolean values.
     let mut is_boolean = vec![false; max_id + 1];
 
+    // Track values produced by fabs/fabsf (call or intrinsic) so
+    // `fabs(x) < 0.0` can fold to false, including through Copies.
+    // gcc.c-torture 20020720-1: `if (fabs(x) < 0.0) link_error();`
+    let mut is_fabs = vec![false; max_id + 1];
+
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -185,6 +190,40 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                 } => {
                     set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                 }
+                Instruction::Call { func, info } => {
+                    if matches!(
+                        func.as_str(),
+                        "fabs"
+                            | "fabsf"
+                            | "fabsl"
+                            | "__builtin_fabs"
+                            | "__builtin_fabsf"
+                            | "__builtin_fabsl"
+                    ) {
+                        if let Some(d) = info.dest {
+                            let id = d.0 as usize;
+                            if id < is_fabs.len() {
+                                is_fabs[id] = true;
+                            }
+                        }
+                    }
+                }
+                Instruction::Intrinsic { dest, op, .. } => {
+                    if matches!(
+                        op,
+                        IntrinsicOp::FabsF32
+                            | IntrinsicOp::FabsF64
+                            | IntrinsicOp::LDFabs
+                            | IntrinsicOp::F128Fabs
+                    ) {
+                        if let Some(d) = dest {
+                            let id = d.0 as usize;
+                            if id < is_fabs.len() {
+                                is_fabs[id] = true;
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -213,8 +252,48 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
         }
     }
 
+    // Propagate fabs-ness through Copy (p = fabs(x); if (p < 0.0)).
+    let mut fabs_changed = true;
+    while fabs_changed {
+        fabs_changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } = inst
+                {
+                    let src_id = v.0 as usize;
+                    let dest_id = dest.0 as usize;
+                    if src_id < is_fabs.len()
+                        && dest_id < is_fabs.len()
+                        && is_fabs[src_id]
+                        && !is_fabs[dest_id]
+                    {
+                        is_fabs[dest_id] = true;
+                        fabs_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
+            if let Instruction::Cmp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } = inst
+            {
+                if let Some(folded) = fold_fabs_lt_zero(*dest, *op, lhs, rhs, *ty, &is_fabs) {
+                    *inst = folded;
+                    total += 1;
+                    continue;
+                }
+            }
             if let Some(simplified) = try_simplify_with_types(
                 inst,
                 &cast_defs,
@@ -973,6 +1052,44 @@ fn simplify_cmp(
         });
     }
 
+    None
+}
+
+/// Fold `fabs(x) < 0` (and the swapped `0 > fabs(x)`) to false.
+///
+/// IEEE 754: `fabs` never returns a negative number, and a comparison
+/// against NaN is unordered (false for ordered `<`). This is exactly the
+/// identity gcc.c-torture 20020720-1 checks: the `link_error()` call in
+/// `if (fabs(x) < 0.0)` must be DCE'd.
+fn fold_fabs_lt_zero(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    is_fabs: &[bool],
+) -> Option<Instruction> {
+    if !ty.is_float() {
+        return None;
+    }
+    let (val, cval, effective_op) = match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) => (v, c, op),
+        (Operand::Const(c), Operand::Value(v)) => (v, c, swap_cmp_op(op)),
+        _ => return None,
+    };
+    if !cval.is_zero() {
+        return None;
+    }
+    let idx = val.0 as usize;
+    if idx >= is_fabs.len() || !is_fabs[idx] {
+        return None;
+    }
+    if effective_op == IrCmpOp::Slt {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(0)),
+        });
+    }
     None
 }
 
@@ -2685,6 +2802,51 @@ mod tests {
                 assert_eq!(args.len(), 1);
             }
             _ => panic!("Expected FabsF64 intrinsic, got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_fabs_lt_zero_folds_false() {
+        let mut is_fabs = vec![false; 4];
+        is_fabs[1] = true;
+        let inst = fold_fabs_lt_zero(
+            Value(2),
+            IrCmpOp::Slt,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::F64(0.0)),
+            IrType::F64,
+            &is_fabs,
+        )
+        .unwrap();
+        match inst {
+            Instruction::Copy {
+                src: Operand::Const(c),
+                ..
+            } => assert!(c.is_zero()),
+            other => panic!("expected Copy(0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fabs_lt_zero_swapped_gt_folds_false() {
+        let mut is_fabs = vec![false; 4];
+        is_fabs[1] = true;
+        // 0.0 > fabs(x)  <=>  fabs(x) < 0.0
+        let inst = fold_fabs_lt_zero(
+            Value(2),
+            IrCmpOp::Sgt,
+            &Operand::Const(IrConst::F64(0.0)),
+            &Operand::Value(Value(1)),
+            IrType::F64,
+            &is_fabs,
+        )
+        .unwrap();
+        match inst {
+            Instruction::Copy {
+                src: Operand::Const(c),
+                ..
+            } => assert!(c.is_zero()),
+            other => panic!("expected Copy(0), got {other:?}"),
         }
     }
 

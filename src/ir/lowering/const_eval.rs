@@ -13,7 +13,9 @@ use super::lower::Lowerer;
 use crate::common::const_arith;
 use crate::common::const_eval as shared_const_eval;
 use crate::common::types::{CType, IrType};
-use crate::frontend::parser::ast::{BinOp, Expr, Initializer, SizeofArg, TypeSpecifier, UnaryOp};
+use crate::frontend::parser::ast::{
+    BinOp, DerivedDeclarator, Expr, Initializer, SizeofArg, StructFieldDecl, TypeSpecifier, UnaryOp,
+};
 use crate::ir::reexports::{GlobalInit, IrConst};
 
 impl Lowerer {
@@ -182,6 +184,15 @@ impl Lowerer {
             Expr::Cast(ref target_type, inner, _) => self.eval_const_cast(target_type, inner),
             Expr::Identifier(name, _) => self.eval_const_identifier(name),
             Expr::Sizeof(arg, _) => {
+                // VLA sizeof is a runtime value (C99 6.7.6.2 / 6.5.3.4): the
+                // size is captured at the point of the declaration, not a
+                // compile-time constant. Folding it via sizeof_type() yields
+                // the pointer-size fallback for Array(_, None) (e.g. 8*3=24
+                // instead of (i+2)*sizeof(int)*3). GCC torture 20040411-1,
+                // 20040423-1, 20041218-2.
+                if self.sizeof_arg_is_vla(arg) {
+                    return None;
+                }
                 let size = match arg.as_ref() {
                     SizeofArg::Type(ts) => self.sizeof_type(ts),
                     SizeofArg::Expr(e) => self.sizeof_expr(e),
@@ -259,7 +270,11 @@ impl Lowerer {
     }
 
     /// Evaluate a cast expression at compile time.
-    fn eval_const_cast(&self, target_type: &TypeSpecifier, inner: &Expr) -> Option<IrConst> {
+    pub(super) fn eval_const_cast(
+        &self,
+        target_type: &TypeSpecifier,
+        inner: &Expr,
+    ) -> Option<IrConst> {
         let target_ir_ty = self.type_spec_to_ir(target_type);
 
         // _Float128 (IEEE binary128, carried as IrType::U128) cannot be produced
@@ -750,5 +765,100 @@ impl Lowerer {
             Expr::Cast(_, inner, _) => Self::expr_is_always_nonzero(inner),
             _ => false,
         }
+    }
+
+    /// True when `sizeof` of this argument is a runtime VLA size, not a
+    /// compile-time constant. Used to keep `eval_const_expr` from folding
+    /// `sizeof(vla_typedef) * N` into a pointer-sized constant.
+    fn sizeof_arg_is_vla(&self, arg: &SizeofArg) -> bool {
+        match arg {
+            SizeofArg::Type(ts) => self.type_spec_is_vla(ts),
+            SizeofArg::Expr(e) => self.expr_sizeof_is_vla(e),
+        }
+    }
+
+    fn expr_sizeof_is_vla(&self, expr: &Expr) -> bool {
+        if let Expr::Identifier(name, _) = expr {
+            if let Some(fs) = self.func_state.as_ref() {
+                if fs.vla_typedef_sizes.contains_key(name) {
+                    return true;
+                }
+                if fs
+                    .locals
+                    .get(name)
+                    .is_some_and(|info| info.vla_size.is_some())
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Recursively detect a variably-modified type (VLA array dimension, or
+    /// a struct/union containing one, or a typedef of either).
+    fn type_spec_is_vla(&self, ts: &TypeSpecifier) -> bool {
+        if let Some(fs) = self.func_state.as_ref() {
+            match ts {
+                TypeSpecifier::TypedefName(name) => {
+                    if fs.vla_typedef_sizes.contains_key(name) {
+                        return true;
+                    }
+                }
+                TypeSpecifier::Struct(Some(tag), _, _, _, _) => {
+                    if fs
+                        .vla_typedef_sizes
+                        .contains_key(&format!("struct.{}", tag))
+                    {
+                        return true;
+                    }
+                }
+                TypeSpecifier::Union(Some(tag), _, _, _, _) => {
+                    if fs.vla_typedef_sizes.contains_key(&format!("union.{}", tag)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ts = self.resolve_type_spec(ts);
+        match ts {
+            TypeSpecifier::Array(elem, Some(size_expr)) => {
+                self.expr_as_array_size(size_expr).is_none() || self.type_spec_is_vla(elem)
+            }
+            TypeSpecifier::Array(elem, None) => self.type_spec_is_vla(elem),
+            TypeSpecifier::Struct(_, Some(fields), _, _, _)
+            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+                fields.iter().any(|f| self.struct_field_is_vla(f))
+            }
+            TypeSpecifier::TypedefName(name) => {
+                if let Some(ct) = self.types.typedefs.get(name) {
+                    match ct {
+                        crate::common::types::CType::Struct(key)
+                        | crate::common::types::CType::Union(key) => self
+                            .func_state
+                            .as_ref()
+                            .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(key.as_ref())),
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            TypeSpecifier::Pointer(_, _) => false, // pointer-to-VLA is a pointer, sizeof is const
+            TypeSpecifier::TypeofType(inner) => self.type_spec_is_vla(inner),
+            _ => false,
+        }
+    }
+
+    fn struct_field_is_vla(&self, field: &StructFieldDecl) -> bool {
+        for d in &field.derived {
+            if let DerivedDeclarator::Array(Some(expr)) = d {
+                if self.expr_as_array_size(expr).is_none() {
+                    return true;
+                }
+            }
+        }
+        self.type_spec_is_vla(&field.type_spec)
     }
 }

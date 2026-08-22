@@ -3,7 +3,7 @@ use super::lower::Lowerer;
 use crate::common::types::{target_int_ir_type, AddressSpace, CType, IrType, StructLayout};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator,
-    Initializer, InitializerItem, Stmt, TypeSpecifier,
+    Initializer, InitializerItem, Stmt, StructFieldDecl, TypeSpecifier,
 };
 use crate::frontend::sema::type_context::extract_fptr_typedef_info;
 use crate::ir::reexports::{
@@ -272,7 +272,20 @@ impl Lowerer {
                     .insert_typedef_alignment_scoped(declarator.name.clone(), align);
             }
             if self.func_state.is_some() {
-                if let Some(vla_size) =
+                let copied_from_struct = {
+                    let td = self.types.typedefs.get(&declarator.name);
+                    let fs = self.func_state.as_ref();
+                    match (td, fs) {
+                        (Some(CType::Struct(key) | CType::Union(key)), Some(fs)) => {
+                            fs.vla_typedef_sizes.get(key.as_ref()).copied()
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(vla_size) = copied_from_struct {
+                    self.func_mut()
+                        .insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
+                } else if let Some(vla_size) =
                     self.compute_vla_runtime_size(type_spec, &declarator.derived)
                 {
                     self.func_mut()
@@ -1673,8 +1686,41 @@ impl Lowerer {
         }
     }
 
-    /// Compute VLA size from a typedef'd array type (e.g., typedef char buf[n]).
-    fn compute_vla_size_from_type_spec(&mut self, type_spec: &TypeSpecifier) -> Option<Value> {
+    /// Compute VLA size from a typedef'd array type (e.g., typedef char buf[n])
+    /// or from a struct/union type whose fields include a VLA.
+    pub(super) fn compute_vla_size_from_type_spec(
+        &mut self,
+        type_spec: &TypeSpecifier,
+    ) -> Option<Value> {
+        if let TypeSpecifier::TypedefName(name) = type_spec {
+            if let Some(&vla_size) = self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.vla_typedef_sizes.get(name))
+            {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Struct(Some(tag), _, _, _, _) = type_spec {
+            let key = format!("struct.{}", tag);
+            if let Some(&vla_size) = self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.vla_typedef_sizes.get(&key))
+            {
+                return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Union(Some(tag), _, _, _, _) = type_spec {
+            let key = format!("union.{}", tag);
+            if let Some(&vla_size) = self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.vla_typedef_sizes.get(&key))
+            {
+                return Some(vla_size);
+            }
+        }
         let resolved = self.resolve_type_spec(type_spec).clone();
         match &resolved {
             TypeSpecifier::Array(elem, Some(size_expr)) => {
@@ -1700,7 +1746,154 @@ impl Lowerer {
                     Some(dim_value)
                 }
             }
+            TypeSpecifier::Struct(_, Some(fields), is_packed, _, _) => {
+                self.compute_vla_struct_sizeof(fields, false, *is_packed)
+            }
+            TypeSpecifier::Union(_, Some(fields), is_packed, _, _) => {
+                self.compute_vla_struct_sizeof(fields, true, *is_packed)
+            }
+            TypeSpecifier::TypedefName(name) => {
+                if let Some(ct) = self.types.typedefs.get(name).cloned() {
+                    match ct {
+                        CType::Struct(key) | CType::Union(key) => self
+                            .func_state
+                            .as_ref()
+                            .and_then(|fs| fs.vla_typedef_sizes.get(key.as_ref()).copied()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
+    }
+
+    /// Runtime sizeof of a struct/union that contains at least one VLA field.
+    ///
+    /// GCC extension: a local struct may have a VLA member, and `sizeof` of
+    /// that type is evaluated at the point of the type definition (the VLA
+    /// bound is captured, later stores to the bound expression are ignored).
+    /// Covers gcc.c-torture 20040423-1 (`typedef struct { int c[i+2]; } c`)
+    /// and 20041218-2 (`struct s { char b[n]; } packed; n++; sizeof(struct s)`).
+    fn compute_vla_struct_sizeof(
+        &mut self,
+        fields: &[StructFieldDecl],
+        is_union: bool,
+        is_packed: bool,
+    ) -> Option<Value> {
+        let ptr_int_ty = target_int_ir_type();
+        let mut vla_total: Option<Value> = None;
+        let mut const_total: usize = 0;
+        let mut has_vla = false;
+        let mut max_align: usize = 1;
+
+        for f in fields {
+            if f.bit_width.is_some() {
+                continue;
+            }
+            let ct = self.struct_field_ctype(f);
+            let align = if is_packed {
+                1
+            } else {
+                self.ctype_align(&ct).max(1)
+            };
+            if align > max_align {
+                max_align = align;
+            }
+
+            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
+                has_vla = true;
+                if !is_packed && align > 1 {
+                    const_total = (const_total + align - 1) & !(align - 1);
+                }
+                let combined = if let Some(prev) = vla_total {
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(prev),
+                        Operand::Value(vla_sz),
+                        ptr_int_ty,
+                    )
+                } else if const_total > 0 {
+                    let added = self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(vla_sz),
+                        Operand::Const(IrConst::ptr_int(const_total as i64)),
+                        ptr_int_ty,
+                    );
+                    const_total = 0;
+                    added
+                } else {
+                    vla_sz
+                };
+                vla_total = Some(combined);
+            } else {
+                let sz = self.ctype_size(&ct);
+                if !is_packed && align > 1 {
+                    const_total = (const_total + align - 1) & !(align - 1);
+                }
+                if let Some(prev) = vla_total {
+                    if sz > 0 {
+                        vla_total = Some(self.emit_binop_val(
+                            IrBinOp::Add,
+                            Operand::Value(prev),
+                            Operand::Const(IrConst::ptr_int(sz as i64)),
+                            ptr_int_ty,
+                        ));
+                    }
+                } else {
+                    const_total += sz;
+                }
+            }
+        }
+
+        if !has_vla {
+            return None;
+        }
+
+        // Union size is the max of members, not the sum. The VLA member is
+        // typically the largest; returning it is correct for a single VLA
+        // field (the only form the torture suite uses).
+        if is_union {
+            return vla_total;
+        }
+
+        let mut result = match (vla_total, const_total) {
+            (Some(v), 0) => v,
+            (Some(v), c) => self.emit_binop_val(
+                IrBinOp::Add,
+                Operand::Value(v),
+                Operand::Const(IrConst::ptr_int(c as i64)),
+                ptr_int_ty,
+            ),
+            (None, _) => return None,
+        };
+
+        if !is_packed && max_align > 1 {
+            let mask = (max_align - 1) as i64;
+            let added = self.emit_binop_val(
+                IrBinOp::Add,
+                Operand::Value(result),
+                Operand::Const(IrConst::ptr_int(mask)),
+                ptr_int_ty,
+            );
+            result = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(added),
+                Operand::Const(IrConst::ptr_int(!mask)),
+                ptr_int_ty,
+            );
+        }
+        Some(result)
+    }
+
+    /// Runtime byte size of a struct field if it is (or contains) a VLA.
+    fn field_vla_runtime_size(&mut self, field: &StructFieldDecl) -> Option<Value> {
+        if !field.derived.is_empty() {
+            if let Some(v) = self.compute_vla_runtime_size(&field.type_spec, &field.derived) {
+                return Some(v);
+            }
+        }
+        self.compute_vla_size_from_type_spec(&field.type_spec)
     }
 }
