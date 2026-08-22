@@ -521,7 +521,78 @@ pub fn lower_cast(
     let to_size = OpSize::from_ir_type(to_ty);
 
     if to_size as u8 <= from_size as u8 {
-        emit_mov_operand_r(src, dst, to_size, ra, out);
+        // Narrowing or same-size cast.  A plain truncating move (movb/movw/
+        // movl) would leave the destination register's UPPER BITS STALE.
+        // x86 code may legitimately consume the value at a wider width:
+        // the folded-SIB index path reads a never-materialized cast result
+        // straight from its (possibly die-at-birth-shared) home at 64-bit
+        // width — zlib-ng's zng_emit_dist computed `code` as uint8_t and
+        // folded it into `extra_dbits(%rcx,%r10,4)`; the stale high bytes of
+        // %r10 made the index garbage and segfaulted out of bounds.  Emit
+        // the extending forms instead: same length, no partial-register
+        // false dependency, and every wider reader sees a defined value
+        // (matches the mature path and GCC/Clang lowering).
+        match src {
+            Operand::Const(_) => {
+                // movl $imm zero-extends; movq $imm carries the sign-extended
+                // mathematical value for signed sources.  movzx/movsx have no
+                // immediate forms, so pick the width by destination sign.
+                let size = if to_ty.is_signed() {
+                    OpSize::S64
+                } else {
+                    OpSize::S32
+                };
+                emit_mov_operand_r(src, dst, size, ra, out);
+            }
+            Operand::Value(v) => {
+                let src_reg = value_to_reg(v, ra);
+                match (to_size, to_ty.is_signed()) {
+                    (OpSize::S8, true) => out.push(MachInst::Movsx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S8,
+                        to_size: OpSize::S32,
+                    }),
+                    (OpSize::S8, false) => out.push(MachInst::Movzx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S8,
+                        to_size: OpSize::S32,
+                    }),
+                    (OpSize::S16, true) => out.push(MachInst::Movsx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S16,
+                        to_size: OpSize::S32,
+                    }),
+                    (OpSize::S16, false) => out.push(MachInst::Movzx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S16,
+                        to_size: OpSize::S32,
+                    }),
+                    // I32 narrowing: movslq sign-extends to 64 bits; movl
+                    // zero-extends — mirror the mature path exactly.
+                    // Movzx/S32->S32 lowers to `movl` but, unlike a plain
+                    // Mov, is never elided as a self-move: a die-at-birth
+                    // shared home must still be re-zero-extended.
+                    (OpSize::S32, true) => out.push(MachInst::Movsx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S32,
+                        to_size: OpSize::S64,
+                    }),
+                    (OpSize::S32, false) => out.push(MachInst::Movzx {
+                        src: MachOperand::Reg(src_reg),
+                        dst,
+                        from_size: OpSize::S32,
+                        to_size: OpSize::S32,
+                    }),
+                    // Same-size 64-bit: identical bits.
+                    _ => emit_mov_operand_r(src, dst, to_size, ra, out),
+                }
+            }
+        }
         return;
     }
 
@@ -1033,6 +1104,95 @@ mod tests {
             [MachInst::Movzx {
                 from_size: OpSize::S32,
                 to_size: OpSize::S64,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn narrowing_cast_extends_the_register() {
+        // A truncating `movb`/`movw` would leave the destination register's
+        // upper bits stale.  The folded-SIB index path reads a
+        // never-materialized cast result straight from its (possibly
+        // die-at-birth-shared) home at 64-bit width — zlib-ng's
+        // zng_emit_dist computed `code` as uint8_t and folded it into
+        // `extra_dbits(%rcx,%r10,4)`, and the stale high bytes made the
+        // index garbage (out-of-bounds segfault).  Narrowing casts must
+        // therefore extend, matching the mature path and GCC/Clang.
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        assignments.insert(2, PhysReg(2));
+
+        let mut u32_to_u8 = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Value(Value(1)),
+            IrType::U32,
+            IrType::U8,
+            &assignments,
+            &mut u32_to_u8,
+        );
+        assert!(matches!(
+            u32_to_u8.as_slice(),
+            [MachInst::Movzx {
+                from_size: OpSize::S8,
+                to_size: OpSize::S32,
+                ..
+            }]
+        ));
+
+        let mut i32_to_i8 = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Value(Value(1)),
+            IrType::I32,
+            IrType::I8,
+            &assignments,
+            &mut i32_to_i8,
+        );
+        assert!(matches!(
+            i32_to_i8.as_slice(),
+            [MachInst::Movsx {
+                from_size: OpSize::S8,
+                to_size: OpSize::S32,
+                ..
+            }]
+        ));
+
+        let mut u64_to_u32 = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Value(Value(1)),
+            IrType::U64,
+            IrType::U32,
+            &assignments,
+            &mut u64_to_u32,
+        );
+        // movl-via-Movzx: always emitted (a plain Mov would be elided as a
+        // self-move on a die-at-birth shared home and skip the extension).
+        assert!(matches!(
+            u64_to_u32.as_slice(),
+            [MachInst::Movzx {
+                from_size: OpSize::S32,
+                to_size: OpSize::S32,
+                ..
+            }]
+        ));
+
+        let mut const_to_u8 = Vec::new();
+        lower_cast(
+            &Value(2),
+            &Operand::Const(IrConst::I64(0x1000)),
+            IrType::I64,
+            IrType::U8,
+            &assignments,
+            &mut const_to_u8,
+        );
+        // movl $imm zero-extends; movzx has no immediate form.
+        assert!(matches!(
+            const_to_u8.as_slice(),
+            [MachInst::Mov {
+                size: OpSize::S32,
                 ..
             }]
         ));

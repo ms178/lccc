@@ -61,3 +61,4 @@ __pycache__/
 agentB*.patch
 agentB*.txt
 /results/
+/zlib-ng-validation/
