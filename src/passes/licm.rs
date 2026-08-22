@@ -772,9 +772,11 @@ fn is_load_hoistable(
     loop_defined: &FxHashSet<u32>,
     invariant: &FxHashSet<u32>,
     global_addr_values: &FxHashSet<u32>,
+    root_global_addr_values: &FxHashSet<u32>,
     value_to_base_global: &FxHashMap<u32, u32>,
     alias_info: &LoopAliasInfo,
     load_size: i64,
+    preheader_is_dedicated: bool,
 ) -> bool {
     let ptr_id = ptr.0;
 
@@ -811,7 +813,16 @@ fn is_load_hoistable(
     // This is particularly important for inner rendering loops (e.g., DOOM's
     // R_DrawColumn) where globals like dc_source and dc_colormap are read
     // every iteration but never written.
+    //
+    // Speculation safety: only a load of the *root* symbol address is
+    // unconditionally dereferenceable. A GEP-derived global pointer with a
+    // loop-invariant but runtime-variable offset (g.s[x]) can fault when the
+    // guard protecting the loop is false, so it needs a dedicated preheader
+    // like any other derived pointer.
     if global_addr_values.contains(&ptr_id) {
+        if !preheader_is_dedicated && !root_global_addr_values.contains(&ptr_id) {
+            return false;
+        }
         if loop_mem.has_calls {
             return false;
         }
@@ -834,6 +845,15 @@ fn is_load_hoistable(
     // memory write in the loop must be modeled, and each modeled store must be
     // provably disjoint in this exact loop frame. An empty store set is safe
     // when there are no calls/unmodeled writes.
+    //
+    // Unlike the alloca and direct-global classes above, a derived pointer
+    // (call result, parameter, GEP chain) is not provably dereferenceable:
+    // executing the load on a path that never enters the loop can fault.
+    // Such loads may only move into a *dedicated* preheader, whose sole
+    // successor is the loop header (see hoist_loop_invariants).
+    if !preheader_is_dedicated {
+        return false;
+    }
     if std::env::var_os("CCC_NO_LICM_ALIAS").is_some() || !alias_info.complete || loop_mem.has_calls
     {
         return false;
@@ -862,6 +882,33 @@ fn hoist_loop_invariants(
     let preheader = match preheader {
         Some(ph) => ph,
         None => return 0, // No suitable preheader found
+    };
+
+    // A *dedicated* preheader has the loop header as its ONLY successor
+    // (unconditional branch). Hoisting a potentially-faulting load into a
+    // NON-dedicated preheader executes it on paths that never enter the
+    // loop — speculation across the very guard that makes the load legal.
+    //
+    // Miscompile this gate fixes (SQLite 3.53.4 jsonCacheSearch, inlined
+    // into jsonParseFuncArg; speedtest1 --testset json SIGSEGV):
+    //
+    //   p = sqlite3_get_auxdata(ctx, JSON_CACHE_ID);
+    //   if( p==0 ) return 0;
+    //   for(i=0; i<p->nUsed; i++) ...
+    //
+    // The `if(p==0)` block is the unique loop predecessor, so it *is* the
+    // preheader — but it branches both into the loop and to the early
+    // return. Hoisting the `p->nUsed` load to its end dereferenced NULL
+    // whenever the cache was empty.
+    //
+    // Loads that are provably dereferenceable regardless of the guard
+    // (allocas and direct data-symbol globals) remain hoistable into
+    // non-dedicated preheaders; only the derived-pointer path (call
+    // results, params, GEP chains — anything that can fault) requires the
+    // dedicated shape.
+    let preheader_is_dedicated = match &func.blocks[preheader].terminator {
+        Terminator::Branch(l) => *l == func.blocks[header].label,
+        _ => false,
     };
 
     // Build the set of Value IDs defined inside the loop.
@@ -1070,9 +1117,11 @@ fn hoist_loop_invariants(
                             &loop_defined,
                             &invariant,
                             &global_addr_values,
+                            &root_global_addr_values,
                             &value_to_base_global,
                             &alias_info,
                             ty.size() as i64,
+                            preheader_is_dedicated,
                         )
                 } else {
                     false

@@ -324,6 +324,69 @@ impl Parser {
             return result;
         }
 
+        // Function declarator returning a function pointer (C89 "obscure" form),
+        // e.g. sqlite3 fts3_hash.c:
+        //   static int (*ftsHashFunction(int keyClass))(const void*,int) { ... }
+        // and the nested variant
+        //   int (*(*f(int))(char))(long);
+        //
+        // Shape: the parenthesized inner declarator is itself a *function*
+        // declarator (`*name(A)` → inner = [Pointer, Function(A), ...]) and the
+        // outer suffix is the parameter list of the *returned* function pointer
+        // (`(B)` → outer_suffixes = [Function(B)]).
+        //
+        // C reads this inside-out: `f` is a function taking A returning a
+        // pointer to a function taking B returning the base type. In the
+        // derived-list encoding consumed by `build_full_ctype_with_base` and
+        // `build_return_type`, that is:
+        //   outer_pointers ++ [Pointer, FunctionPointer(B)] ++ inner[1..]
+        // i.e. the inner's leading syntax-marker `*` binds to the outer suffix
+        // to form the returned-function-pointer core, and the rest of the inner
+        // declarator (ending in Function(A) — the function's own parameters,
+        // which funcdef detection expects at derived.last()) follows.
+        //
+        // For the nested variant, inner is already the combined
+        // [Pointer, FunctionPointer(char), Function(int)] from the recursive
+        // parse, and the same rewrite yields
+        // [Pointer, FunctionPointer(long), Pointer, FunctionPointer(char), Function(int)].
+        //
+        // Restricted to shapes where the inner's leading `*` is the free syntax
+        // marker for the outer suffix: the inner must end in Function (the
+        // function's own parameter list) and no Pointer in the remainder may
+        // bind directly to a Function (which would mean a
+        // pointer-to-pointer-to-function return like `int (**f(int))(char)`;
+        // those fall through to the general case rather than being silently
+        // mis-encoded). This accepts arbitrary nesting depth, since each
+        // recursive combine emits `[Pointer, FunctionPointer, ...]` chains in
+        // which every Pointer is immediately consumed by a FunctionPointer.
+        let inner_has_function = inner_derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Function(_, _)));
+        let remainder_ptr_binds_function = inner_derived[1..].windows(2).any(|w| {
+            matches!(w[0], DerivedDeclarator::Pointer)
+                && matches!(w[1], DerivedDeclarator::Function(_, _))
+        });
+        if inner_has_function
+            && outer_starts_with_function
+            && outer_suffixes.len() == 1
+            && matches!(inner_derived.first(), Some(DerivedDeclarator::Pointer))
+            && matches!(
+                inner_derived.last(),
+                Some(DerivedDeclarator::Function(_, _))
+            )
+            && !remainder_ptr_binds_function
+        {
+            let mut result = outer_pointers;
+            result.push(DerivedDeclarator::Pointer);
+            if let Some(DerivedDeclarator::Function(params, variadic)) =
+                outer_suffixes.into_iter().next()
+            {
+                result.push(DerivedDeclarator::FunctionPointer(params, variadic));
+            }
+            result.extend(inner_derived.into_iter().skip(1));
+            return result;
+        }
+
         // Handle nested function pointer variables like `int (*(*p)(int a, int b))(int c, int d)`.
         // The inner declarator produces [Pointer, Pointer, FunctionPointer(...)], and the
         // outer adds Function(...). We keep inner_derived intact and convert the outer

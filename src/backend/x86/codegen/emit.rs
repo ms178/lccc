@@ -1394,11 +1394,25 @@ impl X86Codegen {
                     // p->aSortFlags stored as NULL → SIGSEGV in
                     // sqlite3KeyInfoFromExprList).  Reaching here means a
                     // producer/consumer handoff is broken; fail loudly.
+                    //
+                    // Include the tail of the asm emitted so far: the
+                    // instruction context around the failure is exactly what a
+                    // soundness hunt needs, and it is otherwise lost because
+                    // the panic aborts before the .s file is written.
+                    let tail: Vec<&str> = {
+                        let lines: Vec<&str> = self.state.out.buf.lines().collect();
+                        let n = lines.len();
+                        lines[n.saturating_sub(30)..].to_vec()
+                    };
                     panic!(
                         "x86 codegen: operand_to_rax: value {} in function '{}' \
                          has no register home, no stack slot and no acc-cache \
-                         entry — refusing to fabricate a value",
-                        v.0, self.state.current_func_name
+                         entry — refusing to fabricate a value\n\
+                         --- last {} asm lines ---\n{}",
+                        v.0,
+                        self.state.current_func_name,
+                        tail.len(),
+                        tail.join("\n")
                     );
                 }
             }
