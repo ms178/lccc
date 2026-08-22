@@ -1223,21 +1223,19 @@ macro_rules! preloop_dump {
         vector_temp_promotion::promote_vector_temps(module);
     }
 
-    // Phase 11b: downgrade the alignment of non-escaping vector-sized allocas
-    // (16/32 B) so every access skips the runtime lea/add/and alignment dance
-    // (3 instructions per 32-byte access in zlib-ng's compare256_avx2 inner
-    // loop). All emitter accesses are unaligned moves, and an address that
-    // never escapes makes _Alignas unobservable — so the downgrade is sound.
-    if !disabled.contains("vecpromote") {
-        vector_temp_promotion::downgrade_nonescaping_vector_align(module);
-    }
-
-    // Phase 11c: Vector load fusion. After promotion, `ymm = _mm256_loadu(p)`
-    // followed by a consumer that reads `ymm` is a pure slot round-trip; fuse
-    // the load into the consumer by passing `p` through (the backend emits
-    // `vmovdqu (%p)` / uses `(%p)` as the memory operand, matching GCC).
+    // Phase 11c: Forward direct vector loads into compatible consumers while
+    // the original alignment facts are still available. This must precede
+    // alignment relaxation: deleting a load can make its temporary's expensive
+    // >16-byte alignment completely unobservable.
     if !disabled.contains("vecpromote") {
         vector_temp_promotion::fuse_vector_loads(module);
+    }
+
+    // Phase 11d: Relax only the alignment left unobservable by the final use
+    // set. Aligned/non-temporal, atomic, volatile, address-observing and
+    // unaudited intrinsic positions retain their required alignment.
+    if !disabled.contains("vecpromote") {
+        vector_temp_promotion::downgrade_nonescaping_vector_align(module);
     }
 
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
