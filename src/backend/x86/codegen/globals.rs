@@ -155,6 +155,57 @@ impl X86Codegen {
         self.store_rax_to(dest);
     }
 
+    /// Materialise a global symbol's runtime address directly into a named
+    /// 64-bit register, honouring GOT / TLS / absolute addressing exactly like
+    /// `emit_global_addr_impl` / `emit_tls_global_addr_impl`, but without
+    /// routing through a value's home.
+    ///
+    /// This is the safe reconstruction for a *rematerialisable* `GlobalAddr`
+    /// (a value whose address computation was deliberately omitted because it
+    /// has no stack/register home). Every generic value-load path that can
+    /// encounter such a value must rebuild it here instead of fabricating 0 —
+    /// a silent `xorl %ecx,%ecx` for a global address corrupted the base of
+    /// `&buf[k]` pointer arithmetic (torture execute/20000412-6.c: `buf+3`
+    /// decoded as `6`, not `&buf[3]`). Credit: Agent C torture triage.
+    ///
+    /// TLS model selection mirrors emit_tls_global_addr_impl: Local-Exec for
+    /// local symbols (even under -fPIC, like GCC), Initial-Exec via GOTTPOFF
+    /// only for external TLS symbols in PIC mode.
+    pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
+        if self.state.tls_symbols.contains(name) {
+            if self.state.pic_mode && !self.state.local_symbols.contains(name) {
+                self.state
+                    .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, reg));
+                self.state
+                    .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
+            } else {
+                self.state.emit_fmt(format_args!("    movq %fs:0, %{}", reg));
+                self.state
+                    .emit_fmt(format_args!("    leaq {}@TPOFF(%{}), %{}", name, reg, reg));
+            }
+        } else if self.state.needs_got_for_addr(name) {
+            let n = self.got_name(name);
+            self.state
+                .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, reg));
+        } else if self.state.absolute_symbols.contains(name) {
+            self.state
+                .out
+                .emit_instr_sym_imm_reg("    movq", name, reg);
+        } else {
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", name, "rip", reg);
+        }
+        // Conservative cache hygiene: this helper writes an arbitrary named
+        // register from a generic load path whose callers manage caches
+        // differently; drop whichever cached mapping the write could stale.
+        if reg == "rax" {
+            self.state.reg_cache.invalidate_acc();
+        } else if reg == "rcx" {
+            self.state.reg_cache.invalidate_sec();
+        }
+    }
+
     pub(super) fn emit_global_addr_absolute_impl(&mut self, dest: &Value, name: &str) {
         // Register-direct: emit directly to dest register.
         if let Some(d_reg) = self.dest_reg(dest) {

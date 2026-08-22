@@ -540,6 +540,10 @@ impl Parser {
         mut ctx: DeclContext,
     ) -> Option<ExternalDecl> {
         let mut declarators = Vec::with_capacity(4);
+        // Same snapshot rationale as parse_local_declaration: initializer
+        // casts to segment-qualified pointers clear parsing_address_space
+        // before Declaration::new would read it.
+        let decl_addr_space = self.attrs.parsing_address_space;
         let init = if self.consume_if(&TokenKind::Assign) {
             Some(self.parse_initializer())
         } else {
@@ -697,7 +701,7 @@ impl Parser {
             ctx.alignment,
             ctx.alignas_type,
             ctx.alignment_sizeof_type,
-            self.attrs.parsing_address_space,
+            decl_addr_space,
             self.attrs.parsing_vector_size.take(),
             self.attrs.parsing_ext_vector_nelem.take(),
             start,
@@ -733,6 +737,15 @@ impl Parser {
 
         self.consume_post_type_qualifiers();
 
+        // Snapshot the declaration's address space NOW: initializer parsing
+        // can contain casts to segment-qualified pointers, and the abstract-
+        // declarator path `mem::take`s parsing_address_space (types.rs), so
+        // reading the flag after the declarators+inits are parsed loses the
+        // qualifier. `unsigned long __seg_fs *p = (fsptr)40;` compiled its
+        // `*p` without the %fs prefix — an absolute-address load (glibc TLS
+        // stack-guard reads at %fs:16/%fs:40 became NULL-page dereferences).
+        let decl_addr_space = self.attrs.parsing_address_space;
+
         let is_static = self.attrs.parsing_static();
         let is_extern = self.attrs.parsing_extern();
 
@@ -747,7 +760,7 @@ impl Parser {
                 None,
                 None,
                 None,
-                self.attrs.parsing_address_space,
+                decl_addr_space,
                 self.attrs.parsing_vector_size.take(),
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
@@ -855,7 +868,7 @@ impl Parser {
             alignment,
             alignas_type,
             alignment_sizeof_type,
-            self.attrs.parsing_address_space,
+            decl_addr_space,
             self.attrs.parsing_vector_size.take(),
             self.attrs.parsing_ext_vector_nelem.take(),
             start,

@@ -1013,8 +1013,15 @@ impl X86Codegen {
     pub(super) fn emit_int_cmp_insn_typed(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
         let (cmp_instr, test_instr, acc_reg) = cmp_width_info(ty);
         let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
-        let lhs_phys = self.operand_reg(lhs);
-        let rhs_phys = self.operand_reg(rhs);
+        // An INTEGER compare of a value homed in an XMM register (bit-punned
+        // float words: GET_FLOAT_WORD in glibc's flt-32 kernels after the
+        // hidden_proto wrappers inline) has no typed GPR sub-register name —
+        // typed_phys_reg_name would hit unreachable!("invalid x86 register
+        // index"). Route XMM-homed operands through the accumulator
+        // fallbacks below, whose operand_to_rax already handles the
+        // xmm→GPR move.
+        let lhs_phys = self.operand_reg(lhs).filter(|r| !is_xmm_reg(*r));
+        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
         // Prefer the immediate form whenever rhs is an encodable constant —
         // BEFORE checking register pairs, so `mask == 0xFFFFFFFF` becomes
         // `cmpl $-1, %eax` instead of movabs+cmpq.
@@ -2049,7 +2056,14 @@ impl X86Codegen {
                 {
                     self.state.out.emit_instr_reg_reg("    movq", "rax", "rcx");
                 } else {
-                    self.state.emit("    xorl %ecx, %ecx");
+                    // value_to_reg rebuilds a rematerialisable GlobalAddr (a
+                    // value with deliberately no home) and otherwise fails
+                    // loudly. The old `xorl %ecx,%ecx` silently fabricated 0
+                    // for `&buf[k]` and corrupted the address base — the same
+                    // disease class as the operand_to_rax hard gate
+                    // (torture execute/20000412-6.c: `buf+3` decoded as `6`).
+                    // Credit: Agent C torture triage T01-family.
+                    self.value_to_reg(v, "rcx");
                 }
                 // Record what's now in %rcx
                 self.state.reg_cache.set_sec(v.0, is_alloca);
@@ -2218,10 +2232,33 @@ impl X86Codegen {
                 Some(constant @ crate::ir::reexports::Operand::Const(_)) => {
                     self.operand_to_reg(&constant, reg);
                 }
-                None => panic!(
-                    "x86 codegen: value {} has no register, stack slot, or Copy definition",
-                    val.0
-                ),
+                None => {
+                    // A rematerialisable GlobalAddr deliberately has no home:
+                    // its address computation was omitted at the definition
+                    // and every consumer is expected to rebuild it. The
+                    // audited-Add interception in generation.rs is NOT the
+                    // only consumer shape — emit_gep bases, fused int-madd
+                    // operands and operand_to_rcx all reach this generic
+                    // loader (torture execute/20000412-6.c). Rebuild the
+                    // address here; anything else still fails loudly.
+                    // Credit: Agent C torture triage.
+                    let gaddr_name = self.get_defining_instruction(val.0).and_then(|inst| {
+                        if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
+                            Some(name.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(name) = gaddr_name {
+                        self.emit_global_addr_into_reg(&name, reg);
+                        return;
+                    }
+                    panic!(
+                        "x86 codegen: value {} has no register, stack slot, Copy, or \
+                         GlobalAddr definition",
+                        val.0
+                    );
+                }
             }
         }
     }
@@ -2741,7 +2778,11 @@ impl X86Codegen {
         }
 
         // Register-register form
-        let rhs_phys = self.operand_reg(rhs);
+        // Integer ALU reg-direct requires GPR names; an XMM-homed operand
+        // (bit-punned float words after hidden_proto math wrappers inline)
+        // must take the accumulator fallback, which handles the xmm->GPR
+        // move (phys_reg_name_32(xmm) is unreachable!()).
+        let rhs_phys = self.operand_reg(rhs).filter(|r| !is_xmm_reg(*r));
         let rhs_conflicts = rhs_phys.is_some_and(|r| r.0 == dest_phys.0);
         let (rhs_reg_name, rhs_reg_name_32): (String, String) = if rhs_conflicts {
             // rhs is in dest register — we need to save rhs to %rax before loading lhs.

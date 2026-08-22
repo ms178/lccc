@@ -374,3 +374,44 @@ engineering/evidence/workloads/
 - ✅ **Session 43** — red-team of Agent D's vector-temp-promotion v2: adopted (movnt align-16 relaxation via `intrinsic_dest_required_alignment`, unified width-typed `pointer_vector_arg_width`, non-escaping-alloca alias refinement, load-load chaining, single-read-site gating) and fixed two miscompiles it re-introduced — (1) `invalidate_for_value_write` dropped the slot-vs-write check (reassignment `v=load(p); v=setzero(); use(v)` read stale `p`), now a `write_may_clobber` slot+source test; (2) `VecStoreI64x2` writes memory through `args[1]` with `dest_ptr:None` but inherited the `produces_vector_value` register-result exemption. Also re-added the load-`dest` dead check and added the six 256-bit widening extensions (Pmovzx*/Pmovsx*256) to the forwardable/relaxable table. Measured: simd_movnt 422→390 insns / frame 440→392; simd_avx2_256 743→734 / 1016→824. See `docs/history/2026-08-21-session43-vector-promotion-v2-redteam.md`.
 - ✅ **Session 42** — red-team audit of `vector_temp_promotion.rs` (late SIMD cleanup): adopted Agent D's alias-aware rewrite (escape-gated promotion window, object-root load fusion with write invalidation, fail-closed alignment whitelist, span-preserving removal) and fixed four audit-found defects — (1) slot-identity invalidation in `invalidate_for_pointer_write` (reassignment miscompile), (2) `Add`/`Sub` root propagation in `pointer_roots` (param-derived load sources were "may alias anything" and un-fused), (3) `LoadF64x4/2,LoadI32x8/4` downgrade whitelist narrowed to `index == 0` (offset arg), (4) fail-closed `dest_ptr: None` invalidation + load-`dest` dead check. A/B: 34-file corpus byte-identical; 1022 unit + 389 regression + 50 correctness + 60 fuzz green. See `docs/history/2026-08-21-session42-vector-temp-promotion-redteam.md`.
 - ✅ **Session 41** — `redundant_ext.rs` SIB comma fix (zero-extend tracking re-enabled after indexed loads; also fixes a latent stale-byte-fact soundness bug on opaque SIB `movq` loads); 3-operand immediate `imul` for constant multiplies; BT bit-index consumed from its own register (no `%rcx` staging; `check_bit_test_canonical` oracle widened); 32-bit ALU writes tracked as upper-32-zero (enables `movq→movl` narrowing after `addl`/`subl` chains); `setup_oracles.sh` pins `MOLD_LTO=OFF` and records resolved oracle revisions. See `docs/history/2026-08-21-session41-x86-isel-peephole-sweep.md`.
+
+## 9. glibc 2.44 campaign (sessions 54-55, 2026-08-22) — status + new items
+
+**State:** configure passes with `CC=lccc` + `LD=lccc-ld` (`--disable-multi-arch
+--disable-cet`, official tarball + `ms178-glibc.patch`). Entire compile phase
+(every TU incl. malloc.c, all of elf/, nptl, libio, stdlib) compiles at
+`-O2 -march=x86-64-v3 -fPIC`. rtld-libc.a machinery (relocatable links, map
+scraping) works end-to-end. Fixes landed this campaign (do not re-fix):
+`-print-prog-name=`, post-phi `Copy(Const)` Value-position soundness,
+`__seg_fs`/`__seg_gs` declarator/typedef/local threading, `__CET__` GCC
+parity, gnu89 extern-inline must-inline class, `-r` whole-archive/`.os`/`.oS`
+inputs + `-Map` emission, sema vector_size typedef layout (shared cache
+poisoning), return-void GNU compat (sema + lowering), scoped shadowing of
+file-scope prototypes, SQLite-era four miscompiles (see session docs).
+
+| # | ID | Pri | Item | Evidence | Notes |
+|---|----|-----|------|----------|-------|
+| 171 | LK-19 | **P0** | IFUNC end-to-end: `__attribute__((ifunc))` in sema/lowering, `.type %gnu_indirect_function` data refs, `R_X86_64_IRELATIVE` for data words in exec/shared links, ld.so-side semantics | **M** glibc configure rejects `--enable-multi-arch` (probe: `.quad ifunc-sym` produced no IRELATIVE; attribute produced no IFUNC symbol) | Gate for the ms178 PKGBUILD's multi-arch build; string-fn dispatch performance depends on it |
+| 172 | LK-20 | P1 | `-r` output emits a spurious blank `UND NOTYPE LOCAL` symtab entry (index 3) | **M** `readelf -sW` on any `-r` product | Cosmetic-ish but GNU nm prints a bare `U `; fix in emit_rel symbol table build |
+| 173 | LK-21 | P1 | `-l` library resolution in the driver's `-r` path (`-lgcc` in glibc's reloc-link is currently dropped) | **C** common.rs `-r` branch collects only bare paths | Soft-float/i128 helpers would go missing; x86-64-v3 got lucky |
+| 174 | LK-22 | P2 | `-Map` for exec/shared links reaching the mapfile.rs writer from the -r path spellings | **C** | mapfile.rs exists; -r path writes a minimal member list only |
+| 175 | FE-23 | P1 | Address-space qualifiers on function PARAMETERS (`void f(u64 __seg_fs *p)`) and multi-level positions (`T * __seg_fs *`) | **C** apply_declaration_address_space handles decl-level only | glibc THREAD_* macros mostly cast, so not blocking |
+| 176 | FE-24 | P2 | `#error` message must be emitted verbatim (lccc macro-expands the token list: "96 must be multiple of 64" instead of "REGISTER_SAVE_AREA must be multiple of VEC_SIZE") | **M** dl-trampoline.h diagnostics | Diagnostics-quality only |
+| 177 | MS-10 | P1 | `CCC_VALIDATE_SSA` in CI for the regression corpus (watermark + duplicate-def, conventional-SSA aware post phi-elim) | **C** validator landed in passes/mod.rs + 3 backend hooks | Cheap: gate behind env in run_regression.py |
+| 178 | OP-35 | P2 | Post-phi cleanup Case-2 forwarding for Const sources into Value positions could MATERIALIZE the const into a fresh Copy placed at first use instead of refusing (keeps the copy-elimination win for `%fs:16`-style TLS bases) | **C** copy_prop.rs one_round_post_phi filter | Perf polish over the soundness fix |
+| 179 | MS-11 | P0 | glibc `make check` triage harness: run subdir test suites under the lccc-built libc with `test-wrapper`, classify {miscompile, unsupported-feature, environment} | **C** this file, session 55 | Next session's main task |
+
+## 10. Session 56 addenda (agent-audit + glibc runtime)
+
+| # | ID | Pri | Item | Evidence | Notes |
+|---|----|-----|------|----------|-------|
+| 180 | IS-29 | **P0** | Lower `__builtin_fma`/`__builtin_fmaf` (vfmadd at v3) and `__builtin_ia32_cvtpd2ps`; currently emitted as external calls | **M** libm.so link fails (ms178 patch math-use-builtins-fma.h) | Gate for libm.so + make check |
+| 181 | LK-23 | P1 | ldconfig `feof_unlocked` undefined | **M** glibc elf/others | same hidden_proto/export family; check libc_nonshared/static path |
+| 182 | LK-24 | **P0** | Externally-compiled PIE segfaults at startup against lccc-glibc (glibc's OWN utmpdump/sprof run fine) | **M** /tmp/hg2 SIGSEGV | crt/TLS-init triage with LD_DEBUG under our ld.so |
+| 183 | MS-12 | P1 | Audit remaining ~40 `phys_reg_name_32`/`typed_phys_reg_name` sites for XMM-homed operands (8 fixed on evidence this session); consider a debug_assert wrapper | **C** grep audit | loud unreachable!, not silent — fix on evidence |
+| 184 | LK-25 | P2 | -r output: spurious blank UND local symtab entry; host libc.so.6/libm NEEDED leak into our libc.so via -lgcc_s | **M** readelf | cosmetic + hygiene |
+
+Agent-patch policy record: Agent C's remat-globaladdr fixes accepted (reworked:
+TLS-before-GOT order, get_defining_instruction reuse); Agent B's bare-alloca
+accepted; Agent B's MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call
+`>0` REJECTED AGAIN — do not resubmit without per-workload A/B evidence.

@@ -377,12 +377,26 @@ fn select_inline_site(
         // For recursive callers, only inline tiny callees and always_inline callees.
         // Inlining larger callees into recursive functions multiplies the stack frame
         // increase by the recursion depth, easily causing stack overflow.
-        if caller_is_recursive && !is_tiny && !callee_data.is_always_inline {
+        // gnu_inline defs must also pass the recursive-caller guard: their
+        // body is the ONLY definition in this TU, so a skipped site becomes
+        // an undefined symbol in -nostdlib links (glibc rtld: the extern
+        // inline `free` wrapper called from the RECURSIVE free_slotinfo).
+        if caller_is_recursive
+            && !is_tiny
+            && !callee_data.is_always_inline
+            && !callee_data.is_gnu_inline_def
+        {
             continue;
         }
+        // gnu_inline caps: generous enough for glibc's header bodies
+        // (bsearch: ~35 insts, 8 blocks with a loop) but still bounded.
+        let is_gnu_inline_eligible = callee_data.is_gnu_inline_def
+            && callee_inst_count <= 128
+            && callee_data.blocks.len() <= 16;
         if is_tiny
             || (is_small && (!budget_exhausted || callee_data.is_always_inline))
             || is_static_inline_eligible
+            || is_gnu_inline_eligible
         {
             let use_relaxed = callee_data.is_always_inline || callee_data.exceeds_normal_limits;
             return Some((site.clone(), callee_inst_count, use_relaxed));
@@ -1540,6 +1554,7 @@ fn short_inst_name(inst: &Instruction) -> &'static str {
 }
 
 /// Information about a callee function eligible for inlining.
+#[derive(Clone)]
 struct CalleeData {
     blocks: Vec<BasicBlock>,
     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
@@ -1561,6 +1576,12 @@ struct CalleeData {
     /// same to match GCC behavior and enable critical optimizations (e.g.,
     /// constant propagation of shift amounts in ror32 used by blake2s).
     is_static_inline: bool,
+    /// GNU89 `extern inline __attribute__((gnu_inline))` definition: the body
+    /// exists ONLY for inlining — no out-of-line copy is emitted in this TU.
+    /// A call left behind resolves to an external symbol that may not exist
+    /// (glibc rtld links -nostdlib: `__bsearch` in intel_check_word was a
+    /// hard undefined-symbol error). Eligibility uses dedicated relaxed caps.
+    is_gnu_inline_def: bool,
     /// Whether this callee is a `static` (non-`inline`) function with exactly
     /// one call site in the whole module. Such callees are dead after inlining
     /// (net code shrink), so they are exempt from the caller-size caps and the
@@ -1902,9 +1923,23 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         // value anywhere (function-pointer table, alias, constructor, asm
         // template or "i"-constraint symbol); otherwise the outlined body
         // survives and the exemption must not apply.
-        let has_single_call_site = call_site_counts.get(&func.name).copied().unwrap_or(0) == 1;
+        // glibc hidden_proto: call sites are redirected to the
+        // __asm__("__GI_...") label while the body keeps its C name, so the
+        // call accounting and the value-reference check must consider both.
+        let asm_alias = module
+            .asm_labels
+            .get(&func.name)
+            .filter(|a| a.as_str() != func.name.as_str());
+        let total_calls = call_site_counts.get(&func.name).copied().unwrap_or(0)
+            + asm_alias
+                .map(|a| call_site_counts.get(a.as_str()).copied().unwrap_or(0))
+                .unwrap_or(0);
+        let has_single_call_site = total_calls == 1;
         let survives_via_reference = has_single_call_site
-            && function_referenced_as_value(&func.name, &value_referenced, &asm_templates);
+            && (function_referenced_as_value(&func.name, &value_referenced, &asm_templates)
+                || asm_alias.is_some_and(|a| {
+                    function_referenced_as_value(a, &value_referenced, &asm_templates)
+                }));
         let fits_single_call_site_static = func.is_static
             && !func.is_inline
             && !is_small_static
@@ -1987,7 +2022,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         ) || (func.is_static
             && !func.is_inline
             && has_loops
-            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count));
+            && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count))
+            // GNU89 `extern inline __attribute__((gnu_inline))` bodies exist
+            // ONLY for inlining (no out-of-line copy is emitted in this TU);
+            // a rejected site leaves a call to an external symbol that may
+            // not exist (glibc rtld __bsearch). Dedicated caps: big enough
+            // for glibc's header bodies, still bounded.
+            || (func.is_gnu_inline_def && inst_count <= 128 && func.blocks.len() <= 16);
         let fits_relaxed = inst_count <= MAX_ALWAYS_INLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_ALWAYS_INLINE_BLOCKS;
         // Single-call-site statics were already size-checked above against
@@ -2078,6 +2119,7 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 is_always_inline,
                 exceeds_normal_limits: exceeds_normal,
                 is_static_inline: func.is_static && func.is_inline,
+                is_gnu_inline_def: func.is_gnu_inline_def,
                 // Any static (non-inline) callee with a single call site is
                 // dead after inlining, so it is exempt from the soft caller-
                 // size cap and the per-caller budget in select_inline_site
@@ -2094,6 +2136,21 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 size_inline_cost: inst_count,
             },
         );
+        // Register the same body under its __asm__ label so call sites that
+        // carry the redirected name find the inline definition. Without this,
+        // glibc's hidden_proto pattern (body `__argz_next`, calls
+        // `__GI___argz_next`) left the gnu89 extern-inline body uninlined and
+        // the libc.so link failed with undefined `__GI___argz_next` /
+        // `__option_is_end` / `__option_is_short`.
+        if let Some(asm_name) = module.asm_labels.get(&func.name) {
+            if asm_name.as_str() != func.name.as_str() && !map.contains_key(asm_name.as_str()) {
+                let aliased = map
+                    .get(&func.name)
+                    .cloned()
+                    .expect("entry inserted just above");
+                map.insert(asm_name.clone(), aliased);
+            }
+        }
     }
 
     // Callee snapshots are captured before any function in this invocation is
@@ -2142,7 +2199,10 @@ fn is_mandatory_first_pass_callee(data: &CalleeData) -> bool {
                 static_inline_block_limit
             };
 
+    let is_gnu_inline_eligible =
+        data.is_gnu_inline_def && inst_count <= 128 && data.blocks.len() <= 16;
     data.is_always_inline || is_tiny || is_small || is_static_inline_eligible
+        || is_gnu_inline_eligible
 }
 
 /// Estimate a callee's instruction count after mandatory descendants expand.

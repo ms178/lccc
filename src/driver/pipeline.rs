@@ -126,6 +126,9 @@ pub struct Driver {
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required by the Linux kernel for Intel CET/IBT (Indirect Branch Tracking).
     pub(super) cf_protection_branch: bool,
+    /// GCC __CET__ macro value derived from -fcf-protection
+    /// (None = flag absent or =none; "1" branch, "2" return, "3" full).
+    pub(super) cf_protection_value: Option<&'static str>,
     /// Whether SSE is disabled (-mno-sse). When true, the compiler must not emit
     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
@@ -388,6 +391,7 @@ impl Driver {
             indirect_branch_thunk: false,
             patchable_function_entry: None,
             cf_protection_branch: false,
+            cf_protection_value: None,
             no_sse: false,
             skip_rax_setup: false,
             no_x87: false,
@@ -1044,6 +1048,8 @@ impl Driver {
         // PIE and full PIC both define __PIC__; only PIE defines __PIE__.
         // Kernel `-fno-pic` clears both before RIP_REL_REF inline asm expands.
         preprocessor.set_pic(self.pic || self.pie || self.shared_lib);
+        // __CET__ mirrors -fcf-protection exactly (GCC never predefines it).
+        preprocessor.set_cet(self.cf_protection_value);
         preprocessor.set_pie(self.pie && !self.pic && !self.shared_lib);
         // Set SSE/SSE2/MMX predefined macros for x86 targets.
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
@@ -1582,8 +1588,14 @@ impl Driver {
         }
 
         // Lower SSA phi nodes to copies before codegen
+        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+            crate::passes::validate_unique_defs(&module, "backend:pre-eliminate_phis");
+        }
         let t7 = std::time::Instant::now();
         eliminate_phis(&mut module);
+        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+            crate::passes::validate_unique_defs(&module, "backend:eliminate_phis");
+        }
         if time_phases {
             eprintln!("[TIME] phi elimination: {:.3}s", t7.elapsed().as_secs_f64());
         }
@@ -1801,6 +1813,9 @@ impl Driver {
         {}
 
         // Debug: dump IR labels before codegen
+        if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+            crate::passes::validate_unique_defs(&module, "backend:pre-codegen");
+        }
         if std::env::var("LCCC_DUMP_PRECG").is_ok() {
             eprintln!("==== IR immediately before codegen ====");
             eprintln!("{:#?}", module);

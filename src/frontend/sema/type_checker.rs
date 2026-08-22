@@ -946,6 +946,7 @@ impl<'a> ExprTypeChecker<'a> {
             | "__builtin_memset"
             | "__builtin_alloca"
             | "__builtin_alloca_with_align"
+            | "alloca"
             | "__builtin_frame_address"
             | "__builtin_return_address"
             | "__builtin_thread_pointer" => {

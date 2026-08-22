@@ -401,6 +401,19 @@ impl SemanticAnalyzer {
                         &declarator.derived,
                     )
                 };
+                // Mirror lowering's __attribute__((vector_size(N))) handling:
+                // without the Vector wrap, sema records `typedef float xmm_t
+                // __attribute__((vector_size(16)))` as a plain 4-byte float,
+                // and every struct layout computed through sema's
+                // TypeConvertContext (cached in the SHARED type_context
+                // layout table) is wrong. glibc's La_x86_64_regs then put
+                // lr_vector at offset 96 instead of 192 in the gen-as-const
+                // pipeline, and elf/dl-trampoline.S failed its
+                // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
+                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
+                    Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
+                    None => resolved_ctype,
+                };
                 self.result
                     .type_context
                     .typedefs
@@ -877,9 +890,29 @@ impl SemanticAnalyzer {
                 self.analyze_expr(expr);
                 if let Some(expected) = self.current_return_type.clone() {
                     if matches!(expected, CType::Void) {
-                        self.diagnostics
-                            .borrow_mut()
-                            .error("return with a value, in function returning void", *span);
+                        // GCC compatibility: `return void_expr;` in a void
+                        // function is accepted silently in GNU mode (glibc
+                        // uses `return __set_errno(...)`/`return helper();`
+                        // shims throughout malloc.c, qsort.c, libio).
+                        // Returning a real VALUE from a void function is a
+                        // default-on warning in GCC, not an error; the value
+                        // is discarded.
+                        let checker = super::type_checker::ExprTypeChecker {
+                            symbols: &self.symbol_table,
+                            types: &self.result.type_context,
+                            functions: &self.result.functions,
+                            expr_types: Some(&self.result.expr_types),
+                        };
+                        let expr_is_void = matches!(
+                            checker.infer_expr_ctype(expr),
+                            Some(CType::Void) | None
+                        );
+                        if !expr_is_void {
+                            self.diagnostics.borrow_mut().warning(
+                                "'return' with a value, in function returning void",
+                                *span,
+                            );
+                        }
                     } else {
                         let checker = super::type_checker::ExprTypeChecker {
                             symbols: &self.symbol_table,
@@ -1467,18 +1500,40 @@ impl SemanticAnalyzer {
                 // Validate real prototypes. Empty parameter lists are kept
                 // permissive because sema also carries legacy `f()` and fallback
                 // libc declarations with unspecified arguments.
+                //
+                // C scoping: a local object (parameter or variable) SHADOWS a
+                // file-scope function of the same name. glibc nss_module.c
+                // declares `void (*bind)(...)` as a parameter while
+                // <sys/socket.h> declares the 3-argument socket bind();
+                // resolving the call against the global prototype rejected
+                // the 1-argument call through the parameter. When shadowed,
+                // fall through to the function-pointer signature path, which
+                // resolves the identifier through the scoped symbol table.
+                let shadowed_by_object = if let Expr::Identifier(name, _) = callee.as_ref() {
+                    self.symbol_table
+                        .lookup(name)
+                        .map(|s| !matches!(&s.ty, CType::Function(_)))
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
                 let direct = if let Expr::Identifier(name, _) = callee.as_ref() {
-                    self.result
-                        .functions
-                        .get(name)
-                        .filter(|fi| !fi.params.is_empty())
-                        .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
+                    if shadowed_by_object {
+                        None
+                    } else {
+                        self.result
+                            .functions
+                            .get(name)
+                            .filter(|fi| !fi.params.is_empty())
+                            .map(|fi| (name.clone(), fi.params.clone(), fi.variadic))
+                    }
                 } else {
                     None
                 };
                 if let Some((name, params, variadic)) = direct {
                     self.check_call_arguments(&name, args, &params, variadic, expr.span());
-                } else if !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
+                } else if shadowed_by_object
+                    || !matches!(callee.as_ref(), Expr::Identifier(name, _) if self.result.functions.contains_key(name))
                 {
                     let checker = super::type_checker::ExprTypeChecker {
                         symbols: &self.symbol_table,

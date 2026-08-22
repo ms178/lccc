@@ -165,7 +165,10 @@ impl X86Codegen {
 
         // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
         // Safe because %al is part of %rax, never overlaps callee-saved registers.
-        if let Some(d_reg) = self.dest_reg(dest) {
+        if let Some(d_reg) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name_32(d_reg);
                 self.state
@@ -262,7 +265,13 @@ impl X86Codegen {
         // Stage the BASE for the r/m operand of BT.
         let base_reg: String = match base {
             Operand::Value(v) => {
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                // XMM-homed base (bit-punned float word): no GPR names;
+                // stage through the accumulator, which handles xmm->GPR.
+                if let Some(&reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
                     if use_32bit {
                         format!("%{}", super::emit::phys_reg_name_32(reg))
                     } else {
@@ -301,7 +310,11 @@ impl X86Codegen {
             // The index register: prefer its home when it does not alias the
             // staged base; otherwise stage through %rcx.
             let idx_reg: String = match index {
-                Operand::Value(v) => match self.reg_assignments.get(&v.0) {
+                Operand::Value(v) => match self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
                     Some(&reg) => {
                         let name = if use_32bit {
                             format!("%{}", super::emit::phys_reg_name_32(reg))
@@ -686,7 +699,10 @@ impl X86Codegen {
     ) {
         // legacy-compat path (debugging): the legacy emission order.
         if std::env::var("CCC_V9_SELECT").is_ok() {
-            if let Some(d_reg) = self.dest_reg(dest) {
+            if let Some(d_reg) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
                 if !is_xmm_reg(d_reg) {
                     let d_name = phys_reg_name(d_reg);
                     self.operand_to_rax(cond);
@@ -730,7 +746,10 @@ impl X86Codegen {
         // the chosen one needs to be loaded — no test/cmov/branch at all.
         if let Operand::Const(c) = cond {
             let chosen = if c.is_zero() { false_val } else { true_val };
-            if let Some(d_reg) = self.dest_reg(dest) {
+            if let Some(d_reg) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
                 if !is_xmm_reg(d_reg) {
                     self.operand_to_callee_reg(chosen, d_reg);
                     self.state.reg_cache.invalidate_acc();
@@ -774,7 +793,10 @@ impl X86Codegen {
         };
 
         // Register-direct: when dest has a register, operate directly on it.
-        if let Some(d_reg) = self.dest_reg(dest) {
+        if let Some(d_reg) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
                 if tested_in_place {

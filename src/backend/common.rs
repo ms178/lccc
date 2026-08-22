@@ -252,20 +252,73 @@ pub fn link_with_args(
                 for f in object_files {
                     inputs.push((f.to_string(), false));
                 }
+                // Track --whole-archive / --no-whole-archive state in
+                // command-line order (both bare and -Wl, spellings). glibc
+                // builds libc_pic.os with
+                //   `$(CC) -r -Wl,--whole-archive libc_pic.a -o libc_pic.os`
+                // — with the flag ignored, the archive was loaded
+                // *selectively* against an empty undefined-symbol set, so
+                // nothing was pulled in and objcopy failed with "input file
+                // has no sections".
+                let mut whole_archive = false;
                 for a in user_args {
-                    if !a.starts_with('-')
-                        && std::path::Path::new(a).exists()
-                        && (a.ends_with(".o") || a.ends_with(".a"))
-                    {
-                        inputs.push((a.clone(), false));
+                    match a.as_str() {
+                        "--whole-archive" | "-Wl,--whole-archive" => whole_archive = true,
+                        "--no-whole-archive" | "-Wl,--no-whole-archive" => whole_archive = false,
+                        _ if !a.starts_with('-')
+                            && std::path::Path::new(a).exists()
+                            // glibc object suffixes: .o (static), .os (PIC),
+                            // .oS (static-PIC for libc_nonshared.a). The
+                            // librtld.map link passes dl-allobjs.os — with
+                            // only .o/.a accepted it was silently dropped and
+                            // the selective libc_pic.a search resolved
+                            // nothing.
+                            && (a.ends_with(".o")
+                                || a.ends_with(".os")
+                                || a.ends_with(".oS")
+                                || a.ends_with(".a")) =>
+                        {
+                            inputs.push((a.clone(), whole_archive && a.ends_with(".a")));
+                        }
+                        _ => {}
                     }
                 }
                 let mut objects = Vec::new();
                 crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects)?;
-                return crate::backend::x86::linker::emit_rel::link_relocatable(
-                    &objects,
-                    output_path,
-                );
+                crate::backend::x86::linker::emit_rel::link_relocatable(&objects, output_path)?;
+                // `-Map FILE` (any spelling): glibc's elf/Makefile builds
+                // librtld.map with `$(reloc-link) ... -Wl,-Map,$@T` and then
+                // scrapes lines of the form `<path>/libc_pic.a(member.os)` to
+                // learn which archive members the rtld link pulled in. Emit
+                // one line per loaded object (archive members already carry
+                // their GNU `archive(member)` source name), matching the
+                // `^[0-9a-f ]*PATH(MEMBER) *.*$` sed pattern.
+                let mut map_path: Option<String> = None;
+                let mut it = user_args.iter().peekable();
+                while let Some(a) = it.next() {
+                    if let Some(v) = a.strip_prefix("-Wl,-Map,") {
+                        map_path = Some(v.to_string());
+                    } else if let Some(v) = a.strip_prefix("-Wl,-Map=") {
+                        map_path = Some(v.to_string());
+                    } else if let Some(v) = a.strip_prefix("-Map=") {
+                        map_path = Some(v.to_string());
+                    } else if a == "-Map" {
+                        if let Some(v) = it.peek() {
+                            map_path = Some((*v).clone());
+                        }
+                    }
+                }
+                if let Some(map_path) = map_path {
+                    let mut map = String::from("Archive member included in relocatable link\n\n");
+                    for obj in &objects {
+                        map.push_str(&obj.source_name);
+                        map.push('\n');
+                    }
+                    std::fs::write(&map_path, map).map_err(|e| {
+                        format!("cannot write link map '{}': {}", map_path, e)
+                    })?;
+                }
+                return Ok(());
             }
             return Err("Relocatable linking (-r) requires the gcc_linker feature. \
                        Rebuild with: cargo build --features gcc_linker"

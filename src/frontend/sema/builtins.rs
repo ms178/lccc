@@ -199,6 +199,14 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_alloca_with_align",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::Alloca),
     );
+    // Bare `alloca` is a builtin in GNU modes, exactly like GCC: code that
+    // calls it without including <alloca.h> (30+ GCC torture execute tests)
+    // must get the DynAlloca lowering, not an undefined external call.
+    // A user-defined function body named `alloca` still overrides this via
+    // the is_defined check in try_lower_builtin_call. glibc is unaffected
+    // (<alloca.h> #defines alloca to __builtin_alloca).
+    // Credit: Agent B torture triage.
+    m.insert("alloca", BuiltinInfo::intrinsic(BuiltinIntrinsic::Alloca));
 
     // Return address / frame address / thread pointer
     m.insert(

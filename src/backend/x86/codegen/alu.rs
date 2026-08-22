@@ -108,7 +108,10 @@ impl X86Codegen {
             return;
         }
 
-        if let Some(reg) = self.dest_reg(dest) {
+        if let Some(reg) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
             let name = if narrow {
                 super::emit::phys_reg_name_32(reg)
             } else {
@@ -215,7 +218,15 @@ impl X86Codegen {
         // not matter whether the base and index source registers alias.
         match base {
             Operand::Value(v) => {
-                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                // An XMM-homed base (bit-punned float word) has no GPR
+                // sub-register names; route it through the accumulator arm
+                // below, whose operand_to_rax performs the xmm->GPR movq
+                // (glibc s_nextupf: BitTest on GET_FLOAT_WORD's value).
+                if let Some(&reg) = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .filter(|r| !super::emit::is_xmm_reg(**r))
+                {
                     let src64 = super::emit::phys_reg_name(reg);
                     if src64 != dest64 {
                         if use_32bit {
@@ -319,8 +330,16 @@ impl X86Codegen {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         let is_unsigned = ty.is_unsigned();
 
-        // Register-direct path
-        if let Some(dest_phys) = self.dest_reg(dest) {
+        // Register-direct path. An XMM-homed dest (integer value the RA
+        // parked in an XMM register: bit-punned float words) has no GPR
+        // sub-register names — emit_alu_reg_direct would hit
+        // phys_reg_name_32's unreachable!(). The accumulator path below
+        // handles XMM homes on both loads (operand_to_rax) and the final
+        // store (store_rax_to).
+        if let Some(dest_phys) = self
+            .dest_reg(dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
             let is_simple_alu = matches!(
                 op,
                 IrBinOp::Add
@@ -427,7 +446,10 @@ impl X86Codegen {
                         if dest_slot.0 == lhs_slot.0 {
                             let sref = self.slot_ref(dest_slot.0);
                             // Try register source: op %reg, mem
-                            if let Some(rhs_phys) = self.operand_reg(rhs) {
+                            if let Some(rhs_phys) = self
+                                .operand_reg(rhs)
+                                .filter(|r| !super::emit::is_xmm_reg(*r))
+                            {
                                 if use_32bit {
                                     let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
                                     self.state.emit_fmt(format_args!(
@@ -766,7 +788,10 @@ impl X86Codegen {
     /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
     fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
         // If add_dest is register-allocated, add %eax to it directly.
-        if let Some(dest_phys) = self.dest_reg(add_dest) {
+        if let Some(dest_phys) = self
+            .dest_reg(add_dest)
+            .filter(|r| !super::emit::is_xmm_reg(*r))
+        {
             // Ensure acc is in the dest register first
             self.operand_to_callee_reg(acc, dest_phys);
             if use_32bit {

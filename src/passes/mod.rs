@@ -55,11 +55,79 @@ use crate::common::fx_hash::FxHashSet;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 
+/// CCC_VALIDATE_SSA=1 debug validator: every Value id must have exactly one
+/// defining instruction, InlineAsm outputs and Phi dests included, and every
+/// def must be strictly below the function's `next_value_id` watermark.
+///
+/// A stale watermark is the *origin* of duplicate-def bugs: the offending
+/// pass clones or synthesizes instructions with ids at/above `next_value_id`,
+/// and a later pass that allocates "fresh" ids from the watermark silently
+/// collides with them. The RA then computes one merged live range for two
+/// unrelated values and the backend's no-home hard gate fires far from the
+/// cause (glibc __libc_start_main_impl: Cast and GetElementPtr both defining
+/// v356). Panics at the FIRST violating phase so the bisection is exact.
+///
+/// `strict`: before phi elimination the IR is SSA and every duplicate def is
+/// a violation. After `eliminate_phis` the IR is *conventional* SSA — a phi
+/// home is legally assigned by one `Copy` per predecessor edge — so
+/// duplicates are tolerated iff every def of that id is a `Copy`.
+pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
+    let strict = !tag.starts_with("backend:eliminate_phis") && !tag.starts_with("backend:post-phi")
+        && !tag.starts_with("backend:pre-codegen");
+    for func in &module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let mut def_of: crate::common::fx_hash::FxHashMap<u32, (String, bool)> =
+            crate::common::fx_hash::FxHashMap::default();
+        let mut max_def: u32 = 0;
+        let mut check = |id: u32, what: String, is_copy: bool| {
+            max_def = max_def.max(id);
+            if let Some((prev, prev_copy)) = def_of.insert(id, (what.clone(), is_copy)) {
+                if strict || !(is_copy && prev_copy) {
+                    panic!(
+                        "SSA VIOLATION after phase '{}': value v{} in function '{}' \
+                         defined twice:\n  first : {}\n  second: {}",
+                        tag, id, func.name, prev, what
+                    );
+                }
+            }
+        };
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    let is_copy = matches!(inst, Instruction::Copy { .. });
+                    check(d.0, format!("block {} {:?}", bi, inst), is_copy);
+                }
+                // NOTE: InlineAsm `outputs` carry value_POINTERS (addresses
+                // the asm stores through) — they are uses, not defs, and may
+                // legitimately repeat a GEP dest. They are deliberately not
+                // checked here.
+            }
+        }
+        if max_def >= func.next_value_id {
+            panic!(
+                "SSA WATERMARK VIOLATION after phase '{}': function '{}' has \
+                 def v{} >= next_value_id {} — the phase that created it did \
+                 not bump the watermark; later passes will allocate colliding \
+                 'fresh' ids",
+                tag, func.name, max_def, func.next_value_id
+            );
+        }
+    }
+}
+
 /// Debug hook: dump only functions whose name contains one of the comma-
 /// separated substrings in `CCC_DUMP_FUNC` (empty = dump all), in the same
 /// compact per-block format as the backend's CCC_DUMP_IR.
 /// Environment-gated; never changes codegen.
 fn dump_ir_filtered(module: &IrModule, tag: &str) {
+    if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
+        validate_unique_defs(module, tag);
+    }
+    if std::env::var_os("CCC_DUMP_EACH_PASS").is_none() {
+        return;
+    }
     use std::fmt::Write as _;
     let filters: Vec<String> = std::env::var("CCC_DUMP_FUNC")
         .unwrap_or_default()
@@ -343,7 +411,8 @@ impl DisabledPasses {
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
 fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, size_profile: bool) {
-    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
+    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+        || std::env::var("CCC_VALIDATE_SSA").is_ok();
     macro_rules! iphase_dump {
         ($name:expr) => {
             if dump_pre {
@@ -394,7 +463,10 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
             inline::run(module);
         }
     }
-    if std::env::var("CCC_DUMP_IR").is_ok() || std::env::var("CCC_DUMP_EACH_PASS").is_ok() {
+    if std::env::var("CCC_DUMP_IR").is_ok()
+        || std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+        || std::env::var("CCC_VALIDATE_SSA").is_ok()
+    {
         dump_ir_filtered(module, "pre-loop after inliner");
     }
 
@@ -513,7 +585,8 @@ pub(crate) fn run_passes(
 
     let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
     // -fdump-tree-all equivalent: dump the module after every pass.
-    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok();
+    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
+        || std::env::var("CCC_VALIDATE_SSA").is_ok();
 
     // -O0: preserve the alloca-based IR and skip the optimizer completely.
     // Inline asm symbol resolution is not an optimization; it is required for
