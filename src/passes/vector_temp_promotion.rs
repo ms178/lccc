@@ -109,6 +109,14 @@ fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
 fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
     use IntrinsicOp as O;
 
+    // Load256 is a valid full-width producer, but its source carries a 32-byte
+    // alignment contract.  It must not become an arbitrary forwarded memory
+    // operand (nor make alignment relaxation believe the source is unaligned-
+    // safe) merely because the current backend happens to stage it through a
+    // register.
+    if op == O::Load256 {
+        return None;
+    }
     if let Some(width) = direct_vector_load_width(op) {
         return (index == 0).then_some(width);
     }
@@ -234,6 +242,9 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
 /// vector data.
 fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usize> {
     use IntrinsicOp as O;
+    if op == O::Load256 && index == 0 {
+        return Some(32);
+    }
     if pointer_vector_arg_width(op, index).is_some() {
         return Some(0);
     }
@@ -276,7 +287,6 @@ fn intrinsic_dest_required_alignment(
         O::Storedqu
         | O::Storeldi128
         | O::Storeu256
-        | O::Store256
         | O::StoreuPs256
         | O::StoreuPd256
         | O::Movnti
@@ -286,12 +296,51 @@ fn intrinsic_dest_required_alignment(
         | O::FmaF64x4
         | O::FmaF64x4Hoisted
         | O::FmaF64x4SIB => Some(0),
+        // The aligned AVX store contract must survive even though today's
+        // backend happens to use its generic unaligned destination helper.
+        O::Store256 => Some(32),
         // x86 non-temporal vector stores fault unless the destination is
         // 16-byte aligned.  Alignment 16 is still a direct stack slot and
         // therefore avoids the expensive runtime alignment sequence.
         O::Movntdq | O::Movntpd => Some(16),
         _ => None,
     }
+}
+
+/// A vector result width is not by itself a proof that `dest_ptr` is a
+/// write-only full result.  These intrinsics read the old destination (or do
+/// not materialize the advertised result there), so redirecting them to the
+/// memcpy destination changes the value being computed.
+fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
+    !matches!(
+        op,
+        IntrinsicOp::FmaF64x2
+            | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::FmaF64x4
+            | IntrinsicOp::FmaF64x4Hoisted
+            | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::BroadcastLoadF64
+            | IntrinsicOp::Storedqu
+            | IntrinsicOp::Storeldi128
+            | IntrinsicOp::Storeu256
+            | IntrinsicOp::Store256
+            | IntrinsicOp::StoreuPs256
+            | IntrinsicOp::StoreuPd256
+            | IntrinsicOp::Movntdq
+            | IntrinsicOp::Movntpd
+            | IntrinsicOp::VecStoreI64x2
+    )
+}
+
+fn intrinsic_dest_reads_old_value(op: IntrinsicOp) -> bool {
+    matches!(
+        op,
+        IntrinsicOp::FmaF64x2
+            | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::FmaF64x4
+            | IntrinsicOp::FmaF64x4Hoisted
+            | IntrinsicOp::FmaF64x4SIB
+    )
 }
 
 fn instruction_uses_any(inst: &Instruction, values: &FxHashSet<u32>) -> bool {
@@ -587,6 +636,7 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                         continue;
                     };
                     if op.vector_result_width().map(|width| width as usize) == Some(info.size)
+                        && intrinsic_overwrites_full_result(*op)
                         && !info.volatile
                         && !info.semantic_volatile
                     {
@@ -672,34 +722,92 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointerRoot {
     Alloca(u32),
-    // Distinct global symbol names are not an alias proof because ELF aliases
-    // can bind multiple names to one object.
     Global,
     Param { index: usize, noalias: bool },
 }
 
-fn common_root<'a>(
-    operands: impl IntoIterator<Item = &'a Operand>,
-    roots: &FxHashMap<u32, PointerRoot>,
-) -> Option<PointerRoot> {
-    let mut common = None;
-    for operand in operands {
-        let Operand::Value(value) = operand else {
-            return None;
-        };
-        let root = *roots.get(&value.0)?;
-        if common.is_some_and(|old| old != root) {
-            return None;
-        }
-        common = Some(root);
-    }
-    common
+enum RootRule {
+    Unary { dest: u32, source: u32 },
+    Merge { dest: u32, sources: Vec<u32> },
+    Offset {
+        dest: u32,
+        lhs: Option<u32>,
+        rhs: Option<u32>,
+        subtract: bool,
+    },
 }
 
-/// Compute exact roots only through operations that preserve pointer object
-/// identity.  Unknown roots may alias anything.
-fn pointer_roots(func: &IrFunction) -> FxHashMap<u32, PointerRoot> {
-    let mut roots = FxHashMap::with_capacity_and_hasher(map_capacity(func), Default::default());
+/// Iterative Kosaraju decomposition used to recognize loop-carried pointer
+/// phis without recursion or optimistic alias assumptions.
+fn strongly_connected_components(edges: &[Vec<usize>]) -> Vec<usize> {
+    let mut visited = vec![false; edges.len()];
+    let mut order = Vec::with_capacity(edges.len());
+    for start in 0..edges.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, next_edge)) = stack.last_mut() {
+            if *next_edge < edges[*node].len() {
+                let successor = edges[*node][*next_edge];
+                *next_edge += 1;
+                if !visited[successor] {
+                    visited[successor] = true;
+                    stack.push((successor, 0));
+                }
+            } else {
+                order.push(*node);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut reverse = vec![Vec::new(); edges.len()];
+    for (node, successors) in edges.iter().enumerate() {
+        for &successor in successors {
+            reverse[successor].push(node);
+        }
+    }
+    let mut component = vec![usize::MAX; edges.len()];
+    let mut next_component = 0usize;
+    for &start in order.iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        component[start] = next_component;
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for &predecessor in &reverse[node] {
+                if component[predecessor] == usize::MAX {
+                    component[predecessor] = next_component;
+                    stack.push(predecessor);
+                }
+            }
+        }
+        next_component += 1;
+    }
+    component
+}
+
+struct PointerRootAnalysis {
+    roots: FxHashMap<u32, PointerRoot>,
+    /// Values whose pointer depends on a loop-carried pointer recurrence.
+    recurrence_derived: FxHashSet<u32>,
+}
+
+/// Compute object roots with a dependency worklist.  The SCC decomposition is
+/// O(V+E) and the worklist fires each rule at most once per known source, so
+/// the total cost is O(V + Σ rule arity²) — for the small-arities found in
+/// real IR (phi width, select, offset) this is linear in practice and it
+/// never degrades into the repeated full-function fixpoint scan.  Loop phis
+/// are handled through the single-seed cycle shortcut; multi-seed pointer
+/// cycles stay unknown.
+fn pointer_root_analysis(func: &IrFunction) -> PointerRootAnalysis {
+    let estimate = map_capacity(func);
+    let mut roots = FxHashMap::with_capacity_and_hasher(estimate, Default::default());
+    let mut rules = Vec::new();
+
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -722,94 +830,253 @@ fn pointer_roots(func: &IrFunction) -> FxHashMap<u32, PointerRoot> {
                         },
                     );
                 }
+                Instruction::GetElementPtr { dest, base, .. } => rules.push(RootRule::Unary {
+                    dest: dest.0,
+                    source: base.0,
+                }),
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Value(source),
+                }
+                | Instruction::Cast {
+                    dest,
+                    src: Operand::Value(source),
+                    ..
+                } => rules.push(RootRule::Unary {
+                    dest: dest.0,
+                    source: source.0,
+                }),
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ..
+                } if matches!(
+                    op,
+                    crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub
+                ) => rules.push(RootRule::Offset {
+                    dest: dest.0,
+                    lhs: match lhs {
+                        Operand::Value(value) => Some(value.0),
+                        Operand::Const(_) => None,
+                    },
+                    rhs: match rhs {
+                        Operand::Value(value) => Some(value.0),
+                        Operand::Const(_) => None,
+                    },
+                    subtract: matches!(op, crate::ir::reexports::IrBinOp::Sub),
+                }),
+                Instruction::Select {
+                    dest,
+                    true_val: Operand::Value(lhs),
+                    false_val: Operand::Value(rhs),
+                    ty: IrType::Ptr,
+                    ..
+                } => rules.push(RootRule::Merge {
+                    dest: dest.0,
+                    sources: vec![lhs.0, rhs.0],
+                }),
+                Instruction::Phi {
+                    dest,
+                    incoming,
+                    ty: IrType::Ptr,
+                } if incoming.iter().all(|(op, _)| matches!(op, Operand::Value(_))) => {
+                    rules.push(RootRule::Merge {
+                        dest: dest.0,
+                        sources: incoming
+                            .iter()
+                            .filter_map(|(op, _)| match op {
+                                Operand::Value(value) => Some(value.0),
+                                Operand::Const(_) => None,
+                            })
+                            .collect(),
+                    });
+                }
                 _ => {}
             }
         }
     }
 
-    loop {
-        let mut changed = false;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                let derived = match inst {
-                    Instruction::GetElementPtr { dest, base, .. } => {
-                        roots.get(&base.0).copied().map(|root| (dest.0, root))
-                    }
-                    Instruction::Copy {
-                        dest,
-                        src: Operand::Value(source),
-                    } => roots.get(&source.0).copied().map(|root| (dest.0, root)),
-                    Instruction::Cast {
-                        dest,
-                        src: Operand::Value(source),
-                        from_ty: IrType::Ptr,
-                        to_ty: IrType::Ptr,
-                    } => roots.get(&source.0).copied().map(|root| (dest.0, root)),
-                    // Lowering represents pointer arithmetic as integer-width
-                    // Add/Sub after the base pointer has entered IR.  In a
-                    // defined C program, adding an integer offset preserves the
-                    // base object; adding two pointers is not valid C.  Require
-                    // exactly one known root so pointer differences and mixed
-                    // roots never become an alias proof.
-                    Instruction::BinOp {
-                        dest,
-                        op: crate::ir::reexports::IrBinOp::Add,
-                        lhs,
-                        rhs,
-                        ..
-                    } => match (lhs, rhs) {
-                        (Operand::Value(lhs), Operand::Value(rhs)) => {
-                            match (roots.get(&lhs.0), roots.get(&rhs.0)) {
-                                (Some(root), None) | (None, Some(root)) => {
-                                    Some((dest.0, *root))
-                                }
-                                _ => None,
+    let rule_sources: Vec<Vec<u32>> = rules
+        .iter()
+        .map(|rule| match rule {
+            RootRule::Unary { source, .. } => vec![*source],
+            RootRule::Merge { sources, .. } => sources.clone(),
+            RootRule::Offset { lhs, rhs, .. } => [*lhs, *rhs].into_iter().flatten().collect(),
+        })
+        .collect();
+    let rule_dest = |rule: &RootRule| match rule {
+        RootRule::Unary { dest, .. }
+        | RootRule::Merge { dest, .. }
+        | RootRule::Offset { dest, .. } => *dest,
+    };
+
+    // Collapse pointer-recurrence SCCs conceptually.  A component with exactly
+    // one external dependency has a unique seed (for example
+    // `p = phi(param, p + 64)`) and may use that seed before its backedge root
+    // has been materialized.  Components with multiple external dependencies
+    // remain unknown, avoiding the unsound optimistic-phi shortcut.
+    //
+    // Dense renumbering first: `func.max_value_id()` is the MODULE-wide
+    // counter, so sizing the adjacency/component arrays by it would allocate
+    // per-function arrays proportional to the whole TU (a function late in a
+    // large file pays megabytes for a handful of values).  Collect exactly
+    // the ids the rules mention and map them to a dense range; only rule
+    // dests/sources are ever indexed.
+    let mut dense_ids: Vec<u32> = rules
+        .iter()
+        .flat_map(|rule| {
+            let mut ids: Vec<u32> = Vec::new();
+            ids.push(rule_dest(rule));
+            match rule {
+                RootRule::Unary { source, .. } => ids.push(*source),
+                RootRule::Merge { sources, .. } => ids.extend(sources.iter().copied()),
+                RootRule::Offset { lhs, rhs, .. } => {
+                    ids.extend([*lhs, *rhs].into_iter().flatten());
+                }
+            }
+            ids
+        })
+        .collect();
+    dense_ids.sort_unstable();
+    dense_ids.dedup();
+    let dense: FxHashMap<u32, usize> = dense_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| (id, index))
+        .collect();
+
+    let mut edges = vec![Vec::new(); dense_ids.len()];
+    for (rule, sources) in rules.iter().zip(&rule_sources) {
+        let dest_index = dense[&rule_dest(rule)];
+        edges[dest_index].extend(sources.iter().map(|&value| dense[&value]));
+    }
+    let component = strongly_connected_components(&edges);
+    let component_count = component.iter().copied().max().unwrap_or(0) + 1;
+    let mut external: Vec<FxHashSet<u32>> = (0..component_count)
+        .map(|_| FxHashSet::with_capacity_and_hasher(2, Default::default()))
+        .collect();
+    for (rule, sources) in rules.iter().zip(&rule_sources) {
+        let dest_component = component[dense[&rule_dest(rule)]];
+        for &source in sources {
+            if component[dense[&source]] != dest_component {
+                external[dest_component].insert(source);
+            }
+        }
+    }
+    let cyclic_seed: Vec<Option<u32>> = external
+        .iter()
+        .map(|sources| {
+            if sources.len() == 1 {
+                sources.iter().next().copied()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut dependents: FxHashMap<u32, Vec<usize>> =
+        FxHashMap::with_capacity_and_hasher(rules.len(), Default::default());
+    for (rule_idx, sources) in rule_sources.iter().enumerate() {
+        for &source in sources {
+            dependents.entry(source).or_insert_with(Vec::new).push(rule_idx);
+        }
+    }
+
+    let mut worklist: Vec<u32> = roots.keys().copied().collect();
+    while let Some(known) = worklist.pop() {
+        let Some(affected) = dependents.get(&known) else {
+            continue;
+        };
+        for &rule_idx in affected {
+            let (dest, derived) = match &rules[rule_idx] {
+                RootRule::Unary { dest, source } => (*dest, roots.get(source).copied()),
+                RootRule::Merge { dest, sources } => {
+                    let dest_component = component[dense[dest]];
+                    let seed_is_known = cyclic_seed[dest_component]
+                        .and_then(|source| roots.get(&source))
+                        .is_some();
+                    let mut root: Option<&PointerRoot> = None;
+                    let mut valid = true;
+                    for source in sources {
+                        if let Some(next) = roots.get(source) {
+                            if root.is_some_and(|old| old != next) {
+                                valid = false;
+                                break;
                             }
+                            root = Some(next);
+                        } else if component[dense[source]] != dest_component || !seed_is_known {
+                            valid = false;
+                            break;
                         }
-                        (Operand::Value(value), Operand::Const(_))
-                        | (Operand::Const(_), Operand::Value(value)) => {
-                            roots.get(&value.0).copied().map(|root| (dest.0, root))
+                    }
+                    (*dest, valid.then(|| root.copied()).flatten())
+                }
+                RootRule::Offset {
+                    dest,
+                    lhs,
+                    rhs,
+                    subtract,
+                } => {
+                    let lhs_root = lhs.and_then(|value| roots.get(&value));
+                    let rhs_root = rhs.and_then(|value| roots.get(&value));
+                    let root = if *subtract {
+                        // Pointer - integer preserves the object root. Pointer
+                        // subtraction produces an integer and is deliberately
+                        // left unknown.
+                        lhs_root.filter(|_| rhs_root.is_none()).copied()
+                    } else {
+                        match (lhs_root, rhs_root) {
+                            (Some(root), None) | (None, Some(root)) => Some(*root),
+                            _ => None,
                         }
-                        _ => None,
-                    },
-                    Instruction::BinOp {
-                        dest,
-                        op: crate::ir::reexports::IrBinOp::Sub,
-                        lhs: Operand::Value(base),
-                        rhs,
-                        ..
-                    } if !matches!(rhs, Operand::Value(value) if roots.contains_key(&value.0)) => {
-                        roots.get(&base.0).copied().map(|root| (dest.0, root))
-                    }
-                    Instruction::Select {
-                        dest,
-                        true_val,
-                        false_val,
-                        ty: IrType::Ptr,
-                        ..
-                    } => common_root([true_val, false_val], &roots)
-                        .map(|root| (dest.0, root)),
-                    Instruction::Phi {
-                        dest,
-                        incoming,
-                        ty: IrType::Ptr,
-                    } => common_root(incoming.iter().map(|(operand, _)| operand), &roots)
-                        .map(|root| (dest.0, root)),
-                    _ => None,
-                };
-                if let Some((dest, root)) = derived {
-                    if let std::collections::hash_map::Entry::Vacant(entry) = roots.entry(dest) {
-                        entry.insert(root);
-                        changed = true;
-                    }
+                    };
+                    (*dest, root)
+                }
+            };
+            if !roots.contains_key(&dest) {
+                if let Some(root) = derived {
+                    roots.insert(dest, root);
+                    worklist.push(dest);
                 }
             }
         }
-        if !changed {
-            break;
+    }
+
+    let mut component_sizes = vec![0usize; component_count];
+    for &id in &component {
+        component_sizes[id] += 1;
+    }
+    let mut recurrence_derived = FxHashSet::with_capacity_and_hasher(
+        rules.len().min(32),
+        Default::default(),
+    );
+    let mut recurrence_work = Vec::new();
+    for (dense_index, successors) in edges.iter().enumerate() {
+        let id = component[dense_index];
+        if component_sizes[id] > 1 || successors.contains(&dense_index) {
+            let value = dense_ids[dense_index];
+            if recurrence_derived.insert(value) {
+                recurrence_work.push(value);
+            }
         }
     }
-    roots
+    while let Some(value) = recurrence_work.pop() {
+        if let Some(affected) = dependents.get(&value) {
+            for &rule_idx in affected {
+                let dest = rule_dest(&rules[rule_idx]);
+                if recurrence_derived.insert(dest) {
+                    recurrence_work.push(dest);
+                }
+            }
+        }
+    }
+
+    PointerRootAnalysis {
+        roots,
+        recurrence_derived,
+    }
 }
 
 fn roots_proven_distinct(lhs: PointerRoot, rhs: PointerRoot) -> bool {
@@ -827,6 +1094,7 @@ fn roots_proven_distinct(lhs: PointerRoot, rhs: PointerRoot) -> bool {
         (PointerRoot::Global, PointerRoot::Global) => false,
     }
 }
+
 
 struct LocalAliasFacts {
     /// Vector-sized allocas whose address cannot be recovered through memory or
@@ -978,7 +1246,9 @@ fn invalidate_for_value_write(
             // symbol there, a load result is unknown), so those must
             // invalidate the forward — otherwise a promoted consumer
             // re-reads the address after an intervening store and observes
-            // the wrong value.
+            // the wrong value.  (Audit revision: an unconditional `false`
+            // would be sound but strictly coarser; the alloca-confined
+            // exemption carries a symbolic-object proof for the WRITE side.)
             Operand::Const(_) => matches!(write_root, Some(PointerRoot::Alloca(_))),
         }
     });
@@ -1104,15 +1374,18 @@ fn single_read_sites(
         for (instruction_idx, inst) in block.instructions.iter().enumerate() {
             let site = (block_idx, instruction_idx);
             match inst {
-                // A direct load writes dest_ptr; only its source arguments read
-                // memory/value state.  Every other dest_ptr is conservatively
-                // treated as a use because some intrinsics are read-modify-write.
+                // Intrinsic arguments read their values.  A normal dest_ptr is
+                // a write and does not make an earlier load multi-use; only an
+                // audited read-modify-write destination reads old contents.
                 Instruction::Intrinsic {
                     op,
-                    dest_ptr: Some(_),
+                    dest_ptr: Some(destination),
                     args,
                     ..
-                } if direct_vector_load_width(*op).is_some() => {
+                } => {
+                    if intrinsic_dest_reads_old_value(*op) {
+                        record(destination.0, site);
+                    }
                     for arg in args {
                         if let Operand::Value(value) = arg {
                             record(value.0, site);
@@ -1153,7 +1426,10 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
     if allocas.is_empty() {
         return 0;
     }
-    let roots = pointer_roots(func);
+    let PointerRootAnalysis {
+        roots,
+        recurrence_derived,
+    } = pointer_root_analysis(func);
     let (_, conservative_graph) = build_alias_graphs(func);
     let local_aliases = local_alias_facts(func, &allocas, &conservative_graph);
     let read_sites = single_read_sites(func, &allocas);
@@ -1213,12 +1489,17 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                         && !operand_is_value(source, destination)
                         // The legacy SSE path benefits from forwarding its
                         // first Loaddqu consumer even when a later consumer
-                        // keeps the home live: doing so shortens GPR address
-                        // lifetimes in adler32-style unpack chains.  The AVX
-                        // backend instead keeps multi-use values in a vector
-                        // register; partial forwarding there caused an extra
-                        // reload and larger frame in measured intrinsic suites.
-                        && (op == IntrinsicOp::Loaddqu
+                        // keeps the home live (adler32 unpack chains).  Do not
+                        // extend that exception to a loop-carried source
+                        // pointer: keeping the recurrence address live delayed
+                        // its update and added instructions in the multi-def
+                        // vector corpus. Single-reader loads remain profitable.
+                        && ((op == IntrinsicOp::Loaddqu
+                            && !matches!(
+                                source,
+                                Operand::Value(value)
+                                    if recurrence_derived.contains(&value.0)
+                            ))
                             || read_sites
                                 .get(&destination.0)
                                 .is_some_and(|summary| !summary.multiple))
@@ -1334,12 +1615,13 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
         }
     }
 
+    let load_results: FxHashSet<u32> = load_result_slots.values().flatten().copied().collect();
     let mut remaining = FxHashMap::with_capacity_and_hasher(
         forwarded_slots.len(),
         Default::default(),
     );
     let mut remaining_results = FxHashMap::with_capacity_and_hasher(
-        load_result_slots.len(),
+        load_results.len(),
         Default::default(),
     );
     for block in &func.blocks {
@@ -1347,14 +1629,22 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
             match inst {
                 Instruction::Intrinsic {
                     op,
-                    dest_ptr: Some(_),
+                    dest_ptr: Some(destination),
                     args,
                     ..
-                } if direct_vector_load_width(*op).is_some() => {
+                } => {
+                    if intrinsic_dest_reads_old_value(*op)
+                        && forwarded_slots.contains(&destination.0)
+                    {
+                        *remaining.entry(destination.0).or_insert(0usize) += 1;
+                    }
                     for arg in args {
                         if let Operand::Value(value) = arg {
                             if forwarded_slots.contains(&value.0) {
                                 *remaining.entry(value.0).or_insert(0usize) += 1;
+                            }
+                            if load_results.contains(&value.0) {
+                                *remaining_results.entry(value.0).or_insert(0usize) += 1;
                             }
                         }
                     }
@@ -1363,7 +1653,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
                     if forwarded_slots.contains(&value) {
                         *remaining.entry(value).or_insert(0usize) += 1;
                     }
-                    if load_result_slots.values().any(|slot| *slot == Some(value)) {
+                    if load_results.contains(&value) {
                         *remaining_results.entry(value).or_insert(0usize) += 1;
                     }
                 }),
@@ -1373,7 +1663,7 @@ fn fuse_in_function(func: &mut IrFunction) -> usize {
             if forwarded_slots.contains(&value) {
                 *remaining.entry(value).or_insert(0usize) += 1;
             }
-            if load_result_slots.values().any(|slot| *slot == Some(value)) {
+            if load_results.contains(&value) {
                 *remaining_results.entry(value).or_insert(0usize) += 1;
             }
         });
@@ -1507,12 +1797,32 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
                 | Instruction::ParamRef { .. }
                 | Instruction::PgoCounterInc { .. } => {}
 
-                // Dereferencing the object does not expose its address and all
-                // scalar accesses remain naturally aligned at 16.
-                Instruction::Load { .. } => {}
-                Instruction::Store { val, .. } => {
-                    // ptr is safe; storing the pointer itself as data is not.
+                // Dereferencing does not expose the address, but relaxing a
+                // 32-byte object to the ordinary stack alignment must still
+                // preserve the natural requirement of wide scalar accesses on
+                // non-x86 targets.
+                Instruction::Load { ptr, ty, .. } => {
+                    if let Some(roots) = owners.get(&ptr.0) {
+                        for root in roots {
+                            if safe.contains(root) && ty.align() > 8 {
+                                let current = required_align.entry(*root).or_insert(0);
+                                *current = (*current).max(ty.align());
+                            }
+                        }
+                    }
+                }
+                Instruction::Store { val, ptr, ty, .. } => {
+                    // ptr is a dereference; storing the pointer itself as data
+                    // is an escape/address observation.
                     remove_operand_owners(val, &owners, &mut safe);
+                    if let Some(roots) = owners.get(&ptr.0) {
+                        for root in roots {
+                            if safe.contains(root) && ty.align() > 8 {
+                                let current = required_align.entry(*root).or_insert(0);
+                                *current = (*current).max(ty.align());
+                            }
+                        }
+                    }
                 }
                 Instruction::Memcpy { .. } => {}
 
@@ -1605,8 +1915,11 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
         for inst in &mut block.instructions {
             if let Instruction::Alloca { dest, align, .. } = inst {
                 if safe.contains(&dest.0) {
-                    *align = required_align.get(&dest.0).copied().unwrap_or(0);
-                    changed += 1;
+                    let target = required_align.get(&dest.0).copied().unwrap_or(0);
+                    if *align != target {
+                        *align = target;
+                        changed += 1;
+                    }
                 }
             }
         }
@@ -1752,6 +2065,32 @@ mod tests {
     }
 
     #[test]
+    fn read_modify_write_result_is_not_promoted() {
+        let mut function = function(
+            "rmw_result",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(1, 32, 32),
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::FmaF64x4,
+                        Some(0),
+                        vec![Operand::Value(Value(3)), Operand::Value(Value(4))],
+                    ),
+                    Instruction::Memcpy {
+                        dest: Value(1),
+                        src: Value(0),
+                        size: 32,
+                    },
+                ],
+            )],
+        );
+        assert_eq!(promote_in_function(&mut function), 0);
+    }
+
+    #[test]
     fn derived_destination_access_blocks_promotion() {
         let mut function = function(
             "alias_window",
@@ -1853,6 +2192,39 @@ mod tests {
         );
         assert_eq!(fuse_in_function(&mut function), 0);
         assert_eq!(function.blocks[0].instructions.len(), 4);
+    }
+
+    #[test]
+    fn fixed_address_source_is_invalidated_by_unknown_write() {
+        let mut function = function(
+            "constant_source_clobber",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    intrinsic(
+                        Some(1),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Const(IrConst::I64(0x1000))],
+                    ),
+                    Instruction::Store {
+                        val: Operand::Const(IrConst::I32(1)),
+                        ptr: Value(10),
+                        ty: IrType::I32,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Pcmpeqb256,
+                        Some(20),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(21))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 0);
     }
 
     #[test]
@@ -2205,6 +2577,75 @@ mod tests {
     }
 
     #[test]
+    fn aligned_load_source_is_not_a_forwarding_consumer() {
+        let mut function = function(
+            "aligned_chain",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(1, 32, 32),
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Loadu256,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    intrinsic(
+                        Some(3),
+                        IntrinsicOp::Load256,
+                        Some(1),
+                        vec![Operand::Value(Value(0))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 0);
+        assert!(matches!(
+            &function.blocks[0].instructions[3],
+            Instruction::Intrinsic { args, .. }
+                if matches!(args[0], Operand::Value(Value(0)))
+        ));
+    }
+
+    #[test]
+    fn write_only_destinations_do_not_keep_a_forwarded_load_alive() {
+        let mut function = function(
+            "write_only_home",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 16, 16),
+                    intrinsic(Some(1), IntrinsicOp::Setzero128, Some(0), vec![]),
+                    intrinsic(
+                        Some(2),
+                        IntrinsicOp::Loaddqu,
+                        Some(0),
+                        vec![Operand::Value(Value(10))],
+                    ),
+                    intrinsic(
+                        Some(3),
+                        IntrinsicOp::Paddw128,
+                        Some(11),
+                        vec![Operand::Value(Value(0)), Operand::Value(Value(12))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(fuse_in_function(&mut function), 1);
+        assert_eq!(function.blocks[0].instructions.len(), 3);
+        assert!(!function.blocks[0].instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Intrinsic { op: IntrinsicOp::Loaddqu, .. }
+        )));
+        assert!(matches!(
+            &function.blocks[0].instructions[2],
+            Instruction::Intrinsic { args, .. }
+                if matches!(args[0], Operand::Value(Value(10)))
+        ));
+    }
+
+    #[test]
     fn scalar_intrinsic_argument_is_never_forwarded() {
         let mut function = function(
             "scalar_arg",
@@ -2258,6 +2699,31 @@ mod tests {
         assert!(matches!(
             function.blocks[0].instructions[0],
             Instruction::Alloca { align: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn wide_scalar_access_retains_natural_alignment() {
+        let mut function = function(
+            "wide_scalar_alignment",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    Instruction::Load {
+                        dest: Value(1),
+                        ptr: Value(0),
+                        ty: IrType::I128,
+                        seg_override: AddressSpace::Default,
+                        volatile: false,
+                    },
+                ],
+            )],
+        );
+        assert_eq!(downgrade_in_function(&mut function), 1);
+        assert!(matches!(
+            function.blocks[0].instructions[0],
+            Instruction::Alloca { align: 16, .. }
         ));
     }
 
@@ -2325,6 +2791,40 @@ mod tests {
             function.blocks[0].instructions[0],
             Instruction::Alloca { align: 0, .. }
         ));
+    }
+
+    #[test]
+    fn aligned_avx_load_and_store_retain_align32() {
+        for (name, inst) in [
+            (
+                "aligned_load",
+                intrinsic(
+                    Some(2),
+                    IntrinsicOp::Load256,
+                    Some(1),
+                    vec![Operand::Value(Value(0))],
+                ),
+            ),
+            (
+                "aligned_store",
+                intrinsic(
+                    None,
+                    IntrinsicOp::Store256,
+                    Some(0),
+                    vec![Operand::Value(Value(1))],
+                ),
+            ),
+        ] {
+            let mut function = function(
+                name,
+                vec![block(0, vec![alloca(0, 32, 32), alloca(1, 32, 16), inst])],
+            );
+            assert_eq!(downgrade_in_function(&mut function), 0, "{name}");
+            assert!(matches!(
+                function.blocks[0].instructions[0],
+                Instruction::Alloca { align: 32, .. }
+            ));
+        }
     }
 
     #[test]
@@ -2424,9 +2924,75 @@ mod tests {
             ],
         ));
         assert_eq!(
-            pointer_roots(&function).get(&3),
+            pointer_root_analysis(&function).roots.get(&3),
             Some(&PointerRoot::Param { index: 0, noalias: false })
         );
+    }
+
+    #[test]
+    fn pointer_root_solves_single_seed_loop_phi() {
+        let function = function(
+            "single_seed_phi",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(0)),
+                            (Operand::Value(Value(2)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I64(32)),
+                        ty: IrType::I64,
+                    },
+                ],
+            )],
+        );
+        let analysis = pointer_root_analysis(&function);
+        assert_eq!(analysis.roots.get(&1), Some(&PointerRoot::Alloca(0)));
+        assert_eq!(analysis.roots.get(&2), Some(&PointerRoot::Alloca(0)));
+        assert!(analysis.recurrence_derived.contains(&1));
+        assert!(analysis.recurrence_derived.contains(&2));
+    }
+
+    #[test]
+    fn pointer_root_rejects_multi_seed_pointer_cycle() {
+        let function = function(
+            "multi_seed_phi",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    alloca(3, 32, 32),
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::Ptr,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(0)),
+                            (Operand::Value(Value(2)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::Phi {
+                        dest: Value(2),
+                        ty: IrType::Ptr,
+                        incoming: vec![
+                            (Operand::Value(Value(3)), BlockId(0)),
+                            (Operand::Value(Value(1)), BlockId(1)),
+                        ],
+                    },
+                ],
+            )],
+        );
+        let analysis = pointer_root_analysis(&function);
+        assert!(!analysis.roots.contains_key(&1));
+        assert!(!analysis.roots.contains_key(&2));
     }
 
     #[test]
