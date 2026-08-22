@@ -63,7 +63,7 @@ macro_rules! delegate_to_impl {
     };
 }
 
-use super::cast::{classify_float_binop, FloatOp};
+use super::cast::{FloatOp, classify_float_binop};
 use super::common::PtrDirective;
 use super::generation::is_i128_type;
 use super::regalloc::PhysReg;
@@ -576,18 +576,60 @@ pub trait ArchCodegen {
         ty: IrType,
     ) {
         // Default: emit mul then add separately via the standard paths.
+        //
+        // Operand order is load-bearing on accumulator-flow backends (i686):
+        // the fused mul_dest has use_count 1, so it gets neither a register
+        // home nor a stack slot — its ONLY location is the accumulator
+        // (%eax) right after the multiply. The Add must therefore consume it
+        // as the FIRST (accumulator-loaded) operand: operand_to_eax on a
+        // home-less value is a no-op that reads %eax in place. With `acc`
+        // first, loading it clobbered %eax and the mul result fell into the
+        // home-less staging fallback, which materialises 0 — `i*j + 1`
+        // compiled to `imull; movl $1,%eax; xorl %ecx,%ecx; addl %ecx,%eax`
+        // = 1 at -m32 (matmul rows all 0.25). Add is commutative, so the
+        // swap is semantics-preserving on every backend using this default.
         self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
         self.emit_int_binop(
             add_dest,
             IrBinOp::Add,
-            acc,
             &Operand::Value(Value(_mul_dest.0)),
+            acc,
             ty,
         );
     }
 
     fn supports_fused_float_mul_add(&self) -> bool {
         false
+    }
+
+    /// Whether the target has a single-instruction fused multiply-subtract
+    /// (AArch64 fmsub/fnmsub, x86 FMA3 vfmsub231/vfnmadd231). Gates the
+    /// detector's float Sub fusion; the same fp-contract contract as
+    /// supports_fused_float_mul_add applies (single rounding is observable).
+    fn supports_fused_float_mul_sub(&self) -> bool {
+        false
+    }
+
+    /// Emit a fused multiply-subtract.
+    /// `mul_is_lhs == false`: sub_dest = acc - (mul_lhs * mul_rhs)  [fmsub]
+    /// `mul_is_lhs == true` : sub_dest = (mul_lhs * mul_rhs) - acc  [fnmsub]
+    ///
+    /// Only called when supports_fused_float_mul_sub() returned true and the
+    /// type is F32/F64; there is deliberately NO default mul+sub fallback —
+    /// a fallback emitting the mul via emit_int_binop would be wrong for
+    /// floats, and a silent two-instruction split would hide a backend
+    /// forgetting to implement the hook it advertised.
+    fn emit_fused_mul_sub(
+        &mut self,
+        _mul_dest: &Value,
+        _mul_lhs: &Operand,
+        _mul_rhs: &Operand,
+        _acc: &Operand,
+        _sub_dest: &Value,
+        _ty: IrType,
+        _mul_is_lhs: bool,
+    ) {
+        unreachable!("emit_fused_mul_sub called on a backend that does not support it");
     }
 
     /// Whether the target can encode `other & ~value` directly.

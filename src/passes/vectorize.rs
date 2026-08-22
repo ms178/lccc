@@ -2956,29 +2956,41 @@ fn insert_remainder_loop(
 
     // Step 2: Create vec_exit block.
     // Convert the loop's final IV into the element index where the scalar
-    // remainder must start. The IV representation differs by vector width:
-    //   - AVX2 (width 4): IV is a BYTE offset stepping 32 -> start = IV / 8.
-    //   - SSE2 (width 2): IV is an ELEMENT index stepping 1 (GEP stride x2)
-    //                    -> start = IV * 2.
-    // The previous code always divided by 8, which is only valid for the AVX2
-    // byte-offset scheme; for SSE2 it re-processed nearly the whole array
-    // (double-counting elements) and miscomputed the result.
-    let rem_start_inst = if vec_width == 2 {
-        Instruction::BinOp {
+    // remainder must start. The IV representation differs by scheme:
+    //   - width 2 (legacy SSE2): IV is an ELEMENT index stepping 1 with the
+    //     GEP stride doubled -> start = IV * 2.
+    //   - width 4 (two-NEON / two-XMM hoisted FmaF64x2): IV is a GROUP index
+    //     stepping 1, each group covering 4 doubles (GEP stride x4, loop
+    //     limit divided by 4) -> start = IV * 4. Using the byte-offset
+    //     formula here computed IV >> 3 = 0, so the scalar remainder
+    //     re-accumulated the ENTIRE row on top of the vector result —
+    //     matmul C[i][j] came out exactly 2x too large on AArch64 at -O2
+    //     (x86 masked it: its FmaF64x2Hoisted was a no-op stub, so the
+    //     remainder redid all the work correctly but unvectorized).
+    //   - width 16 (quad FmaF64x4, AVX2): IV is a BYTE offset stepping 128
+    //     -> start = IV / 8.
+    let rem_start_inst = match vec_width {
+        2 => Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::Mul,
             lhs: Operand::Value(pattern.iv), // Final element index
             rhs: Operand::Const(IrConst::I32(2)),
             ty: IrType::I32,
-        }
-    } else {
-        Instruction::BinOp {
+        },
+        4 => Instruction::BinOp {
+            dest: j_rem_start,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(pattern.iv),   // Final 4-element group index
+            rhs: Operand::Const(IrConst::I32(4)),
+            ty: IrType::I32,
+        },
+        _ => Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::LShr,
             lhs: Operand::Value(pattern.iv), // Final non-negative byte offset
             rhs: Operand::Const(IrConst::I32(3)), // log2(sizeof(double))
             ty: IrType::I32,
-        }
+        },
     };
 
     let vec_exit_block = BasicBlock {
