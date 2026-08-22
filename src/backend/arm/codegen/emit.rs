@@ -55,6 +55,10 @@ pub(super) const ARM_CALLER_SAVED: [PhysReg; 7] = [
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
+        0 => "x0",
+        1 => "x1",
+        2 => "x2",
+        3 => "x3",
         4 => "x4",
         5 => "x5",
         6 => "x6",
@@ -85,6 +89,10 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
 pub(super) fn callee_saved_name_32(reg: PhysReg) -> &'static str {
     match reg.0 {
         // Caller-saved registers
+        0 => "w0",
+        1 => "w1",
+        2 => "w2",
+        3 => "w3",
         4 => "w4",
         5 => "w5",
         6 => "w6",
@@ -247,6 +255,10 @@ pub struct ArmCodegen {
     /// must not be used. Variadic prologues skip saving q0-q7 and va_start
     /// sets __vr_offs=0 (no FP register save area available).
     pub(super) general_regs_only: bool,
+    /// Exact AAPCS64 fixed-register conditional-increment leaf: no stack frame,
+    /// no callee saves, parameters stay in x0..x7, result stays in x0.
+    pub(super) conditional_increment_leaf: bool,
+    pub(super) conditional_increment_leaf_condition_32: bool,
 }
 
 impl ArmCodegen {
@@ -271,6 +283,8 @@ impl ArmCodegen {
             fp_callee_save_offset: 0,
             frame_base_offset: None,
             general_regs_only: false,
+            conditional_increment_leaf: false,
+            conditional_increment_leaf_condition_32: false,
         }
     }
 
