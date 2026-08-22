@@ -455,7 +455,14 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
             let mov_line = infos[j].trimmed(store.get(j));
             if mov_line != "movq %rsp, %rbp" {
-                i = j + 1;
+                // Not a frame-pointer prologue: %rbp was pushed as an ordinary
+                // callee-saved register (no-FP mode allocates rbp), and the
+                // real prologue marker is the `subq $N,%rsp` that follows the
+                // push chain.  Falling through to the form-2 detection lets
+                // that line be examined instead of skipping it — the old
+                // `i = j + 1` jumped PAST the subq and disabled dead-store
+                // elimination for every six-push no-FP function.
+                i += 1;
                 continue;
             }
             j += 1;
@@ -518,19 +525,29 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
             }
             // Must be preceded by .cfi_startproc (within 3 lines) to confirm this
             // is a function prologue and not just a random subq in the middle.
+            // Callee-saved pushes (`pushq %rbx` … `pushq %rbp`) legitimately sit
+            // between the .cfi directives and the `subq $N,%rsp`: a six-push
+            // prologue moved the directive 7+ lines away and the old fixed
+            // 3-line window missed it, silently skipping dead-store
+            // elimination for the entire function (gzip CRC kernel: a
+            // never-read `movq %rax, 8(%rsp)` survived forever).  Scan back
+            // past up to 8 push-save lines for the directive; any other
+            // non-nop line terminates the window (an interior `subq` must not
+            // match a directive belonging to an earlier function).
             let mut found_cfi = false;
-            let check_start = if i >= 3 { i - 3 } else { 0 };
-            for k in check_start..i {
-                if infos[k].is_nop() {
+            let check_start = if i >= 16 { i - 16 } else { 0 };
+            for k in (check_start..i).rev() {
+                if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Push { .. }) {
                     continue;
                 }
                 if matches!(infos[k].kind, LineKind::Directive) {
                     let dl = infos[k].trimmed(store.get(k));
                     if dl.contains("cfi_startproc") || dl.contains("cfi_def_cfa_offset") {
                         found_cfi = true;
-                        break;
                     }
+                    break;
                 }
+                break;
             }
             if !found_cfi {
                 i += 1;
