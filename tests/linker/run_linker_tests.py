@@ -4235,6 +4235,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep temp dirs")
     args = ap.parse_args()
+    # Many cases execute the driver from a temporary working directory. Keep a
+    # caller-supplied relative path anchored to the invocation directory.
+    args.lccc = os.path.abspath(os.path.expanduser(args.lccc))
 
     have_mold = shutil.which("mold") is not None
     have_wild = shutil.which("wild") is not None

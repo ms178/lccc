@@ -48,7 +48,7 @@ HERE = Path(__file__).resolve().parent
 PROGRAMS = HERE / "programs"
 REPO_ROOT = HERE.parents[1]
 LEGACY_PROGRAMS = REPO_ROOT / "lccc-improvements" / "benchmarks" / "bench"
-DEFAULT_LCCC = REPO_ROOT / "target" / "release" / "lccc"
+DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
 
 
 @dataclass(frozen=True)
@@ -112,6 +112,8 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               ("binary_search.c",), ("synthetic", "search", "branch")),
     Benchmark("ring_fifo", "masked ring FIFO enqueue/dequeue / dependent loads",
               ("ring_fifo.c",), ("synthetic", "queue", "memory", "branch")),
+    Benchmark("aarch64_select_patterns", "conditional increment, narrow compare, and select pressure",
+              ("aarch64_select_patterns.c",), ("synthetic", "aarch64", "select", "integer")),
     Benchmark("histogram", "256-bin histogram / indexed increment and reduction",
               ("histogram.c",), ("synthetic", "database", "memory", "integer")),
     # Workload-derived corpus.  Licenses and exact extraction records are in

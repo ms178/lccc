@@ -1,0 +1,250 @@
+{
+  "gcc_revision": "ad82e41f1b997dedd2cf227cb410afd8763d89c8",
+  "corpus": "gcc/testsuite/gcc.c-torture/execute (first 500 sorted top-level C files)",
+  "flags": [
+    "-O2"
+  ],
+  "tools": {
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+    "assembler": "GNU assembler (GNU Binutils) 2.47.20260726",
+    "gcc": "aarch64-linux-gnu-gcc (Debian 14.2.0-19) 14.2.0",
+    "clang": null,
+    "qemu": "qemu-aarch64 version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)"
+  },
+  "counts": {
+    "PASS": 454,
+    "FAIL": 46
+  },
+  "failures": [
+    {
+      "source": "20000822-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20000822-1.c:15:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20000822-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20010209-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010209-1.c:9:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010209-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20010605-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010605-1.c:6:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20010605-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20010910-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20020411-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20020412-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20020413-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20020720-1.c",
+      "stage": "lccc-link",
+      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20020720-1.c/lccc.o: in function `foo':\n(.text+0x28): undefined reference to `link_error'\ncollect2: error: ld returned 1 exit status"
+    },
+    {
+      "source": "20021127-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20030125-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20030216-1.c",
+      "stage": "lccc-link",
+      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20030216-1.c/lccc.o: in function `main':\n(.text+0x38): undefined reference to `link_error'\ncollect2: error: ld returned 1 exit status"
+    },
+    {
+      "source": "20030501-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20030501-1.c:11:7: error: expected ';' after declaration before '{'\n       {\n       ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20030501-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20031003-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040411-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040423-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040520-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20040520-1.c:7:9: error: expected ';' after declaration before '{'\n         {\n         ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20040520-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20040706-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040709-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040709-2.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20040709-3.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20041019-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20041114-1.c",
+      "stage": "lccc-link",
+      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20041114-1.c/lccc.o: in function `foo':\n(.text+0x34): undefined reference to `link_failure'\ncollect2: error: ld returned 1 exit status"
+    },
+    {
+      "source": "20041214-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20041218-2.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20050121-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20050502-2.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20051215-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20060929-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20061220-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:11:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:30:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:49:3: error: expected ';' after declaration before '{'\n   {\n   ^\n  fix-it hint: insert ';'\n/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c:51:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20061220-1.c: 4 parse error(s)"
+    },
+    {
+      "source": "20070212-2.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20070614-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20070919-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20071210-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20071220-1.c",
+      "stage": "lccc-link",
+      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20071220-1.c/lccc.o:(.data+0x0): undefined reference to `.LBB3'\ncollect2: error: ld returned 1 exit status"
+    },
+    {
+      "source": "20071220-2.c",
+      "stage": "lccc-link",
+      "detail": "/usr/lib/gcc-cross/aarch64-linux-gnu/14/../../../../aarch64-linux-gnu/bin/ld: /home/user/.cache/lccc-aarch64-suite-wiqq49wj/20071220-2.c/lccc.o:(.data+0x0): undefined reference to `.LBB3'\ncollect2: error: ld returned 1 exit status"
+    },
+    {
+      "source": "20080604-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20090219-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20090219-1.c:12:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/20090219-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "20120919-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20171008-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20230630-2.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "20230630-4.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-6 out='' err='qemu: uncaught target signal 6 (Aborted) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "920302-1.c",
+      "stage": "execute-vs-gcc",
+      "detail": "lccc rc=-11 out='' err='qemu: uncaught target signal 11 (Segmentation fault) - core dumped'; gcc rc=0 out='' err=''"
+    },
+    {
+      "source": "920415-1.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920415-1.c:3:28: error: expected ';' after declaration before '{'\n main(){__label__ l;void*x(){return&&l;}goto*x();abort();return;l:exit(0);}\n                            ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920415-1.c: 1 parse error(s)"
+    },
+    {
+      "source": "920428-2.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920428-2.c:5:39: error: expected ';' after declaration before '{'\n s(i){if(i>0){__label__ l1;int f(int i){if(i==2)goto l1;return 0;}return f(i);l1:;}return 1;}\n                                       ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920428-2.c: 1 parse error(s)"
+    },
+    {
+      "source": "920501-7.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920501-7.c:16:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920501-7.c: 1 parse error(s)"
+    },
+    {
+      "source": "920612-2.c",
+      "stage": "lccc-compile",
+      "detail": "/home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920612-2.c:11:5: error: expected ';' after declaration before '{'\n     {\n     ^\n  fix-it hint: insert ';'\nccc: error: /home/user/gcc-src/gcc/testsuite/gcc.c-torture/execute/920612-2.c: 1 parse error(s)"
+    }
+  ]
+}

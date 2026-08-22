@@ -23,8 +23,9 @@ Survey a benchmark file and write review artifacts::
         --artifact-dir results/gzip-crc --json results/gzip-crc/manifest.json
 
 The x86 defaults intentionally include GCC, Clang, ICC and ICX because ICX is
-a moving channel. AArch64 defaults to ARM64 GCC 16.1 plus trunk. Every manifest
-records the architecture and resolved compiler id/name/version.
+a moving channel. AArch64 defaults to ARM64 GCC 16.1, GCC trunk, and Clang 22.1
+(with automatic `--target=aarch64-linux-gnu`). Every manifest records the
+architecture and resolved compiler id/name/version.
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -48,7 +50,7 @@ import godbolt  # noqa: E402
 
 DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
-DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk")
+DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk", "cclang2210")
 
 _DIRECTIVE = re.compile(r"^\s*(?:\.|#|//|cfi_)")
 _LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
@@ -146,7 +148,13 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
 
 def _local_compile(executable: str, source: Path, flags: str) -> list[str]:
     digest = hashlib.sha256((str(source.resolve()) + "\0" + flags).encode()).hexdigest()[:16]
-    output = Path(os.environ.get("TMPDIR", "/tmp")) / f"codegen-oracle-{digest}-{os.getpid()}.s"
+    fd, output_name = tempfile.mkstemp(
+        prefix=f"codegen-oracle-{digest}-",
+        suffix=".s",
+        dir=os.environ.get("TMPDIR", "/tmp"),
+    )
+    os.close(fd)
+    output = Path(output_name)
     command = [executable, *shlex.split(flags), "-S", str(source), "-o", str(output)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
@@ -184,14 +192,21 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
 
 
 def _record_remote(name: str, source: str, req: Request, compilers: list[dict[str, Any]]) -> dict[str, Any]:
+    metadata = godbolt.compiler_metadata(name, compilers=compilers)
+    flags = req.flags
+    compiler_text = f"{metadata.get('id', '')} {metadata.get('name', '')}".lower()
+    # CE's native ARM GCC channels already target AArch64, whereas the newest
+    # Clang channel is hosted as x86-64 and needs an explicit backend target.
+    if req.arch == "aarch64" and "clang" in compiler_text and "--target=" not in flags:
+        flags = f"{flags} --target=aarch64-linux-gnu"
     started = time.perf_counter()
-    lines = _compile_remote(name, source, req.flags)
+    lines = _compile_remote(name, source, flags)
     elapsed = time.perf_counter() - started
     body = _function_body(lines, req.function)
     return {
         "key": name,
-        **godbolt.compiler_metadata(name, compilers=compilers),
-        "flags": req.flags,
+        **metadata,
+        "flags": flags,
         "elapsed_s": elapsed,
         **asdict(_stats(body, req.arch)),
         "assembly": body,
