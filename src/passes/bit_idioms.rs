@@ -131,6 +131,30 @@ fn add_const(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option
     commutative_const(opnd, IrBinOp::Add, amount, defs)
 }
 
+/// Match `((value & mask) == 0)` in either operand order and return `value`.
+/// This is the condition form produced by lowering Linux's portable `__ffs`
+/// tree. It is intentionally stricter than a generic equality simplifier: the
+/// mask is part of the idiom's proof and each stage is checked independently.
+fn equal_zero_mask(
+    condition: Operand,
+    mask: u64,
+    defs: &[Option<Instruction>],
+) -> Option<Operand> {
+    let Operand::Value(v) = peel(condition, defs) else {
+        return None;
+    };
+    let Instruction::Cmp { op, lhs, rhs, .. } = defs
+        .get(v.0 as usize)
+        .and_then(Option::as_ref)?
+    else {
+        return None;
+    };
+    if *op != IrCmpOp::Eq || const_u64(*rhs) != Some(0) {
+        return None;
+    }
+    commutative_const(*lhs, IrBinOp::And, mask, defs)
+}
+
 fn is_incremented(
     true_val: Operand,
     false_val: Operand,
@@ -234,6 +258,66 @@ fn match_clz32(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand>
     (const_u64(peel(count, defs)) == Some(0)).then_some(peel(working, defs))
 }
 
+/// Match the six-stage portable 64-bit `__ffs` tree used by Linux:
+///
+/// ```text
+/// if ((x & 0xffffffff) == 0) { n += 32; x >>= 32; }
+/// if ((x & 0xffff) == 0)     { n += 16; x >>= 16; }
+/// ...
+/// ```
+///
+/// If-conversion produces a select chain for `x` and a parallel select chain
+/// for `n`. Requiring every condition, shift, mask and increment to agree is
+/// what makes this safe. The zero case is preserved explicitly: the Linux tree
+/// returns 63 for zero, while native `tzcnt` returns the operand width. The
+/// rewrite materializes a nonzero Ctz operand and selects 63 for zero.
+fn match_ctz64(result: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (final_cond, final_true, final_false, final_ty) = select(result, defs)?;
+    if final_ty != IrType::I32 && final_ty != IrType::U32 {
+        return None;
+    }
+    if !is_incremented(final_true, final_false, 1, defs) {
+        return None;
+    }
+
+    // The final one-bit test selects only the count; its working-value input
+    // is the operand of the final mask test.
+    let mut working = equal_zero_mask(final_cond, 1, defs)?;
+    let mut count = final_false;
+
+    for (amount, mask) in [(2, 3), (4, 15), (8, 255), (16, 65535), (32, 0xffff_ffff)] {
+        let (count_cond, count_true, count_false, count_ty) = select(count, defs)?;
+        if count_ty != IrType::I32 && count_ty != IrType::U32 {
+            return None;
+        }
+        if !is_incremented(count_true, count_false, amount, defs) {
+            return None;
+        }
+
+        let (value_cond, value_true, value_false, value_ty) = select(working, defs)?;
+        if value_ty != IrType::I64 && value_ty != IrType::U64 {
+            return None;
+        }
+        if !same(count_cond, value_cond, defs) {
+            return None;
+        }
+        if !shift(value_true, IrBinOp::LShr, amount, defs)
+            .is_some_and(|base| same(base, value_false, defs))
+        {
+            return None;
+        }
+        if !equal_zero_mask(count_cond, mask, defs)
+            .is_some_and(|base| same(base, value_false, defs))
+        {
+            return None;
+        }
+        working = value_false;
+        count = count_false;
+    }
+
+    (const_u64(peel(count, defs)) == Some(0)).then_some(peel(working, defs))
+}
+
 fn match_shift_pair(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
     let (a, b, _) = binop(opnd, IrBinOp::Or, defs)?;
     if let (Some(x), Some(y)) = (
@@ -315,19 +399,22 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
     }
 
     let mut changes = 0;
+    let mut next_value_id = func.max_value_id().saturating_add(1);
     for block in &mut func.blocks {
-        for inst in &mut block.instructions {
-            match inst {
+        let mut index = 0;
+        while index < block.instructions.len() {
+            let mut consumed = 1;
+            match &block.instructions[index] {
                 Instruction::BinOp {
                     dest,
                     op: IrBinOp::LShr,
                     ty,
                     ..
                 } if *ty == IrType::U32 || *ty == IrType::I32 => {
-                    let result = Operand::Value(*dest);
-                    if let Some(src) = match_popcount32(result, &defs) {
-                        *inst = Instruction::UnaryOp {
-                            dest: *dest,
+                    let dest = *dest;
+                    if let Some(src) = match_popcount32(Operand::Value(dest), &defs) {
+                        block.instructions[index] = Instruction::UnaryOp {
+                            dest,
                             op: IrUnaryOp::Popcount,
                             src,
                             ty: IrType::U32,
@@ -341,22 +428,23 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
                     ty,
                     ..
                 } if *ty == IrType::U32 || *ty == IrType::I32 => {
-                    let result = Operand::Value(*dest);
+                    let dest = *dest;
                     if enable_bit_reverse {
-                        if let Some(src) = match_bit_reverse32(result, &defs) {
-                            *inst = Instruction::UnaryOp {
-                                dest: *dest,
+                        if let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs) {
+                            block.instructions[index] = Instruction::UnaryOp {
+                                dest,
                                 op: IrUnaryOp::BitReverse,
                                 src,
                                 ty: IrType::U32,
                             };
                             changes += 1;
+                            index += consumed;
                             continue;
                         }
                     }
-                    if let Some(src) = match_bswap32_network(result, &defs) {
-                        *inst = Instruction::UnaryOp {
-                            dest: *dest,
+                    if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
+                        block.instructions[index] = Instruction::UnaryOp {
+                            dest,
                             op: IrUnaryOp::Bswap,
                             src,
                             ty: IrType::U32,
@@ -365,12 +453,85 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
                     }
                 }
                 Instruction::Select { dest, ty, .. }
-                    if *ty == IrType::U32 || *ty == IrType::I32 =>
+                    if *ty == IrType::U32 || *ty == IrType::I32 || *ty == IrType::U64 =>
                 {
-                    let result = Operand::Value(*dest);
-                    if let Some(src) = match_clz32(result, &defs) {
-                        *inst = Instruction::UnaryOp {
-                            dest: *dest,
+                    let dest = *dest;
+                    let ty = *ty;
+                    if let Some(src) = match_ctz64(Operand::Value(dest), &defs) {
+                        if ty == IrType::U64 {
+                            block.instructions[index] = Instruction::UnaryOp {
+                                dest,
+                                op: IrUnaryOp::Ctz,
+                                src,
+                                ty: IrType::U64,
+                            };
+                        } else {
+                            // The source tree returns 63 for zero (it is
+                            // normally called only after a nonzero guard, but
+                            // the standalone C function is still defined).
+                            // Make the Ctz operand nonzero before evaluating
+                            // it, then select the exact zero result. This is
+                            // required on targets where the native Ctz
+                            // instruction is undefined for zero.
+                            let zero = crate::ir::reexports::Value(next_value_id);
+                            let safe_src = crate::ir::reexports::Value(next_value_id + 1);
+                            let ctz = crate::ir::reexports::Value(next_value_id + 2);
+                            let narrowed = crate::ir::reexports::Value(next_value_id + 3);
+                            next_value_id = next_value_id.saturating_add(4);
+                            block.instructions[index] = Instruction::Cmp {
+                                dest: zero,
+                                op: IrCmpOp::Eq,
+                                lhs: src,
+                                rhs: Operand::Const(IrConst::I64(0)),
+                                ty: IrType::U64,
+                            };
+                            block.instructions.insert(
+                                index + 1,
+                                Instruction::Select {
+                                    dest: safe_src,
+                                    cond: Operand::Value(zero),
+                                    true_val: Operand::Const(IrConst::I64(1)),
+                                    false_val: src,
+                                    ty: IrType::U64,
+                                },
+                            );
+                            block.instructions.insert(
+                                index + 2,
+                                Instruction::UnaryOp {
+                                    dest: ctz,
+                                    op: IrUnaryOp::Ctz,
+                                    src: Operand::Value(safe_src),
+                                    ty: IrType::U64,
+                                },
+                            );
+                            block.instructions.insert(
+                                index + 3,
+                                Instruction::Cast {
+                                    dest: narrowed,
+                                    src: Operand::Value(ctz),
+                                    from_ty: IrType::U64,
+                                    to_ty: ty,
+                                },
+                            );
+                            block.instructions.insert(
+                                index + 4,
+                                Instruction::Select {
+                                    dest,
+                                    cond: Operand::Value(zero),
+                                    true_val: Operand::Const(IrConst::I64(63)),
+                                    false_val: Operand::Value(narrowed),
+                                    ty,
+                                },
+                            );
+                            consumed = 5;
+                        }
+                        changes += 1;
+                    } else if (ty == IrType::U32 || ty == IrType::I32)
+                        && match_clz32(Operand::Value(dest), &defs).is_some()
+                    {
+                        let src = match_clz32(Operand::Value(dest), &defs).unwrap();
+                        block.instructions[index] = Instruction::UnaryOp {
+                            dest,
                             op: IrUnaryOp::Clz,
                             src,
                             ty: IrType::U32,
@@ -380,8 +541,10 @@ pub(crate) fn recognize_function(func: &mut IrFunction, enable_bit_reverse: bool
                 }
                 _ => {}
             }
+            index += consumed;
         }
     }
+    func.next_value_id = next_value_id.max(func.next_value_id);
     changes
 }
 

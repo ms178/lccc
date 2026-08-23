@@ -1200,6 +1200,22 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Re-run bit-idiom recognition after if-conversion. Portable trees such
+        // as Linux __ffs are initially CFG diamonds; only this placement sees
+        // the parallel value/count Select chains needed for Ctz recognition.
+        // The pass is idempotent and remains behind the normal disable switch.
+        if !disabled.contains("bit_idioms") {
+            let enable_bit_reverse = target == crate::backend::Target::Aarch64;
+            let n = timed_pass!(
+                "bit_idioms_post_ifconv",
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    bit_idioms::recognize_function(func, enable_bit_reverse)
+                })
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 7b: Range-check folding.
         // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
         // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).
