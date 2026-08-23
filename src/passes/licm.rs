@@ -1467,7 +1467,7 @@ mod tests {
         let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
 
-        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
 
         // n * 4 should be hoisted (1 instruction)
         assert_eq!(hoisted, 1);
@@ -1506,7 +1506,7 @@ mod tests {
         let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
         assert_eq!(
-            hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info),
+            hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info),
             1
         );
 
@@ -1550,7 +1550,7 @@ mod tests {
         let idom = analysis::compute_dominators(func.blocks.len(), &preds, &succs);
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
         assert_eq!(
-            hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info),
+            hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info),
             0
         );
         assert_eq!(
@@ -1704,7 +1704,7 @@ mod tests {
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
 
         assert_eq!(loops.len(), 1);
-        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
 
         // The load from the unmodified, non-address-taken alloca should be hoisted
         assert_eq!(hoisted, 1);
@@ -1812,7 +1812,7 @@ mod tests {
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
 
         assert_eq!(loops.len(), 1);
-        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
 
         // Nothing should be hoisted because the alloca is stored to in the loop
         assert_eq!(hoisted, 0);
@@ -1917,7 +1917,7 @@ mod tests {
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
 
         assert_eq!(loops.len(), 1);
-        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
 
         // Nothing should be hoisted: the alloca is written by inline asm in the loop
         assert_eq!(hoisted, 0);
@@ -2052,7 +2052,7 @@ mod tests {
         let loops = loop_analysis::find_natural_loops(func.blocks.len(), &preds, &succs, &idom);
 
         assert_eq!(loops.len(), 1);
-        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &alloca_info);
+        let hoisted = hoist_loop_invariants(&mut func, &loops[0], &preds, &idom, &alloca_info);
 
         // The Copy from Value(5) must NOT be hoisted because Value(5) is
         // defined by InlineAsm inside the loop. The BinOp depends on the

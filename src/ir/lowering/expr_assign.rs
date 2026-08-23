@@ -875,10 +875,17 @@ impl Lowerer {
             };
             let ir_op = Self::binop_to_ir(*op, is_unsigned);
 
-            // Scale RHS for pointer += and -=
+            // Scale RHS for pointer += and -=. Match the plain pointer +/-
+            // lowering: widen the index to pointer width before multiplying
+            // by the element size, preserving signedness. Without this,
+            // `p += signed_i32_negative` is multiplied as a 64-bit value with
+            // stale/zero high bits and can walk far past the object (SQLite's
+            // yy_reduce shape: stack pointer += signed-char table entry + 1).
             let actual_rhs = if ty == IrType::Ptr && matches!(op, BinOp::Add | BinOp::Sub) {
                 let elem_size = self.get_pointer_elem_size_from_expr(lhs);
-                self.scale_index(rhs_val, elem_size)
+                let ptr_int_ty = crate::common::types::target_int_ir_type();
+                let rhs_wide = self.emit_implicit_cast(rhs_val, rhs_ir_ty, ptr_int_ty);
+                self.scale_index(rhs_wide, elem_size)
             } else {
                 rhs_val
             };
