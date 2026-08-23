@@ -910,7 +910,23 @@ impl Lowerer {
                     let decomposes_cd = self.decomposes_complex_double();
                     let decomposes_cf = self.decomposes_complex_float();
                     match ctype {
-                        Some(CType::Struct(_)) | Some(CType::Union(_)) => self.struct_value_size(a),
+                        Some(CType::Struct(_)) | Some(CType::Union(_)) => {
+                            if pre_call_variadic
+                                && matches!(
+                                    self.target,
+                                    crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64
+                                )
+                                && self.dynamic_struct_value_size(a).is_some()
+                            {
+                                // AAPCS64 passes variable-size aggregate variadic
+                                // arguments by reference; do not mark them as
+                                // by-value struct args with size zero, or the call
+                                // consumes no GP register for the pointer.
+                                None
+                            } else {
+                                self.struct_value_size(a)
+                            }
+                        },
                         Some(CType::Vector(_, total_size)) => Some(total_size),
                         Some(CType::ComplexLongDouble) if !decomposes_cld => {
                             Some(CType::ComplexLongDouble.size())
@@ -943,7 +959,23 @@ impl Lowerer {
                     }
                     let ctype = self.get_expr_ctype(a);
                     match ctype {
-                        Some(CType::Struct(_)) | Some(CType::Union(_)) => self.struct_value_size(a),
+                        Some(CType::Struct(_)) | Some(CType::Union(_)) => {
+                            if pre_call_variadic
+                                && matches!(
+                                    self.target,
+                                    crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64
+                                )
+                                && self.dynamic_struct_value_size(a).is_some()
+                            {
+                                // AAPCS64 passes variable-size aggregate variadic
+                                // arguments by reference; do not mark them as
+                                // by-value struct args with size zero, or the call
+                                // consumes no GP register for the pointer.
+                                None
+                            } else {
+                                self.struct_value_size(a)
+                            }
+                        },
                         Some(CType::Vector(_, total_size)) => {
                             Some(total_size) // Vector types are passed by value like structs
                         }
