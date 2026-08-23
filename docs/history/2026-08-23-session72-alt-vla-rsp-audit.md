@@ -1,4 +1,4 @@
-# Session 72 — Alternative patch audit: accepted rsp/push peephole, kept safer VLA-varargs model
+# Session 72 — Alternative patch audit: accepted rsp/push peephole and broadened VLA-varargs by-reference ABI
 
 Date: 2026-08-23
 Base: `655569d6342950e13e9073485e3401c5b140772a` (latest `ms178/lccc` main at session start).
@@ -11,8 +11,10 @@ The proposed patch contained two major ideas:
 1. x86 `eliminate_redundant_leaq` must treat stack-pointer updates as writes,
    because cached `leaq X(%rsp), %rax` addresses become stale across `push` /
    `pop` / `leave` / `enter`.
-2. VLA-containing struct varargs must be passed by reference and `typeof(d)`
-   must resolve to the runtime size for `va_arg(ap, typeof(d))`.
+2. VLA-containing struct varargs must be passed by reference and
+   `va_arg(ap, typeof(d))` must fetch a pointer. The prior PR audit correctly
+   fixed AArch64, but missed that x86 `20020412-1.c` still failed without the
+   broader by-reference rule.
 
 ## Decision
 
@@ -47,25 +49,55 @@ push_rsp_leaq_dedup.c at -O0/-O1/-O2
 # all PASS
 ```
 
-### Kept current model: VLA struct varargs
+### Accepted after re-audit: VLA struct varargs by-reference, all supported ABIs
 
-The alternative's diagnosis is correct and already represented in current main,
-but the current implementation is more conservative semantically:
+The user counter-analysis is correct for LCCC's supported C surface:
 
-- Callee `lower_va_arg_struct` reads the by-reference pointer, allocates a fresh
-  runtime-sized temporary, and copies `runtime_size` bytes before returning the
-  expression value. This preserves by-value `va_arg` semantics for all expression
-  consumers, not only assignment forms.
-- Caller classification is gated on AArch64/RISC-V **and variadic calls** before
-  treating dynamic aggregate args as plain pointers. A global
-  `dynamic_struct_value_size(a) -> None` rule is too broad and risks changing
-  non-variadic ABI classification.
-- Runtime `typeof(identifier)` size resolution uses the active local's
-  `LocalInfo.vla_size`. Registering local variable names in the typedef-size map
-  is workable, but it mixes local identifiers into a typedef-oriented namespace
-  and can collide with shadowing in ways the locals table already models.
+- A function prototype cannot name a variable-size struct parameter type in the
+  ordinary fixed-parameter ABI path, so the practical reachable case is the
+  variadic path.
+- `va_arg(...)` yields a non-lvalue expression. Valid C consumers can copy from
+  it or pass it onward; they cannot assign into the `va_arg` result object.
+- LCCC internally represents aggregate rvalues as pointers already. Returning
+  the by-reference pointer from `va_arg` is therefore semantically consistent for
+  valid programs and avoids the extra callee-side temporary+memcpy.
 
-Validation retained:
+The implementation now does this:
+
+Callee side (`lower_va_arg_struct`):
+
+```text
+if requested type has runtime VLA aggregate size:
+    return va_arg(ap, void *)   // pointer to referenced aggregate object
+```
+
+Caller side (`lower_call_arguments`):
+
+```text
+if call is variadic and argument is a dynamic-size aggregate:
+    struct_arg_size = None      // classify/pass as ordinary pointer
+```
+
+The caller-side rule remains explicitly `pre_call_variadic`, so non-variadic ABI
+classification is not accidentally changed.
+
+Regression added:
+
+```text
+tests/regression/vla_struct_varargs.c
+```
+
+Validation:
+
+```text
+scripts/x86_gcc_torture_slice.sh 20020412-1.c
+# PASS
+
+vla_struct_varargs.c at -O0/-O1/-O2
+# all PASS
+```
+
+The existing AArch64 regression remains green:
 
 ```text
 20020412-1.c PASS
@@ -86,9 +118,16 @@ The seven AArch64 torture fixes from current main remain green:
 920612-2.c PASS
 ```
 
+Full first-500 AArch64 slice remains:
+
+```text
+SUMMARY FAIL=8 PASS=492
+```
+
 ## Conclusion
 
-The alternative is better only for the x86 `%rsp` peephole hole, which is now
-adopted. Its VLA-varargs direction is correct, but the current implementation is
-safer and more general because it preserves by-value expression semantics and is
-properly target/variadic gated.
+The alternative provided two valid insights. The x86 `%rsp` peephole fix is
+adopted directly. The VLA-varargs insight is also adopted, but with the safer
+variadic-only caller gating and with the existing `LocalInfo.vla_size` lookup for
+`typeof(identifier)` retained instead of mixing local names into the typedef-size
+namespace.

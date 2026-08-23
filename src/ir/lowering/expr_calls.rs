@@ -911,17 +911,12 @@ impl Lowerer {
                     let decomposes_cf = self.decomposes_complex_float();
                     match ctype {
                         Some(CType::Struct(_)) | Some(CType::Union(_)) => {
-                            if pre_call_variadic
-                                && matches!(
-                                    self.target,
-                                    crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64
-                                )
-                                && self.dynamic_struct_value_size(a).is_some()
-                            {
-                                // AAPCS64 passes variable-size aggregate variadic
-                                // arguments by reference; do not mark them as
-                                // by-value struct args with size zero, or the call
-                                // consumes no GP register for the pointer.
+                            if pre_call_variadic && self.dynamic_struct_value_size(a).is_some() {
+                                // GCC passes variable-size aggregate variadic
+                                // arguments by reference on the supported ABIs.
+                                // Do not mark them as by-value struct args with
+                                // size zero, or call lowering consumes no GP
+                                // register for the pointer (20020412-1.c).
                                 None
                             } else {
                                 self.struct_value_size(a)
@@ -960,17 +955,12 @@ impl Lowerer {
                     let ctype = self.get_expr_ctype(a);
                     match ctype {
                         Some(CType::Struct(_)) | Some(CType::Union(_)) => {
-                            if pre_call_variadic
-                                && matches!(
-                                    self.target,
-                                    crate::backend::Target::Aarch64 | crate::backend::Target::Riscv64
-                                )
-                                && self.dynamic_struct_value_size(a).is_some()
-                            {
-                                // AAPCS64 passes variable-size aggregate variadic
-                                // arguments by reference; do not mark them as
-                                // by-value struct args with size zero, or the call
-                                // consumes no GP register for the pointer.
+                            if pre_call_variadic && self.dynamic_struct_value_size(a).is_some() {
+                                // GCC passes variable-size aggregate variadic
+                                // arguments by reference on the supported ABIs.
+                                // Do not mark them as by-value struct args with
+                                // size zero, or call lowering consumes no GP
+                                // register for the pointer (20020412-1.c).
                                 None
                             } else {
                                 self.struct_value_size(a)
