@@ -6,9 +6,10 @@
 # The harness snapshot restores /home/user contents but: drops /opt (rustup),
 # drops /swapfile, drops /tmp, drops target/ (excluded dir name), strips +x
 # from worktree files, truncates the ~55k-file kernel tree (10k-file cap),
-# and removes .git/config (credential-path exclusion).  This script restores
-# every piece idempotently so a new session is one command from productive
-# work.
+# and removes .git/config (credential-path exclusion). The persisted
+# /home/user/.cargo and /home/user/.rustup trees are the canonical toolchain
+# location. This script restores every piece idempotently so a new session is
+# one command from productive work.
 #
 # Usage: scripts/arena_session_restore.sh [--with-kernel]
 # ============================================================================
@@ -30,15 +31,28 @@ if ! grep -q '^/swapfile' /proc/swaps 2>/dev/null; then
 fi
 log "swap: $(awk '/SwapTotal/{print $2"kB"}' /proc/meminfo)"
 
-# ---- 2. rust toolchain to /opt (kept out of the snapshot) --------------------
-export RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
-if [[ ! -x /opt/cargo/bin/rustc ]]; then
-    log 'installing rust (minimal profile) to /opt'
-    sudo mkdir -p /opt/rustup /opt/cargo
-    sudo chown -R "$(id -u):$(id -g)" /opt/rustup /opt/cargo
-    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null 2>&1
+# ---- 2. exact Rust/Cargo toolchain in the persisted workspace --------------
+# Do not reinstall under /opt: the harness wipes it and the old restore path
+# silently downgraded the next session to an image-provided Cargo.  The
+# repository's rust-toolchain.toml and this explicit channel must agree.
+export RUSTUP_HOME=${RUSTUP_HOME:-/home/user/.rustup}
+export CARGO_HOME=${CARGO_HOME:-/home/user/.cargo}
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
+export PATH="$CARGO_HOME/bin:$PATH"
+if [[ ! -x "$CARGO_HOME/bin/rustup" ]]; then
+    log 'installing rustup into persisted /home/user/.cargo'
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --profile minimal --default-toolchain none --no-modify-path \
+        >/dev/null 2>&1
 fi
-log "rustc: $(/opt/cargo/bin/rustc --version 2>/dev/null || echo MISSING)"
+if ! "$CARGO_HOME/bin/rustup" toolchain list 2>/dev/null | grep -q "^${RUSTUP_TOOLCHAIN}"; then
+    log "installing Rust/Cargo $RUSTUP_TOOLCHAIN"
+    "$CARGO_HOME/bin/rustup" toolchain install "$RUSTUP_TOOLCHAIN" \
+        --profile minimal --no-self-update >/dev/null
+fi
+"$CARGO_HOME/bin/rustup" default "$RUSTUP_TOOLCHAIN" >/dev/null 2>&1 || true
+log "rustc: $(rustc --version 2>/dev/null || echo MISSING)"
+log "cargo: $(cargo --version 2>/dev/null || echo MISSING)"
 
 # ---- 3. host packages (kernel tree + -m32 oracle) ----------------------------
 if ! gcc -m32 -x c -o /dev/null - <<< 'int main(){return 0;}' 2>/dev/null; then
@@ -79,7 +93,7 @@ fi
 # ---- 6. compiler binaries -----------------------------------------------------
 if [[ ! -x target/fastbuild/lccc ]]; then
     log 'building lccc (fastbuild)'
-    export PATH=/opt/cargo/bin:$PATH
+    export PATH="$CARGO_HOME/bin:$PATH"
     ./scripts/build_lccc_fast.sh >/dev/null 2>&1 \
         && log "lccc built: $(./target/fastbuild/lccc --version 2>/dev/null | head -1)" \
         || log 'BUILD FAILED — run scripts/build_lccc_fast.sh manually'

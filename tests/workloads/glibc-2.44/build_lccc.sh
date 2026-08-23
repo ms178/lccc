@@ -44,7 +44,7 @@ mkdir -p "$WORK" "$CACHE"
     echo "error: binutils 2.47 prefix missing under $BINUTILS" >&2
     exit 2
 }
-"$BINUTILS/readelf" --version | grep -q '2\.47' || { echo 'error: readelf is not binutils 2.47' >&2; exit 2; }
+"$BINUTILS/readelf" --version | grep -F '2.47' >/dev/null || { echo 'error: readelf is not binutils 2.47' >&2; exit 2; }
 
 if [[ ! -f "$TARBALL" ]]; then curl -fL --retry 3 -o "$TARBALL" "$TARBALL_URL"; fi
 archive_sha=$(sha256sum "$TARBALL" | awk '{print $1}')
@@ -57,44 +57,56 @@ patch_sha=$(sha256sum "$PATCH" | awk '{print $1}')
 SRC="$WORK/glibc-2.44"
 BUILD="$WORK/build-lccc"
 STAGE="$WORK/stage-lccc"
-rm -rf "$SRC" "$BUILD" "$STAGE"
-tar -xf "$TARBALL" -C "$WORK"
-patch --dry-run -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
-patch -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
-mkdir -p "$BUILD"
 
-# CXX needs the GCC internal headers because glibc's support helper is compiled
-# with -nostdinc while still using libstdc++ headers.
-CXX="/usr/bin/g++ -isystem /usr/lib/gcc/x86_64-linux-gnu/14/include -isystem /usr/include/x86_64-linux-gnu"
-BINUTILS_PATH="$BIN:/home/user/lccc/target/fastbuild:/usr/bin"
-(
-    cd "$BUILD"
-    PATH="$BINUTILS_PATH" CC="$LCCC" CXX="$CXX" LD="$LCCC_LD" \
-      AS="$BINUTILS/as" AR="$BINUTILS/ar" RANLIB="$BINUTILS/ranlib" \
-      OBJDUMP="$BINUTILS/objdump" READELF="$BINUTILS/readelf" \
-      CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$CFLAGS" CXXFLAGS="$CFLAGS" \
-      "$SRC/configure" \
-        --prefix="$WORK/install-lccc" \
-        --libdir="$WORK/install-lccc/lib" \
-        --libexecdir="$WORK/install-lccc/lib" \
-        --with-headers=/usr/include --enable-bind-now \
-        --disable-fortify-source --enable-kernel=3.2 --disable-cet \
-        --disable-multi-arch --disable-mathvec --disable-stack-protector \
-        --disable-systemtap --disable-nscd --disable-profile --disable-werror \
-        --with-rtld-early-cflags='-march=x86-64' --disable-sframe >configure.log 2>&1
-    PATH="$BINUTILS_PATH" make -j"$JOBS" -Oline CXX="$CXX" >build.log 2>&1
-    PATH="$BINUTILS_PATH" make install DESTDIR="$STAGE" >install.log 2>&1
-)
+# Reuse is an explicit recovery mode: it lets a harness restart after an
+# interrupted/failed post-build gate without paying another multi-minute glibc
+# compile. The default remains clean and reproducible.
+if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
+    rm -rf "$SRC" "$BUILD" "$STAGE"
+    tar -xf "$TARBALL" -C "$WORK"
+    patch --dry-run -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
+    patch -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
+    mkdir -p "$BUILD"
+
+    # CXX needs the GCC internal headers because glibc's support helper is compiled
+    # with -nostdinc while still using libstdc++ headers.
+    CXX="/usr/bin/g++ -isystem /usr/lib/gcc/x86_64-linux-gnu/14/include -isystem /usr/include/x86_64-linux-gnu"
+    BINUTILS_PATH="$BINUTILS:/home/user/lccc/target/fastbuild:/usr/bin"
+    (
+        cd "$BUILD"
+        PATH="$BINUTILS_PATH" CC="$LCCC" CXX="$CXX" LD="$LCCC_LD" \
+          AS="$BINUTILS/as" AR="$BINUTILS/ar" RANLIB="$BINUTILS/ranlib" \
+          OBJDUMP="$BINUTILS/objdump" READELF="$BINUTILS/readelf" \
+          CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$CFLAGS" CXXFLAGS="$CFLAGS" \
+          "$SRC/configure" \
+            --prefix="$WORK/install-lccc" \
+            --libdir="$WORK/install-lccc/lib" \
+            --libexecdir="$WORK/install-lccc/lib" \
+            --with-headers=/usr/include --enable-bind-now \
+            --disable-fortify-source --enable-kernel=3.2 --disable-cet \
+            --disable-multi-arch --disable-mathvec --disable-stack-protector \
+            --disable-systemtap --disable-nscd --disable-profile --disable-werror \
+            --with-rtld-early-cflags='-march=x86-64' --disable-sframe >configure.log 2>&1
+        PATH="$BINUTILS_PATH" make -j"$JOBS" -Oline CXX="$CXX" >build.log 2>&1
+        PATH="$BINUTILS_PATH" make install DESTDIR="$STAGE" >install.log 2>&1
+    )
+else
+    INSTALL_REUSE="$STAGE$WORK/install-lccc"
+    [[ -x "$INSTALL_REUSE/lib/libc.so.6" ]] || {
+        echo "error: GLIBC_REUSE_BUILD=1 but staged libc is missing: $INSTALL_REUSE" >&2
+        exit 2
+    }
+fi
 
 # Structural ABI checks are meaningful even when staged runtime execution is
 # deliberately not requested. They catch the exact historical failure modes:
 # missing versioned imports, malformed verneed offsets, and accidental host
 # libc dependencies.
 INSTALL="$STAGE$WORK/install-lccc"
-readelf -h "$INSTALL/lib/libc.so.6" | grep -q 'ELF64'
-readelf -sW "$INSTALL/lib/libc.so.6" | grep -q '_rtld_global_ro@GLIBC_PRIVATE'
-readelf -d "$INSTALL/lib/libc.so.6" | grep -q 'VERNEED'
-readelf --version-info "$INSTALL/lib/libc.so.6" | grep -q 'Name: GLIBC_PRIVATE'
+readelf -h "$INSTALL/lib/libc.so.6" | grep -F 'ELF64' >/dev/null
+readelf -sW "$INSTALL/lib/libc.so.6" | grep -F '_rtld_global_ro@GLIBC_PRIVATE' >/dev/null
+readelf -d "$INSTALL/lib/libc.so.6" | grep -F 'VERNEED' >/dev/null
+readelf --version-info "$INSTALL/lib/libc.so.6" | grep -F 'Name: GLIBC_PRIVATE' >/dev/null
 
 if [[ ${GLIBC_RUN_SMOKE:-0} == 1 ]]; then
     cat >"$WORK/smoke.c" <<'EOF'

@@ -3100,6 +3100,56 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                                 continue;
                             }
                         }
+
+                        // Sub-pattern G3: a pointer copy feeding a store:
+                        //   movq %<ptr>, %rcx
+                        //   movq %<value>, (%rcx)
+                        // becomes:
+                        //   movq %<value>, (%<ptr>)
+                        //
+                        // This is the common scalar-store form emitted by
+                        // accumulator codegen. The address copy is removable
+                        // only when the store's destination is exactly
+                        // (%rcx), the value does not read %rcx, and no later
+                        // instruction reads %rcx. A displacement operand is
+                        // deliberately excluded: replacing only the base
+                        // register there would need a different parser and
+                        // could change the effective address.
+                        if line_j.starts_with("mov") {
+                            let Some((source, destination)) = line_j.rsplit_once(',') else {
+                                i += 1;
+                                continue;
+                            };
+                            if destination.trim() == "(%rcx)"
+                                && !source.contains("%rcx")
+                            {
+                                let mut k = j + 1;
+                                while k < len && infos[k].is_nop() {
+                                    k += 1;
+                                }
+                                if !rcx_is_live_at(store, infos, k, len) {
+                                    let replacement = line_j.replacen(
+                                        "(%rcx)",
+                                        &format!("(%{})", src_reg),
+                                        1,
+                                    );
+                                    if replacement != line_j
+                                        && !replacement.contains("%rcx")
+                                    {
+                                        mark_nop(&mut infos[i]);
+                                        replace_line(
+                                            store,
+                                            &mut infos[j],
+                                            j,
+                                            format!("    {}", replacement),
+                                        );
+                                        changed = true;
+                                        i = j + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
