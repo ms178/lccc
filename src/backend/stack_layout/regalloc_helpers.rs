@@ -416,18 +416,18 @@ pub fn filter_available_regs(callee_saved: &[PhysReg], asm_clobbered: &[PhysReg]
 
 /// Find the nth alloca instruction in the entry block (used for parameter storage).
 pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, IrType)> {
+    // Parameter allocas are authoritative in `func.param_alloca_values`; using
+    // "the Nth alloca in the entry block" is unsound after mem2reg removes a
+    // parameter home.  A later local alloca (notably a volatile local) can then
+    // be mistaken for the parameter slot, making emit_store_params overwrite it
+    // with the incoming argument and later reload the local as the pointer
+    // parameter (gcc.c-torture/execute/20180112-1.c).  Look up the indexed
+    // parameter-home value and verify that its Alloca still exists.
+    let want = *func.param_alloca_values.get(param_idx)?;
     func.blocks.first().and_then(|block| {
-        block
-            .instructions
-            .iter()
-            .filter(|i| matches!(i, Instruction::Alloca { .. }))
-            .nth(param_idx)
-            .and_then(|inst| {
-                if let Instruction::Alloca { dest, ty, .. } = inst {
-                    Some((*dest, *ty))
-                } else {
-                    None
-                }
-            })
+        block.instructions.iter().find_map(|inst| match inst {
+            Instruction::Alloca { dest, ty, .. } if *dest == want => Some((*dest, *ty)),
+            _ => None,
+        })
     })
 }

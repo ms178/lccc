@@ -214,6 +214,7 @@ pub(super) fn classify_instructions(
                     *size,
                     *ty,
                     *align,
+                    *semantic_volatile,
                     ctx,
                     assign_slot,
                     non_local_space,
@@ -360,6 +361,7 @@ fn classify_alloca(
     size: usize,
     ty: IrType,
     align: usize,
+    semantic_volatile: bool,
     ctx: &StackLayoutContext,
     assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
     non_local_space: &mut i64,
@@ -424,7 +426,7 @@ fn classify_alloca(
         .get(&dest.0)
         .map(|&ub| ctx.block_loop_depth.get(ub).copied().unwrap_or(1) != 0)
         .unwrap_or(false);
-    if effective_align <= 16 && !use_block_in_loop {
+    if effective_align <= 16 && !semantic_volatile && !use_block_in_loop {
         if let Some(&use_block) = ctx.coalescable_allocas.single_block.get(&dest.0) {
             let alloca_size = raw_size + extra as i64;
             let alloca_align = align as i64;

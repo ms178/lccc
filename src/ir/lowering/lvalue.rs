@@ -80,9 +80,18 @@ impl Lowerer {
                 }
             }
             Expr::Deref(inner, _) => {
-                // *ptr -> the address is the value of ptr
+                // *ptr -> the address is the value of ptr.  Even when this
+                // lvalue is the operand of a discarded outer post-inc/dec, a
+                // nested post-inc in the pointer expression still supplies the
+                // OLD pointer value by C semantics: `(*p++)++` increments
+                // `*old_p`, not `*(p_after_increment)`.  The top-level discard
+                // fast path is therefore not allowed to leak into address
+                // computation for a dereference lvalue.
                 let addr_space = self.get_addr_space_of_ptr_expr(inner);
+                let saved_discard = self.discard_expr_result;
+                self.discard_expr_result = false;
                 let ptr_val = self.lower_expr(inner);
+                self.discard_expr_result = saved_discard;
                 match ptr_val {
                     Operand::Value(v) => Some(LValue::address(v, addr_space, vol)),
                     Operand::Const(_) => {
