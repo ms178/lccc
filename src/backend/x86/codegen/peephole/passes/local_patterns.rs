@@ -5100,17 +5100,39 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
     // Register families written by `line` (REG_NONE entries ignored).
     // Returns an empty slice when the destination is memory or unknown.
     fn written_families(line: &str) -> Vec<RegId> {
+        // %rsp writes are as real as any data-register write: every cached
+        // `leaq X(%rsp), %rax` bakes the CURRENT %rsp into the address.  A
+        // push/pop/leave/enter makes that address stale even when the textual
+        // displacement is identical.  Missing `push` let this peephole delete
+        // a second `leaq 80(%rsp), %rax` after four pushes had moved %rsp;
+        // sret calls passing a by-value struct then reused the argument address
+        // as the return buffer (gcc.c-torture/execute/20040709-{1,2,3}.c).
+        const RSP: RegId = 4;
+        const RBP: RegId = 5;
+        if line.starts_with("push") {
+            // push writes memory and decrements %rsp. It has no destination
+            // register operand, so the generic comma fallback would return
+            // nothing — handle it before that.
+            return vec![RSP];
+        }
         if line.starts_with("pop") {
-            // popq %r12 / pop %r12 — writes the operand register.
+            // popq %r12 / pop %r12 — writes the operand register AND %rsp.
+            let mut fams = Vec::with_capacity(2);
             if let Some(sp) = line.find('%') {
-                return vec![register_family_fast(line[sp..].trim())];
+                let fam = register_family_fast(line[sp..].trim());
+                if fam != REG_NONE {
+                    fams.push(fam);
+                }
             }
-            return Vec::new();
+            fams.push(RSP);
+            return fams;
         }
         match line {
             "cltq" => return vec![0],
             "cqto" | "cqo" => return vec![0, 2],
             "cdq" => return vec![2],
+            "leave" => return vec![RSP, RBP],
+            "enter" => return vec![RSP, RBP],
             _ => {}
         }
         // Generic: `... , %reg` — the trailing register is the destination.
