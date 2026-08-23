@@ -14,6 +14,7 @@
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
+pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod block_layout;
 pub(crate) mod cfg_simplify;
@@ -1473,6 +1474,11 @@ pub(crate) fn run_passes(
     // plus an extra callee-saved push in the prologue).
     if target == crate::backend::Target::Aarch64 && !disabled.contains("intconst") {
         module.for_each_function(int_const_hoist::run);
+    }
+
+    if !disabled.contains("bepre") {
+        let n = module.for_each_function(backedge_pre::run);
+        if n > 0 { module.for_each_function(dce::eliminate_dead_code); }
     }
 
     // Phase 11: Dead static function elimination.

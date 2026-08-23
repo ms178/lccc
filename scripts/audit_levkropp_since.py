@@ -28,7 +28,7 @@ class Rule:
 
 
 RULES: tuple[Rule, ...] = (
-    Rule("Backedge PRE", ("src/passes/backedge_pre.rs", "backedge_pre::run", "bepre"), "not-adopted/high-value"),
+    Rule("Backedge PRE", ("src/passes/backedge_pre.rs", "backedge_pre::run", "bepre"), "adopted-this-session/int-only"),
     Rule("pointer +=/-=", ("pointer +=", "rhs_wide", "pointer_compound_assign_signed_index"), "adopted-this-session"),
     Rule("volatile forwarding guard", ("volatile / semantic_volatile allocas are never tracked", "if *volatile"), "already-adopted"),
     Rule("quadratic", ("src/passes/quadratic_sr.rs", "quadratic_sr::run"), "already-adopted"),

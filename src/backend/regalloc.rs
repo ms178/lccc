@@ -15,6 +15,7 @@ use super::liveness::{
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
+use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3992,13 +3993,17 @@ fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>
 
 /// A phi/backedge pair that may share one physical register.
 ///
-/// `source_def_idx..copy_idx` is a straight-line window in `block_idx`.
-/// Shared with stack-slot coalescing: do not change the field set.
+/// `source_def_idx..copy_idx` is a straight-line window when
+/// `source_block_idx == block_idx`.  When the source is defined in the unique
+/// predecessor of `block_idx`, the window is `(source_def_idx..end_of_pred) +
+/// (start_of_block..copy_idx)`.  This covers branch-separated latch copies from
+/// Backedge PRE without allowing arbitrary cross-block destructive updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PhiCoalesceCandidate {
     pub(crate) phi_dest: u32,
     pub(crate) backedge_src: u32,
     pub(crate) block_idx: usize,
+    pub(crate) source_block_idx: usize,
     pub(crate) source_def_idx: usize,
     pub(crate) copy_idx: usize,
 }
@@ -4026,15 +4031,30 @@ fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
 /// clobber. Sharing the dest register then means the source is born in that
 /// register *before* the clobber and read after it — illegal for rdi/rsi/…
 fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandidate) -> bool {
-    let Some(block) = func.blocks.get(cand.block_idx) else {
+    let Some(copy_block) = func.blocks.get(cand.block_idx) else {
         return false;
     };
-    if cand.source_def_idx >= cand.copy_idx || cand.copy_idx > block.instructions.len() {
+    let Some(src_block) = func.blocks.get(cand.source_block_idx) else {
+        return false;
+    };
+    if cand.copy_idx > copy_block.instructions.len()
+        || cand.source_def_idx >= src_block.instructions.len()
+    {
         return false;
     }
-    block.instructions[cand.source_def_idx + 1..cand.copy_idx]
-        .iter()
-        .any(instruction_clobbers_caller_saved)
+    if cand.source_block_idx == cand.block_idx {
+        if cand.source_def_idx >= cand.copy_idx {
+            return false;
+        }
+        copy_block.instructions[cand.source_def_idx + 1..cand.copy_idx]
+            .iter()
+            .any(instruction_clobbers_caller_saved)
+    } else {
+        src_block.instructions[cand.source_def_idx + 1..]
+            .iter()
+            .chain(copy_block.instructions[..cand.copy_idx].iter())
+            .any(instruction_clobbers_caller_saved)
+    }
 }
 
 /// Revalidate the same-block destructive-update proof and propagate an
@@ -4059,25 +4079,39 @@ fn apply_phi_coalesce_assignments(
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
-        let Some(block) = func.blocks.get(candidate.block_idx) else {
+        let Some(copy_block) = func.blocks.get(candidate.block_idx) else {
             continue;
         };
-        if candidate.source_def_idx >= candidate.copy_idx
-            || candidate.copy_idx >= block.instructions.len()
-            || block.instructions[candidate.source_def_idx]
+        let Some(src_block) = func.blocks.get(candidate.source_block_idx) else {
+            continue;
+        };
+        if candidate.copy_idx >= copy_block.instructions.len()
+            || candidate.source_def_idx >= src_block.instructions.len()
+            || src_block.instructions[candidate.source_def_idx]
                 .dest()
                 .is_none_or(|dest| dest.0 != backedge_src)
             || !matches!(
-                block.instructions[candidate.copy_idx],
+                copy_block.instructions[candidate.copy_idx],
                 Instruction::Copy {
                     dest,
                     src: Operand::Value(src),
                 } if dest.0 == phi_dest && src.0 == backedge_src
             )
-            || block.instructions[candidate.source_def_idx + 1..candidate.copy_idx]
-                .iter()
-                .any(|inst| uses_value(inst, phi_dest))
         {
+            continue;
+        }
+        let phi_used_in_window = if candidate.source_block_idx == candidate.block_idx {
+            candidate.source_def_idx >= candidate.copy_idx
+                || copy_block.instructions[candidate.source_def_idx + 1..candidate.copy_idx]
+                    .iter()
+                    .any(|inst| uses_value(inst, phi_dest))
+        } else {
+            src_block.instructions[candidate.source_def_idx + 1..]
+                .iter()
+                .chain(copy_block.instructions[..candidate.copy_idx].iter())
+                .any(|inst| uses_value(inst, phi_dest))
+        };
+        if phi_used_in_window {
             continue;
         }
 
@@ -4185,6 +4219,9 @@ pub(crate) fn detect_phi_coalesce_groups(
         });
     }
 
+    let label_to_idx = analysis::build_label_map(func);
+    let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+
     let debug = env_on("CCC_DEBUG_PHI_COALESCE");
     let mut candidates = Vec::new();
 
@@ -4223,27 +4260,55 @@ pub(crate) fn detect_phi_coalesce_groups(
                 continue;
             };
 
-            if source_block != block_idx || source_def_idx >= copy_idx {
+            let same_block = source_block == block_idx;
+            let source_is_fp = func.blocks[source_block].instructions[source_def_idx]
+                .result_type()
+                .is_some_and(|ty| ty.is_float());
+            let pred_is_unique = !same_block
+                && source_is_fp
+                && preds.len(block_idx) == 1
+                && preds.row(block_idx)[0] as usize == source_block
+                // Do not coalesce a preheader/init definition into a loop phi:
+                // the source must be born on the same loop-carried path, not
+                // before the loop. Backedge PRE's branch-separated latch shape
+                // has equal loop depth for source and copy blocks; the
+                // 20041011-1 torture failure exposed the preheader case.
+                && liveness.block_loop_depth.get(source_block).copied().unwrap_or(0)
+                    >= liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
+            if !(same_block && source_def_idx < copy_idx || pred_is_unique) {
                 if debug {
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} != copy {}:{}",
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}): def block/index {}:{} cannot feed copy {}:{}",
                         dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
                     );
                 }
                 continue;
             }
 
-            let phi_used_in_window = block.instructions[source_def_idx + 1..copy_idx]
-                .iter()
-                .any(|middle| uses_value(middle, dest.0));
-            let source_used_elsewhere = src_use_blocks
-                .get(&src.0)
-                .is_some_and(|blocks| blocks.iter().any(|&use_block| use_block != block_idx));
-            if phi_used_in_window || source_used_elsewhere {
+            let phi_used_in_window = if same_block {
+                block.instructions[source_def_idx + 1..copy_idx]
+                    .iter()
+                    .any(|middle| uses_value(middle, dest.0))
+            } else {
+                func.blocks[source_block].instructions[source_def_idx + 1..]
+                    .iter()
+                    .chain(block.instructions[..copy_idx].iter())
+                    .any(|middle| uses_value(middle, dest.0))
+            };
+            let source_used_elsewhere = src_use_blocks.get(&src.0).is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|&use_block| use_block != block_idx && use_block != source_block)
+            });
+            let source_used_before_copy = !same_block
+                && block.instructions[..copy_idx]
+                    .iter()
+                    .any(|middle| uses_value(middle, src.0));
+            if phi_used_in_window || source_used_elsewhere || source_used_before_copy {
                 if debug {
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} used_in_window={} cross_block={}",
-                        dest.0, src.0, block_idx, phi_used_in_window, source_used_elsewhere
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} cross_block={} src_before_copy={}",
+                        dest.0, src.0, block_idx, source_block, phi_used_in_window, source_used_elsewhere, source_used_before_copy
                     );
                 }
                 continue;
@@ -4251,14 +4316,15 @@ pub(crate) fn detect_phi_coalesce_groups(
 
             if debug {
                 eprintln!(
-                    "[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) in block {} window {}..{}",
-                    dest.0, src.0, block_idx, source_def_idx, copy_idx
+                    "[PHI_COALESCE] Coalescing phi_dest=Value({}) with backedge_src=Value({}) source block {} idx {} copy block {} idx {}",
+                    dest.0, src.0, source_block, source_def_idx, block_idx, copy_idx
                 );
             }
             candidates.push(PhiCoalesceCandidate {
                 phi_dest: dest.0,
                 backedge_src: src.0,
                 block_idx,
+                source_block_idx: source_block,
                 source_def_idx,
                 copy_idx,
             });
@@ -4652,6 +4718,7 @@ mod phi_coalesce_tests {
             phi_dest: 1,
             backedge_src: 2,
             block_idx: 1,
+            source_block_idx: 1,
             source_def_idx: 0,
             copy_idx: 2,
         };

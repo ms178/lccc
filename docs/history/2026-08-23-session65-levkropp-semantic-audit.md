@@ -95,41 +95,54 @@ filtered unit suite now passes (`3 passed; 0 failed`).
 
 ## Backedge PRE spike result
 
-I temporarily imported levkropp `a08f676` (`backedge_pre`) and enabled it late in
-the optimization pipeline. It compiled and did not change the native x86 first-500
-GCC torture fail set, but it regressed the cited `mandelbrot` benchmark in this
-ms178 tree:
+I imported levkropp `a08f676` (`backedge_pre`) and tested it late in the scalar
+pipeline. The naive FP behavior was rejected: with `CCC_BEPRE_FP=1`, Mandelbrot
+reduced static `vmulsd` count from 5 to 4, but the extra loop-carried FP phi/copy
+increased register pressure and regressed runtime. The production pass therefore
+uses a cost model:
+
+- integer recurrences are enabled by default;
+- FP recurrences are disabled by default on current ms178 backends;
+- `CCC_BEPRE_FP=1` keeps the FP path available for research;
+- `CCC_DISABLE_PASSES=bepre` disables the pass.
+
+Default Mandelbrot assembly is identical with and without the pass, proving the
+FP guardrail:
 
 ```text
-mulsd counts: bepre=0, no-bepre=0
-FMA counts:   bepre=3, no-bepre=3
-mandelbrot median: bepre 2.1175 s, no-bepre 1.9637 s, gcc 1.5007 s
+target/fastbuild/lccc -O2 mandelbrot.c -S -o default.s
+CCC_DISABLE_PASSES=bepre target/fastbuild/lccc -O2 mandelbrot.c -S -o off.s
+cmp -s default.s off.s  # identical
 ```
 
-Both LCCC binaries produced identical output. The candidate was therefore
-rejected for default integration on x86-64: it adds phi/register pressure without
-reducing the current backend's FP/FMA instruction count. Full evidence is in
-`engineering/evidence/levkropp/backedge_pre_x86_spike.md`.
+Integer recurrence evidence is positive:
 
-## Why only this code change in this session?
+```text
+Backedge PRE on : 1 imul in run()
+Backedge PRE off: 2 imul in run()
+Runtime median: on 0.1619 s, off 0.1850 s, speedup 1.14x
+```
+
+Full evidence is in `engineering/evidence/levkropp/backedge_pre_x86_spike.md`.
+
+## Why these code changes?
 
 The audit found many performance-oriented levkropp commits, but the project rule
 is correctness first under generated-code performance. The pointer compound
 assignment bug is a low-risk, high-confidence semantic fix with a small proof and
-a permanent regression. Backedge PRE was empirically rejected for x86 in this
-session. Label-address CFG identity and nested-function/static-chain support
-remain correctness projects that require dedicated design+validation cycles;
-importing them without empirical proof would be exactly the kind of lazy
-engineering this project forbids.
+a permanent regression. Backedge PRE is now integrated only where the current
+backend shows a measured win (integer recurrences) and guarded away from the
+known x86 FP regression. Label-address CFG identity and nested-function/static-chain
+support remain correctness projects that require dedicated design+validation cycles.
 
 ## Next concrete follow-up queue
 
 1. **Computed-goto label identity**: diagnose why static label initializers can
    reference a different `.LBB` than the kept `global_init_label_blocks` target.
    Use `20071220-1.c` and `920302-1.c` as minimal oracles.
-2. **Backedge PRE spike**: port `a08f676` behind a kill switch; validate on
-   mandelbrot and a GCC torture loop slice; inspect generated assembly for lost
-   FMA/fusion opportunities.
+2. **Backedge PRE FP follow-up**: only revisit FP PRE after regalloc can prove
+   or coalesce the added loop-carried FP state; keep using `CCC_BEPRE_FP=1` for
+   experiments and require a mandelbrot/nbody/spectral A/B before defaulting it.
 3. **VLA aggregate `va_arg`**: extend dynamic VLA-struct handling to varargs
    (`20020412-1.c`).
 4. **Bitfield cluster**: reduce `20040709-{1,2,3}.c`; compare extracted field
