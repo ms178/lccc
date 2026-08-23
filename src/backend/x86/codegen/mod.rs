@@ -16,6 +16,7 @@ pub(crate) mod isel;
 pub(crate) mod machinst;
 pub(crate) mod machinst_emit;
 mod memory;
+mod nested_fn;
 pub(crate) mod peephole;
 mod prologue;
 mod returns;

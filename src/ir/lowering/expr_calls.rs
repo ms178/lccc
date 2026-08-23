@@ -105,6 +105,16 @@ impl Lowerer {
             }
         }
 
+        // GNU C nested function call: if the identifier names a visible
+        // nested function, route through the static-chain call path.
+        if let Expr::Identifier(name, span) = stripped_func {
+            if self.lookup_nested_function(name).is_some() {
+                return self
+                    .try_lower_nested_call(name, args, *span)
+                    .unwrap_or(Operand::Const(IrConst::ptr_int(0)));
+            }
+        }
+
         // Resolve _Generic selections to the selected expression.
         // Without this, _Generic(expr, type1: func1, type2: func2)(args) would
         // fall through to the catch-all indirect call path, which dereferences

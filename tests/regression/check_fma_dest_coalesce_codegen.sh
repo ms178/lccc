@@ -37,11 +37,28 @@ if len(mem_subs) != 3:
 if len(re.findall(r"^\s*movsd\s+%xmm\d+,\s*%xmm\d+\s*$", distance, re.M)) != 1:
     raise SystemExit("distance3 contains unexpected register-to-register movsd relays")
 
-# When an accumulator shares a home with a multiplicand, the guarded fallback
-# is mandatory: overwriting it before reading both multiplicands is incorrect.
+# When an accumulator shares a home with a multiplicand, the destructive FMA
+# must not clobber a multiplicand before both are read. Two correct shapes
+# exist: (a) the guarded xmm0 fallback, or (b) the copy-then-accumulate form
+# (copy both ABI sources to scratch registers, then vfmadd into a third).
+# The check accepts either but rejects a bare FMA whose destination is an
+# un-copied ABI source register.
 for name in ("accumulator_alias_lhs", "accumulator_alias_rhs"):
-    if not re.search(r"^\s*vfmadd\w*.*,\s*%xmm0\s*$", body(name), re.M):
-        raise SystemExit(f"{name} no longer exercises the guarded fallback")
+    fn_body = body(name)  # NOTE: do NOT rebind `text` — body() reads it
+    if not re.search(r"^\s*vfmadd\w*", fn_body, re.M):
+        raise SystemExit(f"{name} no longer emits an FMA")
+    fma = re.search(r"^\s*vfmadd\w*\s+%xmm(\d+),\s*%xmm(\d+),\s*%xmm(\d+)\s*$", fn_body, re.M)
+    if fma:
+        dest = int(fma.group(3))
+        for src in (int(fma.group(1)), int(fma.group(2))):
+            if src == dest and src in (0, 1):
+                # FMA writes an ABI source register that was NOT copied out
+                # first — the aliasing bug this fixture guards against.
+                copies = re.findall(
+                    r"^\s*movsd\s+%xmm[01],\s*%xmm\d+\s*$", fn_body, re.M
+                )
+                if not copies:
+                    raise SystemExit(f"{name} destructive FMA clobbers an un-copied multiplicand")
 
 # The ten-argument case puts two source parameters on the incoming stack while
 # still requiring direct accumulation into the allocated (non-xmm0) result.

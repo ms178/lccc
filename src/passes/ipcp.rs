@@ -544,6 +544,10 @@ fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
                 | Instruction::Call { .. }
                 | Instruction::CallIndirect { .. }
                 | Instruction::InlineAsm { .. }
+                | Instruction::SetStaticChain { .. }
+                | Instruction::InitTrampoline { .. }
+                | Instruction::NonlocalGotoSave { .. }
+                | Instruction::NonlocalGoto { .. }
                 | Instruction::AtomicRmw { .. }
                 | Instruction::AtomicInc { .. }
                 | Instruction::AtomicCmpxchg { .. }
@@ -571,6 +575,7 @@ fn is_side_effect_free(func: &crate::ir::reexports::IrFunction) -> bool {
 
                 // These are pure (compute a value only from inputs/constants):
                 Instruction::Alloca { .. }
+                | Instruction::GetStaticChain { .. }
                 | Instruction::BinOp { .. }
                 | Instruction::UnaryOp { .. }
                 | Instruction::Cmp { .. }

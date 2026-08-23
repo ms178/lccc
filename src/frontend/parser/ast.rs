@@ -216,7 +216,7 @@ impl std::fmt::Debug for FunctionAttributes {
 }
 
 /// A function definition.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionDef {
     pub return_type: TypeSpecifier,
     pub name: String,
@@ -786,6 +786,11 @@ pub struct CompoundStmt {
 pub enum BlockItem {
     Declaration(Declaration),
     Statement(Stmt),
+    /// GNU C nested function definition (GCC extension): a function defined
+    /// at block scope that may reference enclosing-function locals through a
+    /// static chain. Reuses `FunctionDef`; the item is lowered to a separate
+    /// IR function with a mangled `parent.name` symbol.
+    NestedFunction(FunctionDef),
 }
 
 /// Statements.

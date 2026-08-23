@@ -377,6 +377,55 @@ pub enum Instruction {
     /// Must appear immediately before a Return terminator.
     SetReturnF128Second { src: Operand },
 
+    /// Read the incoming static-chain register (%r10 on x86-64 SysV nested
+    /// functions) into `dest`. Emitted at the entry of a GNU C nested
+    /// function whose body references enclosing-function state. The caller
+    /// (parent or trampoline) loads %r10 with a pointer to the enclosing
+    /// function's frame struct immediately before the call/jump.
+    GetStaticChain { dest: Value },
+
+    /// Load `src` into the static-chain register (%r10) before a direct call
+    /// to a nested function that uses its chain.
+    SetStaticChain { src: Operand },
+
+    /// Build a trampoline for taking the address of a nested function
+    /// (GCC semantics): writes a small code sequence into the 16-byte
+    /// `buffer` alloca that loads the static-chain register with `chain`
+    /// and jumps to `func`. `buffer`'s address is the resulting function
+    /// pointer value. Requires an executable stack (marked in the output
+    /// object when any trampoline is emitted).
+    InitTrampoline {
+        buffer: Value,
+        chain: Operand,
+        func: String,
+    },
+
+    /// Save the frame/stack pointer pair into the non-local-goto save area
+    /// of this function's frame struct (at `rbp_off`/`rsp_off`), so that a
+    /// nested function executing `NonlocalGoto` can restore this frame.
+    /// Emitted once at function entry when any descendant nested function
+    /// performs a non-local goto into this function.
+    NonlocalGotoSave {
+        frame: Value,
+        rbp_off: i64,
+        rsp_off: i64,
+    },
+
+    /// Non-local goto: restore the frame and stack pointers of an enclosing
+    /// function from its frame-struct save area, then jump to its label.
+    /// `label` is a NAMED assembly label: block IDs are renumbered
+    /// per-function during optimization, so a cross-function reference by
+    /// BlockId would hit an unrelated block in THIS function's label space.
+    /// The enclosing function emits `label:` as an alias at the target
+    /// block (see IrFunction::nonlocal_goto_aliases).
+    NonlocalGoto {
+        chain: Operand,
+        up: usize,
+        rbp_off: i64,
+        rsp_off: i64,
+        label: String,
+    },
+
     /// Inline assembly statement
     InlineAsm {
         /// Assembly template string (with \n\t separators)
@@ -512,6 +561,7 @@ impl Instruction {
             | Instruction::GetReturnF64Second { dest }
             | Instruction::GetReturnF32Second { dest }
             | Instruction::GetReturnF128Second { dest }
+            | Instruction::GetStaticChain { dest }
             | Instruction::Select { dest, .. }
             | Instruction::StackSave { dest }
             | Instruction::ParamRef { dest, .. } => Some(*dest),
@@ -530,6 +580,10 @@ impl Instruction {
             | Instruction::SetReturnF64Second { .. }
             | Instruction::SetReturnF32Second { .. }
             | Instruction::SetReturnF128Second { .. }
+            | Instruction::SetStaticChain { .. }
+            | Instruction::InitTrampoline { .. }
+            | Instruction::NonlocalGotoSave { .. }
+            | Instruction::NonlocalGoto { .. }
             | Instruction::InlineAsm { .. }
             | Instruction::StackRestore { .. } => None,
         }
@@ -587,6 +641,7 @@ impl Instruction {
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
+            Instruction::GetStaticChain { .. } => Some(IrType::Ptr),
             Instruction::ParamRef { ty, .. } => Some(*ty),
             _ => None,
         }
@@ -614,6 +669,7 @@ impl Instruction {
             | Instruction::GetReturnF64Second { .. }
             | Instruction::GetReturnF32Second { .. }
             | Instruction::GetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
             | Instruction::ParamRef { .. }
             | Instruction::PgoCounterInc { .. } => {}
 
@@ -691,7 +747,14 @@ impl Instruction {
             }
             Instruction::SetReturnF64Second { src }
             | Instruction::SetReturnF32Second { src }
-            | Instruction::SetReturnF128Second { src } => visit_op(src, &mut f),
+            | Instruction::SetReturnF128Second { src }
+            | Instruction::SetStaticChain { src } => visit_op(src, &mut f),
+            Instruction::NonlocalGoto { chain, .. } => visit_op(chain, &mut f),
+            Instruction::InitTrampoline { buffer, chain, .. } => {
+                f(buffer.0);
+                visit_op(chain, &mut f);
+            }
+            Instruction::NonlocalGotoSave { frame, .. } => f(frame.0),
             Instruction::InlineAsm {
                 outputs, inputs, ..
             } => {
@@ -762,6 +825,8 @@ impl Instruction {
                     f(value);
                 }
             }
+            Instruction::InitTrampoline { buffer, .. } => f(buffer),
+            Instruction::NonlocalGotoSave { frame, .. } => f(frame),
             Instruction::Intrinsic { dest_ptr, .. } => {
                 if let Some(ptr) = dest_ptr {
                     f(ptr);
@@ -797,7 +862,10 @@ impl Instruction {
             | Instruction::GetReturnF32Second { .. }
             | Instruction::SetReturnF32Second { .. }
             | Instruction::GetReturnF128Second { .. }
-            | Instruction::SetReturnF128Second { .. } => {}
+            | Instruction::SetReturnF128Second { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::SetStaticChain { .. }
+            | Instruction::NonlocalGoto { .. } => {}
         }
     }
 
@@ -859,7 +927,10 @@ impl Instruction {
             }
             Instruction::SetReturnF64Second { src }
             | Instruction::SetReturnF32Second { src }
-            | Instruction::SetReturnF128Second { src } => f(src),
+            | Instruction::SetReturnF128Second { src }
+            | Instruction::SetStaticChain { src } => f(src),
+            Instruction::NonlocalGoto { chain, .. } => f(chain),
+            Instruction::InitTrampoline { chain, .. } => f(chain),
             Instruction::InlineAsm { inputs, .. } => {
                 for (_, op, _) in inputs {
                     f(op);
@@ -898,7 +969,9 @@ impl Instruction {
             | Instruction::GetReturnF128Second { .. }
             | Instruction::StackSave { .. }
             | Instruction::StackRestore { .. }
-            | Instruction::ParamRef { .. } => {}
+            | Instruction::ParamRef { .. }
+            | Instruction::GetStaticChain { .. }
+            | Instruction::NonlocalGotoSave { .. } => {}
         }
     }
 

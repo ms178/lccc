@@ -562,6 +562,10 @@ impl Lowerer {
                     func.attrs.is_static(),
                     func.is_kr,
                 );
+                // GNU C nested functions: register their signatures under
+                // the parent-mangled name (recursively for deeper nesting)
+                // so call sites find ABI metadata during lowering.
+                self.register_nested_function_metas(&func.name, &func.body);
             }
             if let ExternalDecl::Declaration(decl) = decl {
                 for declarator in &decl.declarators {
@@ -941,7 +945,7 @@ impl Lowerer {
     /// this method uses sema's return CType as source-of-truth instead of re-computing
     /// it from the AST TypeSpecifier. This reduces duplicated work and establishes
     /// sema as the authority on function type information.
-    fn register_function_meta(
+    pub(super) fn register_function_meta(
         &mut self,
         name: &str,
         ret_type_spec: &TypeSpecifier,

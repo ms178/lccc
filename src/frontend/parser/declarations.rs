@@ -305,7 +305,7 @@ impl Parser {
 
     /// Build the return type from derived declarators.
     /// For `int (*func())[3]`, we apply post-Function and pre-Function derivations.
-    fn build_return_type(
+    pub(super) fn build_return_type(
         &self,
         base_type: TypeSpecifier,
         derived: &[DerivedDeclarator],
@@ -397,7 +397,7 @@ impl Parser {
 
     /// Parse K&R-style parameter declarations.
     /// In K&R style, the parameter list is just names, and type declarations follow.
-    fn parse_kr_params(&mut self, mut kr_params: Vec<ParamDecl>) -> Vec<ParamDecl> {
+    pub(super) fn parse_kr_params(&mut self, mut kr_params: Vec<ParamDecl>) -> Vec<ParamDecl> {
         while self.is_type_specifier() && !matches!(self.peek(), TokenKind::LBrace) {
             if let Some(type_spec) = self.parse_type_specifier() {
                 loop {

@@ -192,6 +192,14 @@ fn for_each_operand_value(inst: &Instruction, mut f: impl FnMut(u32)) {
 
     match inst {
         Instruction::PgoCounterInc { .. } => {}
+        Instruction::GetStaticChain { .. } => {}
+        Instruction::SetStaticChain { src } => collect(src, &mut f),
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            f(buffer.0);
+            collect(chain, &mut f);
+        }
+        Instruction::NonlocalGotoSave { frame, .. } => f(frame.0),
+        Instruction::NonlocalGoto { chain, .. } => collect(chain, &mut f),
         Instruction::BinOp { lhs, rhs, .. } => {
             collect(lhs, &mut f);
             collect(rhs, &mut f);

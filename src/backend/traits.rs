@@ -2095,6 +2095,46 @@ pub trait ArchCodegen {
     /// Emit code to capture the second F64 return value after a function call.
     fn emit_get_return_f64_second(&mut self, dest: &Value);
 
+    // ── GNU C nested-function support (static chain, trampolines,
+    //    non-local goto). Default bodies fail closed with a diagnostic so
+    //    targets without nested-function support reject the construct
+    //    loudly instead of emitting wrong code.
+
+    /// Read the incoming static-chain register into `dest`.
+    fn emit_get_static_chain(&mut self, _dest: &Value) {
+        unimplemented_target("nested functions (static chain)");
+    }
+
+    /// Load `src` into the static-chain register before a nested-function call.
+    fn emit_set_static_chain(&mut self, _src: &Operand) {
+        unimplemented_target("nested functions (static chain)");
+    }
+
+    /// Build a trampoline: 15 bytes of code at `buffer` that loads the
+    /// static-chain register with `chain` and jumps to `func`.
+    fn emit_init_trampoline(&mut self, _buffer: &Value, _chain: &Operand, _func: &str) {
+        unimplemented_target("nested function trampolines");
+    }
+
+    /// Save the frame/stack pointers into the non-local-goto save area of
+    /// the frame at `frame` (offsets rbp_off/rsp_off).
+    fn emit_nonlocal_goto_save(&mut self, _frame: &Value, _rbp_off: i64, _rsp_off: i64) {
+        unimplemented_target("non-local goto");
+    }
+
+    /// Restore the frame/stack pointers from the save area (walking `up`
+    /// frame links from `chain`) and jump to `label`.
+    fn emit_nonlocal_goto(
+        &mut self,
+        _chain: &Operand,
+        _up: usize,
+        _rbp_off: i64,
+        _rsp_off: i64,
+        _label: &str,
+    ) {
+        unimplemented_target("non-local goto");
+    }
+
     /// Emit code to set the second F64 return value before a return.
     fn emit_set_return_f64_second(&mut self, src: &Operand);
 
@@ -2665,4 +2705,12 @@ pub fn emit_return_default(
         }
     }
     cg.emit_epilogue_and_ret(frame_size);
+}
+
+/// Fail closed for target-unsupported constructs (nested functions etc.).
+/// Emitting a diagnostic-worthy error from a trait default is not possible,
+/// so this panics with a clear message; the frontend routes these
+/// instructions only when the target supports them.
+fn unimplemented_target(what: &str) -> ! {
+    unimplemented!("target does not support {}", what)
 }

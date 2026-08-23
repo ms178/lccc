@@ -1732,6 +1732,7 @@ impl Driver {
                     }
                 }
 
+
                 // Renumber all terminator targets
                 for block in &mut func.blocks {
                     use crate::ir::reexports::Terminator;
@@ -1777,6 +1778,42 @@ impl Driver {
                 }
             }
             crate::pgo::remap_promoted_hot(&renumber_map);
+
+            // Rewrite `.LBB<n>` names inside static initializer DATA: the
+            // renumbering above updated every BlockId reference, but
+            // `GlobalInit::GlobalAddr` stores the label NAME as a string
+            // (`static void *t[] = { &&lbl };` lowered to `.quad .LBBn`).
+            // Without this rewrite the data pointed at the OLD label id
+            // while the function emitted the renumbered one — the computed
+            // goto jumped to a wrong/nonexistent block (gcc.c-torture
+            // 20071220-1: `.quad .LBB3` while `addr:` was emitted as
+            // `.LBB2`).
+            fn rewrite_init_labels(
+                init: &mut crate::ir::module::GlobalInit,
+                map: &FxHashMap<u32, u32>,
+            ) {
+                use crate::ir::module::GlobalInit;
+                match init {
+                    GlobalInit::GlobalAddr(name) => {
+                        if let Some(num) = name.strip_prefix(".LBB") {
+                            if let Ok(old) = num.parse::<u32>() {
+                                if let Some(&new) = map.get(&old) {
+                                    *name = format!(".LBB{}", new);
+                                }
+                            }
+                        }
+                    }
+                    GlobalInit::Compound(items) => {
+                        for element in items.iter_mut() {
+                            rewrite_init_labels(element, map);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for global in &mut module.globals {
+                rewrite_init_labels(&mut global.init, &renumber_map);
+            }
         }
 
         // PGO is post-optimization and post-label-renumber; profiles are

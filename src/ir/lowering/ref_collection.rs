@@ -145,6 +145,13 @@ impl Lowerer {
                 BlockItem::Statement(stmt) => {
                     self.collect_refs_from_stmt(stmt, refs);
                 }
+                // A nested function body may call static functions; those
+                // references keep the callees alive exactly like parent-body
+                // references do (the nested function is only reachable from
+                // the parent).
+                BlockItem::NestedFunction(nested) => {
+                    self.collect_refs_from_compound(&nested.body, refs);
+                }
             }
         }
     }

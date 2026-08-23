@@ -1320,6 +1320,12 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
 fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
     match inst {
         Instruction::PgoCounterInc { .. } => {}
+        // Nested-function support: GetStaticChain defines a dest; the others
+        // define nothing.
+        Instruction::SetStaticChain { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. }
+        | Instruction::NonlocalGoto { .. } => {}
         Instruction::Alloca { dest, .. }
         | Instruction::DynAlloca { dest, .. }
         | Instruction::Load { dest, .. }
@@ -1341,6 +1347,7 @@ fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
         | Instruction::GetReturnF128Second { dest }
         | Instruction::Select { dest, .. }
         | Instruction::StackSave { dest }
+        | Instruction::GetStaticChain { dest }
         | Instruction::ParamRef { dest, .. } => replace_val(dest, map),
 
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {

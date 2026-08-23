@@ -1353,7 +1353,20 @@ pub(super) fn emit_executable(
         );
         ph += 56;
     }
-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+    // Executable stack when ANY input object requests it (GNU semantics:
+    // .note.GNU-stack with SHF_EXECINSTR — set by nested-function
+    // trampolines). GNU ld ORs the flag across all inputs.
+    let exec_stack = objects.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|sec| sec.name == ".note.GNU-stack" && sec.flags & SHF_EXECINSTR != 0)
+    });
+    let stack_flags = if exec_stack {
+        PF_R | PF_W | PF_X
+    } else {
+        PF_R | PF_W
+    };
+    wphdr(&mut out, ph, PT_GNU_STACK, stack_flags, 0, 0, 0, 0, 0x10);
     ph += 56;
     if eh_frame_hdr_size > 0 {
         wphdr(

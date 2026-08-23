@@ -30,7 +30,10 @@ impl Lowerer {
         let has_declarations = compound
             .items
             .iter()
-            .any(|item| matches!(item, BlockItem::Declaration(_)));
+            .any(|item| {
+                matches!(item, BlockItem::Declaration(_))
+                    || matches!(item, BlockItem::NestedFunction(_))
+            });
 
         if has_declarations {
             // Push a scope frame to track additions/modifications in this block.
@@ -45,6 +48,9 @@ impl Lowerer {
                         self.lower_local_decl(decl);
                     }
                     BlockItem::Statement(stmt) => self.lower_stmt(stmt),
+                    BlockItem::NestedFunction(nested) => {
+                        self.lower_nested_function_def(nested);
+                    }
                 }
             }
 

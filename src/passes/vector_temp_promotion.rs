@@ -1404,7 +1404,12 @@ fn invalidate_for_memory_effects(
         }
         Instruction::Load { volatile: true, .. }
         | Instruction::AtomicLoad { .. }
-        | Instruction::Fence { .. } => available.clear(),
+        | Instruction::Fence { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. } => available.clear(),
+        Instruction::GetStaticChain { .. }
+        | Instruction::SetStaticChain { .. }
+        | Instruction::NonlocalGoto { .. } => {}
         Instruction::Memcpy { dest, .. } => {
             invalidate_for_value_write(available, *dest, roots, local_aliases)
         }

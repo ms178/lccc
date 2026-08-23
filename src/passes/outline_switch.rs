@@ -482,6 +482,18 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
         | Instruction::SetReturnF128Second { src } => {
             vop!(src, IrType::F64);
         }
+        Instruction::GetStaticChain { .. }
+        | Instruction::NonlocalGotoSave { .. } => {}
+        Instruction::SetStaticChain { src } => {
+            vop!(src, IrType::Ptr);
+        }
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            vop!(chain, IrType::Ptr);
+            f(*buffer, IrType::Ptr);
+        }
+        Instruction::NonlocalGoto { chain, .. } => {
+            vop!(chain, IrType::Ptr);
+        }
     }
 }
 
@@ -1245,6 +1257,41 @@ fn remap_instruction(
         Instruction::SetReturnF128Second { src } => {
             Instruction::SetReturnF128Second { src: remap_op(src) }
         }
+        Instruction::GetStaticChain { dest } => Instruction::GetStaticChain { dest: *dest },
+        Instruction::SetStaticChain { src } => {
+            Instruction::SetStaticChain { src: remap_op(src) }
+        }
+        Instruction::InitTrampoline {
+            buffer,
+            chain,
+            func,
+        } => Instruction::InitTrampoline {
+            buffer: *buffer,
+            chain: remap_op(chain),
+            func: func.clone(),
+        },
+        Instruction::NonlocalGotoSave {
+            frame,
+            rbp_off,
+            rsp_off,
+        } => Instruction::NonlocalGotoSave {
+            frame: *frame,
+            rbp_off: *rbp_off,
+            rsp_off: *rsp_off,
+        },
+        Instruction::NonlocalGoto {
+            chain,
+            up,
+            rbp_off,
+            rsp_off,
+            label,
+        } => Instruction::NonlocalGoto {
+            chain: remap_op(chain),
+            up: *up,
+            rbp_off: *rbp_off,
+            rsp_off: *rsp_off,
+            label: label.clone(),
+        },
     }
 }
 

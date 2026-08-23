@@ -718,7 +718,15 @@ pub(crate) fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32
         | Instruction::StackSave { .. }
         | Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
-        | Instruction::GetReturnF128Second { .. } => {}
+        | Instruction::GetReturnF128Second { .. }
+        | Instruction::GetStaticChain { .. } => {}
+        Instruction::SetStaticChain { src } => replace_op(src, map),
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            replace_val(buffer, map);
+            replace_op(chain, map);
+        }
+        Instruction::NonlocalGotoSave { frame, .. } => replace_val(frame, map),
+        Instruction::NonlocalGoto { chain, .. } => replace_op(chain, map),
 
         // ── Memory ───────────────────────────────────────────────────────
         Instruction::Store { val, ptr, .. } => {

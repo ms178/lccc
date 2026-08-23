@@ -3,7 +3,7 @@
 
 use super::lower::Lowerer;
 use crate::frontend::parser::ast::{Expr, ForInit, Stmt};
-use crate::ir::reexports::{BlockId, Instruction, Terminator};
+use crate::ir::reexports::{BlockId, Instruction, Operand, Terminator};
 
 impl Lowerer {
     pub(super) fn lower_if_stmt(
@@ -218,6 +218,30 @@ impl Lowerer {
     }
 
     pub(super) fn lower_goto_stmt(&mut self, label: &str) {
+        // GNU C non-local goto: a label of an ENCLOSING function targeted
+        // from a nested function. Restore the enclosing frame and jump.
+        let resolved = self.resolve_local_label(label);
+        if let Some(target) = self.func().nonlocal_labels.get(&resolved).cloned() {
+            let chain = self
+                .func()
+                .chain_value
+                .expect("non-local goto requires the static chain");
+            self.emit(Instruction::NonlocalGoto {
+                chain: Operand::Value(chain),
+                up: target.up,
+                rbp_off: target.rbp_off,
+                rsp_off: target.rsp_off,
+                label: target.label,
+            });
+            // Control never falls through a non-local goto: terminate the
+            // current block (flushing the NonlocalGoto instruction into it —
+            // start_block alone would CLEAR the unflushed buffer) and open a
+            // dead continuation block, exactly like a local goto.
+            let dead = self.fresh_label();
+            self.terminate(Terminator::Branch(dead));
+            self.start_block(dead);
+            return;
+        }
         // Determine the target label's scope depth (populated by prescan_label_depths).
         // Only emit cleanup calls for scopes being exited by the goto, i.e. scopes
         // deeper than the target label's scope depth.
@@ -296,6 +320,30 @@ impl Lowerer {
         self.func_mut().defined_user_labels.insert(key);
         self.terminate(Terminator::Branch(label));
         self.start_block(label);
+        // GNU C nested functions: a label targeted by non-local gotos (or
+        // whose address was taken by a nested function) exports a NAMED
+        // assembly alias here. The alias is emitted as an InlineAsm label —
+        // a real instruction that survives block merging and the global
+        // block-label renumbering, so cross-function jumps and &&label
+        // values stay correct.
+        let aliases = self
+            .func()
+            .pending_label_aliases
+            .get(&resolved_name)
+            .cloned()
+            .unwrap_or_default();
+        for alias in aliases {
+            self.emit(Instruction::InlineAsm {
+                template: format!("{}:", alias),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: Vec::new(),
+                operand_types: Vec::new(),
+                goto_labels: Vec::new(),
+                input_symbols: Vec::new(),
+                seg_overrides: Vec::new(),
+            });
+        }
         self.lower_stmt(stmt);
     }
 }

@@ -789,9 +789,17 @@ fn rewrite_uses_in_inst(inst: &mut Instruction, from: u32, to: u32) {
         | Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
         | Instruction::GetReturnF128Second { .. }
+        | Instruction::GetStaticChain { .. }
         | Instruction::StackSave { .. }
         | Instruction::ParamRef { .. }
         | Instruction::VaEnd { .. } => {}
+        Instruction::SetStaticChain { src } => rewrite_operand(src, from, to),
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            rewrite_value(buffer, from, to);
+            rewrite_operand(chain, from, to);
+        }
+        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, from, to),
+        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, from, to),
         Instruction::DynAlloca { size, .. } => rewrite_operand(size, from, to),
         Instruction::Store { val, ptr, .. } => {
             rewrite_operand(val, from, to);
