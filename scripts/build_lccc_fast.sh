@@ -19,6 +19,13 @@ cd "$repo_root"
 
 "$repo_root/scripts/ensure_swap.sh"
 
+# Prefer the persisted rustup installation after an Arena restore.  The
+# system-image Cargo is intentionally not the research baseline: it was 1.85
+# while this repository now pins Rust/Cargo 1.98.0 in rust-toolchain.toml.
+if [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+fi
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"

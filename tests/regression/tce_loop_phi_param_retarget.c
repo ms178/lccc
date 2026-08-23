@@ -35,7 +35,10 @@ lookup (const char *s, unsigned depth, unsigned salt)
 
   /* Retry path: tail call with SHIFTED arguments so the TCE phis carry
      different values per iteration (s advances, salt mixes the hash). */
-  return lookup (s + (h & 1), depth - 1, h ^ salt);
+  const char *retry = s;
+  if ((h & 1) != 0 && *s != '\0')
+    retry = s + 1;
+  return lookup (retry, depth - 1, h ^ salt);
 }
 
 int
