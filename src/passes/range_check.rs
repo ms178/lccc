@@ -19,7 +19,9 @@
 //! Pass name for CCC_DISABLE_PASSES: "range_fold".
 
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 
 /// A comparison, canonicalized to `value OP const` with an explicit role.
 #[derive(Clone, Copy)]
@@ -317,10 +319,11 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         next_id = func.max_value_id() + 1;
     }
 
-    // Def maps: value → its defining comparison / cast.
+    // Def maps: value → its defining comparison / cast / integer binop.
     let max_id = func.max_value_id() as usize;
     let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; max_id + 1];
     let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; max_id + 1];
+    let mut binop_defs: Vec<Option<(IrBinOp, Operand, Operand, IrType)>> = vec![None; max_id + 1];
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
@@ -347,16 +350,155 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
                         cast_defs[idx] = Some((*src, *from_ty, *to_ty));
                     }
                 }
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    let idx = dest.0 as usize;
+                    if idx < binop_defs.len() {
+                        binop_defs[idx] = Some((*op, *lhs, *rhs, *ty));
+                    }
+                }
                 _ => {}
             }
         }
     }
 
+    // One-block path-sensitive truth for the canonical short-circuit shape:
+    //
+    //   if (x <= 0) goto join; else goto check;
+    // check:
+    //   if ((unsigned)(x - 1) < UINT_MAX) goto join; else goto fail;
+    //
+    // On the false edge of `x <= 0`, signed 32-bit `x` is in [1, INT_MAX], so
+    // `(u32)(x - 1)` is in [0, INT_MAX-1] and is necessarily below UINT_MAX.
+    // GCC torture 20041114-1 uses this exact overflow-sensitive idiom to make
+    // the `link_failure` edge unreachable.  This is deliberately local and
+    // typed: no global range lattice is invented here, but the proof is strong
+    // enough to remove the dead edge without weakening C signed-overflow rules.
+    let mut block_known_pos_i32: Vec<Option<Value>> = vec![None; func.blocks.len()];
+    for (pred_idx, pred) in func.blocks.iter().enumerate() {
+        let Terminator::CondBranch {
+            cond: Operand::Value(cond_v),
+            true_label,
+            false_label,
+        } = pred.terminator
+        else {
+            continue;
+        };
+        let Some((op, lhs, rhs, ty)) = cmp_defs.get(cond_v.0 as usize).and_then(|x| *x) else {
+            continue;
+        };
+        if ty != IrType::I32 {
+            continue;
+        }
+        let known = match (op, lhs, rhs) {
+            (IrCmpOp::Sle, Operand::Value(x), Operand::Const(c)) if c.to_i64() == Some(0) => {
+                Some((false_label, x))
+            }
+            (IrCmpOp::Sgt, Operand::Value(x), Operand::Const(c)) if c.to_i64() == Some(0) => {
+                Some((true_label, x))
+            }
+            (IrCmpOp::Sge, Operand::Const(c), Operand::Value(x)) if c.to_i64() == Some(0) => {
+                Some((false_label, x))
+            }
+            (IrCmpOp::Slt, Operand::Const(c), Operand::Value(x)) if c.to_i64() == Some(0) => {
+                Some((true_label, x))
+            }
+            _ => None,
+        };
+        if let Some((label, x)) = known {
+            if let Some((idx, _)) = func
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, b)| b.label == label)
+            {
+                // Keep it single-predecessor: joining different path facts
+                // requires a real range lattice, not this local edge fact.
+                if func
+                    .blocks
+                    .iter()
+                    .filter(|b| match &b.terminator {
+                        Terminator::Branch(l) => *l == label,
+                        Terminator::CondBranch {
+                            true_label,
+                            false_label,
+                            ..
+                        } => *true_label == label || *false_label == label,
+                        _ => false,
+                    })
+                    .count()
+                    == 1
+                {
+                    let _ = pred_idx;
+                    block_known_pos_i32[idx] = Some(x);
+                }
+            }
+        }
+    }
+
     let mut changes = 0usize;
-    for block in &mut func.blocks {
+    for (block_idx, block) in func.blocks.iter_mut().enumerate() {
         let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
+        let known_pos = block_known_pos_i32[block_idx];
         for inst in block.instructions.drain(..) {
-            if let Some(replacements) = try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id)
+            let path_fold = if let (
+                Some(x),
+                Instruction::Cmp {
+                    dest,
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(cast_v),
+                    rhs: Operand::Const(limit),
+                    ty: IrType::U32,
+                },
+            ) = (known_pos, &inst)
+            {
+                if limit.to_i64() == Some(u32::MAX as i64) || limit.to_i64() == Some(-1) {
+                    let cast_src = cast_defs
+                        .get(cast_v.0 as usize)
+                        .and_then(|d| d.as_ref())
+                        .and_then(|(src, _from_ty, to_ty)| {
+                            if *to_ty == IrType::U32 {
+                                if let Operand::Value(v) = src {
+                                    Some(*v)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        });
+                    let is_x_minus_one = cast_src
+                        .and_then(|sub_v| binop_defs.get(sub_v.0 as usize).and_then(|d| d.as_ref()))
+                        .is_some_and(|(op, lhs, rhs, ty)| {
+                            *op == IrBinOp::Sub
+                                && *ty == IrType::I32
+                                && matches!(lhs, Operand::Value(v) if *v == x)
+                                && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1))
+                        });
+                    if is_x_minus_one {
+                        Some(Instruction::Copy {
+                            dest: *dest,
+                            src: Operand::Const(IrConst::I8(1)),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(replacement) = path_fold {
+                changes += 1;
+                new_insts.push(replacement);
+            } else if let Some(replacements) =
+                try_fold_select(&inst, &cmp_defs, &cast_defs, &mut next_id)
             {
                 changes += 1;
                 new_insts.extend(replacements);
