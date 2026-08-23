@@ -77,7 +77,22 @@ class AsmStats:
     vectors: int = 0
 
 
-def _function_body(lines: list[str], wanted: str | None) -> list[str]:
+_OPTIMIZED_FUNCTION_SUFFIX = re.compile(
+    r"^(?:constprop|isra|part|cold|llvm\.[A-Za-z0-9_.-]+)(?:\.\d+)*$"
+)
+
+
+def _label_is_function(wanted: str, actual: str) -> bool:
+    """Match a requested function and GCC/LLVM's local clone suffixes."""
+    if actual == wanted:
+        return True
+    prefix = wanted + "."
+    return actual.startswith(prefix) and bool(
+        _OPTIMIZED_FUNCTION_SUFFIX.fullmatch(actual[len(prefix):])
+    )
+
+
+def _function_body(lines: list[str], wanted: str | None) -> list[str] | None:
     if not wanted:
         return [line for line in lines if not _DIRECTIVE.match(line)]
     label = re.compile(r'^\s*"?([^"\s:]+)"?:\s*(?:[#;].*)?$')
@@ -89,14 +104,14 @@ def _function_body(lines: list[str], wanted: str | None) -> list[str]:
         if match and not match.group(1).startswith("."):
             if active:
                 break
-            active = match.group(1) == wanted
+            active = _label_is_function(wanted, match.group(1))
         if active and text.startswith(".size "):
             break
         if active and text.startswith(".cfi_endproc"):
             continue
         if active:
             out.append(line)
-    return out
+    return out if active else None
 
 
 def _stats(lines: Iterable[str], arch: str) -> AsmStats:
@@ -180,6 +195,11 @@ def _record_local(req: Request, executable: str) -> dict[str, Any]:
     lines = _local_compile(executable, req.source, req.local_flags or req.flags)
     elapsed = time.perf_counter() - started
     body = _function_body(lines, req.function)
+    if body is None:
+        raise godbolt.GodboltError(
+            f"function '{req.function}' was not emitted by local LCCC "
+            "(likely inlined or removed)"
+        )
     return {
         "key": "lccc",
         "id": str(Path(executable).resolve()),
@@ -203,6 +223,11 @@ def _record_remote(name: str, source: str, req: Request, compilers: list[dict[st
     lines = _compile_remote(name, source, flags)
     elapsed = time.perf_counter() - started
     body = _function_body(lines, req.function)
+    if body is None:
+        raise godbolt.GodboltError(
+            f"function '{req.function}' was not emitted by {name} "
+            "(likely inlined or removed)"
+        )
     return {
         "key": name,
         **metadata,

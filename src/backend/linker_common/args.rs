@@ -55,6 +55,14 @@ pub struct LinkerArgs {
     pub exclude_libs: Vec<String>,
     /// `--version-script=FILE`: restricts the exported symbol set.
     pub version_script: Option<String>,
+    /// Requested ELF interpreter from `--dynamic-linker=PATH`.
+    ///
+    /// The default remains the target ABI interpreter.  Keeping this in the
+    /// parsed argument object is important for sysroot/staging builds (and for
+    /// testing a freshly built libc without replacing the host loader):
+    /// silently hard-wiring `/lib64/ld-linux-x86-64.so.2` makes an otherwise
+    /// valid binary execute against the wrong libc.
+    pub dynamic_linker: Option<String>,
     /// `-soname=NAME`: DT_SONAME recorded in a shared library.
     pub soname: Option<String>,
     /// `-Bsymbolic` / `-Bsymbolic-functions`: bind global references inside a
@@ -134,6 +142,17 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
         } else if arg == "-Map" && i + 1 < args.len() {
             i += 1;
             result.map_path = Some(args[i].to_string());
+        } else if let Some(v) = arg.strip_prefix("--dynamic-linker=") {
+            if !v.is_empty() {
+                result.dynamic_linker = Some(v.to_string());
+            }
+        } else if arg == "--dynamic-linker" || arg == "-dynamic-linker" || arg == "-I" {
+            if i + 1 < args.len() {
+                i += 1;
+                if !args[i].is_empty() {
+                    result.dynamic_linker = Some(args[i].to_string());
+                }
+            }
         } else if arg == "-static" {
             result.is_static = true;
         } else if let Some(path) = arg.strip_prefix("-L") {
@@ -172,6 +191,21 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
                 let part = parts[j];
                 if part == "--export-dynamic" || part == "-export-dynamic" || part == "-E" {
                     result.export_dynamic = true;
+                } else if let Some(v) = part.strip_prefix("--dynamic-linker=") {
+                    if !v.is_empty() {
+                        result.dynamic_linker = Some(v.to_string());
+                    }
+                } else if let Some(v) = part.strip_prefix("-dynamic-linker=") {
+                    if !v.is_empty() {
+                        result.dynamic_linker = Some(v.to_string());
+                    }
+                } else if (part == "--dynamic-linker" || part == "-dynamic-linker" || part == "-I")
+                    && j + 1 < parts.len()
+                {
+                    j += 1;
+                    if !parts[j].is_empty() {
+                        result.dynamic_linker = Some(parts[j].to_string());
+                    }
                 } else if let Some(rp) = part.strip_prefix("-rpath=") {
                     result.rpath_entries.push(rp.to_string());
                 } else if part == "-rpath" && j + 1 < parts.len() {
@@ -377,6 +411,24 @@ mod map_arg_tests {
                 .as_deref(),
             Some("out.map")
         );
+    }
+
+    #[test]
+    fn dynamic_linker_is_preserved_in_driver_and_ld_spellings() {
+        for argv in [
+            vec!["--dynamic-linker=/tmp/ld.so"],
+            vec!["--dynamic-linker", "/tmp/ld.so"],
+            vec!["-Wl,--dynamic-linker=/tmp/ld.so"],
+            vec!["-Wl,--dynamic-linker,/tmp/ld.so"],
+        ] {
+            assert_eq!(
+                parse_linker_args(&args(&argv))
+                    .dynamic_linker
+                    .as_deref(),
+                Some("/tmp/ld.so"),
+                "argv={argv:?}"
+            );
+        }
     }
 
     #[test]

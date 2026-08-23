@@ -183,10 +183,32 @@ def assembly_lines(result: dict[str, Any]) -> list[str]:
     return [item.get("text", "") for item in (result.get("asm") or [])]
 
 
-def _function_body(lines: list[str], wanted: str | None) -> list[str]:
+_OPTIMIZED_FUNCTION_SUFFIX = re.compile(
+    r"^(?:constprop|isra|part|cold|llvm\.[A-Za-z0-9_.-]+)(?:\.\d+)*$"
+)
+
+
+def _label_is_function(wanted: str, actual: str) -> bool:
+    """Match compiler-created clone suffixes without matching a new symbol.
+
+    GCC routinely turns ``foo`` into ``foo.constprop.0``/``foo.isra.0``.
+    Treating that as an absent function silently produced a zero-instruction
+    oracle row, which is worse than a hard failure because it can make a bad
+    compiler look optimal.  Only the documented optimization suffix families
+    are accepted; ``foo_helper`` remains a different function.
+    """
+    if actual == wanted:
+        return True
+    prefix = wanted + "."
+    return actual.startswith(prefix) and bool(
+        _OPTIMIZED_FUNCTION_SUFFIX.fullmatch(actual[len(prefix):])
+    )
+
+
+def _function_body(lines: list[str], wanted: str | None) -> list[str] | None:
     if not wanted:
         return lines
-    # Handles foo:, "foo": (GCC CE output), and foo: # comments.
+    # Handles foo:, foo.constprop.0:, "foo": (GCC CE output), and comments.
     label = re.compile(r'^\s*"?([^"\s:]+)"?:\s*(?:[#;].*)?$')
     out: list[str] = []
     active = False
@@ -195,10 +217,14 @@ def _function_body(lines: list[str], wanted: str | None) -> list[str]:
         if match and not match.group(1).startswith("."):
             if active:
                 break
-            active = match.group(1) == wanted
+            active = _label_is_function(wanted, match.group(1))
+        if active and line.strip().startswith(".size "):
+            break
+        if active and line.strip().startswith(".cfi_endproc"):
+            continue
         if active:
             out.append(line)
-    return out
+    return out if active else None
 
 
 def _instruction_count(lines: list[str]) -> int:
@@ -250,6 +276,10 @@ def command_compile(args: argparse.Namespace) -> int:
     if result is None:
         return 1
     lines = _function_body(assembly_lines(result), args.function)
+    if lines is None:
+        print(f"godbolt: function '{args.function}' was not emitted (likely inlined or removed)",
+              file=sys.stderr)
+        return 1
     print("\n".join(lines))
     return 0
 
@@ -266,6 +296,11 @@ def command_compare(args: argparse.Namespace) -> int:
     try:
         local_lines = _compile_local(args.local, args.source, args.local_flags or args.flags)
         local_body = _function_body(local_lines, args.function)
+        if local_body is None:
+            raise GodboltError(
+                f"function '{args.function}' was not emitted by local LCCC "
+                "(likely inlined or removed)"
+            )
         records.append({
             "key": "lccc", "id": str(Path(args.local)), "name": "local LCCC",
             "flags": args.local_flags or args.flags,
@@ -283,6 +318,12 @@ def command_compare(args: argparse.Namespace) -> int:
             records.append({"key": requested_name, **meta, "error": "compile failed"})
             continue
         body = _function_body(assembly_lines(result), args.function)
+        if body is None:
+            records.append({
+                "key": requested_name, **meta, "flags": args.flags,
+                "error": f"function '{args.function}' was not emitted (likely inlined or removed)",
+            })
+            continue
         records.append({
             "key": requested_name, **meta, "flags": args.flags,
             "instructions": _instruction_count(body), "assembly": body,

@@ -351,5 +351,47 @@ pub fn register_symbols_elf64<G: GlobalSymbolOps>(
             globals.insert(sym.name.to_string(), G::new_undefined(sym));
         }
     }
+
+    // `.symver real, public@@VERSION` creates a versioned definition but
+    // ordinary references inside the same DSO remain spelled `public`.
+    // GNU ld binds that unversioned reference to the default (`@@`) version;
+    // leaving only the composed name in the global table makes it look
+    // undefined and forces an accidental host-libc dependency. Install a
+    // non-versioned alias for every default-version definition after the main
+    // pass, so it also works when the unversioned reference appeared earlier
+    // in this object. Non-default `@VERSION` entries intentionally do not get
+    // an alias.
+    for sym in &obj.symbols {
+        if sym.sym_type() == STT_SECTION
+            || sym.sym_type() == STT_FILE
+            || sym.name.is_empty()
+            || sym.is_local()
+            || sym.is_undefined()
+        {
+            continue;
+        }
+        let full_name = sym.name.to_string();
+        let Some(pos) = full_name.find("@@") else {
+            continue;
+        };
+        let base = &full_name[..pos];
+        if base.is_empty() {
+            continue;
+        }
+        let alias = G::new_defined(obj_idx, sym);
+        match globals.get_mut(base) {
+            None => {
+                globals.insert(base.to_string(), alias);
+            }
+            Some(existing)
+                if !existing.is_defined()
+                    || should_replace_extra(existing)
+                    || (existing.info() >> 4 == STB_WEAK) =>
+            {
+                *existing = alias;
+            }
+            Some(_) => {}
+        }
+    }
     Ok(())
 }

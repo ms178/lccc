@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeSet;
 
 use super::elf::*;
-use super::types::{GlobalSymbol, BASE_ADDR, INTERP, PAGE_SIZE};
+use super::types::{GlobalSymbol, BASE_ADDR, PAGE_SIZE};
 use crate::backend::elf::{elf64_sym_entry, push_strtab_name};
 use crate::backend::linker_common::{self, DynStrTab, OutputSection};
 
@@ -28,6 +28,7 @@ fn dynsym_emit_name(name: &str) -> &str {
 
 pub(super) fn emit_executable(
     objects: &[ElfObject],
+    interp: &[u8],
     globals: &mut FxHashMap<String, GlobalSymbol>,
     output_sections: &mut [OutputSection],
     section_map: &FxHashMap<(usize, usize), (usize, u64)>,
@@ -554,7 +555,7 @@ pub(super) fn emit_executable(
     let interp_offset = offset;
     let interp_addr = vaddr!(offset);
     if !is_static {
-        offset += INTERP.len() as u64;
+        offset += interp.len() as u64;
     }
 
     offset = (offset + 7) & !7;
@@ -1271,8 +1272,8 @@ pub(super) fn emit_executable(
             PF_R,
             interp_offset,
             interp_addr,
-            INTERP.len() as u64,
-            INTERP.len() as u64,
+            interp.len() as u64,
+            interp.len() as u64,
             1,
         );
         ph += 56;
@@ -1393,7 +1394,7 @@ pub(super) fn emit_executable(
     // Dynamic linking sections (skipped for static executables)
     if !is_static {
         // .interp
-        write_bytes(&mut out, interp_offset as usize, INTERP);
+        write_bytes(&mut out, interp_offset as usize, interp);
 
         // .gnu.hash - proper hash table so dynamic linker can find copy-reloc symbols
         let gh = gnu_hash_offset as usize;
@@ -2430,7 +2431,7 @@ pub(super) fn emit_executable(
             SHF_ALLOC,
             interp_addr,
             interp_offset,
-            INTERP.len() as u64,
+            interp.len() as u64,
             0,
             0,
             1,
