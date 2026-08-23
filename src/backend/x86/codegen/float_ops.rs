@@ -144,15 +144,24 @@ impl X86Codegen {
                 }
             }
             _ => {
-                self.operand_to_rax(op);
-                if ty == IrType::F32 {
-                    self.state.emit("    movd %eax, %xmm1");
-                    self.state
-                        .emit_fmt(format_args!("    movss %xmm1, %{}", reg));
+                // Pick a scratch register that does not alias the final
+                // target. Before this fix the F32/F64 fallback hard-coded
+                // %xmm1, clobbering the destination when callers passed
+                // reg == "xmm1" (e.g. the FMA path loading mul_lhs into xmm1).
+                // We simply load directly into the target via rax/rcx.
+                let gpr = if reg == "xmm0" { "rax" } else { "rcx" };
+                let gpr32 = if reg == "xmm0" { "eax" } else { "ecx" };
+                if gpr == "rax" {
+                    self.operand_to_rax(op);
                 } else {
-                    self.state.emit("    movq %rax, %xmm1");
+                    self.operand_to_rcx(op);
+                }
+                if ty == IrType::F32 {
                     self.state
-                        .emit_fmt(format_args!("    movsd %xmm1, %{}", reg));
+                        .emit_fmt(format_args!("    movd %{}, %{}", gpr32, reg));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", gpr, reg));
                 }
             }
         }
@@ -208,53 +217,55 @@ impl X86Codegen {
                 }
                 self.operand_to_rcx(rhs);
                 if ty == IrType::F32 {
-                    self.state.emit("    movd %ecx, %xmm1");
+                    self.state.emit_fmt(format_args!("    movd %ecx, %{}", reg));
                 } else {
-                    self.state.emit("    movq %rcx, %xmm1");
+                    self.state.emit_fmt(format_args!("    movq %rcx, %{}", reg));
                 }
                 self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %{}, %{}",
-                    mnemonic, suffix, reg, reg
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, suffix, reg, reg, reg
                 ));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
                 if bits == 0 {
-                    self.state.emit("    xorpd %xmm1, %xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
                     self.state
-                        .emit_fmt(format_args!("    movsd {}(%rip), %xmm1", label));
+                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", label, reg));
                 }
                 self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %{}, %{}",
-                    mnemonic, suffix, reg, reg
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, suffix, reg, reg, reg
                 ));
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
                 if bits == 0 {
-                    self.state.emit("    xorps %xmm1, %xmm1");
+                    self.state
+                        .emit_fmt(format_args!("    xorps %{}, %{}", reg, reg));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
                     self.state
-                        .emit_fmt(format_args!("    movss {}(%rip), %xmm1", label));
+                        .emit_fmt(format_args!("    movss {}(%rip), %{}", label, reg));
                 }
                 self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %{}, %{}",
-                    mnemonic, suffix, reg, reg
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, suffix, reg, reg, reg
                 ));
             }
             _ => {
                 self.operand_to_rcx(rhs);
                 if ty == IrType::F32 {
-                    self.state.emit("    movd %ecx, %xmm1");
+                    self.state.emit_fmt(format_args!("    movd %ecx, %{}", reg));
                 } else {
-                    self.state.emit("    movq %rcx, %xmm1");
+                    self.state.emit_fmt(format_args!("    movq %rcx, %{}", reg));
                 }
                 self.state.emit_fmt(format_args!(
-                    "    {}{} %xmm1, %{}, %{}",
-                    mnemonic, suffix, reg, reg
+                    "    {}{} %{}, %{}, %{}",
+                    mnemonic, suffix, reg, reg, reg
                 ));
             }
         }
@@ -730,8 +741,19 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let name = phys_reg_name(reg);
                         if name != xmm {
+                            // Use the type-appropriate scalar move (movsd for
+                            // F64, movss for F32). `movaps` here was a domain-
+                            // crossing bug: on scalar FP values it is 1) a
+                            // partial-register dependency on the old content
+                            // of `xmm` (since movaps writes the full register
+                            // but downstream code only consumes the low 64/32
+                            // bits, creating false dependencies) and 2) can
+                            // trigger SSE/AVX transition stalls on non-VEX
+                            // paths. Scalar moves zero-extend the high lanes
+                            // exactly like GCC/Clang/ICX produce.
+                            let mv = if ty == IrType::F32 { "movss" } else { "movsd" };
                             self.state
-                                .emit_fmt(format_args!("    movaps %{}, %{}", name, xmm));
+                                .emit_fmt(format_args!("    {} %{}, %{}", mv, name, xmm));
                         }
                     } else {
                         let gpr = phys_reg_name(reg);

@@ -7,7 +7,7 @@ CCC=${CCC:-./target/release/lccc}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out=$(mktemp "${TMPDIR:-/tmp}/lccc-fma-codegen.XXXXXX.s")
 trap 'rm -f "$out"' EXIT
-"$CCC" -O2 -march=x86-64-v3 -S "$dir/fma_dest_coalesce.c" -o "$out"
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=fast -S "$dir/fma_dest_coalesce.c" -o "$out"
 python3 - "$out" <<'PY'
 import re
 import sys

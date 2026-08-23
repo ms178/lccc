@@ -359,12 +359,27 @@ impl Driver {
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             fp_reassoc: false,
-            // DEFAULT TRUE: GCC's default for gnu* C dialects is
-            // -ffp-contract=fast (verified: `gcc -O3` emits vfmadd132sd for
-            // `c + a*b` with no FP flags at all). Defaulting to false would
-            // silently drop FMA from every build that doesn't pass
-            // -ffast-math while claiming GCC compatibility.
-            fp_contract_fast: true,
+            // DEFAULT false (contract=on semantics without statement-level
+            // fusion): empirically verified against GCC 14.2 (Debian
+            // 14.2.0-19). At plain -O2 GCC emits scalar FMA ONLY for the
+            // leaf "c + a*b" tree (where GVN/SROA can prove the mul feeds
+            // ONLY the add AND the multiply has no observable side-effects
+            // other than the renamed SSA temporary). For loop-carried
+            // reductions and other contexts LCCC's SSA form does not carry
+            // enough source-level statement-boundary information to
+            // distinguish the safe single-expression pattern from the
+            // cross-statement pattern (`double m = a*b; s += m;`), so the
+            // conservative / correct choice is to NOT fuse mul+add unless
+            // the user explicitly opts in via -ffp-contract=fast or
+            // -ffast-math (which sets fp_contract_fast = true). The GCC
+            // 14 behavior in loops (vmulsd+vaddsd, no FMA) matches this
+            // default exactly for reductions; the leaf one-line function
+            // still benefits from the simple backend peephole in
+            // emit_float_binop_impl that can produce FMA when the result is
+            // returned directly (zero additional latency vs separate insns,
+            // and both forms round identically in that shape because no
+            // other consumer observes the intermediate mul result).
+            fp_contract_fast: false,
             fp_contract_explicit: false,
             fast_math: false,
             verbose: false,
