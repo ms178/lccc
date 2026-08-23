@@ -202,6 +202,12 @@ struct GvnState {
     /// clobbering instruction is encountered, bump this counter; cached
     /// load entries with older generations are considered stale.
     load_generation: u32,
+    /// Epoch for loads/forwards through pointers with no provably unique base.
+    /// Such a pointer may alias any tracked object, so every store (even a
+    /// store to a known alloca/global whose own base epoch is precise) must
+    /// invalidate unknown-pointer entries. This preserves the optimization win
+    /// for distinct known globals while closing the classic STORE-CCP hole.
+    unknown_ptr_epoch: u64,
     /// Store-to-load forwarding map with the version recorded after the store.
     store_fwd_map: FxHashMap<StoreFwdKey, (Operand, MemoryVersion)>,
     /// Pointer value number -> provably-distinct base object, for pointers
@@ -280,6 +286,7 @@ impl GvnState {
             load_expr_to_value: FxHashMap::default(),
             gep_value_numbers: FxHashMap::default(),
             load_generation: 0,
+            unknown_ptr_epoch: 0,
             store_fwd_map: FxHashMap::default(),
             ptr_base: FxHashMap::default(),
             base_store_epoch: FxHashMap::default(),
@@ -355,13 +362,15 @@ impl GvnState {
     /// since. Stores to other (disjoint) globals do not invalidate it.
     fn memory_version(&self, ptr_vn: &VNOperand) -> MemoryVersion {
         let base = match ptr_vn {
-            VNOperand::ValueNum(v) => self
-                .ptr_base
-                .get(v)
-                .and_then(|base| self.base_store_epoch.get(&obj_key(base)))
-                .copied()
-                .unwrap_or(0),
-            VNOperand::Const(_) => 0,
+            VNOperand::ValueNum(v) => match self.ptr_base.get(v) {
+                Some(base) => self
+                    .base_store_epoch
+                    .get(&obj_key(base))
+                    .copied()
+                    .unwrap_or(0),
+                None => self.unknown_ptr_epoch,
+            },
+            VNOperand::Const(_) => self.unknown_ptr_epoch,
         };
         MemoryVersion {
             global: self.load_generation,
@@ -703,6 +712,7 @@ impl GvnState {
             vn_log_start: self.vn_log.len(),
             base_epoch_log_start: self.base_epoch_log.len(),
             saved_load_generation: self.load_generation,
+            saved_unknown_ptr_epoch: self.unknown_ptr_epoch,
         }
     }
 
@@ -773,8 +783,9 @@ impl GvnState {
             }
         }
 
-        // Rollback: restore load_generation
+        // Rollback: restore memory epochs
         self.load_generation = checkpoint.saved_load_generation;
+        self.unknown_ptr_epoch = checkpoint.saved_unknown_ptr_epoch;
     }
 }
 
@@ -787,6 +798,7 @@ struct ScopeCheckpoint {
     vn_log_start: usize,
     base_epoch_log_start: usize,
     saved_load_generation: u32,
+    saved_unknown_ptr_epoch: u64,
 }
 
 /// Find param allocas whose address has escaped (used in non-Load/Store contexts).
@@ -1222,6 +1234,11 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
             ptr, seg_override, ..
         } = &inst
         {
+            // Unknown-base pointer loads/forwards may alias any store.  Bump a
+            // separate epoch on every store so a cached `load *p` where `p` is
+            // a phi of multiple roots cannot survive a later `store &b` just
+            // because that store also has a precise per-base epoch.
+            state.unknown_ptr_epoch = state.unknown_ptr_epoch.saturating_add(1);
             if *seg_override != AddressSpace::Default {
                 state.load_generation += 1;
             } else {

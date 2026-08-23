@@ -174,10 +174,35 @@ fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
                         }
                     }
                 }
-                Instruction::GetElementPtr { .. }
-                | Instruction::Copy { .. }
-                | Instruction::Phi { .. } => {
+                Instruction::GetElementPtr { .. } | Instruction::Copy { .. } => {
                     // Pure derivations, tracked in root_suffix above.
+                }
+                Instruction::Phi { incoming, .. } => {
+                    // A phi that merges pointers to DIFFERENT allocation roots
+                    // is not a precise aggregate-field derivation.  The fixpoint
+                    // deliberately tombstones the phi result in that case, but
+                    // the incoming roots still flow to an untracked pointer; if
+                    // a later load uses the phi, it may read any of those roots.
+                    // Treat all such incoming roots as escaped instead of
+                    // deleting their stores as "unread".  This is the STORE-CCP
+                    // family from gcc.c-torture/execute/20041019-1.c and
+                    // 20070212-2.c (`p = k ? &i1 : &j1; i1 = 0; return *p`).
+                    let mut value_incomings = 0usize;
+                    let roots: Vec<u32> = incoming
+                        .iter()
+                        .filter_map(|(op, _)| match op {
+                            Operand::Value(v) => {
+                                value_incomings += 1;
+                                root_suffix.get(&v.0).map(|(root, _)| *root)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !roots.is_empty()
+                        && (roots.len() != value_incomings || roots.iter().any(|r| *r != roots[0]))
+                    {
+                        escaping.extend(roots);
+                    }
                 }
                 _ => {
                     // Escape every tracked root referenced by any operand,

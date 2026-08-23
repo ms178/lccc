@@ -62,7 +62,7 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     sorted_loops.sort_by_key(|l| l.body.len());
 
     for natural_loop in &sorted_loops {
-        total_hoisted += hoist_loop_invariants(func, natural_loop, &cfg.preds, &alloca_info);
+        total_hoisted += hoist_loop_invariants(func, natural_loop, &cfg.preds, &cfg.idom, &alloca_info);
     }
 
     total_hoisted
@@ -866,6 +866,21 @@ fn is_load_hoistable(
     })
 }
 
+fn dominates_block(idom: &[usize], a: usize, mut b: usize) -> bool {
+    if a == b {
+        return true;
+    }
+    let mut guard = 0usize;
+    while b < idom.len() && idom[b] != b && guard <= idom.len() {
+        b = idom[b];
+        if a == b {
+            return true;
+        }
+        guard += 1;
+    }
+    false
+}
+
 /// Hoist loop-invariant instructions from a natural loop to a preheader.
 ///
 /// Returns the number of instructions hoisted.
@@ -873,6 +888,7 @@ fn hoist_loop_invariants(
     func: &mut IrFunction,
     natural_loop: &NaturalLoop,
     preds: &analysis::FlatAdj,
+    idom: &[usize],
     alloca_info: &AllocaAnalysis,
 ) -> usize {
     let header = natural_loop.header;
@@ -1108,8 +1124,18 @@ fn hoist_loop_invariants(
                 {
                     // Volatile loads must execute exactly as written: hoisting
                     // one out of its loop changes the number of observable
-                    // accesses (C11 5.1.2.3).
+                    // accesses (C11 5.1.2.3). Non-volatile loads also must not
+                    // be speculated from a conditional loop block into the
+                    // preheader: `if (p) x = *p;` inside the loop may be safe
+                    // for `p == NULL`, while the hoisted load would fault
+                    // before the guard (gcc.c-torture/execute/20051215-1.c).
+                    // Require the load's original block to dominate every
+                    // loop block, i.e. it is must-execute for any iteration.
                     !*volatile
+                        && natural_loop
+                            .body
+                            .iter()
+                            .all(|&b| dominates_block(idom, block_idx, b))
                         && is_load_hoistable(
                             ptr,
                             alloca_info,

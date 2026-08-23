@@ -1277,13 +1277,22 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movq %{}, {}(%rsp)", reg_name, rsp_offset));
                 }
             }
+            let actual_stack = frame_size.max(n_saves * 8);
             if self.state.emit_cfi {
-                let actual_stack = frame_size.max(n_saves * 8);
                 self.state
                     .emit_fmt(format_args!("    .cfi_def_cfa_offset {}", actual_stack + 8));
             }
             self.state.out.use_rsp_addressing = true;
-            self.state.out.rsp_frame_size = frame_size;
+            // RSP-relative addressing models a virtual frame base at the
+            // caller's entry %rsp.  When the empty-local-frame elision keeps a
+            // leaf function at `frame_size == 0` but the register allocator
+            // still saved callee-saved homes with push/pop, the live %rsp is
+            // below entry by `n_saves * 8`.  Positive references to stack
+            // parameters therefore need the save area in the displacement.
+            // Keeping `rsp_frame_size == 0` made the 7th+ integer parameters
+            // reload saved registers instead of caller arguments
+            // (gcc.c-torture/execute/20010518-1.c returned 187 instead of 91).
+            self.state.out.rsp_frame_size = actual_stack;
         } else {
             // Traditional frame-pointer prologue.
             // Reset RSP-relative addressing flag: a previous FPO function may have

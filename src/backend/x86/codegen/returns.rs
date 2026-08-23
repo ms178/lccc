@@ -170,61 +170,27 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_get_return_f64_second_impl(&mut self, dest: &Value) {
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.state
-                .out
-                .emit_instr_reg_rbp("    movsd", "xmm1", slot.0);
-        }
+        self.store_xmm_to(dest, "xmm1", IrType::F64);
     }
 
     pub(super) fn emit_set_return_f64_second_impl(&mut self, src: &Operand) {
-        match src {
-            Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movsd", slot.0, "xmm1");
-                }
-            }
-            Operand::Const(IrConst::F64(_)) => {
-                self.emit_fp_operand_to_xmm(src, IrType::F64, "xmm1");
-                self.state.reg_cache.invalidate_all();
-            }
-            _ => {
-                self.operand_to_rax(src);
-                self.state.emit("    movq %rax, %xmm1");
-                self.state.reg_cache.invalidate_all();
-            }
-        }
+        // The imaginary half of `_Complex double` is returned in %xmm1.  The
+        // old implementation only handled stack-resident SSA values; if the
+        // imaginary value was register-allocated (the optimized common case),
+        // it emitted nothing and left %xmm1 stale/uninitialized.  Route through
+        // the normal FP operand loader so XMM/GPR/slot/constant sources are all
+        // handled identically to call arguments and comparisons.
+        self.emit_fp_operand_to_xmm(src, IrType::F64, "xmm1");
+        self.state.reg_cache.invalidate_all();
     }
 
     pub(super) fn emit_get_return_f32_second_impl(&mut self, dest: &Value) {
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.state
-                .out
-                .emit_instr_reg_rbp("    movss", "xmm1", slot.0);
-        }
+        self.store_xmm_to(dest, "xmm1", IrType::F32);
     }
 
     pub(super) fn emit_set_return_f32_second_impl(&mut self, src: &Operand) {
-        match src {
-            Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state
-                        .out
-                        .emit_instr_rbp_reg("    movss", slot.0, "xmm1");
-                }
-            }
-            Operand::Const(IrConst::F32(_)) => {
-                self.emit_fp_operand_to_xmm(src, IrType::F32, "xmm1");
-                self.state.reg_cache.invalidate_all();
-            }
-            _ => {
-                self.operand_to_rax(src);
-                self.state.emit("    movd %eax, %xmm1");
-                self.state.reg_cache.invalidate_all();
-            }
-        }
+        self.emit_fp_operand_to_xmm(src, IrType::F32, "xmm1");
+        self.state.reg_cache.invalidate_all();
     }
 
     pub(super) fn emit_get_return_f128_second_impl(&mut self, dest: &Value) {
