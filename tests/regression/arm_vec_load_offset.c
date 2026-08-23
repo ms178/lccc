@@ -5,7 +5,7 @@
  * 512*(a[0]+a[1]) instead of the true sum (8704 vs 1578496 on this input).
  * F64 reductions and the NEON map transform hit the same hole.
  * On x86 this test also guards the SSE2/AVX2 offset paths. */
-#include <stdio.h>
+extern int printf(const char *, ...);
 
 static int a32[1024];
 static double f64[512];

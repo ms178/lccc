@@ -1,5 +1,12 @@
-#include <stdint.h>
-#include <stdio.h>
+/* Freestanding typedefs keep the AArch64 structural regression independent of
+ * host/cross libc header layout. The test is also runnable on native x86 via
+ * the normal regression harness, so keep the printf declaration. */
+typedef unsigned int uint32_t;
+typedef int int32_t;
+typedef unsigned long uint64_t;
+#define UINT32_MAX (~0u)
+#define UINT64_MAX (~0ul)
+extern int printf(const char *, ...);
 
 static volatile uint32_t observed;
 

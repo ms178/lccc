@@ -769,12 +769,47 @@ impl ArmCodegen {
     ///   4. fallback → load lhs→x1, rhs→x0, `cmp w1/x1, w0/x0`
     ///      Used by both emit_cmp and emit_fused_cmp_branch.
     pub(super) fn emit_int_cmp_insn(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) {
-        let use_32bit = ty == IrType::I32
-            || ty == IrType::U32
-            || ty == IrType::I8
-            || ty == IrType::U8
-            || ty == IrType::I16
-            || ty == IrType::U16;
+        // AArch64 has no byte/halfword compare. For an IR compare whose type is
+        // I8/U8/I16/U16, compare the low subword after the correct
+        // sign/zero-extension. Using the 32-bit register name directly is
+        // wrong when the producer is a packed/wide value: gcc torture
+        // 20171008-1 compared a struct's c1 byte but the register also held
+        // uninitialized c2..c4 bits, so `cmp wN,#0` spuriously aborted.
+        if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
+            let ext = match ty {
+                IrType::I8 => "sxtb",
+                IrType::U8 => "uxtb",
+                IrType::I16 => "sxth",
+                IrType::U16 => "uxth",
+                _ => unreachable!(),
+            };
+            if let Operand::Value(lv) = lhs {
+                if let Some((_x, w)) = self.value_reg_name(lv) {
+                    self.state.emit_fmt(format_args!("    {} w1, {}", ext, w));
+                } else {
+                    self.operand_to_x0(lhs);
+                    self.state.emit_fmt(format_args!("    {} w1, w0", ext));
+                }
+            } else {
+                self.operand_to_x0(lhs);
+                self.state.emit_fmt(format_args!("    {} w1, w0", ext));
+            }
+            if let Operand::Value(rv) = rhs {
+                if let Some((_x, w)) = self.value_reg_name(rv) {
+                    self.state.emit_fmt(format_args!("    {} w0, {}", ext, w));
+                } else {
+                    self.operand_to_x0(rhs);
+                    self.state.emit_fmt(format_args!("    {} w0, w0", ext));
+                }
+            } else {
+                self.operand_to_x0(rhs);
+                self.state.emit_fmt(format_args!("    {} w0, w0", ext));
+            }
+            self.state.emit("    cmp w1, w0");
+            return;
+        }
+
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
         // Try optimized path: lhs in register, rhs is immediate
         if let Operand::Value(lv) = lhs {
@@ -2804,9 +2839,20 @@ impl ArchCodegen for ArmCodegen {
         self.state
             .emit_fmt(format_args!("    mov x9, {}", callee_saved_name(reg)));
     }
-    fn emit_memcpy_store_dest_from_acc(&mut self) {}
+    fn emit_memcpy_store_dest_from_acc(&mut self) {
+        // The shared memcpy skeleton resolves the destination first into the
+        // architecture address register (x9), then resolves the source.  On ARM
+        // source resolution also uses x9 as its accumulator, so a register- or
+        // over-aligned source used to overwrite a register destination:
+        //   mov x9, <dest>; mov x9, <src>; mov x10, x9; copy [x10] -> [x9]
+        // i.e. source copied to itself.  Save the destination in x11 until the
+        // source hook has copied x9 to x10; emit_memcpy_impl may freely reuse
+        // x11 afterwards.
+        self.state.emit("    mov x11, x9");
+    }
     fn emit_memcpy_store_src_from_acc(&mut self) {
         self.state.emit("    mov x10, x9");
+        self.state.emit("    mov x9, x11");
     }
     fn emit_call_spill_fptr(&mut self, func_ptr: &Operand) {
         self.operand_to_x0(func_ptr);

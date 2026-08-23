@@ -419,7 +419,77 @@ impl ArmCodegen {
                 }
 
                 let rhs_phys = self.operand_reg(rhs).filter(|r| !is_arm_fp_phys(*r));
+                // Regalloc can assign two values whose lifetime endpoints meet
+                // to the same register. If they are then used by the SAME
+                // instruction, the later definition has overwritten the older
+                // value in that register (AArch64 torture 20120919-1: `s +=
+                // pi[i]` became `add w5,w5,w5`).  Repair this rare boundary
+                // case locally by reloading one operand from its stack home
+                // into x0/w0 and using the three-operand form. This preserves
+                // the aggressive allocator's half-open handoff policy while
+                // keeping same-instruction uses correct.
+                if let (
+                    Operand::Value(lv),
+                    Operand::Value(rv),
+                    Some(lp),
+                    Some(rp),
+                ) = (lhs, rhs, lhs_phys, rhs_phys)
+                {
+                    if lv.0 != rv.0 && lp.0 == rp.0 {
+                        let scratch = if use_32bit { "w0" } else { "x0" };
+                        if let Some(slot) = self.state.get_slot(lv.0) {
+                            self.emit_load_from_sp(scratch, slot.0, "ldr");
+                            let r = if use_32bit {
+                                callee_saved_name_32(rp)
+                            } else {
+                                callee_saved_name(rp)
+                            };
+                            let out = if use_32bit { dest_name_32 } else { dest_name };
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, {}",
+                                mnemonic, out, scratch, r
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                        if let Some(slot) = self.state.get_slot(rv.0) {
+                            self.emit_load_from_sp(scratch, slot.0, "ldr");
+                            let l = if use_32bit {
+                                callee_saved_name_32(lp)
+                            } else {
+                                callee_saved_name(lp)
+                            };
+                            let out = if use_32bit { dest_name_32 } else { dest_name };
+                            self.state.emit_fmt(format_args!(
+                                "    {} {}, {}, {}",
+                                mnemonic, out, l, scratch
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
                 if let Some(rp) = rhs_phys {
+                    if lhs_phys.is_none() && rp.0 == dest_phys.0 {
+                        if let Operand::Value(lv) = lhs {
+                            if let Some(slot) = self.state.get_slot(lv.0) {
+                                let scratch = if use_32bit { "w0" } else { "x0" };
+                                self.emit_load_from_sp(scratch, slot.0, "ldr");
+                                let r = if use_32bit {
+                                    callee_saved_name_32(rp)
+                                } else {
+                                    callee_saved_name(rp)
+                                };
+                                let out = if use_32bit { dest_name_32 } else { dest_name };
+                                self.state.emit_fmt(format_args!(
+                                    "    {} {}, {}, {}",
+                                    mnemonic, out, scratch, r
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                    }
                     emit3!(|_, is32| if is32 {
                         callee_saved_name_32(rp).to_string()
                     } else {
