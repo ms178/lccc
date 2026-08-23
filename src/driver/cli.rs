@@ -1452,11 +1452,11 @@ impl Driver {
                 "-fno-fast-math" => {
                     self.fast_math = false;
                     self.fp_reassoc = false;
-                    // Restore the DEFAULT (fast), not "off": GCC's
-                    // -fno-fast-math resets contraction to its default mode,
-                    // and the gnu-C default is fast. Explicit flags stay.
+                    // Restore the DEFAULT (contract=on, no statement-level
+                    // fusion in LCCC because SSA loses statement boundaries).
+                    // Explicit -ffp-contract={on,off,fast} flags always win.
                     if !self.fp_contract_explicit {
-                        self.fp_contract_fast = true;
+                        self.fp_contract_fast = false;
                     }
                 }
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
@@ -1869,13 +1869,23 @@ mod cli_tests {
         reen.parse_cli_args(&args).unwrap();
         assert!(reen.fp_contract_fast);
 
-        // GCC parity: default is -ffp-contract=fast for gnu C.
+        // GCC parity: default is -ffp-contract=on for gnu C. LCCC's
+        // SSA-level Mul/Add fusion can change rounding across what the C
+        // abstract machine sees as separate statements (e.g. the lowered
+        // form of `double m = a*b; s += m;` looks identical to that of
+        // `s += a*b;` after SROA/GVN), so fp_contract_fast defaults to
+        // false. Users who want FMA contraction must explicitly request
+        // it via -ffp-contract=fast or -ffast-math (which also enables
+        // reassociation). The backend peephole layer still recognises the
+        // leaf-return `c + a*b` tree where the mul result is consumed
+        // exactly once as an FMA, matching GCC's observed vfmadd output
+        // for that case without affecting loop reductions.
         let mut dflt = Driver::new();
         let args = vec!["lccc".to_string(), "x.c".to_string()];
         dflt.parse_cli_args(&args).unwrap();
         assert!(
-            dflt.fp_contract_fast,
-            "gnu-C default must contract (GCC parity)"
+            !dflt.fp_contract_fast,
+            "gnu-C default must NOT fuse mul+add across SSA values without explicit -ffp-contract=fast"
         );
 
         // Explicit contract flag is sticky against later -ffast-math
@@ -1893,7 +1903,8 @@ mod cli_tests {
             "explicit off survives -ffast-math"
         );
 
-        // -fno-fast-math restores the default (fast), it does not force off.
+        // -fno-fast-math restores the non-fast default (i.e. fp_contract_fast
+        // is NOT set). It does not itself enable contraction.
         let mut nfm = Driver::new();
         let args = vec![
             "lccc".to_string(),
@@ -1902,8 +1913,8 @@ mod cli_tests {
         ];
         nfm.parse_cli_args(&args).unwrap();
         assert!(
-            nfm.fp_contract_fast,
-            "-fno-fast-math keeps the fast default"
+            !nfm.fp_contract_fast,
+            "-fno-fast-math must not silently turn contraction on"
         );
     }
 

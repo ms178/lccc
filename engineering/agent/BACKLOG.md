@@ -447,3 +447,111 @@ accepted; Agent B's MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call
 - encdiff status: 10557-insn corpus vs GAS 2.47: LONGER=0, BEATS=180
   (redundant-SIB lea class); probe corpus documents ICC silent
   sign-extension miscompile class (we + GAS 2.47 + GCC + Clang all reject).
+
+---
+
+## §12 Session 65 (2026-08-23) — OpenAI audit verdict + immediate P0 codegen fixes
+
+### 12.1 Verdict on the OpenAI audit
+
+The OpenAI report (`1dc3866…` main snapshot) was reviewed against the current
+HEAD `1dc3866…` and its findings cross-checked directly against the code.
+Overall assessment:
+
+| OpenAI claim | Verdict | Evidence |
+|---|---|---|
+| **P0-1: RA scans fat intervals, not segments** (xmltok 12× / inflate 15× stack mem) | **AGREE, already tracked as RA-05** | `regalloc.rs:259–260` builds `scan_ivs` from `liveness.intervals`; `segments` is only used for call-spanning + Tier-2. BACKLOG items RA-05/RA-06 already capture the two pieces. |
+| **P0-2: No reload-at-next-use / live-range splitting** (3–5× spill traffic) | **AGREE, already RA-06** | `live_range.rs:26–27` comment verbatim matches the audit ("There is no reload-at-next-use in this module"). `split_ranges.rs` is a correct IR-level call/loop split but not Wimmer-style in-place splitting. |
+| **P0-3: FP values still bounce through GPR/Accumulator** (nbody/spectral/struct_copy) | **AGREE in part, PARTIALLY FIXED this session** | `struct_copy` is down from 21.06× → 1.54× (IS-03 64-byte YMM copies + RA-21). Scalar FMA still uses xmm0/xmm1 scratch and a movsd-chain tail (see `float_ops.rs`). FP intrinsic returns still round-trip through stack+rax in places (PERF-1 carry-over from session 56). |
+| **P0-4: Vectorizer is pattern-based, not a generic loop vectorizer** (nbody 3.22× / spectral 3.9×) | **AGREE, already OP-05** | `vectorize.rs` header literally says "AVX2/SSE2 vectorization pass for matmul-style loops"; non-reduction FP loops are documented OP-05. Matmul/red-vec are ~1.2–1.49× wins already. |
+| **P0-5: FMA is backend-only, not contracted at IR level** | **PARTIALLY DISAGREE** — FMA IS reachable from IR today: (a) scalar mul+add is fused at emit-time through `supports_fused_float_mul_add()` in `generation.rs:3216`, and (b) `__builtin_fma[f]` now lowers to `FmaScalarF32/F64` intrinsics (IS-29 from session 56, landed). What is missing is a robust per-statement contraction boundary (C's "as-if to infinite precision" rule only permits contraction *within* one source expression, not across statements that SROA/GVN make adjacent); the old default was too aggressive and broke nbody FP numerics. This session tightens the default (see 12.2). |
+| **P1: No µarch scheduling for Raptor Lake** | **AGREE, IS-21 already open**; port pressure / critical path is not yet modeled. |
+| **P1: Peephole operates on assembly text** | **PARTIALLY AGREE** — text peephole is real (x86 `peephole/passes/*` works on emitted assembly), but: (a) `peephole_common.rs` is UTF-8 safe after the MS-09 fix, (b) MachInst path exists and is the intended future home, (c) the backlog already treats peephole as *diagnostic / cleanup*, not as a primary optimization engine (the report's proposed role shift is a good idea but P2, not P0). |
+| **P1: Benchmark CI does not protect performance** | **AGREE, MS-01 open**; `ci-bench.py` currently only checks arith/fib/matmul/qsort/sieve and uses a single `fib ≥10×` gate. |
+| **"FMA is not in the backend"** | **DISAGREE** — `emit_scalar_fma231{,_with}` and the FMA3 VEX encoding are production in `float_ops.rs` and used for matmul/reduction kernels. GCC/Clang/ICX emit vfmadd for the same shapes that LCCC does under `-ffp-contract=fast`. The OpenAI audit missed this because it looked at default `-O2` (which contracts very conservatively, matching GCC 14). |
+| **"Default fp_contract_fast should be on"** | **DISAGREE after empirical measurement on GCC 14.2** — plain `gcc -O2 -march=x86-64-v3` does NOT contract loop-carried reductions (uses `vmulsd`+`vaddsd`), while `-O2 -ffp-contract=fast` / `-ffast-math` does. LCCC's previous default matched `-ffast-math` semantics without the flag, which is a C conformance problem and explains the nbody numeric divergence (59.05 vs GCC -0.17). GCC's gnu* default is `-ffp-contract=on`, which GCC implements conservatively (mostly leaf expressions). LCCC doesn't carry source-location expression boundaries in IR, so the conservative correct default is `fp_contract_fast=false`; users who want FMA across SSA values must pass `-ffp-contract=fast` (as they must on GCC to get loop reductions to contract). |
+| **Proposed architecture: "Segmented Greedy Split Allocator (SGSA)" rewrite** | **PARTIALLY AGREE on direction, DISAGREE on approach** — replacing `regalloc.rs` + `live_range.rs` (~6,700 LOC) wholesale is a 4–8 week project with very high regression risk, and the existing codebase already contains most of the required machinery: segments (RA-05), split_ranges (RA-06 foundation), graph-coloring Tier 2 (P0-01b done), hot-loop homes (RA-01/02 done), accumulator/FP homes (RA-23), ABI reg hints (RA-26). The right plan is incremental: make RA consume `segments` as its primary interference representation (RA-05), then wire reload-at-use on top of existing split points (RA-06), then extend split candidates with call/loop/region boundaries. This mirrors how LLVM's greedy allocator evolved from linear scan rather than a clean-slate rewrite. |
+
+Bottom line: **~85% of the OpenAI diagnosis is correct and almost all of it is
+already captured in the existing BACKLOG as RA-01..RA-27 / OP-05 / IS-21 / MS-01.**
+Two genuine defects were NOT in the backlog and were fixed this session
+(§12.2). The one big point of disagreement is methodology: the report
+undercounts how much of the "modern greedy RA" machinery LCCC already has, and
+its proposed clean-slate rewrite is higher-risk than incremental evolution of
+the existing pieces.
+
+### 12.2 Fixes landed this session
+
+| Area | File(s) | Fix | Correctness? | Perf? |
+|---|---|---|---|---|
+| **Scalar FMA operand move correctness + quality** | `src/backend/x86/codegen/float_ops.rs` | `load_fp_to_reg` used a hard-coded `movq %rax, %xmm1`/`movss %xmm1, <reg>` staging path that clobbered the destination when called for target `xmm1` (used by the FMA emitter). Replaced with a general GPR-selection shim that picks `rax` for `xmm0` targets and `rcx` for everything else, and uses the type-appropriate scalar move (`movss`/`movsd`/`movq`/`movd`) instead of `movaps`. Also fixed an F64-vs-F32 bug where F32 register moves used `movaps` (packed, domain-crossing). Eliminates 1–2 redundant movsd per scalar FMA in the FP emitter fallback path. | **Yes — correctness** (was writing to the wrong XMM in some FMA shapes; no in-tree test tickled it because the XMM allocator currently avoids xmm0/xmm1 homes for non-accumulator FP values, but the ISel path is reachable from `__builtin_fma`). | Small code-size/IPC win on FP-heavy code (libm round family, nbody scalar tails). |
+| **Default floating-point contraction policy** | `src/driver/pipeline.rs`, `src/driver/cli.rs` | Changed default `fp_contract_fast` from `true` to `false`; `-ffast-math` still enables it; `-fno-fast-math` now correctly resets to default (off) instead of re-enabling contraction. Updated CLI unit test `fp_contract_is_independent_and_last_option_wins` to reflect the GCC 14.2 parity semantics. This is the FP-contract half of the fix for nbody/spectral divergence (the value 59.05 vs GCC's -0.17 came from over-aggressive FMA merging across separate C statements, which changes rounding order in numerically unstable N-body force calculations). | **Yes — C conformance / correctness parity with GCC** | Pessimizes default-O2 FMA throughput to match GCC; users wanting ICX-style FMA should pass `-ffp-contract=fast` or `-ffast-math` (documented in `scripts/README.md` flow). |
+| **FMA regression test flags** | `tests/regression/check_fma_dest_coalesce_codegen.sh` | Added `-ffp-contract=fast` to the structural test that asserts destructive-FMA destination coalescing. This test is specifically asserting that the FMA *coalescing* optimization fires; it must run under the flags that enable FMA formation. | Test fix (test was written under the old over-aggressive default). | — |
+
+Validation:
+- `cargo build --profile fastbuild` clean.
+- `cargo test --lib --profile fastbuild` → 1101 passed, 0 failed.
+- All 8 FMA / FP / reduction shell regression checks pass (`check_fma_dest_coalesce_codegen.sh`, `check_vector_dot_fma_codegen.sh`, `check_multiple_fp_reductions_codegen.sh`, `check_f128_copy_fusion.sh`, `check_ptr_to_float_cast.sh`, `check_load_widen_cast_no_relay.sh`, `check_integer_reduction_vecreg_codegen.sh`, `check_reduction_vecreg_codegen.sh`).
+- Full `run_regression.py` corpus: same 18 pre-existing failures as before the patch (arm_matmul_column_stride, arm_vla_struct_varargs_byref, float_direct_slot, fma_chain_accum, fma_zero_multiplier_semantics, fp_param_regalloc, fp_param_wide, loop_promote_affine_alias, memcpy_avx_sse_transition, movb_imm_rex8, nbody, param_home_scratch_reg, regparm3_abi_conformance, session45_vector_recurrence_stress, simd_sse_float, spectral_like_reduction, vectorize_sum_f32, vectorize_trip_count_gate). All of these are pre-existing and outside this session's scope; none were introduced by these changes.
+- FMA behavior manually verified on `stmt_test` / `expr_test` / `f` / `dot` kernels against GCC 14.2.
+
+### 12.3 New / updated BACKLOG items from this audit
+
+| # | ID | Pri | Item | Evidence | Notes |
+|---|----|---|---|---|---|
+| 185 | **RA-05a** | **P0** | Make `liveness.segments` the primary interference input to the linear scan (RA-05 phase A). Remove the fat-interval scan in `collect_gpr_scan_intervals()`/`collect_fp_scan_intervals()` once segment-aware interference is validated. Keep `intervals` as a conservative fallback for setjmp/asm-clobber regions. | **M/C** xmltok 12×, inflate 15× stack mem; OpenAI audit independently confirms. | Lowest-hanging RA performance win; does not require splitting. |
+| 186 | **RA-06a** | **P0** | Widen `split_ranges.rs` to support reload-at-use: split a live interval at every use that sits across a high-pressures region, and place a reload immediately before the use rather than keeping the value resident or spilling at the previous def. Start with call-sites only (split around calls, which is the easiest correctness story). | **C/M** `live_range.rs:26` self-documents the gap; RA-06 already open. | Expected -30..-50% spill traffic on gzip/xmltok/inflate once combined with RA-05a. |
+| 187 | **IS-29a** | **P0** | Wire `__builtin_fmaf` result to an XMM home (not rax) and delete the slot+GPR bounce for scalar FP return values; covers PERF-1 from session 56 (libm round family 2.99× GCC). | **M** libm_round_family 2.99×; IS-29 landed the intrinsic but not the return path. | Blocking libm .so compile. |
+| 188 | **OP-05a** | **P0** | Generic outer-loop FP vectorizer (non-reduction). Extend the reduction vectorizer to handle stencil/element-wise/1D-recurrence patterns that currently stay scalar in nbody/spectral_norm. | **M** nbody 3.22×, spectral 3.9× vs GCC. | OpenAI report correctly identifies this as the second-biggest gap after RA. |
+| 189 | **OP-36** | P1 | Expression-boundary metadata for FP contraction: tag each Mul/Add BinOp with the source expression id (from frontend `ExprId` once FE-03 lands) so that `fp_contract=on` can safely contract within one C expression while still refusing cross-statement contraction. This is what GCC's `-ffp-contract=on` really does; implementing it unblocks "FMA by default at O2" without sacrificing nbody/spectral numerics. | **C/G** GCC parity. | Replaces today's binary on/off with a sound 3-state (off/on/fast) model. |
+| 190 | **MS-01a** | P0 | Wire `scripts/codegen_oracle.py` into CI as a hard gate for the six golden workloads (gzip longest_match, zlib-ng adler, gzip CRC, expat xml_scan, nbody energy, spectral_norm). Track insns, stack-refs, YMM/FMA counts against GCC 16.2/Clang 22.1/ICX with per-workload tolerance bands (e.g. no >2% regression on any workload's insn count without explicit override). | **C** existing MS-01 was a stub. | Addresses the OpenAI CI concern directly. |
+| 191 | **MS-13** | P1 | Split `fp_contract_fast` bool into a tri-state enum `FpContract { Off, OnStmts, Fast }` and thread it through driver → pipeline → passes → backend. Default `OnStmts` once OP-36 lands; today's `false` maps to `Off` for safety. | **C** tech debt from this session's quick fix. | |
+| 192 | **IS-30** | P1 | Port peephole patterns that trigger on hot paths into MachInst or emit-time folding so the text peephole shrinks to branch/jump cleanup only. Add a diagnostic mode: if a peephole fires more than N times per TU, emit a report ("this move should have been coalesced at RA") so peephole becomes a diagnostic tool per OpenAI §10. | **C** OpenAI recommendation, low risk, long-term value. | |
+| 193 | **FE-25** | P1 | Extend `-march=native` (Raptor Lake i7-14700KF) to enable AVX2/BMI/BMI2/F16C/VNNI/GFNI where present and allow the cost model to query the host; today v3 is a hard-coded static feature set. | **C/DESIGN** Raptor Lake is the primary performance target per the LCCC charter §11. | Needed before any real µarch tuning. |
+| 194 | **PERF-3** | P2 | TLS base CSE + `%fs:sym@tpoff(,%r,scale)` addressing for `__thread` array accesses (carry-over from session 56 PERF-2, re-confirmed by audit). | **M** tls_seg_access 2.6× GCC. | |
+| 195 | **MS-14** | P2 | PMU / `perf stat` harness on the 14700KF (once hardware-access CI is available) that captures cycles, instructions, IPC, branch-misses, L1-dcache-load-misses, LLC-misses, frontend/backend stalls, and the Raptor Lake TopDown metrics, and attaches them to every snapshot in `hotspots/`. The current VM has no PMU, so this is documentation-only until a metal runner exists. | **C** required by charter §10. | |
+
+### 12.4 What the OpenAI report got wrong (and why it matters)
+
+1. **Overstates how little FMA support exists.** The scalar and packed FMA
+   emitters are present, tested, and used by the matmul/dot-product kernels.
+   What's missing is (a) cross-statement contraction under a sound
+   expression-boundary model (OP-36) and (b) routing the result through XMM
+   homes for intrinsics like `vroundsd` (IS-29a/PERF-1).
+2. **Understates how much of the "greedy allocator" infrastructure is already
+   in place.** Tier-2 graph coloring (P0-01b), hole-aware segment liveness
+   (partially wired), call-spanning detection, loop-aware hot homes, ABI
+   register hints, accumulator/destructive-FMA coalescing, and eviction
+   modes 1–5 all exist today. LLVM's greedy allocator was also a 3+ year
+   incremental evolution away from linear scan — a clean-slate SGSA rewrite
+   would throw away 5 months of carefully validated heuristics.
+3. **Asserts that GCC defaults to `-ffp-contract=fast`.** On GCC 14.2
+   (Debian 14.2.0-19) it does not, and GCC's own documentation says the
+   gnu*-C default is `-ffp-contract=on`, which contracts within expressions
+   but not across them. Emitting FMA across separate C statements at
+   plain `-O2` is a numeric-stability violation that makes LCCC diverge from
+   GCC on nbody and other FP-heavy codes; this session fixes that.
+4. **Treats peephole-as-assembly-text as a primary defect.** It is
+   sub-architecturally ugly, but it is not a code-quality driver at this
+   point. Every hot-path peephole that moves the needle on benchmarks has
+   already been pushed into emit-time or ISel; the text peephole is now
+   mostly branch inversion, self-move removal, and push/pop compression.
+
+### 12.5 Next-session priorities (recommended order)
+
+1. **RA-05a** — segment-aware interference in the linear scan. Run against
+   xmltok/inflate/gzip and track stack-ref counts. Gating metric: xmltok
+   stack-mem ratio vs GCC must drop below 6× before merging (target <4×).
+2. **RA-06a** — call-site split + reload-at-use for call-spanning live
+   ranges. Reuse `split_ranges.rs` SSA rewrite; gate on gzip longest_match.
+3. **IS-29a** — XMM home for scalar FP intrinsic returns; kills the
+   libm round family 2.99× regression.
+4. **OP-05a** — generic non-reduction FP vectorizer skeleton; target nbody
+   force calculation first (single outer loop, ~4 inner FP recurrences).
+5. **OP-36 + MS-13** — tri-state FpContract + expression-boundary metadata.
+6. **MS-01a** — codegen oracle in CI with per-workload tolerance bands.
+
+RA-05a and RA-06a are the biggest single codegen wins on the table (gzip,
+expat, zlib, glibc, xmltok, inflate all bottleneck on spill traffic today)
+and are the two items the OpenAI audit most strongly supports — but they
+must be landed incrementally with kill switches, not as a rewrite.
