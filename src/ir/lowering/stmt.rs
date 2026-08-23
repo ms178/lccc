@@ -108,6 +108,15 @@ impl Lowerer {
 
             let vla_size = if da.is_array {
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
+            } else if da.is_struct {
+                // GCC extension: block-scope structs may contain VLA members
+                // (`struct S { char w[y]; } a;`).  Such objects need dynamic
+                // stack allocation and a runtime size for later by-value
+                // assignment/copy.  Previously only array declarators used
+                // DynAlloca, so VLA-struct locals got zero-byte allocas and
+                // their struct assignments lowered to zero-byte memcpy
+                // (gcc.c-torture/execute/20070919-1.c).
+                self.compute_vla_size_from_type_spec(type_spec)
             } else {
                 None
             };

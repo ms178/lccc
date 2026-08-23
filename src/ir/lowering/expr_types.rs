@@ -11,7 +11,7 @@ use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Expr, GenericAssociation, Initializer, Stmt, TypeSpecifier,
     UnaryOp,
 };
-use crate::ir::reexports::IrConst;
+use crate::ir::reexports::{IrConst, Value};
 
 /// Promote small integer types to I32, matching C integer promotion rules.
 /// I8, U8, I16, U16 all promote to I32. All other types are returned unchanged.
@@ -97,6 +97,31 @@ impl Lowerer {
             3..=4 => IrType::I32,
             // 0 and 5-8: use I64. Call sites guard size==0 to 8.
             _ => IrType::I64,
+        }
+    }
+
+    /// Runtime size for expressions that produce a VLA-containing aggregate.
+    /// Fixed-size aggregates still use `struct_value_size` so the backend can
+    /// inline small copies; this is only for GCC's block-scope VLA-struct
+    /// extension where the byte count is an SSA value.
+    pub(super) fn dynamic_struct_value_size(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Identifier(name, _) => self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.locals.get(name))
+                .and_then(|info| if info.is_struct { info.vla_size } else { None }),
+            Expr::StmtExpr(compound, _) => {
+                if let Some(crate::frontend::parser::ast::BlockItem::Statement(
+                    crate::frontend::parser::ast::Stmt::Expr(Some(inner_expr)),
+                )) = compound.items.last()
+                {
+                    self.dynamic_struct_value_size(inner_expr)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 

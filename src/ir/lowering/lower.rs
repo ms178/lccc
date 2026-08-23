@@ -1843,6 +1843,37 @@ impl Lowerer {
         self.emit(Instruction::Memcpy { dest, src, size });
     }
 
+    /// Emit a libc `memcpy(dest, src, size)` call for runtime-sized aggregate
+    /// copies.  The fixed-size IR `Memcpy` instruction intentionally keeps a
+    /// compile-time byte count so the backend can inline small copies; VLA
+    /// structs need the dynamic path instead.
+    pub(super) fn emit_dynamic_memcpy(&mut self, dest: Value, src: Value, size: Value) -> Value {
+        let ret = self.fresh_value();
+        let ptr_ty = IrType::Ptr;
+        let size_ty = crate::common::types::target_int_ir_type();
+        self.emit(Instruction::Call {
+            func: "memcpy".to_string(),
+            info: CallInfo {
+                dest: Some(ret),
+                args: vec![Operand::Value(dest), Operand::Value(src), Operand::Value(size)],
+                arg_types: vec![ptr_ty, ptr_ty, size_ty],
+                return_type: ptr_ty,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                is_fastcall: false,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+            },
+        });
+        ret
+    }
+
     pub(super) fn terminate(&mut self, term: Terminator) {
         let block = BasicBlock {
             label: self.func_mut().current_label,

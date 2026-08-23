@@ -82,10 +82,11 @@ impl Lowerer {
     /// Lower struct/union assignment using memcpy.
     fn lower_struct_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
         let struct_size = self.struct_value_size(lhs).unwrap_or(8);
+        let dynamic_size = self.dynamic_struct_value_size(lhs).or_else(|| self.dynamic_struct_value_size(rhs));
 
         // For expressions producing packed struct data (small struct function
         // call returns, ternaries over them, etc.), store directly
-        if self.expr_produces_packed_struct_data(rhs) && struct_size <= 8 {
+        if dynamic_size.is_none() && self.expr_produces_packed_struct_data(rhs) && struct_size <= 8 {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
@@ -105,11 +106,15 @@ impl Lowerer {
         if let Some(lv) = self.lower_lvalue(lhs) {
             let dest_addr = self.lvalue_addr(&lv);
             let src_addr = self.operand_to_value(rhs_val);
-            self.emit(Instruction::Memcpy {
-                dest: dest_addr,
-                src: src_addr,
-                size: struct_size,
-            });
+            if let Some(size_val) = dynamic_size {
+                self.emit_dynamic_memcpy(dest_addr, src_addr, size_val);
+            } else {
+                self.emit(Instruction::Memcpy {
+                    dest: dest_addr,
+                    src: src_addr,
+                    size: struct_size,
+                });
+            }
             return Operand::Value(dest_addr);
         }
         rhs_val
