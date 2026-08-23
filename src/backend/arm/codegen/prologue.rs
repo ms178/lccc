@@ -535,10 +535,14 @@ impl ArmCodegen {
                             }
                         }
                     }
-                    // Only pre-store to callee-saved registers (x20-x28).
-                    // Caller-saved registers (x13, x14) cannot be used because
-                    // they may overlap with scratch registers.
-                    let is_callee_saved = phys_reg.0 >= 20 && phys_reg.0 <= 28;
+                    // Only pre-store to callee-saved registers (x19-x28).
+                    // x19 is in ARM_CALLEE_SAVED and is a normal allocatable
+                    // home. Excluding it let an F128 parameter spill call
+                    // clobber x0 before a later ParamRef of a GP parameter
+                    // assigned to x19 (gcc torture 20020413-1: eval pointer
+                    // became the truncated long-double bits). Caller-saved
+                    // registers (x13, x14) remain excluded.
+                    let is_callee_saved = phys_reg.0 >= 19 && phys_reg.0 <= 28;
                     if is_callee_saved {
                         // Safety check: if another param's dest is also assigned
                         // to this register, skip pre-store to avoid conflicts.

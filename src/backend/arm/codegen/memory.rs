@@ -691,6 +691,10 @@ impl ArmCodegen {
         } else {
             self.emit_load_from_sp("x9", slot.0, "ldr");
         }
+        // Preserve destination across subsequent source-address resolution,
+        // which also uses x9 as its accumulator. emit_memcpy_store_src_from_acc
+        // restores x9 from x11 after moving the source into x10.
+        self.state.emit("    mov x11, x9");
     }
 
     pub(super) fn emit_memcpy_load_src_addr_impl(

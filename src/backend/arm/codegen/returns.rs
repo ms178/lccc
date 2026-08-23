@@ -2,7 +2,7 @@
 
 use super::emit::ArmCodegen;
 use crate::common::types::IrType;
-use crate::ir::reexports::{IrConst, Operand, Value};
+use crate::ir::reexports::{Operand, Value};
 
 impl ArmCodegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
@@ -43,53 +43,19 @@ impl ArmCodegen {
     }
 
     pub(super) fn emit_get_return_f64_second_impl(&mut self, dest: &Value) {
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.emit_store_to_sp("d1", slot.0, "str");
-        }
+        self.store_float_reg(dest, IrType::F64, "d1");
     }
 
     pub(super) fn emit_set_return_f64_second_impl(&mut self, src: &Operand) {
-        match src {
-            Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    self.emit_load_from_sp("d1", slot.0, "ldr");
-                }
-            }
-            Operand::Const(IrConst::F64(f)) => {
-                let bits = f.to_bits();
-                self.emit_load_imm64("x0", bits as i64);
-                self.state.emit("    fmov d1, x0");
-            }
-            _ => {
-                self.operand_to_x0(src);
-                self.state.emit("    fmov d1, x0");
-            }
-        }
+        self.float_operand_to_reg(src, IrType::F64, "d1");
     }
 
     pub(super) fn emit_get_return_f32_second_impl(&mut self, dest: &Value) {
-        if let Some(slot) = self.state.get_slot(dest.0) {
-            self.emit_store_to_sp("s1", slot.0, "str");
-        }
+        self.store_float_reg(dest, IrType::F32, "s1");
     }
 
     pub(super) fn emit_set_return_f32_second_impl(&mut self, src: &Operand) {
-        match src {
-            Operand::Value(v) => {
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    self.emit_load_from_sp("s1", slot.0, "ldr");
-                }
-            }
-            Operand::Const(IrConst::F32(f)) => {
-                let bits = f.to_bits();
-                self.emit_load_imm64("x0", bits as i64);
-                self.state.emit("    fmov s1, w0");
-            }
-            _ => {
-                self.operand_to_x0(src);
-                self.state.emit("    fmov s1, w0");
-            }
-        }
+        self.float_operand_to_reg(src, IrType::F32, "s1");
     }
 
     pub(super) fn emit_get_return_f128_second_impl(&mut self, dest: &Value) {
