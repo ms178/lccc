@@ -1228,6 +1228,7 @@ impl X86Codegen {
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
         self.func_ret_classes = func.ret_eightbyte_classes.clone();
+        self.func_set_second_ret = false;
         self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         if self.state.cf_protection_branch {
             self.state.emit("    endbr64");
@@ -2135,6 +2136,13 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        // IS-20: a function that dirtied upper YMM halves must clean them
+        // before returning, or every legacy-SSE instruction in the caller
+        // pays the AVX-SSE transition penalty (~50-100 cycles on current
+        // Intel). GCC/Clang emit the same vzeroupper-before-ret.
+        if self.state.dirty_upper_ymm {
+            self.state.emit("    vzeroupper");
+        }
         self.emit_epilogue_impl(frame_size);
         if self.state.function_return_thunk {
             self.state.emit("    jmp __x86_return_thunk");

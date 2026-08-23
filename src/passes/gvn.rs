@@ -264,6 +264,22 @@ struct GvnState {
     /// GlobalAddr values feeding variable-index GEPs must not CSE/hoist: their
     /// site-local identity preserves symbol+index addressing profitability.
     site_local_gaddrs: FxHashSet<u32>,
+    /// Canonical value number per global symbol (the first GlobalAddr
+    /// numbered for it). Site-local GlobalAddr duplicates get fresh VNs by
+    /// design (OP-34), but memory keys must not fork per site.
+    symbol_canonical_vn: FxHashMap<String, u32>,
+    /// Inverse of the GlobalAddr numbering: VN -> canonical symbol name.
+    vn_symbol: FxHashMap<u32, String>,
+    /// GEP value number -> canonical address VN. Two GEPs over the same
+    /// symbol with equal offsets denote the same address even when their
+    /// GlobalAddr bases stayed site-local with distinct VNs. This folds
+    /// those GEP VNs onto one canonical address VN for load-CSE and
+    /// store-forwarding keys. The GEP instructions and site-local
+    /// GlobalAddrs are untouched, so SIB addressing decisions are
+    /// unaffected (OP-12/OP-32).
+    gep_addr_canonical: FxHashMap<u32, u32>,
+    /// (canonical symbol base VN, offset VN, type) -> canonical address VN.
+    addr_key_to_vn: FxHashMap<(u32, VNOperand, IrType), u32>,
 }
 
 impl GvnState {
@@ -305,6 +321,10 @@ impl GvnState {
             volatile_allocas,
             must_mat_gaddrs,
             site_local_gaddrs,
+            symbol_canonical_vn: FxHashMap::default(),
+            vn_symbol: FxHashMap::default(),
+            gep_addr_canonical: FxHashMap::default(),
+            addr_key_to_vn: FxHashMap::default(),
         }
     }
 
@@ -688,6 +708,7 @@ impl GvnState {
                     return None;
                 }
                 let ptr_vn = self.operand_to_vn(&Operand::Value(*ptr));
+                let ptr_vn = self.canonical_addr_vn(ptr_vn);
                 Some((
                     ExprKey::Load {
                         ptr: ptr_vn,
@@ -700,6 +721,55 @@ impl GvnState {
             // AtomicLoad is excluded because it has memory ordering semantics that
             // require the load to actually execute.
             _ => None,
+        }
+    }
+
+    /// Fold a pointer VN onto its canonical address VN when it is a GEP over
+    /// a symbol whose sites were deliberately kept distinct.
+    fn canonical_addr_vn(&self, vn: VNOperand) -> VNOperand {
+        if let VNOperand::ValueNum(v) = vn {
+            if let Some(&c) = self.gep_addr_canonical.get(&v) {
+                return VNOperand::ValueNum(c);
+            }
+        }
+        vn
+    }
+
+    /// Canonical base VN when `base` resolves to a GlobalAddr (through
+    /// Copies): the first VN numbered for that symbol.
+    fn canonical_symbol_base_vn(&mut self, base: &Value) -> Option<u32> {
+        let vn = match self.operand_to_vn(&Operand::Value(*base)) {
+            VNOperand::ValueNum(v) => v,
+            VNOperand::Const(_) => return None,
+        };
+        let sym = self.vn_symbol.get(&vn)?.clone();
+        self.symbol_canonical_vn.get(&sym).copied()
+    }
+
+    /// Record a freshly numbered GlobalAddr's symbol identity.
+    fn record_symbol_vn(&mut self, name: &str, vn: u32) {
+        let canon = self.context.canonical(name).to_string();
+        self.vn_symbol.insert(vn, canon.clone());
+        self.symbol_canonical_vn.entry(canon).or_insert(vn);
+    }
+
+    /// Record a freshly numbered GEP under its canonical address key so
+    /// later loads/stores through an equivalent GEP (possibly over a
+    /// site-local GlobalAddr duplicate) share one memory key.
+    fn record_gep_addr_key(&mut self, base: &Value, offset: &Operand, ty: IrType, vn: u32) {
+        let Some(cb) = self.canonical_symbol_base_vn(base) else {
+            return;
+        };
+        let off_vn = self.operand_to_vn(offset);
+        let key = (cb, off_vn, ty);
+        match self.addr_key_to_vn.get(&key).copied() {
+            Some(c) => {
+                self.gep_addr_canonical.insert(vn, c);
+            }
+            None => {
+                self.addr_key_to_vn.insert(key, vn);
+                self.gep_addr_canonical.insert(vn, vn);
+            }
         }
     }
 
@@ -1186,17 +1256,15 @@ fn clobbers_memory(inst: &Instruction) -> bool {
 }
 
 /// Check if a Store instruction is eligible for store-to-load forwarding.
-/// Same restrictions as Load CSE: no segment overrides, no float/long-double/i128 types.
+/// Same restrictions as Load CSE (session-25): no segment overrides, no
+/// long-double/i128 types. F32/F64 stores ARE forwardable — FP load CSE is
+/// enabled and the forwarding path creates the same backend Copy machinery
+/// (kept in the XMM domain) that FP load CSE already proven-safe uses.
 fn is_forwardable_store(inst: &Instruction) -> bool {
     match inst {
         Instruction::Store {
             ty, seg_override, ..
-        } => {
-            *seg_override == AddressSpace::Default
-                && !ty.is_float()
-                && !ty.is_long_double()
-                && !ty.is_128bit()
-        }
+        } => *seg_override == AddressSpace::Default && !ty.is_long_double() && !ty.is_128bit(),
         _ => false,
     }
 }
@@ -1290,6 +1358,7 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                     && !state.volatile_allocas.contains(&ptr.0)
                 {
                     let ptr_vn = state.operand_to_vn(&Operand::Value(*ptr));
+                    let ptr_vn = state.canonical_addr_vn(ptr_vn);
                     let version = state.memory_version(&ptr_vn);
                     let fwd_key = StoreFwdKey { ptr_vn, ty: *ty };
                     let fwd_key_for_log = fwd_key.clone();
@@ -1433,6 +1502,21 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         state.vn_log.push((dest_idx, old_vn));
                         state.value_numbers[dest_idx] = vn;
                     }
+                    // Record symbol identity for GlobalAddr and the canonical
+                    // address key for GEPs over a symbol base, so that memory
+                    // keys (load CSE / store forwarding) unify across
+                    // deliberately site-local GlobalAddr duplicates (OP-12).
+                    match &inst {
+                        Instruction::GlobalAddr { name, .. } => {
+                            state.record_symbol_vn(name, vn);
+                        }
+                        Instruction::GetElementPtr {
+                            base, offset, ty, ..
+                        } => {
+                            state.record_gep_addr_key(base, offset, *ty, vn);
+                        }
+                        _ => {}
+                    }
                     // Record in appropriate map with rollback
                     if is_load {
                         let ptr_vn = match &expr_key {
@@ -1479,6 +1563,39 @@ fn process_block(block_idx: usize, func: &mut IrFunction, state: &mut GvnState) 
                         let old = state.value_numbers[idx];
                         state.vn_log.push((idx, old));
                         state.value_numbers[idx] = vn;
+                    }
+                    // Canonical address key for symbol-based GEPs that reach
+                    // the non-numberable path (same rationale as above).
+                    state.record_gep_addr_key(base, offset, inst_ty_of(&inst), vn);
+                } else if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } = &inst
+                {
+                    // Copies are value-numbering TRANSPARENT: the dest
+                    // inherits the source's VN. GEP/load/store-forward keys
+                    // computed through a Copy then match the keys computed
+                    // from the original value. This is what lets a
+                    // store-to-load forward fire when one access goes through
+                    // the original GlobalAddr and the other through a
+                    // GlobalAddr-CSE'd Copy of it (g1[i]=5 ... load g1[i]
+                    // previously missed: the Copy's fresh VN made the two GEP
+                    // keys unequal, so the forward candidate lookup never
+                    // hit). CSE-replacement Copies already share the
+                    // canonical VN with their source; this extends the same
+                    // invariant to surviving Copies.
+                    let src_vn = state.operand_to_vn(&Operand::Value(*src));
+                    if let VNOperand::ValueNum(vn) = src_vn {
+                        let idx = dest.0 as usize;
+                        if idx >= state.value_numbers.len() {
+                            state.value_numbers.resize(idx + 1, u32::MAX);
+                        }
+                        let old = state.value_numbers[idx];
+                        state.vn_log.push((idx, old));
+                        state.value_numbers[idx] = vn;
+                    } else {
+                        // Copy of a constant: nothing to inherit.
+                        state.assign_fresh_vn(*dest);
                     }
                 } else if let Some(dest) = inst.dest() {
                     state.assign_fresh_vn(dest);
@@ -2804,5 +2921,13 @@ mod tests {
                 .count(),
             2
         );
+    }
+}
+
+/// The pointee type of a GEP instruction (helper for canonical address keys).
+fn inst_ty_of(inst: &Instruction) -> IrType {
+    match inst {
+        Instruction::GetElementPtr { ty, .. } => *ty,
+        _ => IrType::Ptr,
     }
 }

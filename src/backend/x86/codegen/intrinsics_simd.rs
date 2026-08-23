@@ -297,6 +297,14 @@ impl X86Codegen {
         args: &[Operand],
     ) -> bool {
         use IntrinsicOp::*;
+        // IS-20: 256/512-bit vector ops dirty the upper YMM halves; the
+        // epilogue will emit vzeroupper before ret.
+        {
+            let name = format!("{:?}", op);
+            if name.contains("256") || name.contains("512") || name.ends_with("Si256") {
+                self.state.dirty_upper_ymm = true;
+            }
+        }
         let Some(dptr) = dest_ptr else {
             // Scalar-result ops use `dest` (lowering already produced the
             // real operands: dummy/imm dropped, imm re-appended last).

@@ -21,7 +21,10 @@ set -euo pipefail
 REPO=${LCCC_REPO:-/home/user/lccc}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
-DELIVERABLE=/home/user/ms178-1.patch
+# Deliverable location is overridable so the script works in any workspace
+# (the Arena harness persists /home/user; other environments point it at their
+# own durable directory, e.g. a CI artifact mount).
+DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}

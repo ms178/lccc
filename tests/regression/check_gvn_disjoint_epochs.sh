@@ -44,10 +44,12 @@ plain_body=$(sed -n '/^f_plain:/,/^\.size[[:space:]]*f_plain/p' "$td/r.s")
 
 # The restrict version must load y exactly once in the loop body (the second
 # y[i] read is CSE'd to the first; the store through x has its own epoch).
-r_loads=$(grep -cE 'movslq[[:space:]]*\(' <<<"$restrict_body" || true)
+# IS-15: I32 loads with no 64-bit consumer emit `movl` instead of `movslq`,
+# so count both load mnemonics.
+r_loads=$(grep -cE 'mov(s[l]q|l)[[:space:]]*\(' <<<"$restrict_body" || true)
 # The plain version must load y twice (the store may alias y, so the second
 # read reloads it).
-p_loads=$(grep -cE 'movslq[[:space:]]*\(' <<<"$plain_body" || true)
+p_loads=$(grep -cE 'mov(s[l]q|l)[[:space:]]*\(' <<<"$plain_body" || true)
 
 if [ "$r_loads" -gt 1 ]; then
     echo "restrict loop should load y once; got $r_loads movslq loads" >&2

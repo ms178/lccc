@@ -245,6 +245,10 @@ impl Preprocessor {
         }
 
         for (line_num, line) in source.lines().enumerate() {
+            // Execute `_Pragma` operators queued by the previous line's macro
+            // expansion BEFORE processing this line, so their effects (C99
+            // §6.10.9) apply in source order relative to directives.
+            self.drain_expansion_pragmas();
             let trimmed = line.trim();
 
             // Map output line number to original source line number using the
@@ -358,6 +362,7 @@ impl Preprocessor {
                     let after_hash = trimmed[1..].trim_start();
                     if after_hash.starts_with("define") || after_hash.starts_with("undef") {
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                        self.drain_expansion_pragmas();
                         pending_line.clear();
                         pending_line.push_str(&expanded);
                     } else if after_hash.starts_with("include") {
@@ -366,6 +371,7 @@ impl Preprocessor {
                         // pending tokens to output first. The included content must appear
                         // after the preceding tokens, not before them.
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+                        self.drain_expansion_pragmas();
                         let expanded = self.resolve_has_macros_in_code(&expanded);
                         output.push_str(&expanded);
                         output.push('\n');
@@ -456,9 +462,13 @@ impl Preprocessor {
             }
         }
 
+        // Pragmas queued by the final line's expansion.
+        self.drain_expansion_pragmas();
+
         // Flush any remaining pending line
         if !pending_line.is_empty() {
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
+            self.drain_expansion_pragmas();
             let expanded = self.resolve_has_macros_in_code(&expanded);
             output.push_str(&expanded);
             output.push('\n');
@@ -518,6 +528,9 @@ impl Preprocessor {
                 *pending_newlines = 1;
             } else {
                 let expanded = self.macros.expand_line_reuse(line, expanding);
+                // _Pragma operators queued by this expansion are drained by
+                // the caller (this method holds &self; pragma execution needs
+                // &mut). They take effect before the next line is processed.
                 // After expansion, check if the expanded result ends with a
                 // function-like macro name. This handles chained macros like:
                 //   #define STEP1(x) x STEP2
@@ -810,6 +823,20 @@ impl Preprocessor {
     /// Returns Some(content) if an #include was processed and should be inserted.
     /// `line_num` is the 1-based source line number, `col` is the 1-based column
     /// of the `#` character (used for diagnostic source locations).
+    /// Execute `_Pragma("...")` operators queued by the last macro expansion
+    /// (C99 §6.10.9: `_Pragma("foo")` behaves like `#pragma foo` at that
+    /// point). Called after every expansion pass so pragma effects
+    /// (push_macro/pop_macro, weak, visibility, ...) apply in source order.
+    fn drain_expansion_pragmas(&mut self) {
+        for content in self.macros.take_pending_pragmas() {
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                continue;
+            }
+            self.handle_pragma(&content);
+        }
+    }
+
     fn process_directive(&mut self, line: &str, line_num: usize, col: usize) -> Option<String> {
         // Strip leading # and whitespace
         let after_hash = line.trim_start_matches('#').trim();

@@ -206,6 +206,11 @@ pub struct CodegenState {
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
     pub vec_live_regs: FxHashMap<u32, &'static str>,
+    /// True once this function emitted any 256/512-bit vector instruction.
+    /// Dirty upper YMM halves trigger the AVX-SSE transition penalty in
+    /// callers that use legacy SSE encodings; the epilogue emits
+    /// `vzeroupper` before `ret` when this is set (IS-20).
+    pub dirty_upper_ymm: bool,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether any position-independent code generation is enabled. Backends
@@ -435,6 +440,7 @@ impl CodegenState {
             pending_vec_store: None,
             direct_fp_result: None,
             vec_live_regs: FxHashMap::default(),
+            dirty_upper_ymm: false,
             label_counter: 0,
             pic_mode: false,
             pie_mode: false,
@@ -630,6 +636,7 @@ impl CodegenState {
         self.pending_vec_store = None;
         self.direct_fp_result = None;
         self.vec_live_regs.clear();
+        self.dirty_upper_ymm = false;
         self.uses_sret = false;
         self.next_block_label = None;
         // GEP-fold bookkeeping is function-local too: `folded_gep_values`
@@ -671,6 +678,11 @@ impl CodegenState {
     pub fn invalidate_vec_peephole(&mut self) {
         self.invalidate_vec_scratch_peephole();
         self.vec_live_regs.clear();
+        // NOTE: dirty_upper_ymm is deliberately NOT cleared here. The vec
+        // peephole cache is compiler bookkeeping, but upper-half dirtiness is
+        // physical machine state that persists until an explicit vzeroupper
+        // (or the epilogue's); invalidating the cache mid-function must not
+        // lose the pending epilogue emission.
     }
 
     /// Get the over-alignment requirement for an alloca (> 16 bytes), or None.
