@@ -42,6 +42,10 @@ pub(super) struct FuncScopeFrame {
     pub vla_typedef_sizes_added: Vec<String>,
     /// Keys that were overwritten in `vla_typedef_sizes`: (key, previous_value).
     pub vla_typedef_sizes_shadowed: Vec<(String, Value)>,
+    /// Nested-function names newly declared in this scope.
+    pub nested_fns_added: Vec<String>,
+    /// Nested-function names shadowed by this scope: (name, previous entry).
+    pub nested_fns_shadowed: Vec<(String, NestedFnEntry)>,
     /// Saved stack pointer before the first VLA in this scope.
     /// When set, StackRestore is emitted at scope exit to reclaim VLA stack space.
     pub scope_stack_save: Option<Value>,
@@ -65,6 +69,8 @@ impl FuncScopeFrame {
             var_ctypes_shadowed: Vec::new(),
             vla_typedef_sizes_added: Vec::new(),
             vla_typedef_sizes_shadowed: Vec::new(),
+            nested_fns_added: Vec::new(),
+            nested_fns_shadowed: Vec::new(),
             scope_stack_save: None,
             cleanup_vars: Vec::new(),
         }
@@ -158,6 +164,92 @@ pub(super) struct FunctionBuildState {
     /// Transferred to IrFunction in finalize_function so CFG simplify can keep
     /// these blocks reachable (their labels appear in global data like .quad .LBB3).
     pub global_init_label_blocks: Vec<BlockId>,
+    /// ── GNU C nested-function support ────────────────────────────────────
+    /// Nested functions visible in the current function (by plain name),
+    /// with scope-restore bookkeeping (added to the current scope frame).
+    pub nested_functions: FxHashMap<String, NestedFnEntry>,
+    /// Static-nesting depth: 0 for file-scope functions, +1 per nested level.
+    pub nesting_depth: usize,
+    /// Frame struct state: the frame alloca value (an entry-block alloca
+    /// whose size is patched at finalize), its current size/alignment, the
+    /// member layout cursor, and the reserved header words. The header is
+    /// [link (if this function is itself nested)][rbp][rsp (if non-local
+    /// gotos target this function)].
+    pub frame: Option<FrameState>,
+    /// The GetStaticChain dest (this function's incoming chain value),
+    /// present when the function is nested AND uses (or forwards) the chain.
+    pub chain_value: Option<Value>,
+    /// Frame-member memoization: captured-local name -> byte offset in this
+    /// function's frame struct. The FIRST nested function that captures a
+    /// local moves it into the frame; later nested functions capturing the
+    /// same local MUST reuse the identical offset (their bodies were lowered
+    /// with that offset baked in, and re-framing would allocate a second,
+    /// never-written member).
+    pub frame_members: FxHashMap<String, i64>,
+    /// Captured-variable access bookkeeping for THIS function's visible
+    /// locals that live in an ANCESTOR's frame: alloca-value-id ->
+    /// (frame-link hops, byte offset in the owning frame). Used to compute
+    /// the access path when a deeper nested function captures the same
+    /// variable again.
+    pub chain_locals: FxHashMap<u32, (usize, i64)>,
+    /// Non-local goto targets visible in this function: resolved label name
+    /// -> (hops to the owning frame, rbp offset, rsp offset, label block).
+    pub nonlocal_labels: FxHashMap<String, NonlocalGotoTarget>,
+    /// Named-label aliases to emit AT a label statement in THIS function,
+    /// for nested functions (non-local goto targets and &&label refs):
+    /// resolved label name -> aliases. Consumed by lower_label_stmt, which
+    /// emits each alias as an InlineAsm label at the label's block — a real
+    /// instruction that survives block merging and label renumbering.
+    pub pending_label_aliases: FxHashMap<String, Vec<String>>,
+    /// &&label references to ENCLOSING function labels, resolved to named
+    /// aliases: label name (as written) -> alias. Consulted by the
+    /// LabelAddr lowering hook; empty in non-nested contexts.
+    pub addr_label_aliases: FxHashMap<String, String>,
+}
+
+/// A nested function visible for call resolution.
+#[derive(Debug, Clone)]
+pub struct NestedFnEntry {
+    /// IR symbol name (parent-mangled: "parent.name", possibly nested further).
+    pub mangled: String,
+    /// Static-nesting depth of the nested function (parent depth + 1).
+    pub depth: usize,
+    /// Whether the function reads its static chain (or forwards it for
+    /// descendants). When false, callers skip SetStaticChain and
+    /// address-taking needs no trampoline.
+    pub uses_chain: bool,
+}
+
+/// Frame struct layout state for a function containing nested functions.
+#[derive(Debug, Clone)]
+pub struct FrameState {
+    /// The frame alloca value (pointer to the frame struct).
+    pub alloca: Value,
+    /// Current total size in bytes (patched into the alloca at finalize).
+    pub size: usize,
+    /// Alignment of the frame (>= 8; 16 when any member needs it).
+    pub align: usize,
+    /// Whether the link word (offset 0) is present (function is nested).
+    pub has_link: bool,
+    /// Whether the non-local-goto save area (2 words after the link) is
+    /// present, and at which offsets.
+    pub goto_save: Option<(i64, i64)>,
+    /// Member cursor: next free byte offset (after the header).
+    pub cursor: i64,
+}
+
+/// A non-local goto target reachable from the current function.
+#[derive(Debug, Clone)]
+pub struct NonlocalGotoTarget {
+    /// Frame-link hops from THIS function's static chain to the frame that
+    /// owns the save area.
+    pub up: usize,
+    pub rbp_off: i64,
+    pub rsp_off: i64,
+    /// Named assembly label emitted by the ENCLOSING function at the target
+    /// block (block IDs are per-function; cross-function references need a
+    /// stable name).
+    pub label: String,
 }
 
 impl FunctionBuildState {
@@ -193,12 +285,40 @@ impl FunctionBuildState {
             current_span: Span::dummy(),
             is_inline_candidate: false,
             global_init_label_blocks: Vec::new(),
+            nested_functions: FxHashMap::default(),
+            nesting_depth: 0,
+            frame: None,
+            chain_value: None,
+            frame_members: FxHashMap::default(),
+            chain_locals: FxHashMap::default(),
+            nonlocal_labels: FxHashMap::default(),
+            pending_label_aliases: FxHashMap::default(),
+            addr_label_aliases: FxHashMap::default(),
         }
     }
 
     /// Push a new function-local scope frame.
     pub fn push_scope(&mut self) {
         self.scope_stack.push(FuncScopeFrame::new());
+    }
+
+    /// Declare a nested function in the CURRENT scope (with undo bookkeeping
+    /// so pop_scope restores the previous binding).
+    pub fn declare_nested_fn(&mut self, name: &str, entry: NestedFnEntry) {
+        match self.scope_stack.last_mut() {
+            Some(frame) => {
+                if let Some(prev) = self.nested_functions.insert(name.to_string(), entry) {
+                    frame.nested_fns_shadowed.push((name.to_string(), prev));
+                } else {
+                    frame.nested_fns_added.push(name.to_string());
+                }
+            }
+            None => {
+                // No scope frame (shouldn't happen: blocks with nested defs
+                // always push one) — declare without undo tracking.
+                self.nested_functions.insert(name.to_string(), entry);
+            }
+        }
     }
 
     /// Pop the top function-local scope frame and undo changes to locals,
@@ -237,6 +357,12 @@ impl FunctionBuildState {
             }
             for (key, val) in frame.vla_typedef_sizes_shadowed {
                 self.vla_typedef_sizes.insert(key, val);
+            }
+            for key in frame.nested_fns_added {
+                self.nested_functions.remove(&key);
+            }
+            for (key, val) in frame.nested_fns_shadowed {
+                self.nested_functions.insert(key, val);
             }
             (scope_stack_save, cleanup_vars)
         } else {

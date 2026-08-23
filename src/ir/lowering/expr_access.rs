@@ -1244,7 +1244,14 @@ impl Lowerer {
         let has_declarations = compound
             .items
             .iter()
-            .any(|item| matches!(item, BlockItem::Declaration(_)));
+            .any(|item| {
+                matches!(item, BlockItem::Declaration(_)) || {
+                    // Nested definitions contribute a scope entry exactly
+                    // like declarations do (the nested function name is
+                    // declared in this block).
+                    matches!(item, BlockItem::NestedFunction(_))
+                }
+            });
         if has_declarations {
             self.push_scope();
         }
@@ -1288,6 +1295,13 @@ impl Lowerer {
                 BlockItem::Declaration(decl) => {
                     self.collect_enum_constants_scoped(&decl.type_spec);
                     self.lower_local_decl(decl);
+                }
+                BlockItem::NestedFunction(_) => {
+                    // Nested function definitions inside statement
+                    // expressions are not lowered here: a definition is not
+                    // an expression. (GCC accepts the shape; lowering the
+                    // function itself happens through the enclosing
+                    // function-body walk, which re-visits all items.)
                 }
             }
         }

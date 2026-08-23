@@ -532,6 +532,20 @@ fn replace_operands_in_instruction(inst: &mut Instruction, copy_map: &[Option<Op
 
     match inst {
         Instruction::Alloca { .. } | Instruction::PgoCounterInc { .. } => {}
+        Instruction::GetStaticChain { .. } => {}
+        Instruction::SetStaticChain { src } => {
+            count += replace_operand(src, copy_map);
+        }
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            count += replace_value_in_place(buffer, copy_map);
+            count += replace_operand(chain, copy_map);
+        }
+        Instruction::NonlocalGotoSave { frame, .. } => {
+            count += replace_value_in_place(frame, copy_map);
+        }
+        Instruction::NonlocalGoto { chain, .. } => {
+            count += replace_operand(chain, copy_map);
+        }
         Instruction::DynAlloca { size, .. } => {
             count += replace_operand(size, copy_map);
         }

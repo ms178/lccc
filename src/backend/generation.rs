@@ -82,6 +82,10 @@ pub(crate) fn instruction_may_clobber_vector_scratch(inst: &Instruction) -> bool
         Instruction::Copy { .. }
         | Instruction::Select { .. }
         | Instruction::DynAlloca { .. }
+        | Instruction::SetStaticChain { .. }
+        | Instruction::InitTrampoline { .. }
+        | Instruction::NonlocalGotoSave { .. }
+        | Instruction::NonlocalGoto { .. }
         | Instruction::Store { .. }
         | Instruction::Call { .. }
         | Instruction::CallIndirect { .. }
@@ -113,6 +117,7 @@ pub(crate) fn instruction_may_clobber_vector_scratch(inst: &Instruction) -> bool
         | Instruction::PgoCounterInc { .. }
         | Instruction::Phi { .. }
         | Instruction::LabelAddr { .. }
+        | Instruction::GetStaticChain { .. }
         | Instruction::StackSave { .. }
         | Instruction::StackRestore { .. } => false,
     }
@@ -2409,7 +2414,13 @@ pub fn generate_module(
     cg.state().emit_fp_const_pool();
 
     cg.state().emit("");
-    cg.state().emit(".section .note.GNU-stack,\"\",@progbits");
+    // Nested-function trampolines execute code on the stack: mark the
+    // stack executable (GCC does the same for trampoline-using units).
+    if cg.state_ref().requires_executable_stack {
+        cg.state().emit(".section .note.GNU-stack,\"x\",@progbits");
+    } else {
+        cg.state().emit(".section .note.GNU-stack,\"\",@progbits");
+    }
 
     std::mem::take(&mut cg.state().out.buf)
 }
@@ -3876,6 +3887,43 @@ pub(super) fn generate_instruction(
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
     match inst {
+        // GNU C nested-function support (static chain / trampoline /
+        // non-local goto). x86-only; the trait defaults fail closed on
+        // other targets.
+        Instruction::GetStaticChain { dest } => {
+            cg.emit_get_static_chain(dest);
+            clobber_after_call_like(cg);
+        }
+        Instruction::SetStaticChain { src } => {
+            cg.emit_set_static_chain(src);
+            clobber_after_call_like(cg);
+        }
+        Instruction::InitTrampoline {
+            buffer,
+            chain,
+            func,
+        } => {
+            cg.emit_init_trampoline(buffer, chain, func);
+            clobber_after_call_like(cg);
+        }
+        Instruction::NonlocalGotoSave {
+            frame,
+            rbp_off,
+            rsp_off,
+        } => {
+            cg.emit_nonlocal_goto_save(frame, *rbp_off, *rsp_off);
+            clobber_after_call_like(cg);
+        }
+        Instruction::NonlocalGoto {
+            chain,
+            up,
+            rbp_off,
+            rsp_off,
+            label,
+        } => {
+            cg.emit_nonlocal_goto(chain, *up, *rbp_off, *rsp_off, label);
+            clobber_after_call_like(cg);
+        }
         Instruction::PgoCounterInc {
             name,
             offset,

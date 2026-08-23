@@ -26,6 +26,7 @@ mod global_init_compound_ptrs;
 mod global_init_compound_struct;
 pub(crate) mod global_init_helpers;
 pub(crate) mod lower;
+mod nested_functions;
 pub(crate) mod lvalue;
 mod pointer_analysis;
 mod ref_collection;

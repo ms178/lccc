@@ -75,9 +75,28 @@ impl Parser {
             if matches!(self.peek(), TokenKind::StaticAssert) {
                 self.parse_static_assert();
             } else if self.is_type_specifier() && !self.is_typedef_label() {
+                // GNU C nested function definition? (`int f(int *p) { ... }`
+                // at block scope). Try to parse one; on mismatch the parser
+                // state is restored and the item falls through to a normal
+                // local declaration.
+                if let Some(nf) = self.try_parse_nested_function_def() {
+                    items.push(BlockItem::NestedFunction(nf));
+                    continue;
+                }
                 if let Some(decl) = self.parse_local_declaration() {
                     items.push(BlockItem::Declaration(decl));
                 }
+            } else if self.looks_like_implicit_int_nested_function() {
+                // C89 implicit-int nested function (`retframe_block() { ... }`
+                // or K&R `f(a) int a; { ... }` at block scope): an identifier
+                // directly followed by a parameter list and a body cannot be
+                // an expression statement (that would require a ';').
+                if let Some(nf) = self.try_parse_nested_function_def() {
+                    items.push(BlockItem::NestedFunction(nf));
+                    continue;
+                }
+                let stmt = self.parse_stmt();
+                items.push(BlockItem::Statement(stmt));
             } else {
                 let stmt = self.parse_stmt();
                 items.push(BlockItem::Statement(stmt));

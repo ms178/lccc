@@ -209,9 +209,18 @@ fn replace_values_in_inst(inst: &mut Instruction, map: &FxHashMap<u32, u32>, rew
         | Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
         | Instruction::GetReturnF128Second { .. }
+        | Instruction::GetStaticChain { .. }
         | Instruction::StackSave { .. }
         | Instruction::ParamRef { .. }
         | Instruction::VaEnd { .. } => {}
+        // Nested-function support: operand rewrites.
+        Instruction::SetStaticChain { src } => rewrite_operand(src, map),
+        Instruction::InitTrampoline { buffer, chain, .. } => {
+            rewrite_value(buffer, map);
+            rewrite_operand(chain, map);
+        }
+        Instruction::NonlocalGotoSave { frame, .. } => rewrite_value(frame, map),
+        Instruction::NonlocalGoto { chain, .. } => rewrite_operand(chain, map),
         Instruction::DynAlloca { size, .. } => rewrite_operand(size, map),
         Instruction::Store { val, ptr, .. } => {
             rewrite_operand(val, map);

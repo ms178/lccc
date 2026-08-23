@@ -124,6 +124,12 @@ pub struct SemanticAnalyzer {
     defined_structs: RefCell<FxHashSet<String>>,
     /// Return type of the function body currently being checked.
     current_return_type: Option<CType>,
+    /// Stack of enclosing function definition names for nested functions.
+    /// Entry i is the name of the function containing the body currently
+    /// being analyzed; the LAST entry is the innermost (possibly nested)
+    /// function. Used by the lowerer-side capture analysis via the analyzer
+    /// result (see `nested_function_names`).
+    function_nesting_stack: Vec<String>,
 }
 
 impl SemanticAnalyzer {
@@ -135,6 +141,7 @@ impl SemanticAnalyzer {
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
             current_return_type: None,
+            function_nesting_stack: Vec::new(),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -186,6 +193,81 @@ impl SemanticAnalyzer {
     // === Function analysis ===
 
     fn analyze_function_def(&mut self, func: &FunctionDef) {
+        self.function_nesting_stack.push(func.name.clone());
+        self.analyze_function_def_inner(func);
+        self.function_nesting_stack.pop();
+    }
+
+    /// Analyze a GNU C nested function definition (block scope).
+    ///
+    /// The nested function's symbol is declared in the CURRENT block scope
+    /// (so calls resolve with correct shadowing), its body is analyzed with
+    /// its own return-type context, and its signature is registered in the
+    /// function table under the plain name (first definition wins, matching
+    /// the file-scope rule). A separate record keyed by the mangled
+    /// `parent.nested` name is added for the lowerer.
+    fn analyze_nested_function_def(&mut self, func: &FunctionDef) {
+        let parent = self
+            .function_nesting_stack
+            .last()
+            .cloned()
+            .unwrap_or_default();
+        let mangled = format!("{}.{}", parent, func.name);
+
+        let return_type = self.type_spec_to_ctype(&func.return_type);
+        self.collect_enum_constants_from_type_spec(&func.return_type);
+
+        let params: Vec<(CType, Option<String>)> = func
+            .params
+            .iter()
+            .map(|p| (self.param_decl_ctype(p), p.name.clone()))
+            .collect();
+
+        let func_info = FunctionInfo {
+            return_type: return_type.clone(),
+            params: params.clone(),
+            variadic: func.variadic,
+            is_defined: true,
+            is_noreturn: func.attrs.is_noreturn(),
+        };
+        self.result.functions.insert(mangled, func_info);
+
+        // Declare the symbol in the enclosing block scope so identifier
+        // resolution finds it with proper lexical scoping.
+        let func_ctype = CType::Function(Box::new(FunctionType {
+            return_type: return_type.clone(),
+            params: params.clone(),
+            variadic: func.variadic,
+        }));
+        self.symbol_table.declare(Symbol {
+            name: func.name.clone(),
+            ty: func_ctype,
+            explicit_alignment: None,
+        });
+
+        // Analyze the body in its own scope, with its own return type.
+        self.symbol_table.push_scope();
+        self.result.type_context.push_scope();
+        for param in &func.params {
+            if let Some(name) = &param.name {
+                let ty = self.param_decl_ctype(param);
+                self.symbol_table.declare(Symbol {
+                    name: name.clone(),
+                    ty,
+                    explicit_alignment: None,
+                });
+            }
+        }
+        let previous_return_type = self.current_return_type.replace(return_type.clone());
+        self.function_nesting_stack.push(func.name.clone());
+        self.analyze_compound_stmt(&func.body);
+        self.function_nesting_stack.pop();
+        self.current_return_type = previous_return_type;
+        self.result.type_context.pop_scope();
+        self.symbol_table.pop_scope();
+    }
+
+    fn analyze_function_def_inner(&mut self, func: &FunctionDef) {
         let return_type = self.type_spec_to_ctype(&func.return_type);
 
         // Register enum constants from the return type (e.g., anonymous enums
@@ -874,6 +956,9 @@ impl SemanticAnalyzer {
                 BlockItem::Statement(stmt) => {
                     self.analyze_stmt(stmt);
                 }
+                BlockItem::NestedFunction(nested) => {
+                    self.analyze_nested_function_def(nested);
+                }
             }
         }
         self.result.type_context.pop_scope();
@@ -927,12 +1012,16 @@ impl SemanticAnalyzer {
                 }
             }
             Stmt::Return(None, span) => {
+                // GCC treats a bare `return;` in a non-void function as a
+                // WARNING (the return value is indeterminate), not an error
+                // — gcc.c-torture/execute/920415-1.c relies on this in gnu89
+                // code. The lowered function returns an undefined value.
                 if self
                     .current_return_type
                     .as_ref()
                     .is_some_and(|t| !matches!(t, CType::Void))
                 {
-                    self.diagnostics.borrow_mut().error(
+                    self.diagnostics.borrow_mut().warning(
                         "return with no value, in function returning non-void",
                         *span,
                     );
@@ -1052,7 +1141,7 @@ impl SemanticAnalyzer {
         for item in &compound.items {
             let falls_through = match item {
                 BlockItem::Statement(stmt) => self.stmt_can_fall_through(stmt),
-                BlockItem::Declaration(_) => true,
+                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => true,
             };
             if !falls_through {
                 return false;
@@ -1219,7 +1308,7 @@ impl SemanticAnalyzer {
 
         for item in segment {
             let outcome = match item {
-                BlockItem::Declaration(_) => continue,
+                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => continue,
                 BlockItem::Statement(stmt) => {
                     let inner = self.unwrap_case_label(stmt);
                     self.stmt_switch_outcome(inner)
@@ -1247,7 +1336,7 @@ impl SemanticAnalyzer {
                 // subsequent items are dead code. This handles `return x; break;`.
                 for item in &compound.items {
                     let outcome = match item {
-                        BlockItem::Declaration(_) => continue,
+                        BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => continue,
                         BlockItem::Statement(s) => self.stmt_switch_outcome(s),
                     };
                     if outcome != SwitchSegmentOutcome::FallsThrough {

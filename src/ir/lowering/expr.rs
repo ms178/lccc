@@ -304,6 +304,18 @@ impl Lowerer {
                 self.lower_generic_selection(controlling, associations)
             }
             Expr::LabelAddr(label_name, _) => {
+                // GNU C nested functions: &&label of an ENCLOSING function's
+                // label resolves to the parent's named alias (block IDs are
+                // per-function; the child cannot reference them numerically).
+                let alias = self.func().addr_label_aliases.get(label_name).cloned();
+                if let Some(alias) = alias {
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::GlobalAddr {
+                        dest,
+                        name: alias,
+                    });
+                    return Operand::Value(dest);
+                }
                 let scoped_label = self.get_or_create_user_label(label_name);
                 let dest = self.fresh_value();
                 self.emit(Instruction::LabelAddr {
@@ -514,6 +526,16 @@ impl Lowerer {
         if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
             if let Some(ginfo) = self.globals.get(&mangled).cloned() {
                 return self.load_global_var(mangled, &ginfo);
+            }
+        }
+
+        // GNU C nested function used as a value (address taken): a
+        // trampoline for chain-using functions, the plain symbol otherwise.
+        // Checked BEFORE globals so a nested function shadows a same-named
+        // global, per lexical scoping.
+        if self.lookup_nested_function(name).is_some() {
+            if let Some(op) = self.lower_nested_function_address(name) {
+                return op;
             }
         }
 

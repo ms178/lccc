@@ -211,6 +211,10 @@ pub struct CodegenState {
     /// callers that use legacy SSE encodings; the epilogue emits
     /// `vzeroupper` before `ret` when this is set (IS-20).
     pub dirty_upper_ymm: bool,
+    /// True once any function emitted a nested-function trampoline. The
+    /// stack must be executable for trampolines to work; the output's
+    /// .note.GNU-stack section is emitted with the "x" flag.
+    pub requires_executable_stack: bool,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether any position-independent code generation is enabled. Backends
@@ -441,6 +445,7 @@ impl CodegenState {
             direct_fp_result: None,
             vec_live_regs: FxHashMap::default(),
             dirty_upper_ymm: false,
+            requires_executable_stack: false,
             label_counter: 0,
             pic_mode: false,
             pie_mode: false,

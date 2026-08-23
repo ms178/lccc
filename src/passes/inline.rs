@@ -3306,7 +3306,7 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         },
         Instruction::LabelAddr { dest, label } => Instruction::LabelAddr {
             dest: remap_value(*dest, vo),
-            label: remap_block(*label, bo),
+            label: label.clone(),
         },
         Instruction::GetReturnF64Second { dest } => Instruction::GetReturnF64Second {
             dest: remap_value(*dest, vo),
@@ -3325,6 +3325,47 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         },
         Instruction::SetReturnF128Second { src } => Instruction::SetReturnF128Second {
             src: remap_operand(src, vo),
+        },
+        // Nested-function support instructions. The inliner never inlines
+        // nested functions (they are marked noinline), so these can only
+        // appear when inlining a PARENT that calls a nested child; remap
+        // their operands and pass the rest through unchanged.
+        Instruction::GetStaticChain { dest } => Instruction::GetStaticChain {
+            dest: remap_value(*dest, vo),
+        },
+        Instruction::SetStaticChain { src } => Instruction::SetStaticChain {
+            src: remap_operand(src, vo),
+        },
+        Instruction::InitTrampoline {
+            buffer,
+            chain,
+            func,
+        } => Instruction::InitTrampoline {
+            buffer: remap_value(*buffer, vo),
+            chain: remap_operand(chain, vo),
+            func: func.clone(),
+        },
+        Instruction::NonlocalGotoSave {
+            frame,
+            rbp_off,
+            rsp_off,
+        } => Instruction::NonlocalGotoSave {
+            frame: remap_value(*frame, vo),
+            rbp_off: *rbp_off,
+            rsp_off: *rsp_off,
+        },
+        Instruction::NonlocalGoto {
+            chain,
+            up,
+            rbp_off,
+            rsp_off,
+            label,
+        } => Instruction::NonlocalGoto {
+            chain: remap_operand(chain, vo),
+            up: *up,
+            rbp_off: *rbp_off,
+            rsp_off: *rsp_off,
+            label: label.clone(),
         },
         Instruction::InlineAsm {
             template,

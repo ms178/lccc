@@ -960,7 +960,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 Instruction::GetElementPtr { dest, .. }
                 | Instruction::GlobalAddr { dest, .. }
-                | Instruction::LabelAddr { dest, .. } => {
+                | Instruction::LabelAddr { dest, .. }
+                | Instruction::GetStaticChain { dest } => {
                     eligible.insert(dest.0);
                 }
                 Instruction::Copy { dest, .. } => {

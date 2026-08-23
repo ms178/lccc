@@ -124,7 +124,7 @@ impl Lowerer {
     }
 
     /// Compute the IR return type for a function, applying ABI overrides.
-    fn compute_function_return_type(&mut self, func: &FunctionDef) -> IrType {
+    pub(super) fn compute_function_return_type(&mut self, func: &FunctionDef) -> IrType {
         // Record complex return type for expr_ctype resolution
         let ret_ctype = self.type_spec_to_ctype(&func.return_type);
         if ret_ctype.is_complex() {
@@ -167,7 +167,7 @@ impl Lowerer {
     }
 
     /// Build the IR parameter list for a function, handling ABI decomposition.
-    fn build_ir_params(&mut self, func: &FunctionDef) -> IrParamBuildResult {
+    pub(super) fn build_ir_params(&mut self, func: &FunctionDef) -> IrParamBuildResult {
         let mut params: Vec<IrParam> = Vec::new();
         let mut param_kinds: Vec<ParamKind> = Vec::new();
         let mut uses_sret = false;
@@ -355,7 +355,7 @@ impl Lowerer {
     }
 
     /// Allocate function parameters as local variables (3-phase process).
-    fn allocate_function_params(&mut self, func: &FunctionDef, info: &IrParamBuildResult) {
+    pub(super) fn allocate_function_params(&mut self, func: &FunctionDef, info: &IrParamBuildResult) {
         // Phase 1: Emit allocas for all IR params
         let mut ir_allocas: Vec<Value> = Vec::new();
         for param in &info.params {
@@ -744,7 +744,7 @@ impl Lowerer {
     /// Handle K&R default argument promotions: narrow promoted params back to declared types.
     /// float->double promotion: narrow double back to float.
     /// char/short->int promotion: narrow int back to char/short.
-    fn handle_kr_float_promotion(&mut self, func: &FunctionDef) {
+    pub(super) fn handle_kr_float_promotion(&mut self, func: &FunctionDef) {
         if !func.is_kr {
             return;
         }
@@ -996,7 +996,7 @@ impl Lowerer {
     /// `a++`) must still be evaluated for its side effects. The expression was
     /// preserved in `ParamDecl::vla_size_exprs` during parsing; we evaluate it here
     /// (discarding the result) so that side effects take effect before the body runs.
-    fn evaluate_vla_param_side_effects(&mut self, func: &FunctionDef) {
+    pub(super) fn evaluate_vla_param_side_effects(&mut self, func: &FunctionDef) {
         for param in &func.params {
             for expr in &param.vla_size_exprs {
                 // Evaluate the expression for its side effects; discard the result.
@@ -1168,7 +1168,7 @@ impl Lowerer {
     /// This information is used by `lower_goto_stmt` to determine which cleanup
     /// scopes need to be exited: only scopes deeper than the target label's depth
     /// should have their cleanup destructors called.
-    fn prescan_label_depths(body: &CompoundStmt) -> FxHashMap<String, usize> {
+    pub(super) fn prescan_label_depths(body: &CompoundStmt) -> FxHashMap<String, usize> {
         let mut result = FxHashMap::default();
         // depth starts at 1 because lower_function calls push_scope() before
         // lower_compound_stmt, and then lower_compound_stmt calls push_scope again
@@ -1188,12 +1188,18 @@ impl Lowerer {
         let has_declarations = compound
             .items
             .iter()
-            .any(|item| matches!(item, BlockItem::Declaration(_)));
+            .any(|item| {
+                matches!(item, BlockItem::Declaration(_))
+                    || matches!(item, BlockItem::NestedFunction(_))
+            });
         let inner_depth = if has_declarations { depth + 1 } else { depth };
         for item in &compound.items {
             match item {
                 BlockItem::Statement(stmt) => Self::prescan_stmt(stmt, inner_depth, result),
-                BlockItem::Declaration(_) => {}
+                // A nested function's labels live in ITS body, not the
+                // parent's: skip the whole definition. The nested function
+                // gets its own prescan when it is lowered independently.
+                BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => {}
             }
         }
     }

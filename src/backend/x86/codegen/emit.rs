@@ -4584,6 +4584,11 @@ impl ArchCodegen for X86Codegen {
         fn emit_return_i128_to_regs(&mut self) => emit_return_i128_to_regs_impl;
         fn emit_get_return_f64_second(&mut self, dest: &Value) => emit_get_return_f64_second_impl;
         fn emit_set_return_f64_second(&mut self, src: &Operand) => emit_set_return_f64_second_impl;
+        fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
+        fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
+        fn emit_init_trampoline(&mut self, buffer: &Value, chain: &Operand, func: &str) => emit_init_trampoline_impl;
+        fn emit_nonlocal_goto_save(&mut self, frame: &Value, rbp_off: i64, rsp_off: i64) => emit_nonlocal_goto_save_impl;
+        fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
         fn emit_get_return_f32_second(&mut self, dest: &Value) => emit_get_return_f32_second_impl;
         fn emit_set_return_f32_second(&mut self, src: &Operand) => emit_set_return_f32_second_impl;
         fn emit_return_f128_to_reg(&mut self) => emit_return_f128_to_reg_impl;

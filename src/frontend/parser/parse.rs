@@ -145,6 +145,7 @@ pub(super) mod parsed_attr_flag {
 /// efficiency — 19 booleans collapse from 19 bytes into 4 bytes. Accessor
 /// methods provide the same API as the old struct fields.
 #[derive(Default)]
+#[derive(Clone)]
 pub(super) struct ParsedDeclAttrs {
     /// Packed boolean flags — see `parsed_attr_flag` constants.
     pub(super) flags: u32,

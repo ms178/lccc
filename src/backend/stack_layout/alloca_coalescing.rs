@@ -215,6 +215,30 @@ impl AllocaEscapeAnalysis {
                 self.mark_direct_escaped(dest_ptr.0);
                 self.mark_direct_escaped(va_list_ptr.0);
             }
+            // GNU C nested-function support: the frame alloca is read by
+            // the chain instructions (SetStaticChain operand, NonlocalGoto
+            // operand, NonlocalGotoSave/InitTrampoline frame/buffer value).
+            // Record these as USES (not escapes): the frame's identity as a
+            // stack object is preserved; only its address is consumed.
+            Instruction::SetStaticChain { src } => {
+                if let Operand::Value(v) = src {
+                    self.record_use(v.0, block_idx);
+                }
+            }
+            Instruction::NonlocalGoto { chain, .. } => {
+                if let Operand::Value(v) = chain {
+                    self.record_use(v.0, block_idx);
+                }
+            }
+            Instruction::NonlocalGotoSave { frame, .. } => {
+                self.record_use(frame.0, block_idx);
+            }
+            Instruction::InitTrampoline { buffer, chain, .. } => {
+                self.record_use(buffer.0, block_idx);
+                if let Operand::Value(v) = chain {
+                    self.record_use(v.0, block_idx);
+                }
+            }
             Instruction::Cast { src, .. }
             | Instruction::Copy { src, .. }
             | Instruction::UnaryOp { src, .. } => {

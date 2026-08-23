@@ -1666,6 +1666,11 @@ pub(crate) fn for_each_operand_in_instruction(inst: &Instruction, mut f: impl Fn
         Instruction::StackSave { .. } => {}
         Instruction::StackRestore { .. } => {}
         Instruction::ParamRef { .. } => {}
+        Instruction::GetStaticChain { .. } => {}
+        Instruction::SetStaticChain { src } => f(src),
+        Instruction::InitTrampoline { chain, .. } => f(chain),
+        Instruction::NonlocalGotoSave { .. } => {}
+        Instruction::NonlocalGoto { chain, .. } => f(chain),
     }
 }
 
@@ -1705,6 +1710,8 @@ pub(crate) fn for_each_value_use_in_instruction(inst: &Instruction, mut f: impl 
             f(dp);
         }
         Instruction::StackRestore { ptr } => f(ptr),
+        Instruction::InitTrampoline { buffer, .. } => f(buffer),
+        Instruction::NonlocalGotoSave { frame, .. } => f(frame),
         _ => {}
     }
 }
