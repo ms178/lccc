@@ -70,6 +70,36 @@ fn push_verdef_entry_with_parent(
     }
 }
 
+/// Emit one GNU ELF64 `Verneed` node and its `Vernaux` entries.
+///
+/// Undefined references in a shared object carry a version index in
+/// `.gnu.version`; the index is resolved through `.gnu.version_r`, not the
+/// provider-side `.gnu.version_d`. Omitting this table makes glibc's internal
+/// `*_rtld_global*@GLIBC_PRIVATE` references look unversioned at load time and
+/// fails before `main` with a misleading undefined-symbol diagnostic.
+fn push_verneed_entry(
+    buf: &mut Vec<u8>,
+    soname_off: usize,
+    versions: &[(String, u16, usize)],
+) {
+    let start = buf.len();
+    buf.resize(start + 16, 0);
+    w16(buf, start, 1); // vn_version
+    w16(buf, start + 2, versions.len() as u16);
+    w32(buf, start + 4, soname_off as u32);
+    w32(buf, start + 8, 16); // vn_aux: first Vernaux
+    w32(buf, start + 12, 0); // one provider per node in this emitter
+    for (idx, (version, other, name_off)) in versions.iter().enumerate() {
+        let aux = buf.len();
+        buf.resize(aux + 16, 0);
+        w32(buf, aux, elf_hash_name(version));
+        w16(buf, aux + 4, 0); // vna_flags
+        w16(buf, aux + 6, *other);
+        w32(buf, aux + 8, *name_off as u32);
+        w32(buf, aux + 12, if idx + 1 == versions.len() { 0 } else { 16 });
+    }
+}
+
 fn elf_hash_name(name: &str) -> u32 {
     let mut h: u32 = 0;
     for b in name.bytes() {
@@ -541,7 +571,6 @@ pub(super) fn emit_shared_library(
 
     let dynsym_count = 1 + dyn_sym_names.len();
     let dynsym_size = dynsym_count as u64 * 24;
-    let dynstr_size = dynstr.as_bytes().len() as u64;
 
     // Build .gnu.hash
     // Separate defined (hashed) from undefined (unhashed) symbols.
@@ -641,8 +670,68 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    // Dynamic imports have their own version-index namespace. Allocate it
+    // after all provider-side verdef nodes so a `.gnu.version` entry can be
+    // decoded unambiguously by ld.so. Keep the allocation deterministic: both
+    // library names and version names are sorted before serialization.
+    let mut needed_versions: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
+    for name in &dyn_sym_names {
+        if let Some(g) = globals.get(name) {
+            if g.is_dynamic {
+                if let (Some(lib), Some(version)) = (&g.from_lib, &g.version) {
+                    needed_versions
+                        .entry(lib.clone())
+                        .or_default()
+                        .insert(version.clone());
+                }
+            }
+        }
+    }
+    let provider_verdef_count = if !version_set.is_empty() {
+        1 + version_set.len() as u64
+    } else if script_nodes.len() > 1 {
+        1 + script_nodes.len() as u64
+    } else if versioned_name.is_some() {
+        2
+    } else {
+        0
+    };
+    let first_verneed_index = if provider_verdef_count > 0 {
+        provider_verdef_count + 1
+    } else {
+        2
+    };
+    let mut version_need_indices: FxHashMap<(String, String), u16> = FxHashMap::default();
+    let mut next_verneed_index = first_verneed_index as u16;
+    let mut sorted_needed_libs: Vec<String> = needed_versions.keys().cloned().collect();
+    sorted_needed_libs.sort();
+    for lib in &sorted_needed_libs {
+        let mut versions: Vec<String> = needed_versions[lib].iter().cloned().collect();
+        versions.sort();
+        for version in versions {
+            version_need_indices.insert((lib.clone(), version), next_verneed_index);
+            next_verneed_index = next_verneed_index
+                .checked_add(1)
+                .ok_or("too many shared-library symbol versions")?;
+        }
+    }
+    for ((_, version), _) in version_need_indices.iter() {
+        dynstr.add(version);
+    }
+    // A needs-only DSO still gets the base verdef node emitted by the
+    // version-table path below; make its SONAME/string-table name available
+    // before capturing offsets.
+    if !version_need_indices.is_empty() {
+        dynstr.add(&base_version_name);
+    }
+    // This must be computed after importing version names.  Otherwise the
+    // VERNEED name offsets point past the end of `.dynstr`; ld.so reports the
+    // first byte at that offset as a bogus version such as `G`.
+    let dynstr_size = dynstr.as_bytes().len() as u64;
+
     let (versym_data, verdef_data, verdef_count): (Vec<u8>, Vec<u8>, u64) = if !version_set
         .is_empty()
+        && script_nodes.len() <= 1
     {
         // Proper GNU versioning from the objects' .symver names: one verdef
         // node per version; each dynsym entry's versym index selects its node.
@@ -664,7 +753,16 @@ pub(super) fn emit_shared_library(
             } else {
                 (None, false)
             };
+            let dynamic_import = globals.get(name).is_some_and(|g| g.is_dynamic);
+            let import_idx = globals.get(name).and_then(|g| {
+                let lib = g.from_lib.as_ref()?;
+                let version = g.version.as_ref()?;
+                version_need_indices
+                    .get(&(lib.clone(), version.clone()))
+                    .copied()
+            });
             let mut idx: u16 = match ver {
+                Some(_v) if dynamic_import => import_idx.unwrap_or(1),
                 Some(v) => 2 + version_set.iter().position(|x| x == v).unwrap_or(0) as u16,
                 // Plain (un-@-suffixed) DEFINED name: GNU ld assigns the
                 // version of the FIRST version-script node whose `global:`
@@ -677,8 +775,11 @@ pub(super) fn emit_shared_library(
                 // Undefined symbols stay 1: imports are versioned via
                 // verneed, not verdef.
                 None => {
-                    let defined = globals
-                        .get(name)
+                    if let Some(idx) = import_idx {
+                        idx
+                    } else {
+                        let defined = globals
+                            .get(name)
                         .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
                     let from_script = if defined {
                         version_script.as_ref().and_then(|vs| {
@@ -700,11 +801,14 @@ pub(super) fn emit_shared_library(
                     } else {
                         None
                     };
-                    from_script.unwrap_or(1)
+                        from_script.unwrap_or(1)
+                    }
                 }
             };
             // "name@VER" (single @): non-default version — hidden bit set.
-            if hidden {
+            // The high bit is only valid for a provider-side hidden version;
+            // versioned undefined imports use VERNEED's plain index.
+            if hidden && !dynamic_import {
                 idx |= 0x8000;
             }
             versym.extend_from_slice(&idx.to_le_bytes());
@@ -734,7 +838,16 @@ pub(super) fn emit_shared_library(
             let defined = globals
                 .get(name)
                 .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
-            let idx: u16 = if !defined {
+            let import_idx = globals.get(name).and_then(|g| {
+                let lib = g.from_lib.as_ref()?;
+                let version = g.version.as_ref()?;
+                version_need_indices
+                    .get(&(lib.clone(), version.clone()))
+                    .copied()
+            });
+            let idx: u16 = if let Some(import_idx) = import_idx {
+                import_idx
+            } else if !defined {
                 1
             } else {
                 script_nodes
@@ -787,11 +900,52 @@ pub(super) fn emit_shared_library(
         push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 28);
         push_verdef_entry(&mut verdef, 2, vn, ver_off, 0);
         (versym, verdef, 2)
+    } else if !version_need_indices.is_empty() {
+        // A DSO with only versioned imports has no provider version nodes, but
+        // it still needs a versym entry for every dynamic symbol and a base
+        // verdef node so the section remains a valid GNU version table.
+        let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
+        versym.extend_from_slice(&0u16.to_le_bytes());
+        for name in &dyn_sym_names {
+            let idx = globals
+                .get(name)
+                .and_then(|g| {
+                    let lib = g.from_lib.as_ref()?;
+                    let version = g.version.as_ref()?;
+                    version_need_indices
+                        .get(&(lib.clone(), version.clone()))
+                        .copied()
+                })
+                .unwrap_or(1);
+            versym.extend_from_slice(&idx.to_le_bytes());
+        }
+        let mut verdef = Vec::new();
+        let base_off = dynstr.get_offset(&base_version_name);
+        push_verdef_entry(&mut verdef, 1, &base_version_name, base_off, 0);
+        (versym, verdef, 1)
     } else {
         (Vec::new(), Vec::new(), 0)
     };
     let versym_size = versym_data.len() as u64;
     let verdef_size = verdef_data.len() as u64;
+
+    let mut verneed_data = Vec::new();
+    for lib in &sorted_needed_libs {
+        let mut versions: Vec<(String, u16, usize)> = needed_versions[lib]
+            .iter()
+            .filter_map(|version| {
+                let index = version_need_indices
+                    .get(&(lib.clone(), version.clone()))
+                    .copied()?;
+                Some((version.clone(), index, dynstr.get_offset(version)))
+            })
+            .collect();
+        versions.sort_by(|a, b| a.1.cmp(&b.1));
+        let soname_off = dynstr.get_offset(lib);
+        push_verneed_entry(&mut verneed_data, soname_off, &versions);
+    }
+    let verneed_size = verneed_data.len() as u64;
+    let verneed_count = sorted_needed_libs.len() as u64;
 
     let gnu_hash_size: u64 = 16
         + (gnu_hash_bloom_size as u64 * 8)
@@ -838,9 +992,15 @@ pub(super) fn emit_shared_library(
     if bsymbolic {
         dyn_count += 2;
     } // DT_SYMBOLIC + DT_FLAGS(DF_SYMBOLIC)
+    if verdef_count > 0 || verneed_count > 0 {
+        dyn_count += 1; // DT_VERSYM
+    }
     if verdef_count > 0 {
-        dyn_count += 3;
-    } // DT_VERSYM, DT_VERDEF, DT_VERDEFNUM
+        dyn_count += 2; // DT_VERDEF, DT_VERDEFNUM
+    }
+    if verneed_count > 0 {
+        dyn_count += 2; // DT_VERNEED, DT_VERNEEDNUM
+    }
     let dynamic_size = dyn_count * 16;
 
     let has_tls_sections = output_sections
@@ -920,6 +1080,10 @@ pub(super) fn emit_shared_library(
     let verdef_offset = offset;
     let verdef_addr = vaddr!(offset);
     offset += verdef_size;
+    offset = (offset + 7) & !7;
+    let verneed_offset = offset;
+    let verneed_addr = vaddr!(offset);
+    offset += verneed_size;
 
     // Text segment
     new_segment!();
@@ -1285,7 +1449,9 @@ pub(super) fn emit_shared_library(
     // Initial read-only metadata segment: ELF/PHDR + dynamic lookup tables.
     // Keep provider-side version sections inside this LOAD segment; linkers and
     // dynamic loaders expect DT_VERSYM/DT_VERDEF virtual addresses to be mapped.
-    let ro_seg_end = if verdef_size > 0 {
+    let ro_seg_end = if verneed_size > 0 {
+        verneed_offset + verneed_size
+    } else if verdef_size > 0 {
         verdef_offset + verdef_size
     } else if versym_size > 0 {
         versym_offset + versym_size
@@ -1473,6 +1639,9 @@ pub(super) fn emit_shared_library(
     }
     if !verdef_data.is_empty() {
         write_bytes(&mut out, verdef_offset as usize, &verdef_data);
+    }
+    if !verneed_data.is_empty() {
+        write_bytes(&mut out, verneed_offset as usize, &verneed_data);
     }
 
     // Section data
@@ -1969,15 +2138,25 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, 0x2);
         dd += 16; // DF_SYMBOLIC
     }
-    if verdef_count > 0 {
+    if verdef_count > 0 || verneed_count > 0 {
         w64(&mut out, dd, DT_VERSYM as u64);
         w64(&mut out, dd + 8, versym_addr);
         dd += 16;
+    }
+    if verdef_count > 0 {
         w64(&mut out, dd, DT_VERDEF as u64);
         w64(&mut out, dd + 8, verdef_addr);
         dd += 16;
         w64(&mut out, dd, DT_VERDEFNUM as u64);
         w64(&mut out, dd + 8, verdef_count);
+        dd += 16;
+    }
+    if verneed_count > 0 {
+        w64(&mut out, dd, DT_VERNEED as u64);
+        w64(&mut out, dd + 8, verneed_addr);
+        dd += 16;
+        w64(&mut out, dd, DT_VERNEEDNUM as u64);
+        w64(&mut out, dd + 8, verneed_count);
         dd += 16;
     }
     if has_init_array {
@@ -2030,6 +2209,7 @@ pub(super) fn emit_shared_library(
         ".dynstr",
         ".gnu.version",
         ".gnu.version_d",
+        ".gnu.version_r",
         ".rela.dyn",
         ".rela.plt",
         ".plt",
@@ -2078,6 +2258,9 @@ pub(super) fn emit_shared_library(
         next_hdr += 1;
     }
     if verdef_size > 0 {
+        next_hdr += 1;
+    }
+    if verneed_size > 0 {
         next_hdr += 1;
     }
     if rela_dyn_size > 0 {
@@ -2213,6 +2396,9 @@ pub(super) fn emit_shared_library(
         sh_count += 1;
     }
     if verdef_size > 0 {
+        sh_count += 1;
+    }
+    if verneed_size > 0 {
         sh_count += 1;
     }
     if rela_dyn_size > 0 {
@@ -2366,6 +2552,21 @@ pub(super) fn emit_shared_library(
             dynstr_shidx,
             verdef_count as u32,
             8,
+            0,
+        );
+    }
+    if verneed_size > 0 {
+        write_shdr_so(
+            &mut out,
+            get_shname(".gnu.version_r"),
+            SHT_GNU_VERNEED,
+            SHF_ALLOC,
+            verneed_addr,
+            verneed_offset,
+            verneed_size,
+            dynstr_shidx,
+            verneed_count as u32,
+            4,
             0,
         );
     }

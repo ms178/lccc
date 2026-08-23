@@ -277,6 +277,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Compilation workers use a private temporary cwd. Normalize tool paths
+    # before dispatching them; otherwise a perfectly valid invocation such as
+    # `--lccc target/fastbuild/lccc` becomes ENOENT in every worker while the
+    # error misleadingly resembles 100% compiler regressions.
+    args.lccc = args.lccc.expanduser().resolve()
+    if os.sep in args.gcc or args.gcc.startswith("."):
+        args.gcc = str(Path(args.gcc).expanduser().resolve())
+    else:
+        args.gcc = shutil.which(args.gcc) or args.gcc
+
     if not args.lccc.exists():
         print(f"error: lccc binary not found: {args.lccc}", file=sys.stderr)
         return 2

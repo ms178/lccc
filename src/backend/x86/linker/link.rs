@@ -14,7 +14,7 @@ use super::emit_shared::emit_shared_library;
 use super::icf;
 use super::input::{load_file, load_file_as_needed};
 use super::plt_got::{collect_ifunc_symbols, create_plt_got};
-use super::types::GlobalSymbol;
+use super::types::{GlobalSymbol, INTERP};
 use crate::backend::linker_common::{self, OutputSection};
 
 pub fn link_builtin(
@@ -456,9 +456,25 @@ pub fn link_builtin(
     let ifunc_symbols = collect_ifunc_symbols(&globals, is_static);
 
     phase!("ifunc");
+    // Emit executable.  The target ABI interpreter is the default, but a
+    // caller may select a staging/sysroot loader with GNU ld's
+    // --dynamic-linker spelling.  Materialise a NUL-terminated copy once so
+    // layout, PT_INTERP, and .interp cannot disagree about its length.
+    let interpreter = if let Some(path) = parsed_args.dynamic_linker.as_deref() {
+        if path.as_bytes().contains(&0) || path.is_empty() {
+            return Err("invalid --dynamic-linker path".into());
+        }
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.push(0);
+        bytes
+    } else {
+        INTERP.to_vec()
+    };
+
     // Emit executable
     let r = emit_executable(
         &objects,
+        &interpreter,
         &mut globals,
         &mut output_sections,
         &section_map,

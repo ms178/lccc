@@ -226,19 +226,24 @@ fn run(args: &[String]) -> Result<(), String> {
                     passthrough.push(format!("-Map={}", v));
                 }
             }
-            "--dynamic-linker" | "-dynamic-linker" | "-I" => {
-                // The builtin emitter hardwires the standard glibc interp
-                // path; accept and verify rather than silently diverging.
-                i += 1;
-                if let Some(p) = args.get(i) {
-                    if p != "/lib64/ld-linux-x86-64.so.2" && !p.is_empty() {
-                        eprintln!(
-                            "lccc-ld: warning: non-standard --dynamic-linker '{}' \
-                             (builtin emitter uses /lib64/ld-linux-x86-64.so.2)",
-                            p
-                        );
-                    }
+            a if a.starts_with("--dynamic-linker=") || a.starts_with("-dynamic-linker=") => {
+                // Preserve a caller-selected interpreter all the way to the
+                // ELF emitter.  Previously this option was accepted but
+                // discarded, so staging links silently ran with the host
+                // loader and could bind against the wrong libc.
+                let p = a.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if p.is_empty() {
+                    return Err("--dynamic-linker needs a non-empty path".into());
                 }
+                passthrough.push(format!("--dynamic-linker={p}"));
+            }
+            "--dynamic-linker" | "-dynamic-linker" | "-I" => {
+                i += 1;
+                let p = args.get(i).ok_or("--dynamic-linker needs an argument")?;
+                if p.is_empty() {
+                    return Err("--dynamic-linker needs a non-empty path".into());
+                }
+                passthrough.push(format!("--dynamic-linker={p}"));
             }
             "-z" => {
                 i += 1;
