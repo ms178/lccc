@@ -2977,6 +2977,9 @@ impl ArchCodegen for ArmCodegen {
         fn emit_conditional_increment_select(&mut self, dest: &Value, cond: &Operand, base: &Operand, increment_on_true: bool, ty: IrType) => emit_conditional_increment_select_impl;
         fn emit_fused_cmp_conditional_increment_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, base: &Operand, increment_on_true: bool, dest: &Value, sel_ty: IrType) => emit_fused_cmp_conditional_increment_select_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        // GNU C nested-function direct static-chain calls.
+        fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
+        fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;

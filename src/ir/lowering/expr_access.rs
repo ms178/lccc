@@ -1466,6 +1466,28 @@ impl Lowerer {
 
         let struct_size = self.sizeof_type(type_spec);
         let struct_align = self.alignof_type(type_spec);
+        let dynamic_struct_size = self.compute_vla_size_from_type_spec(type_spec);
+
+        // AAPCS64 passes variable-size aggregate variadic arguments by
+        // reference.  `va_arg(ap, typeof(vla_struct))` therefore reads a
+        // pointer from the va_list and copies the captured runtime byte count.
+        // A static size of zero is only a placeholder for the VLA-containing
+        // type; lowering it as VaArgStruct(size=0) copies nothing.
+        if matches!(self.target, Target::Aarch64 | Target::Riscv64) && struct_size == 0 {
+            if let Some(size_val) = dynamic_struct_size {
+                let ap_val = self.lower_va_list_pointer(ap_expr);
+                let va_list_ptr = self.operand_to_value(ap_val);
+                let src_ptr = self.fresh_value();
+                self.emit(Instruction::VaArg {
+                    dest: src_ptr,
+                    va_list_ptr,
+                    result_ty: IrType::Ptr,
+                });
+                let alloca = self.emit_vla_alloca(size_val, struct_align.max(1));
+                self.emit_dynamic_memcpy(alloca, src_ptr, size_val);
+                return Operand::Value(alloca);
+            }
+        }
 
         // On ARM64 and RISC-V, structs > 16 bytes are passed by reference:
         // a pointer to the struct is placed in the va_list. Read the pointer

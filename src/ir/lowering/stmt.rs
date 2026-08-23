@@ -344,7 +344,7 @@ impl Lowerer {
     }
 
     /// Emit VLA dynamic alloca with stack save at function and scope level.
-    fn emit_vla_alloca(&mut self, vla_size_val: Value, explicit_align: usize) -> Value {
+    pub(super) fn emit_vla_alloca(&mut self, vla_size_val: Value, explicit_align: usize) -> Value {
         let alloca = self.fresh_value();
         if !self.func().has_vla {
             self.func_mut().has_vla = true;
@@ -1734,6 +1734,18 @@ impl Lowerer {
                 .and_then(|fs| fs.vla_typedef_sizes.get(&key))
             {
                 return Some(vla_size);
+            }
+        }
+        if let TypeSpecifier::Typeof(expr) = type_spec {
+            if let Expr::Identifier(name, _) = &**expr {
+                if let Some(vla_size) = self
+                    .func_state
+                    .as_ref()
+                    .and_then(|fs| fs.locals.get(name))
+                    .and_then(|info| info.vla_size)
+                {
+                    return Some(vla_size);
+                }
             }
         }
         let resolved = self.resolve_type_spec(type_spec).clone();

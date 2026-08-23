@@ -42,6 +42,38 @@ impl ArmCodegen {
         self.current_return_type
     }
 
+    /// GNU C nested-function static chain for AArch64.
+    ///
+    /// GCC uses x18 as the static-chain register on AArch64.  The lowerer
+    /// emits GetStaticChain at nested-function entry before ordinary code can
+    /// clobber it, and emits SetStaticChain immediately before a direct nested
+    /// function call.  Trampolines/non-local goto still fail closed via the
+    /// trait defaults; this covers the common direct-call torture cluster.
+    pub(super) fn emit_get_static_chain_impl(&mut self, dest: &Value) {
+        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+            if !super::emit::is_arm_fp_phys(d_reg) {
+                let name = super::emit::callee_saved_name(d_reg);
+                if name != "x18" {
+                    self.state.emit_fmt(format_args!("    mov {}, x18", name));
+                }
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+        }
+        if self.state.get_slot(dest.0).is_none() {
+            return;
+        }
+        self.state.emit("    mov x0, x18");
+        self.store_x0_to(dest);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    pub(super) fn emit_set_static_chain_impl(&mut self, src: &Operand) {
+        self.operand_to_x0(src);
+        self.state.emit("    mov x18, x0");
+        self.state.reg_cache.invalidate_all();
+    }
+
     pub(super) fn emit_get_return_f64_second_impl(&mut self, dest: &Value) {
         self.store_float_reg(dest, IrType::F64, "d1");
     }
