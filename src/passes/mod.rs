@@ -21,6 +21,7 @@ pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
+pub(crate) mod dse;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
@@ -507,6 +508,7 @@ struct DisabledPasses {
     licm: bool,
     ifconv: bool,
     dce: bool,
+    dse: bool,
     ipcp: bool,
     unroll: bool,
 }
@@ -523,6 +525,7 @@ impl DisabledPasses {
             licm: disabled.contains("licm"),
             ifconv: disabled.contains("ifconv"),
             dce: disabled.contains("dce"),
+            dse: disabled.contains("dse"),
             ipcp: disabled.contains("ipcp"),
             unroll: disabled.contains("unroll"),
         }
@@ -732,6 +735,10 @@ pub(crate) fn run_passes(
         copy_prop::run(module);
         // Same f128-builtin fold as -O0 (see above).
         simplify::fold_math_intrinsic_calls(module);
+        module.for_each_function(dce::eliminate_dead_code);
+        // Same-block dead store elimination is cheap and removes the
+        // store-overwritten lowering residue at -O1 too.
+        module.for_each_function(dse::eliminate_dead_stores);
         module.for_each_function(dce::eliminate_dead_code);
         resolve_asm::resolve_inline_asm_symbols(module);
         constant_fold::resolve_remaining_is_constant(module);
@@ -1285,6 +1292,29 @@ pub(crate) fn run_passes(
             cur_pass_changes[9] = n;
             total_changes += n;
             // Intentionally NOT added to total_changes_excl_dce
+        }
+
+        // Phase 9.5: Dead store elimination (same-block overwritten stores).
+        // Runs right after DCE so stores made dead by folding are gone and
+        // the values stored by eliminated instructions feed the next DCE
+        // round. Like DCE, its change count is excluded from the
+        // diminishing-returns comparison (pure cleanup pass).
+        if !dis.dse && !dis.dce && should_run!(9, 5, 6, 7, 8) {
+            let n = timed_pass!(
+                "dse",
+                run_on_visited(module, &dirty, &mut changed, dse::eliminate_dead_stores)
+            );
+            total_changes += n;
+            // Re-run DCE when DSE removed stores: the stored values may now
+            // be dead. Cheap and bounded (next iteration's DCE is gated by
+            // the same should_run! heuristics).
+            if n > 0 {
+                let m = timed_pass!(
+                    "dce-post-dse",
+                    run_on_visited(module, &dirty, &mut changed, dce::eliminate_dead_code)
+                );
+                total_changes += m;
+            }
         }
 
         // Phase 10: CFG simplification again

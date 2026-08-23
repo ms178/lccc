@@ -522,11 +522,17 @@ impl X86Codegen {
         self.state.vec_last_store_reg = false;
     }
     pub(super) fn avx_load_arg(&mut self, arg: &Operand) {
+        // 256-bit loads write the full YMM register: upper halves dirty.
+        self.state.dirty_upper_ymm = true;
         self.avx_load_arg_to(arg, "ymm0");
     }
 
     /// Store %ymm0 to a 256-bit operand's register or home slot.
     pub(super) fn avx_store_dest(&mut self, dest_ptr: &Value) {
+        // 256-bit store paths read the full YMM register; the earlier load
+        // already dirtied it, but mark defensively (a broadcast-only body
+        // could reach here through a register-copy path).
+        self.state.dirty_upper_ymm = true;
         if let Some(&reg) = self.reg_assignments.get(&dest_ptr.0) {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name_256(reg);
@@ -3542,6 +3548,8 @@ impl X86Codegen {
             self.state.emit("    vaddss %xmm1, %xmm0, %xmm0");
         }
         self.state.emit("    vzeroupper");
+        // Cleaned here; a later 256-bit op re-arms the epilogue emission.
+        self.state.dirty_upper_ymm = false;
         self.state.direct_fp_result = Some(dest.0);
     }
 

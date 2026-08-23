@@ -333,6 +333,12 @@ pub struct X86Codegen {
     /// SysV ABI eightbyte classification for the current function's return struct.
     /// Set in prologue, used in emit_return_i128_to_regs for the function's own return.
     pub(super) func_ret_classes: Vec<crate::common::types::EightbyteClass>,
+    /// True once this function emitted an explicit `SetReturnF64Second`.
+    /// For [Sse, Sse] two-eightbyte returns whose lowering routes the high
+    /// half through SetReturnF64Second (IS-02), the primary I128 return must
+    /// only write xmm0 — writing xmm1 from %rdx would clobber the explicit
+    /// second-half value.
+    pub(super) func_set_second_ret: bool,
     /// True when the current function returns _Float128 (ONE 16-byte XMM, xmm0).
     pub(super) func_ret_is_f128_sse: bool,
     /// SysV ABI eightbyte classification for the most recent call-site's return struct.
@@ -625,6 +631,7 @@ impl X86Codegen {
             state: CodegenState::new(),
             current_return_type: IrType::I64,
             func_ret_classes: Vec::new(),
+            func_set_second_ret: false,
             call_ret_is_f128_sse: false,
             call_ret_classes: Vec::new(),
             func_ret_is_f128_sse: false,

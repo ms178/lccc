@@ -222,6 +222,85 @@ impl Lowerer {
         if struct_size <= 8 || struct_size > 16 {
             return None;
         }
+        // x86-64: an all-SSE two-eightbyte struct return (e.g.
+        // `struct { double, double }`, `struct { float x4 }`) is returned in
+        // xmm0/xmm1 per the SysV psABI. When both eightbytes are fully
+        // occupied (size 16), load them as two F64 values and use the
+        // SetReturnF64Second path instead of packing into I128 — the I128
+        // route materializes Cast/Shl/Or chains that round-trip the FP bits
+        // through integer registers and the stack (the "rax shuttle",
+        // IS-02/AB-01). Mixed [Integer, Sse] classifications and 9-15-byte
+        // tails keep the I128 path (partial eightbyte loads would read
+        // past the object).
+        if struct_size == 16 && self.target == crate::backend::Target::X86_64 {
+            // Vector types (__m128/__m128d/…) are NOT two-eightbyte structs:
+            // the vector-ABI convention returns the full 16-byte value in a
+            // single XMM register. Check BOTH the function's declared return
+            // ctype and the expression's ctype — intrinsic wrapper bodies
+            // sometimes lack a resolvable expression ctype, and the function
+            // declaration is the authoritative ABI source.
+            //
+            // INLINE-CANDIDATE functions keep the I128 path: the inliner
+            // merges only the Return operand into its phi — a value split
+            // across Return + SetReturnF64Second cannot be reassembled
+            // inline, so emitting the split form in an inlinable body loses
+            // the high eightbyte at every inline site.
+            let fname = self.func().name.clone();
+            let ret_is_vector = self
+                .types
+                .func_return_ctypes
+                .get(&fname)
+                .map(|ct| ct.is_vector())
+                .unwrap_or(false)
+                || self
+                    .get_expr_ctype(e)
+                    .map(|ct| ct.is_vector())
+                    .unwrap_or(false);
+            let all_sse = !ret_is_vector
+                && !self.func().is_inline_candidate
+                && self
+                    .func_meta
+                    .sigs
+                    .get(fname.as_str())
+                    .map(|s| {
+                        s.ret_eightbyte_classes.len() == 2
+                            && s
+                                .ret_eightbyte_classes
+                                .iter()
+                                .all(|c| *c == crate::common::types::EightbyteClass::Sse)
+                    })
+                    .unwrap_or(false);
+            if all_sse {
+                let addr = self.get_struct_base_addr(e);
+                let hi_ptr = self.fresh_value();
+                self.emit(Instruction::GetElementPtr {
+                    dest: hi_ptr,
+                    base: addr,
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::F64,
+                });
+                let hi = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: hi,
+                    ptr: hi_ptr,
+                    ty: IrType::F64,
+                    seg_override: AddressSpace::Default,
+                });
+                self.emit(Instruction::SetReturnF64Second {
+                    src: Operand::Value(hi),
+                });
+                let lo = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: lo,
+                    ptr: addr,
+                    ty: IrType::F64,
+                    seg_override: AddressSpace::Default,
+                });
+                return Some(Operand::Value(lo));
+            }
+        }
         let addr = self.get_struct_base_addr(e);
         // Load low 8 bytes
         let lo = self.fresh_value();

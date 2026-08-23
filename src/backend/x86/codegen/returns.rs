@@ -148,9 +148,15 @@ impl X86Codegen {
                     self.state.emit("    movq %rdx, %rax");
                 }
                 (EightbyteClass::Sse, EightbyteClass::Sse) => {
-                    // Both SSE: rax -> xmm0, rdx -> xmm1
+                    // Both SSE: rax -> xmm0, rdx -> xmm1. When the lowering
+                    // routed the high eightbyte through an explicit
+                    // SetReturnF64Second (IS-02 all-SSE struct returns),
+                    // xmm1 already holds it and %rdx is zero — write xmm0
+                    // only.
                     self.state.emit("    movq %rax, %xmm0");
-                    self.state.emit("    movq %rdx, %xmm1");
+                    if !self.func_set_second_ret {
+                        self.state.emit("    movq %rdx, %xmm1");
+                    }
                 }
                 _ => {} // INTEGER+INTEGER: already correct
             }
@@ -182,6 +188,10 @@ impl X86Codegen {
         // handled identically to call arguments and comparisons.
         self.emit_fp_operand_to_xmm(src, IrType::F64, "xmm1");
         self.state.reg_cache.invalidate_all();
+        // Record that xmm1 now carries an explicit second-half value so the
+        // [Sse, Sse] two-eightbyte primary return does not clobber it with
+        // %rdx (IS-02 SSE-class struct returns).
+        self.func_set_second_ret = true;
     }
 
     pub(super) fn emit_get_return_f32_second_impl(&mut self, dest: &Value) {

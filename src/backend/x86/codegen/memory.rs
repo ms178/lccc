@@ -713,7 +713,39 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 true
             }
-            _ => false, // OverAligned or no slot — fall back to default
+            Some(SlotAddr::Reg(reg)) => {
+                // Pointer lives in a physical GPR (register-homed GEP result,
+                // RA-26 caller home, ...): store the immediate directly through
+                // it. Without this arm the store fell back to
+                // `movq $IMM, %rax; movX %eax, (%reg)`, one instruction and an
+                // accumulator clobber longer per store (IS-24).
+                if !is_xmm_reg(reg) {
+                    let reg_name = phys_reg_name(reg);
+                    self.state.emit_fmt(format_args!(
+                        "    {} ${}, (%{})",
+                        store_instr, imm, reg_name
+                    ));
+                    self.state.reg_cache.invalidate_all();
+                    self.flush_pending_vec_store_impl();
+                    self.state.invalidate_vec_peephole();
+                    true
+                } else {
+                    false
+                }
+            }
+            Some(SlotAddr::OverAligned(slot, id)) => {
+                // Over-aligned alloca: materialize its address into %rcx first,
+                // then store the immediate through it — same shape the scalar
+                // FP store path above uses.
+                self.emit_alloca_aligned_addr_impl(slot, id);
+                self.state
+                    .emit_fmt(format_args!("    {} ${}, (%rcx)", store_instr, imm));
+                self.state.reg_cache.invalidate_all();
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                true
+            }
+            _ => false, // no slot — fall back to default
         }
     }
 
@@ -1143,6 +1175,48 @@ impl X86Codegen {
                                         store_instr, imm32
                                     ));
                                 }
+                                self.state.reg_cache.invalidate_all();
+                                self.flush_pending_vec_store_impl();
+                                self.state.invalidate_vec_peephole();
+                                return;
+                            }
+                            Some(SlotAddr::Reg(reg)) => {
+                                // Base pointer is register-homed (RA-26 param
+                                // home / register GEP): fold offset + immediate
+                                // into one addressing form (IS-24). Without this
+                                // arm the store materialized the constant via
+                                // `movq $IMM, %rax` first.
+                                if !is_xmm_reg(reg) {
+                                    let reg_name = phys_reg_name(reg);
+                                    if offset != 0 {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, {}(%{})",
+                                            store_instr, imm32, offset, reg_name
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {} ${}, (%{})",
+                                            store_instr, imm32, reg_name
+                                        ));
+                                    }
+                                    self.state.reg_cache.invalidate_all();
+                                    self.flush_pending_vec_store_impl();
+                                    self.state.invalidate_vec_peephole();
+                                    return;
+                                }
+                            }
+                            Some(SlotAddr::OverAligned(slot, id)) => {
+                                // Over-aligned alloca base: materialize the
+                                // aligned address, add the field offset, store
+                                // the immediate through it.
+                                self.emit_alloca_aligned_addr_impl(slot, id);
+                                if offset != 0 {
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                }
+                                self.state.emit_fmt(format_args!(
+                                    "    {} ${}, (%rcx)",
+                                    store_instr, imm32
+                                ));
                                 self.state.reg_cache.invalidate_all();
                                 self.flush_pending_vec_store_impl();
                                 self.state.invalidate_vec_peephole();
@@ -1692,6 +1766,17 @@ impl X86Codegen {
             return false;
         }
         let load_instr = Self::mov_load_for_type(ty);
+        // IS-15: honor the function-wide sext analysis for I32 loads. The
+        // static table always answers `movslq` for I32, but when this value
+        // has no 64-bit consumer (not in `needs_sext_values`) a plain `movl`
+        // is correct and saves the implicit REX byte; downstream consumers
+        // only read the low 32 bits. This mirrors what the non-indexed load
+        // path (`mov_load_for_value`) already does.
+        let load_instr = if ty == IrType::I32 {
+            self.mov_load_for_value(ty, dest.0)
+        } else {
+            load_instr
+        };
         let _ = index; // liveness handled by the RA link wiring
         if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
             if !is_xmm_reg(d_reg) {
@@ -2311,6 +2396,9 @@ impl X86Codegen {
             self.state.emit("    vmovdqu 32(%rsi), %ymm1");
             self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
             self.state.emit("    vzeroupper");
+            // The upper halves are clean again right here; any later 256-bit
+            // op re-arms the epilogue vzeroupper via dirty_upper_ymm.
+            self.state.dirty_upper_ymm = false;
             self.state.reg_cache.invalidate_all();
             return;
         }

@@ -20,8 +20,15 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
 elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     privilege=(sudo -n)
 else
-    echo "error: no active swap and root/passwordless sudo is unavailable" >&2
-    exit 1
+    # Unprivileged sandbox (no root, no passwordless sudo, no CAP_SYS_ADMIN):
+    # mkswap/swapon are impossible, so there is nothing this script can do.
+    # A hard failure here would break every compiler build in such an
+    # environment even though the build itself only needs swap as overflow
+    # insurance. Warn loudly and let the caller decide (the build wrappers
+    # run with -j2 precisely to stay inside the RAM budget without swap).
+    echo "warning: no root privileges and no active swap; continuing without swap" >&2
+    echo "warning: keep build parallelism at -j2 and monitor memory (OOM killer)" >&2
+    exit 0
 fi
 
 if [[ ! -e "$swapfile" ]]; then

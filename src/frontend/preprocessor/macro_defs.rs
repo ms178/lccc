@@ -129,6 +129,11 @@ pub struct MacroTable {
     /// identifier. Without this, `$FOO` is tokenized as one identifier and the
     /// macro `FOO` is never expanded.
     pub(super) asm_mode: bool,
+    /// `_Pragma("...")` operators encountered during macro expansion (C99
+    /// §6.10.9). The de-escaped string contents are queued here; the
+    /// preprocessor pipeline drains them and executes each as if a
+    /// `#pragma <content>` directive had appeared at that point.
+    pending_pragmas: std::cell::RefCell<Vec<String>>,
 }
 
 impl MacroTable {
@@ -140,7 +145,13 @@ impl MacroTable {
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
+            pending_pragmas: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Take the `_Pragma` string contents queued by the last expansion.
+    pub fn take_pending_pragmas(&self) -> Vec<String> {
+        std::mem::take(&mut *self.pending_pragmas.borrow_mut())
     }
 
     /// Define a new macro.
@@ -517,9 +528,11 @@ impl MacroTable {
             return i;
         }
 
-        // Handle _Pragma("string") operator (C99 §6.10.9).
+        // Handle _Pragma("string") operator (C99 §6.10.9): queue the
+        // de-escaped string content as a pragma for the pipeline to execute
+        // (`_Pragma("foo")` is equivalent to `#pragma foo`).
         if ident == "_Pragma" {
-            return Self::skip_pragma(bytes, i, ident, result);
+            return self.handle_pragma_operator(bytes, i, ident, result);
         }
 
         // Handle __COUNTER__ built-in
@@ -587,31 +600,82 @@ impl MacroTable {
         }
     }
 
-    /// Skip a _Pragma("...") operator, consuming the parenthesized argument.
-    fn skip_pragma(bytes: &[u8], i: usize, ident: &str, result: &mut String) -> usize {
+    /// Handle a `_Pragma("...")` operator: queue the de-escaped string
+    /// literal content as a pending pragma (C99 §6.10.9.1 — `\\"` becomes
+    /// `"`, `\\\\` becomes `\\`), removing the operator from the token
+    /// stream. Returns the index just past the closing `)`. On any parse
+    /// failure the identifier is preserved verbatim for a downstream
+    /// diagnostic.
+    fn handle_pragma_operator(&self, bytes: &[u8], i: usize, ident: &str, result: &mut String) -> usize {
         let len = bytes.len();
         let mut j = i;
         while j < len && bytes[j].is_ascii_whitespace() {
             j += 1;
         }
-        if j < len && bytes[j] == b'(' {
-            let mut depth = 1;
-            j += 1;
-            while j < len && depth > 0 {
-                if bytes[j] == b'(' {
-                    depth += 1;
-                } else if bytes[j] == b')' {
-                    depth -= 1;
-                } else if bytes[j] == b'"' || bytes[j] == b'\'' {
-                    j = skip_literal_bytes(bytes, j, bytes[j]);
-                    continue;
-                }
-                j += 1;
-            }
-            return j;
+        if j >= len || bytes[j] != b'(' {
+            result.push_str(ident);
+            return i;
         }
-        result.push_str(ident);
-        i
+        j += 1;
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Optional encoding prefix (L, u, U, u8) before the string literal.
+        while j < len && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'8') {
+            j += 1;
+        }
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= len || bytes[j] != b'"' {
+            result.push_str(ident);
+            return i;
+        }
+        j += 1;
+        let mut content = String::new();
+        let mut closed = false;
+        while j < len {
+            match bytes[j] {
+                b'\\' if j + 1 < len => {
+                    // De-stringize: only quote and backslash escapes alter the
+                    // pragma text; unknown escapes keep the character as-is.
+                    match bytes[j + 1] {
+                        b'"' => content.push('"'),
+                        b'\\' => content.push('\\'),
+                        c => {
+                            content.push('\\');
+                            content.push(c as char);
+                        }
+                    }
+                    j += 2;
+                }
+                b'"' => {
+                    j += 1;
+                    closed = true;
+                    break;
+                }
+                c => {
+                    // Preserve bytes verbatim (pragma text may be non-ASCII in
+                    // the source encoding).
+                    content.push(c as char);
+                    j += 1;
+                }
+            }
+        }
+        if !closed {
+            result.push_str(ident);
+            return i;
+        }
+        while j < len && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= len || bytes[j] != b')' {
+            result.push_str(ident);
+            return i;
+        }
+        j += 1;
+        self.pending_pragmas.borrow_mut().push(content);
+        j
     }
 
     /// Expand a macro invocation (function-like or object-like).
