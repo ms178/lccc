@@ -702,7 +702,18 @@ fn try_complete_unroll_general(
     }) || header_nonphi.iter().any(|&hi| {
         matches!(&func.blocks[header].instructions[hi], Instruction::BinOp { ty, .. } if ty.is_float())
     });
-    let budget: usize = if has_fp { 256 } else { 512 };
+    // Tunable for A/B experiments (default 256 FP / 512 int).
+    let budget: usize = if has_fp {
+        std::env::var("CCC_CUNROLL_FP_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256)
+    } else {
+        std::env::var("CCC_CUNROLL_INT_BUDGET")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512)
+    };
     if total_insts.saturating_mul(trip as usize) > budget {
         return false;
     }

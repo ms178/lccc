@@ -5922,3 +5922,318 @@ mod lea_scan_debug {
         }
     }
 }
+
+
+/// Fuse `movsd %A, %D` + `vOP %S, %D, %D` into `vOP %S, %A, %D`.
+///
+/// The scalar-FP emitters stage the first operand into the destination with
+/// a `movsd` and then apply the (already 3-operand VEX) operation — a pure
+/// 2-operand-ISA habit. VEX scalar ops can read the source directly, so the
+/// copy is one wasted uop AND one extra dependency-chain link per FP op
+/// (nbody's inner pair-interaction showed 7–9 such copies per iteration:
+/// every `dx*dx`, `dx*mag`, `dt/x` square/mul/div site).
+///
+/// Rewrite validity (no commutativity needed — operand ROLES are preserved):
+///   original:  D := A (mov); D := D op S   (AT&T `vOP %S, %D, %D`)
+///   rewritten: D := A op S                 (AT&T `vOP %S, %A, %D`)
+/// Rejected when: a label/branch/call sits between (control could enter
+/// between the mov and its consumer); any intervening instruction touches A
+/// or D; the mov is a self-move; or S references D (S may be a register or
+/// a memory operand, but it must not read the register the mov just wrote).
+pub(super) fn fuse_mov_scalar_fp_into_vex_op(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Match: `movsd %xmmA, %xmmD` / `movss %xmmA, %xmmD` (A != D).
+        let line_i = infos[i].trimmed(store.get(i));
+        let (width, rest) = if let Some(r) = line_i.strip_prefix("movsd %") {
+            ("sd", r)
+        } else if let Some(r) = line_i.strip_prefix("movss %") {
+            ("ss", r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_a, dst_d)) = rest.split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let dst_d = dst_d.trim();
+        let src_a = src_a.trim();
+        if !src_a.starts_with("xmm") || !dst_d.starts_with("xmm") || src_a == dst_d {
+            i += 1;
+            continue;
+        }
+        // Only %xmmN register moves (no memory sources here: those are the
+        // load paths, not the copy-staging paths).
+        let reg_num = |r: &str| -> Option<u8> {
+            let n = r.strip_prefix("xmm").and_then(|d| d.parse::<u8>().ok());
+            n.filter(|&n| n <= 15)
+        };
+        let (Some(a_num), Some(d_num)) = (reg_num(src_a), reg_num(dst_d)) else {
+            i += 1;
+            continue;
+        };
+
+        // Find the next active (non-Nop, non-Empty) line: only Nop/Empty
+        // may sit between the mov and its consumer op — anything else (a
+        // Label admits control flow between the pair; a Directive or
+        // instruction can observe or clobber the staged register) breaks
+        // the pair.
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || matches!(infos[j].kind, LineKind::Empty)) {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+
+        // Match: `vOP<width> %S, %xmmD, %xmmD`.
+        let line_j = infos[j].trimmed(store.get(j));
+        let (vop, body) = match binary_vex_scalar_mnemonic(line_j, width) {
+            Some((m, rest)) => (m, rest.trim_start()),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let Some((s_operand, tail)) = body.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let tail = tail.trim_start();
+        let Some((mid, last)) = tail.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let mid = mid.trim();
+        let last = last.trim();
+        // The two trailing operands must both be exactly the mov's dst.
+        if mid != dst_d_full(dst_d) || last != dst_d_full(dst_d) {
+            i += 1;
+            continue;
+        }
+        let s_operand = s_operand.trim();
+        // S must not read D (the register whose mov we are deleting).
+        let d_full = dst_d_full(dst_d);
+        if s_operand.contains(d_full.as_str()) {
+            i += 1;
+            continue;
+        }
+        // Memory operands may not write (they are loads here by VEX
+        // encoding rules; a store-form would not match this shape).
+
+        // Rewrite: delete the mov, retarget the vop's second source to A.
+        let replacement = format!("    {} {}, %{}, %{}", vop, s_operand, src_a, dst_d);
+        crate::backend::x86::codegen::peephole::types::mark_nop(&mut infos[i]);
+        crate::backend::x86::codegen::peephole::types::replace_line(
+            store,
+            &mut infos[j],
+            j,
+            replacement,
+        );
+        changed = true;
+        // Continue scanning from the rewritten op (its own result may feed
+        // another fusible pair).
+        i = j;
+    }
+    changed
+}
+
+/// Fold `movsd MEM, %D` + `vCOMM %S, %D, %D` into `vCOMM MEM, %S, %D`.
+///
+/// The load staged a memory value into %D which is then both an input and
+/// the destination of a COMMUTATIVE scalar VEX op. AT&T VEX allows the
+/// memory operand in the first (src2-of-Intel) position, so for commutative
+/// ops the load can be folded into the op outright — but only when %D is
+/// dead after the op: the mov must keep feeding any later reader. Deadness
+/// proof: block-local textual uniqueness (no later active line in the same
+/// basic block mentions %D), the same proof style relay_and_lea uses; a
+/// label/branch/call ends the scan conservatively. Non-commutative ops
+/// (vsub/vdiv) are excluded: their operand roles cannot be swapped.
+pub(super) fn fold_scalar_fp_memory_into_vex_op(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+
+    while i + 1 < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        // Match: `movsd <MEM>, %xmmD` / `movss <MEM>, %xmmD`.
+        let line_i = infos[i].trimmed(store.get(i));
+        let width = if line_i.starts_with("movsd ") {
+            "sd"
+        } else if line_i.starts_with("movss ") {
+            "ss"
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem, dst_d)) = line_i[6..].split_once(", %") else {
+            i += 1;
+            continue;
+        };
+        let dst_d = dst_d.trim();
+        let mem = mem.trim();
+        if !dst_d.starts_with("xmm")
+            || !dst_d[3..].chars().all(|c| c.is_ascii_digit())
+            || mem.starts_with('%')
+            || !mem.contains('(')
+            || mem.contains("%xmm")
+        {
+            // dst must be a plain %xmmN; the source must be a memory
+            // operand (contains a paren) that is not an XMM-form (e.g.
+            // `movsd (%rax), %xmm` is fine; reject register sources).
+            i += 1;
+            continue;
+        }
+        let d_full = format!("%{}", dst_d);
+
+        // Next active line.
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || matches!(infos[j].kind, LineKind::Empty)) {
+            j += 1;
+        }
+        if j >= len {
+            i += 1;
+            continue;
+        }
+        let line_j = infos[j].trimmed(store.get(j));
+        let Some((vop, body)) = commutative_vex_scalar(line_j, width) else {
+            i += 1;
+            continue;
+        };
+        let body = body.trim_start();
+        let Some((s_operand, tail)) = body.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let tail = tail.trim_start();
+        let Some((mid, last)) = tail.split_once(',') else {
+            i += 1;
+            continue;
+        };
+        let mid = mid.trim();
+        let last = last.trim();
+        let s_operand = s_operand.trim();
+        // Memory case shape: `vOP %D, %X, %X` — the loaded register is the
+        // FIRST source; the other value X occupies both the middle source
+        // and the destination slot. X must be a register distinct from D.
+        if s_operand != d_full || mid != last || !mid.starts_with("%xmm") || mid == d_full {
+            i += 1;
+            continue;
+        }
+
+        // Deadness of %D after j: no later ACTIVE line in this basic block
+        // mentions it. Labels/branches/calls end the scan conservatively
+        // (a call could return to a path that reads D... no — calls end the
+        // BLOCK context; treat the block as ended).
+        let mut dead = true;
+        let mut k = j + 1;
+        let mut scanned = 0;
+        while k < len && scanned < 64 {
+            if infos[k].is_nop() || matches!(infos[k].kind, LineKind::Empty | LineKind::Directive) {
+                k += 1;
+                continue;
+            }
+            if matches!(
+                infos[k].kind,
+                LineKind::Label
+                    | LineKind::Jmp
+                    | LineKind::JmpIndirect
+                    | LineKind::CondJmp
+                    | LineKind::Call
+                    | LineKind::Ret
+            ) {
+                break;
+            }
+            if infos[k].trimmed(store.get(k)).contains(&d_full) {
+                dead = false;
+                break;
+            }
+            scanned += 1;
+            k += 1;
+        }
+        if !dead {
+            i += 1;
+            continue;
+        }
+
+        // Rewrite: fold MEM into the op's first source slot (AT&T first
+        // operand = Intel src2, the memory-legal position); the duplicated
+        // X operand pair stays verbatim. Delete the staging load.
+        let replacement = format!("    {} {}, {}, {}", vop, mem, mid, last);
+        crate::backend::x86::codegen::peephole::types::mark_nop(&mut infos[i]);
+        crate::backend::x86::codegen::peephole::types::replace_line(
+            store,
+            &mut infos[j],
+            j,
+            replacement,
+        );
+        changed = true;
+        i = j;
+    }
+    changed
+}
+
+/// Commutative scalar VEX mnemonics (operand roles may be swapped, which
+/// the memory fold relies on). Returns (mnemonic, rest-of-line).
+fn commutative_vex_scalar<'a>(line: &'a str, width: &str) -> Option<(&'static str, &'a str)> {
+    let table: [(&str, &str); 4] = [
+        ("vmul", "sd"),
+        ("vadd", "sd"),
+        ("vmul", "ss"),
+        ("vadd", "ss"),
+    ];
+    for (prefix, w) in table {
+        if w == width {
+            // build "vmulsd" etc.
+            let full: &'static str = match (prefix, w) {
+                ("vmul", "sd") => "vmulsd",
+                ("vadd", "sd") => "vaddsd",
+                ("vmul", "ss") => "vmulss",
+                _ => "vaddss",
+            };
+            if line.starts_with(full) && line[full.len()..].starts_with(' ') {
+                return Some((full, &line[full.len()..]));
+            }
+        }
+    }
+    None
+}
+
+fn dst_d_full(dst: &str) -> String {
+    format!("%{}", dst)
+}
+
+/// The role-preserving binary scalar VEX mnemonics for `width` (sd or ss).
+/// Returns the mnemonic plus the rest of the line.
+fn binary_vex_scalar_mnemonic<'a>(line: &'a str, width: &str) -> Option<(&'static str, &'a str)> {
+    let _ = width;
+    const MNEMONICS: [&str; 12] = [
+        "vmulsd", "vaddsd", "vsubsd", "vdivsd", "vminsd", "vmaxsd", "vmulss", "vaddss",
+        "vsubss", "vdivss", "vminss", "vmaxss",
+    ];
+    for m in MNEMONICS {
+        if line.starts_with(m) && line[m.len()..].starts_with(' ') {
+            let _ = width;
+            return Some((m, &line[m.len()..]));
+        }
+    }
+    None
+}
