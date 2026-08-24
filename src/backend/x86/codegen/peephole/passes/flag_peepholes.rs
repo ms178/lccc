@@ -23,8 +23,11 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
+use super::helpers::get_dest_reg;
+use super::liveness::FileLiveness;
 use super::relay_and_lea::{
-    dead_in_block_after, family_private_to, line_refs_family, plain_gp_operand, split_two_operands,
+    dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
+    split_two_operands,
 };
 
 /// What a line does to EFLAGS.
@@ -480,6 +483,7 @@ fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
 ///   condition or its negation.
 pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -515,8 +519,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         let mut k = i;
         let mut test_idx = None;
         let mut cmov_idx = None;
-        loop {
-            let Some(n) = next_real(infos, k, len) else { break };
+        while let Some(n) = next_real(infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
                 break;
@@ -602,7 +605,8 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // rewrites it before any read, or the whole function only mentions it
         // in the lines we are about to delete.
         owned.push(cmov_i);
-        let dead = dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
+        let dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
+            || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
             || family_private_to(store, infos, i, bool_fam, &owned);
         if !dead {
             i += 1;
@@ -619,6 +623,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             }
         }
         replace_line(store, &mut infos[cmov_i], cmov_i, new_line);
+        lv.refresh_at(store, infos, cmov_i);
         changed = true;
         i = test_i.max(cmov_i) + 1;
     }
@@ -721,12 +726,396 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
     changed
 }
 
+
+// ── 5. redundant self-test after a logical op ────────────────────────────────
+
+/// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
+///
+/// `and`/`or`/`xor` set ZF/SF/PF from the result and clear CF/OF — exactly the
+/// flag state a `test` of that result produces, so the test is pure overhead.
+/// The i686 backend already does this (`check_redundant_test_elimination.sh`);
+/// x86-64 kept the pair because the codegen emits a 64-bit `testq` over a
+/// 32-bit logical result.
+///
+/// Width rule: a 32-bit logical op zero-extends, so ZF is identical for the
+/// 64-bit test, but SF is not (bit 31 vs bit 63). When the widths differ the
+/// fold is therefore only applied if every consumer of the flags tests ZF.
+#[allow(clippy::needless_range_loop)]
+pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned {
+            j += 1;
+            continue;
+        }
+        let t = infos[j].trimmed(store.get(j));
+        let (test_wide, args) = if let Some(a) = t.strip_prefix("testq ") {
+            (true, a)
+        } else if let Some(a) = t.strip_prefix("testl ") {
+            (false, a)
+        } else {
+            j += 1;
+            continue;
+        };
+        let Some((a, b)) = split_two_operands(args) else {
+            j += 1;
+            continue;
+        };
+        if a != b {
+            j += 1;
+            continue;
+        }
+        let fam = register_family_fast(a);
+        if fam == REG_NONE || fam > REG_GP_MAX {
+            j += 1;
+            continue;
+        }
+        let mask = 1u16 << fam;
+
+        // Walk back to the producer through flag-neutral instructions.
+        let mut k = j;
+        let mut producer = None;
+        while k > 0 {
+            k -= 1;
+            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() {
+                break;
+            }
+            let tk = infos[k].trimmed(store.get(k));
+            if infos[k].reg_refs & mask != 0 {
+                producer = Some((k, tk));
+                break;
+            }
+            if flags_effect(tk) != FlagsEffect::Neutral {
+                break; // another instruction owns the flags
+            }
+        }
+        let Some((pidx, ptext)) = producer else {
+            j += 1;
+            continue;
+        };
+        // Only logical ops reproduce a `test`'s flag state exactly.
+        let (prod_wide, is_logical) = if ptext.starts_with("andq ")
+            || ptext.starts_with("orq ")
+            || ptext.starts_with("xorq ")
+        {
+            (true, true)
+        } else if ptext.starts_with("andl ") || ptext.starts_with("orl ") || ptext.starts_with("xorl ")
+        {
+            (false, true)
+        } else {
+            (false, false)
+        };
+        if !is_logical || get_dest_reg(&infos[pidx]) != fam {
+            j += 1;
+            continue;
+        }
+        // The producer must WRITE the whole tested value: a 32-bit op under a
+        // 64-bit test is fine (zero extension), the reverse is not.
+        if prod_wide && !test_wide {
+            j += 1;
+            continue;
+        }
+        // Anything between the producer and the test must leave both the flags
+        // and the register alone.
+        for n in pidx + 1..j {
+            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+                continue;
+            }
+             let tn = infos[n].trimmed(store.get(n));
+            if flags_effect(tn) != FlagsEffect::Neutral || infos[n].reg_refs & mask != 0 {
+                producer = None;
+                break;
+            }
+        }
+        if producer.is_none() {
+            j += 1;
+            continue;
+        }
+        // With mismatched widths only ZF survives unchanged.
+        if prod_wide != test_wide {
+            let Some((fstart, fend)) = function_range(store, infos, j) else {
+                j += 1;
+                continue;
+            };
+            if !flags_are_block_local(store, infos, fstart, fend)
+                || !flag_consumers_are_zf_only(store, infos, j + 1)
+            {
+                j += 1;
+                continue;
+            }
+        }
+        mark_nop(&mut infos[j]);
+        changed = true;
+        j += 1;
+    }
+    changed
+}
+
+
+/// Verify the whole function keeps EFLAGS inside a basic block: every
+/// flag-reading instruction is preceded, in its own block, by a flag writer.
+///
+/// The peephole flag transforms reason about a single block; if some block
+/// consumed flags produced by a PREDECESSOR, a rewrite could change what that
+/// consumer sees. LCCC's codegen (like GCC's and LLVM's) never keeps flags live
+/// across a join, and this check turns that convention into a verified
+/// precondition instead of an assumption.
+#[allow(clippy::needless_range_loop)]
+fn flags_are_block_local(store: &LineStore, infos: &[LineInfo], fstart: usize, fend: usize) -> bool {
+    let mut written = false;
+    for n in fstart..fend {
+        if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            continue;
+        }
+        if infos[n].kind == LineKind::Label {
+            written = false;
+            continue;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        match flags_effect(t) {
+            FlagsEffect::Reads => {
+                if !written {
+                    return false;
+                }
+            }
+            FlagsEffect::Writes => written = true,
+            FlagsEffect::Neutral => {}
+        }
+        if matches!(infos[n].kind, LineKind::Call) {
+            written = true; // a call leaves the flags undefined
+        }
+    }
+    true
+}
+
+/// True when every consumer of the current flags, up to the next flags writer,
+/// only tests ZF (`e`/`ne`).
+fn flag_consumers_are_zf_only(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+    let mut n = from;
+    let mut saw_consumer = false;
+    while n < store.len() {
+        if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+            n += 1;
+            continue;
+        }
+        // Structural cases first: `flags_effect` classifies anything it does
+        // not recognise as a READER, and a label line is exactly that.
+        match infos[n].kind {
+            // End of the block. Flags are block-local (verified by
+            // `flags_are_block_local`), so nothing beyond depends on them.
+            LineKind::Label | LineKind::Ret => return saw_consumer,
+            // A call leaves EFLAGS undefined: the value is dead from here.
+            LineKind::Call => return saw_consumer,
+            // Stack adjustments do not touch EFLAGS.
+            LineKind::Push { .. } | LineKind::Pop { .. } => {
+                n += 1;
+                continue;
+            }
+            LineKind::Jmp | LineKind::JmpIndirect => return false,
+            _ => {}
+        }
+        let t = infos[n].trimmed(store.get(n));
+        match flags_effect(t) {
+            FlagsEffect::Writes => return saw_consumer,
+            FlagsEffect::Neutral => {}
+            FlagsEffect::Reads => {
+                saw_consumer = true;
+                let cc = if let Some(rest) = t.strip_prefix("set") {
+                    rest.split_whitespace().next().unwrap_or("")
+                } else if let Some(rest) = t.strip_prefix("cmov") {
+                    let tag = rest.split_whitespace().next().unwrap_or("");
+                    tag.strip_suffix(|c| c == 'q' || c == 'l' || c == 'w')
+                        .unwrap_or(tag)
+                } else if t.starts_with('j') {
+                    &t[1..t.find(' ').unwrap_or(t.len())]
+                } else {
+                    return false; // adc/sbb/... consume CF
+                };
+                if !matches!(cc, "e" | "z" | "ne" | "nz") {
+                    return false;
+                }
+            }
+        }
+        n += 1;
+    }
+    saw_consumer
+}
+
+/// Whole-name occurrence test: `%r8` must not match inside `%r8d`.
+fn mentions_exact_name(line: &str, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let nb = name.as_bytes();
+    let mut pos = 0;
+    while pos + nb.len() <= bytes.len() {
+        if &bytes[pos..pos + nb.len()] == nb {
+            let after = pos + nb.len();
+            if after >= bytes.len() || !bytes[after].is_ascii_alphanumeric() {
+                return true;
+            }
+        }
+        pos += 1;
+    }
+    false
+}
+
+// ── 6. narrow a sign extension nobody reads at 64 bits ───────────────────────
+
+/// `movslq %edx, %r8` → `movl %edx, %r8d` when the 64-bit half of the result is
+/// never read. The narrower form is the same length but feeds the copy folds
+/// (`producer_retarget`, `eliminate_move_relays`), which cannot touch a
+/// sign-extending producer because it changes the value's width class.
+pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i)).to_string();
+        let Some(rest) = t.strip_prefix("movslq ") else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let Some(dst_fam) = plain_gp_operand(dst) else {
+            i += 1;
+            continue;
+        };
+        if dst != REG_NAMES[0][dst_fam as usize] || !src.starts_with('%') {
+            i += 1;
+            continue;
+        }
+        let name64 = REG_NAMES[0][dst_fam as usize];
+        let mask = 1u16 << dst_fam;
+        let mut ok = false;
+        let mut j = i + 1;
+        while j < len {
+            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() || infos[j].pinned {
+                // Safe to stop here only if the register is dead from now on.
+                ok = matches!(lv.live_after(j - 1, dst_fam), Some(false));
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            if infos[j].reg_refs & mask != 0 {
+                if mentions_exact_name(tj, name64) {
+                    break; // a 64-bit read observes the sign extension
+                }
+                if get_dest_reg(&infos[j]) == dst_fam && !tj.starts_with("cmov") {
+                    ok = true; // fully redefined before any wide read
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if ok {
+            let new_line = format!("    movl {}, {}", src, REG_NAMES[1][dst_fam as usize]);
+            replace_line(store, &mut infos[i], i, new_line);
+            changed = true;
+        }
+        i += 1;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+
+    #[test]
+    fn self_test_after_and_is_removed() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    andl $1, %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("testq %rsi, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_and_is_kept_for_a_sign_consumer() {
+        // SF of a 32-bit `andl` is bit 31; `testq` reports bit 63. A signed
+        // consumer must keep the wide test.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    andl $255, %esi\n",
+            "    testq %rsi, %rsi\n",
+            "    js .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testq %rsi, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn self_test_after_add_is_kept() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl %edx, %esi\n",
+            "    testl %esi, %esi\n",
+            "    jb .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("testl %esi, %esi"), "{out}");
+    }
+
+    #[test]
+    fn dead_sign_extension_is_narrowed() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edx, %r8\n",
+            "    movl %r8d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movslq"), "{out}");
+    }
+
+    #[test]
+    fn live_sign_extension_is_kept() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edx, %r8\n",
+            "    movq %r8, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movslq %edx, %r8"), "{out}");
     }
 
     #[test]

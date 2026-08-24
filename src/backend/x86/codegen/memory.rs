@@ -1704,19 +1704,29 @@ impl X86Codegen {
     // not allocatable on x86-64, so rax staging can never collide with the
     // base/index registers.
 
-    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("(%{}, %{})", base_reg, index_reg)
+    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        let d = if disp == 0 {
+            String::new()
         } else {
-            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
+            format!("{}", disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, base_reg, index_reg, 1u32 << shift)
         }
     }
 
-    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("{}(, %{})", sym, index_reg)
+    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        let d = if disp == 0 {
+            String::new()
         } else {
-            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
+            format!("{}", disp)
+        };
+        if shift == 0 {
+            format!("{}{}(, %{})", sym, d, index_reg)
+        } else {
+            format!("{}{}(, %{}, {})", sym, d, index_reg, 1u32 << shift)
         }
     }
 
@@ -1872,6 +1882,7 @@ impl X86Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
@@ -1890,6 +1901,7 @@ impl X86Codegen {
             phys_reg_name(b),
             phys_reg_name(self.reg_assignments[&index.0]),
             shift,
+            disp,
         );
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
@@ -1900,6 +1912,7 @@ impl X86Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
@@ -1918,6 +1931,7 @@ impl X86Codegen {
             phys_reg_name(b),
             phys_reg_name(self.reg_assignments[&index.0]),
             shift,
+            disp,
         );
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
@@ -1928,6 +1942,7 @@ impl X86Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         // `sym` may carry a composed constant displacement ("gh+2"). The GOT
@@ -1959,9 +1974,9 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
-            Self::sib_mem64("rcx", index_name, shift)
+            Self::sib_mem64("rcx", index_name, shift, disp)
         } else {
-            Self::sib_mem64_sym(sym, index_name, shift)
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
@@ -1972,6 +1987,7 @@ impl X86Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         // Same basename rule as emit_load_indexed_sym_impl (see comment there):
@@ -1992,9 +2008,9 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
-            Self::sib_mem64("rcx", index_name, shift)
+            Self::sib_mem64("rcx", index_name, shift, disp)
         } else {
-            Self::sib_mem64_sym(sym, index_name, shift)
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }

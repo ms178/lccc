@@ -2408,8 +2408,11 @@ impl ArchCodegen for ArmCodegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
+        // AArch64 does not support a displacement + SIB in one operand;
+        // the displacement is folded into the GEP offset upstream.
         self.emit_load_indexed_impl(dest, base, index, shift, ty)
     }
     fn emit_store_indexed(
@@ -2418,6 +2421,7 @@ impl ArchCodegen for ArmCodegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
         self.emit_store_indexed_impl(val, base, index, shift, ty)

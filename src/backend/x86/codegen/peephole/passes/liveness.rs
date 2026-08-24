@@ -1,0 +1,597 @@
+//! Exact intra-function register liveness for the x86-64 peephole passes.
+//!
+//! Every pass that deletes a definition needs one question answered: *is this
+//! register read on any path from here?* The passes used to answer it with two
+//! syntactic approximations — a block-local write-before-read scan and a
+//! whole-function "no other mention" test. Both are sound but blind: they miss
+//! the common case where a register is written in a loop body and its only
+//! other mention is a read in the PROLOGUE, which no back edge reaches.
+//!
+//! This module computes the real answer: basic blocks, a successor graph, and
+//! a backward dataflow fixpoint over the 16 general-purpose register families.
+//!
+//! # Conservative by construction
+//!
+//! * A function is analysed only when it is delimited by
+//!   `.cfi_startproc`/`.cfi_endproc` and **every** control transfer inside it
+//!   is resolvable: a `jmp`/`jCC` to a label defined in the same function, a
+//!   `call`, or a `ret`. An indirect jump, a jump table, a tail call to a
+//!   symbol, or a label that is never targeted by a resolvable branch but sits
+//!   in the middle of the function is fine — what is *not* fine is a transfer
+//!   whose destination is unknown, which marks the whole function unanalysable
+//!   ([`FileLiveness::live_after`] then answers `None` and callers fall back to
+//!   their syntactic proofs).
+//! * Instructions are classified by mnemonic. An unrecognised mnemonic is
+//!   assumed to READ every register it mentions and to write nothing, so its
+//!   operands stay live.
+//! * Inline assembly reads and writes everything.
+//! * At `ret`, the return-value registers (`%rax`, `%rdx`) and the callee-saved
+//!   registers (`%rbx`, `%rbp`, `%rsp`, `%r12`..`%r15`) are live: the ABI
+//!   requires their values to be intact.
+//! * A `call` reads the SysV argument registers, `%rax` (variadic vector count)
+//!   and `%r10` (static chain), and clobbers the caller-saved set.
+
+use super::super::types::*;
+use super::helpers::get_dest_reg;
+
+/// All 16 GP families.
+const ALL: u16 = 0xFFFF;
+/// rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8..r15 = 8..15.
+const RAX: u16 = 1 << 0;
+const RCX: u16 = 1 << 1;
+const RDX: u16 = 1 << 2;
+const RSP: u16 = 1 << 4;
+/// Values an ABI-visible transfer reads without naming them: the six SysV
+/// argument registers, `%rax` (variadic vector count) and `%r10` (static chain
+/// for nested functions — family 10 in the peephole numbering, NOT 11 which is
+/// `%r11`; getting that wrong let a relay delete the chain set-up).
+const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10);
+/// Registers a call may destroy.
+const CALLER_SAVED: u16 =
+    RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
+/// Live at `ret`: integer return value plus everything the callee must restore.
+const RET_LIVE: u16 = RAX | RDX | (1 << 3) | (1 << 5) | RSP | (1 << 12) | (1 << 13) | (1 << 14)
+    | (1 << 15);
+/// Same, for a function that demonstrably returns a single value in `%rax`
+/// (its epilogue writes the accumulator and never touches `%rdx`). Keeping
+/// `%rdx` artificially live there hides every dead `movq %rax, %rdx` the
+/// return-value materialisation leaves behind.
+const RET_LIVE_RAX_ONLY: u16 = RET_LIVE & !RDX;
+
+/// Per-line liveness for a whole assembly file.
+pub(super) struct FileLiveness {
+    /// Registers live immediately AFTER each line, when its function could be
+    /// analysed.
+    live_out: Vec<u16>,
+    /// Whether the line belongs to an analysable function.
+    known: Vec<bool>,
+}
+
+/// Read/write sets of one instruction.
+#[derive(Clone, Copy)]
+struct Effect {
+    reads: u16,
+    writes: u16,
+}
+
+/// Mnemonics whose destination operand is written without being read.
+fn is_pure_write_mnemonic(t: &str) -> bool {
+    // `cmov` is deliberately absent: it only conditionally updates its
+    // destination, so the old value stays live.
+    (t.starts_with("mov") && !t.starts_with("movs") || t.starts_with("movs") && t.len() > 5)
+        || t.starts_with("lea")
+        || t.starts_with("set")
+        // Always-writing bit counters. `bsf`/`bsr` are deliberately absent:
+        // they leave the destination untouched when the source is zero.
+        || t.starts_with("lzcnt")
+        || t.starts_with("tzcnt")
+        || t.starts_with("popcnt")
+}
+
+fn mnemonic_is_known(t: &str) -> bool {
+    const KNOWN: &[&str] = &[
+        "mov", "lea", "add", "sub", "and", "or", "xor", "cmp", "test", "imul", "mul", "div",
+        "idiv", "neg", "not", "inc", "dec", "shl", "shr", "sar", "sal", "rol", "ror", "adc",
+        "sbb", "set", "cmov", "push", "pop", "call", "ret", "jmp", "j", "nop", "cqto", "cltq",
+        "cdq", "cwtl", "cdqe", "bswap", "bt", "bsf", "bsr", "popcnt", "lzcnt", "tzcnt", "xchg",
+        "cmpxchg", "xadd", "lock", "leave", "endbr64", "ud2", "int3", "hlt", "pause", "prefetch",
+        "cvt", "vm", "movs", "movz", "andn", "bls", "sh", "rc", "adcx", "adox", "mulx", "rdtsc",
+        "cpuid", "syscall", "sfence", "lfence", "mfence", "vzeroupper", "vzeroall", "xgetbv",
+    ];
+    KNOWN.iter().any(|k| t.starts_with(k))
+}
+
+impl FileLiveness {
+    /// Compute liveness for every function in the file.
+    #[allow(clippy::needless_range_loop)]
+    pub(super) fn new(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let len = store.len();
+        let mut lv = FileLiveness {
+            live_out: vec![ALL; len],
+            known: vec![false; len],
+        };
+        let mut i = 0;
+        while i < len {
+            if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+                i += 1;
+                continue;
+            }
+            let mut end = len;
+            for n in i + 1..len {
+                if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc")
+                {
+                    end = n;
+                    break;
+                }
+            }
+            lv.analyse_function(store, infos, i, end);
+            i = end.max(i + 1);
+        }
+        lv
+    }
+
+    /// `Some(true)` when `fam` may be read after line `idx`, `Some(false)` when
+    /// it is provably dead, `None` when the enclosing function was not
+    /// analysable.
+    pub(super) fn live_after(&self, idx: usize, fam: RegId) -> Option<bool> {
+        if fam > REG_GP_MAX || idx >= self.known.len() || !self.known[idx] {
+            return None;
+        }
+        Some(self.live_out[idx] & (1u16 << fam) != 0)
+    }
+
+
+    /// Recompute the liveness of the function containing `idx` after a pass
+    /// rewrote or deleted a line inside it. Cheaper than rebuilding the file
+    /// and mandatory for correctness: a transform can extend the live range of
+    /// the register it substitutes in, so a later query in the same pass must
+    /// not see stale data.
+    #[allow(clippy::needless_range_loop)]
+    pub(super) fn refresh_at(&mut self, store: &LineStore, infos: &[LineInfo], idx: usize) {
+        let len = store.len();
+        let mut start = None;
+        for n in (0..=idx.min(len.saturating_sub(1))).rev() {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if t.starts_with(".cfi_startproc") {
+                start = Some(n);
+                break;
+            }
+            if t.starts_with(".cfi_endproc") {
+                return;
+            }
+        }
+        let Some(start) = start else { return };
+        let mut end = len;
+        for n in start + 1..len {
+            if !infos[n].is_nop() && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc") {
+                end = n;
+                break;
+            }
+        }
+        for n in start..end {
+            self.known[n] = false;
+            self.live_out[n] = ALL;
+        }
+        self.analyse_function(store, infos, start, end);
+    }
+
+    /// `true` when every `ret` in the range is preceded, inside its own tail
+    /// block, by a write of `%rax` and by no mention of `%rdx`: the signature
+    /// of a function returning one integer in the accumulator.
+    #[allow(clippy::needless_range_loop)]
+    pub(super) fn returns_in_rax_only(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> bool {
+        let mut saw_ret = false;
+        for n in start..end {
+            if infos[n].is_nop() || infos[n].kind != LineKind::Ret {
+                continue;
+            }
+            saw_ret = true;
+            let mut writes_rax = false;
+            let mut k = n;
+            while k > start {
+                k -= 1;
+                if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                    continue;
+                }
+                if matches!(
+                    infos[k].kind,
+                    LineKind::Label
+                        | LineKind::Jmp
+                        | LineKind::CondJmp
+                        | LineKind::JmpIndirect
+                        | LineKind::Call
+                ) {
+                    break;
+                }
+                if infos[k].reg_refs & RDX != 0 {
+                    // A pure `movq %rax, %rdx` in the epilogue is the dead
+                    // duplicate the return-value materialisation leaves behind:
+                    // an i128 return writes two DIFFERENT halves, never a copy
+                    // of the accumulator. Anything else that touches %rdx here
+                    // may be the high half, so the register stays live.
+                    let tk = infos[k].trimmed(store.get(k));
+                    if tk != "movq %rax, %rdx" {
+                        return false;
+                    }
+                    continue;
+                }
+                if get_dest_reg(&infos[k]) == 0 {
+                    writes_rax = true;
+                }
+            }
+            if !writes_rax {
+                return false;
+            }
+        }
+        saw_ret
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn analyse_function(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+    ) {
+        let ret_live = if Self::returns_in_rax_only(store, infos, start, end) {
+            RET_LIVE_RAX_ONLY
+        } else {
+            RET_LIVE
+        };
+        // ── labels ───────────────────────────────────────────────────────────
+        let mut labels: Vec<(String, usize)> = Vec::new();
+        for n in start..end {
+            if infos[n].is_nop() {
+                continue;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if infos[n].kind == LineKind::Label {
+                if let Some(name) = t.strip_suffix(':') {
+                    labels.push((name.to_string(), n));
+                }
+            }
+        }
+        let resolve = |name: &str| -> Option<usize> {
+            labels
+                .iter()
+                .find(|(l, _)| l == name)
+                .map(|&(_, idx)| idx)
+        };
+
+        // ── instruction effects + successor edges ────────────────────────────
+        let mut effects: Vec<Option<Effect>> = vec![None; end.saturating_sub(start)];
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); end.saturating_sub(start)];
+        let mut lines: Vec<usize> = Vec::new();
+        for n in start..end {
+            if infos[n].is_nop() || infos[n].kind == LineKind::Directive {
+                continue;
+            }
+            lines.push(n);
+        }
+        for (pos, &n) in lines.iter().enumerate() {
+            let t = infos[n].trimmed(store.get(n));
+            let next = lines.get(pos + 1).copied();
+            let rel = n - start;
+            let (eff, edges) = match self.classify(store, infos, n, t, &resolve, next, ret_live) {
+                Some(v) => v,
+                None => return, // unanalysable control flow: leave `known` false
+            };
+            effects[rel] = Some(eff);
+            succs[rel] = edges;
+        }
+
+        // ── backward dataflow ────────────────────────────────────────────────
+        let mut live_in: Vec<u16> = vec![0; end.saturating_sub(start)];
+        let mut live_out: Vec<u16> = vec![0; end.saturating_sub(start)];
+        let mut changed = true;
+        let mut rounds = 0;
+        while changed && rounds < 64 {
+            changed = false;
+            rounds += 1;
+            for &n in lines.iter().rev() {
+                let rel = n - start;
+                let Some(eff) = effects[rel] else { continue };
+                let mut out = 0u16;
+                for &s in &succs[rel] {
+                    out |= live_in[s - start];
+                }
+                if succs[rel].is_empty() {
+                    out |= ret_live; // fell off the end: be conservative
+                }
+                let inn = eff.reads | (out & !eff.writes);
+                if out != live_out[rel] || inn != live_in[rel] {
+                    live_out[rel] = out;
+                    live_in[rel] = inn;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            return; // did not converge (pathological CFG): stay unknown
+        }
+
+        for &n in &lines {
+            self.live_out[n] = live_out[n - start];
+            self.known[n] = true;
+        }
+    }
+
+    /// Effects and successors of one instruction, or `None` when the control
+    /// transfer cannot be resolved.
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn classify(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        n: usize,
+        t: &str,
+        resolve: &dyn Fn(&str) -> Option<usize>,
+        next: Option<usize>,
+        ret_live: u16,
+    ) -> Option<(Effect, Vec<usize>)> {
+        let mentioned = infos[n].reg_refs;
+        let fall: Vec<usize> = next.into_iter().collect();
+
+        if infos[n].kind == LineKind::InlineAsm || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
+        {
+            return Some((
+                Effect {
+                    reads: ALL,
+                    writes: 0,
+                },
+                fall,
+            ));
+        }
+
+        match infos[n].kind {
+            LineKind::Label => Some((
+                Effect {
+                    reads: 0,
+                    writes: 0,
+                },
+                fall,
+            )),
+            LineKind::Ret => Some((
+                Effect {
+                    reads: ret_live | mentioned,
+                    writes: 0,
+                },
+                Vec::new(),
+            )),
+            LineKind::Call => Some((
+                Effect {
+                    reads: CALL_READS | mentioned,
+                    writes: CALLER_SAVED,
+                },
+                fall,
+            )),
+            LineKind::JmpIndirect => None,
+            LineKind::Jmp => {
+                let target = t.split_whitespace().nth(1)?;
+                if target.starts_with('*') {
+                    return None;
+                }
+                let idx = resolve(target)?; // tail call / foreign label
+                Some((
+                    Effect {
+                        reads: mentioned,
+                        writes: 0,
+                    },
+                    vec![idx],
+                ))
+            }
+            LineKind::CondJmp => {
+                let target = t.split_whitespace().nth(1)?;
+                let idx = resolve(target)?;
+                let mut edges = fall;
+                edges.push(idx);
+                Some((
+                    Effect {
+                        reads: mentioned,
+                        writes: 0,
+                    },
+                    edges,
+                ))
+            }
+            LineKind::Push { .. } => Some((
+                Effect {
+                    reads: mentioned | RSP,
+                    writes: RSP,
+                },
+                fall,
+            )),
+            LineKind::Pop { reg } => {
+                let w = if reg != REG_NONE && reg <= REG_GP_MAX {
+                    1u16 << reg
+                } else {
+                    0
+                };
+                Some((
+                    Effect {
+                        reads: RSP,
+                        writes: w | RSP,
+                    },
+                    fall,
+                ))
+            }
+            _ => {
+                if !mnemonic_is_known(t) {
+                    // Unknown: keep every mentioned register live.
+                    return Some((
+                        Effect {
+                            reads: mentioned,
+                            writes: 0,
+                        },
+                        fall,
+                    ));
+                }
+                let mut reads = mentioned;
+                let mut writes = 0u16;
+                let dest = get_dest_reg(&infos[n]);
+                if dest != REG_NONE && dest <= REG_GP_MAX {
+                    let bit = 1u16 << dest;
+                    writes |= bit;
+                    // A pure write does not read its destination; anything else
+                    // (add, cmov, inc, shifts, xchg) does.
+                    if is_pure_write_mnemonic(t) {
+                        let src_part = &t[..t.rfind(',').unwrap_or(t.len())];
+                        let name64 = REG_NAMES[0][dest as usize];
+                        let name32 = REG_NAMES[1][dest as usize];
+                        let name16 = REG_NAMES[2][dest as usize];
+                        let name8 = REG_NAMES[3][dest as usize];
+                        let src_reads_dest = src_part.contains(name64)
+                            || src_part.contains(name32)
+                            || src_part.contains(name16)
+                            || src_part.contains(name8);
+                        // A partial write (8/16-bit destination) preserves the
+                        // rest of the register, so the old value stays live.
+                        let dst_text = t[t.rfind(',').map(|c| c + 1).unwrap_or(0)..].trim();
+                        let full = dst_text == name64 || dst_text == name32;
+                        if !src_reads_dest && full {
+                            reads &= !bit;
+                        }
+                    }
+                }
+                // Implicit operands.
+                if t.starts_with("div") || t.starts_with("idiv") || t.starts_with("mul") && !t.starts_with("mulx")
+                {
+                    reads |= RAX | RDX;
+                    writes |= RAX | RDX;
+                }
+                if t.starts_with("cltq") || t.starts_with("cdqe") {
+                    reads |= RAX;
+                    writes |= RAX;
+                }
+                if t.starts_with("cqto") || t.starts_with("cdq") || t.starts_with("cwtl") {
+                    reads |= RAX;
+                    writes |= RAX | RDX;
+                }
+                if t.starts_with("shld") || t.starts_with("shrd") {
+                    reads |= RCX;
+                }
+                if t.starts_with("xchg") || t.starts_with("cmpxchg") || t.starts_with("xadd") {
+                    reads |= mentioned;
+                    writes |= mentioned;
+                }
+                let _ = store;
+                Some((Effect { reads, writes }, fall))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let lv = FileLiveness::new(&store, &infos);
+        (store, infos, lv)
+    }
+
+    fn line_of(store: &LineStore, needle: &str) -> usize {
+        (0..store.len())
+            .find(|&i| store.get(i).contains(needle))
+            .expect("line")
+    }
+
+    #[test]
+    fn loop_body_write_is_dead_when_only_the_prologue_reads_it() {
+        // %rdi is read by the prologue copy, then written (never read) in the
+        // loop body: the write is dead even though the family IS mentioned
+        // elsewhere in the function.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %rsi\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    cmpl %edx, %ebx\n",
+            "    jae .LBB3\n",
+            ".LBB2:\n",
+            "    leaq 0(,%rbx,4), %rdi\n",
+            "    movl (%rsi,%rbx,4), %eax\n",
+            "    addl $1, %ebx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "leaq 0(,%rbx,4)");
+        assert_eq!(lv.live_after(idx, 7), Some(false), "rdi must be dead");
+        let idx_copy = line_of(&store, "movq %rdi, %rsi");
+        assert_eq!(lv.live_after(idx_copy, 6), Some(true), "rsi live into loop");
+    }
+
+    #[test]
+    fn value_live_across_the_back_edge_is_not_dead() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    addl %ebx, %eax\n",
+            "    addl $1, %ebx\n",
+            "    cmpl $10, %ebx\n",
+            "    jl .LBB1\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "addl $1, %ebx");
+        assert_eq!(lv.live_after(idx, 3), Some(true), "rbx live via back edge");
+    }
+
+    #[test]
+    fn return_value_is_live_at_ret() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl $7, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "movl $7, %eax");
+        assert_eq!(lv.live_after(idx, 0), Some(true));
+    }
+
+    #[test]
+    fn argument_registers_are_live_into_a_call() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rbx, %rdi\n",
+            "    call bar\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "movq %rbx, %rdi");
+        assert_eq!(lv.live_after(idx, 7), Some(true));
+    }
+
+    #[test]
+    fn indirect_jump_makes_the_function_unanalysable() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl $7, %eax\n",
+            "    jmpq *%rdx\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "movl $7, %eax");
+        assert_eq!(lv.live_after(idx, 0), None);
+    }
+}

@@ -874,6 +874,7 @@ impl I686Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -912,6 +913,7 @@ impl I686Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -952,6 +954,7 @@ impl I686Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
         if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -985,6 +988,7 @@ impl I686Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
         if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {

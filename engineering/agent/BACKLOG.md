@@ -9,29 +9,46 @@ Evidence: **M** measured LCCC vs GCC14 on kernels; **G** Compiler Explorer (`cg1
 
 Count: P0 5 + RA 27 + IS 28 + OP 34 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **170** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
 
-### Peephole/RA ledger from the kernel corpus (`tests/benchmark/kernel_corpus` + `scripts/kernel_count.py`)
+### Peephole/RA ledger (kernel corpus + `tests/benchmark/programs` A/B + Godbolt oracle)
 
-Measured with `scripts/kernel_count.py` (per-function instruction counts, LCCC
-`-O2` vs system GCC `-O2`). Corpus baseline before this ledger: **LCCC 375 vs
-GCC 264**; after PF-01/PF-02: **LCCC 363 vs GCC 264**.
+Harnesses: `scripts/kernel_count.py` (per-function counts vs system GCC),
+`scripts/peephole_ab.py` (whole-corpus A/B **with a behaviour comparison**) and
+`scripts/godbolt.py` (the scoreboard oracle).
+
+Kernel corpus total: **375 → 325** against GCC's 264. Benchmark corpus A/B:
+**7060 → 6705 instructions (−5.03 %)**, 38/38 programs behaviour-identical.
+Compiler Explorer at `-O2`: LCCC is the best of {LCCC, GCC 16.2, Clang 22.1,
+ICX} on **sum8 12** (GCC 57), **cntz 16** (GCC 68), **maxv 19** (GCC 27),
+**dot 15** (GCC 17) and **hsh 14** (GCC 15), and ties on **copy64 9** and
+**my_strlen 10**.
 
 | ID | P | Item | Evidence | Status |
 |----|---|------|----------|--------|
-| PF-01 | DONE | `eliminate_move_relays` — delete `mov %S,%D` feeding a single ALU source (`relay_and_lea.rs`) | sum8 15→14, hash 20→19, strcmp 27→26, adler 105→99 | shipped, default-on |
-| PF-02 | DONE | `fold_lea_into_load` — windowed single-base `lea`→memory-operand fold for unrolled loops | adler 99→98, strlen 14→13, crc 30→29 | shipped, default-on |
-| PF-03 | P1 | setcc/movzbl + mov/add-1/test/cmov → `add` of the 0/1 boolean | cntz 22 vs GCC 13 | designed, NOT shipped: `cmovneq %r8,%rbx` preserves the upper 32 bits of `%rbx` on the not-taken path while `addl` zero-extends. Needs a proof that every definition of the cmov destination is a 32-bit (zero-extending) write. |
-| PF-04 | P1 | Dead reg-move elimination with dominance-correct liveness (a label fallthrough can read the copy after a block-local scan stops) | corpus −25 in a prototype, but unsound as a text scan | needs CFG-aware liveness before any attempt |
-| PF-05 | P0 | RA-03 next-use eviction: adler keeps eight byte temporaries live for the s2 recurrence and spills `s1`/`s2` to the frame | adler 98 vs GCC 63 | see RA-03 |
-| PF-06 | P1 | `isort` shift-store recognition; `scmp` compare width fold | isort 47 vs 23, scmp 26 vs 22 | open |
-| PF-07 | P1 | crc32 SIB fold `xorl table(,%reg,4)` (RA-01 follow-up) | crc 29 vs GCC 18 | open |
+| PF-00 | DONE | FP binop wrote the RHS into the destination holding the LHS (`x + 1.5` computed `1.5 + 1.5`) | regression 462→475 | fixed (session 74) |
+| PF-01..03 | DONE | move relay, windowed lea fold, setcc/test/cmov collapse | — | shipped |
+| PF-04 | DONE | **dominance-correct liveness**: real CFG dataflow (`peephole/passes/liveness.rs`) is now the primary deadness answer; the two syntactic proofs remain as a union for sub-register cases the dataflow must be pessimistic about | unlocked PF-08..PF-14 | shipped |
+| PF-05 | P0 | RA-03: adler keeps eight unrolled byte temporaries live and spills `s1`/`s2` | adler 89 vs GCC 66 (oracle) | open, largest gap |
+| PF-06 | P1 | isort: `(j+1)*4` strength reduction and `int` index widening (`cltq`/`movslq` chains) | isort 43 vs Clang 23 | open |
+| PF-07 | P1 | LICM for `leaq sym(%rip)` in loops. x86-64 cannot combine a rip-relative displacement with an index register, so the earlier "crc SIB fold" entry was wrong — hoisting is the fix | crc 28 vs GCC 17 | open |
+| PF-08 | DONE | producer retargeting and store relay (`movl %A,%D; movl %D,MEM` → `movl %A,MEM`) | gzip_crc32 −26 | shipped |
+| PF-09 | DONE | copy+add and copy+shl folded into `lea` (flag-neutral) | isort 47→43 | shipped |
+| PF-10 | DONE | copy+mask → `movzx` | crc | shipped |
+| PF-11 | DONE | **copy coalescing**: rename the allocator's home onto the ABI register and retire the parameter shuffle | sum8 14→12, bswp32 13→11, mix6 16→13 | shipped |
+| PF-12 | DONE | dead pure-write elimination (LEA / `movz*` / `setCC` / `cmov` / copies) | bswp32, lz, copy64 | shipped |
+| PF-13 | DONE | load + self-test → `cmp $0, mem` — needs liveness ACROSS the branch, which is why it was rejected in session 74 | strlen 12→10, ties GCC | shipped |
+| PF-14 | DONE | accumulator round-trip applied in place, redundant self-test after a logical op, dead sign-extension narrowing, repeated-load reuse | hsh 18→14, ffs1 18→17, lz 9→8 | shipped |
+| PF-15 | P1 | scmp re-sign-extends the same byte three times (`movsbq %dil, %rsi` after `movsbq (%rbx), %rdi`): "the source is already its own extension" | scmp 25 vs GCC 12 | designed |
+| PF-16 | P2 | `movq $imm32, %reg` → `movl $imm32, %reg`; `cltq` after `lzcnt` is provably redundant | ffs1 17 vs 11, lz 8 vs 6 | open |
+| PF-17 | P2 | loop rotation (bottom test): −1 taken branch per iteration but +1 static instruction — needs a cycle-level gate, the instruction-count proxy would call it a regression | every loop kernel | open |
 
-Soundness notes discovered while measuring PF-01/PF-02 (encoded as unit tests
-in `relay_and_lea.rs`): register liveness must be family-wide (a `%ecx` write
-kills `%rcx`), source operands must be rewritten only when the register text
-matches exactly (width-exact), and whole-function "no other mention" deadness
-is invalid for `%rdi..%r9`/`%rax`/`%r10` in functions containing a call or tail
-jump (implicit SysV argument and static-chain reads) and for `%rax`/`%rdx` at
-`ret`.
+Rules encoded as unit tests in `liveness.rs`, `copy_coalesce.rs`,
+`dead_writes.rs`, `flag_peepholes.rs` and `relay_and_lea.rs`: `%r10` is the
+static chain (family **10**, not 11) and is live into every call; `%cl` is a
+fixed operand of the shift instructions and must never be renamed; `%rdx` is
+live at `ret` unless the epilogue demonstrably returns one integer in `%rax`;
+32-bit writes zero-extend, which makes the width rules asymmetric in both
+directions; EFLAGS being block-local is verified per function, not assumed; and
+a label with no incoming branch is a fall-through edge, not a join.
 
 ## 1. How to gather data (mandatory)
 
