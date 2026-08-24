@@ -124,6 +124,12 @@ impl Lowerer {
                         if !d.name.is_empty() {
                             Self::capture_declare(scopes, &d.name);
                         }
+                        // Initializers are expressions in the nested subtree
+                        // too. Omitting them missed the most common capture
+                        // shape: `T local = helper(enclosing_a, enclosing_b)`.
+                        if let Some(init) = &d.init {
+                            self.capture_initializer(init, visible, scopes, result);
+                        }
                     }
                 }
                 BlockItem::Statement(stmt) => {
@@ -400,7 +406,7 @@ impl Lowerer {
             | Expr::CharLiteral(..)
             | Expr::Alignof(_, _)
             | Expr::GnuAlignof(_, _)
-            | Expr::BuiltinTypesCompatibleP(_, _, _) => {}
+            | Expr::BuiltinTypesCompatibleP(_, _, _, _, _) => {}
         }
     }
 
@@ -641,6 +647,15 @@ impl Lowerer {
         let visible = self.visible_local_names();
         let enclosing_labels = self.visible_label_names();
         let capture = self.analyze_nested_captures(nf, &visible, &enclosing_labels);
+        if std::env::var_os("CCC_DEBUG_NESTED_CAPTURE").is_some() {
+            eprintln!(
+                "[NESTED_CAPTURE] parent={} child={} visible={:?} captured={:?}",
+                self.func().name,
+                nf.name,
+                visible,
+                capture.vars
+            );
+        }
 
         // Filter addr_labels: only those that are enclosing labels (not
         // subtree-local). The walker records every &&label; subtree-local
@@ -661,7 +676,9 @@ impl Lowerer {
         let frame_alloca = frame.alloca;
 
         // 2a. Captured variables -> frame members.
-        let mut captured: Vec<(String, LocalInfo, i64)> = Vec::new();
+        // bool marks VLA descriptors (frame stores {base pointer, runtime size})
+        // rather than fixed-size inline storage.
+        let mut captured: Vec<(String, LocalInfo, i64, bool)> = Vec::new();
         let mut static_captured: Vec<(String, LocalInfo)> = Vec::new();
         let mut transitive_captured: Vec<(String, LocalInfo, usize, i64)> = Vec::new();
         for name in &capture.vars {
@@ -690,11 +707,35 @@ impl Lowerer {
                 transitive_captured.push((name.clone(), info, hops, ancestor_off));
                 continue;
             }
-            if info.vla_size.is_some() {
-                self.emit_warning(
-                    "capturing a variable-length array in a nested function is not supported",
-                    nf.span,
-                );
+            if let Some(vla_size) = info.vla_size {
+                // A VLA cannot be moved into the fixed-size static-chain frame.
+                // Capture a descriptor instead: its dynamic base pointer and
+                // runtime byte size. The child loads both, so indexing and
+                // sizeof(VLA) retain the parent's live allocation.
+                let off = if let Some(&existing) = self.func().frame_members.get(name) {
+                    existing
+                } else {
+                    let off = self.frame_add_member(16);
+                    self.func_mut().frame_members.insert(name.clone(), off);
+                    off
+                };
+                let base_slot = self.frame_member_gep(frame_alloca, off);
+                self.emit(Instruction::Store {
+                    val: Operand::Value(info.alloca),
+                    ptr: base_slot,
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                });
+                let size_slot = self.frame_member_gep(frame_alloca, off + 8);
+                self.emit(Instruction::Store {
+                    val: Operand::Value(vla_size),
+                    ptr: size_slot,
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                });
+                captured.push((name.clone(), info, off, true));
                 continue;
             }
             // MEMOIZED FRAMING: if a previous nested function already
@@ -727,7 +768,7 @@ impl Lowerer {
                 }
                 off
             };
-            captured.push((name.clone(), info, off));
+            captured.push((name.clone(), info, off, false));
         }
 
         // 2b. Non-local gotos: create labels in the parent, reserve the
@@ -889,16 +930,40 @@ impl Lowerer {
         // 3e. Pre-register captured enclosing locals in the nested
         // function's locals map with chain-walk address values.
         let mut statics_to_register: Vec<(String, LocalInfo)> = Vec::new();
-        for (name, info, off) in &captured {
+        for (name, info, off, is_vla) in &captured {
             let info = info.clone();
             let off = *off;
             // Access path: base = chain; 0 link loads (parent is direct).
             let addr = self.frame_member_gep(chain_val, off);
             let mut new_info = info;
-            new_info.alloca = addr;
+            if *is_vla {
+                let base = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: base,
+                    ptr: addr,
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                });
+                let size_addr = self.frame_member_gep(chain_val, off + 8);
+                let size = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: size,
+                    ptr: size_addr,
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                });
+                new_info.alloca = base;
+                new_info.vla_size = Some(size);
+                // A descendant needs a descriptor-aware transitive capture;
+                // do not mislabel this loaded pointer as inline frame storage.
+            } else {
+                new_info.alloca = addr;
+                self.func_mut().chain_locals.insert(addr.0, (0, off));
+            }
             new_info.static_global_name = None;
             self.func_mut().locals.insert(name.clone(), new_info);
-            self.func_mut().chain_locals.insert(addr.0, (0, off));
         }
         // Transitive captures: chain -> `hops` link loads -> GEP(off).
         // Each link load reads link[0] of the frame at that level; the

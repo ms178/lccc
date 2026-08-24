@@ -144,13 +144,28 @@ impl Lowerer {
         &self,
         type1: &TypeSpecifier,
         type2: &TypeSpecifier,
+        qualifiers1: &[u8],
+        qualifiers2: &[u8],
     ) -> i32 {
         let ctype1 = self.type_spec_to_ctype(type1);
         let ctype2 = self.type_spec_to_ctype(type2);
-        // Strip top-level qualifiers (CType doesn't carry qualifiers, so this is already done).
-        // Compare the resolved CTypes. GCC considers enum types as their underlying int type,
-        // and considers long/int as distinct even if same size on the platform.
-        if Self::ctypes_compatible(&ctype1, &ctype2) {
+        // Top-level CVR qualifiers do not affect compatibility; nested ones
+        // (notably `char *` vs `const char *`) do. Derive the level count from
+        // the resolved CType so a typedef'd array/pointer gets its implicit
+        // outer levels even though they were absent from the query's tokens.
+        fn qualifier_levels(ty: &CType) -> usize {
+            match ty {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => 1 + qualifier_levels(inner),
+                _ => 1,
+            }
+        }
+        if crate::frontend::parser::ast::nested_type_qualifiers_compatible(
+            qualifiers1,
+            qualifier_levels(&ctype1),
+            qualifiers2,
+            qualifier_levels(&ctype2),
+        ) && Self::ctypes_compatible(&ctype1, &ctype2)
+        {
             1
         } else {
             0
@@ -176,9 +191,13 @@ impl Lowerer {
         match (a_norm, b_norm) {
             // Pointers: pointee types must be compatible
             (CType::Pointer(p1, _), CType::Pointer(p2, _)) => Self::ctypes_compatible(p1, p2),
-            // Arrays: element types must be compatible, sizes must match (or both unsized)
+            // Arrays with compatible elements are compatible when both known
+            // bounds agree OR either side is incomplete (C17 6.2.7p3).
+            // `int[5]` and `int[]` are therefore compatible, while `int[5]`
+            // and `int[6]` are not.
             (CType::Array(e1, s1), CType::Array(e2, s2)) => {
-                Self::ctypes_compatible(e1, e2) && s1 == s2
+                Self::ctypes_compatible(e1, e2)
+                    && (s1 == s2 || s1.is_none() || s2.is_none())
             }
             // Structs/Unions: use derived PartialEq (compares name + fields)
             (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,

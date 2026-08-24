@@ -77,25 +77,78 @@ impl X86Codegen {
                     }
                 }
             }
-            // Copy-closure: a value copied from a va_list value is still the
-            // same va_list.
+            // Alias closure: optimization can represent a source-level
+            // `cond ? &ap : NULL` as Select, and CFG form uses Phi.  A pointer
+            // derived from the va_list root by any of these value-only forms
+            // still exposes the register-save area to a callee.  Tracking only
+            // Copy made FP-save elimination phase-order dependent: if-conversion
+            // changed the escaping `&ap` into a Select, all XMM saves vanished,
+            // and a callee's `va_arg(double)` read uninitialized stack bytes.
             let mut changed = true;
             while changed {
                 changed = false;
                 for block in &func.blocks {
                     for inst in &block.instructions {
-                        if let Instruction::Copy {
-                            dest,
-                            src: Operand::Value(sv),
-                        } = inst
-                        {
-                            if va_ids.contains(&sv.0) && va_ids.insert(dest.0) {
-                                changed = true;
+                        let (dest, aliases_va_list) = match inst {
+                            Instruction::Copy {
+                                dest,
+                                src: Operand::Value(src),
                             }
+                            | Instruction::Cast {
+                                dest,
+                                src: Operand::Value(src),
+                                ..
+                            } => (*dest, va_ids.contains(&src.0)),
+                            Instruction::GetElementPtr { dest, base, .. } => {
+                                (*dest, va_ids.contains(&base.0))
+                            }
+                            Instruction::Select {
+                                dest,
+                                true_val,
+                                false_val,
+                                ..
+                            } => (
+                                *dest,
+                                [true_val, false_val].iter().any(|op| {
+                                    matches!(op, Operand::Value(v) if va_ids.contains(&v.0))
+                                }),
+                            ),
+                            Instruction::Phi { dest, incoming, .. } => (
+                                *dest,
+                                incoming.iter().any(|(op, _)| {
+                                    matches!(op, Operand::Value(v) if va_ids.contains(&v.0))
+                                }),
+                            ),
+                            _ => continue,
+                        };
+                        if aliases_va_list && va_ids.insert(dest.0) {
+                            changed = true;
                         }
                     }
                 }
             }
+            // A va_list rooted in static storage, or whose address is stored
+            // anywhere, escapes without appearing as a call argument. Global
+            // `va_start(gap, ...)` followed by `bar()` is a canonical GCC
+            // torture shape: bar reads gap and may consume both GP and SSE
+            // classes. Preserve the complete register-save area.
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    let escapes = match inst {
+                        Instruction::GlobalAddr { dest, .. } => va_ids.contains(&dest.0),
+                        Instruction::Store {
+                            val: Operand::Value(value),
+                            ..
+                        } => va_ids.contains(&value.0),
+                        _ => false,
+                    };
+                    if escapes {
+                        needs_gp = true;
+                        needs_fp = true;
+                    }
+                }
+            }
+
             // Escape: any call argument that references a va_list value.
             for block in &func.blocks {
                 for inst in &block.instructions {

@@ -373,10 +373,29 @@ impl<'a> SemaConstEval<'a> {
             }
 
             // __builtin_types_compatible_p
-            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
+            Expr::BuiltinTypesCompatibleP(
+                ref type1,
+                ref type2,
+                ref qualifiers1,
+                ref qualifiers2,
+                _,
+            ) => {
                 let ctype1 = self.type_spec_to_ctype(type1);
                 let ctype2 = self.type_spec_to_ctype(type2);
-                let compatible = self.ctypes_compatible(&ctype1, &ctype2);
+                fn qualifier_levels(ty: &CType) -> usize {
+                    match ty {
+                        CType::Pointer(inner, _) | CType::Array(inner, _) => {
+                            1 + qualifier_levels(inner)
+                        }
+                        _ => 1,
+                    }
+                }
+                let compatible = crate::frontend::parser::ast::nested_type_qualifiers_compatible(
+                    qualifiers1,
+                    qualifier_levels(&ctype1),
+                    qualifiers2,
+                    qualifier_levels(&ctype2),
+                ) && self.ctypes_compatible(&ctype1, &ctype2);
                 Some(IrConst::I64(compatible as i64))
             }
 
@@ -386,6 +405,23 @@ impl<'a> SemaConstEval<'a> {
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
+                    if name == "__builtin_constant_p" {
+                        let arg = args.first()?;
+                        if self.eval_const_expr(arg).is_some() {
+                            return Some(IrConst::I32(1));
+                        }
+                        // A file-scope object's value is never a compile-time
+                        // constant. Resolve this negative answer even in a
+                        // required integer-constant-expression context (global
+                        // initializer / __builtin_choose_expr). Parameters and
+                        // locals remain deferred so inlining/propagation may
+                        // prove them constant later.
+                        if matches!(arg, Expr::Identifier(id, _) if self.symbols.lookup_global(id).is_some())
+                        {
+                            return Some(IrConst::I32(0));
+                        }
+                        return None;
+                    }
                     shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
                         self.eval_const_expr(e)
                     })
@@ -515,7 +551,10 @@ impl<'a> SemaConstEval<'a> {
         // Strip qualifiers (CType doesn't carry them) and compare
         match (t1, t2) {
             (CType::Pointer(a, _), CType::Pointer(b, _)) => self.ctypes_compatible(a, b),
-            (CType::Array(a, _), CType::Array(b, _)) => self.ctypes_compatible(a, b),
+            (CType::Array(a, sa), CType::Array(b, sb)) => {
+                self.ctypes_compatible(a, b)
+                    && (sa == sb || sa.is_none() || sb.is_none())
+            }
             _ => t1 == t2,
         }
     }

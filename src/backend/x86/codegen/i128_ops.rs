@@ -238,7 +238,17 @@ impl X86Codegen {
         self.operand_to_rax_rdx(rhs);
         self.state.emit("    pushq %rdx");
         self.state.emit("    pushq %rax");
+        // In frame-pointer-omitted mode every logical slot is addressed from
+        // %rsp. The two saves above lowered the physical stack pointer by 16;
+        // without compensating, loading lhs reads two slots early (often zeros
+        // or an unrelated i128 half). Treat the temporary push depth exactly
+        // like the inline-asm after-push path does.
+        let saved_frame_size = self.state.out.rsp_frame_size;
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 16;
+        }
         self.operand_to_rax_rdx(lhs);
+        self.state.out.rsp_frame_size = saved_frame_size;
         self.state.emit("    movq %rax, %rdi");
         self.state.emit("    movq %rdx, %rsi");
         self.state.emit("    popq %rdx");

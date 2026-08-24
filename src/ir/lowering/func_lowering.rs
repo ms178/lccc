@@ -541,9 +541,9 @@ impl Lowerer {
                     .iter()
                     .map(|fp| self.type_spec_to_ir(&fp.type_spec))
                     .collect();
-                self.func_meta
-                    .ptr_sigs
-                    .insert(name.clone(), FuncSig::for_ptr(ret_ty, param_tys));
+                let mut signature = FuncSig::for_ptr(ret_ty, param_tys);
+                signature.is_variadic = orig_param.fptr_variadic;
+                self.func_meta.ptr_sigs.insert(name.clone(), signature);
             }
         } else if let Some(ref name) = orig_param.name {
             // Fallback: check if the parameter type is a bare function typedef

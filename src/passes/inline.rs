@@ -1955,7 +1955,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             && !is_small_static
             && !is_medium_static
             && !fits_single_call_site_static
-            && (!func.is_static || !func.is_inline)
+            // An external-linkage `inline` definition is still an inlining
+            // candidate; linkage controls out-of-line emission, not whether
+            // callers in this TU may use the body. Excluding it made
+            // __builtin_constant_p(parameter) specialization impossible and
+            // contradicted both C99 and GNU89 inline behavior.
+            && !func.is_inline
+            && !func.is_gnu_inline_def
         {
             if debug_callee {
                 eprintln!(

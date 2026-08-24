@@ -51,6 +51,7 @@ impl Lowerer {
                             type_spec: Self::ctype_to_type_spec(cty),
                             name: name.clone(),
                             fptr_params: None,
+                            fptr_variadic: false,
                             is_const: false,
                             is_volatile: false,
                             is_restrict: false,
@@ -107,8 +108,9 @@ impl Lowerer {
                     .map(|(cty, name)| ParamDecl {
                         type_spec: Self::ctype_to_type_spec(cty),
                         name: name.clone(),
-                        fptr_params: None,
-                        is_const: false,
+                            fptr_params: None,
+                            fptr_variadic: false,
+                            is_const: false,
                         is_volatile: false,
                         is_restrict: false,
                         vla_size_exprs: Vec::new(),
@@ -162,7 +164,7 @@ impl Lowerer {
             let func_type = CType::Function(Box::new(crate::common::types::FunctionType {
                 return_type: actual_return,
                 params: param_types,
-                variadic: false,
+                variadic: param.fptr_variadic,
             }));
             let result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
             return result;

@@ -162,6 +162,19 @@ impl Lowerer {
         Some((field_addr, storage_ty, bit_offset, bit_width))
     }
 
+    /// Integer-promotion result used by arithmetic on a bit-field. Fields wider
+    /// than int retain their declared 64-bit type; forcing every operation to
+    /// I32 discards the high half of 33..64-bit fields before read-modify-write.
+    pub(super) fn bitfield_arithmetic_type(storage_ty: IrType, bit_width: u32) -> IrType {
+        if bit_width <= 31 || (bit_width <= 32 && storage_ty.is_signed()) {
+            IrType::I32
+        } else if bit_width == 32 {
+            IrType::U32
+        } else {
+            storage_ty
+        }
+    }
+
     /// Truncate a value to bit_width bits and sign-extend if the bitfield is signed.
     pub(super) fn truncate_to_bitfield_value(
         &mut self,
@@ -244,7 +257,7 @@ impl Lowerer {
 
         let is_unsigned = storage_ty.is_unsigned();
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
-        let wt = widened_op_type(IrType::I32);
+        let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
         let result = self.emit_binop_val(ir_op, current_val, rhs_val, wt);
 
         // C standard 6.3.1.2: when the target is _Bool, normalize the result

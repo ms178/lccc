@@ -170,6 +170,23 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
 
+        // Coalescing a value out of a callee-saved home needs coordinated
+        // prologue/epilogue surgery.  This text-level pass only rewrites from
+        // the copy onwards, so changing `%rbx` to `%r11`, for example, would
+        // leave `pushq %rbx` paired with `popq %r11`.  Worse, the renamed value
+        // would then live in a caller-saved register across calls.  Leave such
+        // homes to the allocator until the coalescer can update unwind state
+        // and save/restore pairs as one transaction.
+        if (fstart..fend).any(|n| {
+            matches!(
+                infos[n].kind,
+                LineKind::Push { reg } | LineKind::Pop { reg } if reg == d_fam
+            )
+        }) {
+            i += 1;
+            continue;
+        }
+
         for n in i + 1..fend {
             if infos[n].is_nop() {
                 continue;
@@ -177,6 +194,19 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
             // Rule 2: no later mention of the source family. A read is already
             // excluded by rule 1; a write would clobber the coalesced value.
             if infos[n].reg_refs & s_mask != 0 {
+                ok = false;
+                break;
+            }
+            // A call has implicit *writes* to every caller-saved register.
+            // `live_after(i, S) == false` describes the original program, in
+            // which D—not S—holds the value; it therefore cannot detect this
+            // newly-created live range.  Reject exactly when D is live after
+            // the call and S would be clobbered there.
+            let source_is_caller_saved = matches!(s_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11);
+            if infos[n].kind == LineKind::Call
+                && source_is_caller_saved
+                && lv.live_after(n, d_fam) != Some(false)
+            {
                 ok = false;
                 break;
             }
@@ -326,6 +356,51 @@ mod tests {
         ));
         // %rdi is live into the call (first argument), so the save must stay.
         assert!(out.contains("movq %rdi, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn callee_saved_home_is_not_renamed_without_updating_its_save_pair() {
+        // Reduced from gcc.c-torture/execute/20080604-1.c.  The old pass
+        // deleted `movq %r11,%rbx`, rewrote the body and `popq` to %r11, but
+        // left `pushq %rbx` untouched.  The call then clobbered the selected
+        // pointer and the mismatched pop corrupted the caller's %r11 value.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    leaq object(%rip), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    movq %r12, (%rbx)\n",
+            "    call observe\n",
+            "    movq %r12, (%rbx)\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("pushq %rbx"), "{out}");
+        assert!(out.contains("popq %rbx"), "{out}");
+        assert!(!out.contains("popq %r11"), "{out}");
+        assert!(out.contains("movq %r12, (%rbx)"), "{out}");
+        assert!(!out.contains("movq %r12, (%r11)"), "{out}");
+    }
+
+    #[test]
+    fn caller_saved_source_is_not_extended_across_call() {
+        // The original liveness of %r11 ends at the copy; after coalescing it
+        // would carry %rbx's live range across `call`, where the ABI permits
+        // it to be destroyed.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq object(%rip), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    call observe\n",
+            "    movq (%rbx), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq (%rbx), %rax"), "{out}");
+        assert!(!out.contains("movq (%r11), %rax"), "{out}");
     }
 
     #[test]

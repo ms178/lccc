@@ -781,7 +781,7 @@ pub(super) fn memrchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 /// conventional `memrchr(',')` cannot be used to determine an instruction's
 /// destination operand.
 #[inline]
-fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
+pub(super) fn last_top_level_comma(bytes: &[u8]) -> Option<usize> {
     let mut depth = 0u32;
     let mut last = None;
     for (idx, &byte) in bytes.iter().enumerate() {

@@ -666,6 +666,23 @@ mod tests {
     }
 
     #[test]
+    fn sib_destination_is_memory_not_a_fake_index_register() {
+        // Reduced from gcc.c-torture/execute/20090207-1.c after base-index
+        // folding. A raw last-comma split saw `%r8)` as the destination and
+        // deleted this observable store as a dead pure register write.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq 8(%rsp), %rcx\n",
+            "    movl $2, (%rcx, %r8)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl $2, (%rcx, %r8)"), "{out}");
+        assert!(out.contains("leaq 8(%rsp), %rcx"), "{out}");
+    }
+
+    #[test]
     fn dead_scaled_lea_is_deleted() {
         let out = run(concat!(
             "foo:\n",

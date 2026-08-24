@@ -319,16 +319,31 @@ fn narrow_through_stores(
                             disqualified = true;
                         }
                     }
-                    Instruction::Cast { src, to_ty, .. } => {
+                    Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } => {
                         let src_ok = match src {
                             Operand::Value(v) => {
                                 let id = v.0 as usize;
                                 if id <= max_id {
                                     match ntype[id] {
                                         Some(t) => {
-                                            // Truncating cast (I64->T) or the widening def (T->I64).
-                                            (*to_ty == IrType::I64 || *to_ty == IrType::U64)
-                                                || to_ty.size() == t.size()
+                                            // Only a real truncation to T or a
+                                            // real widening from T can consume
+                                            // the low bits alone.  A same-width
+                                            // I64<->U64 cast observes every bit:
+                                            // accepting it used to narrow a
+                                            // 64-bit multiply before `>> 32`
+                                            // into `imull` + sign extension,
+                                            // destroying the high product.
+                                            let truncates_to_t = from_ty.size() > to_ty.size()
+                                                && to_ty.size() == t.size();
+                                            let widens_from_t = from_ty.size() == t.size()
+                                                && to_ty.size() > from_ty.size();
+                                            truncates_to_t || widens_from_t
                                         }
                                         None => true,
                                     }
@@ -1420,6 +1435,62 @@ mod tests {
 
         let changes = narrow_function(&mut func);
         assert_eq!(changes, 0, "Should not narrow LShr with signed target");
+    }
+
+    #[test]
+    fn test_same_width_cast_preserves_high_multiply_bits() {
+        // `(u64)(sext(x) * C) >> 32` is the classic signed-division magic
+        // sequence.  The I64->U64 cast is not a truncation: the following
+        // shift consumes the high half, so the multiply must remain 64-bit.
+        let mut func = make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1431655766)),
+                    ty: IrType::I64,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(32)),
+                    ty: IrType::U64,
+                },
+                Instruction::Cast {
+                    dest: Value(5),
+                    src: Operand::Value(Value(4)),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        }]);
+
+        narrow_function(&mut func);
+        assert!(matches!(
+            func.blocks[0].instructions[1],
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                ty: IrType::I64,
+                ..
+            }
+        ));
     }
 
     #[test]

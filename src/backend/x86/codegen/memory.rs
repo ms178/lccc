@@ -2044,13 +2044,15 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_typed_load_from_slot_impl(&mut self, instr: &'static str, slot: StackSlot) {
-        // movl/movzbl/movzwl write a 32-bit register (implicit zero-extend);
-        // emitting %rax is rejected by GAS for movzbl (GAS-oracle:
-        // "incorrect register %rax used with l suffix").
-        let dest_reg = if matches!(instr, "movl" | "movzbl" | "movzwl") {
-            "%eax"
-        } else {
-            "%rax"
+        // Select the architectural destination width of the move. `movb` and
+        // `movw` appear in narrow temporary copy paths; spelling `%rax` there
+        // is invalid assembly. Extending loads and movl write eax, while
+        // full-width/sign-to-64 loads write rax.
+        let dest_reg = match instr {
+            "movb" => "%al",
+            "movw" => "%ax",
+            "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "%eax",
+            _ => "%rax",
         };
         let out = &mut self.state.out;
         out.write_str("    ");

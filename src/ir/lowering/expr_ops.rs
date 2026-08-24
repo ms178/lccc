@@ -1093,7 +1093,12 @@ impl Lowerer {
         let lower_last_bool = |slf: &mut Self| -> Operand {
             let val = slf.lower_condition_expr(last);
             if last_is_normalized_bool {
-                val
+                // C comparisons/logical-not have int value semantics, while
+                // the IR Cmp result is a one-byte boolean. Widen explicitly
+                // before it enters the I64 short-circuit result slot/phi;
+                // otherwise phi elimination emits a byte copy into a 64-bit
+                // home and leaves the upper bits undefined.
+                slf.emit_implicit_cast(val, IrType::U8, int_ty)
             } else {
                 Operand::Value(slf.emit_cmp_val(
                     IrCmpOp::Ne,
@@ -1232,7 +1237,7 @@ impl Lowerer {
             self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width);
 
         let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
-        let wt = widened_op_type(IrType::I32);
+        let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
         let one = if wt == IrType::I32 {
             IrConst::I32(1)
         } else {

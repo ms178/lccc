@@ -1775,7 +1775,7 @@ impl SemanticAnalyzer {
             // Label address (&&label) - just a compile-time address
             Expr::LabelAddr(_, _) => {}
             // __builtin_types_compatible_p(type1, type2) - compile-time constant
-            Expr::BuiltinTypesCompatibleP(_, _, _) => {}
+            Expr::BuiltinTypesCompatibleP(_, _, _, _, _) => {}
         }
 
         // After analyzing sub-expressions, infer this expression's CType using
@@ -2140,7 +2140,7 @@ impl SemanticAnalyzer {
             let func_type = CType::Function(Box::new(FunctionType {
                 return_type: actual_return,
                 params: param_types,
-                variadic: false,
+                variadic: param.fptr_variadic,
             }));
             let mut result = CType::Pointer(Box::new(func_type), AddressSpace::Default);
             for _ in 1..param.fptr_inner_ptr_depth.max(1) {

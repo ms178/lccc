@@ -237,6 +237,9 @@ pub struct ParamDecl {
     /// For function pointer parameters, the parameter types of the pointed-to function.
     /// E.g., for `float (*func)(float, float)`, this holds the two float param decls.
     pub fptr_params: Option<Vec<ParamDecl>>,
+    /// Whether the pointed-to function accepts a variadic tail. Kept separate
+    /// because CType erases the parser's explicit function-pointer declarator.
+    pub fptr_variadic: bool,
     /// Whether this parameter's base type has a `const` qualifier.
     /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`.
     pub is_const: bool,
@@ -967,9 +970,29 @@ pub enum Expr {
     GenericSelection(Box<Expr>, Vec<GenericAssociation>, Span),
     /// GCC extension: &&label (address of label, for computed goto)
     LabelAddr(String, Span),
-    /// GCC extension: __builtin_types_compatible_p(type1, type2)
-    /// Compile-time constant: 1 if the two types are compatible, 0 otherwise.
-    BuiltinTypesCompatibleP(TypeSpecifier, TypeSpecifier, Span),
+    /// GCC extension: __builtin_types_compatible_p(type1, type2).
+    /// Qualifier vectors run from the innermost/base type out through each
+    /// derived pointer/array level (bit 0 const, bit 1 volatile, bit 2
+    /// restrict). CType intentionally erases CVR qualifiers, but this builtin
+    /// must ignore only the *top-level* qualifier and preserve nested ones.
+    BuiltinTypesCompatibleP(TypeSpecifier, TypeSpecifier, Vec<u8>, Vec<u8>, Span),
+}
+
+pub(crate) fn nested_type_qualifiers_compatible(
+    a: &[u8],
+    a_levels: usize,
+    b: &[u8],
+    b_levels: usize,
+) -> bool {
+    fn normalized_nested(input: &[u8], levels: usize) -> Vec<u8> {
+        let mut normalized = input.to_vec();
+        // Typedef expansion can reveal pointer/array layers after parsing. A
+        // layer absent from the syntax has no separately-written qualifier.
+        normalized.resize(levels.max(1), 0);
+        normalized.truncate(levels.max(1).saturating_sub(1));
+        normalized
+    }
+    normalized_nested(a, a_levels) == normalized_nested(b, b_levels)
 }
 
 /// A _Generic association: either a type-expression pair, or a default expression.
@@ -1107,7 +1130,7 @@ impl Expr {
             | Expr::Deref(_, s)
             | Expr::GenericSelection(_, _, s)
             | Expr::LabelAddr(_, s)
-            | Expr::BuiltinTypesCompatibleP(_, _, s) => *s,
+            | Expr::BuiltinTypesCompatibleP(_, _, _, _, s) => *s,
         }
     }
 }

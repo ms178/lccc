@@ -4579,6 +4579,40 @@ pub(crate) fn detect_phi_coalesce_groups(
                     .chain(block.instructions[..copy_idx].iter())
                     .any(|middle| uses_value(middle, dest.0))
             };
+            // A use can be hidden behind a value computed before the destructive
+            // update.  In `p = &a[i]; next = i + 1; *p = ...; i = next`, the
+            // Store reads `p`, not `i`, so the direct test above misses it.
+            // x86 can defer/fold that GEP into the Store's SIB operand; sharing
+            // the homes then increments `i` before the effective address is
+            // formed.  Track the pre-update dataflow closure and reject when a
+            // derived old-phi value remains live after the source definition.
+            let phi_derived_used_in_window = if same_block {
+                let mut derived: FxHashSet<u32> = FxHashSet::default();
+                derived.insert(dest.0);
+                for earlier in &block.instructions[..source_def_idx] {
+                    let mut depends = false;
+                    for_each_operand_in_instruction(earlier, |op| {
+                        if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
+                            depends = true;
+                        }
+                    });
+                    for_each_value_use_in_instruction(earlier, |v| {
+                        if derived.contains(&v.0) {
+                            depends = true;
+                        }
+                    });
+                    if depends {
+                        if let Some(d) = earlier.dest() {
+                            derived.insert(d.0);
+                        }
+                    }
+                }
+                block.instructions[source_def_idx + 1..copy_idx]
+                    .iter()
+                    .any(|middle| derived.iter().any(|&v| uses_value(middle, v)))
+            } else {
+                false
+            };
             let source_used_elsewhere = src_use_blocks.get(&src.0).is_some_and(|blocks| {
                 blocks
                     .iter()
@@ -4588,11 +4622,22 @@ pub(crate) fn detect_phi_coalesce_groups(
                 && block.instructions[..copy_idx]
                     .iter()
                     .any(|middle| uses_value(middle, src.0));
-            if phi_used_in_window || source_used_elsewhere || source_used_before_copy {
+            if phi_used_in_window
+                || phi_derived_used_in_window
+                || source_used_elsewhere
+                || source_used_before_copy
+            {
                 if debug {
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} cross_block={} src_before_copy={}",
-                        dest.0, src.0, block_idx, source_block, phi_used_in_window, source_used_elsewhere, source_used_before_copy
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} cross_block={} src_before_copy={}",
+                        dest.0,
+                        src.0,
+                        block_idx,
+                        source_block,
+                        phi_used_in_window,
+                        phi_derived_used_in_window,
+                        source_used_elsewhere,
+                        source_used_before_copy
                     );
                 }
                 continue;
@@ -4871,6 +4916,83 @@ mod phi_coalesce_tests {
                 .iter()
                 .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "window use of phi must block coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_phi_value_derived_before_update_and_used_after_it() {
+        // Reduced from gcc.c-torture/execute/pr51933.c after GVN merged two
+        // `i + 1` values.  The backend may fold the GEP into Store, so the
+        // address dependency on old `i` remains live past the next-IV def.
+        let mut func = IrFunction::new("deferred_gep_index".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(1)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(4),
+                        name: "table".to_string(),
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(4),
+                        offset: Operand::Value(Value(3)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        val: Operand::Const(IrConst::I8(7)),
+                        ptr: Value(5),
+                        ty: IrType::I8,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(2)),
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 6;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "derived old-phi address must block destructive coalescing: {candidates:?}"
         );
     }
 

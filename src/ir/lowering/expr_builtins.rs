@@ -9,7 +9,7 @@
 
 use super::lower::Lowerer;
 use crate::common::types::{target_is_32bit, AddressSpace, CType, IrType};
-use crate::frontend::parser::ast::Expr;
+use crate::frontend::parser::ast::{Expr, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
     CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator,
@@ -1088,27 +1088,94 @@ impl Lowerer {
         }
     }
 
+    /// Whether it is safe to materialize an operand solely for a deferred
+    /// IsConstant query. The builtin never evaluates its argument; lowering a
+    /// call, increment, volatile/global load, or dereference would introduce an
+    /// observable operation that the source program does not perform.
+    fn constant_query_can_lower(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::IntLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..)
+            | Expr::CharLiteral(..)
+            | Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..) => true,
+            Expr::Identifier(name, _) => self
+                .func()
+                .locals
+                .get(name)
+                .is_some_and(|local| !local.is_array && !local.base_type_volatile),
+            Expr::BinaryOp(_, lhs, rhs, _) | Expr::Comma(lhs, rhs, _) => {
+                self.constant_query_can_lower(lhs) && self.constant_query_can_lower(rhs)
+            }
+            Expr::UnaryOp(op, inner, _) => {
+                !matches!(op, UnaryOp::PreInc | UnaryOp::PreDec)
+                    && self.constant_query_can_lower(inner)
+            }
+            Expr::Cast(_, inner, _) => self.constant_query_can_lower(inner),
+            Expr::Conditional(cond, yes, no, _) => {
+                self.constant_query_can_lower(cond)
+                    && self.constant_query_can_lower(yes)
+                    && self.constant_query_can_lower(no)
+            }
+            Expr::GnuConditional(cond, no, _) => {
+                self.constant_query_can_lower(cond) && self.constant_query_can_lower(no)
+            }
+            // All remaining forms either perform work (call/assignment/va_arg),
+            // access memory through an lvalue, or need statement/initializer
+            // lowering. If not already proven constant above, GCC's answer is
+            // conservatively zero and no IR for the argument may be emitted.
+            _ => false,
+        }
+    }
+
     /// Lower __builtin_constant_p(expr): 1 if compile-time constant, 0 otherwise.
     /// Per GCC semantics, the argument is NOT evaluated (no side effects).
-    /// In inline candidates, emits a deferred IsConstant instruction for post-optimization resolution.
     fn lower_constant_p(&mut self, args: &[Expr]) -> Option<Operand> {
         let Some(arg) = args.first() else {
             return Some(Operand::Const(IrConst::I32(0)));
         };
-        // If already a compile-time constant at lowering time, resolve immediately
-        if self.eval_const_expr(arg).is_some() {
+        // If already a compile-time constant at lowering time, resolve immediately.
+        // String literals are constant addresses even though numeric const-eval
+        // intentionally has no IrConst representation for an address.
+        let constant_literal_subscript = matches!(
+            arg,
+            Expr::ArraySubscript(base, index, _)
+                if matches!(base.as_ref(),
+                    Expr::StringLiteral(..)
+                    | Expr::WideStringLiteral(..)
+                    | Expr::Char16StringLiteral(..))
+                && self.eval_const_expr(index).is_some()
+        );
+        if self.eval_const_expr(arg).is_some()
+            || constant_literal_subscript
+            || matches!(
+                arg,
+                Expr::StringLiteral(..)
+                    | Expr::WideStringLiteral(..)
+                    | Expr::Char16StringLiteral(..)
+            )
+        {
             return Some(Operand::Const(IrConst::I32(1)));
         }
-        // In non-inline-candidate functions, non-constant expressions always resolve to 0.
-        // The argument is NOT evaluated per GCC semantics -- __builtin_constant_p
-        // never has side effects regardless of its argument.
-        if !self.func().is_inline_candidate {
+        if !self.constant_query_can_lower(arg) {
             return Some(Operand::Const(IrConst::I32(0)));
         }
-        // For inline candidates, emit an IsConstant instruction to be resolved after
-        // optimization. We lower the expression to get a value reference, but it will
-        // only be used to check constness, not for side effects. After inlining,
-        // if the argument becomes constant, constant_fold resolves IsConstant to 1.
+        // Defer in every function, not only inline candidates. Ordinary local
+        // propagation is enough to make a value constant (`int n=sizeof(int)`),
+        // and GCC reports that at -O1+ even in `main`. Eagerly returning zero
+        // for non-inline functions permanently hid those opportunities.
+        // The lowered value is used only as a constness query; later folding
+        // resolves it to one after mem2reg/constant propagation, or the final
+        // resolver turns it into zero.
         let src = self.lower_expr(arg);
         let src_ty = self.get_expr_type(arg);
         let dest = self.fresh_value();
