@@ -725,26 +725,24 @@ impl CodegenState {
     /// Check if a value uses a 4-byte (small) stack slot.
     /// Used by store/load paths to emit 4-byte instructions instead of 8-byte.
     ///
-    /// RE-ENABLED: the previous disable note claimed movl corrupts
-    /// signed I32 values flowing into 64-bit operations. That is solved by
-    /// type-aware loads: signed I32 values that are consumed in 64-bit
-    /// contexts (tracked by the needs-sext analysis) are loaded with
-    /// `movslq` (sign-extending), everything else ≤ 4 bytes is loaded with
-    /// `movl` (zero-extending). All load/store paths are now consistent
-    /// (slots are 8 bytes on x86-64, so a 4-byte access never corrupts a
-    /// neighbour; it only ever reads/writes the low 4 bytes of the slot).
-    pub fn is_small_slot(&self, _v: u32) -> bool {
-        // Stores ALWAYS write 8 bytes (movq): a 4-byte store would leave the
-        // slot's upper half stale, and when the slot is REUSED across values
-        // of different types (a 32-bit value sharing a slot with a pointer),
-        // a later 64-bit memory read (`addq mem, %reg` / an ALU memory
-        // operand) would read the stale upper bytes — corrupting pointers
-        // and indices. Loads, in contrast, are width-typed by VALUE TYPE in
-        // value_to_reg (movb/movw/movl/movslq), which is consistent with
-        // both the 8-byte stores here and the type-aware generate_store
-        // (movb/movw/movl) — reading the low N bytes of an 8-byte store is
-        // always correct.
-        false
+    /// Soundness contract (enforced by the slot allocator):
+    ///   1. Small slots are only allocated on targets whose store/load paths
+    ///      are width-consistent (x86-64; see set_target_small_slots), and
+    ///      only for values whose IR type is ≤ 4 bytes.
+    ///   2. Slot sharing is partitioned by exact size class — Tier 3 free
+    ///      lists, Tier 2 graph coloring and copy-alias resolution never mix
+    ///      4-byte and 8-byte occupants of the same physical slot. A 4-byte
+    ///      store therefore can never leave stale bytes that a later 64-bit
+    ///      access of the SAME slot could observe.
+    ///   3. Every access path honours the width: stores use movl, loads use
+    ///      the type-aware movzbl/movzwl/movl/movslq family, and ALU/compare
+    ///      memory-operand folding is suppressed whenever it would touch a
+    ///      small slot with an 8-byte form.
+    /// With those invariants, the old hazard (a 32-bit value sharing a slot
+    /// with a pointer, whose upper half a 64-bit reader then observed) is
+    /// structurally impossible rather than merely avoided.
+    pub fn is_small_slot(&self, v: u32) -> bool {
+        self.small_slot_values.contains(&v)
     }
 
     /// Check if a value is a "wide" type on 32-bit targets (F64, I64, U64).

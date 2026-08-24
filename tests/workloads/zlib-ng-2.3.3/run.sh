@@ -30,8 +30,17 @@ if [[ ! -x $LCCC ]]; then
     exit 2
 fi
 if [[ $(wc -l </proc/swaps) -le 1 ]]; then
-    echo "error: no active swap; run scripts/ensure_swap.sh first" >&2
-    exit 2
+    # Unprivileged containers (no CAP_SYS_ADMIN) cannot swapon at all. The
+    # swap gate exists to protect constrained VMs from OOM during the build;
+    # on such boxes the equivalent protection is the userspace memory
+    # watchdog (scripts/memwatch.sh) plus -j2 discipline. Allow an explicit,
+    # documented waiver rather than silently disabling the gate.
+    if [[ ${LCCC_SWAP_WAIVER:-0} == 1 ]]; then
+        echo "warning: no active swap; proceeding under LCCC_SWAP_WAIVER (watchdog + -j2 discipline)" >&2
+    else
+        echo "error: no active swap; run scripts/ensure_swap.sh first (or set LCCC_SWAP_WAIVER=1 in a swapless container with the memwatch watchdog)" >&2
+        exit 2
+    fi
 fi
 for tool in git cmake ninja timeout sha256sum python3 curl gzip cmp; do
     command -v "$tool" >/dev/null || { echo "error: missing tool: $tool" >&2; exit 2; }

@@ -444,6 +444,13 @@ impl X86Codegen {
                         (self.state.get_slot(dest.0), self.state.get_slot(lhs_val.0))
                     {
                         if dest_slot.0 == lhs_slot.0 {
+                            // Width guard: the 64-bit `opq %reg/$imm, mem`
+                            // forms read AND write 8 bytes. A 4-byte small
+                            // slot must only be touched by the 32-bit form;
+                            // fall through to the register path otherwise
+                            // (I8/I16 ALU ops have use_32bit == false).
+                            let dest_is_small = self.state.is_small_slot(dest.0);
+                            if !dest_is_small || use_32bit {
                             let sref = self.slot_ref(dest_slot.0);
                             // Try register source: op %reg, mem
                             if let Some(rhs_phys) = self
@@ -483,6 +490,7 @@ impl X86Codegen {
                                 self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
                                 return;
                             }
+                            } // width guard
                         }
                     }
                 }
@@ -511,7 +519,12 @@ impl X86Codegen {
                 // (`opq slot, %rax`) would read the array's first element instead of
                 // adding the base address. Skip allocas so the general path below
                 // materializes them with `lea` (value_to_reg/operand_to_rax).
-                if self.dest_reg(&rhs_val).is_none() && !self.state.is_alloca(rhs_val.0) {
+                // Width guard: the 64-bit `opq mem, %rax` form reads 8 bytes;
+                // a 4-byte small slot may only be folded with the 32-bit form.
+                if self.dest_reg(&rhs_val).is_none()
+                    && !self.state.is_alloca(rhs_val.0)
+                    && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+                {
                     if let Some(slot) = self.state.get_slot(rhs_val.0) {
                         if use_32bit {
                             self.operand_to_eax(lhs);
@@ -540,7 +553,12 @@ impl X86Codegen {
             let is_commutative = !matches!(op, IrBinOp::Sub);
             if is_commutative {
                 if let Operand::Value(lhs_val) = lhs {
-                    if self.dest_reg(&lhs_val).is_none() && !self.state.is_alloca(lhs_val.0) {
+                    // Width guard mirrors the rhs path: the 64-bit form reads
+                    // 8 bytes from the slot, which a small slot cannot serve.
+                    if self.dest_reg(&lhs_val).is_none()
+                        && !self.state.is_alloca(lhs_val.0)
+                        && (use_32bit || !self.state.is_small_slot(lhs_val.0))
+                    {
                         if let Some(slot) = self.state.get_slot(lhs_val.0) {
                             if use_32bit {
                                 self.operand_to_eax(rhs);
@@ -741,9 +759,14 @@ impl X86Codegen {
         // Try memory-source multiply for rhs. An alloca's VALUE is its ADDRESS
         // (a pointer), so folding it as a memory source would read the array's
         // first element instead of multiplying by the base address — the same
-        // alloca guard the plain binop mem-source path has.
+        // alloca guard the plain binop mem-source path has. Width guard: the
+        // 64-bit imulq memory form reads 8 bytes; small slots need the 32-bit
+        // form (or no folding at all).
         if let Operand::Value(rhs_val) = mul_rhs {
-            if self.dest_reg(rhs_val).is_none() && !self.state.is_alloca(rhs_val.0) {
+            if self.dest_reg(rhs_val).is_none()
+                && !self.state.is_alloca(rhs_val.0)
+                && (use_32bit || !self.state.is_small_slot(rhs_val.0))
+            {
                 if let Some(slot) = self.state.get_slot(rhs_val.0) {
                     let sref = self.slot_ref(slot.0);
                     if use_32bit {

@@ -1237,8 +1237,25 @@ impl X86Codegen {
             func,
             callee_save_reserve,
             |space, alloc_size, align| {
-                let effective_align = if align > 0 { align.max(8) } else { 8 };
-                let alloc = (alloc_size + 7) & !7;
+                // 4-byte granularity for 4-byte spill slots (small values):
+                // rounding them to 8 would defeat the frame-size halving that
+                // fixes pcre2-style stack overflow in deep recursion. Slots
+                // wider than 4 bytes keep the 8-byte rounding; alignment
+                // requests of 16+ (over-aligned allocas, vectors) are honoured
+                // exactly as before.
+                let is_small_alloc = alloc_size <= 4;
+                let effective_align = if align > 0 {
+                    align.max(8)
+                } else if is_small_alloc {
+                    4
+                } else {
+                    8
+                };
+                let alloc = if is_small_alloc {
+                    4
+                } else {
+                    (alloc_size + 7) & !7
+                };
                 let mut new_space =
                     ((space + alloc + effective_align - 1) / effective_align) * effective_align;
                 // FPO: the virtual frame base (rsp + frame_size) is entry %rsp,

@@ -68,3 +68,4 @@ zlib-ng-validation/
 # Stray stdout-capture from "lccc <in> -o -" test invocations
 # (got swept by git add -A in aa1956b and 12eed2b)
 /-
+.base_ref

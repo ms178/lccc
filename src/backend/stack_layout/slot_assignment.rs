@@ -491,11 +491,18 @@ fn classify_value(
     }
 
     // Detect small values (types that fit in 4 bytes on 64-bit targets).
-    // Currently used to populate small_slot_values for future store/load
-    // width optimization. Slot allocation remains 8-byte minimum because
-    // the backend's store/load paths aren't fully type-safe yet (some paths
-    // always use movq/sd/str x0 regardless of IR type).
-    let is_small = !crate::common::types::target_is_32bit()
+    // These get width-partitioned 4-byte spill slots on backends whose store/
+    // load paths are fully width-consistent (x86-64, see is_small_slot).
+    // Halving the slot width halves the frame of spill-heavy functions
+    // (pcre2's compile_branch: 10320-byte frames overflowed the 8 MiB stack
+    // at 792 levels of recursion). Slot sharing is partitioned by exact
+    // size class (Tier 3 free lists, Tier 2 graph coloring, copy aliases),
+    // so a 4-byte slot is never shared with an 8-byte value — the stale-
+    // upper-half hazard that forced the old 8-byte minimum cannot arise.
+    let small_slots_enabled = crate::common::types::target_small_slots()
+        && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none();
+    let is_small = small_slots_enabled
+        && !crate::common::types::target_is_32bit()
         && matches!(
             inst.result_type(),
             Some(IrType::I8)
@@ -515,6 +522,10 @@ fn classify_value(
         16 // SSE 128-bit vectors need 16 bytes
     } else if is_i128 || is_f128 {
         16
+    } else if is_small {
+        // Width-partitioned small slot: only ever shared with other 4-byte
+        // values, and only accessed with ≤4-byte instructions.
+        4
     } else {
         8
     };
@@ -684,12 +695,19 @@ pub(super) fn assign_tier3_block_local_slots(
     }
 
     if !coalesce {
-        // Fallback: no reuse, just accumulate.
+        // Fallback: no reuse, just accumulate. Offsets keep natural
+        // alignment (8 for ≥8-byte slots) so the finalize-time mapping
+        // cannot shift a wide slot onto a neighbour (see the coalescing
+        // path's alignment note).
         for blv in block_local_values {
             let bs = block_space.entry(blv.block_idx).or_insert(0);
-            let before = *bs;
-            let (_, new_space) = assign_slot(*bs, blv.slot_size, 0);
-            *bs = new_space;
+            let before = if blv.slot_size >= 8 {
+                (*bs + 7) & !7
+            } else {
+                *bs
+            };
+            let (_, new_space) = assign_slot(before, blv.slot_size, 0);
+            *bs = new_space.max(before + blv.slot_size);
             if new_space > *max_block_local_space {
                 *max_block_local_space = new_space;
             }
@@ -811,9 +829,19 @@ pub(super) fn assign_tier3_block_local_slots(
     }
 
     // For each block, assign slots with greedy coloring.
+    //
+    // PROCESSING ORDER IS A SOUNDNESS INVARIANT: values MUST be visited in
+    // definition order. The expiry rule (`active[i].0 < my_def`) frees an
+    // occupant's slot relative to the CURRENT value's def point; visiting a
+    // later-defined value first would free slots that an earlier-defined,
+    // still-unprocessed value (whose lifetime encloses the occupant's) must
+    // not reuse — the zlib-ng build_tree v89/v319 overlap was exactly this
+    // bug when a size-descending reorder was tried. Size-class packing gains
+    // must come from the exact-size free lists alone, never from reordering.
     let debug_protect = std::env::var("LCCC_DEBUG_PROTECT").is_ok();
     for (blk_idx, values) in &per_block {
         let mut active: Vec<(usize, i64, i64)> = Vec::new(); // (last_use, offset, size)
+        let mut free_4: Vec<i64> = Vec::new();
         let mut free_8: Vec<i64> = Vec::new();
         let mut free_16: Vec<i64> = Vec::new();
         let mut free_32: Vec<i64> = Vec::new();
@@ -831,23 +859,30 @@ pub(super) fn assign_tier3_block_local_slots(
                         free_32.push(off);
                     } else if sz == 16 {
                         free_16.push(off);
-                    } else {
+                    } else if sz == 8 {
                         free_8.push(off);
+                    } else {
+                        free_4.push(off);
                     }
                 } else {
                     i += 1;
                 }
             }
 
-            // Try to reuse a freed slot of matching size.
+            // Try to reuse a freed slot of EXACTLY matching size. The exact-
+            // size partition is what makes 4-byte slots sound: a 4-byte store
+            // into a slot previously owned by an 8-byte value would leave that
+            // value's stale upper half readable by later 64-bit accesses.
             // Protected values (DynAlloca results, vector temps) must get unique slots.
             let can_reuse = !state.protected_slot_values.contains(&dest_id);
             let free_list = if slot_size >= 32 {
                 &mut free_32
             } else if slot_size == 16 {
                 &mut free_16
-            } else {
+            } else if slot_size == 8 {
                 &mut free_8
+            } else {
+                &mut free_4
             };
             let offset = if can_reuse && free_list.len() > 0 {
                 let reused = free_list.pop().unwrap();
@@ -859,8 +894,19 @@ pub(super) fn assign_tier3_block_local_slots(
                 }
                 reused
             } else {
-                let off = block_peak;
-                block_peak += slot_size;
+                // Natural alignment inside the pool is what keeps the final
+                // `assign_slot(nls + block_offset, size, ..)` mapping
+                // shift-free: finalize rounds an 8-byte value at a 4-mod-8
+                // pool offset up to the next 8-byte boundary, silently
+                // shifting it ONTO the following small slot's bytes (the
+                // rot() v11/v14 [40,48) vs [44,48) overlap). Reused offsets
+                // are already size-aligned by construction.
+                let off = if slot_size >= 8 && block_peak % 8 != 0 {
+                    (block_peak + 7) & !7
+                } else {
+                    block_peak
+                };
+                block_peak = off + slot_size;
                 if debug_protect && !can_reuse {
                     eprintln!(
                         "[PROTECT-T3] SSA {} is protected, forced new slot at offset {}",
@@ -960,10 +1006,15 @@ pub(super) fn finalize_deferred_slots(
             .map(|ds| if ds.align > 0 { ds.align } else { 8 })
             .max()
             .unwrap_or(8);
+        // ALWAYS 8-align the deferred-region base: Tier-2 small slots leave
+        // non_local_space at a 4-mod-8 value, and the pool offsets of 8-byte
+        // values are 8-aligned only relative to an 8-aligned base. With a
+        // 4-mod-8 base, finalize's alignment rounding shifts wide slots onto
+        // small slots' bytes (rot() v11/v14 overlap).
         let aligned_nls = if max_align > 8 {
             ((non_local_space + max_align - 1) / max_align) * max_align
         } else {
-            non_local_space
+            (non_local_space + 7) & !7
         };
         if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
             eprintln!(
@@ -1002,6 +1053,7 @@ pub(super) fn resolve_copy_aliases(
     let debug_slot_coalesce = std::env::var("CCC_DEBUG_SLOT_COALESCE").is_ok();
     let mut resolved_count = 0usize;
     let mut blocked_overlap_count = 0usize;
+    let mut blocked_width_mismatch_count = 0usize;
     let mut blocked_missing_root_count = 0usize;
     // Build liveness intervals for interference checking.
     // We use a lightweight approach: compute def-point and last-use-point for
@@ -1059,6 +1111,18 @@ pub(super) fn resolve_copy_aliases(
         // its old linear interval guard when explicitly selected for bisection.
         let cfg_proven = std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
             && phi_web_aliases.contains(&dest_id);
+        // Width-class guard: never share a slot across 4-byte/8-byte classes.
+        // A small value storing movl into an 8-byte root's slot leaves the
+        // root's stale upper half for later 64-bit readers; conversely an
+        // 8-byte movq store into a 4-byte slot corrupts the slot's neighbour.
+        // Copy/phi webs carry one type, so a mismatch here can only come from
+        // a Cast-fed copy web — keep both values in their own slots instead.
+        if state.small_slot_values.contains(&dest_id)
+            != state.small_slot_values.contains(&root_id)
+        {
+            blocked_width_mismatch_count += 1;
+            continue;
+        }
         if let Some(&slot) = state.value_locations.get(&root_id) {
             // Loop-backedge phi aliases are certified by
             // detect_phi_coalesce_groups: the phi dest (root) is provably dead
@@ -1101,12 +1165,13 @@ pub(super) fn resolve_copy_aliases(
 
     if debug_slot_coalesce && !copy_alias.is_empty() {
         eprintln!(
-            "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={}",
+            "[SLOT-COALESCE] resolve fn={} requested={} resolved={} blocked_overlap={} blocked_missing_root={} blocked_width_mismatch={}",
             func.name,
             copy_alias.len(),
             resolved_count,
             blocked_overlap_count,
             blocked_missing_root_count,
+            blocked_width_mismatch_count,
         );
     }
 }

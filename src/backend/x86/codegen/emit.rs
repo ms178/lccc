@@ -1662,8 +1662,15 @@ impl X86Codegen {
                     .emit_instr_reg_reg("    movq", "rax", reg_name);
             }
         } else if let Some(slot) = self.state.get_slot(dest.0) {
-            // No register: store 64 bits to preserve sign extension.
-            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            if self.state.is_small_slot(dest.0) {
+                // 4-byte slot: writing all 8 bytes of %rax would clobber the
+                // neighbouring slot. The low 4 bytes carry the entire value;
+                // sign-extending consumers reload with movslq (needs-sext).
+                self.state.out.emit_instr_reg_rbp("    movl", "eax", slot.0);
+            } else {
+                // No register: store 64 bits to preserve sign extension.
+                self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+            }
         } else if !self.state.is_accumulator_location(dest.0) {
             panic!(
                 "x86 codegen: live value {} has no assigned location",
@@ -3816,10 +3823,11 @@ impl ArchCodegen for X86Codegen {
             _ => {}
         }
 
-        let lowered = super::isel::lower_instruction_ctx(
+        let lowered = super::isel::lower_instruction_typed(
             inst,
             &self.reg_assignments,
             &alloca_slots,
+            Some(&self.value_types),
             &mut self.machinst_buf,
         );
         if lowered {
@@ -4359,10 +4367,11 @@ impl ArchCodegen for X86Codegen {
                 self.state.reg_cache.invalidate_acc();
             }
             _ => {
-                // XMM source → stack-slot dest: movsd directly, no GPR relay.
-                // Only F64 values are XMM-allocated and all slots are 8 bytes,
-                // so movsd is type-safe here. %rax is untouched, so the
-                // accumulator cache stays valid.
+                // XMM source → stack-slot dest: movss/movsd directly, no GPR
+                // relay. Both F32 and F64 values can be XMM-allocated
+                // (is_scalar_fp covers both), so the store width follows the
+                // value type. %rax is untouched, so the accumulator cache
+                // stays valid.
                 if let Operand::Value(v) = src {
                     if let Some(s) = src_phys {
                         if is_xmm_reg(s)
@@ -4370,11 +4379,23 @@ impl ArchCodegen for X86Codegen {
                             && !self.state.vector_values.contains(&dest.0)
                         {
                             if let Some(slot) = self.state.get_slot(dest.0) {
-                                self.state.out.emit_instr_reg_rbp(
-                                    "    movsd",
-                                    phys_reg_name(s),
-                                    slot.0,
-                                );
+                                // Width-consistent store: an XMM-allocated F32
+                                // value must spill with movss (4 bytes) — movsd
+                                // would write 8 bytes and, into a 4-byte small
+                                // slot, clobber the neighbour. F64 keeps movsd.
+                                let ty = self
+                                    .value_types
+                                    .get(&v.0)
+                                    .copied()
+                                    .unwrap_or(IrType::F64);
+                                let mov = if ty == IrType::F32 {
+                                    "    movss"
+                                } else {
+                                    "    movsd"
+                                };
+                                self.state
+                                    .out
+                                    .emit_instr_reg_rbp(mov, phys_reg_name(s), slot.0);
                                 return;
                             }
                         }

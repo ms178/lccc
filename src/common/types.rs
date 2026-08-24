@@ -15,6 +15,22 @@ thread_local! {
     /// Whether long double is IEEE binary128 (f128). True for AArch64/RISC-V,
     /// false for x86/i686 where long double is x87 80-bit.
     static TARGET_LONG_DOUBLE_IS_F128: Cell<bool> = const { Cell::new(false) };
+    /// Whether the current backend supports width-partitioned 4-byte spill
+    /// slots. Only the x86-64 backend's store/load paths are fully
+    /// width-consistent for small types (see state::is_small_slot); every
+    /// other backend keeps the 8-byte fallback until it is audited.
+    static TARGET_SMALL_SLOTS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Set whether the current target allows 4-byte spill slots (x86-64 only).
+/// Must be called before stack layout runs.
+pub fn set_target_small_slots(enabled: bool) {
+    TARGET_SMALL_SLOTS.with(|c| c.set(enabled));
+}
+
+/// Whether the current target allows 4-byte spill slots.
+pub fn target_small_slots() -> bool {
+    TARGET_SMALL_SLOTS.with(|c| c.get())
 }
 
 /// Set the target pointer size for the current thread (4 for i686/ILP32, 8 for LP64).

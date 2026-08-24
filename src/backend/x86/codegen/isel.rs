@@ -398,14 +398,17 @@ pub fn lower_store(
 }
 
 /// Lower an IR Copy: dest = src.
+/// `size` must match the value's IR width so slot-to-slot relays stay
+/// width-consistent with 4-byte small spill slots.
 pub fn lower_copy(
     dest: &Value,
     src: &Operand,
+    size: crate::backend::x86::codegen::machinst::OpSize,
     ra: &FxHashMap<u32, PhysReg>,
     out: &mut Vec<MachInst>,
 ) {
     let dst = value_to_reg(dest, ra);
-    emit_mov_operand_r(src, dst, OpSize::S64, ra, out);
+    emit_mov_operand_r(src, dst, size, ra, out);
 }
 
 // ── Comparison ───────────────────────────────────────────────────────────
@@ -825,6 +828,19 @@ pub fn lower_instruction_ctx(
     alloca_slots: &FxHashMap<u32, i64>,
     out: &mut Vec<MachInst>,
 ) -> bool {
+    lower_instruction_typed(inst, reg_assignments, alloca_slots, None, out)
+}
+
+/// Lower with full context plus a value-type map for width-consistent
+/// Copy lowering. `value_types` may be None (tests); copies then keep the
+/// historical 64-bit width.
+pub fn lower_instruction_typed(
+    inst: &Instruction,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    alloca_slots: &FxHashMap<u32, i64>,
+    value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
+    out: &mut Vec<MachInst>,
+) -> bool {
     // For values that already have register allocations from the existing
     // allocator, use their physical register directly (MachReg::Phys).
     // The MachInst allocator only handles the remaining Vreg values.
@@ -968,7 +984,25 @@ pub fn lower_instruction_ctx(
             true
         }
         Instruction::Copy { dest, src } => {
-            lower_copy(dest, src, ra, out);
+            // Width-consistent copy: a ≤32-bit value spilled to a 4-byte small
+            // slot must be moved with a 32-bit mov. The historical
+            // unconditional S64 relay (`movq slot,%rax; movq %rax,slot`)
+            // reads 4 stale neighbour bytes out of a small src slot AND
+            // clobbers the neighbour of a small dst slot (the -O0 loop-phi
+            // o0_phi_multidef miscompile). The Copy instruction itself is
+            // type-polymorphic, so the width comes from the value-type map
+            // (propagated Copy/producer types); unknown types keep S64,
+            // which matches the 8-byte slots untyped values receive.
+            let copy_size = value_types.and_then(|vt| {
+                let ty = match src {
+                    Operand::Value(v) => vt.get(&v.0).copied(),
+                    _ => None,
+                };
+                let ty = ty.or_else(|| vt.get(&dest.0).copied());
+                ty.map(crate::backend::x86::codegen::machinst::OpSize::from_ir_type)
+            });
+            let copy_size = copy_size.unwrap_or(crate::backend::x86::codegen::machinst::OpSize::S64);
+            lower_copy(dest, src, copy_size, ra, out);
             true
         }
         Instruction::Cmp {
