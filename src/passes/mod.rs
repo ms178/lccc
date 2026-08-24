@@ -1494,16 +1494,26 @@ pub(crate) fn run_passes(
         module.for_each_function(fp_const_hoist::run);
     }
 
-    // Hoist large integer constants (not encodable as cmp/add immediates) out
-    // of loop bodies for the same reason — sieve's loop bound cost movz+movk
-    // per iteration before this.
+    // Hoist large integer constants (not encodable as target immediates) out
+    // of loop bodies. Target-aware since the Lev-Kropp-audit session:
     //
-    // AArch64-ONLY: the pass models A64 immediate encodings (imm12/cmn).
-    // x86-64 encodes any imm32 directly in cmp/add, so hoisting there only
-    // burns a register and pessimizes the loop (measured on sieve: the
-    // hoisted bound turned `cmpq $10000000, %r11` into a register compare
-    // plus an extra callee-saved push in the prologue).
-    if target == crate::backend::Target::Aarch64 && !disabled.contains("intconst") {
+    // * AArch64: anything outside imm12/cmn pays movz/movk per iteration
+    //   (sieve's loop bound was the original case).
+    // * x86-64: imm32 is directly encodable in cmp/add/imul, so the pass now
+    //   hoists ONLY true 64-bit constants — dominated by div_by_const's
+    //   magic multipliers (`movabsq $2454267027` was re-materialized inside
+    //   every division loop iteration; sum_div7 paid it per element).
+    //   Small imm32 constants are deliberately NOT hoisted (they are free
+    //   in-place; hoisting them burns a register and a callee-saved push —
+    //   the old sieve regression the AArch64-only gate existed for).
+    // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
+    if !disabled.contains("intconst")
+        && matches!(
+            target,
+            crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
+        )
+    {
+        int_const_hoist::set_target_aarch64(target == crate::backend::Target::Aarch64);
         module.for_each_function(int_const_hoist::run);
     }
 

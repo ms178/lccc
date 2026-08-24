@@ -767,3 +767,64 @@ correctness · 1200+ differential fuzz across O0/O2/O3/Os (all clean) ·
 5. **PF-11** (setcc+test+jne→jCC): no instances in the corpus
    (if-conversion already emits direct branches); implement only when a
    workload shows the shape.
+
+---
+
+## §16 Session 69 (2026-08-24) — Lev Kropp upstream audit + v5
+
+Base: `daf3f48` (main after the v3/v4 merges). Lev Kropp's `levkropp/lccc`
+main (76 commits since 2026-08-19, tip `e74883e0`) audited commit-by-commit;
+ms178 main already contains the adopted lineage (PRs #209–#223 embed the
+backedge-PRE, pointer-compound-assign, DSE, LICM, and cmp/select-fusion
+fixes — verified behaviorally).
+
+### 16.1 Audit classification
+
+| Class | Commits | Verdict |
+|---|---|---|
+| **Semantic fixes already adopted** (2ed29fd8 ptr+=, 1e3d8c84 DSE void-ptr, 53ef5201 LICM use-before-def + vectorizer gates, 40261e3c sqlite ×4, e03da2f1 aggregate init DSE) | ~8 | **Verified present on main by targeted reproducers** (ptr-widening, void-ptr DSE, i-j-k matmul, cmp/select distance) — every Lev bug class I could reconstruct produces CORRECT output on main. His regression tests would pass. |
+| **AArch64-only peepholes/RA** (sxtw, stp/ldp, csinc, GDSE, shrink-wrap, x9, madd fusion, ~35 commits) | ~35 | **Not portable to the x86-64 charter target**; the ms178 arm backend diverged long ago. Concepts (function-scoped constant tracking, store sinking) recorded as ideas only. |
+| **RA ranking experiments** (priority-first scans, reverse FP phi coalescing, point-precise web merges, c710ed4a/38a85795/6b8fa0b5/b15548ac/eb587035/f958b6af) | ~10 | ms178's RA took a different path (segment-aware interference + Tier-2 graph coloring, both landed and validated). Lev's own roadmap entries mark half of these dead-ends. **No adoption** — merging two RA philosophies without a shared measurement harness is how miscompiles ship. |
+| **Portable optimization wins** | | |
+| — backedge PRE (a08f6768) | 1 | **Already on main, extended** (main's copy is 672 lines vs his 518 — further developed here). |
+| — csinc/csel-increment fold (24200ab4) | 1 | AArch64 csinc has **no x86 equivalent** (x86 cmov cannot add-and-select in one op); the x86 shape is already covered by the flag_peepholes setcc/test/cmov collapse. N/A. |
+| — **operand-const hoisting (558e3ed9)** | 1 | **REAL GAP ON MAIN → PORTED & GENERALIZED** (below). |
+| — plain-copy loop vectorize (6e955227) | 1 | Main's stencil/map vectorizers already cover `dst[i]=src[i]` (verified: memcpy-shaped loops vectorize). |
+| — second-order SR (885f129c) | 1 | Main's univsr covers the triangular-IV shapes; isort's remaining gap is the marching secondary IV (PF-06, open). |
+| Docs/roadmap/task notes | ~20 | Read for intelligence; nothing to port. |
+
+### 16.2 The one adopted change, perfected
+
+**x86-64 `int_const_hoist`** (from 558e3ed9's insight): div_by_const's magic
+multipliers were re-materialized (`movabsq $2454267027`) inside EVERY loop
+iteration; main's pass was AArch64-only because its imm12 model over-hoists
+on x86 (the old sieve regression). The port is target-aware:
+- x86-64 hoists ONLY out-of-i32-range constants (the movabs class);
+  imm32 stays in place (free in cmp/add/imul immediate forms).
+- AArch64 keeps the imm12/cmn model; div/rem/mul operand positions
+  (`needs_reg`) pay materialization even for small constants there.
+- i686 no-op.
+
+Measured: `sum_div7` loop body loses the per-iteration movabsq entirely
+(`imulq %r8` reads the preheader home). Gates: 1134 unit tests, 451/3
+regression (env-only), 300/300 O2/O3 fuzz, div checksums identical to GCC.
+
+### 16.3 README/CI refresh
+
+- README performance table rebuilt from the canonical runner
+  (`run_benchmarks.py`, 30 pairs, 2026-08-24): **geomean 0.8235**
+  (conventional-code geomean 1.29 excluding the three algorithmic recursion
+  wins). Wins: fib 109×, bitops 1.7×, crc32 1.15×, matmul/double_reduction/
+  qsort/ring_fifo/tce_sum all ≤1.0. Honest gap table with root causes.
+- `ci-codegen-baseline.json` refreshed (crc 192→174 insns after the
+  table-base + magic-const hoists; adler 344→322).
+
+### 16.4 Follow-up status (all sessions consolidated)
+
+1. **RA-06 / PF-05** (adler 1.58×): arithmetic-chain copy webs — the
+   measured-negative naive version (§15.2) maps the failure; needs the
+   location-map design.
+2. **PF-06** (isort/loop_patterns 2.4×): secondary-IV strength reduction.
+3. **Non-reduction FP vectorization** (spectral 4.8×, nbody 3.9×,
+   mandelbrot 1.65×): multi-store stencil analysis.
+4. **expat 1.61×**: hash-multiply chains (imul), not RA.
