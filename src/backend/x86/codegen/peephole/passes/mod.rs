@@ -468,6 +468,13 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("fuse_movq_ext") {
             changed |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
+            // VEX 3-operand exploitation: `movsd %A,%D; vOP %S,%D,%D` ->
+            // `vOP %S,%A,%D`. Removes the 2-operand-ISA staging copy the
+            // scalar FP emitters insert before every binary op.
+            changed |= local_patterns::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
+            // Memory-source half: fold a dead staged load into a commutative
+            // scalar VEX op's memory operand slot.
+            changed |= local_patterns::fold_scalar_fp_memory_into_vex_op(&mut store, &mut infos);
         }
         if !sk("fp_roundtrips") {
             changed |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
