@@ -15,8 +15,20 @@
 
 use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use std::cell::Cell;
+
+thread_local! {
+    /// Whether the current target is AArch64 (imm12 immediate model).
+    static AARCH64: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record the current target for the immediate-encoding model. Called by
+/// the driver before the pass runs.
+pub(crate) fn set_target_aarch64(is_aarch64: bool) {
+    AARCH64.with(|c| c.set(is_aarch64));
+}
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Run integer-constant hoisting on a function. Returns the number of
 /// distinct constants materialized in preheaders.
@@ -51,8 +63,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
             for inst in &func.blocks[bi].instructions {
-                for_each_int_operand(inst, &mut |op| {
-                    if let Some(bits) = large_int_const(op) {
+                for_each_int_operand(inst, &mut |op, needs_reg| {
+                    if let Some(bits) = large_int_const(op, needs_reg) {
                         if seen.insert(bits) {
                             consts.push(bits);
                         }
@@ -91,10 +103,20 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     count
 }
 
-/// An integer constant that is NOT encodable as an AArch64 add/cmp immediate
-/// (imm12 0..=4095, or the cmn negative range -4095..=-1) and so would be
-/// materialized with movz/movk. Returns the value as u64 bits.
-fn large_int_const(op: &Operand) -> Option<u64> {
+/// An integer constant that is NOT encodable as a target immediate and so
+/// would be materialized into a register inside the loop:
+///
+/// * AArch64: anything outside imm12 (0..=4095) / cmn (-4095..=-1) pays
+///   movz/movk per iteration.
+/// * x86-64: `cmp/add/sub` (and `imul r,r,i`) take a SIGNED imm32 directly,
+///   so only constants outside i32 pay a `movabsq`. The dominant source is
+///   div_by_const's magic multipliers (e.g. 2454267027 is encodable as
+///   imm32 for imul's 3-operand form, but the sign-extended I64 sequence
+///   uses movabsq — and the pass conservatively hoists any i64-out-of-range
+///   constant).
+///
+/// Returns the value as u64 bits.
+fn large_int_const(op: &Operand, needs_reg: bool) -> Option<u64> {
     let v: i64 = match op {
         Operand::Const(IrConst::I8(v)) => *v as i64,
         Operand::Const(IrConst::I16(v)) => *v as i64,
@@ -102,27 +124,65 @@ fn large_int_const(op: &Operand) -> Option<u64> {
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
-    if (-4095..=4095).contains(&v) {
-        return None; // imm12 / cmn encodable — free already
+    // Operand positions with no immediate encoding at all (div/rem on every
+    // target; mul on AArch64) pay a register materialization even for small
+    // constants — except that on x86-64 a div-by-constant is expanded by
+    // div_by_const into imul+shift whose immediates ARE encodable, so by the
+    // time this pass sees the loop, small divisors are gone. Constants that
+    // survive here are the real per-iteration movabs/movz materializations.
+    if !needs_reg {
+        if (-4095..=4095).contains(&v) && AARCH64.with(|c| c.get()) {
+            return None; // AArch64 imm12 / cmn encodable — free already
+        }
+        if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+            return None; // x86-64 imm32 encodable
+        }
+    } else if AARCH64.with(|c| !c.get()) && v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        // x86-64 div/rem: only out-of-i32 constants force movabsq; an imm32
+        // constant costs one movl — cheaper than a hoisted register's
+        // prologue pressure in short loops.
+        return None;
     }
     Some(v as u64)
 }
 
 /// Visit operands of the instruction forms with range-limited immediate encodings.
-fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
+/// `needs_reg` is true when the operand position has NO immediate encoding at
+/// all (div/rem on both targets; mul on AArch64), so even a small constant
+/// pays a materialization there (Lev Kropp's 558e3ed9 insight, generalized
+/// per target).
+fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool)) {
     match inst {
-        Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
+        Instruction::BinOp { op, lhs, rhs, .. } => {
+            let needs_reg = match op {
+                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => true,
+                IrBinOp::Mul => AARCH64.with(|c| c.get()),
+                _ => false,
+            };
+            f(lhs, needs_reg);
+            f(rhs, needs_reg);
+        }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            f(lhs, false);
+            f(rhs, false);
         }
         _ => {}
     }
 }
 
 /// Replace operands equal to the constant `bits` with the hoisted value.
+/// Position-agnostic by value: a constant rewritten at one operand position
+/// (e.g. a div magic multiplier) is identical everywhere it appears.
 fn rewrite_int_operands(inst: &mut Instruction, bits: u64, new_val: u32) {
     let sub = |op: &mut Operand| {
-        if large_int_const(op) == Some(bits) {
+        let matches = match op {
+            Operand::Const(IrConst::I8(v)) => (*v as i64) as u64 == bits,
+            Operand::Const(IrConst::I16(v)) => (*v as i64) as u64 == bits,
+            Operand::Const(IrConst::I32(v)) => (*v as i64) as u64 == bits,
+            Operand::Const(IrConst::I64(v)) => (*v as u64) == bits,
+            _ => false,
+        };
+        if matches {
             *op = Operand::Value(Value(new_val));
         }
     };

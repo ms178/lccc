@@ -58,69 +58,70 @@ https://github.com/ms178/lccc
 
 | Compiler | Revision | Notes |
 |---|---|---|
-| **LCCC (ms178)** | [`bc992d69`](https://github.com/ms178/lccc/commit/bc992d69) | this fork, `main` `aa8bc98` (PR #178) + session 41/42 codegen fixes (SIB zero-extend tracking, immediate `imul`, BT direct index, 32-bit-write tracking, alias-aware SIMD temp promotion) |
+| **LCCC (ms178)** | `main` `daf3f48` + session-69 patch (this tree) | segment-aware regalloc, stencil vectorizer, FpContract tri-state, FP return/dest-aliasing fixes, flag-lifetime peepholes, PIC table-base hoist, x86-64 magic-const hoisting |
 | **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference |
 
 All compilers at `-O2`, identical sources, identical machine, same run window.
-Driver: `tests/benchmark/run_benchmarks.py` (canonical runner). Paired
-median wall time, randomized compiler order, warm-ups excluded; every binary's
+Driver: `tests/benchmark/run_benchmarks.py` (canonical runner): paired median
+wall time, randomized compiler order, warm-ups excluded; every binary's
 output is checksummed against the GCC baseline (a mismatch disqualifies the
-number). Measured 2026-08-21 in the shared 2-core VM (no PMU); screening
-evidence only.
+number). Measured 2026-08-24 in the shared 2-core VM (no PMU); screening
+evidence only — reproduce on bare metal before treating any figure as a
+hardware result.
 
 ## Results (ratio = LCCC/GCC; < 1 means LCCC faster)
 
-| Kernel | What it stresses | LCCC median | GCC median | LCCC/GCC | Correct |
-|---|---|---:|---:|---:|:---:|
-| `fib` | binary recursion → TCE/rec2iter | 2.52 ms | 173.02 ms | **0.014** (69× faster) | pass |
-| `ackermann` | deep recursion | 2.48 ms | 150.72 ms | **0.016** (61× faster) | pass |
-| `constant_recursion` | constant recursive specialization | 2.51 ms | 150.87 ms | **0.016** (61× faster) | pass |
-| `bitops` | integer selection, popcount idioms | 260.56 ms | 392.50 ms | **0.664** (1.5× faster) | pass |
-| `matmul` | loop-nest FP + reduction FMA | 7.75 ms | 9.71 ms | **0.840** (1.2× faster) | pass |
-| `binary_search` | branch-heavy lookup | 2.28 ms | 2.37 ms | **0.952** | pass |
-| `ascii_case_fold` | parser byte loop | 2.46 ms | 2.41 ms | 0.995 | pass |
-| `ring_fifo` | dependent loads | 2.25 ms | 2.24 ms | 0.997 | pass |
-| `qsort` | libc branches | 127.54 ms | 126.64 ms | 1.010 | pass |
-| `strlen_bench` | byte loops | 235.44 ms | 233.14 ms | 1.013 | pass |
-| `tce_sum` | tail-recursive accumulator | 2.24 ms | 2.14 ms | 1.052 | pass |
-| `switch_dispatch` | switch lowering | 528.84 ms | 504.43 ms | 1.052 | pass |
-| `gzip_crc32` | gzip CRC-32 table loop | 179.92 ms | 168.86 ms | 1.067 | pass |
-| `arith_loop` | 32-variable register pressure | 112.85 ms | 101.74 ms | 1.112 | pass |
-| `histogram` | indexed increment/reduction | 2.88 ms | 2.52 ms | 1.123 | pass |
-| `hash_table` | pointer chasing | 12.23 s | 10.77 s | 1.129 | pass |
-| `binary_trees` | allocation + recursion | 1.639 s | 1.426 s | 1.147 | pass |
-| `sieve` | branchy int stores | 46.26 ms | 37.82 ms | 1.224 | pass |
-| `glibc_memcmp` | aligned-word memcmp path | 11.75 ms | 9.22 ms | 1.275 | pass |
-| `fannkuch` | permutations | 3.314 s | 2.542 s | 1.303 | pass |
-| `mandelbrot` | FP branch-heavy loop | 2.107 s | 1.489 s | 1.418 | pass |
-| `struct_copy` | aggregate copy + ABI | 41.36 ms | 27.42 ms | 1.514 | pass |
-| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 63.07 ms | 39.41 ms | 1.588 | pass |
-| `loop_patterns` | scalar loop transforms | 127.44 ms | 78.21 ms | 1.629 | pass |
-| `linux_find_bit` | sparse bit search | 25.24 ms | 14.78 ms | 1.697 | pass |
-| `sqlite_varint` | varint decoder | 44.92 ms | 26.09 ms | 1.718 | pass |
-| `expat_xml_scan` | XML name-token scan | 78.44 ms | 40.47 ms | 1.962 | pass |
-| `nbody` | N-body FP structs | 984.30 ms | 305.55 ms | 3.221 | pass |
-| `spectral_norm` | dense FP | 791.51 ms | 202.02 ms | 3.908 | pass |
+| Kernel | What it stresses | LCCC/GCC | Verdict |
+|---|---|---:|---|
+| `fib` | binary recursion → rec2iter | **0.009** (109× faster) | pass |
+| `constant_recursion` | constant recursive specialization | **0.017** (59× faster) | pass |
+| `ackermann` | deep recursion | **0.019** (53× faster) | pass |
+| `bitops` | integer selection, popcount idioms | **0.603** (1.7× faster) | pass |
+| `gzip_crc32` | gzip CRC-32 table loop | **0.872** (1.15× faster) | pass |
+| `ring_fifo` | dependent loads | **0.925** | pass |
+| `matmul` | loop-nest FP + reduction FMA | **0.944** | pass |
+| `tce_sum` | tail-recursive accumulator | **0.967** | pass |
+| `double_reduction` | two independent FP reductions | **0.969** | pass |
+| `qsort` | libc branches | **0.973** | pass |
+| `switch_dispatch` | switch lowering | 1.023 | pass |
+| `ascii_case_fold` | parser byte loop | 1.028 | pass |
+| `glibc_memcmp` | aligned-word memcmp path | 1.031 | pass |
+| `binary_search` | branch-heavy lookup | 1.032 | pass |
+| `strlen_bench` | byte loops | 1.040 | pass |
+| `arith_loop` | 32-variable register pressure | 1.049 | pass |
+| `histogram` | indexed increment/reduction | 1.057 | pass |
+| `binary_trees` | allocation + recursion | 1.064 | pass |
+| `hash_table` | pointer chasing | 1.068 | pass |
+| `sieve` | branchy int stores | 1.304 | pass |
+| `sqlite_varint` | varint decoder | 1.361 | pass |
+| `struct_copy` | aggregate copy + ABI | 1.493 | pass |
+| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 1.580 | pass |
+| `expat_xml_scan` | XML name-token scan | 1.609 | pass |
+| `mandelbrot` | FP branch-heavy loop | 1.653 | pass |
+| `fannkuch` | permutations | 1.784 | pass |
+| `linux_find_bit` | sparse bit search | 1.809 | pass |
+| `loop_patterns` | scalar loop transforms | 2.435 | pass |
+| `nbody` | N-body FP structs | 3.889 | pass |
+| `spectral_norm` | dense FP | 4.779 | pass |
 
-**Aggregate (29 correct pairs): geometric mean 0.8205, arithmetic mean 1.2640.**
-Best `fib` 0.0144; worst `spectral_norm` 3.908.
+**Aggregate (30 correct pairs): geometric mean 0.8235.** Excluding the three
+algorithmic recursion wins, the conventional-code geomean is **1.29**.
 
 ## Reading the table honestly
 
 - **Where LCCC wins**: recursion folding (`fib`/`ackermann`/
-  `constant_recursion` — TCE + rec2iter, 60–69× vs GCC's exponential
-  recursion), hand-rolled popcount recognition (`bitops` 1.5× via `popcntl`),
-  and reduction FMA vectorization (`matmul` 1.2×). These lift the geomean
-  below 1.0 even though several codec/parser kernels trail.
-- **Where GCC wins**: dense/non-reduction FP (`spectral_norm` 3.9×,
-  `nbody` 3.2× — no general loop-nest vectorization, no FMA contraction,
-  accumulator round-trips), and a cluster of parser/codec kernels in the
-  1.5–2.0× band (`expat_xml_scan` 1.96×, `sqlite_varint` 1.72×,
-  `linux_find_bit` 1.70×, `loop_patterns` 1.63×, `zlib_ng_adler32` 1.59×).
-  These are the tracked structural gaps — see
-  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) (segment
-  register allocation, accumulator-centric ISel, SysV aggregate ABI, Expat
-  single-table classify).
+  `constant_recursion` — TCE + rec2iter; GCC keeps exponential recursion),
+  popcount recognition (`bitops` 1.7× via `popcntl`), reduction FMA
+  vectorization (`matmul`), the CRC table loop (hoisted PIC base + magic-const
+  hoisting; 1.15×), and the whole cluster of integer/branch kernels in the
+  0.92–1.07 band.
+- **Where GCC still wins**: non-reduction dense FP (`spectral_norm` 4.8×,
+  `nbody` 3.9×, `mandelbrot` 1.65× — general loop-nest vectorization is the
+  tracked structural gap; the stencil vectorizer covers element-wise shapes
+  only), and a codec/parser cluster (`loop_patterns` 2.4×, `find_bit` 1.8×,
+  `fannkuch` 1.8×, `expat` 1.6×, `adler32` 1.6× — RA-06 arithmetic-chain copy
+  webs and secondary-IV strength reduction are the mapped fixes; see
+  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) §15.5).
 - Every number above was produced by a **correct** binary; correctness is
   enforced before speed is recorded (checksums byte-identical to GCC).
 
