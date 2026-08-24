@@ -29,12 +29,26 @@ export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 # Honour the repo's clang+mold preference (.cargo/config.toml) when both are
-# on PATH. Otherwise fall back to gcc + GNU ld for this invocation only.
+# on PATH. If only mold is available, drive it through the gcc driver
+# (gcc >= 12 resolves -fuse-ld=mold to ld.mold on PATH) so the fast-linker
+# preference survives with only mold installed (e.g. conda-forge mold next
+# to a system gcc).
 # CARGO_TARGET_*_LINKER alone is not enough: the committed rustflags still
 # pass `-fuse-ld=mold`, so we override both via `cargo --config`.
 cargo_config=()
 if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
     : # keep .cargo/config.toml (clang -fuse-ld=mold)
+elif command -v ld.mold >/dev/null 2>&1; then
+    # mold without clang: gcc driver + mold backend. `-fuse-ld=mold` requires
+    # an `ld.mold` on PATH (the conda-forge/make-install symlink layout);
+    # `command -v ld.mold` guarantees that exact resolution.
+    cargo_config=(
+        --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+        --config 'target.x86_64-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold"]'
+        --config 'target.i686-unknown-linux-gnu.linker="gcc"'
+        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold","-C","link-arg=-m32"]'
+    )
+    printf '%s\n' "note: clang not found; linking with gcc driver + mold backend"
 else
     cargo_config=(
         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'

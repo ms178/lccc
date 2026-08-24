@@ -98,7 +98,11 @@ pub(super) fn color_stack_slots(
         }
     }
 
-    for (size, values) in &mut by_size {
+    // Iterate size classes DESCENDING (8/16/32-byte before 4-byte): wider
+    // slots claim the low, naturally aligned offsets first, and the trailing
+    // 4-byte class fills 4-mod-8 gaps. Ascending order would burn 4 bytes of
+    // padding at every 4→8-byte transition.
+    for (size, values) in by_size.iter_mut().rev() {
         values.sort_unstable_by(|a, b| {
             let ap = &segments[a];
             let bp = &segments[b];

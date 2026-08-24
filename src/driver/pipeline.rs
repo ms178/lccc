@@ -520,6 +520,9 @@ impl Driver {
             self.target,
             Target::Aarch64 | Target::Riscv64
         ));
+        // 4-byte width-partitioned spill slots are only enabled where the
+        // backend's store/load paths are proven width-consistent (x86-64).
+        crate::common::types::set_target_small_slots(matches!(self.target, Target::X86_64));
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
