@@ -77,7 +77,8 @@ hardware result.
 | `constant_recursion` | constant recursive specialization | **0.017** (59× faster) | pass |
 | `ackermann` | deep recursion | **0.019** (53× faster) | pass |
 | `bitops` | integer selection, popcount idioms | **0.603** (1.7× faster) | pass |
-| `gzip_crc32` | gzip CRC-32 table loop | **0.872** (1.15× faster) | pass |
+| `gzip_crc32` | gzip CRC-32 table loop | **0.875** (1.14× faster) | pass |
+| `hash_table` | pointer chasing | **1.095** | pass |
 | `ring_fifo` | dependent loads | **0.925** | pass |
 | `matmul` | loop-nest FP + reduction FMA | **0.944** | pass |
 | `tce_sum` | tail-recursive accumulator | **0.967** | pass |
@@ -91,21 +92,41 @@ hardware result.
 | `arith_loop` | 32-variable register pressure | 1.049 | pass |
 | `histogram` | indexed increment/reduction | 1.057 | pass |
 | `binary_trees` | allocation + recursion | 1.064 | pass |
-| `hash_table` | pointer chasing | 1.068 | pass |
-| `sieve` | branchy int stores | 1.304 | pass |
-| `sqlite_varint` | varint decoder | 1.361 | pass |
-| `struct_copy` | aggregate copy + ABI | 1.493 | pass |
-| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 1.580 | pass |
-| `expat_xml_scan` | XML name-token scan | 1.609 | pass |
-| `mandelbrot` | FP branch-heavy loop | 1.653 | pass |
-| `fannkuch` | permutations | 1.784 | pass |
-| `linux_find_bit` | sparse bit search | 1.809 | pass |
-| `loop_patterns` | scalar loop transforms | 2.435 | pass |
-| `nbody` | N-body FP structs | 3.889 | pass |
-| `spectral_norm` | dense FP | 4.779 | pass |
+| `sieve` | branchy int stores | 1.155 | pass |
+| `sqlite_varint` | varint decoder | 1.271 | pass |
+| `struct_copy` | aggregate copy + ABI | 1.491 | pass |
+| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 1.594 | pass |
+| `expat_xml_scan` | XML name-token scan | 1.665 | pass |
+| `mandelbrot` | FP branch-heavy loop | 1.648 | pass |
+| `fannkuch` | permutations | 1.757 | pass |
+| `linux_find_bit` | sparse bit search | 1.961 | pass |
+| `loop_patterns` | scalar loop transforms | 2.805 | pass |
+| `nbody` | N-body FP structs | 3.845 | pass |
+| `spectral_norm` | dense FP | 4.769 | pass |
 
-**Aggregate (30 correct pairs): geometric mean 0.8235.** Excluding the three
-algorithmic recursion wins, the conventional-code geomean is **1.29**.
+**Aggregate (30 correct pairs): geometric mean ~0.85.** Excluding the three
+algorithmic recursion wins, the conventional-code geomean is ~1.30.
+
+### v7 highlights (since v6)
+
+- **Agent C's session-75 peephole layer**: 8 new transforms built on a
+  new exact CFG-liveness module. Kernel corpus: 325 → 322 instructions
+  vs GCC's 264. Largest per-program wins: `gzip_crc32` −26 instructions,
+  `spectral_norm` −20, `hash_table` −16, `sqlite_varint` −13, `isort`
+  −3.
+- **PF-06 (secondary-IV strength reduction)**: `a[i±K]` GEPs with the
+  offset `add(iv, const)` are now SIB-folded into
+  `disp(%base, %iv, scale)`, eliminating the per-iteration
+  `lea X(%iv); cltq; lea 0(,%rax, scale)` chain. Soundness gates:
+  base-contains-iv and iv-update-Copy-coalescing detection. Kill switch:
+  `CCC_NO_PF06_ADD_PEEL=1`.
+- **A miscompile in `reuse_redundant_loads`** (sign-extending-to-64-bit
+  loads were rewritten to `movl`, losing the upper 32 sign-extension
+  bits) was caught in audit and fixed: copy width now chosen per load
+  class (`movq` for `movq/movsbq/movswq/movslq`, `movl` for the 32-bit
+  zero-extending class, refused for `movb/movw`).
+- See `docs/history/2026-08-24-session75-v7-audit-pf06.md` for the
+  full audit notes and the soundness proofs.
 
 ## Reading the table honestly
 
@@ -113,15 +134,15 @@ algorithmic recursion wins, the conventional-code geomean is **1.29**.
   `constant_recursion` — TCE + rec2iter; GCC keeps exponential recursion),
   popcount recognition (`bitops` 1.7× via `popcntl`), reduction FMA
   vectorization (`matmul`), the CRC table loop (hoisted PIC base + magic-const
-  hoisting; 1.15×), and the whole cluster of integer/branch kernels in the
-  0.92–1.07 band.
+  hoisting; 1.14×), and the whole cluster of integer/branch kernels in the
+  0.92–1.10 band.
 - **Where GCC still wins**: non-reduction dense FP (`spectral_norm` 4.8×,
-  `nbody` 3.9×, `mandelbrot` 1.65× — general loop-nest vectorization is the
+  `nbody` 3.8×, `mandelbrot` 1.65× — general loop-nest vectorization is the
   tracked structural gap; the stencil vectorizer covers element-wise shapes
-  only), and a codec/parser cluster (`loop_patterns` 2.4×, `find_bit` 1.8×,
-  `fannkuch` 1.8×, `expat` 1.6×, `adler32` 1.6× — RA-06 arithmetic-chain copy
-  webs and secondary-IV strength reduction are the mapped fixes; see
-  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) §15.5).
+  only), and a codec/parser cluster (`loop_patterns` 2.8×, `find_bit` 1.96×,
+  `fannkuch` 1.76×, `expat` 1.67×, `adler32` 1.59× — RA-06 arithmetic-chain copy
+  webs and multi-store stencil analysis are the mapped fixes; see
+  [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md) §16.4).
 - Every number above was produced by a **correct** binary; correctness is
   enforced before speed is recorded (checksums byte-identical to GCC).
 
@@ -135,6 +156,12 @@ algorithmic recursion wins, the conventional-code geomean is **1.29**.
 - **Profile-guided optimization**: `-fprofile-generate`/`-fprofile-use` fully
   integrated (inlining, unrolling, layout, switch lowering) with no
   PGO-induced regressions on the workload kernels.
+- **Peephole layer with exact CFG liveness** (v7): parameter-shuffle
+  coalescing, dead pure-write elimination, load+self-test → memory
+  compare, accumulator round-trip elimination, redundant-load reuse,
+  redundant self-test after logical ops, dead sign-extension narrowing,
+  and producer retargeting + store relay. Each rule is gated by a
+  skip-key for bisection.
 
 ## Root cause of the remaining gap vs GCC
 
@@ -147,6 +174,16 @@ The 2–5× FP deficit is concentrated in three mechanisms, in priority order:
 3. **No loop-nest vectorization** — only the innermost reduction idiom is
    vectorized; matmul/spectral/nbody inner loops stay scalar.
 
+The integer/codec gap (adler32 1.59×, find_bit 1.96×, loop_patterns 2.8×)
+is concentrated in two more:
+
+4. **RA-06 (arithmetic-chain copy webs)**: adler32 keeps eight unrolled
+   byte temporaries live for the s2 recurrence and spills `s1`/`s2`.
+   Needs next-use-aware eviction, not a peephole.
+5. **Multi-store stencil analysis**: nbody has six stores across two IVs
+   plus field-sensitive load/store disambiguation; sound incremental
+   vectorization needs cross-iteration dependence analysis.
+
 ## Future work (see `hotspots/` and `ideas/`)
 
 - Struct-by-value ABI and wide (vectorized) aggregate copies.
@@ -154,3 +191,26 @@ The 2–5× FP deficit is concentrated in three mechanisms, in priority order:
 - Instruction scheduling for the Raptor Lake port/resource model.
 - Sample-based PGO and PGO value specialization.
 - Use-def-chain shared optimizer context.
+- RA-06: next-use-aware eviction with copy-web coalescing for arithmetic
+  chains (adler32's eight-byte recurrence).
+- Multi-store stencil vectorization (nbody, mandelbrot, spectral_norm).
+
+## Kill switches (for bisection / soundness fallback)
+
+All kill switches are env vars; setting any non-empty value disables the
+named pass.
+
+| Switch | Disables |
+|---|---|
+| `CCC_NO_SEGMENT_RA` | segment-aware register allocator (restores exact fat model) |
+| `CCC_NO_STENCIL_VEC` | stencil vectorizer |
+| `CCC_NO_DEFER_OVERFLOW_VECREG` | deferred overflow vector register allocation |
+| `CCC_NO_SEGMENT_FILL` | segment-aware residual fill (default-on x86-64) |
+| `CCC_NO_GLOBAL_ADDR_REMAT` | global-address rematerialization |
+| `CCC_NO_MAP_VEC` / `CCC_NO_MAP_VECREG` | map-style vectorization |
+| `CCC_NO_PF06_ADD_PEEL` | PF-06 `add(iv, const)` / `sub(iv, const)` SIB displacement peeling (the existing SIB fold without displacement stays on) |
+| `CCC_VERIFY_REGALLOC=1` | verifies register-allocation invariants over the correctness corpus (catches RA interference bugs never surfaced by the regression suite) |
+| `CCC_DEBUG_COALESCE` / `CCC_TRACE_ALLOC` / `CCC_RA_EXPLAIN` | RA debug tracing |
+| `LCCC_DEBUG_VECTORIZE` / `LCCC_WHY_NOT_VECTORIZE` | vectorizer debug tracing |
+| `LCCC_DUMP_IR=1` | dumps the post-optimization IR for each function (for inspection) |
+| `CCC_NO_GEP_FOLD` | disables all GEP folding (both const-offset and indexed-SIB) — strictest fallback |

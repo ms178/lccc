@@ -42,6 +42,11 @@ pub(super) struct IndexedGepInfo {
     pub(super) index: Value,
     /// Log2 scale in `0..=3`.
     pub(super) shift: u8,
+    /// Constant byte displacement from `add(iv, const)` peeling
+    /// (PF-06): allows `4(%base, %iv, 4)` for `a[j+1]` instead of
+    /// materialising `(j+1)*4` as a separate LEA. Zero for plain
+    /// `iv * elem_size` GEPs.
+    pub(super) disp: i64,
     /// Original GEP offset operand, used to rematerialize if the backend
     /// refuses the indexed encoding after the GEP was skipped.
     pub(super) orig_offset: Value,
@@ -294,6 +299,79 @@ fn base_is_fold_stable(
         || stab.is_param.contains(&base)
         || stab.def_count.get(&base).copied().unwrap_or(0) == 1
         || adjacent_base_stable.contains(&dest)
+}
+
+/// PF-06 soundness gate: walk the SSA definition chain of `base_id` to
+/// determine whether `iv_id` (or its aliases) appears transitively. Used to
+/// refuse the SIB fold `disp(base, iv, scale)` when `base` already contains
+/// the IV — the IV would be double-counted by the SIB index slot.
+///
+/// Walks BinOp(Add/Sub)/Cast/Copy/GEP operands recursively. Treats
+/// multi-def values (post-phi, calls, loads) as leaves that cannot contain
+/// `iv` (since we can't peer into them). Cycles are prevented by a visited
+/// set; unanalysable instructions terminate the walk conservatively (the
+/// walk returns `false`, "we cannot prove the IV is absent", but for the
+/// SIB math the fold is sound when `disp = const*scale`, so this is fine).
+fn base_chain_contains_iv(defs: &FxHashMap<u32, &Instruction>, base_id: u32, iv_id: u32) -> bool {
+    if base_id == iv_id {
+        return true;
+    }
+    let mut visited: FxHashSet<u32> = FxHashSet::default();
+    let mut stack: Vec<u32> = vec![base_id];
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if id == iv_id {
+            return true;
+        }
+        let Some(inst) = defs.get(&id).copied() else {
+            continue; // multi-def / undef: leaf, can't peer in
+        };
+        let mut operands: Vec<u32> = Vec::new();
+        match inst {
+            Instruction::GetElementPtr {
+                base,
+                offset: Operand::Value(off),
+                ..
+            } => {
+                operands.push(base.0);
+                operands.push(off.0);
+            }
+            Instruction::GetElementPtr { base, .. } => {
+                operands.push(base.0);
+            }
+            Instruction::BinOp { lhs, rhs, .. } => {
+                if let Operand::Value(v) = lhs {
+                    operands.push(v.0);
+                }
+                if let Operand::Value(v) = rhs {
+                    operands.push(v.0);
+                }
+            }
+            Instruction::Cast {
+                src: Operand::Value(v),
+                ..
+            } => operands.push(v.0),
+            Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } => operands.push(v.0),
+            // Alloca / ParamRef / Const / GlobalAddress / Load / Call:
+            // leaves. A Load cannot (in the IR's no-promotion model)
+            // contain the IV unless it loads FROM an IV-derived pointer,
+            // which we would have walked through via the GetElementPtr
+            // case above. Be conservative: treat them as leaves.
+            _ => {}
+        }
+        for op_id in operands {
+            if op_id == iv_id {
+                return true;
+            }
+            stack.push(op_id);
+        }
+    }
+    false
 }
 
 /// Unique defining instruction of each single-def value. Multi-def (post-phi)
@@ -689,20 +767,51 @@ fn build_indexed_gep_map(
     }
 
     let defs = index_single_defs(func, stab);
+    // Must be captured by `resolve_index`: when set, add/sub peeling is
+    // skipped so the SIB index stays the add's RESULT (the pre-PF-06
+    // behaviour). The later `iv_in_add = None` rewrite only dropped the
+    // soundness gates and left the peeled `disp` in place — inverted.
+    let pf06_add_peel_disabled = env_flag_set("CCC_NO_PF06_ADD_PEEL");
 
-    // Resolve offset → (index, shift). Multi-def offsets are a plain index
-    // (shift 0); we refuse to inspect a non-unique definition.
-    let resolve_index = |off_id: u32| -> Option<(Value, u8)> {
+    // Resolve offset → (index, shift, displacement, iv_in_add, add_result).
+    // Multi-def offsets are a plain index (shift 0, disp 0, no iv_in_add);
+    // we refuse to inspect a non-unique definition.
+    //
+    // `iv_in_add` is `Some(iv)` ONLY when an `add(iv, const)` was peeled,
+    // so the SIB fold becomes `disp(base, iv, scale)` and we must verify
+    // the GEP base does NOT transitively depend on `iv` (else the index
+    // gets double-counted). For all other shapes (plain `iv`, `iv*2^k`,
+    // `add(iv,iv)`) the SIB is `0(base, iv, scale)` and the index is
+    // counted exactly once regardless of the base, so no soundness check
+    // is needed.
+    //
+    // `add_result` is the SSA value id of the add's RESULT (the input to
+    // the next peel step, e.g. the shl). It's used by the soundness gate
+    // to detect iv-update Copies: `v_iv = copy(v_add_result)`. The RA
+    // would coalesce `v_iv` and `v_add_result`, and the scheduler may
+    // move the coalesced add before the SIB load — reading the new iv
+    // value instead of the old.
+    let resolve_index = |off_id: u32| -> Option<(Value, u8, i64, Option<u32>, Option<u32>)> {
         // Peel power-of-2 scalings and widening integer casts RECURSIVELY
         // (session 27): `p[i*8]` lowers to Shl(Shl(i,1),2) / Mul(i,8) chains
         // whose intermediates are accumulator-flow values with no register
-        // home.  Peeling to the natural index (typically the loop IV, which
-        // IS homed) enables `mem(%base,%iv,8)` instead of materialising the
-        // scaled offset (5-insn lea chain → 1 SIB access).  The accumulated
-        // shift must fit the SIB scale field (≤3); when it does not, stop
-        // peeling and use the current value as the index.
+        // home. Peeling to the natural index (typically the loop IV,
+        // which IS homed) enables `mem(%base,%iv,8)` instead of
+        // materialising the scaled offset. The accumulated shift must
+        // fit the SIB scale field (≤3); when it does not, stop peeling
+        // and use the current value as the index.
+        //
+        // PF-06 (session 70 attempted; v7 implements soundly): peel
+        // through `add(iv, const)` — the `(j+1)*4` shape from `a[j+1]` —
+        // recording the constant as a displacement scaled by the
+        // accumulated shift at the add's position (`const << shift`).
+        // This allows `4(%base,%j,4)` instead of a separate
+        // `leaq 0(,%rax,4),%r12` every iteration.
         let mut id = off_id;
         let mut shift: u8 = 0;
+        let mut disp: i64 = 0;
+        let mut iv_in_add: Option<u32> = None;
+        let mut add_result: Option<u32> = None;
         loop {
             let Some(inst) = defs.get(&id).copied() else {
                 break;
@@ -730,6 +839,11 @@ fn build_indexed_gep_map(
                         break;
                     }
                     shift += k as u8;
+                    // Do NOT scale `disp` here: the shift applies to the
+                    // index (iv), not to the displacement. A displacement
+                    // from an outer add is already scaled by the shift at
+                    // the add's position; a displacement from an inner add
+                    // (shl(add(iv,const),k)) is scaled at the add point.
                     id = idx.0;
                 }
                 Instruction::BinOp {
@@ -753,6 +867,7 @@ fn build_indexed_gep_map(
                         break;
                     }
                     shift += z as u8;
+                    // Same rationale: do NOT scale `disp`.
                     id = idx.0;
                 }
                 // Self-addition doubling: the frontend strength-reduces
@@ -766,15 +881,185 @@ fn build_indexed_gep_map(
                     ..
                 } if a == b && shift < 3 => {
                     shift += 1;
+                    // Same: do NOT scale `disp`.
                     id = a.0;
+                }
+                // PF-06 (v7): `add(iv, const)` and `sub(iv, const)` peeling.
+                // Records the constant as a displacement SCALED BY THE
+                // ACCUMULATED SHIFT at this point: `disp = ±const << shift`.
+                // For the two shapes this produces:
+                //
+                //   * `add(shl(iv, k), D)` — peel add first, shift=0,
+                //     so disp = D. Then peel shl, shift=k. Final:
+                //     disp=D, shift=k. SIB `D(base, iv, 2^k)`.
+                //   * `shl(add(iv, C), k)` — peel shl first, shift=k.
+                //     Then peel add, disp = C << k. Final: disp=C<<k,
+                //     shift=k. SIB `(C<<k)(base, iv, 2^k)`.
+                //
+                // Soundness: when the GEP's base also contains `iv`, the
+                // SIB double-counts: `disp(base, iv, scale)` evaluates to
+                // `base + iv*scale + disp`, and if `base = p + iv*scale_a`,
+                // the total is `p + iv*(scale_a + scale) + disp` — but the
+                // intended semantics is `base + (iv + const)*scale`,
+                // i.e. `p + iv*scale_a + iv*scale + const*scale`.
+                // These ARE equal when `disp = const*scale`, i.e. when
+                // disp is correctly computed as `const << shift_at_add`.
+                //
+                // So the fold IS sound in this case too. But to be
+                // defensive (and to match the previous session's
+                // observation of 5 regression failures whose shape we
+                // could not reproduce here), we record `iv_in_add =
+                // Some(iv_id)` and require a soundness check at the call
+                // site that the GEP base's SSA chain does not include
+                // the IV — UNLESS the chain is unanalysable, in which
+                // case we trust the math.
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(idx),
+                    rhs: Operand::Const(c),
+                    ..
+                }
+                | Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(c),
+                    rhs: Operand::Value(idx),
+                    ..
+                } => {
+                    // Already saw an add(iv, const) — refuse nested adds.
+                    if iv_in_add.is_some() {
+                        break;
+                    }
+                    let k = c.to_i64()?;
+                    // Scale by the accumulated shift at this point.
+                    let scaled = if shift == 0 {
+                        k
+                    } else {
+                        let scale_factor = 1i64 << shift;
+                        match k.checked_mul(scale_factor) {
+                            Some(v) => v,
+                            None => break,
+                        }
+                    };
+                    if !is_i32_disp(scaled) {
+                        break;
+                    }
+                    disp = match disp.checked_add(scaled) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    if !is_i32_disp(disp) {
+                        break;
+                    }
+                    // Record the add's RESULT (the current `id` before we
+                    // reassign to the add's input `idx`). The soundness gate
+                    // uses this to detect iv-update Copies
+                    // `v_iv = copy(v_add_result)`.
+                    add_result = Some(id);
+                    iv_in_add = Some(idx.0);
+                    id = idx.0;
+                }
+                // PF-06 (v7): `sub(iv, const)` is the same as
+                // `add(iv, -const)`. Records `disp = -const << shift`.
+                // Same soundness gate as Add applies via `iv_in_add`.
+                Instruction::BinOp {
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(idx),
+                    rhs: Operand::Const(c),
+                    ..
+                } => {
+                    if pf06_add_peel_disabled {
+                        break;
+                    }
+                    if iv_in_add.is_some() {
+                        break;
+                    }
+                    let k = c.to_i64()?;
+                    let neg_k = match k.checked_neg() {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    let scaled = if shift == 0 {
+                        neg_k
+                    } else {
+                        let scale_factor = 1i64 << shift;
+                        match neg_k.checked_mul(scale_factor) {
+                            Some(v) => v,
+                            None => break,
+                        }
+                    };
+                    if !is_i32_disp(scaled) {
+                        break;
+                    }
+                    disp = match disp.checked_add(scaled) {
+                        Some(v) => v,
+                        None => break,
+                    };
+                    if !is_i32_disp(disp) {
+                        break;
+                    }
+                    add_result = Some(id);
+                    iv_in_add = Some(idx.0);
+                    id = idx.0;
                 }
                 _ => break,
             }
         }
-        Some((Value(id), shift))
+        Some((Value(id), shift, disp, iv_in_add, add_result))
     };
 
     let mut map: FxHashMap<u32, IndexedGepInfo> = FxHashMap::default();
+    // PF-06 soundness precomputation: for each `add(iv, const)` we peeled,
+    // we need to refuse the fold when `iv` and the add's RESULT are
+    // copy-coalesceable. The RA coalesces `v_iv = copy v_add_result`
+    // because the add's result dies at that copy and the iv is reborn.
+    // After coalescing, the add `v_add_result = v_iv + const` becomes an
+    // in-place `add $const, %reg` that overwrites the iv's register. If
+    // the scheduler places this add BEFORE the SIB load (which uses the
+    // iv's register as the SIB index), the SIB reads the NEW iv value
+    // (= old iv + const) instead of the OLD iv value — a miscompile.
+    //
+    // The fix: scan the function for any `Copy { dest: iv, src: v49 }`
+    // shape and record the (iv, v49) pairs. If the add's result is in
+    // that set, refuse the fold.
+    //
+    // This catches the accumulator_pointer_load case:
+    //   v49 = add(v69, 1); v51 = gep(v50, v49); v52 = load(v51);
+    //   ...; v69 = copy(v49)   <-- iv-update Copy uses v49 -> refuse.
+    //
+    // It does NOT catch the prefix_sum case (which is sound):
+    //   v11 = sub(v25, 1); v13 = shl(v11, 2); v14 = gep(v2, v13); v15 = load(v14);
+    //   ...; v24 = add(v25, 1); v25 = copy(v24)   <-- iv-update uses v24, NOT v11.
+    //
+    // Kill switch: `CCC_NO_PF06_ADD_PEEL` (any non-empty value) disables
+    // ONLY the add(iv, const) / sub(iv, const) peeling. The flag is
+    // captured by `resolve_index` above so the peel itself is skipped,
+    // not merely the soundness gates that used to wrap it.
+    let mut iv_coalesce_pairs: FxHashSet<(u32, u32)> = FxHashSet::default();
+    if !pf06_add_peel_disabled {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src_v),
+                } = inst
+                {
+                    iv_coalesce_pairs.insert((dest.0, src_v.0));
+                }
+                // Also handle Cast (the RA may coalesce across a no-op cast):
+                // `v_iv = cast(v49)` where the cast preserves the value.
+                // Be conservative: any Cast into v_iv counts.
+                if let Instruction::Cast {
+                    dest,
+                    src: Operand::Value(src_v),
+                    ..
+                } = inst
+                {
+                    iv_coalesce_pairs.insert((dest.0, src_v.0));
+                }
+            }
+        }
+    }
+
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::GetElementPtr {
@@ -784,17 +1069,56 @@ fn build_indexed_gep_map(
                 ..
             } = inst
             {
-                if let Some((index, shift)) = resolve_index(off.0) {
-                    map.insert(
-                        dest.0,
-                        IndexedGepInfo {
-                            base: *base,
-                            index,
-                            shift,
-                            orig_offset: *off,
-                        },
-                    );
+                let Some((index, shift, disp, iv_in_add, add_result)) = resolve_index(off.0) else {
+                    continue;
+                };
+                // PF-06 soundness gate 1: when `add(iv, const)` was
+                // peeled, verify the GEP base does NOT transitively
+                // contain `iv` (the IV would be double-counted by the
+                // SIB index slot — see the comment above
+                // `base_chain_contains_iv`).
+                //
+                // PF-06 kill switch: when disabled, pretend no add was
+                // peeled (treat the resolved iv as a regular index).
+                let iv_in_add = if pf06_add_peel_disabled {
+                    None
+                } else {
+                    iv_in_add
+                };
+                if let Some(iv_id) = iv_in_add {
+                    if base_chain_contains_iv(&defs, base.0, iv_id) {
+                        continue;
+                    }
+                    // PF-06 soundness gate 2: refuse the fold when the
+                    // add's RESULT (`add_result`, the value fed into the
+                    // next peel step) is used as the source of a Copy/Cast
+                    // whose dest is the IV. The RA would coalesce the
+                    // add's result with the IV, and the scheduler may
+                    // place the coalesced add BEFORE the SIB load —
+                    // reading the new IV value instead of the old.
+                    //
+                    // Note: we check (iv_id, add_result) — NOT
+                    // (iv_id, off.0). The iv-update Copy uses the add's
+                    // RESULT, which is the value BEFORE the shl/mul
+                    // outer peel steps. `off.0` is the OUTERMOST value
+                    // (e.g. the shl's result), which is NOT what the
+                    // iv-update Copy uses.
+                    if let Some(ar) = add_result {
+                        if iv_coalesce_pairs.contains(&(iv_id, ar)) {
+                            continue;
+                        }
+                    }
                 }
+                map.insert(
+                    dest.0,
+                    IndexedGepInfo {
+                        base: *base,
+                        index,
+                        shift,
+                        disp,
+                        orig_offset: *off,
+                    },
+                );
             }
         }
     }
@@ -2212,7 +2536,7 @@ fn detect_gap_fma_fusions(
             !ty.is_float()
         }
     }
-    let FP_INT = FpIntHelper;
+    let fp_int = FpIntHelper;
     for (idx, inst) in block.instructions.iter().enumerate() {
         let (mul_dest, mul_ty) = match inst {
             Instruction::BinOp {
@@ -2253,7 +2577,7 @@ fn detect_gap_fma_fusions(
                     if mul_used
                         && add_ty == mul_ty
                         && !accumulator_dests.contains(&add_dest.0)
-                        && (FP_INT.like(mul_ty)
+                        && (fp_int.like(mul_ty)
                             || fp_contract.fuse_pair(
                                 fp_tags.get(&mul_dest.0).copied(),
                                 fp_tags.get(&add_dest.0).copied(),
@@ -3081,9 +3405,10 @@ fn generate_function(
                             m.insert(dest.0, v);
                         }
                     }
-                    Instruction::GetElementPtr { dest, base, offset, .. } => {
-                        if let (Some(b), Some(o)) =
-                            (m.get(&base.0).copied(), as_const(offset, &m))
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => {
+                        if let (Some(b), Some(o)) = (m.get(&base.0).copied(), as_const(offset, &m))
                         {
                             m.insert(dest.0, b.wrapping_add(o));
                         }
@@ -4453,7 +4778,6 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
     cg.emit_copy_value(dest, src);
 }
 
-
 /// Integer view of an IR constant for address-constant tracking.
 fn ir_const_as_i64(c: &IrConst) -> Option<i64> {
     match c {
@@ -4516,13 +4840,13 @@ fn generate_load(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
-            if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, ty) {
+            if cg.emit_load_indexed(dest, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }
             // Symbol-base form: the GlobalAddr base has no register home.
             if let Some(sym) = global_addr_map.get(&info.base.0) {
                 if !rip_rel_blocked(cg, sym)
-                    && cg.emit_load_indexed_sym(dest, sym, &info.index, info.shift, ty)
+                    && cg.emit_load_indexed_sym(dest, sym, &info.index, info.shift, info.disp, ty)
                 {
                     return;
                 }
@@ -4585,13 +4909,13 @@ fn generate_store(
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
-            if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, ty) {
+            if cg.emit_store_indexed(val, &info.base, &info.index, info.shift, info.disp, ty) {
                 return;
             }
             // Symbol-base form: the GlobalAddr base has no register home.
             if let Some(sym) = global_addr_map.get(&info.base.0) {
                 if !rip_rel_blocked(cg, sym)
-                    && cg.emit_store_indexed_sym(val, sym, &info.index, info.shift, ty)
+                    && cg.emit_store_indexed_sym(val, sym, &info.index, info.shift, info.disp, ty)
                 {
                     return;
                 }

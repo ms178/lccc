@@ -28,6 +28,23 @@ fi
 export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
+# Honour the repo's clang+mold preference (.cargo/config.toml) when both are
+# on PATH. Otherwise fall back to gcc + GNU ld for this invocation only.
+# CARGO_TARGET_*_LINKER alone is not enough: the committed rustflags still
+# pass `-fuse-ld=mold`, so we override both via `cargo --config`.
+cargo_config=()
+if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
+    : # keep .cargo/config.toml (clang -fuse-ld=mold)
+else
+    cargo_config=(
+        --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
+        --config 'target.x86_64-unknown-linux-gnu.rustflags=[]'
+        --config 'target.i686-unknown-linux-gnu.linker="gcc"'
+        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-m32"]'
+    )
+    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld"
+fi
+
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 
 # Fail on warnings unless explicitly opted out.
@@ -42,4 +59,5 @@ if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
     export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 fi
 
-exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}"
+exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}" \
+    "${cargo_config[@]}"

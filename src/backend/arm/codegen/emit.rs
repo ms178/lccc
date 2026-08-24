@@ -1,5 +1,4 @@
 use super::asm_emitter::ARM_GP_SCRATCH;
-use crate::common::fp_contract::FpContract;
 use crate::backend::call_abi::ParamClass;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::common::PtrDirective;
@@ -8,6 +7,7 @@ use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
+use crate::common::fp_contract::FpContract;
 use crate::common::fx_hash::FxHashMap;
 use crate::common::types::IrType;
 use crate::delegate_to_impl;
@@ -2408,8 +2408,16 @@ impl ArchCodegen for ArmCodegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
+        // AArch64 has no `disp + base + index<<scale` addressing form.
+        // PF-06 peels `add(iv, const)` into `disp` on the shared IR path;
+        // accepting the fold here would drop that displacement (a
+        // miscompile). Refuse so generate_load rematerializes the GEP.
+        if _disp != 0 {
+            return false;
+        }
         self.emit_load_indexed_impl(dest, base, index, shift, ty)
     }
     fn emit_store_indexed(
@@ -2418,8 +2426,12 @@ impl ArchCodegen for ArmCodegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        _disp: i64,
         ty: IrType,
     ) -> bool {
+        if _disp != 0 {
+            return false;
+        }
         self.emit_store_indexed_impl(val, base, index, shift, ty)
     }
     fn emit_shifted_logical(

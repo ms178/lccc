@@ -852,19 +852,33 @@ impl I686Codegen {
         )
     }
 
-    fn sib_mem(base_reg: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("(%{}, %{})", base_reg, index_reg)
+    fn sib_mem(base_reg: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        let d = if disp == 0 {
+            String::new()
         } else {
-            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
+            format!("{}", disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, base_reg, index_reg, 1u32 << shift)
         }
     }
 
-    fn sib_mem_sym(sym: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("{}(, %{})", sym, index_reg)
+    fn sib_mem_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        // Same AT&T rule as x86-64: `sym+disp`, never `sym` concatenated
+        // with a bare decimal (that would invent a different symbol).
+        let head = if disp == 0 {
+            sym.to_string()
+        } else if disp > 0 {
+            format!("{}+{}", sym, disp)
         } else {
-            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
+            format!("{}{}", sym, disp)
+        };
+        if shift == 0 {
+            format!("{}(, %{})", head, index_reg)
+        } else {
+            format!("{}(, %{}, {})", head, index_reg, 1u32 << shift)
         }
     }
 
@@ -874,6 +888,7 @@ impl I686Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -885,7 +900,7 @@ impl I686Codegen {
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
+        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
         let load_instr = self.load_instr_for_type(ty);
         // Single instruction — no staging, so dest may alias base/index
         // (x86 computes the address before writing the destination).
@@ -912,6 +927,7 @@ impl I686Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -923,7 +939,7 @@ impl I686Codegen {
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift);
+        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
         let store_instr = self.store_instr_for_type(ty);
         // Immediate or register-resident value: single instruction, no
         // staging.  A register source equal to the index register can only
@@ -952,6 +968,7 @@ impl I686Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -960,7 +977,7 @@ impl I686Codegen {
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
+        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
         let load_instr = self.load_instr_for_type(ty);
         if let Some(&d) = self.reg_assignments.get(&dest.0) {
             emit!(
@@ -985,6 +1002,7 @@ impl I686Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         if self.state.pic_mode || !Self::sib_scalar_ty(ty) || shift > 3 {
@@ -993,7 +1011,7 @@ impl I686Codegen {
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift);
+        let mem = Self::sib_mem_sym(sym, phys_reg_name(x), shift, disp);
         let store_instr = self.store_instr_for_type(ty);
         if let Some(src) = self.direct_store_src(val, ty) {
             emit!(self.state, "    {} {}, {}", store_instr, src, mem);

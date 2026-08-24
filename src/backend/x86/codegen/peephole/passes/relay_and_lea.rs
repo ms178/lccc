@@ -50,6 +50,7 @@
 
 use super::super::types::*;
 use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family};
+use super::liveness::FileLiveness;
 
 /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
 /// Unrolled byte loops interleave 2-3 instructions between the address
@@ -124,7 +125,12 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
 }
 
 /// Proof 1: block-local write-before-read deadness of `fam` from `from`.
-pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: usize, fam: RegId) -> bool {
+pub(super) fn dead_in_block_after(
+    store: &LineStore,
+    infos: &[LineInfo],
+    from: usize,
+    fam: RegId,
+) -> bool {
     let mask = 1u16 << fam;
     let mut n = from;
     while n < store.len() {
@@ -157,18 +163,33 @@ pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: u
 
 /// Half-open `[start, end)` line range of the function containing `idx`,
 /// delimited by `.cfi_startproc` / `.cfi_endproc`.
-pub(super) fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize) -> (usize, usize) {
+///
+/// Returns `None` when no `.cfi_startproc` precedes `idx`. Whole-function
+/// reasoning is only valid inside a REAL function: without the delimiter the
+/// text may be a fragment (a peephole unit test, a hand-written stub), and
+/// "this register is never mentioned again" would then be a statement about
+/// the fragment rather than about the program.
+pub(super) fn function_range(
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+) -> Option<(usize, usize)> {
     let len = store.len();
-    let mut start = 0;
+    let mut start = None;
     for n in (0..=idx.min(len.saturating_sub(1))).rev() {
         if infos[n].is_nop() {
             continue;
         }
-        if infos[n].trimmed(store.get(n)).starts_with(".cfi_startproc") {
-            start = n;
+        let t = infos[n].trimmed(store.get(n));
+        if t.starts_with(".cfi_startproc") {
+            start = Some(n);
             break;
         }
+        if t.starts_with(".cfi_endproc") {
+            return None; // `idx` sits between two functions
+        }
     }
+    let start = start?;
     let mut end = len;
     let mut n = idx;
     while n < len {
@@ -178,7 +199,7 @@ pub(super) fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize) 
         }
         n += 1;
     }
-    (start, end)
+    Some((start, end))
 }
 
 /// Registers an ABI-visible control transfer can READ without naming them in
@@ -210,7 +231,9 @@ pub(super) fn family_private_to(
     owned: &[usize],
 ) -> bool {
     let mask = 1u16 << fam;
-    let (start, end) = function_range(store, infos, idx);
+    let Some((start, end)) = function_range(store, infos, idx) else {
+        return false;
+    };
     let mut n = start;
     while n < end {
         if infos[n].is_nop() {
@@ -232,7 +255,8 @@ pub(super) fn family_private_to(
             // argument registers; `.L*` targets are intra-function.
             LineKind::Jmp
                 if implicit_at_transfer(fam)
-                    && !t.trim_start_matches(|c: char| c != ' ')
+                    && !t
+                        .trim_start_matches(|c: char| c != ' ')
                         .trim()
                         .starts_with('.') =>
             {
@@ -263,6 +287,30 @@ pub(super) fn provably_dead(
 ) -> bool {
     dead_in_block_after(store, infos, use_idx + 1, fam)
         || family_private_to(store, infos, use_idx, fam, owned)
+}
+
+/// Deadness with the exact analysis first: [`FileLiveness`] answers precisely
+/// whenever the enclosing function is analysable, and the two syntactic proofs
+/// remain as a fallback for functions it declines (indirect jumps, unknown
+/// mnemonics, missing CFI).
+pub(super) fn provably_dead_lv(
+    lv: &FileLiveness,
+    store: &LineStore,
+    infos: &[LineInfo],
+    use_idx: usize,
+    fam: RegId,
+    owned: &[usize],
+) -> bool {
+    // The three proofs are independent and each is sound on its own, so the
+    // union is used. The dataflow answer is not an authority that can veto the
+    // others: it models a sub-register write (`sete %r10b`) as also READING the
+    // family, which keeps a boolean's upper bits "live" around a loop even
+    // though the next instruction (`movzbl %r10b, %r10d`) kills them — exactly
+    // the case whole-function uniqueness settles.
+    if matches!(lv.live_after(use_idx, fam), Some(false)) {
+        return true;
+    }
+    provably_dead(store, infos, use_idx, fam, owned)
 }
 
 /// Split `OP SRC, DST` (AT&T, dest last) into the trimmed operand texts.
@@ -305,6 +353,7 @@ pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
 /// * `%D` is provably dead after the use (module header, proofs 1 and 2).
 pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -348,7 +397,8 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
             if infos[j].is_barrier() || infos[j].pinned {
                 break;
             }
-            let t = infos[j].trimmed(store.get(j));
+            let t = infos[j].trimmed(store.get(j)).to_string();
+            let t = t.as_str();
             if has_implicit_reg_usage(t) {
                 break; // div/mul/string ops: unmodelled register traffic
             }
@@ -356,22 +406,50 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                 // This is the first line touching %D — it must be the relay
                 // consumer, or the transform is off.
                 let mut folded = false;
-                if let Some(op) = RELAY_OPS.iter().find(|op| t.starts_with(**op)) {
-                    if let Some((use_src, use_dst)) = split_two_operands(&t[op.len()..]) {
-                        let use_dst_fam = register_family_fast(use_dst);
-                        let dst_is_other_reg = use_dst.starts_with('%')
-                            && use_dst_fam != REG_NONE
-                            && use_dst_fam != dst_fam;
-                        if use_src == dst_text && dst_is_other_reg {
-                            let new_line = format!("    {}{}, {}", op, src_text, use_dst);
-                            // The substitution must absorb EVERY mention of %D.
-                            if !line_refs_family(&new_line, dst_fam)
-                                && provably_dead(store, infos, j, dst_fam, &[i, j])
-                            {
-                                mark_nop(&mut infos[i]);
-                                replace_line(store, &mut infos[j], j, new_line);
-                                changed = true;
-                                folded = true;
+                // A store whose SOURCE is the copy: `movl %D, MEM` becomes
+                // `movl %S, MEM`. Same conditions as the ALU case — the
+                // operand text must match exactly (width-exact) and %D must be
+                // dead afterwards.
+                if !folded {
+                    if let Some(sop) = ["movq ", "movl ", "movw ", "movb "]
+                        .iter()
+                        .find(|op| t.starts_with(**op))
+                    {
+                        if let Some((st_src, st_dst)) = split_two_operands(&t[sop.len()..]) {
+                            if st_src == dst_text && st_dst.contains('(') {
+                                let new_line = format!("    {}{}, {}", sop, src_text, st_dst);
+                                if !line_refs_family(&new_line, dst_fam)
+                                    && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
+                                {
+                                    mark_nop(&mut infos[i]);
+                                    replace_line(store, &mut infos[j], j, new_line);
+                                    lv.refresh_at(store, infos, j);
+                                    changed = true;
+                                    folded = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !folded {
+                    if let Some(op) = RELAY_OPS.iter().find(|op| t.starts_with(**op)) {
+                        if let Some((use_src, use_dst)) = split_two_operands(&t[op.len()..]) {
+                            let use_dst_fam = register_family_fast(use_dst);
+                            let dst_is_other_reg = use_dst.starts_with('%')
+                                && use_dst_fam != REG_NONE
+                                && use_dst_fam != dst_fam;
+                            if use_src == dst_text && dst_is_other_reg {
+                                let new_line = format!("    {}{}, {}", op, src_text, use_dst);
+                                // The substitution must absorb EVERY mention of %D.
+                                if !line_refs_family(&new_line, dst_fam)
+                                    && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
+                                {
+                                    mark_nop(&mut infos[i]);
+                                    replace_line(store, &mut infos[j], j, new_line);
+                                    lv.refresh_at(store, infos, j);
+                                    changed = true;
+                                    folded = true;
+                                }
                             }
                         }
                     }
@@ -469,6 +547,7 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
 /// `%T`; and `%T` is provably dead afterwards.
 pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -526,10 +605,11 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                     let replacement = t.replacen(&addr_pat, &folded_addr, 1);
                     if replacement != t
                         && !line_refs_family(&replacement, dst_fam)
-                        && provably_dead(store, infos, j, dst_fam, &[i, j])
+                        && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
                     {
                         mark_nop(&mut infos[i]);
                         replace_line(store, &mut infos[j], j, format!("    {}", replacement));
+                        lv.refresh_at(store, infos, j);
                         changed = true;
                     }
                 }
@@ -586,11 +666,9 @@ fn dest_width(name: &str) -> Option<u8> {
 ///   (retargeting a 64-bit producer under a `movl` copy would keep bits 32..63
 ///   that the copy discarded);
 /// * the producer's register is provably dead after the copy (module header).
-pub(super) fn retarget_producer_into_copy(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-) -> bool {
+pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -665,7 +743,7 @@ pub(super) fn retarget_producer_into_copy(
             i += 1;
             continue;
         }
-        if !provably_dead(store, infos, j, a_fam, &[i, j]) {
+        if !provably_dead_lv(&lv, store, infos, j, a_fam, &[i, j]) {
             i += 1;
             continue;
         }
@@ -682,6 +760,7 @@ pub(super) fn retarget_producer_into_copy(
         }
         replace_line(store, &mut infos[i], i, new_line);
         mark_nop(&mut infos[j]);
+        lv.refresh_at(store, infos, i);
         changed = true;
         i = j + 1;
     }
@@ -785,7 +864,6 @@ mod tests {
         assert!(out.contains("movl %ebx, %eax"), "{out}");
     }
 
-
     #[test]
     fn producer_is_retargeted_into_the_copy_destination() {
         // The store keeps %r10 alive, so the copy cannot simply be deleted;
@@ -800,8 +878,14 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movzbl (%rdx,%r12), %r10d"), "{out}");
+        // Either the producer writes %r10d directly, or (better) the store
+        // relay reads %rax and the copy disappears entirely. Both are correct;
+        // what must NOT happen is keeping the copy.
         assert!(!out.contains("movq %rax, %r10"), "{out}");
+        assert!(
+            out.contains("movzbl (%rdx,%r12), %r10d") || out.contains("movq %rax, (%rsi)"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -829,6 +913,7 @@ mod tests {
             ".cfi_startproc\n",
             "    movq (%rdx), %rax\n",
             "    movl %eax, %r10d\n",
+            "    movq %r10, (%rsi)\n",
             "    movq $0, %rax\n",
             "    ret\n",
             ".cfi_endproc\n",

@@ -388,6 +388,7 @@ pub trait ArchCodegen {
         _base: &Value,
         _index: &Value,
         _shift: u8,
+        _disp: i64,
         _ty: IrType,
     ) -> bool {
         false
@@ -401,6 +402,7 @@ pub trait ArchCodegen {
         _base: &Value,
         _index: &Value,
         _shift: u8,
+        _disp: i64,
         _ty: IrType,
     ) -> bool {
         false
@@ -426,6 +428,7 @@ pub trait ArchCodegen {
         _sym: &str,
         _index: &Value,
         _shift: u8,
+        _disp: i64,
         _ty: IrType,
     ) -> bool {
         false
@@ -438,6 +441,7 @@ pub trait ArchCodegen {
         _sym: &str,
         _index: &Value,
         _shift: u8,
+        _disp: i64,
         _ty: IrType,
     ) -> bool {
         false

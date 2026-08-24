@@ -3,6 +3,9 @@
 # is i686-unknown-linux-gnu; for the default x86_64 host target mold picks the
 # x86_64 preset.  This saves ~300-500 ms per rebuild and cuts peak RSS during
 # LTO/fastbuild links enough to stay out of OOM on the 2 GB VM.
+#
+# scripts/build_lccc_fast.sh keeps this clang+mold pairing when both tools
+# are installed and falls back to gcc + GNU ld otherwise.
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
