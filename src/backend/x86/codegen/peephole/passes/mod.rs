@@ -23,18 +23,21 @@ use super::types::*;
 // Submodule pass implementations
 mod callee_saves;
 mod compare_branch;
+mod copy_coalesce;
 mod copy_propagation;
 mod dead_code;
+mod dead_writes;
+mod flag_peepholes;
 mod frame_compact;
 mod helpers;
 mod identical_blocks;
+mod liveness;
 mod local_patterns;
 mod loop_trampoline;
 mod memory_fold;
 mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
-mod flag_peepholes;
 mod relay_and_lea;
 mod spill_deref;
 mod store_forwarding;
@@ -525,6 +528,32 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("setcc_cmov") {
             changed |= flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
+        }
+        // Sound dead-write elimination (LEAs, widened copies, setCC) and
+        // repeated-load reuse; both use the relay/lea deadness proofs.
+        // Whole-function copy coalescing: rename the destination family to the
+        // source family when the source dies at the copy (kills the parameter
+        // shuffle the allocator emits at every function entry).
+        if !sk("copy_coalesce") {
+            changed |= copy_coalesce::coalesce_register_copies(&mut store, &mut infos);
+        }
+        if !sk("dead_pure_writes") {
+            changed |= dead_writes::eliminate_dead_pure_writes(&store, &mut infos);
+        }
+        if !sk("load_test_cmp") {
+            changed |= dead_writes::fold_load_test_into_cmp(&mut store, &mut infos);
+        }
+        if !sk("acc_roundtrip") {
+            changed |= dead_writes::fold_accumulator_roundtrip(&mut store, &mut infos);
+        }
+        if !sk("load_reuse") {
+            changed |= dead_writes::reuse_redundant_loads(&mut store, &mut infos);
+        }
+        if !sk("self_test") {
+            changed |= flag_peepholes::eliminate_redundant_self_test(&store, &mut infos);
+        }
+        if !sk("narrow_signext") {
+            changed |= flag_peepholes::narrow_dead_sign_extension(&mut store, &mut infos);
         }
         if !sk("copy_mask_movz") {
             changed |= flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);

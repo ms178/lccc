@@ -1704,19 +1704,34 @@ impl X86Codegen {
     // not allocatable on x86-64, so rax staging can never collide with the
     // base/index registers.
 
-    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("(%{}, %{})", base_reg, index_reg)
+    fn sib_mem64(base_reg: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        let d = if disp == 0 {
+            String::new()
         } else {
-            format!("(%{}, %{}, {})", base_reg, index_reg, 1u32 << shift)
+            format!("{}", disp)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, base_reg, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, base_reg, index_reg, 1u32 << shift)
         }
     }
 
-    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8) -> String {
-        if shift == 0 {
-            format!("{}(, %{})", sym, index_reg)
+    fn sib_mem64_sym(sym: &str, index_reg: &str, shift: u8, disp: i64) -> String {
+        // AT&T `sym+disp(, %idx, scale)`. Concatenating the raw number
+        // (`foo` + `4` → `foo4`) invents a different symbol. Negative
+        // displacements already carry the minus sign.
+        let head = if disp == 0 {
+            sym.to_string()
+        } else if disp > 0 {
+            format!("{}+{}", sym, disp)
         } else {
-            format!("{}(, %{}, {})", sym, index_reg, 1u32 << shift)
+            format!("{}{}", sym, disp)
+        };
+        if shift == 0 {
+            format!("{}(, %{})", head, index_reg)
+        } else {
+            format!("{}(, %{}, {})", head, index_reg, 1u32 << shift)
         }
     }
 
@@ -1872,6 +1887,7 @@ impl X86Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
@@ -1890,6 +1906,7 @@ impl X86Codegen {
             phys_reg_name(b),
             phys_reg_name(self.reg_assignments[&index.0]),
             shift,
+            disp,
         );
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
@@ -1900,6 +1917,7 @@ impl X86Codegen {
         base: &Value,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
@@ -1918,6 +1936,7 @@ impl X86Codegen {
             phys_reg_name(b),
             phys_reg_name(self.reg_assignments[&index.0]),
             shift,
+            disp,
         );
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
@@ -1928,6 +1947,7 @@ impl X86Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         // `sym` may carry a composed constant displacement ("gh+2"). The GOT
@@ -1959,9 +1979,9 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
-            Self::sib_mem64("rcx", index_name, shift)
+            Self::sib_mem64("rcx", index_name, shift, disp)
         } else {
-            Self::sib_mem64_sym(sym, index_name, shift)
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
         self.emit_load_indexed_common(dest, index, shift, ty, mem)
     }
@@ -1972,6 +1992,7 @@ impl X86Codegen {
         sym: &str,
         index: &Value,
         shift: u8,
+        disp: i64,
         ty: IrType,
     ) -> bool {
         // Same basename rule as emit_load_indexed_sym_impl (see comment there):
@@ -1992,9 +2013,9 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
-            Self::sib_mem64("rcx", index_name, shift)
+            Self::sib_mem64("rcx", index_name, shift, disp)
         } else {
-            Self::sib_mem64_sym(sym, index_name, shift)
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
         };
         self.emit_store_indexed_common(val, index, shift, ty, mem)
     }
@@ -2683,9 +2704,18 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
-        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
-        {
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
             return false;
         }
         // 64-bit loads straight into a GPR home skip the rax round-trip.
@@ -2694,7 +2724,9 @@ impl X86Codegen {
                 if !is_xmm_reg(reg) {
                     self.state.emit_fmt(format_args!(
                         "    movq {}{}, %{}",
-                        seg_prefix, addr, phys_reg_name(reg)
+                        seg_prefix,
+                        addr,
+                        phys_reg_name(reg)
                     ));
                     self.state.reg_cache.invalidate_acc();
                     return true;
@@ -2723,9 +2755,18 @@ impl X86Codegen {
             AddressSpace::SegFs => "%fs:",
             AddressSpace::Default => return false,
         };
-        if !matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-            | IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 | IrType::Ptr)
-        {
+        if !matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::Ptr
+        ) {
             return false;
         }
         let store_instr = Self::mov_store_for_type(ty);
@@ -2756,7 +2797,10 @@ impl X86Codegen {
         self.operand_to_rax(val);
         self.state.emit_fmt(format_args!(
             "    {} %{}, {}{}",
-            store_instr, Self::reg_for_type("rax", ty), seg_prefix, addr
+            store_instr,
+            Self::reg_for_type("rax", ty),
+            seg_prefix,
+            addr
         ));
         self.state.reg_cache.invalidate_acc();
         true

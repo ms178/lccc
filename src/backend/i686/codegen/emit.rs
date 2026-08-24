@@ -2298,10 +2298,10 @@ impl ArchCodegen for I686Codegen {
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
         fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
         fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;
-        fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool => emit_load_indexed_impl;
-        fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, ty: IrType) -> bool => emit_store_indexed_impl;
-        fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, ty: IrType) -> bool => emit_load_indexed_sym_impl;
-        fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, ty: IrType) -> bool => emit_store_indexed_sym_impl;
+        fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_load_indexed_impl;
+        fn emit_store_indexed(&mut self, val: &Operand, base: &Value, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_store_indexed_impl;
+        fn emit_load_indexed_sym(&mut self, dest: &Value, sym: &str, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_load_indexed_sym_impl;
+        fn emit_store_indexed_sym(&mut self, val: &Operand, sym: &str, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_store_indexed_sym_impl;
         fn emit_typed_store_to_slot(&mut self, instr: &'static str, ty: IrType, slot: StackSlot) => emit_typed_store_to_slot_impl;
         fn emit_typed_load_from_slot(&mut self, instr: &'static str, slot: StackSlot) => emit_typed_load_from_slot_impl;
         fn emit_load_ptr_from_slot(&mut self, slot: StackSlot, val_id: u32) => emit_load_ptr_from_slot_impl;

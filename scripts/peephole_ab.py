@@ -40,6 +40,14 @@ DEFAULT_SKIP = [
     "copy_shift_lea",
     "setcc_cmov",
     "copy_mask_movz",
+    # Session-75 / v7 layer
+    "copy_coalesce",
+    "dead_pure_writes",
+    "load_test_cmp",
+    "acc_roundtrip",
+    "load_reuse",
+    "self_test",
+    "narrow_signext",
 ]
 
 
