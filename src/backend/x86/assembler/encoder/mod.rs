@@ -2028,6 +2028,10 @@ impl InstructionEncoder {
             "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
             "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
             "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
+            // VEX sign-extend dword→qword (opcode 0x25, the sxdq sibling of
+            // sxwd's 0x23 in the 0F38 family). Needed by the widening
+            // I32→I64 reduction (VecWidenAddI32x4ToI64x2).
+            "vpmovsxdq" => self.encode_avx_2op_38(ops, 0x25, true),
             "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
             "vmovd" => self.encode_avx_movd(ops),
             "vmovq" => self.encode_avx_movq(ops),

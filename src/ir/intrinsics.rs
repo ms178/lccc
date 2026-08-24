@@ -313,6 +313,13 @@ pub enum IntrinsicOp {
     VecSqrtF32x8,
     /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
     VecSqrtF32x4,
+    /// Widening reduction step: dest(I64x2 accumulator) += sign-extend of
+    /// 4×I32 loaded from (base, byte_offset). One intrinsic = load 4 I32s,
+    /// widen lanes 0..1 and 2..3 to two I64x2 halves, add both into the
+    /// accumulator. x86 lowering: vmovdqu + vpmovsxdq×2 + vextracti128 +
+    /// paddq×2. Full I64 precision per lane — `long s += (long)int_arr[i]`
+    /// over 4 elements/iteration.
+    VecWidenAddI32x4ToI64x2,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecMulI32x4,
@@ -1135,6 +1142,7 @@ impl IntrinsicOp {
             | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
+            | VecWidenAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
@@ -1160,6 +1168,7 @@ impl IntrinsicOp {
             IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_) |
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
+            IntrinsicOp::VecWidenAddI32x4ToI64x2 |
             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
@@ -1241,6 +1250,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecDivF32x4
                 | IntrinsicOp::VecSqrtF32x8
                 | IntrinsicOp::VecSqrtF32x4
+                | IntrinsicOp::VecWidenAddI32x4ToI64x2
                 | IntrinsicOp::VecBroadcastF32x8
                 | IntrinsicOp::VecBroadcastF32x4
                 | IntrinsicOp::VecFmaF64x4
