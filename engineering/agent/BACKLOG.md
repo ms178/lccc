@@ -691,3 +691,79 @@ ideas), or rejected with measurements.
 - Codegen gate: PASS (baseline refreshed — adler 344/56, expat 268/11, sqlite 431/13, crc 192/0)
 - `CCC_VERIFY_REGALLOC=1` over the whole regression corpus: clean (after the window-semantics fix)
 - Paired runtime vs GCC -O2 (best-of-3, output-checked): wins on expat 0.98×, double_reduction 0.93×, binary_search 0.88×; ties crc/ascii/switch/ring; remaining gaps adler 1.58×, find_bit 1.86×, mandelbrot 1.65×, sqlite 1.33×
+
+---
+
+## §15 Session 68 (2026-08-24) — Agent D audit + rebase + PF-05 root-cause
+
+Base: `57bebcb` (main after the v2 merge; commit `742ca66` is the v2 work).
+D's patch was authored against `d35353c`, so its session-73 content is
+upstream already; only the session-74 delta is new.
+
+### 15.1 Agent D verdict
+
+| Claim | Verdict | Action |
+|---|---|---|
+| FP binop dest-aliasing miscompile (`x+1.5`→`1.5+1.5`, dot4 65≠70) | **CONFIRMED** — independently found by D and by Agent A; the fix is already upstream from the v2 merge. Verified D's `fp_binop_dest_aliasing.c` regression test passes on the upstream fix at -O2/-O3: the two fixes are semantically equivalent | D's float_ops variant NOT taken; D's regression test kept (good coverage: constants both sides, float+double, sub/div with dest=rhs-home, signed-zero) |
+| 5 flag-lifetime peepholes (producer-retarget, copy+add→lea, copy+shl→lea, setcc/test/cmov, copy+mask→movz) + full-SIB lea fold | **SOUND — MERGED.** The flags model treats unknown mnemonics as readers; `setcc_cmov` KEEPS the cmov (removes the boolean round-trip and inverts the condition), which is why D could ship what Agent C correctly refused (C's variant replaced cmov with add — upper-32-bit hazard); width rules enforce 32-bit-write-zero-extends in both directions; `flags_dead_after` with ret=dead/control-flow=live | Taken wholesale + pass registration; reproduced D's numbers: peephole_ab 7060→6848 (−3.00%) behaviour-identical; kernel corpus 346 vs GCC 264 |
+| SSO bitfield patch rejection | **AGREE** — matches my independent measurement exactly (same wrong wire bytes, zero observable delta) | — |
+| Residual-fill rejection ("inert, written against an older base, cannot re-measure") | **STALE but reasonable given their constraints** — I had already re-measured it on the merged base (fuzz + VERIFY + outputs) and it is default-on upstream with measurable wins (stackmem −7.5%) | Not reverted |
+| PF-07 correction ("crc SIB fold" is impossible; LICM hoisting is the fix) | **AGREE** — and the v2 merge already implements exactly the hoist D describes (`leaq table(%rip)` hoisted; expat/crc improved) | Convergent validation |
+
+### 15.2 PF-05 (adler accumulator spills): root-caused, fix attempted, measured NEGATIVE, reverted
+
+Root cause chain (all measured on k01_adler + zlib_ng_adler32):
+- s1/s2 lower to copy webs `{entry, header}` (leaders v11/v15: 4-5 uses,
+  def-at-entry, depth 0, prio 3-4) whose in-body arithmetic continuations
+  (partial sums, prio 20 each) are SEPARATE scan values. No single range
+  carries the recurrence heat; the leaders lose Phase 1 to the partial sums.
+- Attempted fix: leader depth = max over group members (ranking-only change)
+  + hot_loop_home member-depth qualification.
+- Result: static metrics IMPROVED (stackmem 56→54) but runtime REGRESSED
+  +28% (57.5→73.8 ms interleaved best-of-3, stable): promoting the
+  accumulators displaced the s2 partial sums from the 6-register callee
+  pool, and the DO8 body needs the partial sums resident more than the
+  accumulator copies homed. k01_adler instruction count also rose 91→98.
+- **Reverted.** The real fix is RA-06: the copy web must extend through the
+  arithmetic chain so ONE range carries the recurrence and the whole chain
+  shares one home. Promoting only the copy leaders shifts the spill.
+
+### 15.3 Honest final standings (interleaved best-of-3, quiet VM)
+
+Methodology note: batch timing on this VM suffers compile-interference;
+only interleaved per-program measurement is trustworthy. Earlier session
+numbers that beat these are noise-inflated on the GCC side.
+
+| program | gcc | lccc | ratio |
+|---|---:|---:|---:|
+| gzip_crc32 | 154.6 | 135.2 | **0.87× WIN** |
+| binary_search | 0.8 | 0.5 | **0.59× WIN** |
+| double_reduction | 117.3 | 113.9 | **0.97× WIN** |
+| glibc_memcmp | 5.7 | 5.6 | **0.98× WIN** |
+| fp_memfold_stencil5 | 4.8 | 5.1 | 1.08× |
+| histogram | 1.2 | 1.3 | 1.07× |
+| sqlite_varint | 21.6 | 27.4 | 1.27× |
+| expat_xml_scan | 34.3 | 54.4 | 1.59× |
+| zlib_ng_adler32 | 36.2 | 58.9 | 1.63× |
+| mandelbrot | 892.7 | 1472.5 | 1.65× |
+
+### 15.4 Validation battery (final tree)
+
+1134 unit tests (16 new from D) · 451 pass / 3 env-only fails · 50/50
+correctness · 1200+ differential fuzz across O0/O2/O3/Os (all clean) ·
+360 phi-CFG fuzz · kernel corpus 15/15 output-identical · peephole A/B
+38/38 behaviour-identical.
+
+### 15.5 Open follow-ups (priority order)
+
+1. **RA-06 / PF-05**: arithmetic-chain copy webs (the measured negative
+   above is the map of where the naive version fails).
+2. **PF-06 isort**: secondary IV for `j+1` (GCC maintains a marching
+   register; LCCC recomputes leal+cltq+leaq per iteration) + int-index
+   widening pairs. 43 vs 23.
+3. **mandelbrot 1.65×**: FP branch-heavy inner loop; nbody-class (the
+   multi-store stencil analysis is the known enabler).
+4. **expat 1.59×**: hash-multiply chains (imul), not RA.
+5. **PF-11** (setcc+test+jne→jCC): no instances in the corpus
+   (if-conversion already emits direct branches); implement only when a
+   workload shows the shape.

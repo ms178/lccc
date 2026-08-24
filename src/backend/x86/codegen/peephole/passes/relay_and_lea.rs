@@ -70,14 +70,14 @@ const RELAY_OPS: &[&str] = &[
 /// touch. `%rsp`/`%rbp` (4/5) are excluded: they carry the frame, are written
 /// implicitly by push/pop/leave, and are never worth a relay.
 #[inline]
-fn is_relayable_family(fam: RegId) -> bool {
+pub(super) fn is_relayable_family(fam: RegId) -> bool {
     fam <= REG_GP_MAX && fam != 4 && fam != 5
 }
 
 /// Does `line` name any width of GP family `fam`? Boundary-checked so `%r1`
 /// never matches inside `%r10` and `%r8` never matches inside `%r8b`.
 /// Conservatively `true` for out-of-range families.
-fn line_refs_family(line: &str, fam: RegId) -> bool {
+pub(super) fn line_refs_family(line: &str, fam: RegId) -> bool {
     if fam as usize >= REG_NAMES[0].len() {
         return true;
     }
@@ -103,7 +103,7 @@ fn line_refs_family(line: &str, fam: RegId) -> bool {
 /// `true` if `t` writes ALL of family `fam` without reading it — a `mov`-class
 /// or `lea` destination whose source operand text does not mention the family.
 /// `addl %r8d, %r10d` is a write AND a read, so it does not qualify.
-fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
+pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
     if get_dest_reg(info) != fam {
         return false;
     }
@@ -124,7 +124,7 @@ fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
 }
 
 /// Proof 1: block-local write-before-read deadness of `fam` from `from`.
-fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: usize, fam: RegId) -> bool {
+pub(super) fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: usize, fam: RegId) -> bool {
     let mask = 1u16 << fam;
     let mut n = from;
     while n < store.len() {
@@ -157,7 +157,7 @@ fn dead_in_block_after(store: &LineStore, infos: &[LineInfo], from: usize, fam: 
 
 /// Half-open `[start, end)` line range of the function containing `idx`,
 /// delimited by `.cfi_startproc` / `.cfi_endproc`.
-fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize) -> (usize, usize) {
+pub(super) fn function_range(store: &LineStore, infos: &[LineInfo], idx: usize) -> (usize, usize) {
     let len = store.len();
     let mut start = 0;
     for n in (0..=idx.min(len.saturating_sub(1))).rev() {
@@ -202,7 +202,7 @@ fn implicit_at_return(fam: RegId) -> bool {
 /// Proof 2: inside the enclosing function, `fam` is mentioned ONLY by the
 /// lines in `owned` (the ones the caller rewrites or deletes), and no
 /// instruction reads the family implicitly.
-fn family_private_to(
+pub(super) fn family_private_to(
     store: &LineStore,
     infos: &[LineInfo],
     idx: usize,
@@ -254,7 +254,7 @@ fn family_private_to(
 }
 
 /// Combined deadness: either proof suffices (see the module header).
-fn provably_dead(
+pub(super) fn provably_dead(
     store: &LineStore,
     infos: &[LineInfo],
     use_idx: usize,
@@ -266,14 +266,14 @@ fn provably_dead(
 }
 
 /// Split `OP SRC, DST` (AT&T, dest last) into the trimmed operand texts.
-fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
+pub(super) fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
     let (src, dst) = rest.rsplit_once(',')?;
     Some((src.trim(), dst.trim()))
 }
 
 /// Parse a bare register operand into its GP family, rejecting anything that
 /// is not a plain `%reg` (memory operands, immediates, XMM/MMX registers).
-fn plain_gp_operand(text: &str) -> Option<RegId> {
+pub(super) fn plain_gp_operand(text: &str) -> Option<RegId> {
     if !text.starts_with('%') || text.contains('(') {
         return None;
     }
@@ -391,29 +391,60 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
 
 // ── Pass 2: windowed LEA → memory-operand folding ────────────────────────────
 
-/// Parse `leaq DISP(%base), %T` (single-base form, integer displacement).
-/// Returns `(displacement, base_text, dst_text)`.
-fn parse_single_base_lea(lea: &str) -> Option<(&str, &str, &str)> {
+/// Parse `leaq ADDR, %T` and return `(addr_text, dst_text, register families
+/// the address reads)`.
+///
+/// Accepted address forms: `DISP(%base)`, `(%base,%index)` and
+/// `DISP(%base,%index,scale)`, plus the base-less `DISP(,%index,scale)` the
+/// scaled-lea peephole emits. The displacement must be an integer (a symbolic
+/// or `%rip`-relative displacement is left alone: `sym(%rip)` cannot be
+/// combined with an index register at all).
+fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     let rest = lea.strip_prefix("leaq ")?;
     let (addr, dst) = rest.rsplit_once(',')?;
     let (addr, dst) = (addr.trim(), dst.trim());
+    // `rsplit_once(',')` split inside the SIB list when a scale is present;
+    // detect that by an unbalanced parenthesis and re-split at the real end.
+    if addr.matches('(').count() != addr.matches(')').count() {
+        return None;
+    }
     let open = addr.find('(')?;
     let close = addr.rfind(')')?;
     if close + 1 != addr.len() || close <= open {
         return None;
     }
-    let inner = addr[open + 1..close].trim();
-    if inner.contains(',') || !inner.starts_with('%') {
-        return None; // SIB form: handled by fold_lea_into_memory_op
-    }
-    if inner == "%rip" {
-        return None; // symbol-relative: leave to the symbol folders
-    }
     let disp = addr[..open].trim();
     if !disp.is_empty() && disp.parse::<i64>().is_err() {
         return None; // symbolic displacement
     }
-    Some((disp, inner, dst))
+    let mut fams = Vec::new();
+    let fields: Vec<&str> = addr[open + 1..close].split(',').map(str::trim).collect();
+    if fields.is_empty() || fields.len() > 3 {
+        return None;
+    }
+    for (n, f) in fields.iter().enumerate() {
+        if n == 2 {
+            if !matches!(*f, "1" | "2" | "4" | "8") {
+                return None;
+            }
+            continue;
+        }
+        if f.is_empty() && n == 0 && fields.len() == 3 {
+            continue; // base-less `DISP(,%idx,scale)`
+        }
+        if *f == "%rip" {
+            return None;
+        }
+        let fam = register_family_fast(f);
+        if fam == REG_NONE || fam > REG_GP_MAX {
+            return None;
+        }
+        fams.push(fam);
+    }
+    if fams.is_empty() {
+        return None;
+    }
+    Some((addr, dst, fams))
 }
 
 /// Fold `leaq DISP(%base), %T` into a later memory operand `(%T)` inside the
@@ -445,24 +476,22 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
-        let lea = infos[i].trimmed(store.get(i));
-        let Some((disp, base_text, dst_text)) = parse_single_base_lea(lea) else {
+        let lea = infos[i].trimmed(store.get(i)).to_string();
+        let Some((addr_text, dst_text, addr_fams)) = parse_lea_address(&lea) else {
             i += 1;
             continue;
         };
-        let base_fam = register_family_fast(base_text);
         let dst_fam = register_family_fast(dst_text);
-        if base_fam == REG_NONE
-            || base_fam > REG_GP_MAX
-            || !is_relayable_family(dst_fam)
-            || base_fam == dst_fam
-        {
+        if !is_relayable_family(dst_fam) || addr_fams.contains(&dst_fam) {
             i += 1;
             continue;
         }
         let addr_pat = format!("({})", dst_text);
-        let folded_addr = format!("{}({})", disp, base_text);
-        let base_mask = 1u16 << base_fam;
+        let folded_addr = addr_text.to_string();
+        let mut addr_mask = 0u16;
+        for f in &addr_fams {
+            addr_mask |= 1u16 << f;
+        }
         let dst_mask = 1u16 << dst_fam;
 
         let mut j = i + 1;
@@ -479,8 +508,13 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             if has_implicit_reg_usage(t) {
                 break;
             }
-            if infos[j].reg_refs & base_mask != 0 && get_dest_reg(&infos[j]) == base_fam {
-                break; // base redefined: the LEA value is no longer reproducible
+            // A write to any register the address reads makes the LEA
+            // irreproducible at the use site.
+            if infos[j].reg_refs & addr_mask != 0 {
+                let w = get_dest_reg(&infos[j]);
+                if w != REG_NONE && addr_fams.contains(&w) {
+                    break;
+                }
             }
             if infos[j].reg_refs & dst_mask != 0 {
                 // Only a BARE `(%T)` operand can absorb the LEA. `8(%T)` must
@@ -505,6 +539,151 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             j += 1;
         }
         i += 1;
+    }
+    changed
+}
+
+// ── Pass 3: producer retargeting (copy coalescing) ───────────────────────────
+
+/// Pure producers: instructions whose ONLY effect is writing their trailing
+/// register operand. Read-modify-write forms (`addl %ecx, %eax`) are excluded —
+/// retargeting them would change which register is read.
+const PURE_PRODUCERS: &[&str] = &[
+    "movzbl ", "movzbq ", "movzwl ", "movzwq ", "movsbl ", "movsbq ", "movswl ", "movswq ",
+    "movslq ", "movl ", "movq ", "leal ", "leaq ",
+];
+
+/// Width of the register a producer writes, from its destination operand text.
+/// Only the 32- and 64-bit forms take part in retargeting.
+fn dest_width(name: &str) -> Option<u8> {
+    let fam = register_family_fast(name);
+    if fam == REG_NONE || fam > REG_GP_MAX {
+        return None;
+    }
+    if name == REG_NAMES[0][fam as usize] {
+        Some(64)
+    } else if name == REG_NAMES[1][fam as usize] {
+        Some(32)
+    } else {
+        None
+    }
+}
+
+/// Fold a producer + copy pair by making the producer write the copy's
+/// destination directly:
+///
+/// ```text
+///     movzbl (%rdx,%r12), %eax        movzbl (%rdx,%r12), %r10d
+///     movq %rax, %r10            ->
+/// ```
+///
+/// Conditions:
+/// * the producer is a pure producer (no read-modify-write) and does not
+///   mention the copy's destination family anywhere;
+/// * the copy is an adjacent plain register move whose width is compatible —
+///   a 32-bit producer may feed a `movl` or a `movq` copy (both leave the
+///   destination zero-extended), a 64-bit producer only a `movq` copy
+///   (retargeting a 64-bit producer under a `movl` copy would keep bits 32..63
+///   that the copy discarded);
+/// * the producer's register is provably dead after the copy (module header).
+pub(super) fn retarget_producer_into_copy(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let prod = infos[i].trimmed(store.get(i)).to_string();
+        let Some(op) = PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) else {
+            i += 1;
+            continue;
+        };
+        let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
+            i += 1;
+            continue;
+        };
+        let (Some(a_fam), Some(prod_w)) = (plain_gp_operand(prod_dst), dest_width(prod_dst)) else {
+            i += 1;
+            continue;
+        };
+        if !is_relayable_family(a_fam) {
+            i += 1;
+            continue;
+        }
+        // Next real instruction must be the copy.
+        let mut j = i + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let copy = infos[j].trimmed(store.get(j)).to_string();
+        let (copy_w, crest) = if let Some(r) = copy.strip_prefix("movq ") {
+            (64u8, r)
+        } else if let Some(r) = copy.strip_prefix("movl ") {
+            (32u8, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((copy_src, copy_dst)) = split_two_operands(crest) else {
+            i += 1;
+            continue;
+        };
+        // The copy must read exactly the register the producer wrote. The
+        // NAMES may differ in width (`movzbl …, %eax` followed by
+        // `movq %rax, %r10`): a 32-bit write zero-extends, so the 64-bit read
+        // is the same value. A 64-bit producer under a narrow copy is rejected
+        // by the width rule below.
+        if register_family_fast(copy_src) != a_fam || plain_gp_operand(copy_src).is_none() {
+            i += 1;
+            continue;
+        }
+        let Some(d_fam) = plain_gp_operand(copy_dst) else {
+            i += 1;
+            continue;
+        };
+        if d_fam == a_fam || !is_relayable_family(d_fam) {
+            i += 1;
+            continue;
+        }
+        // A 64-bit producer under a 32-bit copy would keep the upper half.
+        if prod_w == 64 && copy_w == 32 {
+            i += 1;
+            continue;
+        }
+        // The producer must not read the destination family (its source is
+        // evaluated before the write, but a rewrite would alias them).
+        if line_refs_family(prod_src, d_fam) || line_refs_family(copy_dst, a_fam) {
+            i += 1;
+            continue;
+        }
+        if !provably_dead(store, infos, j, a_fam, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        // Retarget: the producer keeps its own width, written into D.
+        let new_dst = if prod_w == 64 {
+            REG_NAMES[0][d_fam as usize]
+        } else {
+            REG_NAMES[1][d_fam as usize]
+        };
+        let new_line = format!("    {}{}, {}", op, prod_src, new_dst);
+        if line_refs_family(&new_line, a_fam) {
+            i += 1;
+            continue;
+        }
+        replace_line(store, &mut infos[i], i, new_line);
+        mark_nop(&mut infos[j]);
+        changed = true;
+        i = j + 1;
     }
     changed
 }
@@ -604,6 +783,58 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("movl %ebx, %eax"), "{out}");
+    }
+
+
+    #[test]
+    fn producer_is_retargeted_into_the_copy_destination() {
+        // The store keeps %r10 alive, so the copy cannot simply be deleted;
+        // the producer must write %r10d directly instead.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rdx,%r12), %eax\n",
+            "    movq %rax, %r10\n",
+            "    movq %r10, (%rsi)\n",
+            "    movl $7, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl (%rdx,%r12), %r10d"), "{out}");
+        assert!(!out.contains("movq %rax, %r10"), "{out}");
+    }
+
+    #[test]
+    fn producer_retarget_respects_a_live_source() {
+        // %eax is read after the copy: the producer must keep writing %eax.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl (%rdx), %eax\n",
+            "    movq %rax, %r10\n",
+            "    movq %r10, (%rsi)\n",
+            "    addl %eax, %ecx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl (%rdx), %eax"), "{out}");
+    }
+
+    #[test]
+    fn wide_producer_under_narrow_copy_is_rejected() {
+        // movq writes 64 bits; the movl copy keeps only the low half, so the
+        // producer may not be retargeted (the upper half would survive).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq (%rdx), %rax\n",
+            "    movl %eax, %r10d\n",
+            "    movq $0, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq (%rdx), %rax"), "{out}");
+        assert!(out.contains("movl %eax, %r10d"), "{out}");
     }
 
     #[test]
