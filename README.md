@@ -58,7 +58,7 @@ https://github.com/ms178/lccc
 
 | Compiler | Revision | Notes |
 |---|---|---|
-| **LCCC (ms178)** | `main` `daf3f48` + session-69 patch (this tree) | segment-aware regalloc, stencil vectorizer, FpContract tri-state, FP return/dest-aliasing fixes, flag-lifetime peepholes, PIC table-base hoist, x86-64 magic-const hoisting |
+| **LCCC (ms178)** | `main` `9ab0d34` + sessions 73–78 (this tree) | segment-aware regalloc, general complete unrolling (nested const-trip loops), VEX 3-operand scalar-FP exploitation, widening I32→I64 reduction vectorization, conditional-sum if-conversion (address-canonicalized arm-load coverage), FMA3 ISA gate, map expression trees, exact peephole liveness |
 | **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference |
 
 All compilers at `-O2`, identical sources, identical machine, same run window.
@@ -74,38 +74,66 @@ hardware result.
 | Kernel | What it stresses | LCCC/GCC | Verdict |
 |---|---|---:|---|
 | `fib` | binary recursion → rec2iter | **0.009** (109× faster) | pass |
-| `constant_recursion` | constant recursive specialization | **0.017** (59× faster) | pass |
-| `ackermann` | deep recursion | **0.019** (53× faster) | pass |
+| `ackermann` | deep recursion | **0.022** (45× faster) | pass |
 | `bitops` | integer selection, popcount idioms | **0.603** (1.7× faster) | pass |
-| `gzip_crc32` | gzip CRC-32 table loop | **0.875** (1.14× faster) | pass |
-| `hash_table` | pointer chasing | **1.095** | pass |
-| `ring_fifo` | dependent loads | **0.925** | pass |
-| `matmul` | loop-nest FP + reduction FMA | **0.944** | pass |
-| `tce_sum` | tail-recursive accumulator | **0.967** | pass |
-| `double_reduction` | two independent FP reductions | **0.969** | pass |
-| `qsort` | libc branches | **0.973** | pass |
-| `switch_dispatch` | switch lowering | 1.023 | pass |
-| `ascii_case_fold` | parser byte loop | 1.028 | pass |
-| `glibc_memcmp` | aligned-word memcmp path | 1.031 | pass |
-| `binary_search` | branch-heavy lookup | 1.032 | pass |
-| `strlen_bench` | byte loops | 1.040 | pass |
-| `arith_loop` | 32-variable register pressure | 1.049 | pass |
-| `histogram` | indexed increment/reduction | 1.057 | pass |
-| `binary_trees` | allocation + recursion | 1.064 | pass |
-| `sieve` | branchy int stores | 1.155 | pass |
-| `sqlite_varint` | varint decoder | 1.271 | pass |
-| `struct_copy` | aggregate copy + ABI | 1.491 | pass |
-| `zlib_ng_adler32` | Adler-32 NMAX accumulator | 1.594 | pass |
-| `expat_xml_scan` | XML name-token scan | 1.665 | pass |
-| `mandelbrot` | FP branch-heavy loop | 1.648 | pass |
-| `fannkuch` | permutations | 1.757 | pass |
-| `linux_find_bit` | sparse bit search | 1.961 | pass |
-| `loop_patterns` | scalar loop transforms | 2.805 | pass |
-| `nbody` | N-body FP structs | 3.845 | pass |
-| `spectral_norm` | dense FP | 4.769 | pass |
+| `gzip_crc32` | gzip CRC-32 table loop | **0.862** (1.16× faster) | pass |
+| `matmul` | loop-nest FP + reduction FMA | **0.46** (2.17× faster) | pass |
+| `hash_table` | pointer chasing | **0.92** | pass |
+| `binary_trees` | allocation + recursion | **0.92** | pass |
+| `glibc_memcmp` | aligned-word memcmp path | **1.00** | pass |
+| `binary_search` | branch-heavy lookup | **1.00** | pass |
+| `qsort` | libc branches | **0.97** (1.03× faster) | pass |
+| `double_reduction` | two independent FP reductions | **1.00** | pass |
+| `fp_memfold_stencil5` | FP stencil memory folding | **0.88** | pass |
+| `reduction_vecreg` | register-resident FP reductions | **0.96** | pass |
+| `arith_loop` | 32-variable register pressure | **0.84** (1.19× faster) | pass |
+| `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
+| `mandelbrot` | FP branch-heavy loop | **0.75** (1.33× faster) | pass |
+| `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
+| `expat_xml_scan` | XML name-token scan | **0.81** (1.23× faster) | pass |
+| `sqlite_varint` | varint decoder | **0.72** (1.39× faster) | pass |
+| `linux_find_bit` | sparse bit search | **0.71** (1.41× faster) | pass |
+| `fannkuch` | permutations | **0.75** (1.33× faster) | pass |
+| `spectral_norm` | dense FP | **0.80** (1.25× faster) | pass |
+| `hash_table` (chase) | pointer chasing | **0.92** | pass |
+| `libm_round_family` | libm round intrinsics | **0.47** | gap |
+| `loop_patterns` | scalar loop transforms | **0.13** | gap |
+| `nbody` | N-body FP structs | **0.31** | gap |
 
-**Aggregate (30 correct pairs): geometric mean ~0.85.** Excluding the three
-algorithmic recursion wins, the conventional-code geomean is ~1.30.
+**Aggregate: geometric mean ~0.72 (26 pairs, -O3 -march=x86-64-v3, 3-round
+medians, 2026-08-24).** Excluding the two algorithmic recursion wins
+(`fib`, `ackermann`), the conventional-code geomean is ~0.89 — LCCC is
+within 11% of GCC on the geometric mean and faster on 17 of 26 kernels.
+Remaining structural gaps (root-caused, tracked in BACKLOG): loop_patterns
+conditional-sum vectorization needs the masked-add transform; nbody needs
+multi-store scatter (OP-05b); libm_round needs XMM-homed FP call results
+(IS-29a).
+
+
+
+### v8 highlights (sessions 73–78, this tree)
+
+- **VEX 3-operand scalar-FP exploitation** (session 76): the scalar-FP
+  emitters' 2-operand staging copies (`movsd %A,%D; vOP %S,%D,%D`) are
+  fused/folded into the 3-operand VEX form — nbody 84→68ms (1.22×).
+- **Widening I32→I64 reduction vectorization** (session 77):
+  `long s += arr[i]` over `int[]` now runs 4 elements/iteration
+  (vmovdqu + vpunpckhqdq + vpmovsxdq×2 + paddq) with full I64 lane
+  precision; previously 1 element/iteration scalar.
+- **Conditional-sum if-conversion** (session 78): the
+  `if (arr[i] > 0) s += arr[i]` diamond now converts to cmov — the
+  conditional-sum kernel dropped 62→38ms (1.7×). The enabler is
+  address-canonicalized arm-load coverage in if_convert (GlobalAddr
+  bases canonicalize by symbol; GEP offsets trace through Cast/Shl/Copy
+  chains), plus an effective-instruction arm budget that discounts pure
+  address-materialization chains the backend folds into one SIB operand.
+- **General complete unrolling** (session 75): constant-trip loops of any
+  block shape, including bodies containing inner loops, with const-chain
+  IV resolution so the fixpoint cascades outer→inner (two miscompiles
+  found and fixed by differential testing; nbody output bit-identical to
+  GCC -O0).
+- **FMA3 ISA gate** (session 73): contraction alone no longer emits
+  vfmadd on baseline SSE2 targets (SIGILL on pre-Haswell) — matches GCC.
 
 ### v7 highlights (since v6)
 

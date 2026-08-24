@@ -41,7 +41,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    BasicBlock, BlockId, Instruction, IrCmpOp, IrFunction, Operand, Terminator, Value,
+    BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
 };
 
 /// Run if-conversion on a single function.
@@ -124,6 +124,65 @@ fn rewrite_covered_arm_loads(
         cur
     };
 
+    // Canonical address key of a pointer VALUE: `GEP(base, offset)` reduces
+    // to (resolved-base, canonical-offset) — the offset chain (Cast(IV),
+    // Shl(IV, k), Copy) is traced to its underlying index so two GEPs built
+    // from the same IV and base (but with distinct SSA ids — exactly what
+    // the conditional-reduction diamond produces per arm) compare equal.
+    // Cloned defs: the rewrite loop below mutates func.blocks, so the map
+    // must not hold borrows into it.
+    let defs: FxHashMap<u32, Instruction> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dest().map(|d| (d.0, i.clone())))
+        .collect();
+    let canonical_addr_key = |ptr: &Value| -> String {
+        let root = resolve(ptr);
+        match defs.get(&root.0) {
+            Some(Instruction::GetElementPtr { base, offset, .. }) => {
+                // Base identity: GlobalAddr SSA ids are per-use-site (the
+                // frontend emits a fresh one per source reference), so two
+                // GEPs over the same global have DIFFERENT base value ids.
+                // Canonicalize the base to its symbol when it resolves to a
+                // GlobalAddr; everything else keeps the SSA id.
+                let base_root = resolve(base);
+                let base_key: String = match defs.get(&base_root.0) {
+                    Some(Instruction::GlobalAddr { name, .. }) => format!("sym({})", name),
+                    _ => format!("val({})", base_root.0),
+                };
+                let mut off_root = *offset;
+                for _ in 0..16 {
+                    let vid = match off_root {
+                        Operand::Value(v) => v.0,
+                        Operand::Const(c) => {
+                            return format!("gep({}@{:?})", base_key, c)
+                        }
+                    };
+                    let next = match defs.get(&vid) {
+                        Some(Instruction::Cast {
+                            src: Operand::Value(v),
+                            ..
+                        })
+                        | Some(Instruction::Copy {
+                            src: Operand::Value(v),
+                            ..
+                        })
+                        | Some(Instruction::BinOp {
+                            op: IrBinOp::Shl,
+                            lhs: Operand::Value(v),
+                            ..
+                        }) => *v,
+                        _ => break,
+                    };
+                    off_root = Operand::Value(next);
+                }
+                format!("gep({}@{:?})", base_key, off_root)
+            }
+            _ => format!("val({})", root.0),
+        }
+    };
+
     for pred_idx in 0..func.blocks.len() {
         let (true_label, false_label) = match &func.blocks[pred_idx].terminator {
             Terminator::CondBranch {
@@ -139,7 +198,7 @@ fn rewrite_covered_arm_loads(
         }
         // Collect the pred's loads: (ptr, ty, seg) -> dest. Linear-scan Vec;
         // preds hold only a handful of loads.
-        let mut pred_loads: Vec<(Value, IrType, AddressSpace, Value)> = Vec::new();
+        let mut pred_loads: Vec<(String, IrType, AddressSpace, Value)> = Vec::new();
         for inst in &func.blocks[pred_idx].instructions {
             if let Instruction::Load {
                 dest,
@@ -149,15 +208,15 @@ fn rewrite_covered_arm_loads(
                 ..
             } = inst
             {
-                let root = resolve(ptr);
+                let key = canonical_addr_key(ptr);
                 // On a duplicate, keep the last load (same value either way).
                 if let Some(entry) = pred_loads
                     .iter_mut()
-                    .find(|(p, t, s, _)| *p == root && *t == *ty && *s == *seg_override)
+                    .find(|(p, t, s, _)| *p == key && *t == *ty && *s == *seg_override)
                 {
                     entry.3 = *dest;
                 } else {
-                    pred_loads.push((root, *ty, *seg_override, *dest));
+                    pred_loads.push((key, *ty, *seg_override, *dest));
                 }
             }
         }
@@ -190,10 +249,10 @@ fn rewrite_covered_arm_loads(
                     ..
                 } = inst
                 {
-                    let root = resolve(ptr);
+                    let key = canonical_addr_key(ptr);
                     if let Some((_, _, _, covering)) = pred_loads
                         .iter()
-                        .find(|(p, t, s, _)| *p == root && *t == *ty && *s == *seg_override)
+                        .find(|(p, t, s, _)| *p == key && *t == *ty && *s == *seg_override)
                     {
                         pending.push((inst_pos, *dest, *covering));
                     } else if debug {
@@ -204,13 +263,13 @@ fn rewrite_covered_arm_loads(
                             ty,
                             pred_loads
                                 .iter()
-                                .map(|(p, t, _, d)| (p.0, *t, d.0))
+                                .map(|(p, t, _, d)| (p.as_str(), *t, d.0))
                                 .collect::<Vec<_>>()
                         );
                         for b in &func.blocks {
                             for i in &b.instructions {
                                 if i.dest() == Some(*ptr)
-                                    || pred_loads.iter().any(|(p, ..)| i.dest() == Some(*p))
+                                    || pred_loads.iter().any(|(_, _, _, d)| i.dest() == Some(*d))
                                 {
                                     eprintln!("[IFCONV]   def: {:?}", i);
                                 }
@@ -642,8 +701,30 @@ fn detect_diamond(
     // Load + Cast chains (parameter loads + sign extensions) that inflate
     // the count. A typical arm: Load, Cast, Load, Cast, BinOp, Cast = 6 insts.
     const MAX_ARM_INSTS: usize = 8;
-    if true_block.instructions.len() > MAX_ARM_INSTS
-        || false_block.instructions.len() > MAX_ARM_INSTS
+    // EFFECTIVE instruction count: address-materialization chains (IV Cast,
+    // Shl scaling, base Copy, the GEP itself) are pure address math the
+    // backend folds into one SIB operand — they add nothing speculative.
+    // Count only what actually executes speculatively. The conditional
+    // reduction diamond (`if (arr[i] > 0) s += arr[i]`) is exactly this
+    // shape: each arm = {Cast,Shl,Copy,Shl,GEP,Load,Cast,Add} — 8 raw,
+    // 3 effective (Load, Cast, Add).
+    let effective_arm_len = |block: &BasicBlock| -> usize {
+        block
+            .instructions
+            .iter()
+            .filter(|inst| {
+                !matches!(
+                    *inst,
+                    Instruction::GetElementPtr { .. }
+                        | Instruction::Copy { .. }
+                        | Instruction::GlobalAddr { .. }
+                        | Instruction::BinOp { op: IrBinOp::Shl, .. }
+                )
+            })
+            .count()
+    };
+    if effective_arm_len(true_block) > MAX_ARM_INSTS
+        || effective_arm_len(false_block) > MAX_ARM_INSTS
     {
         return None;
     }

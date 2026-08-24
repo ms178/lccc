@@ -11441,6 +11441,14 @@ pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
     vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
 }
 
+/// x86 late rerun (post-if_convert): catches Select-shaped conditional
+/// reductions the early vectorizer could not see. AVX2 form; strict FP
+/// contract (integer reductions need no contract).
+pub(crate) fn vectorize_function_late(func: &mut IrFunction) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_with_analysis_mode(func, &cfg, false, false, false, FpContract::default())
+}
+
 pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, true, true, true, FpContract::default())

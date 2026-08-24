@@ -1402,12 +1402,15 @@ pub(crate) fn run_passes(
         std::mem::swap(&mut dirty, &mut changed);
     }
 
-    // Late AArch64 vectorization (levkropp 8ef1978f concept, audited): max
-    // and other Select-shaped reductions only exist after the main loop's
-    // if_convert phase, so the early vectorizer never sees them. Re-running
-    // the two-wide NEON pass here catches the converted form; already-
+    // Late vectorization (levkropp 8ef1978f concept, audited): Select-
+    // shaped reductions (max, conditional sums) only exist after the main
+    // loop's if_convert phase, so the early vectorizer never sees them.
+    // Re-running the pass here catches the converted form; already-
     // vectorized loops contain Vec* intrinsics and fail the scalar-shape
     // analyzers, so this is idempotent. -Os/-Oz skip it like the early pass.
+    // AArch64 reruns the two-wide NEON pass; x86-64 reruns the AVX2 pass
+    // (conditional I64 sums are the x86 shape: the widening reduction
+    // machinery handles the Select-guard form).
     // CCC_DISABLE_PASSES=latevec disables.
     if matches!(target, crate::backend::Target::Aarch64)
         && !optimize_for_size
@@ -1419,6 +1422,29 @@ pub(crate) fn run_passes(
             // The vectorizer's block surgery does not maintain source_spans;
             // drop any that no longer align with their block's instructions
             // (debug-info line table would otherwise attribute wrong lines).
+            for func in &mut module.functions {
+                for block in &mut func.blocks {
+                    if !block.source_spans.is_empty()
+                        && block.source_spans.len() != block.instructions.len()
+                    {
+                        block.source_spans.clear();
+                    }
+                }
+            }
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+    }
+
+    // x86-64 twin: rerun the AVX2 vectorizer for Select-shaped reductions
+    // (conditional sums) that if_convert materialized. Same idempotence and
+    // cleanup contract as the AArch64 branch above.
+    if matches!(target, crate::backend::Target::X86_64)
+        && !optimize_for_size
+        && !disabled.contains("latevec")
+        && !disabled.contains("vectorize")
+    {
+        let n = module.for_each_function(vectorize::vectorize_function_late);
+        if n > 0 {
             for func in &mut module.functions {
                 for block in &mut func.blocks {
                     if !block.source_spans.is_empty()
