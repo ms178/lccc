@@ -762,6 +762,56 @@ impl X86Codegen {
             set.extend(
                 crate::backend::generation::build_rematerializable_global_addr_set_for(func, &gmap),
             );
+
+            // PF-07: rematerializing an indexed symbol base re-emits
+            // `leaq sym(%rip), %rcx` at EVERY access. Non-PIC code pays
+            // nothing (the absolute `sym(,%idx,4)` SIB form needs no base
+            // register), but PIC code pays one lea per iteration of any loop
+            // containing the access. When the GlobalAddr is defined at a
+            // STRICTLY SHALLOWER loop depth than an indexed consumer
+            // (the hoisted-address, table-driven-loop shape: CRC-32 tables,
+            // expat's name lookup, hash tables), keep it RA-eligible so it
+            // gets a register home and the SIB load reads the home directly
+            // — exactly what GCC hoists for this shape.
+            let mut promoted: FxHashSet<u32> = FxHashSet::default();
+            if self.state.pic_mode && !set.is_empty() {
+                let depths = global_addr_loop_depths(func, &set);
+                let mut promote: crate::common::fx_hash::FxHashSet<u32> =
+                    crate::common::fx_hash::FxHashSet::default();
+                for (block_idx, block) in func.blocks.iter().enumerate() {
+                    let consumer_depth = depths
+                        .get(block_idx)
+                        .copied()
+                        .unwrap_or_else(|| usize::MAX);
+                    for inst in &block.instructions {
+                        let Instruction::GetElementPtr {
+                            base,
+                            offset: Operand::Value(_),
+                            ..
+                        } = inst
+                        else {
+                            continue;
+                        };
+                        if !set.contains(&base.0) {
+                            continue;
+                        }
+                        // The base's def block depth: find where the
+                        // GlobalAddr (or its chain root) is defined.
+                        let def_depth = gaddr_def_block(func, base.0, &gmap)
+                            .and_then(|b| depths.get(b).copied())
+                            .unwrap_or(consumer_depth);
+                        if consumer_depth > def_depth {
+                            promote.insert(base.0);
+                        }
+                    }
+                }
+                for v in &promote {
+                    set.remove(v);
+                }
+                promoted = promote;
+            }
+
+            self.state.promoted_global_addr_homes = promoted;
             self.state.never_materialized_values = set.clone();
             set
         };
@@ -1071,20 +1121,71 @@ impl X86Codegen {
                                 if width_ok {
                                     if let Some(reg) = self.reg_assignments.get(&cd.0).copied() {
                                         if !is_xmm_reg(reg) {
-                                            // Register-free-at-load guard.
-                                            let mut conflict = false;
+                                            // Register-free-at-load guard (RA-05:
+                                            // segment-aware). Folding loads the
+                                            // cast dest's register at `load_pp`;
+                                            // any OTHER value that is genuinely
+                                            // live there and shares that register
+                                            // would be clobbered. Segment-shared
+                                            // partners are dead at `load_pp` by
+                                            // construction (that is why the scan
+                                            // let them share), so the test uses
+                                            // hole-aware pieces: a fat-interval
+                                            // test refused the fold whenever ANY
+                                            // holder's hull covered the load,
+                                            // re-introducing the load→rax→reg
+                                            // staging the fold exists to delete
+                                            // (adler32 DO8: `movzbl (%rbp),%eax;
+                                            // movq %rax,%r12` per byte). Values
+                                            // WITHOUT segment data keep the
+                                            // conservative fat test.
+                                            let mut seg_conflict = false;
+                                            'outer: for seg in
+                                                cached_liveness.iter().flat_map(|l| l.segments.iter())
+                                            {
+                                                if seg.value_id == cd.0
+                                                    || !(seg.start <= load_pp
+                                                        && load_pp <= seg.end)
+                                                {
+                                                    continue;
+                                                }
+                                                if let Some(&r) =
+                                                    self.reg_assignments.get(&seg.value_id)
+                                                {
+                                                    if r == reg {
+                                                        seg_conflict = true;
+                                                        break 'outer;
+                                                    }
+                                                }
+                                            }
+                                            // Conservative fallback: any assigned
+                                            // value whose FAT hull covers the
+                                            // load and that never appears in the
+                                            // segment list still blocks the fold.
+                                            let mut fat_conflict = false;
                                             for &(vid, s, e) in &intervals {
                                                 if vid != cd.0 && s <= load_pp && load_pp <= e {
-                                                    if let Some(&r) = self.reg_assignments.get(&vid)
+                                                    if let Some(&r) =
+                                                        self.reg_assignments.get(&vid)
                                                     {
-                                                        if r == reg {
-                                                            conflict = true;
+                                                        if r == reg
+                                                            && !cached_liveness.as_ref().is_some_and(
+                                                                |l| {
+                                                                    l.segments.iter().any(
+                                                                        |sg| {
+                                                                            sg.value_id == vid
+                                                                        },
+                                                                    )
+                                                                },
+                                                            )
+                                                        {
+                                                            fat_conflict = true;
                                                             break;
                                                         }
                                                     }
                                                 }
                                             }
-                                            if !conflict {
+                                            if !seg_conflict && !fat_conflict {
                                                 lcf.insert(dest.0, (reg, cd.0));
                                                 fcd.insert(cd.0);
                                             }
@@ -2158,4 +2259,190 @@ impl X86Codegen {
     pub(super) fn load_instr_for_type_impl(&self, ty: IrType) -> &'static str {
         Self::mov_load_for_type(ty)
     }
+}
+
+/// Per-block loop-nesting depth for the PF-07 indexed-symbol-base hoist
+/// decision (cheap CFG pass: back-edge detection + header-body marking,
+/// mirroring `liveness::compute_loop_depth` without dragging the whole
+/// dataflow along).
+fn global_addr_loop_depths(func: &IrFunction, _watched: &FxHashSet<u32>) -> Vec<usize> {
+    let n = func.blocks.len();
+    let mut depths = vec![0usize; n];
+    if n == 0 {
+        return depths;
+    }
+    // Successor lists by block index.
+    let label_to_idx: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, i))
+        .collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, b) in func.blocks.iter().enumerate() {
+        match &b.terminator {
+            Terminator::Branch(t) => {
+                if let Some(&j) = label_to_idx.get(&t.0) {
+                    succs[i].push(j);
+                }
+            }
+            Terminator::CondBranch {
+                true_label,
+                false_label,
+                ..
+            } => {
+                if let Some(&j) = label_to_idx.get(&true_label.0) {
+                    succs[i].push(j);
+                }
+                if let Some(&j) = label_to_idx.get(&false_label.0) {
+                    succs[i].push(j);
+                }
+            }
+            Terminator::Switch { cases, default, .. } => {
+                if let Some(&j) = label_to_idx.get(&default.0) {
+                    succs[i].push(j);
+                }
+                for (_, l) in cases {
+                    if let Some(&j) = label_to_idx.get(&l.0) {
+                        succs[i].push(j);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Back edges: t -> h where h dominates t. Compute dominators by the
+    // simple iterative algorithm (blocks are few at this call site).
+    let preds: Vec<Vec<usize>> = {
+        let mut p: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (i, ss) in succs.iter().enumerate() {
+            for &j in ss {
+                p[j].push(i);
+            }
+        }
+        p
+    };
+    let mut idom: Vec<usize> = vec![usize::MAX; n];
+    if !preds[0].is_empty() {
+        // Entry has predecessors (unreachable shape): fall back to depth 0.
+        return depths;
+    }
+    idom[0] = 0;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 1..n {
+            let mut new_idom = usize::MAX;
+            for &p in &preds[b] {
+                if idom[p] == usize::MAX {
+                    continue;
+                }
+                new_idom = if new_idom == usize::MAX {
+                    p
+                } else {
+                    // Intersect.
+                    let mut x = new_idom;
+                    let mut y = p;
+                    while x != y {
+                        while x > y {
+                            x = idom[x];
+                        }
+                        while y > x {
+                            y = idom[y];
+                        }
+                    }
+                    x
+                };
+            }
+            if new_idom != usize::MAX && idom[b] != new_idom {
+                idom[b] = new_idom;
+                changed = true;
+            }
+        }
+    }
+    // Loop bodies: for each back edge t->h (h dominates t), every block that
+    // can reach t without passing through h, plus h, is the loop body; bump.
+    for t in 0..n {
+        for &h in &succs[t] {
+            // h dominates t?
+            let mut x = t;
+            let mut dom_ok = false;
+            for _ in 0..n {
+                if x == h {
+                    dom_ok = true;
+                    break;
+                }
+                if idom[x] == usize::MAX || idom[x] == x {
+                    break;
+                }
+                x = idom[x];
+            }
+            if !dom_ok {
+                continue;
+            }
+            // Reverse-reach from t stopping at h.
+            let mut stack = vec![t];
+            let mut body = vec![h];
+            let mut in_body: FxHashSet<usize> = FxHashSet::default();
+            in_body.insert(h);
+            while let Some(b) = stack.pop() {
+                if !in_body.insert(b) {
+                    continue;
+                }
+                body.push(b);
+                for &p in &preds[b] {
+                    if !in_body.contains(&p) {
+                        stack.push(p);
+                    }
+                }
+            }
+            for b in body {
+                depths[b] += 1;
+            }
+        }
+    }
+    depths
+}
+
+/// Defining block of a GlobalAddr root (or of the const-offset chain that
+/// ends in one), for the PF-07 depth comparison.
+fn gaddr_def_block(
+    func: &IrFunction,
+    mut v: u32,
+    gmap: &FxHashMap<u32, String>,
+) -> Option<usize> {
+    for _ in 0..8 {
+        if gmap.contains_key(&v) {
+            // Find its defining block.
+            for (bi, b) in func.blocks.iter().enumerate() {
+                for inst in &b.instructions {
+                    if let Some(d) = inst.dest() {
+                        if d.0 == v {
+                            return Some(bi);
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+        // Walk the const-offset chain one step.
+        let mut next: Option<u32> = None;
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                match inst {
+                    Instruction::GetElementPtr { dest, base, .. } if dest.0 == v => {
+                        next = Some(base.0);
+                    }
+                    Instruction::Copy { dest, src } if dest.0 == v => {
+                        if let Operand::Value(sv) = src {
+                            next = Some(sv.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        v = next?;
+    }
+    None
 }

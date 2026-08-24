@@ -133,6 +133,11 @@ pub(super) struct FunctionBuildState {
     pub vla_typedef_sizes: FxHashMap<String, Value>,
     /// Per-function value counter (reset for each function)
     pub next_value: u32,
+    /// Current statement root for FP expression tagging (OP-36): bumped by
+    /// `lower_stmt` per statement; every FP Mul/Add/Sub result is tagged
+    /// with it so the backend's OnExpr contraction gate can fuse only
+    /// within one source expression.
+    pub fp_expr_root: u64,
     /// Saved stack pointer Value for VLA deallocation.
     /// When a function contains VLA declarations and gotos, the stack pointer is saved
     /// at function entry so it can be restored before backward jumps that cross VLA scopes.
@@ -277,6 +282,7 @@ impl FunctionBuildState {
             var_ctypes: FxHashMap::default(),
             vla_typedef_sizes: FxHashMap::default(),
             next_value: 0,
+            fp_expr_root: 0,
             vla_stack_save: None,
             has_vla: false,
             entry_allocas: Vec::new(),

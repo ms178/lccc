@@ -11,6 +11,7 @@
 //! which is critical for build system compatibility.
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
+use crate::common::fp_contract::FpContract;
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 
@@ -1446,7 +1447,7 @@ impl Driver {
                     // GCC: fast-math implies contract=fast only when no
                     // explicit -ffp-contract was given (opts_set semantics).
                     if !self.fp_contract_explicit {
-                        self.fp_contract_fast = true;
+                        self.fp_contract = FpContract::Fast;
                     }
                 }
                 "-fno-fast-math" => {
@@ -1456,7 +1457,7 @@ impl Driver {
                     // fusion in LCCC because SSA loses statement boundaries).
                     // Explicit -ffp-contract={on,off,fast} flags always win.
                     if !self.fp_contract_explicit {
-                        self.fp_contract_fast = false;
+                        self.fp_contract = FpContract::default();
                     }
                 }
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
@@ -1466,14 +1467,20 @@ impl Driver {
                     self.fp_reassoc = false;
                 }
                 "-ffp-contract=fast" => {
-                    self.fp_contract_fast = true;
+                    self.fp_contract = FpContract::Fast;
                     self.fp_contract_explicit = true;
                 }
-                "-ffp-contract=off" | "-ffp-contract=on" => {
-                    // `on` permits only language-standard contraction. LCCC
-                    // does not yet carry per-expression contraction metadata,
-                    // so fail closed rather than fusing across lowered IR.
-                    self.fp_contract_fast = false;
+                "-ffp-contract=off" => {
+                    self.fp_contract = FpContract::Off;
+                    self.fp_contract_explicit = true;
+                }
+                "-ffp-contract=on" => {
+                    // `on` permits language-standard contraction: within ONE
+                    // source expression only. The frontend tags every FP
+                    // Mul/Add/Sub with its statement root (OP-36), so the
+                    // backend fuses `x = a*b + c` but never the split
+                    // `t = a*b; s += t;` (GCC `on` semantics).
+                    self.fp_contract = FpContract::OnExpr;
                     self.fp_contract_explicit = true;
                 }
                 // Diagnostic color: -fdiagnostics-color, -fdiagnostics-color={auto,always,never}
@@ -1681,6 +1688,7 @@ impl Driver {
 #[cfg(test)]
 mod cli_tests {
     use super::cmp_version;
+    use crate::common::fp_contract::FpContract;
     use crate::driver::pipeline::Driver;
 
     /// Parse one flag against a fresh Driver, returning the error text if any.
@@ -1843,7 +1851,7 @@ mod cli_tests {
         ];
         explicit.parse_cli_args(&args).unwrap();
         assert!(explicit.fp_reassoc);
-        assert!(explicit.fp_contract_fast);
+        assert!(explicit.fp_contract == FpContract::Fast);
 
         let mut disabled = Driver::new();
         let args = vec![
@@ -1857,7 +1865,7 @@ mod cli_tests {
             disabled.fp_reassoc,
             "contract-off must not disable reassociation"
         );
-        assert!(!disabled.fp_contract_fast);
+        assert!(disabled.fp_contract == FpContract::Off);
 
         let mut reen = Driver::new();
         let args = vec![
@@ -1867,7 +1875,7 @@ mod cli_tests {
             "x.c".to_string(),
         ];
         reen.parse_cli_args(&args).unwrap();
-        assert!(reen.fp_contract_fast);
+        assert!(reen.fp_contract == FpContract::Fast);
 
         // GCC parity: default is -ffp-contract=on for gnu C. LCCC's
         // SSA-level Mul/Add fusion can change rounding across what the C
@@ -1884,7 +1892,7 @@ mod cli_tests {
         let args = vec!["lccc".to_string(), "x.c".to_string()];
         dflt.parse_cli_args(&args).unwrap();
         assert!(
-            !dflt.fp_contract_fast,
+            dflt.fp_contract == FpContract::Off,
             "gnu-C default must NOT fuse mul+add across SSA values without explicit -ffp-contract=fast"
         );
 
@@ -1899,7 +1907,7 @@ mod cli_tests {
         ];
         sticky.parse_cli_args(&args).unwrap();
         assert!(
-            !sticky.fp_contract_fast,
+            sticky.fp_contract == FpContract::Off,
             "explicit off survives -ffast-math"
         );
 
@@ -1913,7 +1921,7 @@ mod cli_tests {
         ];
         nfm.parse_cli_args(&args).unwrap();
         assert!(
-            !nfm.fp_contract_fast,
+            nfm.fp_contract == FpContract::Off,
             "-fno-fast-math must not silently turn contraction on"
         );
     }

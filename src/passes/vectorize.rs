@@ -77,11 +77,12 @@
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::fp_contract::FpContract;
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminator, Value};
 use crate::ir::intrinsics::IntrinsicOp;
-use crate::ir::ops::{IrBinOp, IrCmpOp};
+use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::{IrConst, IrFunction};
 use crate::passes::loop_analysis;
 
@@ -112,7 +113,7 @@ fn take_reject() -> Option<&'static str> {
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
-    vectorize_with_analysis_mode(func, cfg, false, false, false, false)
+    vectorize_with_analysis_mode(func, cfg, false, false, false, FpContract::default())
 }
 
 fn vectorize_with_analysis_mode(
@@ -121,7 +122,7 @@ fn vectorize_with_analysis_mode(
     force_two_wide: bool,
     neon: bool,
     fp_reassoc: bool,
-    fp_contract_fast: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
     let num_blocks = func.blocks.len();
     let loops = loop_analysis::find_natural_loops(num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
@@ -275,7 +276,7 @@ fn vectorize_with_analysis_mode(
                 if debug {
                     eprintln!("[VEC] Reduction pattern matched! Transforming to AVX2 4-wide");
                 }
-                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract_fast);
+                total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
@@ -289,7 +290,35 @@ fn vectorize_with_analysis_mode(
                         map_pattern.elem_ty
                     );
                 }
-                total_changes += transform_map_vector(func, &map_pattern, avx2, fp_contract_fast);
+                total_changes += transform_map_vector(func, &map_pattern, avx2, fp_contract);
+            } else if std::env::var("CCC_NO_STENCIL_VEC").is_err() {
+                // OP-05a: generalized non-reduction FP loops (stencils and
+                // multi-load maps with constant tap offsets). AArch64's NEON
+                // intrinsics are not wired for the displacement form yet.
+                if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
+                    if !neon {
+                        let avx2 = !force_two_wide
+                            && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                        if debug {
+                            eprintln!(
+                                "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
+                                stencil_pattern.taps.len(),
+                                stencil_pattern.elem_ty,
+                                if avx2 { 256 } else { 128 }
+                            );
+                        }
+                        total_changes +=
+                            transform_stencil_vector(func, &stencil_pattern, avx2, fp_contract);
+                    }
+                } else {
+                    let why = take_reject().unwrap_or("pattern shape not recognized");
+                    if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
+                        eprintln!(
+                            "[VEC] Loop {} (header block {}) not vectorized: {}",
+                            idx, loop_info.header, why
+                        );
+                    }
+                }
             } else {
                 let why = take_reject().unwrap_or("pattern shape not recognized");
                 if debug || std::env::var("LCCC_WHY_NOT_VECTORIZE").is_ok() {
@@ -3506,6 +3535,1638 @@ fn geps_proven_identical(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Stencil vectorization (OP-05a): generalized non-reduction FP loops.
+//
+// Target shape (one store, N loads from one base at constant element
+// offsets, expression tree of adds/muls over the loads and invariants):
+//
+//     for (i = s; i + k < n; ++i)
+//         dst[i] = w0*src[i+o0] + w1*src[i+o1] + ... + C;
+//
+// This is the fp_memfold_stencil5 / nbody-force / spectral-kernel class the
+// pattern-based matmul and single-load map vectorizers reject.
+//
+// Exactness contract: the vector body mirrors the scalar expression TREE
+// one node at a time (VecAdd for Add, VecMul for Mul, broadcast for
+// invariants, VecLoad per tap), so every lane computes exactly the scalar
+// op sequence for its element — no reassociation, no fast-math required.
+// Sub is emitted as Add(x, Mul(y, -1)) which is bit-exact in IEEE-754
+// (subtraction IS addition of the negation; negation is exact).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One stencil input tap: a load at `iv + disp/elem` from the shared base.
+#[derive(Debug, Clone)]
+struct StencilTap {
+    /// The Load instruction's dest value.
+    load: Value,
+    /// Byte displacement from `base + iv*elem` (must fit an i32 SIB disp).
+    disp_bytes: i64,
+}
+
+/// A matched stencil loop.
+#[derive(Debug)]
+struct StencilPattern {
+    header_idx: usize,
+    body_idx: usize,
+    latch_idx: usize,
+    exit_idx: usize,
+    loop_blocks: FxHashSet<usize>,
+    /// Element-counter phi in the header.
+    iv: Value,
+    iv_ty: IrType,
+    /// Constant initial value of the IV (element units).
+    iv_start: i64,
+    /// The exit comparison is `(iv + cmp_k) op limit` (normalized Slt/Ult).
+    cmp_k: i64,
+    limit: Operand,
+    exit_cmp_op: IrCmpOp,
+    elem_ty: IrType,
+    /// Shared source root of every tap GEP.
+    src_base: Value,
+    /// Destination store root.
+    dst_base: Value,
+    /// Byte displacement of the store (usually 0).
+    dst_disp: i64,
+    taps: Vec<StencilTap>,
+    /// The stored value (the expression tree root).
+    store_val: Value,
+    store_gep: Value,
+}
+
+/// Affine form `a*iv + b` over the loop IV, in BYTE units (GEP offsets).
+#[derive(Debug, Clone, Copy)]
+struct IvAffine {
+    scale: i64,
+    const_bytes: i64,
+}
+
+/// Match `v == iv` (element units, scale 1, const 0) through the GEP offset
+/// expression: Cast(widen)/Copy chains, Shl/Mul by a constant, and
+/// Add/Sub of constants — i.e. `((iv ± k) * elem)` byte-offset shapes.
+///
+/// Returns the affine coefficients, or `None` when the expression depends
+/// on anything but the IV and constants.
+fn affine_iv_offset(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    v: Value,
+    iv: Value,
+    depth: u32,
+) -> Option<IvAffine> {
+    if depth > 8 {
+        return None;
+    }
+    if v == iv {
+        return Some(IvAffine {
+            scale: 1,
+            const_bytes: 0,
+        });
+    }
+    // Definition lookup (loop-local values only; the IV chain lives there).
+    let mut def = None;
+    for &block_idx in loop_blocks {
+        for inst in &func.blocks[block_idx].instructions {
+            if inst.dest() == Some(v) {
+                def = Some(inst);
+            }
+        }
+    }
+    let def = def?;
+    match def {
+        Instruction::Copy { src, .. } => match src {
+            Operand::Value(sv) => affine_iv_offset(func, loop_blocks, *sv, iv, depth + 1),
+            Operand::Const(c) => Some(IvAffine {
+                scale: 0,
+                const_bytes: c.to_i64()?,
+            }),
+        },
+        // Widening casts of an integer IV preserve the affine coefficients
+        // (sign/zero extension of a*iv + b for a,b in the source width).
+        Instruction::Cast { src, from_ty, .. } if from_ty.is_integer() => match src {
+            Operand::Value(sv) => affine_iv_offset(func, loop_blocks, *sv, iv, depth + 1),
+            Operand::Const(c) => Some(IvAffine {
+                scale: 0,
+                const_bytes: c.to_i64()?,
+            }),
+        },
+        Instruction::BinOp {
+            op: IrBinOp::Shl,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let k = match rhs {
+                Operand::Const(c) => c.to_i64()?,
+                _ => return None,
+            };
+            if !(0..=16).contains(&k) {
+                return None;
+            }
+            let inner = match lhs {
+                Operand::Value(lv) => affine_iv_offset(func, loop_blocks, *lv, iv, depth + 1)?,
+                Operand::Const(c) => IvAffine {
+                    scale: 0,
+                    const_bytes: c.to_i64()?,
+                },
+            };
+            Some(IvAffine {
+                scale: inner.scale.checked_shl(k as u32)?,
+                const_bytes: inner.const_bytes.checked_shl(k as u32)?,
+            })
+        }
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let (val_op, k) = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) => (*v, c.to_i64()?),
+                (Operand::Const(c), Operand::Value(v)) => (*v, c.to_i64()?),
+                _ => return None,
+            };
+            let inner = affine_iv_offset(func, loop_blocks, val_op, iv, depth + 1)?;
+            Some(IvAffine {
+                scale: inner.scale.checked_mul(k)?,
+                const_bytes: inner.const_bytes.checked_mul(k)?,
+            })
+        }
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let l = affine_operand(func, loop_blocks, lhs, iv, depth + 1)?;
+            let r = affine_operand(func, loop_blocks, rhs, iv, depth + 1)?;
+            Some(IvAffine {
+                scale: l.scale.checked_add(r.scale)?,
+                const_bytes: l.const_bytes.checked_add(r.const_bytes)?,
+            })
+        }
+        Instruction::BinOp {
+            op: IrBinOp::Sub,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let l = affine_operand(func, loop_blocks, lhs, iv, depth + 1)?;
+            let r = affine_operand(func, loop_blocks, rhs, iv, depth + 1)?;
+            Some(IvAffine {
+                scale: l.scale.checked_sub(r.scale)?,
+                const_bytes: l.const_bytes.checked_sub(r.const_bytes)?,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// [`affine_iv_offset`] for an operand (constant or value).
+fn affine_operand(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    op: &Operand,
+    iv: Value,
+    depth: u32,
+) -> Option<IvAffine> {
+    match op {
+        Operand::Const(c) => Some(IvAffine {
+            scale: 0,
+            const_bytes: c.to_i64()?,
+        }),
+        Operand::Value(v) => affine_iv_offset(func, loop_blocks, *v, iv, depth),
+    }
+}
+
+/// Analyze a loop for the stencil pattern. See the section comment for the
+/// shape and the exactness contract.
+fn analyze_stencil_pattern(
+    func: &IrFunction,
+    loop_info: &loop_analysis::NaturalLoop,
+) -> Option<StencilPattern> {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let header_idx = loop_info.header;
+    let header = &func.blocks[header_idx];
+
+    let exit_idx = find_exit(func, loop_info)?;
+    let latch_idx = find_latch(func, loop_info)?;
+    // Canonical while-loop shape (the transform redirects the false edge).
+    if !matches!(header.terminator,
+        Terminator::CondBranch { false_label, .. }
+            if false_label == func.blocks[exit_idx].label)
+    {
+        set_reject("stencil loop is not a canonical while loop");
+        return None;
+    }
+    // No internal conditionals (predication not supported).
+    if loop_info.body.iter().copied().any(|block_idx| {
+        block_idx != header_idx
+            && matches!(
+                func.blocks[block_idx].terminator,
+                Terminator::CondBranch { .. }
+            )
+    }) {
+        set_reject("stencil loop has internal conditionals");
+        return None;
+    }
+
+    // ── IV + exit compare: `(iv + k) op limit` ────────────────────────────
+    // The IV phi: 2 incomings, preheader constant start, latch +1. The
+    // compare operand may be the phi itself (k = 0) or Add(phi, k).
+    let mut iv_info: Option<(Value, IrType, i64, Operand, IrCmpOp)> = None;
+    for inst in &header.instructions {
+        let Instruction::Phi { dest, incoming, ty } = inst else {
+            continue;
+        };
+        if incoming.len() != 2
+            || !matches!(*ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+        {
+            continue;
+        }
+        // Values transitively derived from the phi by Cast/Copy.
+        let mut derived = FxHashSet::default();
+        derived.insert(*dest);
+        for candidate in &header.instructions {
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } =
+                candidate
+            {
+                if matches!(src, Operand::Value(v) if derived.contains(v)) {
+                    derived.insert(*dest);
+                }
+            }
+        }
+        // Values of the form Add(derived, k).
+        let mut derived_k: Vec<(Value, i64)> = vec![(*dest, 0)];
+        for candidate in &header.instructions {
+            if let Instruction::BinOp {
+                dest: d,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = candidate
+            {
+                if let (Operand::Value(v), Operand::Const(c)) = (lhs, rhs) {
+                    if derived.contains(v) {
+                        if let Some(k) = c.to_i64() {
+                            derived_k.push((*d, k));
+                        }
+                    }
+                }
+                if let (Operand::Const(c), Operand::Value(v)) = (lhs, rhs) {
+                    if derived.contains(v) {
+                        if let Some(k) = c.to_i64() {
+                            derived_k.push((*d, k));
+                        }
+                    }
+                }
+            }
+        }
+        for cand in &header.instructions {
+            if let Instruction::Cmp {
+                op,
+                lhs,
+                rhs,
+                ty: cmp_ty,
+                ..
+            } = cand
+            {
+                if *cmp_ty != *ty {
+                    continue;
+                }
+                for (dv, k) in &derived_k {
+                    let (norm_op, limit) = if matches!(lhs, Operand::Value(v) if v == dv) {
+                        (*op, rhs.clone())
+                    } else if matches!(rhs, Operand::Value(v) if v == dv) {
+                        match op {
+                            IrCmpOp::Sgt => (IrCmpOp::Slt, lhs.clone()),
+                            IrCmpOp::Ugt => (IrCmpOp::Ult, lhs.clone()),
+                            _ => continue,
+                        }
+                    } else {
+                        continue;
+                    };
+                    if !matches!(norm_op, IrCmpOp::Slt | IrCmpOp::Ult) {
+                        continue;
+                    }
+                    // The limit must be loop-invariant.
+                    if matches!(&limit, Operand::Value(v)
+                        if find_inst_in_loop(func, &loop_info.body, *v).is_some())
+                    {
+                        continue;
+                    }
+                    if iv_info.is_none() {
+                        iv_info = Some((*dest, *ty, *k, limit, norm_op));
+                    }
+                }
+            }
+        }
+    }
+    let (iv, iv_ty, cmp_k, limit, exit_cmp_op) = iv_info?;
+
+    // IV start: the phi's non-latch incoming must be a constant.
+    let latch_label = func.blocks[latch_idx].label;
+    let mut iv_start = None;
+    for inst in &header.instructions {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            if *dest == iv {
+                for (op, pred) in incoming {
+                    if *pred != latch_label {
+                        if let Operand::Const(c) = op {
+                            iv_start = c.to_i64();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let iv_start = iv_start?;
+
+    // Unit increment in the latch.
+    let latch = &func.blocks[latch_idx];
+    if !latch.instructions.iter().any(|inst| {
+        matches!(inst, Instruction::BinOp { op: IrBinOp::Add, lhs, rhs, .. }
+            if matches!(lhs, Operand::Value(v) if *v == iv)
+                && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))
+    }) {
+        set_reject("stencil IV does not increment by 1");
+        return None;
+    }
+
+    // ── Body scan: one store, N loads, only simple arithmetic ────────────
+    let elem_ty = {
+        let mut store_ty = None;
+        let mut load_tys: Vec<IrType> = Vec::new();
+        for &block_idx in &loop_info.body {
+            for inst in &func.blocks[block_idx].instructions {
+                match inst {
+                    Instruction::Load { ty, .. } => load_tys.push(*ty),
+                    Instruction::Store { ty, .. } => {
+                        if store_ty.is_some() {
+                            set_reject("stencil loop has multiple stores");
+                            return None;
+                        }
+                        store_ty = Some(*ty);
+                    }
+                    Instruction::BinOp { op, .. } if op.can_trap() => {
+                        set_reject("stencil loop has a trapping operation");
+                        return None;
+                    }
+                    Instruction::Phi { .. }
+                    | Instruction::BinOp { .. }
+                    | Instruction::UnaryOp { .. }
+                    | Instruction::Cmp { .. }
+                    | Instruction::Cast { .. }
+                    | Instruction::Copy { .. }
+                    | Instruction::GetElementPtr { .. }
+                    | Instruction::GlobalAddr { .. } => {}
+                    _ => {
+                        set_reject("stencil loop contains an unsupported instruction");
+                        return None;
+                    }
+                }
+            }
+        }
+        let ty = store_ty?;
+        if !matches!(ty, IrType::F32 | IrType::F64) {
+            set_reject("stencil element type is not scalar FP");
+            return None;
+        }
+        for lt in &load_tys {
+            if *lt != ty {
+                set_reject("stencil loads mix element types");
+                return None;
+            }
+        }
+        ty
+    };
+    let elem_size: i64 = if elem_ty == IrType::F64 { 8 } else { 4 };
+
+    // Locate the store and every load; map each to (base, affine).
+    let mut store_info = None;
+    // (load dest, gep, base, affine)
+    let mut load_infos: Vec<(Value, Value, Value, IvAffine)> = Vec::new();
+    for &block_idx in &loop_info.body {
+        for inst in &func.blocks[block_idx].instructions {
+            match inst {
+                Instruction::Store { val, ptr, .. } => {
+                    let Operand::Value(store_val) = val else {
+                        return None;
+                    };
+                    let store_gep = *ptr;
+                    store_info = Some((*store_val, store_gep, block_idx));
+                }
+                Instruction::Load { dest, ptr, .. } => {
+                    let gep = *ptr;
+                    let mut found = None;
+                    for &b2 in &loop_info.body {
+                        for inst2 in &func.blocks[b2].instructions {
+                            if let Instruction::GetElementPtr {
+                                dest: gd, base, offset, ..
+                            } = inst2
+                            {
+                                if *gd == gep {
+                                    found = Some((
+                                        *base,
+                                        affine_operand(func, &loop_info.body, offset, iv, 0),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    let (base, affine) = found?;
+                    let affine = affine?;
+                    if affine.scale != elem_size {
+                        set_reject("stencil access is not a contiguous element stride");
+                        return None;
+                    }
+                    load_infos.push((*dest, gep, base, affine));
+                }
+                _ => {}
+            }
+        }
+    }
+    let (store_val, store_gep, body_idx) = store_info?;
+    if load_infos.is_empty() {
+        set_reject("stencil loop has no loads");
+        return None;
+    }
+    // Store GEP affine.
+    let mut store_affine = None;
+    for &b2 in &loop_info.body {
+        for inst2 in &func.blocks[b2].instructions {
+            if let Instruction::GetElementPtr {
+                dest: gd, base, offset, ..
+            } = inst2
+            {
+                if *gd == store_gep {
+                    store_affine =
+                        Some((*base, affine_operand(func, &loop_info.body, offset, iv, 0)));
+                }
+            }
+        }
+    }
+    let (dst_base, store_affine) = store_affine?;
+    let store_affine = store_affine?;
+    if store_affine.scale != elem_size {
+        set_reject("stencil store is not a contiguous element stride");
+        return None;
+    }
+    let dst_disp = store_affine.const_bytes;
+
+    // All loads must share ONE base root.
+    let src_base = load_infos[0].2;
+    if load_infos.iter().any(|(_, _, b, _)| *b != src_base) {
+        set_reject("stencil taps use multiple source bases");
+        return None;
+    }
+
+    // Displacements must fit the x86 SIB disp32.
+    let disp_ok = |d: i64| d.unsigned_abs() <= 0x7FFF_FFF0;
+    if !disp_ok(dst_disp) || load_infos.iter().any(|(_, _, _, a)| !disp_ok(a.const_bytes)) {
+        set_reject("stencil displacement exceeds the SIB disp32 range");
+        return None;
+    }
+
+    // Alias safety: distinct proven roots, or an exact lane-local in-place
+    // update (store disp 0 AND every tap disp 0).
+    let dst_root = proven_object_root(func, dst_base)?;
+    let src_root = proven_object_root(func, src_base)?;
+    let lane_local = dst_disp == 0 && load_infos.iter().all(|(_, _, _, a)| a.const_bytes == 0);
+    if dst_base != src_base && !roots_proven_distinct(&dst_root, &src_root) && !lane_local {
+        set_reject("stencil source/destination may alias (use restrict)");
+        return None;
+    }
+
+    // Constant trip counts of 4 or fewer are better left scalar (mirrors
+    // the map gate).
+    if let Operand::Const(c) = &limit {
+        let trip = c.to_i64()? - cmp_k - iv_start;
+        if trip <= 4 {
+            return None;
+        }
+    }
+
+    let pattern = StencilPattern {
+        header_idx,
+        body_idx,
+        latch_idx,
+        exit_idx,
+        loop_blocks: loop_info.body.clone(),
+        iv,
+        iv_ty,
+        iv_start,
+        cmp_k,
+        limit,
+        exit_cmp_op,
+        elem_ty,
+        src_base,
+        dst_base,
+        dst_disp,
+        taps: load_infos
+            .into_iter()
+            .map(|(load, _gep, _base, affine)| StencilTap {
+                load,
+                disp_bytes: affine.const_bytes,
+            })
+            .collect(),
+        store_val,
+        store_gep,
+    };
+    if debug {
+        eprintln!(
+            "[VEC-STENCIL] matched: taps={} elem={:?} start={} k={} dst_disp={} disps={:?}",
+            pattern.taps.len(),
+            pattern.elem_ty,
+            pattern.iv_start,
+            pattern.cmp_k,
+            pattern.dst_disp,
+            pattern
+                .taps
+                .iter()
+                .map(|t| t.disp_bytes)
+                .collect::<Vec<_>>()
+        );
+    }
+    Some(pattern)
+}
+
+/// Transform a matched stencil loop. Returns the number of IR changes.
+fn transform_stencil_vector(
+    func: &mut IrFunction,
+    pattern: &StencilPattern,
+    avx2: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
+) -> usize {
+    let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
+    let mut changes = 0usize;
+    let vec_width: u64 = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => 4,
+        (IrType::F64, false) => 2,
+        (_, true) => 8,
+        (_, false) => 4,
+    };
+
+    // A zero-iteration vector loop plus scalar remainder only adds overhead.
+    if let Operand::Const(c) = &pattern.limit {
+        let trip = c.to_i64().unwrap_or(0) - pattern.cmp_k - pattern.iv_start;
+        if trip <= vec_width as i64 {
+            return 0;
+        }
+    }
+
+    let mut next_val_id = func.next_value_id;
+    let mut next_label = func.next_label.max(
+        func.blocks
+            .iter()
+            .map(|b| b.label.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+    );
+
+    // Preheader: the unique out-of-loop branch to the header.
+    let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
+        if pattern.loop_blocks.contains(&idx) {
+            return None;
+        }
+        matches!(block.terminator, Terminator::Branch(label)
+            if label == func.blocks[pattern.header_idx].label)
+        .then_some(idx)
+    }) else {
+        return 0;
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+    let latch_label = func.blocks[pattern.latch_idx].label;
+
+    let elem_size: i64 = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    let int_const = |n: i64| match pattern.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
+        _ => IrConst::I64(n),
+    };
+
+    // ── Vector trip count and the rewritten bound ─────────────────────────
+    // trip = limit − (cmp_k + iv_start); bound = trip/W + cmp_k + iv_start
+    // so the (iv + cmp_k) < bound form runs floor(trip/W) iterations.
+    let trip_val = Value(next_val_id);
+    next_val_id += 1;
+    let trip_operand = match &pattern.limit {
+        Operand::Const(c) => {
+            let n = c.to_i64().unwrap_or(0) - pattern.cmp_k - pattern.iv_start;
+            Operand::Const(int_const(n))
+        }
+        Operand::Value(limit_val) => {
+            func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
+                dest: trip_val,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(*limit_val),
+                rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
+                ty: pattern.iv_ty,
+            });
+            changes += 1;
+            Operand::Value(trip_val)
+        }
+    };
+
+    let vec_trip = Value(next_val_id);
+    next_val_id += 1;
+    let shift = vec_width.trailing_zeros() as i64;
+    if pattern.exit_cmp_op == IrCmpOp::Slt {
+        // Signed division by 2^k rounded toward zero:
+        //   (n + ((n >> (bits-1)) & (2^k-1))) >> k
+        let sign = Value(next_val_id);
+        next_val_id += 1;
+        let bias = Value(next_val_id);
+        next_val_id += 1;
+        let adjusted = Value(next_val_id);
+        next_val_id += 1;
+        let bits = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+            31
+        } else {
+            63
+        };
+        for inst in [
+            Instruction::BinOp {
+                dest: sign,
+                op: IrBinOp::AShr,
+                lhs: trip_operand.clone(),
+                rhs: Operand::Const(int_const(bits)),
+                ty: pattern.iv_ty,
+            },
+            Instruction::BinOp {
+                dest: bias,
+                op: IrBinOp::And,
+                lhs: Operand::Value(sign),
+                rhs: Operand::Const(int_const(vec_width as i64 - 1)),
+                ty: pattern.iv_ty,
+            },
+            Instruction::BinOp {
+                dest: adjusted,
+                op: IrBinOp::Add,
+                lhs: trip_operand.clone(),
+                rhs: Operand::Value(bias),
+                ty: pattern.iv_ty,
+            },
+            Instruction::BinOp {
+                dest: vec_trip,
+                op: IrBinOp::AShr,
+                lhs: Operand::Value(adjusted),
+                rhs: Operand::Const(int_const(shift)),
+                ty: pattern.iv_ty,
+            },
+        ] {
+            func.blocks[preheader_idx].instructions.push(inst);
+            changes += 1;
+        }
+    } else {
+        func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
+            dest: vec_trip,
+            op: IrBinOp::LShr,
+            lhs: trip_operand.clone(),
+            rhs: Operand::Const(int_const(shift)),
+            ty: pattern.iv_ty,
+        });
+        changes += 1;
+    }
+    // bound = vec_trip + (cmp_k + iv_start)
+    let bound = Value(next_val_id);
+    next_val_id += 1;
+    func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
+        dest: bound,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(vec_trip),
+        rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
+        ty: pattern.iv_ty,
+    });
+    changes += 1;
+
+    // Rewrite the header compare's limit operand. The compare's IV-derived
+    // side is (iv + cmp_k) (or the phi itself); replace the OTHER side.
+    {
+        let header = &mut func.blocks[pattern.header_idx];
+        let mut iv_side = FxHashSet::default();
+        iv_side.insert(pattern.iv);
+        for cand in &header.instructions {
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = cand {
+                if matches!(src, Operand::Value(v) if iv_side.contains(v)) {
+                    iv_side.insert(*dest);
+                }
+            }
+        }
+        for cand in &header.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = cand
+            {
+                let lhs_iv = matches!(lhs, Operand::Value(v) if iv_side.contains(v));
+                let rhs_iv = matches!(rhs, Operand::Value(v) if iv_side.contains(v));
+                if lhs_iv != rhs_iv {
+                    iv_side.insert(*dest);
+                }
+            }
+        }
+        for inst in header.instructions.iter_mut() {
+            if let Instruction::Cmp { lhs, rhs, .. } = inst {
+                let lhs_iv = matches!(lhs, Operand::Value(v) if iv_side.contains(v));
+                let rhs_iv = matches!(rhs, Operand::Value(v) if iv_side.contains(v));
+                if lhs_iv && !rhs_iv {
+                    *rhs = Operand::Value(bound);
+                    changes += 1;
+                } else if rhs_iv && !lhs_iv {
+                    *lhs = Operand::Value(bound);
+                    changes += 1;
+                }
+            }
+        }
+    }
+
+    // ── Byte IV: element-accurate vector addressing ────────────────────────
+    // byte_iv starts at iv_start*elem (the first scalar iteration's byte
+    // offset from the GEP bases) and advances width*elem per iteration.
+    let byte_iv = Value(next_val_id);
+    next_val_id += 1;
+    let byte_iv_next = Value(next_val_id);
+    next_val_id += 1;
+    let phi_pos = func.blocks[pattern.header_idx]
+        .instructions
+        .iter()
+        .position(|inst| !matches!(inst, Instruction::Phi { .. }))
+        .unwrap_or(func.blocks[pattern.header_idx].instructions.len());
+    func.blocks[pattern.header_idx].instructions.insert(
+        phi_pos,
+        Instruction::Phi {
+            dest: byte_iv,
+            ty: IrType::I64,
+            incoming: vec![
+                (
+                    Operand::Const(IrConst::I64(pattern.iv_start * elem_size)),
+                    preheader_label,
+                ),
+                (Operand::Value(byte_iv_next), latch_label),
+            ],
+        },
+    );
+    func.blocks[pattern.latch_idx]
+        .instructions
+        .push(Instruction::BinOp {
+            dest: byte_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(byte_iv),
+            rhs: Operand::Const(IrConst::I64(elem_size * vec_width as i64)),
+            ty: IrType::I64,
+        });
+    changes += 2;
+
+    // ── Vector body ────────────────────────────────────────────────────────
+    let (load_op, add_op, mul_op, store_op, broadcast_op) = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => (
+            IntrinsicOp::VecLoadF64x4,
+            IntrinsicOp::VecAddF64x4,
+            IntrinsicOp::VecMulF64x4,
+            IntrinsicOp::VecStoreF64x4,
+            IntrinsicOp::VecBroadcastF64x4,
+        ),
+        (IrType::F64, false) => (
+            IntrinsicOp::VecLoadF64x2,
+            IntrinsicOp::VecAddF64x2,
+            IntrinsicOp::VecMulF64x2,
+            IntrinsicOp::VecStoreF64x2,
+            IntrinsicOp::VecBroadcastF64x2,
+        ),
+        (IrType::F32, true) => (
+            IntrinsicOp::VecLoadF32x8,
+            IntrinsicOp::VecAddF32x8,
+            IntrinsicOp::VecMulF32x8,
+            IntrinsicOp::VecStoreF32x8,
+            IntrinsicOp::VecBroadcastF32x8,
+        ),
+        _ => (
+            IntrinsicOp::VecLoadF32x4,
+            IntrinsicOp::VecAddF32x4,
+            IntrinsicOp::VecMulF32x4,
+            IntrinsicOp::VecStoreF32x4,
+            IntrinsicOp::VecBroadcastF32x4,
+        ),
+    };
+    let madd_op = if fp_contract == FpContract::Fast && avx2 {
+        match pattern.elem_ty {
+            IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
+            IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Load each tap once (displacement folded into the memory operand).
+    let mut tap_vecs: FxHashMap<u32, Value> = FxHashMap::default();
+    let mut vec_insts: Vec<Instruction> = Vec::new();
+    for tap in &pattern.taps {
+        let v = Value(next_val_id);
+        next_val_id += 1;
+        vec_insts.push(Instruction::Intrinsic {
+            dest: Some(v),
+            op: load_op,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(pattern.src_base),
+                Operand::Value(byte_iv),
+                Operand::Const(IrConst::I64(tap.disp_bytes)),
+            ],
+        });
+        changes += 1;
+        tap_vecs.insert(tap.load.0, v);
+    }
+
+    // Mirror the scalar expression tree in the vector domain.
+    let Some(result) = emit_stencil_expr(
+        func,
+        pattern,
+        &tap_vecs,
+        &add_op,
+        &mul_op,
+        madd_op,
+        broadcast_op,
+        preheader_idx,
+        &mut next_val_id,
+        &mut vec_insts,
+        &mut changes,
+    ) else {
+        // Fail soft: revert the bound rewrite so the scalar loop keeps its
+        // original trip count, and drop the byte-IV plumbing.
+        if debug {
+            eprintln!("[VEC-STENCIL] expression mirror failed; reverting");
+        }
+        let header = &mut func.blocks[pattern.header_idx];
+        for inst in header.instructions.iter_mut() {
+            if let Instruction::Cmp { lhs, rhs, .. } = inst {
+                if matches!(lhs, Operand::Value(v) if *v == bound) {
+                    *lhs = pattern.limit.clone();
+                } else if matches!(rhs, Operand::Value(v) if *v == bound) {
+                    *rhs = pattern.limit.clone();
+                }
+            }
+        }
+        func.blocks[pattern.header_idx]
+            .instructions
+            .retain(|i| !matches!(i, Instruction::Phi { dest, .. } if *dest == byte_iv));
+        func.blocks[pattern.latch_idx]
+            .instructions
+            .retain(|i| !matches!(i, Instruction::BinOp { dest, .. } if *dest == byte_iv_next));
+        func.next_value_id = next_val_id;
+        func.next_label = next_label;
+        return changes;
+    };
+
+    // Store the vector result (displacement folded for dst_disp ≠ 0).
+    vec_insts.push(Instruction::Intrinsic {
+        dest: None,
+        op: store_op,
+        dest_ptr: Some(pattern.dst_base),
+        args: vec![
+            Operand::Value(result),
+            Operand::Value(pattern.dst_base),
+            Operand::Value(byte_iv),
+            Operand::Const(IrConst::I64(pattern.dst_disp)),
+        ],
+    });
+    changes += 1;
+
+    // Replace the scalar store with the vector sequence.
+    {
+        let body = &mut func.blocks[pattern.body_idx];
+        let Some(store_pos) = body.instructions.iter().position(
+            |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.store_gep),
+        ) else {
+            if debug {
+                eprintln!("[VEC-STENCIL] store not found at transform time");
+            }
+            func.next_value_id = next_val_id;
+            func.next_label = next_label;
+            return changes;
+        };
+        let inserted = vec_insts.len();
+        for (i, inst) in vec_insts.into_iter().enumerate() {
+            body.instructions.insert(store_pos + i, inst);
+        }
+        body.instructions.remove(store_pos + inserted);
+        changes += inserted;
+    }
+
+    changes += insert_stencil_remainder_loop(
+        func,
+        pattern,
+        vec_width,
+        &mut next_val_id,
+        &mut next_label,
+    );
+
+    func.next_value_id = next_val_id;
+    func.next_label = next_label;
+    if debug {
+        eprintln!("[VEC-STENCIL] transform complete: {} changes", changes);
+    }
+    changes
+}
+
+/// Mirror one scalar expression node of the stencil body in the vector
+/// domain. See the stencil section comment for the exactness contract.
+#[allow(clippy::too_many_arguments)]
+fn emit_stencil_expr(
+    func: &mut IrFunction,
+    pattern: &StencilPattern,
+    tap_vecs: &FxHashMap<u32, Value>,
+    add_op: &IntrinsicOp,
+    mul_op: &IntrinsicOp,
+    madd_op: Option<IntrinsicOp>,
+    broadcast_op: IntrinsicOp,
+    preheader_idx: usize,
+    next_val_id: &mut u32,
+    vec_insts: &mut Vec<Instruction>,
+    changes: &mut usize,
+) -> Option<Value> {
+    // Collect the loop-local def map up front (the scalar body is not
+    // mutated by this emitter).
+    let mut defs: FxHashMap<u32, Instruction> = FxHashMap::default();
+    for &b in &pattern.loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d.0, inst.clone());
+            }
+        }
+    }
+
+    fn broadcast(
+        op: &Operand,
+        func: &mut IrFunction,
+        broadcast_op: IntrinsicOp,
+        preheader_idx: usize,
+        next_val_id: &mut u32,
+        changes: &mut usize,
+        cache: &mut FxHashMap<u64, Value>,
+    ) -> Option<Value> {
+        let key = match op {
+            Operand::Value(v) => v.0 as u64,
+            Operand::Const(c) => u32::MAX as u64 + (c.to_i64().unwrap_or(0) as u64),
+        };
+        if let Some(&b) = cache.get(&key) {
+            return Some(b);
+        }
+        let dest = Value(*next_val_id);
+        *next_val_id += 1;
+        func.blocks[preheader_idx].instructions.push(Instruction::Intrinsic {
+            dest: Some(dest),
+            op: broadcast_op,
+            dest_ptr: None,
+            args: vec![op.clone()],
+        });
+        *changes += 1;
+        cache.insert(key, dest);
+        Some(dest)
+    }
+
+    fn neg_one_const(elem_ty: IrType) -> Operand {
+        Operand::Const(if elem_ty == IrType::F64 {
+            IrConst::F64(-1.0)
+        } else {
+            IrConst::F32(-1.0)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_recursive(
+        node: Value,
+        func: &mut IrFunction,
+        defs: &FxHashMap<u32, Instruction>,
+        tap_vecs: &FxHashMap<u32, Value>,
+        elem_ty: IrType,
+        add_op: &IntrinsicOp,
+        mul_op: &IntrinsicOp,
+        madd_op: Option<IntrinsicOp>,
+        broadcast_op: IntrinsicOp,
+        preheader_idx: usize,
+        next_val_id: &mut u32,
+        vec_insts: &mut Vec<Instruction>,
+        changes: &mut usize,
+        cache: &mut FxHashMap<u64, Value>,
+    ) -> Option<Value> {
+        // Tap leaf: the already-loaded vector.
+        if let Some(&v) = tap_vecs.get(&node.0) {
+            return Some(v);
+        }
+        let is_invariant = |v: Value| !tap_vecs.contains_key(&v.0) && !defs.contains_key(&v.0);
+        let def = defs.get(&node.0)?;
+        match def {
+            Instruction::BinOp { op, lhs, rhs, .. } => match op {
+                IrBinOp::Add | IrBinOp::Sub => {
+                    let lv_node = match lhs {
+                        Operand::Value(v) => *v,
+                        _ => return None,
+                    };
+                    let rv_node = match rhs {
+                        Operand::Value(v) => *v,
+                        _ => return None,
+                    };
+                    // FMA contraction (fast contract only):
+                    // Add(Mul(tap, w), z) → VecMadd(tap, w, z).
+                    if *op == IrBinOp::Add {
+                        if let Some(madd) = madd_op {
+                            if let Some(Instruction::BinOp {
+                                op: IrBinOp::Mul,
+                                lhs: mlhs,
+                                rhs: mrhs,
+                                ..
+                            }) = defs.get(&lv_node.0)
+                            {
+                                if let (Operand::Value(tap), Operand::Value(w)) = (mlhs, mrhs) {
+                                    if tap_vecs.contains_key(&tap.0) && is_invariant(*w) {
+                                        let tv = *tap_vecs.get(&tap.0)?;
+                                        let wv = broadcast(
+                                            &Operand::Value(*w),
+                                            func,
+                                            broadcast_op,
+                                            preheader_idx,
+                                            next_val_id,
+                                            changes,
+                                            cache,
+                                        )?;
+                                        let zv = emit_recursive(
+                                            rv_node,
+                                            func,
+                                            defs,
+                                            tap_vecs,
+                                            elem_ty,
+                                            add_op,
+                                            mul_op,
+                                            madd_op,
+                                            broadcast_op,
+                                            preheader_idx,
+                                            next_val_id,
+                                            vec_insts,
+                                            changes,
+                                            cache,
+                                        )?;
+                                        let dest = Value(*next_val_id);
+                                        *next_val_id += 1;
+                                        vec_insts.push(Instruction::Intrinsic {
+                                            dest: Some(dest),
+                                            op: madd,
+                                            dest_ptr: None,
+                                            args: vec![
+                                                Operand::Value(tv),
+                                                Operand::Value(wv),
+                                                Operand::Value(zv),
+                                            ],
+                                        });
+                                        *changes += 1;
+                                        return Some(dest);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let lv = emit_recursive(
+                        lv_node,
+                        func,
+                        defs,
+                        tap_vecs,
+                        elem_ty,
+                        add_op,
+                        mul_op,
+                        madd_op,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        vec_insts,
+                        changes,
+                        cache,
+                    )?;
+                    let rv = emit_recursive(
+                        rv_node,
+                        func,
+                        defs,
+                        tap_vecs,
+                        elem_ty,
+                        add_op,
+                        mul_op,
+                        madd_op,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        vec_insts,
+                        changes,
+                        cache,
+                    )?;
+                    if *op == IrBinOp::Add {
+                        let dest = Value(*next_val_id);
+                        *next_val_id += 1;
+                        vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op: *add_op,
+                            dest_ptr: None,
+                            args: vec![Operand::Value(lv), Operand::Value(rv)],
+                        });
+                        *changes += 1;
+                        Some(dest)
+                    } else {
+                        // a - b == a + (b * -1), bit-exact in IEEE-754.
+                        let neg = broadcast(
+                            &neg_one_const(elem_ty),
+                            func,
+                            broadcast_op,
+                            preheader_idx,
+                            next_val_id,
+                            changes,
+                            cache,
+                        )?;
+                        let negated = Value(*next_val_id);
+                        *next_val_id += 1;
+                        vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(negated),
+                            op: *mul_op,
+                            dest_ptr: None,
+                            args: vec![Operand::Value(rv), Operand::Value(neg)],
+                        });
+                        *changes += 1;
+                        let dest = Value(*next_val_id);
+                        *next_val_id += 1;
+                        vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op: *add_op,
+                            dest_ptr: None,
+                            args: vec![Operand::Value(lv), Operand::Value(negated)],
+                        });
+                        *changes += 1;
+                        Some(dest)
+                    }
+                }
+                IrBinOp::Mul => {
+                    // Exactly one side tap-derived, the other invariant.
+                    let (tap_node, inv_op) = match (lhs, rhs) {
+                        (Operand::Value(l), r) if !is_invariant(*l) => (*l, r),
+                        (l, Operand::Value(r)) if !is_invariant(*r) => (*r, l),
+                        _ => return None,
+                    };
+                    match inv_op {
+                        Operand::Value(w) if is_invariant(*w) => {}
+                        Operand::Const(_) => {}
+                        _ => return None,
+                    }
+                    let tv = emit_recursive(
+                        tap_node,
+                        func,
+                        defs,
+                        tap_vecs,
+                        elem_ty,
+                        add_op,
+                        mul_op,
+                        madd_op,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        vec_insts,
+                        changes,
+                        cache,
+                    )?;
+                    let wv = broadcast(
+                        inv_op,
+                        func,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        changes,
+                        cache,
+                    )?;
+                    let dest = Value(*next_val_id);
+                    *next_val_id += 1;
+                    vec_insts.push(Instruction::Intrinsic {
+                        dest: Some(dest),
+                        op: *mul_op,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(tv), Operand::Value(wv)],
+                    });
+                    *changes += 1;
+                    Some(dest)
+                }
+                _ => None,
+            },
+            Instruction::UnaryOp { op, src: operand, .. } => match op {
+                IrUnaryOp::Neg => {
+                    let v_node = match operand {
+                        Operand::Value(v) => *v,
+                        _ => return None,
+                    };
+                    let v = emit_recursive(
+                        v_node,
+                        func,
+                        defs,
+                        tap_vecs,
+                        elem_ty,
+                        add_op,
+                        mul_op,
+                        madd_op,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        vec_insts,
+                        changes,
+                        cache,
+                    )?;
+                    let neg = broadcast(
+                        &neg_one_const(elem_ty),
+                        func,
+                        broadcast_op,
+                        preheader_idx,
+                        next_val_id,
+                        changes,
+                        cache,
+                    )?;
+                    let dest = Value(*next_val_id);
+                    *next_val_id += 1;
+                    vec_insts.push(Instruction::Intrinsic {
+                        dest: Some(dest),
+                        op: *mul_op,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(v), Operand::Value(neg)],
+                    });
+                    *changes += 1;
+                    Some(dest)
+                }
+                _ => None,
+            },
+            // Invariant leaf reached as a Value (defined outside the loop):
+            // broadcast it.
+            _ => broadcast(
+                &Operand::Value(node),
+                func,
+                broadcast_op,
+                preheader_idx,
+                next_val_id,
+                changes,
+                cache,
+            ),
+        }
+    }
+
+    let mut broadcast_cache: FxHashMap<u64, Value> = FxHashMap::default();
+    emit_recursive(
+        pattern.store_val,
+        func,
+        &defs,
+        tap_vecs,
+        pattern.elem_ty,
+        add_op,
+        mul_op,
+        madd_op,
+        broadcast_op,
+        preheader_idx,
+        next_val_id,
+        vec_insts,
+        changes,
+        &mut broadcast_cache,
+    )
+}
+
+/// Insert an exact scalar remainder for a vectorized stencil: a fresh loop
+/// over the unprocessed tail elements that recomputes the ORIGINAL
+/// expression (same ops, same order) from the tap GEP shapes.
+fn insert_stencil_remainder_loop(
+    func: &mut IrFunction,
+    pattern: &StencilPattern,
+    vec_width: u64,
+    next_val_id: &mut u32,
+    next_label: &mut u32,
+) -> usize {
+    let mut changes = 0usize;
+    let elem_size: i64 = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
+    let int_const = |n: i64| match pattern.iv_ty {
+        IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
+        _ => IrConst::I64(n),
+    };
+
+    let vec_exit_label = BlockId(*next_label);
+    *next_label += 1;
+    let rem_header_label = BlockId(*next_label);
+    *next_label += 1;
+    let rem_body_label = BlockId(*next_label);
+    *next_label += 1;
+    let rem_latch_label = BlockId(*next_label);
+    *next_label += 1;
+
+    let i_rem_start = Value(*next_val_id);
+    *next_val_id += 1;
+    let i_rem_iv = Value(*next_val_id);
+    *next_val_id += 1;
+    let i_rem_iv_next = Value(*next_val_id);
+    *next_val_id += 1;
+    let i_rem_cmp = Value(*next_val_id);
+    *next_val_id += 1;
+    let i_rem_cmp_lhs = Value(*next_val_id);
+    *next_val_id += 1;
+
+    // Redirect the vector loop's exit edge to the remainder entry.
+    if let Terminator::CondBranch { false_label, .. } =
+        &mut func.blocks[pattern.header_idx].terminator
+    {
+        *false_label = vec_exit_label;
+    }
+
+    // Remainder start element = iv_start + (vector-iv − iv_start) * width.
+    // The header phi at vector-loop exit holds the next unprocessed scalar
+    // IV under unit stepping; the byte-parallel lanes cover the width-fold
+    // span from there.
+    let delta = Value(*next_val_id);
+    *next_val_id += 1;
+    let scaled = Value(*next_val_id);
+    *next_val_id += 1;
+    let vec_exit_block = BasicBlock {
+        label: vec_exit_label,
+        instructions: vec![
+            Instruction::BinOp {
+                dest: delta,
+                op: IrBinOp::Sub,
+                lhs: Operand::Value(pattern.iv),
+                rhs: Operand::Const(int_const(pattern.iv_start)),
+                ty: pattern.iv_ty,
+            },
+            Instruction::BinOp {
+                dest: scaled,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(delta),
+                rhs: Operand::Const(int_const(vec_width as i64)),
+                ty: pattern.iv_ty,
+            },
+            Instruction::BinOp {
+                dest: i_rem_start,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(scaled),
+                rhs: Operand::Const(int_const(pattern.iv_start)),
+                ty: pattern.iv_ty,
+            },
+        ],
+        terminator: Terminator::Branch(rem_header_label),
+        source_spans: vec![],
+    };
+
+    // Remainder header: the ORIGINAL compare shape (iv + cmp_k) op limit.
+    let rem_header_block = BasicBlock {
+        label: rem_header_label,
+        instructions: vec![
+            Instruction::Phi {
+                dest: i_rem_iv,
+                ty: pattern.iv_ty,
+                incoming: vec![
+                    (Operand::Value(i_rem_start), vec_exit_label),
+                    (Operand::Value(i_rem_iv_next), rem_latch_label),
+                ],
+            },
+            Instruction::BinOp {
+                dest: i_rem_cmp_lhs,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(i_rem_iv),
+                rhs: Operand::Const(int_const(pattern.cmp_k)),
+                ty: pattern.iv_ty,
+            },
+            Instruction::Cmp {
+                dest: i_rem_cmp,
+                op: pattern.exit_cmp_op,
+                lhs: Operand::Value(i_rem_cmp_lhs),
+                rhs: pattern.limit.clone(),
+                ty: pattern.iv_ty,
+            },
+        ],
+        terminator: Terminator::CondBranch {
+            cond: Operand::Value(i_rem_cmp),
+            true_label: rem_body_label,
+            false_label: func.blocks[pattern.exit_idx].label,
+        },
+        source_spans: vec![],
+    };
+
+    // Remainder body: recompute the original expression from the taps.
+    let mut body_insts: Vec<Instruction> = Vec::new();
+    let cast_v = Value(*next_val_id);
+    *next_val_id += 1;
+    if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+        body_insts.push(Instruction::Cast {
+            dest: cast_v,
+            src: Operand::Value(i_rem_iv),
+            from_ty: pattern.iv_ty,
+            to_ty: IrType::I64,
+        });
+    }
+    let byte_index = if matches!(pattern.iv_ty, IrType::I32 | IrType::U32) {
+        cast_v
+    } else {
+        i_rem_iv
+    };
+
+    let mut tap_scalar_ptrs: FxHashMap<u32, Value> = FxHashMap::default();
+    for tap in &pattern.taps {
+        let scaled_v = Value(*next_val_id);
+        *next_val_id += 1;
+        let offset_v = Value(*next_val_id);
+        *next_val_id += 1;
+        let gep_v = Value(*next_val_id);
+        *next_val_id += 1;
+        body_insts.push(Instruction::BinOp {
+            dest: scaled_v,
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(byte_index),
+            rhs: Operand::Const(IrConst::I64(elem_size)),
+            ty: IrType::I64,
+        });
+        body_insts.push(Instruction::BinOp {
+            dest: offset_v,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(scaled_v),
+            rhs: Operand::Const(IrConst::I64(tap.disp_bytes)),
+            ty: IrType::I64,
+        });
+        body_insts.push(Instruction::GetElementPtr {
+            dest: gep_v,
+            base: pattern.src_base,
+            offset: Operand::Value(offset_v),
+            ty: pattern.elem_ty,
+        });
+        let load_v = Value(*next_val_id);
+        *next_val_id += 1;
+        body_insts.push(Instruction::Load {
+            volatile: false,
+            dest: load_v,
+            ptr: gep_v,
+            ty: pattern.elem_ty,
+            seg_override: AddressSpace::Default,
+        });
+        tap_scalar_ptrs.insert(tap.load.0, load_v);
+    }
+    // Store address.
+    let dst_scaled = Value(*next_val_id);
+    *next_val_id += 1;
+    let dst_offset = Value(*next_val_id);
+    *next_val_id += 1;
+    let dst_gep_v = Value(*next_val_id);
+    *next_val_id += 1;
+    body_insts.push(Instruction::BinOp {
+        dest: dst_scaled,
+        op: IrBinOp::Mul,
+        lhs: Operand::Value(byte_index),
+        rhs: Operand::Const(IrConst::I64(elem_size)),
+        ty: IrType::I64,
+    });
+    body_insts.push(Instruction::BinOp {
+        dest: dst_offset,
+        op: IrBinOp::Add,
+        lhs: Operand::Value(dst_scaled),
+        rhs: Operand::Const(IrConst::I64(pattern.dst_disp)),
+        ty: IrType::I64,
+    });
+    body_insts.push(Instruction::GetElementPtr {
+        dest: dst_gep_v,
+        base: pattern.dst_base,
+        offset: Operand::Value(dst_offset),
+        ty: pattern.elem_ty,
+    });
+
+    // Mirror the expression tree in the scalar domain with the fresh tap
+    // loads (same ops, same order — an exact copy with remapped leaves).
+    let mut remap: FxHashMap<u32, Value> = tap_scalar_ptrs;
+    let mut defs: FxHashMap<u32, Instruction> = FxHashMap::default();
+    for &b in &pattern.loop_blocks {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d.0, inst.clone());
+            }
+        }
+    }
+    fn remap_expr(
+        node: Value,
+        defs: &FxHashMap<u32, Instruction>,
+        remap: &mut FxHashMap<u32, Value>,
+        next_val_id: &mut u32,
+        out: &mut Vec<Instruction>,
+    ) -> Option<Value> {
+        if let Some(&v) = remap.get(&node.0) {
+            return Some(v);
+        }
+        let def = defs.get(&node.0)?.clone();
+        match def {
+            Instruction::BinOp {
+                op,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let map_op = |o: &Operand,
+                              remap: &mut FxHashMap<u32, Value>,
+                              next_val_id: &mut u32,
+                              out: &mut Vec<Instruction>|
+                 -> Option<Operand> {
+                    match o {
+                        Operand::Value(v) => {
+                            remap_expr(*v, defs, remap, next_val_id, out).map(Operand::Value)
+                        }
+                        c @ Operand::Const(_) => Some(c.clone()),
+                    }
+                };
+                let l = map_op(&lhs, remap, next_val_id, out)?;
+                let r = map_op(&rhs, remap, next_val_id, out)?;
+                let dest = Value(*next_val_id);
+                *next_val_id += 1;
+                out.push(Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs: l,
+                    rhs: r,
+                    ty,
+                });
+                remap.insert(node.0, dest);
+                Some(dest)
+            }
+            Instruction::UnaryOp {
+                op,
+                src: operand,
+                ty,
+                ..
+            } => {
+                let o = match operand {
+                    Operand::Value(v) => {
+                        Operand::Value(remap_expr(v, defs, remap, next_val_id, out)?)
+                    }
+                    c @ Operand::Const(_) => c.clone(),
+                };
+                let dest = Value(*next_val_id);
+                *next_val_id += 1;
+                out.push(Instruction::UnaryOp {
+                    dest,
+                    op,
+                    src: o,
+                    ty,
+                });
+                remap.insert(node.0, dest);
+                Some(dest)
+            }
+            // Invariant leaf: reuse the original value directly.
+            _ => {
+                remap.insert(node.0, node);
+                Some(node)
+            }
+        }
+    }
+    let Some(result) = remap_expr(
+        pattern.store_val,
+        &defs,
+        &mut remap,
+        next_val_id,
+        &mut body_insts,
+    ) else {
+        // Without a remainder the transform would be unsound; the caller
+        // already replaced the store, so report failure (0 added blocks).
+        return 0;
+    };
+    body_insts.push(Instruction::Store {
+        val: Operand::Value(result),
+        ptr: dst_gep_v,
+        ty: pattern.elem_ty,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    });
+
+    let rem_body_block = BasicBlock {
+        label: rem_body_label,
+        instructions: body_insts,
+        terminator: Terminator::Branch(rem_latch_label),
+        source_spans: vec![],
+    };
+    let rem_latch_block = BasicBlock {
+        label: rem_latch_label,
+        instructions: vec![Instruction::BinOp {
+            dest: i_rem_iv_next,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(i_rem_iv),
+            rhs: Operand::Const(int_const(1)),
+            ty: pattern.iv_ty,
+        }],
+        terminator: Terminator::Branch(rem_header_label),
+        source_spans: vec![],
+    };
+
+    // The remainder blocks are appended at the end; the final layout pass
+    // re-orders everything in reverse post-order.
+    func.blocks.push(vec_exit_block);
+    func.blocks.push(rem_header_block);
+    func.blocks.push(rem_body_block);
+    func.blocks.push(rem_latch_block);
+    changes += 4;
+    changes
+}
+
 /// Check if a GEP uses the induction variable.
 fn gep_uses_iv(
     func: &IrFunction,
@@ -6174,7 +7835,7 @@ fn insert_reduction_remainder_loop(
 fn transform_reduction_avx2(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
-    fp_contract_fast: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
     // CONTIGUITY PRECONDITION -- checked BEFORE any IR is touched.
     //
@@ -6843,7 +8504,7 @@ fn transform_reduction_avx2(
                 };
                 let body_block = &mut func.blocks[pattern.body_idx];
 
-                if fp_contract_fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
+                if fp_contract == FpContract::Fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
                     let fma_inst = Instruction::Intrinsic {
                         dest: Some(vec_sum_value),
                         op: vec_fma_op,
@@ -6969,7 +8630,7 @@ fn transform_reduction_avx2(
                     IntrinsicOp::VecAddF64x4,
                     IntrinsicOp::VecZeroF64x4,
                     Some(IntrinsicOp::VecFmaF64x4),
-                    fp_contract_fast,
+                    fp_contract == FpContract::Fast,
                 ),
                 (ReductionKind::DotProduct, IrType::F32) => (
                     IntrinsicOp::VecLoadF32x8,
@@ -6977,7 +8638,7 @@ fn transform_reduction_avx2(
                     IntrinsicOp::VecAddF32x8,
                     IntrinsicOp::VecZeroF32x8,
                     Some(IntrinsicOp::VecFmaF32x8),
-                    fp_contract_fast,
+                    fp_contract == FpContract::Fast,
                 ),
                 (ReductionKind::DotProduct, IrType::I32) => (
                     IntrinsicOp::VecLoadI32x8,
@@ -8335,7 +9996,7 @@ fn transform_map_vector(
     func: &mut IrFunction,
     pattern: &MapPattern,
     avx2: bool,
-    fp_contract_fast: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
@@ -8624,7 +10285,7 @@ fn transform_map_vector(
         ),
         _ => return 0,
     };
-    let madd_op = if fp_contract_fast && avx2 {
+    let madd_op = if fp_contract == FpContract::Fast && avx2 {
         match pattern.elem_ty {
             IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
             IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
@@ -9117,34 +10778,34 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
 
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, false, false, false)
+    vectorize_function_mode(func, false, FpContract::default(), false)
 }
 
 /// Run x86 vectorization with reassociation but without FMA contraction.
 pub(crate) fn vectorize_function_reassoc(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, false, true)
+    vectorize_function_mode(func, true, FpContract::default(), true)
 }
 
 /// Preserve the established loop-vectorization policy while withholding the
 /// fixed-width 256-bit SLP fold when the requested ISA has no AVX.
 pub(crate) fn vectorize_function_reassoc_without_fixed_slp(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, false, false)
+    vectorize_function_mode(func, true, FpContract::default(), false)
 }
 
 /// Run x86 vectorization with explicit reassociation and fast contraction.
 pub(crate) fn vectorize_function_fast_math(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, true, true)
+    vectorize_function_mode(func, true, FpContract::Fast, true)
 }
 
 /// Fast-math counterpart used for baseline x86-64 targets without AVX.
 pub(crate) fn vectorize_function_fast_math_without_fixed_slp(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, true, false)
+    vectorize_function_mode(func, true, FpContract::Fast, false)
 }
 
 fn vectorize_function_mode(
     func: &mut IrFunction,
     fp_reassoc: bool,
-    fp_contract_fast: bool,
+    fp_contract: FpContract,
     enable_fixed_slp: bool,
 ) -> usize {
     // A DynAlloca changes the live stack extent at run time. The current vector
@@ -9188,7 +10849,7 @@ fn vectorize_function_mode(
 
     let cfg = CfgAnalysis::build(func);
     let loop_changes =
-        vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract_fast);
+        vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract);
     let changes = slp_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
@@ -9306,7 +10967,7 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
+    vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
 }
 
 /// Late AArch64 vectorization (levkropp 8ef1978f concept): reduction loops
@@ -9319,12 +10980,12 @@ pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
 /// idempotent and cannot double-transform.
 pub(crate) fn vectorize_function_two_wide_late(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false, false)
+    vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
 }
 
 pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, true, false)
+    vectorize_with_analysis_mode(func, &cfg, true, true, true, FpContract::default())
 }
 
 #[cfg(test)]

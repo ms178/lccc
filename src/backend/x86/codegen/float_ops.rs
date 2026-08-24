@@ -1,18 +1,28 @@
 //! X86Codegen: floating-point binary operations and F128 negation.
 
 use super::emit::X86Codegen;
+
 use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+
 use crate::backend::cast::FloatOp;
+
 use crate::common::types::IrType;
+
 use crate::ir::reexports::{IrConst, IrUnaryOp, Operand, Value};
 
 impl X86Codegen {
     /// Load an F32/F64 operand into %xmm0, honoring a register-allocated XMM
+
     /// home first. The F64 register allocator uses xmm3-xmm7 only (never
+
     /// clobbered by codegen scratch), and an allocated value has no stack slot,
+
     /// so the register IS the value's only home — a `movsd %xmmN, %xmm0` is the
+
     /// whole load. Falls back to a direct slot load, then to the GPR round-trip
+
     /// for constants and values without a home.
+
     pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Operand::Value(v) = op {
@@ -66,7 +76,9 @@ impl X86Codegen {
     }
 
     /// Store %xmm0 to an F32/F64 destination, honoring a register-allocated XMM
+
     /// home first (mirrors load_fp_to_xmm0; the result stays in the XMM domain).
+
     pub(super) fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
@@ -97,9 +109,13 @@ impl X86Codegen {
     }
 
     /// Load an F32/F64 operand into a NAMED xmm register (xmm3-xmm7 target for
+
     /// the compute-into-dest path; xmm0 for the scratch path). Honors a
+
     /// register-allocated XMM home, then a direct slot, then constants and the
+
     /// GPR fallback.
+
     pub(super) fn load_fp_to_reg(&mut self, op: &Operand, ty: IrType, reg: &str) {
         let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
         if let Operand::Value(v) = op {
@@ -168,9 +184,13 @@ impl X86Codegen {
     }
 
     /// Emit an FP binary op with the result left in the named `reg` (an
+
     /// XMM-allocated destination), avoiding the store-to-home + reload-from-home
+
     /// pair the xmm0-scratch path pays on every link of an FP chain.
+
     /// Returns true when the op was emitted into `reg`.
+
     fn emit_float_binop_into_reg(
         &mut self,
         dest: &Value,
@@ -188,95 +208,122 @@ impl X86Codegen {
         }
         let mnemonic = self.emit_float_binop_mnemonic_impl(op);
         let suffix = if ty == IrType::F64 { "sd" } else { "ss" };
+        let commutative = matches!(op, FloatOp::Add | FloatOp::Mul);
 
-        // LHS into the destination register.
-        self.load_fp_to_reg(lhs, ty, reg);
+        let xmm_of = |this: &Self, opnd: &Operand| -> Option<&'static str> {
+            let Operand::Value(v) = opnd else { return None };
+            let r = this.reg_assignments.get(&v.0).copied()?;
+            is_xmm_reg(r).then(|| phys_reg_name(r))
+        };
+        let lhs_home = xmm_of(self, lhs);
+        let rhs_home = xmm_of(self, rhs);
+        let dest_holds_lhs = lhs_home == Some(reg);
+        let dest_holds_rhs = rhs_home == Some(reg);
 
-        // RHS: register home, folded memory slot, constant, or GPR fallback.
-        match rhs {
-            Operand::Value(v) => {
-                if let Some(&r) = self.reg_assignments.get(&v.0) {
-                    if is_xmm_reg(r) {
-                        let name = phys_reg_name(r);
-                        self.state.emit_fmt(format_args!(
-                            "    {}{} %{}, %{}, %{}",
-                            mnemonic, suffix, name, reg, reg
-                        ));
-                        self.state.reg_cache.invalidate_acc();
-                        return true;
-                    }
-                }
-                if let Some(slot) = self.state.get_slot(v.0) {
-                    let sr = self.slot_ref(slot.0);
-                    self.state.emit_fmt(format_args!(
-                        "    {}{} {}, %{}, %{}",
-                        mnemonic, suffix, sr, reg, reg
-                    ));
-                    self.state.reg_cache.invalidate_acc();
-                    return true;
-                }
-                self.operand_to_rcx(rhs);
-                if ty == IrType::F32 {
-                    self.state.emit_fmt(format_args!("    movd %ecx, %{}", reg));
-                } else {
-                    self.state.emit_fmt(format_args!("    movq %rcx, %{}", reg));
-                }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, suffix, reg, reg, reg
-                ));
-            }
-            Operand::Const(IrConst::F64(v)) => {
-                let bits = v.to_bits();
-                if bits == 0 {
-                    self.state
-                        .emit_fmt(format_args!("    xorpd %{}, %{}", reg, reg));
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state
-                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", label, reg));
-                }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, suffix, reg, reg, reg
-                ));
-            }
-            Operand::Const(IrConst::F32(v)) => {
-                let bits = v.to_bits() as u64;
-                if bits == 0 {
-                    self.state
-                        .emit_fmt(format_args!("    xorps %{}, %{}", reg, reg));
-                } else {
-                    let label = self.state.get_fp_const_label(bits);
-                    self.state
-                        .emit_fmt(format_args!("    movss {}(%rip), %{}", label, reg));
-                }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, suffix, reg, reg, reg
-                ));
-            }
-            _ => {
-                self.operand_to_rcx(rhs);
-                if ty == IrType::F32 {
-                    self.state.emit_fmt(format_args!("    movd %ecx, %{}", reg));
-                } else {
-                    self.state.emit_fmt(format_args!("    movq %rcx, %{}", reg));
-                }
-                self.state.emit_fmt(format_args!(
-                    "    {}{} %{}, %{}, %{}",
-                    mnemonic, suffix, reg, reg, reg
-                ));
-            }
+        // VEX 3-operand: `vop src2, src1, dest`  =>  dest = src1 `op` src2
+        // (AT&T). Never materialise a constant 0 by xor'ing `reg` after
+        // `reg` already holds the other operand (dot-product: mul into
+        // xmm2 then `s=0 + p` xorpd'd the product away).
+        let emit_vop = |this: &mut Self, src2: &str, src1: &str| {
+            this.state.emit_fmt(format_args!(
+                "    {}{} {}, %{}, %{}",
+                mnemonic, suffix, src2, src1, reg
+            ));
+        };
+
+        if dest_holds_lhs && dest_holds_rhs {
+            emit_vop(self, &format!("%{}", reg), reg);
+            self.state.reg_cache.invalidate_acc();
+            return true;
         }
+        if dest_holds_lhs {
+            // dest already has lhs: dest = lhs op rhs.
+            self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        if dest_holds_rhs && commutative {
+            // dest already has rhs: dest = rhs op lhs == lhs op rhs.
+            self.emit_fp_src2_then_vop(lhs, ty, reg, mnemonic, suffix);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        if dest_holds_rhs && !commutative {
+            // dest has rhs, need lhs op rhs. Stage lhs in xmm0 (scratch).
+            self.load_fp_to_reg(lhs, ty, "xmm0");
+            emit_vop(self, &format!("%{}", reg), "xmm0");
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+
+        // dest holds neither operand. Load lhs into dest, then op with rhs.
+        // NOTE: `0.0 + rhs` is NOT folded to `rhs` here: +0.0 + (-0.0) = +0.0
+        // per IEEE-754 (observable via signbit), and GCC keeps the add for
+        // exactly this reason at -O2. Only -fno-signed-zeros may fold it,
+        // which LCCC does not plumb into codegen yet.
+        self.load_fp_to_reg(lhs, ty, reg);
+        self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix);
         self.state.reg_cache.invalidate_acc();
         true
     }
 
+    /// Emit `vop src2, %reg, %reg` where src2 is rhs (mem / xmm / const / scratch).
+
+    /// Constants — including +0.0 — are never written into `reg`.
+
+    fn emit_fp_src2_then_vop(
+        &mut self,
+        src: &Operand,
+        ty: IrType,
+        dest: &str,
+        mnemonic: &str,
+        suffix: &str,
+    ) {
+        let vop = |this: &mut Self, src2: String| {
+            this.state.emit_fmt(format_args!(
+                "    {}{} {}, %{}, %{}",
+                mnemonic, suffix, src2, dest, dest
+            ));
+        };
+        match src {
+            Operand::Value(v) => {
+                if let Some(&r) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(r) {
+                        vop(self, format!("%{}", phys_reg_name(r)));
+                        return;
+                    }
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    vop(self, self.slot_ref(slot.0));
+                    return;
+                }
+                // Scratch xmm0: dest is live with lhs; do not reload src into dest.
+                self.load_fp_to_reg(src, ty, "xmm0");
+                vop(self, "%xmm0".into());
+            }
+            Operand::Const(IrConst::F64(c)) => {
+                let label = self.state.get_fp_const_label(c.to_bits());
+                vop(self, format!("{}(%rip)", label));
+            }
+            Operand::Const(IrConst::F32(c)) => {
+                let label = self.state.get_fp_const_label(c.to_bits() as u64);
+                vop(self, format!("{}(%rip)", label));
+            }
+            _ => {
+                self.load_fp_to_reg(src, ty, "xmm0");
+                vop(self, "%xmm0".into());
+            }
+        }
+    }
+
     /// Emit a scalar unary FP op (sqrtsd/sqrtss/roundsd/...) honoring an
+
     /// XMM-allocated destination: compute straight into the dest register
+
     /// instead of the xmm0 scratch + GPR/store round-trip. Falls back to the
+
     /// xmm0 path when dest has no XMM home.
+
     pub(super) fn emit_fp_scalar_unary(
         &mut self,
         dest: &Option<Value>,
@@ -305,9 +352,13 @@ impl X86Codegen {
     }
 
     /// Scalar directed rounding (vroundsd/vroundss imm). VEX 3-operand form
+
     /// to stay in the VEX domain with the vmul/vadd/vsqrt paths (no
+
     /// SSE/VEX transition stalls). Computes straight into an XMM-allocated
+
     /// destination when there is one, mirroring emit_fp_scalar_unary.
+
     pub(super) fn emit_fp_scalar_round(
         &mut self,
         dest: &Option<Value>,
@@ -315,7 +366,11 @@ impl X86Codegen {
         ty: IrType,
         imm: u8,
     ) {
-        let inst = if ty == IrType::F32 { "vroundss" } else { "vroundsd" };
+        let inst = if ty == IrType::F32 {
+            "vroundss"
+        } else {
+            "vroundsd"
+        };
         if let Some(d) = dest {
             if let Some(&reg) = self.reg_assignments.get(&d.0) {
                 if is_xmm_reg(reg) {
@@ -350,18 +405,19 @@ impl X86Codegen {
             }
         }
         self.load_fp_to_xmm0(arg, ty);
-        self.state.emit_fmt(format_args!(
-            "    {} ${}, %xmm0, %xmm0, %xmm0",
-            inst, imm
-        ));
+        self.state
+            .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0, %xmm0", inst, imm));
         if let Some(d) = dest {
             self.store_xmm0_fp_dest(d, ty);
         }
     }
 
     /// copysign(x, y): |x| bits OR'd with y's sign bit — three VEX bit ops
+
     /// against rodata masks, no branches, no libm call. The libm call is not
+
     /// merely slow: inside glibc's own s_copysign.c it recurses.
+
     pub(super) fn emit_fp_copysign(
         &mut self,
         dest: &Option<Value>,
@@ -370,12 +426,7 @@ impl X86Codegen {
         ty: IrType,
     ) {
         let (andp, orp, abs_mask, sign_mask) = if ty == IrType::F32 {
-            (
-                "vandps",
-                "vorps",
-                0x7FFF_FFFFu64,
-                0x8000_0000u64,
-            )
+            ("vandps", "vorps", 0x7FFF_FFFFu64, 0x8000_0000u64)
         } else {
             (
                 "vandpd",
@@ -426,7 +477,9 @@ impl X86Codegen {
     }
 
     /// XMM register home of an FP operand, if it has one (excluding the
+
     /// xmm0/xmm1 scratch pair which the copysign sequence overwrites).
+
     fn fp_arg_xmm_home(&self, arg: &Operand) -> Option<&'static str> {
         if let Operand::Value(v) = arg {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -702,9 +755,13 @@ impl X86Codegen {
     }
 
     /// Load an FP operand directly into an XMM register, using the constant pool
+
     /// for FP literal constants instead of going through a GPR. Value operands
+
     /// allocated to an XMM register or a stack slot are loaded directly with
+
     /// `movsd`/`movss`; the GPR path is only a last-resort fallback.
+
     pub(super) fn emit_fp_operand_to_xmm(&mut self, op: &Operand, ty: IrType, xmm: &str) {
         match op {
             Operand::Const(IrConst::F64(v)) => {
@@ -827,8 +884,11 @@ impl X86Codegen {
     }
 
     /// Stage an FP store value in an XMM register: returns the value's own
+
     /// XMM register when it has one, otherwise loads it into %xmm0 and
+
     /// returns "xmm0". Never clobbers %rcx (safe after address setup).
+
     pub(super) fn fp_store_value_xmm(&mut self, val: &Operand, ty: IrType) -> &'static str {
         if let Operand::Value(v) = val {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
@@ -842,7 +902,9 @@ impl X86Codegen {
     }
 
     /// `add_dest = acc + mul_lhs * mul_rhs` via vfmadd231sd/ss.
+
     /// AT&T: vfmadd231sd src2, src1, dest  with dest holding acc.
+
     pub(super) fn emit_scalar_fma231(
         &mut self,
         mul_lhs: &Operand,
@@ -860,10 +922,15 @@ impl X86Codegen {
     }
 
     /// Fused multiply-subtract via FMA3 (levkropp e3b21b8f, audited port).
+
     /// FMA3 231-form semantics: dest = (src2 * src1) OP dest, dest preloaded
+
     /// with `acc`:
+
     ///   mul_is_lhs == true  (product - acc): vfmsub231  = z*y - x
+
     ///   mul_is_lhs == false (acc - product): vfnmadd231 = -(z*y) + x
+
     pub(super) fn emit_scalar_fms231(
         &mut self,
         mul_lhs: &Operand,
@@ -947,10 +1014,7 @@ impl X86Codegen {
                         Operand::Value(v) => match xmm_home(mul_rhs) {
                             Some(n) if n != dest_name => Some(format!("%{}", n)),
                             Some(_) => None,
-                            None => self
-                                .state
-                                .get_slot(v.0)
-                                .map(|slot| self.slot_ref(slot.0)),
+                            None => self.state.get_slot(v.0).map(|slot| self.slot_ref(slot.0)),
                         },
                         // FP constant: RIP-relative memory operand, exactly
                         // what GCC feeds vfmadd231sd for literal multipliers.

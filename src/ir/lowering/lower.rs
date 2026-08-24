@@ -43,6 +43,9 @@ pub struct Lowerer {
     pub(super) module: IrModule,
     /// Per-function build state. None between functions, Some during lowering.
     pub(super) func_state: Option<FunctionBuildState>,
+    /// FP expression tags for the function being lowered (OP-36). Attached
+    /// to the IrFunction at finalization; see [`Self::tag_fp_expr`].
+    pub(super) fp_expr_tags: crate::common::fp_contract::FpExprTags,
     // Global variable tracking
     pub(super) globals: FxHashMap<String, GlobalInfo>,
     // Set of known function names
@@ -197,6 +200,7 @@ impl Lowerer {
             next_static_local: 0,
             module: IrModule::new(),
             func_state: None,
+            fp_expr_tags: Default::default(),
             globals: FxHashMap::default(),
             known_functions,
             defined_functions: FxHashSet::default(),
@@ -1365,6 +1369,14 @@ impl Lowerer {
         let span = self.func_mut().current_span;
         self.func_mut().instrs.push(inst);
         self.func_mut().instr_spans.push(span);
+    }
+
+    /// Record the FP expression tag for `dest` (OP-36). Tags accumulate in
+    /// a side buffer owned by the lowering state and are attached to the
+    /// `IrFunction` when the function body is finalized.
+    pub(super) fn tag_fp_expr(&mut self, dest: Value) {
+        let root = self.func_mut().fp_expr_root;
+        self.fp_expr_tags.entry(dest.0).or_insert(root);
     }
 
     /// Emit an alloca into the entry block buffer.

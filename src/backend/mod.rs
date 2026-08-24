@@ -142,7 +142,7 @@ pub(crate) struct CodegenOptions {
     /// same contract via run_passes; both consumers must agree or
     /// -ffp-contract=off silently loses its single-rounding guarantee in
     /// whichever layer was forgotten.
-    pub(crate) fp_contract_fast: bool,
+    pub(crate) fp_contract: crate::common::fp_contract::FpContract,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     /// When true, functions do not set up EBP as a frame pointer, freeing it
     /// as a general register and saving prologue/epilogue instructions.

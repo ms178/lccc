@@ -418,6 +418,14 @@ impl Lowerer {
                     rhs: rhs_val,
                     ty: op_ty,
                 });
+                // OP-36: tag FP Mul/Add/Sub results with the current
+                // statement root so -ffp-contract=on can contract within
+                // one source expression and never across statements.
+                if matches!(op_ty, IrType::F32 | IrType::F64)
+                    && matches!(op, BinOp::Mul | BinOp::Add | BinOp::Sub)
+                {
+                    self.tag_fp_expr(dest);
+                }
             }
         }
 

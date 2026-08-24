@@ -9,6 +9,30 @@ Evidence: **M** measured LCCC vs GCC14 on kernels; **G** Compiler Explorer (`cg1
 
 Count: P0 5 + RA 27 + IS 28 + OP 34 + FE 22 + AB 15 + PG 12 + LK 18 + MS 9 = **170** (extra items are refinements; drop `[NEW]`/`[REFINED]` tags when stable).
 
+### Peephole/RA ledger from the kernel corpus (`tests/benchmark/kernel_corpus` + `scripts/kernel_count.py`)
+
+Measured with `scripts/kernel_count.py` (per-function instruction counts, LCCC
+`-O2` vs system GCC `-O2`). Corpus baseline before this ledger: **LCCC 375 vs
+GCC 264**; after PF-01/PF-02: **LCCC 363 vs GCC 264**.
+
+| ID | P | Item | Evidence | Status |
+|----|---|------|----------|--------|
+| PF-01 | DONE | `eliminate_move_relays` — delete `mov %S,%D` feeding a single ALU source (`relay_and_lea.rs`) | sum8 15→14, hash 20→19, strcmp 27→26, adler 105→99 | shipped, default-on |
+| PF-02 | DONE | `fold_lea_into_load` — windowed single-base `lea`→memory-operand fold for unrolled loops | adler 99→98, strlen 14→13, crc 30→29 | shipped, default-on |
+| PF-03 | P1 | setcc/movzbl + mov/add-1/test/cmov → `add` of the 0/1 boolean | cntz 22 vs GCC 13 | designed, NOT shipped: `cmovneq %r8,%rbx` preserves the upper 32 bits of `%rbx` on the not-taken path while `addl` zero-extends. Needs a proof that every definition of the cmov destination is a 32-bit (zero-extending) write. |
+| PF-04 | P1 | Dead reg-move elimination with dominance-correct liveness (a label fallthrough can read the copy after a block-local scan stops) | corpus −25 in a prototype, but unsound as a text scan | needs CFG-aware liveness before any attempt |
+| PF-05 | P0 | RA-03 next-use eviction: adler keeps eight byte temporaries live for the s2 recurrence and spills `s1`/`s2` to the frame | adler 98 vs GCC 63 | see RA-03 |
+| PF-06 | P1 | `isort` shift-store recognition; `scmp` compare width fold | isort 47 vs 23, scmp 26 vs 22 | open |
+| PF-07 | P1 | crc32 SIB fold `xorl table(,%reg,4)` (RA-01 follow-up) | crc 29 vs GCC 18 | open |
+
+Soundness notes discovered while measuring PF-01/PF-02 (encoded as unit tests
+in `relay_and_lea.rs`): register liveness must be family-wide (a `%ecx` write
+kills `%rcx`), source operands must be rewritten only when the register text
+matches exactly (width-exact), and whole-function "no other mention" deadness
+is invalid for `%rdi..%r9`/`%rax`/`%r10` in functions containing a call or tail
+jump (implicit SysV argument and static-chain reads) and for `%rax`/`%rdx` at
+`ret`.
+
 ## 1. How to gather data (mandatory)
 
 ```text
@@ -555,3 +579,115 @@ RA-05a and RA-06a are the biggest single codegen wins on the table (gzip,
 expat, zlib, glibc, xmltok, inflate all bottleneck on spill traffic today)
 and are the two items the OpenAI audit most strongly supports — but they
 must be landed incrementally with kill switches, not as a rewrite.
+
+---
+
+## §13 Session 66 (2026-08-23/24) — P0/P1 execution: RA-05a, IS-29a, OP-05a, OP-36+MS-13, MS-01a
+
+Base: `d35353c` (main tip, verified against GitHub). All items landed with
+kill switches, unit tests, and A/B measurements; regression corpus stayed
+at the pre-existing 20 failures throughout (431→432 pass: +1 = new
+stencil_vectorize regression test).
+
+### 13.1 Landed
+
+| Commit | Item | Summary | Measured |
+|---|---|---|---|
+| `be097c3` | **RA-05a** (#185) | `liveness.segments` is the scan's primary interference model: `LiveRange::segs` + `segments_conflict` (guarded die-at-birth on the hint path only), coalesce-leader piece/use UNION, `seeded_until` split from `reg_free_until`, hot-escape fallback eviction (ratio 8, fallback-only), last-resort multi-victim sweep eviction (loop-weighted traffic-guarded), segment-aware `verify_handled_history`, segment-aware load→cast fold guard (prologue). Kill switch `CCC_NO_SEGMENT_RA`; `CCC_EVICT_HOT_RATIO=0` disables both eviction extensions. | stack-mem total 370→320 (−13.5%); sqlite_varint 42→11, gzip_crc32 7→0, adler32 78→71; runtime adler 55.1 vs 57.5 ms, hash_table −16%, expat −7% |
+| `857ebde` | **IS-29a** (#187) | F32/F64 returns load directly into xmm0 via `load_fp_to_xmm0` — no more `%rax` bounce or stack staging on any FP return (PERF-1 class). | f/g/h/k FP-return shapes all XMM-domain; libm_round_family clean |
+| `88d42bd` | **OP-05a** (#188) | Stencil vectorizer: generalized non-reduction FP loops (N taps at constant element offsets from one base, affine-IV byte model `(iv+k)*elem`, single store, alias-safe). Vector body mirrors the scalar expression TREE → bit-exact with NO fast-math; Sub via `Mul(y,-1)+Add` (IEEE-exact); FMA only under Fast. Backend: disp-form `vmovups disp(%base,%idx)` vector accesses, defer-overflow XMM homes for multi-tap values (`CCC_NO_DEFER_OVERFLOW_VECREG`), direct-to-home loads, all-homed 3-operand VEX ops. | fp_memfold_stencil5: 7.8→5.2 ms (gcc 4.8) = 1.08×, checksums bit-identical; n=0..40 trip sweep bit-exact |
+| `a41a9b5` | **OP-36 + MS-13** (#189/#191) | `FpContract { Off, OnExpr, Fast }` tri-state threaded through cli→pipeline→passes→backend; frontend tags every FP Mul/Add/Sub with its statement root (`IrFunction::fp_expr_tags`); `detect_mul_add_fusions`/`detect_gap_fma_fusions` pair-gate float candidates. Inlined values are untagged → fail closed. | `-ffp-contract=on` fuses `return a*b+c` (vfmadd) but NOT `t=a*b; t+c` — exact GCC `on` semantics |
+| (this) | **MS-01a** (#190) | `ci-codegen-gate.py` + checked-in baseline: per-workload tolerance bands (insns ±2%, stackmem ±5%, pushes ±10%) on gzip_crc32, zlib_ng_adler32, expat_xml_scan, sqlite_varint, glibc_memcmp, hash_table + stencil5 sentinel; wired into bench.yml as a hard gate; ci-bench.py gains not-slower-than ceilings for Arith/MatMul/Qsort/Sieve. Tamper-verified the gate fires. | gate catches a fabricated +137% stackmem regression |
+| (this) | cleanup | Removed the duplicated `CCC_LOOP_SPLIT` block in pipeline.rs (verbatim copy-paste junk from a prior session; the second copy ran the opt-in pass twice). | — |
+
+### 13.2 Key engineering decisions (and why)
+
+1. **Segments as under-approximation, not replacement.** The fat model is
+   still the fallback everywhere a value has no segment data (synthetic
+   vecreg intervals, tests). Every old decision remains representable, and
+   `CCC_NO_SEGMENT_RA` restores the exact fat model for bisection.
+2. **The die-at-birth waiver is hint-path-only** (`adjacent_ok=true`).
+   The first iteration of RA-05a applied it on the rotation path too and
+   *immediately* reproduced the documented `or %r9,%r9` sqlite_get_varint
+   miscompile — the invariants comment is load-bearing.
+3. **Cross-wave occupancy needed its own map.** `reg_free_until` served
+   two roles (advisory scalar + hard cross-wave reservation). Segment
+   sharing makes in-wave occupancy multi-valued, so the hard reservation
+   moved to `seeded_until` and the advisory map became monotone (max).
+4. **Sweep eviction is traffic-guarded, not priority-guarded.** The adler32
+   starvation (v522, 1200 weighted uses slotted while 110-use holders kept
+   registers) was an economic failure, not a ranking failure: the fix
+   requires `future_traffic(holders) < incoming_traffic` so every sweep is
+   provably a net win. The hot-ratio (8×) version alone was NOT enough —
+   same-loop competition made the ratio unreachable.
+5. **The load→cast fold guard had to become segment-aware too.** RA-05a
+   initially *regressed* adler32 despite better register counts: the fold
+   guard's fat-interval test refused folds whenever any holder's HULL
+   covered the load point. Fixing the allocator without fixing every
+   fat-interval consumer that makes sharing-adjacent decisions would have
+   shipped a regression.
+6. **OnExpr contraction needs statement identity, not source columns.**
+   Expression tags are per-statement ROOTS (bumped per `lower_stmt`), not
+   spans: lowering order, inlining, and copy-prop change instruction
+   adjacency constantly, but "same statement" survives all of them. UNTAGGED
+   values fail closed — pass-created and inlined muls/adds never fuse
+   under `on`, which is the GCC-comparable conservative bound.
+7. **CI gates measure codegen, not wall-clock.** Shared runners make
+   runtime ratios flap; instruction/stackmem/ymm/fma counts are
+   deterministic. The runtime ceilings exist but wide; the codegen
+   baseline carries the real protection.
+
+### 13.3 Follow-up work
+
+1. **RA-06a (#186) remains open**: Wimmer-style reload-at-use inside the
+   scan (this session deliberately shipped the interference half only).
+   The sweep-eviction machinery added here is the stepping stone: the
+   traffic model is the same one a split decision needs.
+2. **nbody force loop** still does not match the stencil shape (two
+   stores: `bodies[i].vx -= …` and `bodies[j].vx += …` — the analyzer
+   requires exactly one). A multi-store stencil variant (like GCC's
+   loop-distribution + SLP) is the natural extension; the alias machinery
+   is already in place.
+3. **AArch64 stencil** is analyzed but disabled (NEON disp-form loads not
+   wired). Wire `VecLoad*(base, off, disp)` in the arm backend.
+4. **The vecreg allocator is now segment-aware but still wave-based**;
+   long term the Tier-2 graph colorer should consume pieces directly.
+5. `hash_table` is −16% runtime with RA-05a but still 17.4s vs GCC — the
+   remaining gap is hash-multiply codegen (imul chains), not RA.
+
+---
+
+## §14 Session 67 (2026-08-24) — Agent A/B/C red-team audit + follow-ups
+
+Base: `d35353c` (re-verified = main tip). Every agent patch was applied to a
+review branch, executed, fuzzed, and either merged (with repairs), ported (as
+ideas), or rejected with measurements.
+
+### 14.1 Audit verdicts
+
+| Agent | Claim | Verdict | Action taken |
+|---|---|---|---|
+| **A** | `emit_float_binop_into_reg` xorpd-dest-clobber after a coalesced multiply (12 baseline FAILs) | **CONFIRMED REAL MISCOMPILE on main** — dot4 reproducer returns 65 for 70; root cause of 17 of the 20 "pre-existing" regression failures | **MERGED with repair**: the VEX 3-operand/never-xor-live-dest fix is kept; A's `0.0 + rhs → rhs` fold was REMOVED (+0.0 + (−0.0) = +0.0 is signbit-observable and GCC keeps the add); A's SSO bitfield rework REJECTED — measured ZERO observable delta vs baseline in both test shapes (same round-trip AND same wrong wire bytes `00 00 f8 aa` vs GCC `aa f8 00 00`): 20 frontend files churned for an internal representation change that completes nothing |
+| **B** | Multi-piece occupancy implemented & rejected (miscompiles adler/switch_dispatch); residual fill ranking clean; OccupancyMap RA-06 infra | **AGREE with both the rejection and the caution.** B's occupancy-rejection independently validates RA-05a's design choice (segments for INTERFERENCE-disjointness, never for occupancy windows). The unwired AllocationMap was correctly NOT shipped | **PORTED** the Phase 2f ranking (multi-piece-first + pressure gate ≥ 8) and — after independent validation (regression w/ VERIFY hard-abort, 300/300 O2/O3 fuzz, byte-identical FP outputs, stack-mem 318→294) — **flipped the default ON for x86-64** (B had left it opt-in; the gated version measured clean twice). Unwired infra not ported |
+| **C** | relay/LEA windowed peepholes + kernel corpus; cmov fold designed but NOT shipped (upper-32-bit hazard) | **SOUND — merged as-is.** The deadness contract is genuinely careful: family-wide liveness, width-exact rewrites, ABI-implicit-read refusal at calls/tail-jumps (static-chain r10!), ret reads, div/mul implicit traffic, pinned inline-asm. The xchg hazard is closed (backend never emits xchg outside pinned asm). C's refusal to ship the unsound cmov fold and the label-fallthrough dead-move pass is exactly the right call | **MERGED unchanged** (15-kernel corpus execution verified output-identical vs GCC; PF-07 implemented from C's ledger — see below) |
+
+### 14.2 Follow-up work landed this session
+
+| Item | Status | Detail |
+|---|---|---|
+| **RA-05a verifier semantics** | **FIXED** | Running `CCC_VERIFY_REGALLOC` over the correctness corpus (never done before!) exposed the eviction handoff being flagged as an overlap: an evicted range's occupancy is HALF-OPEN `[start, cut)` — the incoming takes the register AT the cut — while natural expiry keeps the closed window + guarded die-at-birth waiver. `verify_handled_history` now models both. |
+| **PF-07 PIC table-base hoist** | **DONE** | In PIC mode an indexed symbol access re-emitted `leaq sym(%rip), %rcx` per iteration. A GlobalAddr defined at a strictly shallower loop depth than an indexed GEP consumer is promoted out of the never-materialized set → RA homes it → generated once → SIB reads the home (`movl (%r9,%r10,4), %r13d`). crc32k loop: per-iteration leaq eliminated; expat 55.2→50.5 ms (0.98× vs GCC — now a WIN). Kill switch: `CCC_NO_GLOBAL_ADDR_REMAT`. |
+| Residual fill default | **DONE** | See B's verdict above. |
+| RA-06a reload-at-use | **OPEN (documented)** | The sweep-eviction traffic model + B's occupancy-record design are the stepping stones; a full Wimmer split needs the location map wired into emit. Not riskable in this patch. |
+| Multi-store stencil (nbody) | **OPEN (documented)** | nbody's force loop has SIX stores (3× bodies[i].*, 3× bodies[j].*) across two IVs plus field-sensitive load/store disambiguation (x/y/z vs vx/vy/vz). Sound incremental vectorization needs cross-iteration dependence analysis GCC solves by restructuring; skipped deliberately — a miscompile here is worse than the gap. |
+| PF-03 cmov fold, PF-04 dead moves, PF-05 adler RA-03, PF-06 isort | **OPEN** | In C's ledger with soundness obstacles recorded. |
+
+### 14.3 Post-merge validation (all with the final tree)
+
+- Regression: **449 pass / 3 fail** (all 3 = missing i686 ELF interpreter on this host; the other 17 former failures were A's xorpd bug)
+- Unit tests: **1118** pass (10 new = C's peephole tests)
+- Correctness suite: **50/50**; differential fuzz **600/600** at O0/O2/O3/Os; phi-CFG fuzz **360/360**
+- Kernel corpus: **15/15** output-identical vs GCC
+- Codegen gate: PASS (baseline refreshed — adler 344/56, expat 268/11, sqlite 431/13, crc 192/0)
+- `CCC_VERIFY_REGALLOC=1` over the whole regression corpus: clean (after the window-semantics fix)
+- Paired runtime vs GCC -O2 (best-of-3, output-checked): wins on expat 0.98×, double_reduction 0.93×, binary_search 0.88×; ties crc/ascii/switch/ring; remaining gaps adler 1.58×, find_bit 1.86×, mandelbrot 1.65×, sqlite 1.33×

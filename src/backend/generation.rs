@@ -2036,6 +2036,8 @@ fn detect_mul_add_fusions(
     block: &BasicBlock,
     use_counts: &[u32],
     fuse_float: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
+    fp_tags: &crate::common::fp_contract::FpExprTags,
     // Integer `acc - a*b` -> msub (AArch64; see supports_fused_int_mul_sub).
     fuse_int_sub: bool,
     // Float Mul;Sub -> fmsub/fnmsub (levkropp e3b21b8f, audited port).
@@ -2163,6 +2165,18 @@ fn detect_mul_add_fusions(
         if defined_between(add_lhs) || defined_between(add_rhs) || mul_ty != add_ty {
             continue;
         }
+        // OP-36: FP contraction is pair-gated. `fast` fuses freely; `on`
+        // requires the mul and the add to share one statement-root tag
+        // (same source expression); untagged values (pass-generated,
+        // inlined) fail closed. Integer fusion is unaffected.
+        if mul_ty.is_float() {
+            let add_dest = block.instructions[next_idx].dest().map(|d| d.0);
+            let mul_tag = fp_tags.get(&mul_dest.0).copied();
+            let add_tag = add_dest.and_then(|a| fp_tags.get(&a).copied());
+            if !fp_contract.fuse_pair(mul_tag, add_tag) {
+                continue;
+            }
+        }
         claimed_adds.insert(next_idx);
         fusion_map.insert(idx, next_idx);
     }
@@ -2184,11 +2198,21 @@ fn detect_gap_fma_fusions(
     use_counts: &[u32],
     fuse_float: bool,
     accumulator_dests: &FxHashSet<u32>,
+    fp_contract: crate::common::fp_contract::FpContract,
+    fp_tags: &crate::common::fp_contract::FpExprTags,
 ) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     if !fuse_float || env_flag_set("CCC_NO_GAP_FMA") {
         return out;
     }
+    // OP-36 pair gate helper: integer candidates skip the contract check.
+    struct FpIntHelper;
+    impl FpIntHelper {
+        fn like(&self, ty: &IrType) -> bool {
+            !ty.is_float()
+        }
+    }
+    let FP_INT = FpIntHelper;
     for (idx, inst) in block.instructions.iter().enumerate() {
         let (mul_dest, mul_ty) = match inst {
             Instruction::BinOp {
@@ -2226,7 +2250,15 @@ fn detect_gap_fma_fusions(
                     // Accumulator gate mirrors the fmsub/fmadd policy: fusing
                     // into a loop-carried accumulator lengthens the serial
                     // dependency chain.
-                    if mul_used && add_ty == mul_ty && !accumulator_dests.contains(&add_dest.0) {
+                    if mul_used
+                        && add_ty == mul_ty
+                        && !accumulator_dests.contains(&add_dest.0)
+                        && (FP_INT.like(mul_ty)
+                            || fp_contract.fuse_pair(
+                                fp_tags.get(&mul_dest.0).copied(),
+                                fp_tags.get(&add_dest.0).copied(),
+                            ))
+                    {
                         found = Some(j);
                     }
                     break;
@@ -3094,6 +3126,13 @@ fn generate_function(
         FxHashSet::default()
     };
     dead_global_addrs.extend(remat_global_addrs.iter().copied());
+    // PF-07: the prologue promoted PIC indexed-symbol bases (defined at a
+    // shallower loop depth than their consumers) out of the
+    // never-materialized set so RA homes them. Honour that here: skipping
+    // emission would leave the SIB base register unwritten.
+    for v in &cg.state_ref().promoted_global_addr_homes {
+        dead_global_addrs.remove(v);
+    }
 
     // Indexed-fold guaranteed-offset-producer skipping (session 27): when an
     // indexed GEP folds into a Load's SIB memory operand, the GEP's offset
@@ -3214,6 +3253,8 @@ fn generate_function(
             block,
             &value_use_counts,
             cg.supports_fused_float_mul_add(),
+            cg.fp_contract(),
+            &func.fp_expr_tags,
             cg.supports_fused_int_mul_sub(),
             if cg.supports_fused_float_mul_sub() && !env_flag_set("CCC_NO_FMSUB") {
                 Some(&accumulator_dests)
@@ -3237,6 +3278,8 @@ fn generate_function(
             &value_use_counts,
             cg.supports_fused_float_mul_add(),
             &accumulator_dests,
+            cg.fp_contract(),
+            &func.fp_expr_tags,
         ) {
             let Instruction::BinOp {
                 lhs: mul_lhs,
