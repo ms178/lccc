@@ -1503,6 +1503,7 @@ impl Driver {
                 && self.enable_avx
                 && !self.no_sse
                 && !self.general_regs_only,
+            self.enable_fma,
         );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
@@ -1925,6 +1926,7 @@ impl Driver {
             code16gcc: self.code16gcc,
             regparm: self.regparm,
             fp_contract: self.fp_contract,
+            fma: self.enable_fma,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,

@@ -847,10 +847,12 @@ impl X86Codegen {
                     (EightbyteClass::Integer, EightbyteClass::Sse) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
                             self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-                            self.state.emit("    movq %xmm0, %rdx");
+                            // SSE eightbyte: store %xmm0 directly (movq
+                            // xmm→m64 is baseline SSE2); the old %rdx relay
+                            // was an FP-domain round-trip for no reason.
                             self.state
                                 .out
-                                .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
                         self.flush_pending_vec_store_impl();
@@ -858,8 +860,11 @@ impl X86Codegen {
                     }
                     (EightbyteClass::Sse, EightbyteClass::Integer) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
-                            self.state.emit("    movq %xmm0, %rdx");
-                            self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
+                            // Direct xmm0→slot store (baseline SSE2 movq);
+                            // no GPR relay.
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
                             self.state
                                 .out
                                 .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
@@ -870,12 +875,15 @@ impl X86Codegen {
                     }
                     (EightbyteClass::Sse, EightbyteClass::Sse) => {
                         if let Some(slot) = self.state.get_slot(dest.0) {
-                            self.state.emit("    movq %xmm0, %rax");
-                            self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
-                            self.state.emit("    movq %xmm1, %rax");
+                            // Both halves are SSE: two direct xmm stores,
+                            // replacing the double movq→rax relay (2 extra
+                            // insns and two false GPR dependencies).
                             self.state
                                 .out
-                                .emit_instr_reg_rbp("    movq", "rax", slot.0 + 8);
+                                .emit_instr_reg_rbp("    movq", "xmm0", slot.0);
+                            self.state
+                                .out
+                                .emit_instr_reg_rbp("    movq", "xmm1", slot.0 + 8);
                         }
                         self.state.reg_cache.invalidate_all();
                         self.flush_pending_vec_store_impl();

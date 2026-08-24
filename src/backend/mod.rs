@@ -143,6 +143,13 @@ pub(crate) struct CodegenOptions {
     /// -ffp-contract=off silently loses its single-rounding guarantee in
     /// whichever layer was forgotten.
     pub(crate) fp_contract: crate::common::fp_contract::FpContract,
+    /// Whether the x86 target has FMA3 (`-mfma` or an enabling `-march` such
+    /// as x86-64-v3). Scalar FMA fusion (`vfmadd231s{s,d}`) is contraction
+    /// *and* an ISA feature: GCC only emits it when both are present, and
+    /// emitting FMA3 on a baseline (SSE2) target is SIGILL on pre-Haswell
+    /// hardware. AArch64 needs no such gate (`fmadd` is baseline ISA there);
+    /// i686/RISC-V never emit fused FP mul-add.
+    pub(crate) fma: bool,
     /// Whether to omit the frame pointer (-fomit-frame-pointer).
     /// When true, functions do not set up EBP as a frame pointer, freeing it
     /// as a general register and saving prologue/epilogue instructions.
