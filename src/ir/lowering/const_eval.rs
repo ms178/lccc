@@ -244,8 +244,14 @@ impl Lowerer {
             }
             // Handle &((type*)0)->member pattern (offsetof)
             Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
-            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
-                let result = self.eval_types_compatible(type1, type2);
+            Expr::BuiltinTypesCompatibleP(
+                ref type1,
+                ref type2,
+                ref qualifiers1,
+                ref qualifiers2,
+                _,
+            ) => {
+                let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
                 Some(IrConst::I64(result as i64))
             }
             // Handle compile-time builtin function calls in constant expressions.

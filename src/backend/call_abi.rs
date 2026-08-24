@@ -653,7 +653,11 @@ fn classify_args_core(
                     float_idx += 1;
                 } else {
                     result.push(CoreArgClass::StructByValStack { size });
-                    int_idx = config.max_int_regs;
+                    // SysV aggregate assignment is transactional: if the
+                    // complete aggregate does not fit, it goes to memory and
+                    // register allocation rolls back to its pre-aggregate
+                    // state. In particular an SSE overflow must not consume or
+                    // kill an otherwise-free GP register.
                 }
                 continue;
             }
@@ -698,8 +702,12 @@ fn classify_args_core(
                         });
                     }
                     SysvStructRegClass::Stack => {
+                        // SysV AMD64 3.2.3: register assignment for an
+                        // aggregate is all-or-nothing. On overflow the complete
+                        // value is passed on the stack and both register cursors
+                        // remain at their pre-aggregate positions, allowing a
+                        // following scalar to use the still-free register.
                         result.push(CoreArgClass::StructByValStack { size });
-                        int_idx = config.max_int_regs;
                     }
                 }
                 int_idx += gp_used;

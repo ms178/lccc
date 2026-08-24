@@ -727,6 +727,20 @@ fn try_complete_unroll_general(
             | Instruction::DynAlloca { .. } => false,
             Instruction::Intrinsic { op, .. } => op.is_pure(),
             Instruction::PgoCounterInc { .. } => false,
+            // The general CFG cloner currently models carried state through
+            // header phis.  Pointer-controlled diamonds can encode additional
+            // mutable state through local pointer objects (often around a
+            // nested loop); substituting the outer IV then made every clone
+            // reuse iteration zero's pointer comparison.  Refuse this shape
+            // until memory-SSA/object-state carrying is explicit.  Numeric and
+            // FP nested loops—the performance target of the general form—are
+            // unaffected.
+            Instruction::Cmp { lhs, rhs, .. }
+                if operand_has_pointer_origin(func, lhs, 0)
+                    || operand_has_pointer_origin(func, rhs, 0) =>
+            {
+                false
+            }
             _ => true,
         }
     };
@@ -1411,6 +1425,51 @@ fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &
 /// not run on yet (the unroller runs before constant folding in the same
 /// pipeline iteration). Resolving the chain here lets the complete-unroll
 /// fixpoint cascade outer→inner within a single `unroll_loops` call.
+/// Whether an operand is transitively an object address. Pointer comparisons
+/// are represented as I64 on x86, so checking only `Cmp.ty == Ptr` misses the
+/// common `p == &local` form used by pointer-state loops.
+fn operand_has_pointer_origin(func: &IrFunction, op: &Operand, depth: usize) -> bool {
+    if depth > 8 {
+        return true; // fail closed for cyclic/very deep value webs
+    }
+    let Operand::Value(value) = op else {
+        return false;
+    };
+    let def = func
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .find(|inst| inst.dest() == Some(*value));
+    match def {
+        Some(
+            Instruction::Alloca { .. }
+            | Instruction::DynAlloca { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::LabelAddr { .. }
+            | Instruction::GetElementPtr { .. },
+        ) => true,
+        Some(Instruction::Copy { src, .. } | Instruction::Cast { src, .. }) => {
+            operand_has_pointer_origin(func, src, depth + 1)
+        }
+        Some(Instruction::Select {
+            true_val,
+            false_val,
+            ..
+        }) => {
+            operand_has_pointer_origin(func, true_val, depth + 1)
+                || operand_has_pointer_origin(func, false_val, depth + 1)
+        }
+        Some(Instruction::Phi { incoming, .. }) => incoming
+            .iter()
+            .any(|(incoming, _)| operand_has_pointer_origin(func, incoming, depth + 1)),
+        Some(Instruction::BinOp { lhs, rhs, .. }) => {
+            operand_has_pointer_origin(func, lhs, depth + 1)
+                || operand_has_pointer_origin(func, rhs, depth + 1)
+        }
+        _ => false,
+    }
+}
+
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
     if depth > 6 {
         return None;

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Run GCC's native x86-64 C torture/execute corpus with LCCC + lccc-ld.
+
+This runner deliberately splits compilation and linking.  LCCC emits each ELF
+object; GCC is used only as a CRT/library *driver* with a private ``ld`` shim
+that points at the requested standalone lccc-ld.  Consequently a PASS proves:
+
+  C source -> LCCC frontend/optimizer/backend/assembler -> .o
+           -> standalone lccc-ld -> executable -> successful execution
+
+A local GCC compile+run establishes native-host eligibility (helper translation
+units and target-gated tests are reported as reference skips, not false LCCC
+failures). GCC output is not compared: gcc.c-torture/execute's contract is the
+exit status, and some valid tests print process addresses or other deliberately
+unstable values.
+
+Examples:
+  scripts/x86_gcc_torture.py --flags=-O2 -j2
+  scripts/x86_gcc_torture.py 20080604-1.c pr51933.c --flags=-O0,-O2,-Os
+  scripts/x86_gcc_torture.py --filter '^(pr12|va-arg)' --json results.json
+
+The GCC checkout is external test input and is never copied into this repo.
+Set GCC_TORTURE or pass --suite to select it.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import dataclasses
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Sequence
+
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
+DEFAULT_LD = REPO / "target" / "fastbuild" / "lccc-ld"
+DEFAULT_SUITE = Path(os.environ.get(
+    "GCC_TORTURE", "/home/user/src/gcc/gcc/testsuite/gcc.c-torture/execute"
+))
+DEFAULT_FLAGS = ("-O0", "-O1", "-O2", "-O3", "-Os")
+_DIRECTIVE = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"([^}]*)\}")
+
+
+@dataclasses.dataclass(frozen=True)
+class Case:
+    source: Path
+    opt_flags: str
+    directive_flags: tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        return f"{self.source.name}[{self.opt_flags}]"
+
+
+@dataclasses.dataclass
+class Result:
+    test: str
+    flags: str
+    directive_flags: list[str]
+    status: str
+    phase: str
+    returncode: int
+    seconds: float
+    detail: str = ""
+
+
+def run(command: Sequence[str], timeout: float, *, cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(command, cwd=cwd, capture_output=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or b""
+        stderr = (exc.stderr or b"") + f"\nTIMEOUT after {timeout:.0f}s".encode()
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
+    except OSError as exc:
+        return subprocess.CompletedProcess(command, 125, b"", str(exc).encode())
+
+
+def detail_of(proc: subprocess.CompletedProcess[bytes], limit: int = 6000) -> str:
+    data = proc.stdout + proc.stderr
+    return data.decode("utf-8", "replace")[-limit:]
+
+
+def native_directive_flags(source: Path) -> tuple[str, ...]:
+    """Read only unconditional dg-options directives.
+
+    Target-qualified directives need DejaGNU effective-target evaluation and
+    are intentionally left to the GCC eligibility oracle. Applying an ia32,
+    newlib, or foreign-ISA option on native x86-64 would corrupt the test.
+    """
+    text = source.read_text(errors="replace")[:8192]
+    result: list[str] = []
+    for match in _DIRECTIVE.finditer(text):
+        trailer = match.group(2)
+        if "target" in trailer:
+            continue
+        result.extend(shlex.split(match.group(1)))
+    return tuple(result)
+
+
+def execute_case(
+    case: Case,
+    *,
+    lccc: Path,
+    lccc_ld: Path,
+    gcc: str,
+    suite: Path,
+    compile_timeout: float,
+    run_timeout: float,
+) -> Result:
+    started = time.monotonic()
+    all_flags = [case.opt_flags, *case.directive_flags]
+    common = ["-w", *all_flags, "-I", str(suite)]
+
+    with tempfile.TemporaryDirectory(prefix="lccc-gcc-torture-") as temp_name:
+        temp = Path(temp_name)
+
+        # Eligibility and behavioral reference. Helper .c files without main,
+        # unsupported host-target requirements, and intentional host xfails end
+        # here without being misreported as compiler failures.
+        reference = temp / "reference"
+        proc = run(
+            [gcc, *common, str(case.source), "-lm", "-o", str(reference)],
+            compile_timeout,
+        )
+        if proc.returncode:
+            return Result(
+                case.source.name, case.opt_flags, list(case.directive_flags),
+                "reference-compile-skip", "reference-compile", proc.returncode,
+                time.monotonic() - started, detail_of(proc),
+            )
+        proc = run([str(reference)], run_timeout)
+        if proc.returncode:
+            return Result(
+                case.source.name, case.opt_flags, list(case.directive_flags),
+                "reference-run-skip", "reference-run", proc.returncode,
+                time.monotonic() - started, detail_of(proc),
+            )
+
+        obj = temp / "test.o"
+        proc = run(
+            [str(lccc), *common, "-c", str(case.source), "-o", str(obj)],
+            compile_timeout,
+        )
+        if proc.returncode:
+            return Result(
+                case.source.name, case.opt_flags, list(case.directive_flags),
+                "compile-fail", "lccc-compile", proc.returncode,
+                time.monotonic() - started, detail_of(proc),
+            )
+
+        # GCC does not accept arbitrary -fuse-ld=<name> values. -B is the
+        # portable driver contract: put an executable named `ld` in a private
+        # prefix. -no-pie matches LCCC's native non-PIE object/code model and
+        # avoids asking the standalone linker's fixed-base emitter for PIE.
+        shim = temp / "ld-shim"
+        shim.mkdir()
+        (shim / "ld").symlink_to(lccc_ld)
+        binary = temp / "lccc"
+        proc = run(
+            [gcc, "-no-pie", f"-B{shim}", str(obj), "-lm", "-o", str(binary)],
+            compile_timeout,
+        )
+        if proc.returncode:
+            return Result(
+                case.source.name, case.opt_flags, list(case.directive_flags),
+                "link-fail", "lccc-ld", proc.returncode,
+                time.monotonic() - started, detail_of(proc),
+            )
+
+        proc = run([str(binary)], run_timeout)
+        if proc.returncode:
+            return Result(
+                case.source.name, case.opt_flags, list(case.directive_flags),
+                "run-fail", "execute", proc.returncode,
+                time.monotonic() - started, detail_of(proc),
+            )
+
+    return Result(
+        case.source.name, case.opt_flags, list(case.directive_flags),
+        "pass", "complete", 0, time.monotonic() - started,
+    )
+
+
+def revision(path: Path) -> str | None:
+    proc = run(["git", "-C", str(path), "rev-parse", "HEAD"], 10)
+    return proc.stdout.decode().strip() if proc.returncode == 0 else None
+
+
+def atomic_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def discover(args: argparse.Namespace) -> list[Path]:
+    available = {path.name: path for path in args.suite.glob("*.c")}
+    if args.tests:
+        selected: list[Path] = []
+        missing: list[str] = []
+        for item in args.tests:
+            name = Path(item).name
+            if not name.endswith(".c"):
+                name += ".c"
+            path = Path(item)
+            if path.is_file():
+                selected.append(path.resolve())
+            elif name in available:
+                selected.append(available[name])
+            else:
+                missing.append(item)
+        if missing:
+            raise ValueError("tests not found: " + ", ".join(missing))
+    else:
+        selected = sorted(available.values())
+    if args.filter:
+        pattern = re.compile(args.filter)
+        selected = [path for path in selected if pattern.search(path.name)]
+    return selected
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("tests", nargs="*", help="exact test paths/names (default: full execute corpus)")
+    parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
+    parser.add_argument("--lccc", type=Path, default=DEFAULT_LCCC)
+    parser.add_argument("--lccc-ld", type=Path, default=DEFAULT_LD)
+    parser.add_argument("--gcc", default=os.environ.get("GCC_BIN", "gcc"))
+    parser.add_argument("--flags", default=",".join(DEFAULT_FLAGS),
+                        help="comma-separated optimization configurations")
+    parser.add_argument("--filter", default="", help="regular expression over basenames")
+    parser.add_argument("-j", "--jobs", type=int, default=2)
+    parser.add_argument("--compile-timeout", type=float, default=60)
+    parser.add_argument("--run-timeout", type=float, default=10)
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("--failure-log", type=Path)
+    parser.add_argument("-v", "--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    args.suite = args.suite.expanduser().resolve()
+    args.lccc = args.lccc.expanduser().resolve()
+    args.lccc_ld = args.lccc_ld.expanduser().resolve()
+    args.gcc = shutil.which(args.gcc) or args.gcc
+
+    for label, path in (("suite", args.suite), ("lccc", args.lccc), ("lccc-ld", args.lccc_ld)):
+        if not path.exists():
+            print(f"error: {label} not found: {path}", file=sys.stderr)
+            return 2
+    try:
+        sources = discover(args)
+    except (ValueError, re.error) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    flags = [item.strip() for item in args.flags.split(",") if item.strip()]
+    if not sources or not flags:
+        print("error: no tests/configurations selected", file=sys.stderr)
+        return 2
+
+    cases = [
+        Case(source, opt, native_directive_flags(source))
+        for source in sources
+        for opt in flags
+    ]
+    print(f"suite:   {args.suite} ({len(sources)} sources)")
+    print(f"lccc:    {args.lccc}")
+    print(f"lccc-ld: {args.lccc_ld}")
+    print(f"matrix:  {len(cases)} cases, jobs={max(1, args.jobs)}")
+
+    started = time.monotonic()
+    results: list[Result] = []
+    counts: Counter[str] = Counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        futures = {
+            pool.submit(
+                execute_case,
+                case,
+                lccc=args.lccc,
+                lccc_ld=args.lccc_ld,
+                gcc=args.gcc,
+                suite=args.suite,
+                compile_timeout=args.compile_timeout,
+                run_timeout=args.run_timeout,
+            ): case
+            for case in cases
+        }
+        for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
+            result = future.result()
+            results.append(result)
+            counts[result.status] += 1
+            if result.status not in {"pass", "reference-compile-skip", "reference-run-skip"}:
+                print(f"{result.status.upper():<20} {result.test}[{result.flags}] rc={result.returncode}")
+                if result.detail:
+                    print("    " + result.detail.strip().splitlines()[-1])
+            elif args.verbose:
+                print(f"{result.status.upper():<20} {result.test}[{result.flags}]")
+            elif index % 250 == 0:
+                print(f"progress {index}/{len(cases)}: {dict(counts)}")
+
+    results.sort(key=lambda item: (item.test, flags.index(item.flags)))
+    elapsed = time.monotonic() - started
+    payload = {
+        "schema": 1,
+        "suite": str(args.suite),
+        "gcc_checkout_head": revision(args.suite.parents[3]),
+        "lccc": str(args.lccc),
+        "lccc_ld": str(args.lccc_ld),
+        "lccc_head": revision(REPO),
+        "gcc": args.gcc,
+        "flags": flags,
+        "jobs": max(1, args.jobs),
+        "elapsed_s": round(elapsed, 3),
+        "counts": dict(sorted(counts.items())),
+        "results": [dataclasses.asdict(result) for result in results],
+    }
+    if args.json:
+        atomic_json(args.json, payload)
+    if args.failure_log:
+        args.failure_log.parent.mkdir(parents=True, exist_ok=True)
+        with args.failure_log.open("w") as stream:
+            for result in results:
+                if result.status in {"pass", "reference-compile-skip", "reference-run-skip"}:
+                    continue
+                stream.write(
+                    f"=== {result.status} {result.test}[{result.flags}] "
+                    f"phase={result.phase} rc={result.returncode} ===\n"
+                    f"{result.detail}\n"
+                )
+
+    print(f"\n== {len(cases)} cases in {elapsed:.1f}s ==")
+    for status, count in sorted(counts.items()):
+        print(f"{status:>24}: {count}")
+    failures = sum(count for status, count in counts.items() if status.endswith("-fail"))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

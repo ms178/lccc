@@ -337,7 +337,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // __builtin_types_compatible_p: int
-            Expr::BuiltinTypesCompatibleP(_, _, _) => Some(CType::Int),
+            Expr::BuiltinTypesCompatibleP(_, _, _, _, _) => Some(CType::Int),
         }
     }
 
@@ -895,9 +895,17 @@ impl<'a> ExprTypeChecker<'a> {
             // Integer-returning builtins
             "__builtin_fpclassify"
             | "__builtin_isnan"
+            | "__builtin_isnanf"
+            | "__builtin_isnanl"
             | "__builtin_isinf"
+            | "__builtin_isinff"
+            | "__builtin_isinfl"
             | "__builtin_isfinite"
+            | "__builtin_isfinitef"
+            | "__builtin_isfinitel"
             | "__builtin_isnormal"
+            | "__builtin_isnormalf"
+            | "__builtin_isnormall"
             | "__builtin_signbit"
             | "__builtin_signbitf"
             | "__builtin_signbitl"

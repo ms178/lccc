@@ -315,8 +315,13 @@ pub(super) fn provably_dead_lv(
 
 /// Split `OP SRC, DST` (AT&T, dest last) into the trimmed operand texts.
 pub(super) fn split_two_operands(rest: &str) -> Option<(&str, &str)> {
-    let (src, dst) = rest.rsplit_once(',')?;
-    Some((src.trim(), dst.trim()))
+    // AT&T SIB operands contain internal commas: `src, disp(%base,%idx,4)`.
+    // Splitting at the raw last comma turns `%idx)` into a fake destination
+    // register.  Dead-pure-write elimination then classifies an actual memory
+    // store as a register-only move and deletes it. Use the shared balanced-
+    // parentheses scanner that line classification already relies on.
+    let comma = last_top_level_comma(rest.as_bytes())?;
+    Some((rest[..comma].trim(), rest[comma + 1..].trim()))
 }
 
 /// Parse a bare register operand into its GP family, rejecting anything that

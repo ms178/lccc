@@ -60,6 +60,14 @@ impl SymbolTable {
         }
         None
     }
+
+    /// Look up only file-scope storage. Constant-expression queries need to
+    /// distinguish a global object (which cannot become a compile-time value
+    /// through caller specialization) from a parameter/local that may become
+    /// constant after inlining.
+    pub fn lookup_global(&self, name: &str) -> Option<&Symbol> {
+        self.scopes.first()?.symbols.get(name)
+    }
 }
 
 impl Default for SymbolTable {

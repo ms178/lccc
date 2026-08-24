@@ -99,8 +99,14 @@ pub fn eval_builtin_call(
             }
         }
         "__builtin_constant_p" => {
-            let is_const = args.first().is_some_and(|arg| eval_fn(arg).is_some());
-            Some(IrConst::I32(if is_const { 1 } else { 0 }))
+            // Prove positive answers early, but do not cache an early zero.
+            // A local/parameter may become constant after mem2reg, inlining,
+            // and propagation; the IR IsConstant node must survive until then.
+            if args.first().is_some_and(|arg| eval_fn(arg).is_some()) {
+                Some(IrConst::I32(1))
+            } else {
+                None
+            }
         }
         "__builtin_expect" | "__builtin_expect_with_probability" => args.first().and_then(eval_fn),
         "__builtin_bswap16" => {

@@ -382,22 +382,26 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_fpclassify",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::FpClassify),
     );
-    m.insert(
-        "__builtin_isnan",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsNan),
-    );
-    m.insert(
-        "__builtin_isinf",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsInf),
-    );
-    m.insert(
+    for name in ["__builtin_isnan", "__builtin_isnanf", "__builtin_isnanl"] {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::IsNan));
+    }
+    for name in ["__builtin_isinf", "__builtin_isinff", "__builtin_isinfl"] {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::IsInf));
+    }
+    for name in [
         "__builtin_isfinite",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsFinite),
-    );
-    m.insert(
+        "__builtin_isfinitef",
+        "__builtin_isfinitel",
+    ] {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::IsFinite));
+    }
+    for name in [
         "__builtin_isnormal",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::IsNormal),
-    );
+        "__builtin_isnormalf",
+        "__builtin_isnormall",
+    ] {
+        m.insert(name, BuiltinInfo::intrinsic(BuiltinIntrinsic::IsNormal));
+    }
     m.insert(
         "__builtin_signbit",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::SignBit),

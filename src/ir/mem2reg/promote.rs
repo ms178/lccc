@@ -376,8 +376,59 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
         }
     }
 
-    // Build set of parameter alloca values for filtering below
+    // Build set of parameter alloca values for filtering below. A parameter
+    // home is promotable only when its *entry definition* is IR-visible as a
+    // Store fed by ParamRef. Merely having a later user Store is insufficient:
+    // aggregate parameters are initialized only by backend ABI lowering, so
+    // treating their first Load as undef/zero loses untouched fields.
     let param_alloca_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+    let mut param_sources: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef { dest, .. } = inst {
+                param_sources.insert(dest.0);
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    }
+                    | Instruction::Cast {
+                        dest,
+                        src: Operand::Value(src),
+                        ..
+                    } if param_sources.contains(&src.0) => {
+                        changed |= param_sources.insert(dest.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut ir_initialized_params: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Store {
+                ptr,
+                val: Operand::Value(value),
+                ..
+            } = inst
+            {
+                if param_alloca_set.contains(&ptr.0) && param_sources.contains(&value.0) {
+                    ir_initialized_params.insert(ptr.0);
+                }
+            }
+        }
+    }
 
     // Build final list of promotable allocas
     all_allocas
@@ -391,16 +442,12 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
         })
         // Only promote allocas that are actually used (have loads or stores)
         .filter(|info| !info.def_blocks.is_empty() || !info.use_blocks.is_empty())
-        // Parameter allocas (sret, struct params) that have no IR-visible stores must
-        // NOT be promoted: they receive their values from emit_store_params at the
-        // backend level. Only param allocas with explicit ParamRef+Store (scalar params)
-        // have def_blocks and can safely be promoted.
+        // Parameter allocas (sret/aggregate params) whose ABI initialization
+        // is backend-only must stay in memory. A body Store does not make the
+        // incoming value visible to SSA; require a proven ParamRef-fed store.
         .filter(|info| {
-            if param_alloca_set.contains(&info.alloca_value.0) && info.def_blocks.is_empty() {
-                false // Skip param allocas without any stores
-            } else {
-                true
-            }
+            !param_alloca_set.contains(&info.alloca_value.0)
+                || ir_initialized_params.contains(&info.alloca_value.0)
         })
         .collect()
 }
@@ -1700,5 +1747,78 @@ mod tests {
             has_alloca,
             "Alloca should NOT be promoted when used as =m inline asm output"
         );
+    }
+
+
+    #[test]
+    fn backend_initialized_aggregate_param_is_not_promoted_from_undef() {
+        let mut func = IrFunction::new(
+            "wide_bitfield_update".to_string(),
+            IrType::I64,
+            vec![IrParam {
+                ty: IrType::Ptr,
+                noalias: false,
+                struct_size: Some(8),
+                struct_align: Some(8),
+                struct_eightbyte_classes: vec![
+                    crate::common::types::EightbyteClass::Integer,
+                ],
+                riscv_float_class: None,
+                is_f128_sse: false,
+            }],
+            false,
+        );
+        func.param_alloca_values.push(Value(0));
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Or,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(0x1200)),
+                    ty: IrType::U64,
+                },
+                Instruction::Store {
+                    volatile: false,
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(0),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 3;
+
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        promote_allocas_with_params(&mut module);
+
+        let instructions = &module.functions[0].blocks[0].instructions;
+        assert!(instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Load { ptr: Value(0), .. }
+        )));
+        assert!(instructions.iter().any(|inst| matches!(
+            inst,
+            Instruction::Store { ptr: Value(0), .. }
+        )));
     }
 }

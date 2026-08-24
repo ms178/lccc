@@ -1249,6 +1249,19 @@ impl MacroTable {
                     continue;
                 }
 
+                // Encoding prefixes are part of the following literal token,
+                // not standalone identifiers.  This check must happen during
+                // parameter substitution as well as rescan: in
+                // `#define m(L) L'1' + L`, only the final L is a parameter.
+                // Treating the first L as one produced invalid `0'1'` tokens.
+                if i < len
+                    && matches!(bytes[i], b'\'' | b'"')
+                    && matches!(ident, "u8" | "u" | "U" | "L")
+                {
+                    result.push_str(ident);
+                    continue;
+                }
+
                 if ident == "__VA_ARGS__" && is_variadic {
                     let va_args = self.get_va_args(params, args);
                     let next = if i < len { Some(bytes[i]) } else { None };

@@ -39,6 +39,11 @@ impl Parser {
         self.attrs = ParsedDeclAttrs::default();
 
         self.skip_gcc_extensions();
+        // C23 attributes may precede a file-scope declaration/definition just
+        // as they do a block-scope declaration.  The statement parser already
+        // consumed this syntax, but the external-declaration path did not,
+        // leaving `[[gnu::noipa]] int f(...)` to be parsed as an expression.
+        self.skip_c23_attribute_lists();
 
         // Handle #pragma pack directives (emitted as synthetic tokens by preprocessor)
         while self.handle_pragma_pack_token() {
@@ -403,7 +408,7 @@ impl Parser {
                 loop {
                     let (pname, pderived) = self.parse_declarator();
                     if let Some(ref name) = pname {
-                        let (full_type, fptr_params) =
+                        let (full_type, fptr_params, fptr_variadic) =
                             self.apply_kr_derivations(&type_spec, &pderived);
                         // Compute fptr_inner_ptr_depth for K&R function pointer params.
                         // Count Pointer entries AFTER FunctionPointer in derived list;
@@ -432,6 +437,7 @@ impl Parser {
                             if param.name.as_deref() == Some(name.as_str()) {
                                 param.type_spec = full_type.clone();
                                 param.fptr_params = fptr_params.clone();
+                                param.fptr_variadic = fptr_variadic;
                                 param.fptr_inner_ptr_depth = inner_depth;
                                 break;
                             }
@@ -450,15 +456,14 @@ impl Parser {
     }
 
     /// Apply derived declarators to build a K&R parameter's full type.
-    /// Returns (type_specifier, optional_fptr_params).
-    /// For function pointer parameters like `int (*fp)(int, int)`, this returns
-    /// (Pointer(Int), Some([ParamDecl for int, ParamDecl for int])) to match
-    /// the modern-style parameter handling path.
+    /// Returns (type_specifier, optional_fptr_params, fptr_variadic).
+    /// For function pointer parameters like `int (*fp)(int, ...)`, this retains
+    /// both the fixed parameters and the variadic tail, matching modern syntax.
     fn apply_kr_derivations(
         &self,
         type_spec: &TypeSpecifier,
         pderived: &[DerivedDeclarator],
-    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>) {
+    ) -> (TypeSpecifier, Option<Vec<ParamDecl>>, bool) {
         let mut full_type = type_spec.clone();
 
         // Check if this is a function pointer parameter.
@@ -474,7 +479,7 @@ impl Parser {
             }
         });
 
-        if let Some((fptr_params, _variadic)) = fptr_info {
+        if let Some((fptr_params, variadic)) = fptr_info {
             // Function pointer parameter in K&R style.
             // Count how many Pointer derivations exist. For `int (*fp)()`:
             //   pderived = [Pointer, FunctionPointer([], false)]
@@ -493,7 +498,7 @@ impl Parser {
             }
             // Apply one Pointer wrapping for the function-pointer-to-pointer decay
             full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
-            return (full_type, Some(fptr_params));
+            return (full_type, Some(fptr_params), variadic);
         }
 
         // Not a function pointer - apply all derivations normally.
@@ -527,7 +532,7 @@ impl Parser {
                 full_type = TypeSpecifier::Pointer(Box::new(full_type), AddressSpace::Default);
             }
         }
-        (full_type, None)
+        (full_type, None, false)
     }
 
     /// Parse the rest of a declaration (not a function definition).

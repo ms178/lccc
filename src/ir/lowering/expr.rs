@@ -324,8 +324,14 @@ impl Lowerer {
                 });
                 Operand::Value(dest)
             }
-            Expr::BuiltinTypesCompatibleP(ref type1, ref type2, _) => {
-                let result = self.eval_types_compatible(type1, type2);
+            Expr::BuiltinTypesCompatibleP(
+                ref type1,
+                ref type2,
+                ref qualifiers1,
+                ref qualifiers2,
+                _,
+            ) => {
+                let result = self.eval_types_compatible(type1, type2, qualifiers1, qualifiers2);
                 Operand::Const(IrConst::I64(result as i64))
             }
         }

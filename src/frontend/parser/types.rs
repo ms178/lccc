@@ -1141,6 +1141,89 @@ impl Parser {
         }
     }
 
+    /// Parse a type-name for __builtin_types_compatible_p while retaining the
+    /// qualifier level that CType deliberately erases. The returned vector is
+    /// ordered base/innermost -> outermost; callers ignore its last element
+    /// (top-level CVR qualifiers do not affect type compatibility).
+    pub(super) fn parse_compatible_type(&mut self) -> (TypeSpecifier, Vec<u8>) {
+        let saved_attrs = self.attrs.clone();
+        self.attrs.set_const(false);
+        self.attrs.set_volatile(false);
+
+        let Some(type_spec) = self.parse_type_specifier() else {
+            let span = self.peek_span();
+            self.emit_error("expected type in __builtin_types_compatible_p", span);
+            self.attrs = saved_attrs;
+            return (TypeSpecifier::Int, vec![0]);
+        };
+
+        let mut result_type = type_spec;
+        let mut qualifiers = vec![
+            u8::from(self.attrs.parsing_const())
+                | (u8::from(self.attrs.parsing_volatile()) << 1),
+        ];
+        self.attrs.set_const(false);
+        self.attrs.set_volatile(false);
+
+        while self.consume_if(&TokenKind::Star) {
+            result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+            let mut q = 0u8;
+            loop {
+                match self.peek() {
+                    TokenKind::Const => {
+                        q |= 1;
+                        self.advance();
+                    }
+                    TokenKind::Volatile => {
+                        q |= 2;
+                        self.advance();
+                    }
+                    TokenKind::Restrict => {
+                        q |= 4;
+                        self.advance();
+                    }
+                    _ => break,
+                }
+            }
+            qualifiers.push(q);
+        }
+
+        // Handle the common abstract function-pointer spelling `(*)`.
+        if matches!(self.peek(), TokenKind::LParen) {
+            let save = self.pos;
+            self.advance();
+            if self.consume_if(&TokenKind::Star) {
+                while !matches!(self.peek(), TokenKind::RParen | TokenKind::Eof) {
+                    self.advance();
+                }
+                self.consume_if(&TokenKind::RParen);
+                if matches!(self.peek(), TokenKind::LParen) {
+                    self.skip_balanced_parens();
+                }
+                result_type = TypeSpecifier::Pointer(Box::new(result_type), AddressSpace::Default);
+                qualifiers.push(0);
+            } else {
+                self.pos = save;
+            }
+        }
+
+        while matches!(self.peek(), TokenKind::LBracket) {
+            let open = self.peek_span();
+            self.advance();
+            let size = if matches!(self.peek(), TokenKind::RBracket) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()))
+            };
+            self.expect_closing(&TokenKind::RBracket, open);
+            result_type = TypeSpecifier::Array(Box::new(result_type), size);
+            qualifiers.push(0);
+        }
+
+        self.attrs = saved_attrs;
+        (result_type, qualifiers)
+    }
+
     /// Parse an abstract declarator suffix: pointer(s), parenthesized pointer groups,
     /// and array dimensions after a type name. Used by cast expressions, sizeof,
     /// typeof, and _Alignof to avoid duplicating this logic.
