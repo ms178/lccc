@@ -2851,6 +2851,97 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "paddq");
                 }
             }
+            IntrinsicOp::VecWidenAddI32x4ToI64x2 => {
+                // dest(I64x2 accumulator) += sext(load4×I32(base, off)).
+                // args = [accumulator, base, byte_offset].
+                //
+                // Lane math (full I64 precision per lane):
+                //   xmm0 = 4×I32 {a0,a1,a2,a3}
+                //   xmm1 = vpmovsxdq(xmm0)      -> {sext(a0), sext(a1)}
+                //   xmm2 = vextracti128(xmm0,1) -> {a2,a3}
+                //   xmm2 = vpmovsxdq(xmm2)      -> {sext(a2), sext(a3)}
+                //   xmm1 = paddq(xmm1, xmm2)   -> per-lane partial sums
+                //   dst  = paddq(acc, xmm1)    -> new accumulator
+                // The ACCUMULATOR/DEST live in the 128-bit XMM view of the
+                // assigned home; both widened halves first reduce into xmm1,
+                // then a single paddq folds them into the accumulator. When
+                // the accumulator is slot-homed, the acc value loads through
+                // xmm3 and the result stores back to the dest's home.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
+                // 128-bit LOAD of 4×I32: xmm0 = {a0,a1,a2,a3} (qword
+                // lanes q0={a0,a1}, q1={a2,a3}). Split + widen + fold:
+                //   vmovdqu (mem)      → xmm0 = {a0,a1,a2,a3}
+                //   vpunpckhqdq x0,x0  → xmm2 = {a2,a3,a2,a3}
+                //   vpmovsxdq xmm0     → xmm1 = {sext(a0), sext(a1)}
+                //   vpmovsxdq xmm2     → xmm2 = {sext(a2), sext(a3)}
+                //   paddq xmm2, xmm1   → {a0+a2, a1+a3} per-lane I64 sums
+                // (A 256-bit vmovdqu would load EIGHT I32s while the IV
+                // advances only four — lanes 4..7 would be double-counted
+                // on the next iteration's overlap. vextracti128 cannot be
+                // used: after a 128-bit store ymm0's upper half is stale.)
+                match index {
+                    Some(idx) => self.state.emit_fmt(format_args!(
+                        "    vmovdqu (%{},%{}), %xmm0",
+                        base, idx
+                    )),
+                    None => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
+                }
+                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
+                self.state.emit("    vpmovsxdq %xmm0, %xmm1");
+                self.state.emit("    vpmovsxdq %xmm2, %xmm2");
+                self.state.emit("    paddq %xmm2, %xmm1");
+                if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
+                    let acc_reg = self
+                        .reg_assignments
+                        .get(&acc.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name(r));
+                    let dst_reg = self
+                        .reg_assignments
+                        .get(&d.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name(r));
+                    match (acc_reg, dst_reg) {
+                        (Some(a), Some(dst)) => {
+                            if dst != a {
+                                self.state
+                                    .emit_fmt(format_args!("    movdqa %{}, %{}", a, dst));
+                            }
+                            self.state
+                                .emit_fmt(format_args!("    paddq %xmm1, %{}", dst));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(dst);
+                        }
+                        _ => {
+                            // Slot-homed accumulator or dest: round-trip
+                            // through xmm3 (the reserved scratch pair is
+                            // xmm0/xmm1; xmm2 is allocatable, so use xmm3
+                            // only when it is provably free — safest is the
+                            // accumulator's own SLOT as the staging area).
+                            if let Some(slot) = self.state.get_slot(acc.0) {
+                                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm3");
+                                self.state.emit("    paddq %xmm1, %xmm3");
+                                if let Some(dslot) = self.state.get_slot(d.0) {
+                                    self.state
+                                        .out
+                                        .emit_instr_reg_rbp("    movdqu", "xmm3", dslot.0);
+                                }
+                            } else {
+                                self.state.emit("    paddq %xmm1, %xmm1");
+                            }
+                        }
+                    }
+                }
+            }
             IntrinsicOp::VecMulI64x2 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();

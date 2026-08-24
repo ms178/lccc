@@ -247,9 +247,13 @@ fn vectorize_with_analysis_mode(
                 }
                 total_changes += transform_to_fma_f64x4(func, &pattern);
             }
-        } else if let Some(red_pattern) =
-            analyze_reduction_pattern(func, loop_info, cfg, force_two_wide, neon)
-        {
+        } else if let Some(red_pattern) = analyze_reduction_pattern(
+            func,
+            loop_info,
+            cfg,
+            force_two_wide || (!neon && !force_two_wide),
+            neon,
+        ) {
             // Packed FP reductions reassociate additions across SIMD lanes.
             // That is observably different for IEEE-754 values (for example
             // [1e100, 1, -1e100, 1] sums to 1 in source order but 2 after a
@@ -2085,10 +2089,13 @@ fn analyze_reduction_pattern(
                 // as I32 adds on a F32 accumulator, and returned 0.0.
                 //
                 // ONE exception: signed I32 -> I64 widening when the target
-                // provides a true widening load+add (AArch64 NEON
-                // VecLoadWidenI32ToI64x2: ldr + saddlp/smlal keeps full I64
-                // precision per lane). Gated by allow_widening_i32 so x86
-                // never takes this path.
+                // provides a true widening load+add. AArch64 NEON
+                // VecLoadWidenI32ToI64x2 (ldr + saddlp/smlal) and x86
+                // VecWidenAddI32x4ToI64x2 (vmovdqu + vpmovsxdq×2 +
+                // vextracti128 + paddq×2) both keep full I64 precision per
+                // lane. allow_widening_i32 is set for both targets; the x86
+                // AVX2 path additionally requires the AVX feature for
+                // vpmovsxdq's VEX encoding.
                 let allowed_widen =
                     allow_widening_i32 && element_type == IrType::I64 && *from_ty == IrType::I32;
                 if *from_ty != element_type && !allowed_widen {
@@ -8216,6 +8223,10 @@ fn transform_reduction_avx2(
 
     // Determine vector width and intrinsics based on element type
     // NOTE: These are only used for pattern matching - the actual transform uses Vec* variants
+    // The widening I32→I64 reduction consumes FOUR I32 lanes per iteration
+    // (VecWidenAddI32x4ToI64x2) and reduces into an I64x2 accumulator; its
+    // horizontal intrinsic is the I64x2 hadd.
+    let widening_i64 = pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
     let (vec_width, _load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) =
         match pattern.element_type {
             IrType::F64 => (
@@ -8224,6 +8235,13 @@ fn transform_reduction_avx2(
                 IntrinsicOp::AddF64x4,  // Legacy - not used in register-based transform
                 Some(IntrinsicOp::MulF64x4), // Legacy - not used in register-based transform
                 IntrinsicOp::HorizontalAddF64x4, // Used for remainder loop intrinsic selection
+            ),
+            IrType::I32 if widening_i64 => (
+                4u64,
+                IntrinsicOp::VecWidenAddI32x4ToI64x2,
+                IntrinsicOp::VecWidenAddI32x4ToI64x2,
+                None,
+                IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::I32 => (
                 8u64,
@@ -8573,12 +8591,24 @@ fn transform_reduction_avx2(
                 // Simple sum: sum += arr[i]
                 // Register-based flow: vec_zero → vec_load → vec_add → horizontal_add
 
-                // Map to register-based intrinsics based on element type
+                // Map to register-based intrinsics based on element type.
+                // The WIDENING case (I32 loads accumulated into an I64
+                // accumulator) uses the composite VecWidenAddI32x4ToI64x2
+                // intrinsic: one instruction = load 4×I32 + sign-extend +
+                // paddq into the I64x2 accumulator. The emitted body then
+                // carries a single intrinsic instead of a load/add pair.
+                let widening_i64 = pattern.accumulator_type == IrType::I64
+                    && pattern.element_type == IrType::I32;
                 let (vec_load_op, vec_add_op, vec_zero_op) = match pattern.element_type {
                     IrType::F64 => (
                         IntrinsicOp::VecLoadF64x4,
                         IntrinsicOp::VecAddF64x4,
                         IntrinsicOp::VecZeroF64x4,
+                    ),
+                    IrType::I32 if widening_i64 => (
+                        IntrinsicOp::VecWidenAddI32x4ToI64x2,
+                        IntrinsicOp::VecWidenAddI32x4ToI64x2,
+                        IntrinsicOp::VecZeroI64x2,
                     ),
                     IrType::I32 => (
                         IntrinsicOp::VecLoadI32x8,
@@ -8649,45 +8679,65 @@ fn transform_reduction_avx2(
                 {
                     let body_block = &mut func.blocks[pattern.body_idx];
 
-                    // Vector load from array → SSA value
-                    let load_inst = Instruction::Intrinsic {
-                        dest: Some(vec_load),
-                        op: vec_load_op,
-                        dest_ptr: None,
-                        args: {
-                            let (base, off) = match (use_byte_iv, &byte_iv_a) {
-                                (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
-                                _ => (
-                                    Operand::Value(pattern.array_a_gep),
-                                    Operand::Const(IrConst::I64(0)),
-                                ),
-                            };
-                            vec![base, off]
-                        },
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
                     };
 
-                    // Vector add: accumulator + loaded vector → new accumulator
-                    let add_inst = Instruction::Intrinsic {
-                        dest: Some(vec_sum_value),
-                        op: vec_add_op,
-                        dest_ptr: None,
-                        args: vec![
-                            Operand::Value(pattern.accumulator_phi), // Current accumulator (PHI)
-                            Operand::Value(vec_load),                // Loaded vector
-                        ],
-                    };
+                    if widening_i64 {
+                        // One composite intrinsic: acc += sext(load4×I32).
+                        let widen_inst = Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: vec_load_op,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                base,
+                                off,
+                            ],
+                        };
+                        body_block
+                            .instructions
+                            .insert(pattern.accumulator_add_idx, widen_inst);
+                        body_block
+                            .instructions
+                            .remove(pattern.accumulator_add_idx + 1);
+                        changes += 1;
+                    } else {
+                        // Vector load from array → SSA value
+                        let load_inst = Instruction::Intrinsic {
+                            dest: Some(vec_load),
+                            op: vec_load_op,
+                            dest_ptr: None,
+                            args: vec![base, off],
+                        };
 
-                    // Insert vector instructions and remove old scalar add
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx, load_inst);
-                    body_block
-                        .instructions
-                        .insert(pattern.accumulator_add_idx + 1, add_inst);
-                    body_block
-                        .instructions
-                        .remove(pattern.accumulator_add_idx + 2);
-                    changes += 2;
+                        // Vector add: accumulator + loaded vector → new accumulator
+                        let add_inst = Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: vec_add_op,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi), // Current accumulator (PHI)
+                                Operand::Value(vec_load),                // Loaded vector
+                            ],
+                        };
+
+                        // Insert vector instructions and remove old scalar add
+                        body_block
+                            .instructions
+                            .insert(pattern.accumulator_add_idx, load_inst);
+                        body_block
+                            .instructions
+                            .insert(pattern.accumulator_add_idx + 1, add_inst);
+                        body_block
+                            .instructions
+                            .remove(pattern.accumulator_add_idx + 2);
+                        changes += 2;
+                    }
 
                     // Debug: Log vector accumulator flow
                     if debug {

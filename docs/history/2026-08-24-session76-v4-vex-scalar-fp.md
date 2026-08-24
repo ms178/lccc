@@ -59,3 +59,55 @@ Output bit-identical to `gcc -O0` throughout.
 - Pristine `b7f1819` + patch → rebuild → nbody battery + corpus re-verified.
 - Patch: applies clean, zero debug leftovers (XMM instrumentation removed
   pre-commit).
+
+---
+
+# Session 77 addendum (v5) — widening I32→I64 reductions + benchmark sweep
+
+**Base:** `b7f1819` → PR #229 merged the v4 VEX scalar-FP work.
+
+## The 7-worst-benchmark sweep (runtime lccc/gcc, -O3 -march=x86-64-v3)
+
+| # | Benchmark | lccc | gcc | ratio | Root cause |
+|---|-----------|------|-----|-------|------------|
+| 1 | loop_patterns | 403ms | 37ms | 0.09 | sum_array now vectorized (this session); conditional-sum + dot-product + LCG-init stay scalar (GCC: compare/blend + vpmulld) |
+| 2 | nbody | 685ms | 207ms | 0.30 | multi-store scatter (OP-05b) + marching-pointer homes (RA-01b) |
+| 3 | libm_round_family | 389ms | 185ms | 0.47 | FP call-result accumulator path (IS-29a) |
+| 4 | linux_find_bit | 26ms | 16ms | 0.62 | andn/cmov idiom coverage |
+| 5 | mandelbrot | 1154ms | 864ms | 0.75 | escape-loop FP chain |
+| 6 | spectral_norm | 241ms | 182ms | 0.76 | A(i,j) computed-invariant in dot-product |
+| 7 | fannkuch | 3339ms | 2566ms | 0.77 | perm-rotation loop un-vectorized (GCC: vpshufd) |
+
+(Correctness reference established: lccc's nbody is bit-identical to
+`gcc -O0` at 500k AND 5M steps — the FP-semantics gold standard. The
+gcc -O3 differences are GCC's own reassociation.)
+
+## v5 improvement: widening I32→I64 reduction vectorization
+
+`long s = 0; for (...) s += arr[i];` over an `int[]` was pure scalar
+(`movslq; addq`, 1 element/iteration). New composite intrinsic
+`VecWidenAddI32x4ToI64x2` (AVX2): 4 elements/iteration with full I64
+precision per lane. Two correctness traps found by differential testing
+and documented in the lowering: 256-bit loads double-count lanes 4..7
+(IV advances 4), and vextracti128 cannot extract dword lanes 2..3 after
+a 128-bit store (vpunpckhqdq is the correct mover; vpermq's immediate
+selects QWORD lanes). Assembler gains the vpmovsxdq VEX encoding.
+
+Verified exact vs GCC for n=1/10/100/1000 on the multi-call debug
+harness; loop_patterns full-program output byte-identical.
+
+## Remaining gaps (ranked for v6)
+
+1. **Conditional reductions** (`if (a[i]>0) s += a[i]`): GCC emits
+   vpcmpgtd+blend; lccc emits a branchy scalar loop (3× on that kernel).
+   Needs select-reduction support in the reduction family — the if_convert
+   pass already produces Select IR, so the gap is reduction-analyzer
+   recognition of Select-shaped conditional adds.
+2. **Integer dot-product** (`(long)a[i]*b[i]`): needs vpmuldq-class
+   widening multiply (I32×I32→I64) — same shape as the widening sum
+   plus a widening multiply intrinsic.
+3. **LCG init loops**: GCC vectorizes LCG+mod via vpmulld lanes; requires
+   a general integer map vectorizer for nonlinear recurrences (the map
+   trees handle elementwise only; the recurrence is the blocker).
+4. fannkuch rotation (vpshufd), mandelbrot escape loop, spectral A(i,j) —
+   OP-05b scatter/computed-invariant class.
