@@ -552,7 +552,16 @@ Validation:
 | 194 | **PERF-3** | P2 | TLS base CSE + `%fs:sym@tpoff(,%r,scale)` addressing for `__thread` array accesses (carry-over from session 56 PERF-2, re-confirmed by audit). | **M** tls_seg_access 2.6× GCC. | |
 | 195 | **MS-14** | P2 | PMU / `perf stat` harness on the 14700KF (once hardware-access CI is available) that captures cycles, instructions, IPC, branch-misses, L1-dcache-load-misses, LLC-misses, frontend/backend stalls, and the Raptor Lake TopDown metrics, and attaches them to every snapshot in `hotspots/`. The current VM has no PMU, so this is documentation-only until a metal runner exists. | **C** required by charter §10. | |
 
-### 12.4 What the OpenAI report got wrong (and why it matters)
+### 12.5 Session 75 (v3) — general complete unrolling + FP defect hunt
+
+| # | ID | Pri | Item | Evidence | Notes |
+|---|----|-----|------|----------|-------|
+| 196 | **OP-05b** | **P0** | Vectorize multi-store scatter bodies (nbody `advance`: fx/fy/fz[i] += ...) and computed-invariant dot-products (spectral `A(i,j)`). The dominant remaining FP gap: nbody 594 insns/159 stk/0 vec vs GCC 366/0/81; spectral 212/11/0 vs 151/4/8. | **M** A/B at -O3 v3; runtime 0.26×/0.34× of GCC. | spectral additionally needs non-trapping integer-div proofs + vector int div (no such instruction — needs hoisting the A(i,j) computation out of the vector loop when j-invariant... which it is NOT; the real fix is recognizing A(i,j) as affine in j and synthesizing the vector index math). |
+| 197 | **RA-01b** | **P0** | Marching-pointer recurrences (IVSR-created Ptr phis) get slot-homed when RA pressure is high: `leaq bodies(%rip),%rax; movq %rax,344(%rsp)` + per-iteration `leaq 56` + slot reload — 151 of nbody's 159 stack refs are this GPR address traffic. | **M/G** GCC keeps 0 stack refs via direct `bodies+N(%rip)` after full unroll; lccc achieves 66 such folds where the cascade fires. | Extend GlobalAddr remat through Copy chains, or prefer SIB-index forms for IVSR recurrences (base stays a register, index carries the IV). |
+| 198 | **UN-01** | DONE | General complete unroller (nested/multi-block constant-trip loops, pure-intrinsic eligibility, const-chain cascade, FP-aware budget). Two miscompiles found+fixed (terminator value rename; phi→Copy init selection). | **M** 1167/1167 unit; 466-corpus unchanged; nbody 5M-step bit-identical to GCC; new unroll_nested_complete.c regression. | The FP budget is load-bearing: unrolling nbody's advance WITHOUT it regresses 594→1183 insns / 159→476 stk (XMM spill wall). |
+| 199 | **IS-29a** | PARTIAL | FP benchmark gaps remaining: libm_round_family 288 insns/4 stk/1 vec vs GCC 182/1/24 (accumulator-mediated FP call results). | **M** A/B. | The XMM-home-for-FP-call-results work item remains. |
+
+## 12.4 What the OpenAI report got wrong (and why it matters)
 
 1. **Overstates how little FMA support exists.** The scalar and packed FMA
    emitters are present, tested, and used by the matmul/dot-product kernels.
