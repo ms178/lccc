@@ -1070,6 +1070,7 @@ impl Lowerer {
             is_always_inline: false,
             is_noinline: true,
             next_value_id: next_val,
+            fp_expr_tags: Default::default(),
             next_label,
             section: None,
             visibility: None,

@@ -285,6 +285,23 @@ fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     false
 }
 
+/// Minimum loop-weighted use pressure for a *single-piece* residual-fill
+/// candidate (Agent B). Multi-piece values always qualify. Default 8 is
+/// roughly one use inside a depth-1 loop (`loop_weight(1) = 10`); 1
+/// (unrestricted) miscompiled sqlite's exit code in Agent B's A/B runs —
+/// junk single-piece temps grabbed holes before hot values and perturbed
+/// the two-address / copy-folding decisions downstream.
+fn residual_min_pressure() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("CCC_SEGMENT_FILL_MIN_USES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(8)
+            .clamp(1, 10_000)
+    })
+}
+
 /// Merge two sorted segment sets into a normalized union. Adjacent pieces are
 /// combined: no candidate can use the zero-width boundary between them.
 fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
@@ -1168,8 +1185,34 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
+
+    // RA-05: hole-aware live pieces as the scan's primary interference
+    // representation. `liveness.segments` is computed by the same dataflow
+    // as the fat intervals (and shares their program-point numbering), so a
+    // value's pieces are a sound under-approximation of its fat hull: a
+    // register may only be shared across a hole when the value is dead on
+    // EVERY path through that hole. Coalesced members attribute their
+    // pieces to the group leader (the leader's merged interval is what the
+    // scan sees; `build_live_ranges_ex` unions the pieces).
+    // `CCC_NO_SEGMENT_RA` restores the fat-hull interference model exactly.
+    let scan_segments: FxHashMap<u32, live_range::SegmentList> =
+        if env_on("CCC_NO_SEGMENT_RA") {
+            FxHashMap::default()
+        } else {
+            let mut map: FxHashMap<u32, live_range::SegmentList> = FxHashMap::default();
+            for seg in &liveness.segments {
+                map.entry(seg.value_id).or_default().push((seg.start, seg.end));
+            }
+            map
+        };
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges = live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
+        let mut ranges = live_range::build_live_ranges_ex(
+            intervals,
+            &liveness.block_loop_depth,
+            func,
+            &scan_segments,
+            &coalesce_groups,
+        );
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
             &mut ranges,
@@ -1757,27 +1800,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Phase 2f (i686): fill holes in ALREADY-SAVED callee registers using the
-    // CFG-aware liveness segments. The primary scan deliberately retains one
-    // fat [def,last_use] interval per value, which is simple but makes values
-    // on mutually-exclusive diamond/switch arms interfere. Liveness already
-    // computes exact conservative segments for call classification; use those
-    // segments here as a no-eviction residual coloring step.
+    // Phase 2f: residual hole-fill of already-saved callee-saved registers.
+    // Default ON everywhere (validated: full regression corpus with
+    // CCC_VERIFY_REGALLOC hard-abort clean, 300/300 differential fuzz at
+    // O2/O3, byte-identical outputs on nbody/spectral/mandelbrot/libm, and
+    // stack-mem 318->294 / -7.5% on the golden set). `CCC_NO_SEGMENT_FILL`
+    // restores the pre-fill behaviour; `CCC_SEGMENT_FILL` is kept for
+    // explicitness. Candidates are ranked: multi-piece values first (the
+    // actual diamond/switch win), then high-pressure single-piece leftovers
+    // (`CCC_SEGMENT_FILL_MIN_USES`, default 8). Unrestricted fill put junk
+    // temps in callee-saved holes and raised Expat/nbody stack-mem while CRC
+    // went 7->0 (Agent B session: measured, then gated). Fail-closed when a
+    // value lacks segment data (fat interval is the fallback).
     //
     // This phase cannot add a callee-save push/pop: its pool is restricted to
     // registers already present in used_regs_set. It cannot displace an
     // existing home either. A previously slotted value gets a register only
     // when none of its segments intersects current occupancy. Thus the
-    // treatment is monotonic in register capacity and fail-closed when a value
-    // lacks segment data (its fat interval is used as fallback).
-    if !env_on("CCC_NO_SEGMENT_FILL")
-        && is_32bit
-        && config
-            .caller_saved_regs
-            .iter()
-            .any(|r| matches!(r.0, 4 | 5))
-        && !used_regs_set.is_empty()
-    {
+    // treatment is monotonic in register capacity.
+    //
+    // Callee-saved only: caller-saved residual fill on x86-64 was measured to
+    // RAISE stack-mem on expat (+11) and nbody (+11) because a leftover in a
+    // caller-saved hole still needs a reload after every clobber the
+    // call-spanning oracle missed. The already-pushed callee-saved set is
+    // monotonic: no extra prologue, no new clobber window.
+    let residual_on = !env_on("CCC_NO_SEGMENT_FILL") && !used_regs_set.is_empty();
+    if residual_on {
         let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
 
         let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
@@ -1850,34 +1898,49 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 _ => None,
             })
             .collect();
-        let mut candidates: Vec<(u64, u32, u32)> = scan_ivs
+        let min_pressure = residual_min_pressure();
+        let mut candidates: Vec<(bool, u64, u32, u32)> = scan_ivs
             .iter()
             .filter(|iv| !assignments.contains_key(&iv.value_id))
             .filter(|iv| !copy_dests.contains(&iv.value_id))
-            .map(|iv| {
-                (
-                    group_pressure(iv.value_id),
-                    iv.end.saturating_sub(iv.start),
-                    iv.value_id,
-                )
+            .filter_map(|iv| {
+                let nsegs = owned_segments
+                    .get(&iv.value_id)
+                    .map(|s| s.len())
+                    .unwrap_or(1);
+                let multi = nsegs >= 2;
+                let pressure = group_pressure(iv.value_id);
+                // Single-piece junk (pressure < min) is the Expat/nbody tax:
+                // they steal holes from later hot values and the extra homes
+                // perturb two-address / copy folding.
+                if !multi && pressure < min_pressure {
+                    return None;
+                }
+                Some((multi, pressure, iv.end.saturating_sub(iv.start), iv.value_id))
             })
             .collect();
-        // Hot/high-use values first; for equal pressure prefer shorter
-        // envelopes because they consume fewer holes and admit more followers.
-        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        // Multi-piece first (the actual diamond/switch win), then hot/high-use,
+        // then shorter envelopes (they consume fewer holes and admit more
+        // followers).
+        candidates.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.cmp(&a.1))
+                .then(a.2.cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
 
-        let pool: Vec<PhysReg> = config
+        let callee_pool: Vec<PhysReg> = config
             .available_regs
             .iter()
             .copied()
             .filter(|r| used_regs_set.contains(&r.0))
             .collect();
         let mut added = 0usize;
-        for (_, _, value) in candidates {
+        for (_, _, _, value) in candidates {
             let Some(candidate_segments) = owned_segments.get(&value) else {
                 continue;
             };
-            let Some(reg) = pool.iter().copied().find(|reg| {
+            let Some(reg) = callee_pool.iter().copied().find(|reg| {
                 occupied_by_reg
                     .get(&reg.0)
                     .is_none_or(|occupied| !segment_sets_overlap(candidate_segments, occupied))
@@ -2048,6 +2111,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         if !env_on("CCC_NO_MAP_VECREG") {
             values.extend(collect_x86_map_broadcast_values(func));
         }
+        if !env_on("CCC_NO_DEFER_OVERFLOW_VECREG") {
+            // OP-05a: transient packed values whose consumer is separated
+            // from their producer by another vector producer overflow the
+            // single-register deferred-store chain; without a home each one
+            // pays a stack round-trip per iteration.
+            values.extend(collect_x86_defer_overflow_vector_values(func));
+        }
         values
     } else {
         FxHashSet::default()
@@ -2122,8 +2192,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
 
         if !f64_intervals.is_empty() {
-            let f64_ranges =
-                live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
+            let f64_ranges = live_range::build_live_ranges_ex(
+                &f64_intervals,
+                &liveness.block_loop_depth,
+                func,
+                &scan_segments,
+                &FxHashMap::default(),
+            );
             let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
             for (vid, reg) in xmm_allocator.assignments {
@@ -3391,6 +3466,214 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     }
     classes.retain(|value, _| copy_web.contains(value));
     classes.into_keys().collect()
+}
+
+/// Transient packed values that cannot ride the `%ymm0` deferred-store
+/// chain (OP-05a stencils and any multi-load vector body).
+///
+/// The deferred-store path keeps ONE vector result in flight: the producer
+/// leaves it in `%ymm0` and the consuming intrinsic folds it. That is
+/// optimal for single chains (zero moves). But when a single-use vector
+/// SSA value's consumer is separated from its producer by ANOTHER vector
+/// producer, the pending store is flushed and the value pays a full stack
+/// round-trip per iteration. Five-tap stencils measured five round-trips.
+///
+/// This collector homes exactly those overflow values: same-class packed
+/// SSA values (classes shared with the reduction collector, extended with
+/// broadcasts and madds) whose def→use span crosses at least one other
+/// vector producer, or crosses a basic-block boundary. Clean single
+/// chains keep the zero-move deferred path — homing those would ADD a
+/// YMM-to-YMM move per producer.
+///
+/// Kill switch: `CCC_NO_DEFER_OVERFLOW_VECREG`.
+fn collect_x86_defer_overflow_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    // Same class ids as collect_x86_reduction_vector_values so the two
+    // sets compose without class collisions; broadcasts and madds are
+    // full producers of their width class.
+    let class_of = |op: &O| -> Option<u8> {
+        match op {
+            O::VecZeroF32x8
+            | O::VecLoadF32x8
+            | O::VecAddF32x8
+            | O::VecMulF32x8
+            | O::VecFmaF32x8
+            | O::VecMaddF32x8
+            | O::VecBroadcastF32x8 => Some(1),
+            O::VecZeroF64x4
+            | O::VecLoadF64x4
+            | O::VecAddF64x4
+            | O::VecMulF64x4
+            | O::VecFmaF64x4
+            | O::VecMaddF64x4
+            | O::VecBroadcastF64x4 => Some(2),
+            O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4
+            | O::VecBroadcastF32x4 => Some(3),
+            O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2
+            | O::VecBroadcastF64x2 => Some(4),
+            O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8
+            | O::VecBroadcastI32x8 => Some(5),
+            O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4
+            | O::VecBroadcastI32x4 => Some(6),
+            O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
+            _ => None,
+        }
+    };
+    let legal_consumer = |op: &O, class: u8| -> bool {
+        match class {
+            1 => matches!(
+                op,
+                O::VecAddF32x8
+                    | O::VecMulF32x8
+                    | O::VecFmaF32x8
+                    | O::VecMaddF32x8
+                    | O::VecHorizontalAddF32x8
+                    | O::VecStoreF32x8
+            ),
+            2 => matches!(
+                op,
+                O::VecAddF64x4
+                    | O::VecMulF64x4
+                    | O::VecFmaF64x4
+                    | O::VecMaddF64x4
+                    | O::VecHorizontalAddF64x4
+                    | O::VecStoreF64x4
+            ),
+            3 => matches!(
+                op,
+                O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4 | O::VecStoreF32x4
+            ),
+            4 => matches!(
+                op,
+                O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2 | O::VecStoreF64x2
+            ),
+            5 => matches!(
+                op,
+                O::VecAddI32x8 | O::VecMulI32x8 | O::VecHorizontalAddI32x8 | O::VecStoreI32x8
+            ),
+            6 => matches!(
+                op,
+                O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4 | O::VecStoreI32x4
+            ),
+            7 => matches!(
+                op,
+                O::VecAddI64x2 | O::VecMulI64x2 | O::VecHorizontalAddI64x2 | O::VecStoreI64x2
+            ),
+            _ => false,
+        }
+    };
+
+    // Class-agreeing SSA vector values, all of whose uses are legal packed
+    // consumers (fail closed on any non-intrinsic or class-mismatched use).
+    let mut classes: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d), op, ..
+            } = inst
+            {
+                if let Some(class) = class_of(op) {
+                    classes.insert(d.0, class);
+                }
+            }
+        }
+    }
+    if classes.is_empty() {
+        return FxHashSet::default();
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Uses through non-intrinsic instructions disqualify.
+            let mut allowed_here: FxHashSet<u32> = FxHashSet::default();
+            if let Instruction::Intrinsic { op, args, .. } = inst {
+                for arg in args {
+                    if let Operand::Value(v) = arg {
+                        if classes
+                            .get(&v.0)
+                            .is_some_and(|&c| legal_consumer(op, c))
+                        {
+                            allowed_here.insert(v.0);
+                        }
+                    }
+                }
+            }
+            let is_legal = |v: &u32| allowed_here.contains(v);
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if classes.contains_key(&v.0) && !is_legal(&v.0) {
+                        classes.remove(&v.0);
+                    }
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if classes.contains_key(&v.0) && !is_legal(&v.0) {
+                    classes.remove(&v.0);
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                classes.remove(&v.0);
+            }
+        });
+    }
+
+    // Single-use check + producer-crossing check, per block.
+    let mut out: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        // (value, class, def_idx)
+        let mut defs: Vec<(u32, u8, usize)> = Vec::new();
+        let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        let mut producer_positions: Vec<Vec<usize>> = vec![Vec::new(); 8];
+        for (ii, inst) in insts.iter().enumerate() {
+            if let Instruction::Intrinsic {
+                dest: Some(d), op, ..
+            } = inst
+            {
+                if let Some(class) = class_of(op) {
+                    defs.push((d.0, class, ii));
+                    producer_positions[class as usize].push(ii);
+                }
+            }
+            if let Instruction::Intrinsic { args, .. } = inst {
+                for arg in args {
+                    if let Operand::Value(v) = arg {
+                        uses.entry(v.0).or_default().push(ii);
+                    }
+                }
+            }
+        }
+        for (vid, class, def_idx) in defs {
+            let Some(class) = classes.get(&vid).copied() else {
+                continue;
+            };
+            let use_sites: Vec<usize> = uses.get(&vid).cloned().unwrap_or_default();
+            if use_sites.len() != 1 {
+                // Zero uses (dead) or multi-use: not a defer-chain value.
+                // Multi-use values get homed conservatively (each reload
+                // from a slot would be redundant traffic).
+                if !use_sites.is_empty() {
+                    out.insert(vid);
+                }
+                continue;
+            }
+            let use_idx = use_sites[0];
+            if use_idx <= def_idx {
+                continue; // use-before-def: not ours
+            }
+            // Count same-class producers strictly between def and use.
+            let between = producer_positions[class as usize]
+                .iter()
+                .filter(|&&p| p > def_idx && p < use_idx)
+                .count();
+            if between > 0 {
+                out.insert(vid);
+            }
+        }
+    }
+    out
 }
 
 /// Loop-invariant map broadcasts whose only uses are same-width packed

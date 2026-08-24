@@ -71,6 +71,7 @@ impl Lowerer {
 
         let return_is_bool = self.is_type_bool(&func.return_type);
         let base_return_type = self.type_spec_to_ir(&func.return_type);
+        self.fp_expr_tags.clear();
         self.func_state = Some(FunctionBuildState::new(
             func.name.clone(),
             base_return_type,
@@ -962,6 +963,7 @@ impl Lowerer {
             is_always_inline: func.attrs.is_always_inline(),
             is_noinline: func.attrs.is_noinline(),
             next_value_id: next_val,
+            fp_expr_tags: std::mem::take(&mut self.fp_expr_tags),
             next_label,
             section: func.attrs.section.clone(),
             visibility: func.attrs.visibility.clone(),

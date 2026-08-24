@@ -190,6 +190,13 @@ pub struct IrFunction {
     /// Set by lowering/mem2reg/phi_eliminate to avoid expensive full-IR scans.
     /// A value of 0 means "not yet computed" (will fall back to scanning).
     pub next_value_id: u32,
+    /// FP arithmetic value → statement-root id (OP-36). Written by the
+    /// frontend lowering (fresh root per statement); consumed by the
+    /// backend's OnExpr contraction gate. Pass-created values stay absent
+    /// and fail closed; the inline pass drops callee tags rather than
+    /// renumbering (their statement granularity is meaningless in the
+    /// caller and a numeric collision could fabricate a false match).
+    pub fp_expr_tags: crate::common::fp_contract::FpExprTags,
     /// Cached upper bound on Block Labels: all Block Labels in this function are < next_label.
     /// Set by vectorization and other transformation passes to avoid duplicate labels.
     /// A value of 0 means "not yet computed" (will fall back to scanning).
@@ -326,6 +333,7 @@ impl IrFunction {
             is_always_inline: false,
             is_noinline: false,
             next_value_id: 0,
+            fp_expr_tags: Default::default(),
             next_label: 0,
             section: None,
             visibility: None,

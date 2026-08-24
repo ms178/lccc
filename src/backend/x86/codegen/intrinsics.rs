@@ -779,9 +779,40 @@ impl X86Codegen {
         (base, index)
     }
 
+    /// Constant displacement argument of a vector memory intrinsic, if the
+    /// caller appended one (stencil taps: `VecLoad(base, byte_iv, disp)`).
+    /// `idx` is the argument position that carries it (2 for loads, 3 for
+    /// stores).
+    fn vec_disp_arg(args: &[Operand], idx: usize) -> i64 {
+        args.get(idx)
+            .and_then(|o| match o {
+                Operand::Const(c) => c.to_i64(),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Full x86 memory operand for a vector access: `disp(%base,%index)`.
+    /// A zero displacement omits the field, keeping the encoding
+    /// byte-identical to the two-argument (map) form.
+    fn vec_mem_operand(&mut self, base_arg: &Operand, off_arg: &Operand, disp: i64) -> String {
+        let (base, index) = self.vec_load_addr_regs(base_arg, off_arg);
+        let disp_str = if disp == 0 {
+            String::new()
+        } else {
+            format!("{}", disp)
+        };
+        match index {
+            Some(ix) => format!("{}(%{},%{})", disp_str, base, ix),
+            None => format!("{}(%{})", disp_str, base),
+        }
+    }
+
     /// Store a packed map result either through its legacy materialized GEP or
     /// directly through `(base, byte_offset)` operands.  The latter lets the
     /// x86 SIB form replace two LEAs and a pointer shuttle in every iteration.
+    /// A trailing constant argument (args[3]) is a displacement, folding the
+    /// stencil tap offset into the same memory operand.
     fn emit_vec_store_addr(
         &mut self,
         args: &[Operand],
@@ -790,17 +821,10 @@ impl X86Codegen {
         source_reg: &str,
     ) {
         if args.len() >= 3 {
-            let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
-            match index {
-                Some(index) => self.state.emit_fmt(format_args!(
-                    "    {} %{}, (%{},%{})",
-                    mnemonic, source_reg, base, index
-                )),
-                None => self.state.emit_fmt(format_args!(
-                    "    {} %{}, (%{})",
-                    mnemonic, source_reg, base
-                )),
-            }
+            let disp = Self::vec_disp_arg(args, 3);
+            let mem = self.vec_mem_operand(&args[1], &args[2], disp);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, {}", mnemonic, source_reg, mem));
         } else if let Some(ptr) = dest_ptr {
             self.operand_to_reg(&Operand::Value(*ptr), "rax");
             self.state
@@ -2698,18 +2722,35 @@ impl X86Codegen {
                 // Store through avx_store_dest so a single-use result can be
                 // deferred and folded by the next VecAdd/VecMul. Reuse
                 // register-allocated base/offset GPRs (reduction hot loops).
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => self
-                        .state
-                        .emit_fmt(format_args!("    vmovupd (%{},%{}), %ymm0", base, ix)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    vmovupd (%{}), %ymm0", base)),
+                // An optional third argument is a stencil-tap displacement.
+                // An XMM-homed destination loads directly into its home.
+                let disp = Self::vec_disp_arg(args, 2);
+                let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                self.state.dirty_upper_ymm = true;
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name_256(reg);
+                            self.state
+                                .emit_fmt(format_args!("    vmovupd {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state.emit_fmt(format_args!("    vmovupd {}, %ymm0", mem));
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    self.avx_store_dest(d);
+                    if !loaded_home {
+                        self.avx_store_dest(d);
+                    }
                 }
             }
             IntrinsicOp::VecLoadI64x2 => {
@@ -2730,18 +2771,34 @@ impl X86Codegen {
             }
             IntrinsicOp::VecLoadF64x2 => {
                 // %dest_vec = load_vector(base_ptr, offset) - SSE2 2×F64.
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => self
-                        .state
-                        .emit_fmt(format_args!("    movupd (%{},%{}), %xmm0", base, ix)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    movupd (%{}), %xmm0", base)),
+                // An optional third argument is a stencil-tap displacement.
+                // An XMM-homed destination loads directly into its home.
+                let disp = Self::vec_disp_arg(args, 2);
+                let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name(reg);
+                            self.state
+                                .emit_fmt(format_args!("    movupd {}, %{}", mem, name));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
+                        }
+                    }
+                }
+                if !loaded_home {
+                    self.state.emit_fmt(format_args!("    movupd {}, %xmm0", mem));
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    self.sse_store_dest(d, "xmm0");
+                    if !loaded_home {
+                        self.sse_store_dest(d, "xmm0");
+                    }
                 }
             }
             IntrinsicOp::VecLoadI32x8 => {
@@ -3243,35 +3300,56 @@ impl X86Codegen {
             // ---- F32 reduction vector ops (8-wide AVX2 / 4-wide SSE2) ----
             IntrinsicOp::VecLoadF32x8 | IntrinsicOp::VecLoadF32x4 => {
                 // Defer-aware store (single-use result folds into next op);
-                // reuse register-allocated base/offset GPRs.
+                // reuse register-allocated base/offset GPRs. An optional
+                // third argument is a constant displacement (stencil tap),
+                // folded into the SIB operand: `disp(%base,%idx)`.
+                //
+                // When the destination has an XMM home (defer-overflow or
+                // broadcast promotion), load DIRECTLY into the home's YMM
+                // name — no `%ymm0` staging move (OP-05a stencils).
                 let is8 = matches!(op, IntrinsicOp::VecLoadF32x8);
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => {
-                        if is8 {
-                            self.state
-                                .emit_fmt(format_args!("    vmovups (%{},%{}), %ymm0", base, ix));
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    movups (%{},%{}), %xmm0", base, ix));
+                let disp = Self::vec_disp_arg(args, 2);
+                let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                let mut loaded_home = false;
+                if let Some(d) = dest {
+                    if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                        if is_xmm_reg(reg) {
+                            let name = phys_reg_name_256(reg);
+                            if is8 {
+                                self.state.dirty_upper_ymm = true;
+                                self.state
+                                    .emit_fmt(format_args!("    vmovups {}, %{}", mem, name));
+                            } else {
+                                let n128 = phys_reg_name(reg);
+                                self.state
+                                    .emit_fmt(format_args!("    movups {}, %{}", mem, n128));
+                            }
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, name);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(name);
+                            loaded_home = true;
                         }
                     }
-                    None => {
-                        if is8 {
-                            self.state
-                                .emit_fmt(format_args!("    vmovups (%{}), %ymm0", base));
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    movups (%{}), %xmm0", base));
-                        }
+                }
+                if !loaded_home {
+                    if is8 {
+                        self.state
+                            .emit_fmt(format_args!("    vmovups {}, %ymm0", mem));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    movups {}, %xmm0", mem));
                     }
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
-                    if is8 {
-                        self.avx_store_dest(d);
-                    } else {
-                        self.sse_store_dest(d, "xmm0");
+                    if !loaded_home {
+                        if is8 {
+                            self.avx_store_dest(d);
+                        } else {
+                            self.sse_store_dest(d, "xmm0");
+                        }
                     }
                 }
             }
@@ -3726,6 +3804,34 @@ impl X86Codegen {
                         self.state.vec_last_store_val = Some(dest_ptr.0);
                         self.state.vec_last_store_reg = true;
                         self.state.vec_last_store_reg_name = Some(target);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // All-homed fast path (OP-05a stencils): when BOTH operands and the
+        // destination carry XMM homes (defer-overflow promotion), the
+        // three-operand VEX form computes register-to-register with no
+        // `%ymm0/%ymm1` staging at all: `op %ymmS, %ymmR, %ymmD`.
+        if let (Operand::Value(a0), Operand::Value(a1)) = (&args[0], &args[1]) {
+            if let (Some(&r0), Some(&r1)) = (
+                self.reg_assignments.get(&a0.0),
+                self.reg_assignments.get(&a1.0),
+            ) {
+                if let Some(&rd) = self.reg_assignments.get(&dest_ptr.0) {
+                    if is_xmm_reg(r0) && is_xmm_reg(r1) && is_xmm_reg(rd) {
+                        let n0 = phys_reg_name_256(r0);
+                        let n1 = phys_reg_name_256(r1);
+                        let nd = phys_reg_name_256(rd);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, %{}, %{}", avx_inst, n1, n0, nd));
+                        self.state.dirty_upper_ymm = true;
+                        self.state.vec_live_regs.insert(dest_ptr.0, nd);
+                        self.state.vec_last_store_val = Some(dest_ptr.0);
+                        self.state.vec_last_store_reg = true;
+                        self.state.vec_last_store_reg_name = Some(nd);
+                        self.state.reg_cache.invalidate_acc();
                         return;
                     }
                 }

@@ -709,6 +709,7 @@ mod tests {
             is_always_inline: false,
             is_noinline: false,
             next_value_id: 0,
+            fp_expr_tags: Default::default(),
             next_label: 0,
             section: None,
             visibility: None,

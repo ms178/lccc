@@ -64,7 +64,7 @@ pub struct Driver {
     /// `-fassociative-math -ffp-contract=off` may vectorize a reduction but must
     /// retain separate multiply and add rounding. Enabled by `-ffast-math` or
     /// an explicit `-ffp-contract=fast`.
-    pub(super) fp_contract_fast: bool,
+    pub(super) fp_contract: crate::common::fp_contract::FpContract,
     /// An explicit -ffp-contract=... was given. GCC's set_fast_math_flags only
     /// touches the contraction mode when it was NOT explicitly set, so
     /// `-ffp-contract=off -ffast-math` keeps contraction OFF while
@@ -379,7 +379,7 @@ impl Driver {
             // returned directly (zero additional latency vs separate insns,
             // and both forms round identically in that shape because no
             // other consumer observes the intermediate mul result).
-            fp_contract_fast: false,
+            fp_contract: crate::common::fp_contract::FpContract::default(),
             fp_contract_explicit: false,
             fast_math: false,
             verbose: false,
@@ -1498,7 +1498,7 @@ impl Driver {
             self.opt_level,
             self.target,
             self.fp_reassoc,
-            self.fp_contract_fast,
+            self.fp_contract,
             self.target == Target::X86_64
                 && self.enable_avx
                 && !self.no_sse
@@ -1551,24 +1551,6 @@ impl Driver {
                         crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
                     if n > 0 {
                         did_split = true;
-                    }
-                }
-            }
-            // Loop-transparent splitting (spill values live across a hot loop
-            // but unused inside it). NOTE: measured as a net loss on the
-            // benchmark suite — the store/reload round-trips cost more than the
-            // freed registers save, because the values competing for registers
-            // in hot loops are the in-loop ones (bases/IVs), which can't be
-            // transparent-split. Kept opt-in for reference.
-            if std::env::var("CCC_LOOP_SPLIT").is_ok() {
-                for func in &mut module.functions {
-                    if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
-                            func, max_splits,
-                        );
-                        if n > 0 {
-                            did_split = true;
-                        }
                     }
                 }
             }
@@ -1942,7 +1924,7 @@ impl Driver {
             data_sections: self.data_sections,
             code16gcc: self.code16gcc,
             regparm: self.regparm,
-            fp_contract_fast: self.fp_contract_fast,
+            fp_contract: self.fp_contract,
             preferred_stack_bytes: self.preferred_stack_bytes,
             omit_frame_pointer: self.omit_frame_pointer,
             emit_cfi: !self.no_unwind_tables,

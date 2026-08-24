@@ -54,6 +54,7 @@ pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 
 use crate::common::fx_hash::FxHashSet;
+use crate::common::fp_contract::FpContract;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand};
 
@@ -692,7 +693,7 @@ pub(crate) fn run_passes(
     opt_level: u32,
     target: crate::backend::Target,
     fp_reassoc: bool,
-    fp_contract_fast: bool,
+    fp_contract: crate::common::fp_contract::FpContract,
     x86_avx: bool,
 ) {
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
@@ -1027,17 +1028,17 @@ pub(crate) fn run_passes(
             )
             && !disabled.contains("vectorize")
         {
-            let vectorize_fn = match (target, fp_reassoc, fp_contract_fast, x86_avx) {
+            let vectorize_fn = match (target, fp_reassoc, fp_contract, x86_avx) {
                 (crate::backend::Target::Aarch64, true, _, _) => {
                     vectorize::vectorize_function_two_wide_fast_math
                 }
                 (crate::backend::Target::Aarch64, false, _, _) => {
                     vectorize::vectorize_function_two_wide
                 }
-                (_, true, true, true) => vectorize::vectorize_function_fast_math,
-                (_, true, true, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
-                (_, true, false, true) => vectorize::vectorize_function_reassoc,
-                (_, true, false, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
+                (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,
+                (_, true, FpContract::Fast, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
+                (_, true, FpContract::Off | FpContract::OnExpr, true) => vectorize::vectorize_function_reassoc,
+                (_, true, FpContract::Off | FpContract::OnExpr, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
                 (_, false, _, _) => vectorize::vectorize_function,
             };
             let n = timed_pass!(

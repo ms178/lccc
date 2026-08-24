@@ -26,6 +26,14 @@
 //! - Under lifetime-demotion, a spilled value pays a slot access at every
 //!   remaining use. There is no reload-at-next-use in this module; that is
 //!   a backend / `regalloc.rs` policy.
+//! - Segment-aware interference (RA-05): when [`LiveRange::segs`] is
+//!   populated (sorted, pairwise separated by at least one dead point),
+//!   interference is decided on the *hole-aware* live pieces, not the fat
+//!   `[start, end]` hull. A value dead through a diamond arm no longer
+//!   blocks the register for values live only on that arm. Segments are
+//!   strictly an *under*-approximation of the fat hull, so every decision
+//!   the old allocator made remains representable; empty `segs` falls back
+//!   to the fat model exactly.
 //!
 //! # Spill / eviction cost model
 //!
@@ -42,16 +50,48 @@ use super::liveness::{
     for_each_value_use_in_instruction, LiveInterval,
 };
 use super::regalloc::PhysReg;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, IrUnaryOp, Operand, Terminator};
 use std::sync::OnceLock;
 
+/// Hole-aware live pieces `[start, end]` (closed, sorted ascending, merged
+/// so consecutive pieces are separated by at least one dead program point).
+/// Empty means "no segment information" — all interference decisions then
+/// use the fat `[start, end]` hull exactly as before RA-05.
+pub type SegmentList = Vec<(u32, u32)>;
+
+/// Normalize a raw piece list into [`SegmentList`] form: sort by start,
+/// merge pieces that overlap or touch at a point (`s <= cur_end + 1`),
+/// mirroring `liveness::build_segments`' own merge rule so both producers
+/// and manual unions (coalesce groups) yield the same shape.
+pub(crate) fn normalize_segments(mut raw: Vec<(u32, u32)>) -> SegmentList {
+    raw.retain(|&(s, e)| e >= s);
+    if raw.is_empty() {
+        return raw;
+    }
+    raw.sort_unstable_by_key(|&(s, _)| s);
+    let mut out: SegmentList = Vec::with_capacity(raw.len());
+    let (mut cs, mut ce) = raw[0];
+    for &(s, e) in raw.iter().skip(1) {
+        if s <= ce.saturating_add(1) {
+            ce = ce.max(e);
+        } else {
+            out.push((cs, ce));
+            cs = s;
+            ce = e;
+        }
+    }
+    out.push((cs, ce));
+    out
+}
+
 /// Enhanced live interval with priority, uses, and spill weight.
 ///
 /// Extends [`LiveInterval`] with:
 /// - `uses`: individual use points within `[start, end]` (sorted, unique)
+/// - `segs`: hole-aware live pieces (RA-05); empty = fat model
 /// - `loop_depth`: max of def-block depth and hottest use-site depth
 /// - `priority`: profile-weighted uses × `10^min(depth, 4)`
 /// - `reg_hint`: caller-supplied preferred physical register
@@ -64,10 +104,15 @@ pub struct LiveRange {
     pub start: u32,
     pub end: u32,
     pub uses: Vec<u32>,
+    /// Hole-aware live pieces. Invariant: `segs` is empty, or its first
+    /// piece starts at `start`, its last piece ends at `end`, and every
+    /// recorded use lies inside some piece. Interference decisions prefer
+    /// `segs` when present ([`LiveRange::segments_conflict`]).
+    pub segs: SegmentList,
     pub loop_depth: u32,
     pub priority: u64,
     /// Preferred physical register. Honour only if it is in the current
-    /// allocation class and [`LiveRange::conflicts_with`] allows the share.
+    /// allocation class and [`LiveRange::segments_conflict`] allows the share.
     /// Callers / later passes may populate this; [`build_live_ranges`] does
     /// not (it uses [`LiveRange::follow_value`] instead).
     pub reg_hint: Option<PhysReg>,
@@ -93,6 +138,7 @@ impl LiveRange {
             start: interval.start,
             end: interval.end,
             uses: Vec::new(),
+            segs: Vec::new(),
             loop_depth,
             priority: loop_weight,
             reg_hint: None,
@@ -150,6 +196,64 @@ impl LiveRange {
         }
         true
     }
+
+    /// Segment-aware interference (RA-05).
+    ///
+    /// Two values conflict iff some live piece of `self` shares a program
+    /// point with some live piece of `other`. Holes — a value dead through
+    /// a diamond arm — no longer fabricate interference, so two values whose
+    /// fat hulls overlap can legally share one register.
+    ///
+    /// Boundary contact (`a_end == b_start`, both live at that point) counts
+    /// as a shared point. It is waived only when `adjacent_ok` is set AND the
+    /// dying side's last *recorded* use sits exactly at the boundary — the
+    /// guarded die-at-birth share. `adjacent_ok = false` reproduces the
+    /// rotation path's strict pre-RA-05 behaviour (the incoming must start
+    /// strictly after the holder's last live point).
+    ///
+    /// Soundness of the waiver: a recorded use at the boundary `p` is a read
+    /// at `p`; the other value's def at `p` is a write at `p`; every emitter
+    /// the hint path is allowed on reads its operands before writing the
+    /// destination. A use after `p` would make `last_use_is_at(p)` false, so
+    /// the waiver can never fire for a value that survives the boundary.
+    ///
+    /// Falls back to the fat [`LiveRange::conflicts_with`] when either side
+    /// has no segment data, so synthetic intervals keep their exact old
+    /// behaviour.
+    pub fn segments_conflict(&self, other: &LiveRange, adjacent_ok: bool) -> bool {
+        if self.segs.is_empty() || other.segs.is_empty() {
+            return self.conflicts_with(other);
+        }
+        // Fat-disjoint implies segment-disjoint (pieces are subsets of the
+        // hull); cheap exit before the pairwise walk.
+        if self.start > other.end || other.start > self.end {
+            return false;
+        }
+        for &(ss, se) in &self.segs {
+            for &(os, oe) in &other.segs {
+                // No shared program point.
+                if se < os || oe < ss {
+                    continue;
+                }
+                // Touch exactly at one point: both live at that point.
+                if se == os {
+                    if adjacent_ok && self.last_use_is_at(se) {
+                        continue;
+                    }
+                    return true;
+                }
+                if oe == ss {
+                    if adjacent_ok && other.last_use_is_at(oe) {
+                        continue;
+                    }
+                    return true;
+                }
+                // Proper overlap.
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Inclusive live-span length. Inverted intervals do not underflow.
@@ -203,7 +307,15 @@ pub struct LinearScanAllocator {
     pub handled: Vec<ActiveInterval>,
     pub assignments: FxHashMap<u32, PhysReg>,
     /// One past the last use of the most recent occupant of each register.
+    /// Advisory only since RA-05: register eligibility is decided by the
+    /// segment-aware active-list check plus [`Self::seeded_until`]; this map
+    /// is kept monotone (max) for diagnostics.
     pub reg_free_until: FxHashMap<PhysReg, u32>,
+    /// Cross-wave occupancy: values homed by an *earlier allocator wave*
+    /// (not present in this allocator's `active`) reserve their register
+    /// until this point. Within one wave the active list is the complete
+    /// occupancy truth; across waves it cannot see anything.
+    pub seeded_until: FxHashMap<PhysReg, u32>,
     pub spill_slots: FxHashMap<u32, i32>,
     pub available_regs: Vec<PhysReg>,
     pub next_spill_slot: i32,
@@ -223,6 +335,7 @@ impl LinearScanAllocator {
             handled: Vec::new(),
             assignments: FxHashMap::default(),
             reg_free_until: FxHashMap::default(),
+            seeded_until: FxHashMap::default(),
             spill_slots: FxHashMap::default(),
             available_regs,
             next_spill_slot: 0,
@@ -236,8 +349,10 @@ impl LinearScanAllocator {
     /// stale occupancy from the previous class (GPR → XMM, phase 2 → 2c).
     pub fn init_registers(&mut self) {
         self.reg_free_until.clear();
+        self.seeded_until.clear();
         for &reg in &self.available_regs {
             self.reg_free_until.insert(reg, 0);
+            self.seeded_until.insert(reg, 0);
         }
     }
 
@@ -246,7 +361,11 @@ impl LinearScanAllocator {
     }
 
     pub fn occupy_register(&mut self, reg: PhysReg, until: u32) {
-        self.reg_free_until.insert(reg, until);
+        // Monotone (max) since RA-05: two segment-disjoint values can share
+        // one register, and the second assignment must not erase the first
+        // occupant's tail from the advisory map.
+        let cur = self.reg_free_until.get(&reg).copied().unwrap_or(0);
+        self.reg_free_until.insert(reg, cur.max(until));
     }
 
     /// Allocator-local “this value is demoted” record. Slot *packing* and
@@ -290,9 +409,10 @@ impl LinearScanAllocator {
     ///
     /// 1. Honour `reg_hint` / `follow_value` if the register is in this
     ///    pool and [`Self::register_compatible`] (the only path that
-    ///    applies use-before-def adjacency).
-    /// 2. Otherwise a register whose last occupant died *strictly before*
-    ///    `range.start`, rotating the start index for ILP.
+    ///    applies the guarded use-before-def adjacency).
+    /// 2. Otherwise the first rotated register whose active holders are all
+    ///    segment-disjoint from `range` (RA-05; fat-disjoint when no segment
+    ///    data exists) and whose cross-wave seed has expired.
     pub fn find_free_register(&mut self, range: &LiveRange) -> Option<PhysReg> {
         if let Some(hint) = range.reg_hint {
             if self.is_allocatable_reg(hint) && self.register_compatible(hint, range) {
@@ -314,8 +434,19 @@ impl LinearScanAllocator {
         for offset in 0..n {
             let idx = (start + offset) % n;
             let reg = self.available_regs[idx];
-            let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-            if free_until <= range.start {
+            // Registers still held by an earlier wave's values (invisible to
+            // this allocator's active list) stay reserved until the seed
+            // point; `seeded_until` is never raised by in-wave assignments.
+            let seeded = self.seeded_until.get(&reg).copied().unwrap_or(0);
+            if seeded > range.start {
+                continue;
+            }
+            // STRICT segment check: the rotation path must never apply the
+            // die-at-birth waiver. Only the hint path may share a register
+            // at a boundary point, and only for emitters that compute into
+            // the destination with the operand pre-loaded (applying it to
+            // every GPR pair produced `or %r9,%r9` in sqlite_get_varint).
+            if self.register_compatible_strict(reg, range) {
                 self.next_reg_idx = idx + 1;
                 return Some(reg);
             }
@@ -331,26 +462,38 @@ impl LinearScanAllocator {
 
     /// Whether `reg` may hold `range` for its whole lifetime.
     ///
-    /// 1. **Occupancy.** `reg_free_until[reg] - 1` is the last occupant's
-    ///    end. Strictly past `range.start` ⇒ the occupant is still needed
-    ///    after `range`'s def. Equality is the die-at-birth case and is
-    ///    decided by (2).
-    /// 2. **Interference.** No active holder of `reg` may
-    ///    [`LiveRange::conflicts_with`] `range`.
+    /// The active list is the complete in-wave occupancy truth: any holder
+    /// whose live pieces could intersect `range`'s pieces still has
+    /// `range.end >= range.start >= holder_start`-adjacent fat bounds and
+    /// therefore has not expired. The check is segment-aware (RA-05) with
+    /// the guarded boundary waiver, so the hint path keeps its die-at-birth
+    /// sharing and gains hole awareness.
     ///
     /// `|active|` is bounded by the register file plus die-at-birth
     /// extras; a per-register index would add sync surface for tens of
     /// comparisons.
     fn register_compatible(&self, reg: PhysReg, range: &LiveRange) -> bool {
-        let free_until = self.reg_free_until.get(&reg).copied().unwrap_or(0);
-        let occupant_end = free_until.saturating_sub(1);
-        if occupant_end > range.start {
-            return false;
-        }
+        self.register_compatible_impl(reg, range, true)
+    }
+
+    /// [`Self::register_compatible`] without the die-at-birth waiver — the
+    /// rule the rotation path and eviction steal-safety use. A register may
+    /// host `range` only when no active holder shares *any* live point with
+    /// it, boundary points included.
+    fn register_compatible_strict(&self, reg: PhysReg, range: &LiveRange) -> bool {
+        self.register_compatible_impl(reg, range, false)
+    }
+
+    fn register_compatible_impl(
+        &self,
+        reg: PhysReg,
+        range: &LiveRange,
+        adjacent_ok: bool,
+    ) -> bool {
         self.active
             .iter()
             .filter(|a| self.assignments.get(&a.range.value_id) == Some(&reg))
-            .all(|a| !a.range.conflicts_with(range))
+            .all(|a| !a.range.segments_conflict(range, adjacent_ok))
     }
 
     /// Uses of `range` strictly after `pos`. Under lifetime-demotion this
@@ -366,14 +509,14 @@ impl LinearScanAllocator {
     /// Whether giving `evicted_vid`'s register to `incoming` is sound.
     ///
     /// Die-at-birth sharing leaves two active intervals on one physical
-    /// register. Evicting only one of them and handing that register to a
-    /// third interval that conflicts with the surviving partner is a
-    /// silent miscompile.
+    /// register; RA-05 hole-aware sharing adds strictly-disjoint co-holders.
+    /// Evicting only one of them and handing that register to a third
+    /// interval that conflicts with a surviving partner is a silent
+    /// miscompile.
     ///
-    /// Corollary used by [`Self::occupy_register`]: a still-active
-    /// co-holder that does *not* conflict with `incoming` must be the
-    /// die-at-birth partner and therefore dies at `incoming.start`.
-    /// Occupying until `incoming.end + 1` cannot go live too early.
+    /// The surviving-partner test uses the same strict segment rule as the
+    /// rotation path: a co-holder that is segment-disjoint from `incoming`
+    /// may legally keep sharing the register after the eviction.
     fn register_steal_is_safe(&self, evicted_vid: u32, incoming: &LiveRange) -> bool {
         let Some(&reg) = self.assignments.get(&evicted_vid) else {
             return false;
@@ -384,7 +527,7 @@ impl LinearScanAllocator {
         !self.active.iter().any(|a| {
             a.range.value_id != evicted_vid
                 && self.assignments.get(&a.range.value_id) == Some(&reg)
-                && a.range.conflicts_with(incoming)
+                && a.range.segments_conflict(incoming, false)
         })
     }
 
@@ -495,7 +638,9 @@ impl LinearScanAllocator {
     /// - steal-safe
     /// - `incoming.priority > victim.priority` (never evict a hotter value)
     /// - mode 1 only: `victim.loop_depth < incoming.loop_depth`
-    /// - mode ≥ 3: victim's next use is strictly after `incoming.end`
+    /// - mode ≥ 3: victim's next use is strictly after `incoming.end`,
+    ///   UNLESS the incoming is at least `CCC_EVICT_HOT_RATIO` (default 8)
+    ///   times hotter than the victim (see below)
     ///
     /// Note (session 41): a "zero-future-use dead victim" search was
     /// prototyped here twice — as a ranking override and as a last resort
@@ -511,10 +656,38 @@ impl LinearScanAllocator {
     /// callee-saved registers without touching the eviction ranking.
     /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only
     /// for the documented experiment trail.
+    ///
+    /// Hot-ratio escape (RA-05): segment sharing legitimately homes long,
+    /// cool ranges that a fat scan would have spilled (adler32's v720/v540,
+    /// 110 weighted uses each, live across the whole DO8 body). A later
+    /// *much hotter* range (v522) then finds every register held and the
+    /// next-use window refuses every eviction — the hot value is demoted
+    /// instead of the cool one, a pure priority inversion. When
+    /// `incoming.priority ≥ ratio × victim.priority` the window is waived
+    /// **as a fallback only**: window-compliant victims keep precedence, so
+    /// the Braun–Hack far-next-use preference is unchanged whenever it has
+    /// a candidate. Default ratio 8; 0 disables (pre-RA-05 behaviour).
     fn select_evict_victim(&self, incoming: &LiveRange, mode: i32) -> Option<usize> {
         if self.active.is_empty() || mode <= 0 {
             return None;
         }
+        // Pass 1: the window-preferred search (pre-RA-05 semantics).
+        if let Some(idx) = self.rank_victims(incoming, mode, false) {
+            return Some(idx);
+        }
+        // Pass 2: hot-escape fallback. Only reached when no window-compliant
+        // victim exists, so the incoming would otherwise be demoted.
+        if evict_hot_ratio() > 0 {
+            return self.rank_victims(incoming, mode, true);
+        }
+        None
+    }
+
+    /// Victim ranking shared by both passes. `hot_escape` waives the
+    /// mode-≥3 next-use window for victims the incoming dominates by the
+    /// hot ratio (pass 2 only).
+    fn rank_victims(&self, incoming: &LiveRange, mode: i32, hot_escape: bool) -> Option<usize> {
+        let hot_ratio = evict_hot_ratio();
         let mut best_idx: Option<usize> = None;
         let mut best_priority = u64::MAX;
         let mut best_next_use = 0u32;
@@ -543,7 +716,12 @@ impl LinearScanAllocator {
             }
             let nxt = next_use_after(&interval.range, incoming.start);
             if mode >= 3 && nxt <= incoming.end {
-                continue;
+                let escape = hot_escape
+                    && hot_ratio > 0
+                    && incoming.priority >= hot_ratio.saturating_mul(interval.range.priority);
+                if !escape {
+                    continue;
+                }
             }
             let priority = interval.range.priority;
             let sw = interval.range.spill_weight;
@@ -593,20 +771,53 @@ impl LinearScanAllocator {
         } else {
             self.select_evict_victim(&range, mode)
         };
-        if let Some(evict_idx) = victim {
-            if self.try_evict(evict_idx, range) {
-                return;
+        match victim {
+            Some(evict_idx) => {
+                if self.try_evict(evict_idx, range) {
+                    return;
+                }
+                // try_evict refused (defensive): `range` was moved into it,
+                // so nothing more can be done here. Every refusal path in
+                // try_evict runs before the move, keeping this unreachable.
             }
-        } else {
-            // `range` moved only on the success path above.
-            self.allocate_spill_slot(range.value_id);
-            return;
+            None => {
+                // Last resort before demotion: sweep one register clean if
+                // its holders are all dominated by the incoming (RA-05).
+                if let Some((reg, cascade)) = self.sweep_evict_register(&range) {
+                    let mut range = range;
+                    range.cascade = cascade;
+                    self.commit_assignment(range, reg);
+                    return;
+                }
+                if alloc_trace_enabled() {
+                    // Decision trace: which guard class refused every victim.
+                    let blockers: Vec<String> = self
+                        .active
+                        .iter()
+                        .map(|a| {
+                            if a.range.reg_hint.is_some() {
+                                format!("v{}:hint", a.range.value_id)
+                            } else if range.priority <= a.range.priority {
+                                format!("v{}:hotter", a.range.value_id)
+                            } else if next_use_after(&a.range, range.start) <= range.end {
+                                format!("v{}:nextuse", a.range.value_id)
+                            } else {
+                                format!("v{}:steal", a.range.value_id)
+                            }
+                        })
+                        .collect();
+                    eprintln!(
+                        "[ALLOC] v{}[{}-{}] prio={} spilled; active blockers: {}",
+                        range.value_id,
+                        range.start,
+                        range.end,
+                        range.priority,
+                        blockers.join(", ")
+                    );
+                }
+                self.allocate_spill_slot(range.value_id);
+            }
         }
-        // try_evict refused (defensive): incoming was moved into it and
-        // returned, so this path is unreachable. Keep a spill for the
-        // type-checker if the signature ever changes.
-        // (try_evict takes `range` by value; on failure it must not
-        // consume — see try_evict.)
     }
 
     fn commit_assignment(&mut self, range: LiveRange, reg: PhysReg) {
@@ -666,6 +877,126 @@ impl LinearScanAllocator {
         true
     }
 
+    /// Last-resort multi-victim eviction (RA-05).
+    ///
+    /// Segment sharing fragments a register's timeline: one long range with
+    /// holes plus a sequence of short temps can tile a register so densely
+    /// that a later *contiguous hot* range fits no register at all — every
+    /// single-victim eviction is steal-blocked by the surviving co-holders
+    /// (measured: adler32 v522, 1200 weighted uses, slotted while two
+    /// 110-use ranges plus their hole temps held two registers through the
+    /// DO8 loop).
+    ///
+    /// This sweep evicts **every** holder of one register when the whole
+    /// group is dominated by the incoming:
+    /// - every holder has strictly lower priority (never evict a hotter
+    ///   value — same rule as single eviction),
+    /// - the holders' combined *loop-weighted future* slot traffic (uses
+    ///   after the scan point, weighted by `10^loop_depth` like
+    ///   [`LiveRange::priority`]) is strictly less than the incoming's own
+    ///   projected traffic, so every sweep is a net traffic reduction, not
+    ///   a reshuffle,
+    /// - no holder is ABI-hinted, and the incoming's cascade is not above
+    ///   every holder's cascade (bounds ping-pong chains).
+    ///
+    /// Gated by `CCC_EVICT_HOT_RATIO=0` (default 8): the same switch that
+    /// disables the single-evict window escape disables the sweep, keeping
+    /// one documented off-path for the whole RA-05 eviction extension.
+    fn sweep_evict_register(&mut self, incoming: &LiveRange) -> Option<(PhysReg, u32)> {
+        let ratio = evict_hot_ratio();
+        if ratio == 0 || self.active.is_empty() {
+            return None;
+        }
+        let n = self.available_regs.len();
+        let start = self.next_reg_idx % n.max(1);
+        for offset in 0..n {
+            let idx = (start + offset) % n;
+            let reg = self.available_regs[idx];
+            let seeded = self.seeded_until.get(&reg).copied().unwrap_or(0);
+            if seeded > incoming.start {
+                continue;
+            }
+            let holders: Vec<usize> = self
+                .active
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| self.assignments.get(&a.range.value_id) == Some(&reg))
+                .map(|(i, _)| i)
+                .collect();
+            if holders.is_empty() {
+                continue;
+            }
+            let mut hottest = 0u64;
+            let mut future_traffic = 0u64;
+            let mut hinted = false;
+            let mut min_cascade = u32::MAX;
+            let mut max_cascade = 0u32;
+            for &h in &holders {
+                let r = &self.active[h].range;
+                hottest = hottest.max(r.priority);
+                // Loop-weighted future slot traffic: a remaining use in a
+                // hot loop costs `10^depth` more than one outside.
+                future_traffic +=
+                    Self::future_uses(r, incoming.start) as u64
+                        * loop_depth_weight(r.loop_depth);
+                hinted |= r.reg_hint.is_some();
+                min_cascade = min_cascade.min(r.cascade);
+                max_cascade = max_cascade.max(r.cascade);
+            }
+            let incoming_traffic =
+                incoming.uses.len() as u64 * loop_depth_weight(incoming.loop_depth);
+            let reject = if hinted || incoming.priority <= hottest {
+                "hint-or-hotter"
+            } else if incoming.cascade > min_cascade {
+                "cascade"
+            } else if future_traffic >= incoming_traffic {
+                "traffic"
+            } else {
+                ""
+            };
+            if !reject.is_empty() {
+                if alloc_trace_enabled() {
+                    eprintln!(
+                        "[SWEEP-REJECT] reg={} for v{}[{}]: {} (hottest={} in_prio={} fut={} in_traffic={} holders={})",
+                        reg.0,
+                        incoming.value_id,
+                        incoming.start,
+                        reject,
+                        hottest,
+                        incoming.priority,
+                        future_traffic,
+                        incoming_traffic,
+                        holders.len()
+                    );
+                }
+                continue;
+            }
+            // Evict every holder, highest index first so earlier indices
+            // stay valid across swap_remove.
+            if allocstats_enabled() {
+                eprintln!(
+                    "[SWEEP] reg={} -> val{}[{}] evict={} fut_traffic={} in_traffic={}",
+                    reg.0,
+                    incoming.value_id,
+                    incoming.start,
+                    holders.len(),
+                    future_traffic,
+                    incoming_traffic
+                );
+            }
+            for h in holders.into_iter().rev() {
+                let vid = self.active[h].range.value_id;
+                self.assignments.remove(&vid);
+                self.allocate_spill_slot(vid);
+                let mut evicted = self.active.swap_remove(h);
+                evicted.occupancy_end = incoming.start;
+                self.handled.push(evicted);
+            }
+            return Some((reg, max_cascade.saturating_add(1)));
+        }
+        None
+    }
+
     /// Full scan. Idempotent: a second call reallocates from a clean slate.
     /// Sorts here so callers that skip [`build_live_ranges`] cannot feed an
     /// unsorted worklist. Tie-break `value_id` keeps the assignment
@@ -680,6 +1011,13 @@ impl LinearScanAllocator {
     /// earlier wave (e.g. Phase 2's arg-register-free pass for call-argument
     /// values) so it cannot reuse a register that is still occupied by one of
     /// those values.
+    ///
+    /// Since RA-05 the seed lives in [`Self::seeded_until`] (the hard
+    /// cross-wave reservation). The seeded values are not in this wave's
+    /// active list, so the segment-aware in-wave check cannot see them;
+    /// `seeded_until` is the only thing standing between wave N and wave
+    /// N-1's still-live homes. `reg_free_until` mirrors the seed purely for
+    /// the advisory scalar consumers.
     pub fn run_with_seed(&mut self, seed: &FxHashMap<PhysReg, u32>) {
         self.active.clear();
         self.handled.clear();
@@ -689,8 +1027,10 @@ impl LinearScanAllocator {
         self.next_reg_idx = 0;
         self.init_registers();
         for (reg, until) in seed {
-            let cur = self.reg_free_until.entry(*reg).or_insert(0);
+            let cur = self.seeded_until.entry(*reg).or_insert(0);
             *cur = (*cur).max(*until);
+            let advisory = self.reg_free_until.entry(*reg).or_insert(0);
+            *advisory = (*advisory).max(*until);
         }
 
         let mut ranges = std::mem::take(&mut self.ranges);
@@ -712,39 +1052,87 @@ impl LinearScanAllocator {
     /// expired or were evicted and therefore disappeared from final
     /// `assignments`. `occupancy_end` records the eviction cut point, so legal
     /// lifetime demotion is distinguished from a true overlapping assignment.
+    ///
+    /// RA-05: two intervals may legitimately share a register when their live
+    /// *pieces* are disjoint (holes) or touch at a guarded die-at-birth
+    /// boundary. Verification therefore clones each holder with its piece
+    /// list and use list clipped to its occupancy window and applies the
+    /// allocation rule's exact sharing predicate,
+    /// [`LiveRange::segments_conflict`] with `adjacent_ok = true`.
+    ///
+    /// Window semantics (the part that has to match the scan exactly):
+    /// * **Natural expiry** (`occupancy_end == range.end`): the window is the
+    ///   CLOSED piece list. Point `end` may be a guarded die-at-birth share
+    ///   (a recorded use at the boundary, read before the successor's def),
+    ///   so the closed form plus the `adjacent_ok` waiver applies.
+    /// * **Eviction cut** (`occupancy_end < range.end`): the register is
+    ///   handed to the incoming AT the cut point — the victim's window is
+    ///   HALF-OPEN `[start, cut)`. The victim was demoted to a slot; the
+    ///   emitter never reads the victim from the register at or after the
+    ///   cut, so a piece touching the cut from the left must clip to
+    ///   `cut - 1`, not `cut`. (Verification of the first RA-05 revision
+    ///   clipped closed and flagged exactly this eviction handoff as an
+    ///   overlap: v66 [0,55] cut at 25 vs v67 [25,33].)
     fn verify_handled_history(&self) {
-        let mut by_reg: FxHashMap<PhysReg, Vec<(u32, u32, u32)>> = FxHashMap::default();
+        let mut by_reg: FxHashMap<PhysReg, Vec<LiveRange>> = FxHashMap::default();
         for interval in self.handled.iter().chain(self.active.iter()) {
             if interval.occupancy_end <= interval.range.start {
                 continue;
             }
-            by_reg.entry(interval.phys_reg).or_default().push((
-                interval.range.start,
-                interval.occupancy_end,
-                interval.range.value_id,
-            ));
+            let until = interval.occupancy_end;
+            let evicted = until < interval.range.end;
+            // A cut window ends strictly before the cut; a natural window
+            // includes its end point.
+            let last_point = if evicted {
+                until.saturating_sub(1)
+            } else {
+                until
+            };
+            let mut r = interval.range.clone();
+            if r.segs.is_empty() {
+                // No segment data: the fat span is the occupancy window.
+                r.segs = vec![(r.start, last_point.max(r.start))];
+            } else {
+                // Pieces beyond the window belong to the value's
+                // slot-resident tail (eviction) or are empty (natural).
+                r.segs = normalize_segments(
+                    r.segs
+                        .iter()
+                        .filter_map(|&(s, e)| {
+                            let s = s.max(r.start);
+                            let e = e.min(last_point);
+                            (e >= s).then_some((s, e))
+                        })
+                        .collect(),
+                );
+            }
+            // Uses after the window are slot traffic, not register reads;
+            // clip so the die-at-birth waiver only fires inside the window.
+            r.uses.retain(|&u| u <= last_point);
+            by_reg.entry(interval.phys_reg).or_default().push(r);
         }
-        for (reg, intervals) in &mut by_reg {
-            intervals.sort_unstable();
-            let mut previous: Option<(u32, u32, u32)> = None;
-            for &(start, end, value) in intervals.iter() {
-                if let Some((prev_start, prev_end, prev_value)) = previous {
+        for (reg, holders) in &by_reg {
+            for i in 0..holders.len() {
+                for j in (i + 1)..holders.len() {
+                    let a = &holders[i];
+                    let b = &holders[j];
                     assert!(
-                        start >= prev_end,
-                        "linear-scan history overlap: r{} v{}[{}, {}) vs v{}[{}, {})",
+                        !a.segments_conflict(b, true),
+                        "linear-scan history overlap: r{} v{}[{}, {}] vs v{}[{}, {}] \
+                         (pieces {:?} vs {:?}, uses {:?} vs {:?})",
                         reg.0,
-                        prev_value,
-                        prev_start,
-                        prev_end,
-                        value,
-                        start,
-                        end
+                        a.value_id,
+                        a.start,
+                        a.end,
+                        b.value_id,
+                        b.start,
+                        b.end,
+                        a.segs,
+                        b.segs,
+                        a.uses,
+                        b.uses
                     );
-                    if end <= prev_end {
-                        continue;
-                    }
                 }
-                previous = Some((start, end, value));
             }
         }
     }
@@ -784,11 +1172,48 @@ fn evict_mode() -> i32 {
     parsed.unwrap_or(3)
 }
 
+/// Cached `CCC_EVICT_HOT_RATIO` (default 8). The factor by which an incoming
+/// range must outweigh a victim before the mode-3 next-use window is waived.
+/// `0` disables the hot-ratio escape entirely (pre-RA-05 behaviour).
+fn evict_hot_ratio() -> u64 {
+    static RATIO: OnceLock<u64> = OnceLock::new();
+    *RATIO.get_or_init(|| {
+        std::env::var("CCC_EVICT_HOT_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
 /// LiveInterval → LiveRange: one IR walk for defs, uses, loop depth, hints.
 pub fn build_live_ranges(
     intervals: &[LiveInterval],
     loop_depth: &[u32],
     func: &IrFunction,
+) -> Vec<LiveRange> {
+    build_live_ranges_ex(intervals, loop_depth, func, &FxHashMap::default(), &FxHashMap::default())
+}
+
+/// [`build_live_ranges`] with RA-05 segment data.
+///
+/// * `segments`: per-value hole-aware live pieces. Values absent from the
+///   map (or mapped to an empty list) keep the fat model — interference
+///   falls back to [`LiveRange::conflicts_with`].
+/// * `coalesce_groups`: leader → members. A merged range's `uses` list is
+///   the union over the whole group (the register is relayed member to
+///   member, so per-member use counts understate both eviction cost and the
+///   die-at-birth boundary check), and its pieces are the union of the
+///   members' pieces: the shared register must be live whenever ANY member
+///   is live.
+///
+/// Piece lists are normalized ([`normalize_segments`]) so the caller only
+/// needs to concatenate raw `(start, end)` pairs.
+pub fn build_live_ranges_ex(
+    intervals: &[LiveInterval],
+    loop_depth: &[u32],
+    func: &IrFunction,
+    segments: &FxHashMap<u32, SegmentList>,
+    coalesce_groups: &FxHashMap<u32, Vec<u32>>,
 ) -> Vec<LiveRange> {
     let meta = collect_range_metadata(func, loop_depth);
     let pgo_point_weights = pgo_point_weights(func);
@@ -811,13 +1236,47 @@ pub fn build_live_ranges(
         .collect();
 
     for range in &mut ranges {
-        if let Some(uses) = meta.uses.get(&range.value_id) {
-            range.set_uses(
-                uses.iter()
-                    .copied()
-                    .filter(|&u| u >= range.start && u <= range.end)
-                    .collect(),
-            );
+        // Coalesced leader: the register is one relayed home for the whole
+        // group, so both the use list and the piece list must be the union
+        // over the members. The leader-only view undercounts future uses
+        // (eviction cost) and can wrongly certify a die-at-birth boundary
+        // (a member's later use is invisible to the leader's uses list).
+        let members = coalesce_groups.get(&range.value_id);
+        let group_uses: Vec<u32> = match members {
+            None => meta
+                .uses
+                .get(&range.value_id)
+                .map(|uses| {
+                    uses.iter()
+                        .copied()
+                        .filter(|&u| u >= range.start && u <= range.end)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Some(members) => {
+                let mut all: Vec<u32> = Vec::new();
+                for m in members.iter().chain(std::iter::once(&range.value_id)) {
+                    if let Some(uses) = meta.uses.get(m) {
+                        all.extend(uses.iter().copied().filter(|&u| u >= range.start && u <= range.end));
+                    }
+                }
+                all
+            }
+        };
+        range.set_uses(group_uses);
+
+        // Hole-aware pieces: leader-only values take their own list; a
+        // coalesce leader takes the union of the members' pieces.
+        if let Some(members) = members {
+            let mut raw: Vec<(u32, u32)> = Vec::new();
+            for m in members.iter().chain(std::iter::once(&range.value_id)) {
+                if let Some(segs) = segments.get(m) {
+                    raw.extend(segs.iter().copied());
+                }
+            }
+            range.segs = normalize_segments(raw);
+        } else if let Some(segs) = segments.get(&range.value_id) {
+            range.segs = normalize_segments(segs.clone());
         }
 
         let loop_weight = loop_depth_weight(range.loop_depth);
@@ -1070,6 +1529,7 @@ mod tests {
             start,
             end,
             uses: Vec::new(),
+            segs: Vec::new(),
             loop_depth: 0,
             priority,
             reg_hint: None,
@@ -1141,6 +1601,121 @@ mod tests {
 
         let disjoint = lr(5, 20, 30, vec![20, 30], 2);
         assert!(!producer.conflicts_with(&disjoint));
+    }
+
+    // ---- RA-05: segment-aware interference --------------------------------
+
+    /// A range with hole-aware pieces `[10,20] ∪ [40,50]` and a recorded use
+    /// list covering both pieces.
+    fn seg_lr(value_id: u32, pieces: &[(u32, u32)], uses: Vec<u32>) -> LiveRange {
+        let mut r = lr(
+            value_id,
+            pieces.first().map(|&s| s.0).unwrap_or(0),
+            pieces.last().map(|&e| e.1).unwrap_or(0),
+            uses,
+            1,
+        );
+        r.segs = normalize_segments(pieces.to_vec());
+        // The hull must be exactly the piece envelope for the fast paths.
+        r.start = r.segs.first().map(|&s| s.0).unwrap_or(r.start);
+        r.end = r.segs.last().map(|&e| e.1).unwrap_or(r.end);
+        r
+    }
+
+    #[test]
+    fn test_normalize_segments_merges_touching_pieces() {
+        let out = normalize_segments(vec![(10, 20), (21, 30), (40, 50), (45, 55)]);
+        assert_eq!(out, vec![(10, 30), (40, 55)]);
+        // Degenerate/inverted pieces are dropped, not inverted.
+        assert!(normalize_segments(Vec::new()).is_empty());
+        assert!(normalize_segments(vec![(9, 3)]).is_empty());
+    }
+
+    #[test]
+    fn test_segments_conflict_hole_allows_sharing() {
+        // Fat hulls overlap; pieces do not. This is the xmltok/inflate shape.
+        let a = seg_lr(1, &[(10, 20), (40, 50)], vec![10, 15, 20, 45]);
+        let b = seg_lr(2, &[(22, 38)], vec![22, 30, 38]);
+        assert!(a.conflicts_with(&b), "fat hulls overlap");
+        assert!(!a.segments_conflict(&b, false), "pieces are disjoint");
+        assert!(!a.segments_conflict(&b, true));
+    }
+
+    #[test]
+    fn test_segments_conflict_piece_overlap() {
+        let a = seg_lr(1, &[(10, 20), (40, 50)], vec![10, 20, 40]);
+        let b = seg_lr(2, &[(18, 25)], vec![18, 25]);
+        assert!(a.segments_conflict(&b, false));
+        assert!(a.segments_conflict(&b, true));
+        // Second piece overlap is caught too.
+        let c = seg_lr(3, &[(42, 48)], vec![42, 48]);
+        assert!(a.segments_conflict(&c, false));
+    }
+
+    #[test]
+    fn test_segments_conflict_boundary_contact_rules() {
+        // Producer dies exactly where consumer is born, with a recorded use
+        // at the boundary: the guarded die-at-birth share.
+        let producer = seg_lr(1, &[(10, 20)], vec![10, 20]);
+        let consumer = seg_lr(2, &[(20, 30)], vec![20, 30]);
+        assert!(producer.segments_conflict(&consumer, false));
+        assert!(!producer.segments_conflict(&consumer, true));
+
+        // No recorded use at the boundary (artificial live-through tail):
+        // the waiver must NOT fire even with adjacent_ok.
+        let extended = seg_lr(1, &[(10, 20)], vec![10]);
+        assert!(extended.segments_conflict(&consumer, true));
+
+        // A use beyond the boundary means the value survives it; the pair
+        // still conflicts even though the touching pieces end/start there.
+        let survivor = seg_lr(1, &[(10, 20), (30, 40)], vec![10, 20, 35]);
+        let born_at_20 = seg_lr(2, &[(20, 25)], vec![20, 25]);
+        assert!(survivor.segments_conflict(&born_at_20, true));
+    }
+
+    #[test]
+    fn test_segments_conflict_empty_falls_back_to_fat() {
+        let fat_only = lr(1, 10, 50, vec![10, 50], 1);
+        let segmented = seg_lr(2, &[(22, 38)], vec![22, 38]);
+        // Fat fallback keeps the conservative hull conflict.
+        assert!(fat_only.segments_conflict(&segmented, false));
+        // Fat vs fat behaves exactly like conflicts_with.
+        let other = lr(3, 60, 70, vec![60, 70], 1);
+        assert!(!fat_only.segments_conflict(&other, false));
+    }
+
+    #[test]
+    fn test_segment_sharing_frees_register_in_scan() {
+        // Two values whose fat hulls overlap but whose pieces are disjoint
+        // must BOTH receive a register even when the pool has ONE register.
+        let mut a = seg_lr(1, &[(10, 20), (40, 50)], vec![10, 20, 40, 50]);
+        a.priority = 5;
+        let mut b = seg_lr(2, &[(22, 38)], vec![22, 38]);
+        b.priority = 5;
+        let mut allocator = LinearScanAllocator::new(vec![a, b], vec![PhysReg(7)]);
+        allocator.run();
+        assert_eq!(
+            allocator.assignments.get(&1),
+            Some(&PhysReg(7)),
+            "first value must get the register"
+        );
+        assert_eq!(
+            allocator.assignments.get(&2),
+            Some(&PhysReg(7)),
+            "hole-aware sharing must home the second value in the same register"
+        );
+    }
+
+    #[test]
+    fn test_segment_conflicting_values_do_not_share() {
+        // Pieces genuinely overlap: with one register only one value wins.
+        let a = seg_lr(1, &[(10, 30)], vec![10, 30]);
+        let mut b = seg_lr(2, &[(20, 40)], vec![20, 40]);
+        b.priority = 100; // incoming hotter: victim loses
+        let mut allocator = LinearScanAllocator::new(vec![a, b], vec![PhysReg(7)]);
+        allocator.run();
+        let winners: Vec<u32> = allocator.assignments.keys().copied().collect();
+        assert_eq!(winners.len(), 1, "overlapping pieces cannot share");
     }
 
     #[test]
@@ -1257,6 +1832,10 @@ mod tests {
         // B is slightly costlier but not needed until 80 (after incoming).
         // Pick-then-reject would select A, fail the mode-3 window, and
         // spill the incoming. The multi-candidate search must pick B.
+        //
+        // RA-05: the hot-escape fallback must NOT override this — the
+        // incoming (priority 100) dominates A (priority 1) by ≥8×, but a
+        // window-compliant victim (B) exists, and pass 1 keeps precedence.
         let mut a = LinearScanAllocator::new(vec![], vec![PhysReg(0), PhysReg(1)]);
         a.init_registers();
         a.assignments.insert(1, PhysReg(0));
@@ -1293,12 +1872,16 @@ mod tests {
     #[test]
     fn test_select_evict_victim_same_point_use_is_not_dead() {
         // A's last use is AT the incoming's start point (use-before-def in
-        // the same instruction). Evicting A would hand its register to a
-        // value whose definition overwrites it while A's operand is read.
-        // The strict mode-3 window hides A (next use 15 <= incoming.end)
-        // and no other victim exists, so the incoming is spilled. Guards
-        // against reintroducing a "dead victim" search that ignores
-        // same-point uses.
+        // the same instruction). Under mode 3 the window hides A (next use
+        // 15 <= incoming.end) and no other victim exists, so the incoming
+        // is spilled *unless* the RA-05 hot-escape fallback applies.
+        //
+        // Two encoded policies:
+        // * incoming dominates A by < 8× → escape does not fire → spill
+        //   (pre-RA-05 behaviour, conservative default);
+        // * incoming dominates by ≥ 8× → the fallback demotes A (sound:
+        //   eviction is lifetime demotion, A's read at 15 becomes a slot
+        //   access) rather than spilling the hot incoming.
         let mut a = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
         a.init_registers();
         a.assignments.insert(1, PhysReg(0));
@@ -1309,11 +1892,18 @@ mod tests {
             occupancy_end: 50,
             next_use: None,
         });
-        let incoming = lr(3, 15, 100, vec![15, 40, 100], 50);
+        // Below the default hot ratio: no victim, incoming spills.
+        let lukewarm = lr(3, 15, 100, vec![15, 40, 100], 7);
         assert!(
-            a.select_evict_victim(&incoming, 3).is_none(),
-            "victim whose last use coincides with incoming.start must not be evicted"
+            a.select_evict_victim(&lukewarm, 3).is_none(),
+            "sub-ratio incoming must not evict a same-point-use victim"
         );
+        // Above the ratio: the fallback evicts the dominated victim.
+        let hot = lr(4, 15, 100, vec![15, 40, 100], 50);
+        let idx = a
+            .select_evict_victim(&hot, 3)
+            .expect("hot-escape fallback must demote the dominated victim");
+        assert_eq!(a.active[idx].range.value_id, 1);
     }
 
     #[test]

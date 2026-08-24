@@ -1,4 +1,5 @@
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
+use crate::common::fp_contract::FpContract;
 use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
@@ -384,7 +385,7 @@ pub struct X86Codegen {
     pub(super) func_has_calls: bool,
     /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
     /// scalar mul+add -> vfmadd231 fusion.
-    pub(super) fp_contract_fast: bool,
+    pub(super) fp_contract: crate::common::fp_contract::FpContract,
     pub(super) no_sse: bool,
     /// Per-function vector-constant pool: (value, byte_width) -> label.
     /// _mm256_set1_* with a constant argument lowers to a single
@@ -649,7 +650,7 @@ impl X86Codegen {
             function_alignment: 0,
             skip_rax_setup: false,
             func_has_calls: false,
-            fp_contract_fast: false,
+            fp_contract: crate::common::fp_contract::FpContract::default(),
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
@@ -748,7 +749,7 @@ impl X86Codegen {
         self.avx2_enabled = opts.avx2;
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
-        self.fp_contract_fast = opts.fp_contract_fast;
+        self.fp_contract = opts.fp_contract;
         self.optimize_for_size = opts.optimize_for_size;
     }
 
@@ -3495,18 +3496,22 @@ impl ArchCodegen for X86Codegen {
         true
     }
 
+    fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        self.fp_contract
+    }
+
     fn supports_fused_float_mul_add(&self) -> bool {
         // FP contraction changes results (single rounding). Only fuse under
         // the explicit contract; integer mul+add fusion is unaffected (the
         // generation-side detector calls this only for float types).
-        self.fp_contract_fast
+        self.fp_contract != FpContract::Off
     }
 
     fn supports_fused_float_mul_sub(&self) -> bool {
         // vfmsub231/vfnmadd231 need the same contraction contract as
         // vfmadd231. Baseline codegen already emits VEX FMA3 unconditionally
         // for fused mul-add, so no separate ISA gate is needed here.
-        self.fp_contract_fast
+        self.fp_contract != FpContract::Off
     }
 
     fn emit_fused_mul_sub(

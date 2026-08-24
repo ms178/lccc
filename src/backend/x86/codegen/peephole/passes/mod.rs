@@ -6,6 +6,7 @@
 //! - [`local_patterns`]: combined local pattern matching (self-move, reverse-move,
 //!   redundant jump, branch inversion, store/load, extensions) + movq/ext fusion
 //! - [`push_pop`]: push/pop pair and push/binop/pop elimination
+//! - [`relay_and_lea`]: register move-relay elimination, windowed lea folding
 //! - [`compare_branch`]: compare-and-branch fusion (cmp+setCC+test+jCC -> jCC)
 //! - [`copy_propagation`]: register copy propagation across basic blocks
 //! - [`dead_code`]: dead register moves, dead stores, never-read store elimination
@@ -33,6 +34,7 @@ mod memory_fold;
 mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
+mod relay_and_lea;
 mod spill_deref;
 mod store_forwarding;
 mod tail_call;
@@ -498,6 +500,15 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("dead_leaq") {
             changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos);
+        }
+        // Generic move-relay elimination and windowed lea->memory folding.
+        // Both are block-local; see relay_and_lea.rs for the two deadness
+        // proofs (block-local write-before-read, whole-function uniqueness).
+        if !sk("move_relay") {
+            changed |= relay_and_lea::eliminate_move_relays(&mut store, &mut infos);
+        }
+        if !sk("lea_load_window") {
+            changed |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
         }
         if !sk("base_index") {
             changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);

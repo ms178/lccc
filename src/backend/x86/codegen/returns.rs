@@ -113,6 +113,20 @@ impl X86Codegen {
             self.emit_epilogue_and_ret_impl(frame_size);
             return;
         }
+        // IS-29a: scalar FP returns go straight into %xmm0 through the FP
+        // operand loader — one move from an XMM home (`vmovsd %xmmN, %xmm0`)
+        // or a direct slot/constant load. The generic default routes the
+        // value through the GPR accumulator (`operand_to_rax` +
+        // `movq %rax, %xmm0`), bouncing the double through %rax (or a stack
+        // slot) on every FP return — the libm round-family regression class
+        // (PERF-1: 2.99× GCC on `vroundsd` wrappers).
+        if matches!(ret_ty, IrType::F32 | IrType::F64) {
+            if let Some(val) = val {
+                self.load_fp_to_xmm0(val, ret_ty);
+            }
+            self.emit_epilogue_and_ret_impl(frame_size);
+            return;
+        }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }
 

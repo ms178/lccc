@@ -626,6 +626,14 @@ pub trait ArchCodegen {
         false
     }
 
+    /// The active FP contraction contract. Backend fusion layers consult
+    /// this plus the per-value expression tags (`IrFunction::fp_expr_tags`)
+    /// through [`crate::common::fp_contract::FpContract::fuse_pair`] so
+    /// `on` fuses only within one source expression.
+    fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        crate::common::fp_contract::FpContract::Off
+    }
+
     /// Whether the target has a single-instruction fused multiply-subtract
     /// (AArch64 fmsub/fnmsub, x86 FMA3 vfmsub231/vfnmadd231). Gates the
     /// detector's float Sub fusion; the same fp-contract contract as

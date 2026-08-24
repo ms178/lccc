@@ -1359,6 +1359,10 @@ impl Lowerer {
 
     /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+        // Fresh FP expression root per statement (OP-36): every FP arith
+        // result lowered inside this statement is tagged with it, so
+        // -ffp-contract=on fuses mul+add only within one source expression.
+        self.func_mut().fp_expr_root = self.func_mut().fp_expr_root.wrapping_add(1);
         // Set the current span for debug info tracking. All instructions emitted
         // while lowering this statement will inherit this source location.
         if let Some(span) = stmt.span() {

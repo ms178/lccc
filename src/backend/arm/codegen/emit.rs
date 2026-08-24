@@ -1,4 +1,5 @@
 use super::asm_emitter::ARM_GP_SCRATCH;
+use crate::common::fp_contract::FpContract;
 use crate::backend::call_abi::ParamClass;
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
 use crate::backend::common::PtrDirective;
@@ -216,7 +217,7 @@ pub(super) fn arm_invert_cond_code(cc: &str) -> &'static str {
 pub struct ArmCodegen {
     pub(crate) state: CodegenState,
     /// FP contraction contract; gates fmadd fusion (see supports_fused_float_mul_add).
-    pub(super) fp_contract_fast: bool,
+    pub(super) fp_contract: crate::common::fp_contract::FpContract,
     /// Frame size for the current function (needed for epilogue in terminators).
     pub(super) current_frame_size: i64,
     pub(super) current_return_type: IrType,
@@ -265,7 +266,7 @@ impl ArmCodegen {
     pub fn new() -> Self {
         Self {
             state: CodegenState::new(),
-            fp_contract_fast: false,
+            fp_contract: crate::common::fp_contract::FpContract::default(),
             current_frame_size: 0,
             current_return_type: IrType::I64,
             va_gp_save_offset: 0,
@@ -312,7 +313,7 @@ impl ArmCodegen {
         self.set_no_jump_tables(opts.no_jump_tables);
         self.set_general_regs_only(opts.general_regs_only);
         self.state.emit_cfi = opts.emit_cfi;
-        self.fp_contract_fast = opts.fp_contract_fast;
+        self.fp_contract = opts.fp_contract;
     }
 
     /// Get the physical register assigned to an operand (if it's a Value with a register).
@@ -2377,10 +2378,14 @@ impl ArchCodegen for ArmCodegen {
         self.reg_assignments.contains_key(&vid)
     }
 
+    fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
+        self.fp_contract
+    }
+
     fn supports_fused_float_mul_add(&self) -> bool {
         // AArch64 fmadd is a contraction (single rounding); same contract
         // gate as x86's vfmadd231 fusion.
-        self.fp_contract_fast
+        self.fp_contract == FpContract::Fast
     }
     fn supports_shifted_logical(&self) -> bool {
         true
@@ -2468,7 +2473,7 @@ impl ArchCodegen for ArmCodegen {
     fn supports_fused_float_mul_sub(&self) -> bool {
         // Same single-rounding contract as fmadd fusion; the detector is
         // additionally gated on CCC_NO_FMSUB and the accumulator-dest set.
-        self.fp_contract_fast
+        self.fp_contract == FpContract::Fast
     }
     fn emit_fused_mul_sub(
         &mut self,

@@ -275,6 +275,12 @@ pub struct CodegenState {
     /// Values proven never-materialized before slot assignment (foldable
     /// GlobalAddr on i686 non-PIC): no register, no slot.
     pub never_materialized_values: FxHashSet<u32>,
+    /// GlobalAddr values the prologue PROMOTED out of the never-materialized
+    /// set (PF-07: PIC indexed-symbol bases defined at a shallower loop depth
+    /// than their consumers). The instruction-generation dead-address scan
+    /// must NOT skip these: they carry a register home that
+    /// `emit_global_addr` materializes once and the SIB consumers read.
+    pub promoted_global_addr_homes: FxHashSet<u32>,
     /// Name of the function currently being code-generated (diagnostics).
     pub current_func_name: String,
     /// Total use count for each value ID across the entire function.
@@ -462,6 +468,7 @@ impl CodegenState {
             gep_base_offset: FxHashMap::default(),
             folded_gep_values: FxHashSet::default(),
             never_materialized_values: FxHashSet::default(),
+            promoted_global_addr_homes: FxHashSet::default(),
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
             block_use_counts: FxHashMap::default(),
@@ -606,6 +613,7 @@ impl CodegenState {
         self.i128_values.clear();
         self.wide_values.clear();
         self.never_materialized_values.clear();
+        self.promoted_global_addr_homes.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
         self.frame_size = 0;

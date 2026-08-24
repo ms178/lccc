@@ -3,6 +3,7 @@ pub(crate) mod const_arith;
 pub(crate) mod const_eval;
 pub(crate) mod encoding;
 pub(crate) mod error;
+pub(crate) mod fp_contract;
 pub(crate) mod fx_hash;
 pub(crate) mod long_double;
 pub(crate) mod source;

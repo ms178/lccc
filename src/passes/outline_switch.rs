@@ -888,6 +888,7 @@ fn build_outlined_function(
         is_always_inline: false,
         is_noinline: true, // Do NOT inline back — that defeats the purpose
         next_value_id,
+        fp_expr_tags: Default::default(),
         next_label: 0,
         section: func.section.clone(),
         visibility: None,
