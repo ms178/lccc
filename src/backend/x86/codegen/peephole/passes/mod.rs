@@ -34,6 +34,7 @@ mod memory_fold;
 mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
+mod flag_peepholes;
 mod relay_and_lea;
 mod spill_deref;
 mod store_forwarding;
@@ -509,6 +510,24 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("lea_load_window") {
             changed |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
+        }
+        // Flags-aware cleanups: copy+add -> lea (also removes a flags write
+        // from between a comparison and its consumer), the setcc/movzbl/test
+        // boolean round-trip in front of a cmov, and copy+mask -> movzx.
+        if !sk("producer_retarget") {
+            changed |= relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
+        }
+        if !sk("copy_add_lea") {
+            changed |= flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
+        }
+        if !sk("copy_shift_lea") {
+            changed |= flag_peepholes::fold_copy_shift_into_lea(&mut store, &mut infos);
+        }
+        if !sk("setcc_cmov") {
+            changed |= flag_peepholes::fold_setcc_test_cmov(&mut store, &mut infos);
+        }
+        if !sk("copy_mask_movz") {
+            changed |= flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
         }
         if !sk("base_index") {
             changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
