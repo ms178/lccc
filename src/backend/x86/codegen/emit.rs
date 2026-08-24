@@ -386,6 +386,9 @@ pub struct X86Codegen {
     /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
     /// scalar mul+add -> vfmadd231 fusion.
     pub(super) fp_contract: crate::common::fp_contract::FpContract,
+    /// FMA3 ISA availability (-mfma / -march=x86-64-v3+). vfmadd231s{s,d} is
+    /// not in the baseline SSE2 ISA: contraction alone must not emit it.
+    pub(super) fma_enabled: bool,
     pub(super) no_sse: bool,
     /// Per-function vector-constant pool: (value, byte_width) -> label.
     /// _mm256_set1_* with a constant argument lowers to a single
@@ -651,6 +654,7 @@ impl X86Codegen {
             skip_rax_setup: false,
             func_has_calls: false,
             fp_contract: crate::common::fp_contract::FpContract::default(),
+            fma_enabled: false,
             no_sse: false,
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
@@ -750,6 +754,7 @@ impl X86Codegen {
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
         self.fp_contract = opts.fp_contract;
+        self.fma_enabled = opts.fma;
         self.optimize_for_size = opts.optimize_for_size;
     }
 
@@ -3504,14 +3509,16 @@ impl ArchCodegen for X86Codegen {
         // FP contraction changes results (single rounding). Only fuse under
         // the explicit contract; integer mul+add fusion is unaffected (the
         // generation-side detector calls this only for float types).
-        self.fp_contract != FpContract::Off
+        // FMA3 is additionally gated on the target ISA: vfmadd231s{s,d} is
+        // illegal on baseline (SSE2) x86-64, matching GCC, which requires
+        // `-mfma` (or an enabling -march) even under -ffp-contract=fast.
+        self.fp_contract != FpContract::Off && self.fma_enabled
     }
 
     fn supports_fused_float_mul_sub(&self) -> bool {
-        // vfmsub231/vfnmadd231 need the same contraction contract as
-        // vfmadd231. Baseline codegen already emits VEX FMA3 unconditionally
-        // for fused mul-add, so no separate ISA gate is needed here.
-        self.fp_contract != FpContract::Off
+        // vfmsub231/vfnmadd231 need the same contraction contract *and* the
+        // same FMA3 ISA gate as vfmadd231.
+        self.fp_contract != FpContract::Off && self.fma_enabled
     }
 
     fn emit_fused_mul_sub(

@@ -2929,6 +2929,82 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "mulpd");
                 }
             }
+            IntrinsicOp::VecSubF64x4 => {
+                if let Some(d) = dest {
+                    // Non-commutative: preserve operand order.
+                    self.emit_avx_binary_256(d, args, "vsubpd", false);
+                }
+            }
+            IntrinsicOp::VecSubF64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "subpd");
+                }
+            }
+            IntrinsicOp::VecSubF32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vsubps", false);
+                }
+            }
+            IntrinsicOp::VecSubF32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "subps");
+                }
+            }
+            IntrinsicOp::VecDivF64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vdivpd", false);
+                }
+            }
+            IntrinsicOp::VecDivF64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "divpd");
+                }
+            }
+            IntrinsicOp::VecDivF32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vdivps", false);
+                }
+            }
+            IntrinsicOp::VecDivF32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "divps");
+                }
+            }
+            IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
+                // Unary AVX: stream the operand through %ymm0.
+                if let Some(d) = dest {
+                    self.flush_pending_vec_store_impl();
+                    self.state.invalidate_vec_peephole();
+                    self.avx_load_arg_to(&args[0], "ymm0");
+                    let inst = if matches!(op, IntrinsicOp::VecSqrtF64x4) {
+                        "vsqrtpd"
+                    } else {
+                        "vsqrtps"
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
+                    self.state.vec_last_store_val = Some(d.0);
+                    self.state.vec_last_store_reg = true;
+                    self.state.vec_last_store_reg_name = Some("ymm0");
+                    self.avx_store_dest(d);
+                }
+            }
+            IntrinsicOp::VecSqrtF64x2 | IntrinsicOp::VecSqrtF32x4 => {
+                // Unary SSE2: stream the operand through %xmm0.
+                if let Some(d) = dest {
+                    self.flush_pending_vec_store_impl();
+                    self.state.invalidate_vec_peephole();
+                    self.sse_load_arg(&args[0], "xmm0");
+                    let inst = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
+                        "sqrtpd"
+                    } else {
+                        "sqrtps"
+                    };
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+                    self.sse_store_dest(d, "xmm0");
+                }
+            }
             IntrinsicOp::VecFmaF64x4 => {
                 if let Some(d) = dest {
                     self.emit_avx_reduction_fma(d, args, "vfmadd231pd");
@@ -3634,6 +3710,16 @@ impl X86Codegen {
     /// Emit a contract-legal affine map as `input * scale + bias`.  Broadcast
     /// scale/bias values normally have assigned YMM families, while the packed
     /// input streams through ymm0 from the preceding load.
+    ///
+    /// Scratch discipline: %ymm0/%ymm1 are RESERVED (never RA-assigned — the
+    /// XMM pool starts at xmm2), so they are the only safe scratch registers.
+    /// %ymm2..%ymm15 are assigned homes whose contents stay live across loop
+    /// iterations: using one as scratch clobbers a live vector and every
+    /// following iteration reads the wrong broadcast (the map-tree kernels
+    /// with non-broadcast FMA operands exposed exactly this). The fallback
+    /// therefore uses each operand's assigned home directly, a slot-homed
+    /// operand as the memory source, and copies at most ONE operand through
+    /// %ymm1.
     fn emit_avx_map_fma(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
@@ -3668,13 +3754,87 @@ impl X86Codegen {
             }
         }
 
+        // Fallback: the input streams through %ymm0. Every operand source is
+        // chosen so that no RA-assigned home (%ymm2..%ymm15) is ever written:
+        // homed operands are read directly as VEX sources, a slot-homed
+        // operand is read as the memory source (legal in the multiplier
+        // position), and at most ONE operand is copied through the reserved
+        // %ymm1.
         self.avx_load_arg(&args[0]);
-        self.avx_load_arg_to(&args[2], "ymm1");
-        self.avx_load_arg_to(&args[1], "ymm2");
-        self.state
-            .emit_fmt(format_args!("    {} %ymm2, %ymm1, %ymm0", mnemonic));
-        self.state.vec_last_store_reg = false;
-        self.avx_store_dest(dest);
+
+        let operand_reg_source = |this: &Self, arg: &Operand| -> Option<String> {
+            let Operand::Value(v) = arg else {
+                return None;
+            };
+            if let Some(&reg) = this.reg_assignments.get(&v.0) {
+                if is_xmm_reg(reg) {
+                    return Some(format!("%{}", phys_reg_name_256(reg)));
+                }
+                return None;
+            }
+            // A value provably sitting in a non-reserved YMM register within
+            // this block can be read directly.
+            if let Some(&held) = this.state.vec_live_regs.get(&v.0) {
+                if held != "ymm0" && held != "ymm1" {
+                    return Some(format!("%{}", held));
+                }
+                return None;
+            }
+            None
+        };
+
+        let scale_reg = operand_reg_source(self, &args[1]);
+        let bias_reg = operand_reg_source(self, &args[2]);
+
+        match (scale_reg, bias_reg) {
+            (Some(scale), Some(bias)) => {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}, %ymm0", mnemonic, scale, bias));
+                self.state.vec_last_store_reg = false;
+                self.avx_store_dest(dest);
+            }
+            (Some(scale), None) => {
+                self.avx_load_arg_to(&args[2], "ymm1");
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", mnemonic, scale));
+                self.state.vec_last_store_reg = false;
+                self.avx_store_dest(dest);
+            }
+            (None, Some(bias)) => {
+                self.avx_load_arg_to(&args[1], "ymm1");
+                self.state
+                    .emit_fmt(format_args!("    {} %ymm1, {}, %ymm0", mnemonic, bias));
+                self.state.vec_last_store_reg = false;
+                self.avx_store_dest(dest);
+            }
+            (None, None) => {
+                // Neither operand homed: the bias is copied through %ymm1 and
+                // the scale is read from memory (the multiplier position
+                // accepts a memory source). After `avx_load_arg(input)` every
+                // non-homed operand is slot-homed — a deferred register store
+                // was flushed to its slot by the input load — so the memory
+                // operand always exists. (A value tracked in the reserved
+                // %ymm0/%ymm1 pair cannot survive the input load either.)
+                // Bias first: the scale's memory operand is unaffected.
+                self.avx_load_arg_to(&args[2], "ymm1");
+                let Operand::Value(sv) = &args[1] else {
+                    unreachable!("vfmadd132 scale operand must be a value");
+                };
+                let scale_mem = self
+                    .value_ptr_mem_operand(sv.0)
+                    .unwrap_or_else(|| {
+                        unreachable!(
+                            "vfmadd132 scale operand must be homed, tracked, or slot-homed"
+                        )
+                    });
+                self.state.emit_fmt(format_args!(
+                    "    {} {}, %ymm1, %ymm0",
+                    mnemonic, scale_mem
+                ));
+                self.state.vec_last_store_reg = false;
+                self.avx_store_dest(dest);
+            }
+        }
     }
 
     /// Emit one fused AVX reduction step directly from two memory streams:

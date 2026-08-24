@@ -286,6 +286,33 @@ pub enum IntrinsicOp {
     VecBroadcastF64x2,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - SSE2 4×F32
     VecMulF32x4,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 4×F64.
+    /// args[0] = src1 vector value, args[1] = src2 vector value (non-commutative).
+    VecSubF64x4,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 2×F64.
+    VecSubF64x2,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - AVX2 8×F32.
+    VecSubF32x8,
+    /// Vector subtract: %dest_vec = %src1_vec - %src2_vec - SSE2 4×F32.
+    VecSubF32x4,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 4×F64.
+    /// Elementwise IEEE division; identical per-lane results to scalar div.
+    VecDivF64x4,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 2×F64.
+    VecDivF64x2,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - AVX2 8×F32.
+    VecDivF32x8,
+    /// Vector divide: %dest_vec = %src1_vec / %src2_vec - SSE2 4×F32.
+    VecDivF32x4,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 4×F64.
+    /// args[0] = source vector value; dest = result vector.
+    VecSqrtF64x4,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 2×F64.
+    VecSqrtF64x2,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - AVX2 8×F32.
+    VecSqrtF32x8,
+    /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
+    VecSqrtF32x4,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecMulI32x4,
@@ -1064,6 +1091,8 @@ impl IntrinsicOp {
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
+            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
+            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8
             | VecBroadcastF32x8 | VecZeroF32x8
@@ -1103,7 +1132,9 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
+            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
+            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
@@ -1194,10 +1225,22 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecAddF32x4
                 | IntrinsicOp::VecMulF64x4
                 | IntrinsicOp::VecMulF64x2
+                | IntrinsicOp::VecSubF64x4
+                | IntrinsicOp::VecSubF64x2
+                | IntrinsicOp::VecDivF64x4
+                | IntrinsicOp::VecDivF64x2
+                | IntrinsicOp::VecSqrtF64x4
+                | IntrinsicOp::VecSqrtF64x2
                 | IntrinsicOp::VecBroadcastF64x4
                 | IntrinsicOp::VecBroadcastF64x2
                 | IntrinsicOp::VecMulF32x8
                 | IntrinsicOp::VecMulF32x4
+                | IntrinsicOp::VecSubF32x8
+                | IntrinsicOp::VecSubF32x4
+                | IntrinsicOp::VecDivF32x8
+                | IntrinsicOp::VecDivF32x4
+                | IntrinsicOp::VecSqrtF32x8
+                | IntrinsicOp::VecSqrtF32x4
                 | IntrinsicOp::VecBroadcastF32x8
                 | IntrinsicOp::VecBroadcastF32x4
                 | IntrinsicOp::VecFmaF64x4

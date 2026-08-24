@@ -695,7 +695,12 @@ pub(crate) fn run_passes(
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
     x86_avx: bool,
+    x86_fma: bool,
 ) {
+    // FMA3 ISA availability for the vectorizer's VecFma/VecMadd contraction
+    // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
+    // ignores this.
+    vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
     let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     // Debug hook: dump the module IR to stderr before optimization.
     if std::env::var("CCC_DUMP_IR").is_ok() {
@@ -1039,6 +1044,9 @@ pub(crate) fn run_passes(
                 (_, true, FpContract::Fast, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
                 (_, true, FpContract::Off | FpContract::OnExpr, true) => vectorize::vectorize_function_reassoc,
                 (_, true, FpContract::Off | FpContract::OnExpr, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
+                // contract=fast without reassoc: reductions stay order-locked,
+                // map trees may fuse (GCC-parity for -ffp-contract=fast).
+                (_, false, FpContract::Fast, _) => vectorize::vectorize_function_contract,
                 (_, false, _, _) => vectorize::vectorize_function,
             };
             let n = timed_pass!(

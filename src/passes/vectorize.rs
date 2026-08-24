@@ -97,6 +97,23 @@ use crate::passes::loop_analysis;
 // expands to items the comment never reaches), so this is a plain comment.
 thread_local! {
     static REJECT_REASON: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+    // FMA3 ISA availability on the x86 target (`-mfma` / enabling -march).
+    // `VecFma*`/`VecMadd*` lower to `vfmadd231p{s,d}` (FMA3), which is NOT in
+    // the baseline SSE2 ISA. Contraction (`fp_contract == Fast`) alone must
+    // not produce them, exactly like scalar FMA fusion: GCC requires `-mfma`
+    // even under `-ffp-contract=fast`. Set once per `run_passes` (per TU) by
+    // the driver; AArch64 `fmla` is baseline ISA and needs no gate.
+    static X86_FMA_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record whether the x86 target has FMA3. Called by `run_passes` before any
+/// vectorization entry point runs on this thread.
+pub(crate) fn set_x86_fma_enabled(enabled: bool) {
+    X86_FMA_AVAILABLE.with(|f| f.set(enabled));
+}
+
+fn x86_fma_enabled() -> bool {
+    X86_FMA_AVAILABLE.with(|f| f.get())
 }
 
 fn set_reject(reason: &'static str) {
@@ -279,7 +296,7 @@ fn vectorize_with_analysis_mode(
                 total_changes += transform_reduction_avx2(func, &red_pattern, fp_contract);
             }
         } else if std::env::var("CCC_NO_MAP_VEC").is_err() {
-            if let Some(map_pattern) = analyze_map_pattern(func, loop_info) {
+            if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
                 let avx2 = !neon && !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
@@ -3143,14 +3160,159 @@ struct MapPattern {
     exit_cmp_op: IrCmpOp,
     /// GEP for the destination store (dst[iv])
     dst_gep: Value,
-    /// GEP for the source load (src[iv])
-    src_gep: Value,
-    /// Optional loop-invariant scale operand of the multiply.
-    scale: Option<Operand>,
-    /// Optional loop-invariant offset operand of the add.
-    offset: Option<Operand>,
+    /// GEPs for the source load streams (src[iv]); all advance by the same
+    /// byte induction variable.
+    src_geps: Vec<Value>,
+    /// The elementwise expression stored to dst[iv].
+    expr: MapExpr,
     /// All block indices in the loop body
     loop_blocks: FxHashSet<usize>,
+}
+
+/// Elementwise map expression tree (OP-05a). Leaves are loop loads (by
+/// stream index) or loop-invariant scalars; internal nodes are FP Add/Sub/
+/// Mul/Div, integer Add/Mul, or FP Sqrt. The legacy affine family
+/// (`src[i]`, `src[i]*s`, `src[i]+o`, `src[i]*s+o`) is the depth-1 subset of
+/// this tree. Lane-exact by construction: every vector intrinsic computes
+/// the same IEEE operation per lane as the scalar original; the only
+/// semantics-affecting rewrite is the optional mul+add -> fused madd
+/// contraction under `-ffp-contract=fast` (same contract as the affine
+/// path).
+#[derive(Debug, Clone)]
+enum MapExpr {
+    /// Load from source stream `i` (index into `MapPattern::src_geps`).
+    Load(usize),
+    /// Loop-invariant scalar operand (broadcast in the preheader).
+    Invariant(Operand),
+    /// Binary operation; `ty` was checked to equal the element type.
+    BinOp(IrBinOp, Box<MapExpr>, Box<MapExpr>),
+    /// Scalar sqrt over a subexpression (FP only).
+    Sqrt(Box<MapExpr>),
+}
+
+impl MapExpr {
+    fn node_count(&self) -> usize {
+        match self {
+            MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
+            MapExpr::BinOp(_, l, r) => 1 + l.node_count() + r.node_count(),
+            MapExpr::Sqrt(x) => 1 + x.node_count(),
+        }
+    }
+}
+
+/// Emission context for the elementwise map tree (OP-05a). Owns the fresh
+/// value counter and accumulates preheader broadcasts (hoisted, hoisted-once
+/// per invariant operand) and the packed-body instruction list.
+struct MapEmitCtx<'a> {
+    src_bases: &'a [Value],
+    byte_iv: Value,
+    load_op: IntrinsicOp,
+    broadcast_op: IntrinsicOp,
+    sqrt_op: Option<IntrinsicOp>,
+    madd_op: Option<IntrinsicOp>,
+    bin_op: &'a dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
+    broadcast_cache: Vec<(String, Value)>,
+    preheader_insts: Vec<Instruction>,
+    vec_insts: Vec<Instruction>,
+    next_val_id: u32,
+    changes: &'a mut usize,
+}
+
+impl<'a> MapEmitCtx<'a> {
+    fn fresh(&mut self) -> Value {
+        let v = Value(self.next_val_id);
+        self.next_val_id += 1;
+        v
+    }
+
+    fn emit(&mut self, expr: &MapExpr) -> Option<Value> {
+        match expr {
+            MapExpr::Load(stream) => {
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: self.load_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(self.src_bases[*stream]),
+                        Operand::Value(self.byte_iv),
+                    ],
+                });
+                Some(dest)
+            }
+            MapExpr::Invariant(operand) => {
+                let key = format!("{:?}", operand);
+                if let Some(&(_, cached)) = self
+                    .broadcast_cache
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                {
+                    return Some(cached);
+                }
+                let dest = self.fresh();
+                // Broadcasts live in the PREHEADER so they are hoisted out
+                // of the packed loop (register-allocated once).
+                self.preheader_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: self.broadcast_op,
+                    dest_ptr: None,
+                    args: vec![operand.clone()],
+                });
+                self.broadcast_cache.push((key, dest));
+                Some(dest)
+            }
+            MapExpr::Sqrt(x) => {
+                let inner = self.emit(x)?;
+                let sqrt_op = self.sqrt_op?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: sqrt_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(inner)],
+                });
+                Some(dest)
+            }
+            MapExpr::BinOp(op, l, r) => {
+                // Contract-legal fusion (same gate as the affine path): a
+                // mul feeding an add fuses into the 3-operand madd when the
+                // other addend is not itself a mul (a*b + c*d has no single
+                // madd form).
+                if let (Some(madd), IrBinOp::Add, MapExpr::BinOp(IrBinOp::Mul, ml, mr)) =
+                    (self.madd_op, op, &**l)
+                {
+                    if !matches!(&**r, MapExpr::BinOp(IrBinOp::Mul, _, _)) {
+                        let lv = self.emit(ml)?;
+                        let rv = self.emit(mr)?;
+                        let av = self.emit(r)?;
+                        let dest = self.fresh();
+                        self.vec_insts.push(Instruction::Intrinsic {
+                            dest: Some(dest),
+                            op: madd,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(lv),
+                                Operand::Value(rv),
+                                Operand::Value(av),
+                            ],
+                        });
+                        return Some(dest);
+                    }
+                }
+                let lv = self.emit(l)?;
+                let rv = self.emit(r)?;
+                let vec_op = (self.bin_op)(op)?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: vec_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(lv), Operand::Value(rv)],
+                });
+                Some(dest)
+            }
+        }
+    }
 }
 
 /// Analyze a one-source copy/scale/add/affine store loop.
@@ -3162,6 +3324,7 @@ struct MapPattern {
 fn analyze_map_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
+    neon: bool,
 ) -> Option<MapPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -3297,9 +3460,13 @@ fn analyze_map_pattern(
         return None;
     }
 
-    // Scan the loop for loads/stores: exactly one of each, and every other
-    // instruction must be simple, side-effect-free arithmetic.
-    let mut load_info = None; // (block, load dest, ptr value, element type)
+    // Scan the loop for loads/stores: exactly one store, up to four source
+    // load streams, and every other instruction must be simple,
+    // side-effect-free arithmetic. Integer div/rem can fault and keep the
+    // loop scalar; FP division is IEEE-defined elementwise (no trap) and is
+    // parsed into the map expression tree.
+    const MAP_MAX_STREAMS: usize = 4;
+    let mut load_infos: Vec<(usize, Value, Value, IrType)> = Vec::new();
     let mut store_info = None; // (block, ptr value, stored val, element type)
     for &block_idx in &loop_info.body {
         for inst in &func.blocks[block_idx].instructions {
@@ -3307,11 +3474,11 @@ fn analyze_map_pattern(
                 Instruction::Load { dest, ptr, ty, .. } => {
                     // Packed I32/U32/F32/F64 all have native forms.
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
-                        || load_info.is_some()
+                        || load_infos.len() >= MAP_MAX_STREAMS
                     {
                         return None;
                     }
-                    load_info = Some((block_idx, *dest, *ptr, *ty));
+                    load_infos.push((block_idx, *dest, *ptr, *ty));
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
@@ -3324,7 +3491,15 @@ fn analyze_map_pattern(
                     };
                     store_info = Some((block_idx, *ptr, *store_val, *ty));
                 }
-                Instruction::BinOp { op, .. } if op.can_trap() => return None,
+                Instruction::BinOp { op, ty, .. } if op.can_trap() && !ty.is_float() => {
+                    return None;
+                }
+                // Scalar sqrt lowers to a pure intrinsic; the map tree
+                // parser understands it (FP only).
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64,
+                    ..
+                } => {}
                 Instruction::Phi { .. }
                 | Instruction::BinOp { .. }
                 | Instruction::UnaryOp { .. }
@@ -3337,16 +3512,21 @@ fn analyze_map_pattern(
             }
         }
     }
-    let (_, load_dest, src_gep, load_ty) = load_info?;
     let (body_idx, dst_gep, store_val, elem_ty) = store_info?;
-    if load_ty != elem_ty {
+    // At least one source stream is required (a pure store of a loop
+    // invariant is not a map).
+    if load_infos.is_empty() {
+        return None;
+    }
+    if load_infos
+        .iter()
+        .any(|&(_, _, _, ty)| ty != elem_ty)
+    {
         return None;
     }
 
-    // Both GEPs must be indexed by the IV.
-    if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
-        || !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived)
-    {
+    // The destination GEP must be indexed by the IV.
+    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived) {
         if debug {
             eprintln!("[VEC-MAP]   GEPs don't use IV");
         }
@@ -3360,11 +3540,18 @@ fn analyze_map_pattern(
             return None;
         }
     };
-    if find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
-        || find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none()
-    {
+    if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
         set_reject("map access is not a contiguous element-size stride");
         return None;
+    }
+    // Every source stream must be IV-indexed and contiguous as well.
+    for &(_, _, src_gep, _) in &load_infos {
+        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
+            || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
+        {
+            set_reject("map source access is not a contiguous element-size stride");
+            return None;
+        }
     }
 
     // Loop-invariance of an operand: constant, or defined outside the loop and
@@ -3378,105 +3565,79 @@ fn analyze_map_pattern(
         }
     };
 
-    // Accept the complete one-source affine family.  Missing scale/offset
-    // operations are represented explicitly so the transform does not invent
-    // arithmetic (important for copies and pure scales).
-    let body = &func.blocks[body_idx];
-    let scaled_load = |value: Value| -> Option<Operand> {
-        let Instruction::BinOp {
-            op: IrBinOp::Mul,
-            lhs,
-            rhs,
-            ty,
-            ..
-        } = find_inst_by_dest(body, value)?
-        else {
-            return None;
-        };
-        if *ty != elem_ty {
-            return None;
-        }
-        match (lhs, rhs) {
-            (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
-                Some(other.clone())
-            }
-            (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
-                Some(other.clone())
-            }
-            _ => None,
-        }
+    // Parse the stored value as an elementwise expression tree over the load
+    // streams and loop invariants (OP-05a). The legacy affine family is the
+    // depth-1 subset. Bounded: small trees only, so the vector body stays
+    // compact and register pressure bounded.
+    let load_dests: Vec<Value> = load_infos.iter().map(|&(_, d, _, _)| d).collect();
+    // NEON lowers VecAdd/VecMul (fadd/fmul 2d/4s) but has no lowering for
+    // VecSub/VecDiv/VecSqrt yet — restrict those tree nodes to x86 targets
+    // (fail-closed: a NEON loop containing them stays scalar).
+    let allow_ext_fp_ops = !neon;
+    let parse_tree = |value: Value, depth: usize| -> Option<MapExpr> {
+        parse_map_expr(
+            func,
+            &loop_info.body,
+            &load_dests,
+            &iv_derived,
+            &is_invariant,
+            &elem_ty,
+            value,
+            depth,
+            allow_ext_fp_ops,
+        )
     };
-
-    let (scale, offset) = if store_val == load_dest {
-        (None, None)
+    let expr = if load_dests.len() == 1 && store_val == load_dests[0] {
+        MapExpr::Load(0)
     } else {
-        let expression = find_inst_by_dest(body, store_val)?;
-        match expression {
-            Instruction::BinOp {
-                op: IrBinOp::Mul,
-                ty,
-                ..
-            } if *ty == elem_ty => (Some(scaled_load(store_val)?), None),
-            Instruction::BinOp {
-                op: IrBinOp::Add,
-                lhs,
-                rhs,
-                ty,
-                ..
-            } if *ty == elem_ty => match (lhs, rhs) {
-                (Operand::Value(v), other) if *v == load_dest && is_invariant(other) => {
-                    (None, Some(other.clone()))
-                }
-                (other, Operand::Value(v)) if *v == load_dest && is_invariant(other) => {
-                    (None, Some(other.clone()))
-                }
-                (Operand::Value(v), other) if is_invariant(other) => {
-                    (Some(scaled_load(*v)?), Some(other.clone()))
-                }
-                (other, Operand::Value(v)) if is_invariant(other) => {
-                    (Some(scaled_load(*v)?), Some(other.clone()))
-                }
-                _ => return None,
-            },
-            _ => return None,
-        }
+        parse_tree(store_val, 0)?
     };
+    const MAP_MAX_NODES: usize = 12;
+    if expr.node_count() > MAP_MAX_NODES {
+        set_reject("map expression tree too large");
+        return None;
+    }
+    // Every load stream must appear in the tree (a stream read but not
+    // stored would leave a live scalar load the transform cannot remove).
+    for (idx, _) in load_dests.iter().enumerate() {
+        if !expr_uses_stream(&expr, idx) {
+            if load_dests.len() == 1 {
+                // The single legacy stream may feed dead code that DCE owns;
+                // the affine path tolerated this shape.
+                continue;
+            }
+            return None;
+        }
+    }
 
     // Alias safety: identify the complete pointer roots. Different SSA value
     // numbers are NOT an alias proof; ordinary pointer parameters may overlap.
     // Distinct restrict parameters and distinct globals/allocas are legal.
+    // Only WRITE-vs-READ aliasing matters: source streams only read, so they
+    // may alias each other freely; each source must be disjoint from the
+    // destination (or the exact same GEP for lane-local in-place maps).
     let dst_root = proven_object_root(func, dst_gep)?;
-    let src_root = proven_object_root(func, src_gep)?;
-    // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
-    // Otherwise require disjoint complete-object roots; merely seeing different
-    // SSA pointer values is not an alias proof.
-    if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
-        && !roots_proven_distinct(&dst_root, &src_root)
-    {
-        if debug {
-            eprintln!(
-                "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
-                dst_gep, src_gep, dst_root, src_root
-            );
-            for &block_idx in &loop_info.body {
-                for inst in &func.blocks[block_idx].instructions {
-                    if matches!(inst, Instruction::GetElementPtr { dest, .. }
-                        if *dest == dst_gep || *dest == src_gep)
-                    {
-                        eprintln!("[VEC-MAP]     {:?}", inst);
-                    }
-                }
+    for &(_, _, src_gep, _) in &load_infos {
+        let src_root = proven_object_root(func, src_gep)?;
+        // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
+        // Otherwise require disjoint complete-object roots; merely seeing
+        // different SSA pointer values is not an alias proof.
+        if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
+            && !roots_proven_distinct(&dst_root, &src_root)
+        {
+            if debug {
+                eprintln!(
+                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
+                    dst_gep, src_gep, dst_root, src_root
+                );
             }
+            set_reject("map source/destination may alias (use restrict or exact in-place access)");
+            return None;
         }
-        set_reject("map source/destination may alias (use restrict or exact in-place access)");
-        return None;
     }
 
     if debug {
-        eprintln!(
-            "[VEC-MAP]   Map pattern detected: store(dst[iv]) = load(src[iv]) * {:?} + {:?}",
-            scale, offset
-        );
+        eprintln!("[VEC-MAP]   Map pattern detected: {:?}", expr);
     }
 
     Some(MapPattern {
@@ -3490,11 +3651,176 @@ fn analyze_map_pattern(
         limit,
         exit_cmp_op,
         dst_gep,
-        src_gep,
-        scale,
-        offset,
+        src_geps: load_infos.iter().map(|&(_, _, g, _)| g).collect(),
+        expr,
         loop_blocks: loop_info.body.clone(),
     })
+}
+
+/// Recursive parser for the elementwise map expression (OP-05a).
+///
+/// Recognizes, bounded by `depth`: stream loads, loop-invariant scalars,
+/// FP Add/Sub/Mul/Div, integer Add/Mul, and FP Sqrt intrinsics. IV-derived
+/// values and anything defined in the loop outside this grammar fail closed.
+#[allow(clippy::too_many_arguments)]
+fn parse_map_expr(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    load_dests: &[Value],
+    iv_derived: &FxHashSet<Value>,
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    elem_ty: &IrType,
+    value: Value,
+    depth: usize,
+    allow_ext_fp_ops: bool,
+) -> Option<MapExpr> {
+    // Depth guard is a secondary bound; the analyzer's node-count cap is
+    // the primary size limit. 6 allows sqrt(mul+add) / div nesting (the
+    // nbody/spectral elementwise shapes) while keeping the tree compact.
+    if depth > 6 {
+        return None;
+    }
+    if let Some(idx) = load_dests.iter().position(|&d| d == value) {
+        return Some(MapExpr::Load(idx));
+    }
+    let (_, inst) = find_inst_in_loop(func, loop_blocks, value)?;
+    match inst {
+        Instruction::BinOp { op, lhs, rhs, ty, .. } => {
+            if *ty != *elem_ty {
+                return None;
+            }
+            let fp = ty.is_float();
+            match op {
+                IrBinOp::Add | IrBinOp::Mul => {}
+                // Sub/Div (and Sqrt below) lower to VecSub/VecDiv/VecSqrt,
+                // which only the x86 backend implements today.
+                IrBinOp::Sub | IrBinOp::SDiv if fp && allow_ext_fp_ops => {}
+                _ => return None,
+            }
+            let l = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                lhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            let r = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                rhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            Some(MapExpr::BinOp(*op, Box::new(l), Box::new(r)))
+        }
+        Instruction::Intrinsic {
+            op: IntrinsicOp::SqrtF64,
+            args,
+            ..
+        } if *elem_ty == IrType::F64 && allow_ext_fp_ops => {
+            let Operand::Value(v) = &args[0] else {
+                return None;
+            };
+            Some(MapExpr::Sqrt(Box::new(parse_map_expr(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                *v,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?)))
+        }
+        Instruction::Intrinsic {
+            op: IntrinsicOp::SqrtF32,
+            args,
+            ..
+        } if *elem_ty == IrType::F32 && allow_ext_fp_ops => {
+            let Operand::Value(v) = &args[0] else {
+                return None;
+            };
+            Some(MapExpr::Sqrt(Box::new(parse_map_expr(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                *v,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?)))
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parse_map_operand(
+    func: &IrFunction,
+    loop_blocks: &FxHashSet<usize>,
+    load_dests: &[Value],
+    iv_derived: &FxHashSet<Value>,
+    is_invariant: &dyn Fn(&Operand) -> bool,
+    elem_ty: &IrType,
+    operand: &Operand,
+    depth: usize,
+    allow_ext_fp_ops: bool,
+) -> Option<MapExpr> {
+    if is_invariant(operand) {
+        return Some(MapExpr::Invariant(operand.clone()));
+    }
+    let Operand::Value(v) = operand else {
+        return None;
+    };
+    parse_map_expr(
+        func,
+        loop_blocks,
+        load_dests,
+        iv_derived,
+        is_invariant,
+        elem_ty,
+        *v,
+        depth,
+        allow_ext_fp_ops,
+    )
+}
+
+/// Every BinOp/Sqrt node in the tree must have a lowering before the
+/// transform starts mutating the function (fail-closed pre-validation).
+fn map_tree_ops_available(
+    expr: &MapExpr,
+    bin_op: &dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
+    sqrt_op: Option<IntrinsicOp>,
+) -> bool {
+    match expr {
+        MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+        MapExpr::BinOp(op, l, r) => {
+            bin_op(op).is_some()
+                && map_tree_ops_available(l, bin_op, sqrt_op)
+                && map_tree_ops_available(r, bin_op, sqrt_op)
+        }
+        MapExpr::Sqrt(x) => sqrt_op.is_some() && map_tree_ops_available(x, bin_op, sqrt_op),
+    }
+}
+
+fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
+    match expr {
+        MapExpr::Load(i) => *i == stream,
+        MapExpr::Invariant(_) => false,
+        MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
+        MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
+    }
 }
 
 /// Prove two loop GEPs denote the same address in every iteration.  Frontend
@@ -4353,7 +4679,7 @@ fn transform_stencil_vector(
             IntrinsicOp::VecBroadcastF32x4,
         ),
     };
-    let madd_op = if fp_contract == FpContract::Fast && avx2 {
+    let madd_op = if fp_contract == FpContract::Fast && avx2 && x86_fma_enabled() {
         match pattern.elem_ty {
             IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
             IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
@@ -8504,7 +8830,10 @@ fn transform_reduction_avx2(
                 };
                 let body_block = &mut func.blocks[pattern.body_idx];
 
-                if fp_contract == FpContract::Fast && matches!(pattern.element_type, IrType::F32 | IrType::F64) {
+                if fp_contract == FpContract::Fast
+                    && x86_fma_enabled()
+                    && matches!(pattern.element_type, IrType::F32 | IrType::F64)
+                {
                     let fma_inst = Instruction::Intrinsic {
                         dest: Some(vec_sum_value),
                         op: vec_fma_op,
@@ -10042,11 +10371,15 @@ fn transform_map_vector(
     };
 
     let elem_size = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
-    let Some((src_base, _)) =
-        find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.src_gep, elem_size)
-    else {
-        return 0;
-    };
+    let mut src_bases = Vec::with_capacity(pattern.src_geps.len());
+    for &src_gep in &pattern.src_geps {
+        let Some((base, _)) =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, src_gep, elem_size)
+        else {
+            return 0;
+        };
+        src_bases.push(base);
+    }
     let Some((dst_base, _)) =
         find_reduction_byte_iv(func, &pattern.loop_blocks, pattern.dst_gep, elem_size)
     else {
@@ -10208,7 +10541,6 @@ fn transform_map_vector(
         });
     changes += 2;
 
-    let src_address = (src_base, Operand::Value(byte_iv));
     let dst_address = (dst_base, Operand::Value(byte_iv));
 
     let broadcast_op = match (pattern.elem_ty, avx2) {
@@ -10222,70 +10554,63 @@ fn transform_map_vector(
         _ => return 0,
     };
 
-    let mut emit_broadcast = |operand: &Option<Operand>| -> Option<Value> {
-        let scalar = operand.as_ref()?;
-        let value = Value(next_val_id);
-        next_val_id += 1;
-        func.blocks[preheader_idx]
-            .instructions
-            .push(Instruction::Intrinsic {
-                dest: Some(value),
-                op: broadcast_op,
-                dest_ptr: None,
-                args: vec![scalar.clone()],
-            });
-        changes += 1;
-        Some(value)
-    };
-    let scale_vec = emit_broadcast(&pattern.scale);
-    let offset_vec = emit_broadcast(&pattern.offset);
-
-    let (load_op, mul_op, add_op, store_op) = match (pattern.elem_ty, avx2) {
-        (IrType::F64, true) => (
-            IntrinsicOp::VecLoadF64x4,
-            IntrinsicOp::VecMulF64x4,
-            IntrinsicOp::VecAddF64x4,
-            IntrinsicOp::VecStoreF64x4,
-        ),
-        (IrType::F64, false) => (
-            IntrinsicOp::VecLoadF64x2,
-            IntrinsicOp::VecMulF64x2,
-            IntrinsicOp::VecAddF64x2,
-            IntrinsicOp::VecStoreF64x2,
-        ),
-        (IrType::F32, true) => (
-            IntrinsicOp::VecLoadF32x8,
-            IntrinsicOp::VecMulF32x8,
-            IntrinsicOp::VecAddF32x8,
-            IntrinsicOp::VecStoreF32x8,
-        ),
-        (IrType::F32, false) => (
-            IntrinsicOp::VecLoadF32x4,
-            IntrinsicOp::VecMulF32x4,
-            IntrinsicOp::VecAddF32x4,
-            IntrinsicOp::VecStoreF32x4,
-        ),
-        (IrType::I32 | IrType::U32, true) => (
-            IntrinsicOp::VecLoadI32x8,
-            IntrinsicOp::VecMulI32x8,
-            IntrinsicOp::VecAddI32x8,
-            IntrinsicOp::VecStoreI32x8,
-        ),
-        (IrType::I32 | IrType::U32, false) => (
-            IntrinsicOp::VecLoadI32x4,
-            IntrinsicOp::VecMulI32x4,
-            IntrinsicOp::VecAddI32x4,
-            IntrinsicOp::VecStoreI32x4,
-        ),
-        (IrType::I64 | IrType::U64, _) => (
-            IntrinsicOp::VecLoadI64x2,
-            IntrinsicOp::VecMulI64x2,
-            IntrinsicOp::VecAddI64x2,
-            IntrinsicOp::VecStoreI64x2,
-        ),
+    let load_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecLoadF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecLoadF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecLoadF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecLoadF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecLoadI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecLoadI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecLoadI64x2,
         _ => return 0,
     };
-    let madd_op = if fp_contract == FpContract::Fast && avx2 {
+    let store_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => IntrinsicOp::VecStoreF64x4,
+        (IrType::F64, false) => IntrinsicOp::VecStoreF64x2,
+        (IrType::F32, true) => IntrinsicOp::VecStoreF32x8,
+        (IrType::F32, false) => IntrinsicOp::VecStoreF32x4,
+        (IrType::I32 | IrType::U32, true) => IntrinsicOp::VecStoreI32x8,
+        (IrType::I32 | IrType::U32, false) => IntrinsicOp::VecStoreI32x4,
+        (IrType::I64 | IrType::U64, _) => IntrinsicOp::VecStoreI64x2,
+        _ => return 0,
+    };
+    let bin_op = |op: &IrBinOp| -> Option<IntrinsicOp> {
+        match (pattern.elem_ty, avx2, op) {
+            (IrType::F64, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x4),
+            (IrType::F64, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF64x2),
+            (IrType::F64, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x4),
+            (IrType::F64, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF64x2),
+            (IrType::F64, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x4),
+            (IrType::F64, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF64x2),
+            (IrType::F64, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x4),
+            (IrType::F64, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF64x2),
+            (IrType::F32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x8),
+            (IrType::F32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddF32x4),
+            (IrType::F32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x8),
+            (IrType::F32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubF32x4),
+            (IrType::F32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x8),
+            (IrType::F32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulF32x4),
+            (IrType::F32, true, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x8),
+            (IrType::F32, false, IrBinOp::SDiv) => Some(IntrinsicOp::VecDivF32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
+            _ => None,
+        }
+    };
+    // Sqrt is only available for FP element types; integer trees never
+    // contain Sqrt (the parser gates it), so `None` is fine there.
+    let sqrt_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => Some(IntrinsicOp::VecSqrtF64x4),
+        (IrType::F64, false) => Some(IntrinsicOp::VecSqrtF64x2),
+        (IrType::F32, true) => Some(IntrinsicOp::VecSqrtF32x8),
+        (IrType::F32, false) => Some(IntrinsicOp::VecSqrtF32x4),
+        _ => None,
+    };
+    let madd_op = if fp_contract == FpContract::Fast && avx2 && x86_fma_enabled() {
         match pattern.elem_ty {
             IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
             IrType::F32 => Some(IntrinsicOp::VecMaddF32x8),
@@ -10295,68 +10620,58 @@ fn transform_map_vector(
         None
     };
 
+    // Fail-closed BEFORE any mutation: every operation the tree needs must
+    // have a lowering. A mid-transform bail after the preheader/byte-IV
+    // rewrite would leave `func.next_value_id` stale and corrupt every
+    // later pass (bit_idioms indexed out of bounds on exactly this).
+    if !map_tree_ops_available(&pattern.expr, &bin_op, sqrt_op) {
+        if debug {
+            eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
+        }
+        return 0;
+    }
+
     // Replace the scalar store with only the packed operations present in the
     // source expression.  DCE removes the now-unreachable scalar dataflow.
     {
-        let vec_load = Value(next_val_id);
-        next_val_id += 1;
-        let load_args = vec![Operand::Value(src_address.0), src_address.1.clone()];
-        let mut vec_insts = vec![Instruction::Intrinsic {
-            dest: Some(vec_load),
-            op: load_op,
-            dest_ptr: None,
-            args: load_args,
-        }];
-        let mut current = vec_load;
-        if let (Some(madd), Some(scale), Some(offset)) = (madd_op, scale_vec, offset_vec) {
-            let result = Value(next_val_id);
-            next_val_id += 1;
-            vec_insts.push(Instruction::Intrinsic {
-                dest: Some(result),
-                op: madd,
-                dest_ptr: None,
-                args: vec![
-                    Operand::Value(current),
-                    Operand::Value(scale),
-                    Operand::Value(offset),
-                ],
-            });
-            current = result;
-        } else {
-            if let Some(scale) = scale_vec {
-                let result = Value(next_val_id);
-                next_val_id += 1;
-                vec_insts.push(Instruction::Intrinsic {
-                    dest: Some(result),
-                    op: mul_op,
-                    dest_ptr: None,
-                    args: vec![Operand::Value(current), Operand::Value(scale)],
-                });
-                current = result;
+        let mut ctx = MapEmitCtx {
+            src_bases: &src_bases,
+            byte_iv,
+            load_op,
+            broadcast_op,
+            sqrt_op,
+            madd_op,
+            bin_op: &bin_op,
+            broadcast_cache: Vec::new(),
+            preheader_insts: Vec::new(),
+            vec_insts: Vec::new(),
+            next_val_id,
+            changes: &mut changes,
+        };
+        let Some(current) = ctx.emit(&pattern.expr) else {
+            if debug {
+                eprintln!("[VEC-MAP]   Tree emission failed");
             }
-            if let Some(offset) = offset_vec {
-                let result = Value(next_val_id);
-                next_val_id += 1;
-                vec_insts.push(Instruction::Intrinsic {
-                    dest: Some(result),
-                    op: add_op,
-                    dest_ptr: None,
-                    args: vec![Operand::Value(current), Operand::Value(offset)],
-                });
-                current = result;
-            }
-        }
+            return changes;
+        };
         let store_args = vec![
             Operand::Value(current),
             Operand::Value(dst_address.0),
             dst_address.1.clone(),
         ];
-        vec_insts.push(Instruction::Intrinsic {
+        ctx.vec_insts.push(Instruction::Intrinsic {
             dest: None,
             op: store_op,
             dest_ptr: Some(dst_address.0),
             args: store_args,
         });
+        // Broadcasts live in the preheader so they are hoisted out of the
+        // packed loop (register-allocated once, reused across iterations).
+        func.blocks[preheader_idx]
+            .instructions
+            .extend(ctx.preheader_insts);
+        next_val_id = ctx.next_val_id;
+        let mut vec_insts = ctx.vec_insts;
 
         let body = &mut func.blocks[pattern.body_idx];
         let Some(store_pos) = body.instructions.iter().position(
@@ -10368,7 +10683,7 @@ fn transform_map_vector(
             return changes;
         };
         let inserted = vec_insts.len();
-        for (i, inst) in vec_insts.into_iter().enumerate() {
+        for (i, inst) in vec_insts.drain(..).enumerate() {
             body.instructions.insert(store_pos + i, inst);
         }
         body.instructions.remove(store_pos + inserted);
@@ -10397,13 +10712,13 @@ fn insert_map_remainder_loop(
     next_val_id: &mut u32,
     next_label: &mut u32,
 ) -> usize {
-    let mut src_base = None;
+    let mut src_bases: Vec<Option<Value>> = vec![None; pattern.src_geps.len()];
     let mut dst_base = None;
     for &block_idx in &pattern.loop_blocks {
         for inst in &func.blocks[block_idx].instructions {
             if let Instruction::GetElementPtr { dest, base, .. } = inst {
-                if *dest == pattern.src_gep {
-                    src_base = Some(*base);
+                if let Some(slot) = pattern.src_geps.iter().position(|g| *g == *dest) {
+                    src_bases[slot] = Some(*base);
                 }
                 if *dest == pattern.dst_gep {
                     dst_base = Some(*base);
@@ -10411,8 +10726,12 @@ fn insert_map_remainder_loop(
             }
         }
     }
-    let (Some(src_base), Some(dst_base)) = (src_base, dst_base) else {
+    let Some(dst_base) = dst_base else {
         return 0;
+    };
+    let src_bases: Vec<Value> = match src_bases.into_iter().collect::<Option<Vec<_>>>() {
+        Some(v) => v,
+        None => return 0,
     };
 
     let vec_exit_label = BlockId(*next_label);
@@ -10435,9 +10754,7 @@ fn insert_map_remainder_loop(
     let i_rem_cmp = fresh();
     let i_rem_cast = matches!(pattern.iv_ty, IrType::I32 | IrType::U32).then(|| fresh());
     let offset_v = fresh();
-    let gep_src = fresh();
     let gep_dst = fresh();
-    let load_v = fresh();
 
     // Redirect the vectorized header's known false/exit edge.
     if let Terminator::CondBranch { false_label, .. } =
@@ -10516,50 +10833,30 @@ fn insert_map_remainder_loop(
         ty: IrType::I64,
     });
     remainder_insts.push(Instruction::GetElementPtr {
-        dest: gep_src,
-        base: src_base,
-        offset: Operand::Value(offset_v),
-        ty: pattern.elem_ty,
-    });
-    remainder_insts.push(Instruction::GetElementPtr {
         dest: gep_dst,
         base: dst_base,
         offset: Operand::Value(offset_v),
         ty: pattern.elem_ty,
     });
-    remainder_insts.push(Instruction::Load {
-        volatile: false,
-        dest: load_v,
-        ptr: gep_src,
-        ty: pattern.elem_ty,
-        seg_override: AddressSpace::Default,
-    });
-    let mut scalar_result = load_v;
-    if let Some(scale) = &pattern.scale {
-        let value = fresh();
-        remainder_insts.push(Instruction::BinOp {
-            dest: value,
-            op: IrBinOp::Mul,
-            lhs: Operand::Value(scalar_result),
-            rhs: scale.clone(),
-            ty: pattern.elem_ty,
-        });
-        scalar_result = value;
-    }
-    if let Some(offset) = &pattern.offset {
-        let value = fresh();
-        remainder_insts.push(Instruction::BinOp {
-            dest: value,
-            op: IrBinOp::Add,
-            lhs: Operand::Value(scalar_result),
-            rhs: offset.clone(),
-            ty: pattern.elem_ty,
-        });
-        scalar_result = value;
-    }
+    // Per-stream GEP + load, then the scalar mirror of the expression tree.
+    // Invariant leaves are already available as operands (no instruction);
+    // Sqrt re-emits the scalar SqrtF32/SqrtF64 intrinsic, and BinOps re-emit
+    // the identical scalar operation — lane-exact by construction.
+    let mut next_val_local = *next_val_id;
+    let Some(scalar_result) = emit_map_scalar_tree(
+        &pattern.expr,
+        &src_bases,
+        pattern,
+        Operand::Value(offset_v),
+        &mut remainder_insts,
+        &mut next_val_local,
+    ) else {
+        return 0;
+    };
+    *next_val_id = next_val_local;
     remainder_insts.push(Instruction::Store {
         volatile: false,
-        val: Operand::Value(scalar_result),
+        val: scalar_result,
         ptr: gep_dst,
         ty: pattern.elem_ty,
         seg_override: AddressSpace::Default,
@@ -10591,6 +10888,108 @@ fn insert_map_remainder_loop(
     func.blocks.push(remainder_latch_block);
 
     4
+}
+
+/// Scalar mirror of the map expression tree for the exact remainder loop
+/// (OP-05a). Emits one instruction per tree node — the identical scalar
+/// operation the original loop performed — so tail elements observe the same
+/// arithmetic (and, without `-ffp-contract=fast`, the same rounding) as the
+/// pre-vectorization code.
+fn emit_map_scalar_tree(
+    expr: &MapExpr,
+    src_bases: &[Value],
+    pattern: &MapPattern,
+    byte_offset: Operand,
+    remainder_insts: &mut Vec<Instruction>,
+    next_val_id: &mut u32,
+) -> Option<Operand> {
+    match expr {
+        MapExpr::Load(stream) => {
+            let gep = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let load = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            remainder_insts.push(Instruction::GetElementPtr {
+                dest: gep,
+                base: src_bases[*stream],
+                offset: byte_offset.clone(),
+                ty: pattern.elem_ty,
+            });
+            remainder_insts.push(Instruction::Load {
+                volatile: false,
+                dest: load,
+                ptr: gep,
+                ty: pattern.elem_ty,
+                seg_override: AddressSpace::Default,
+            });
+            Some(Operand::Value(load))
+        }
+        MapExpr::Invariant(operand) => Some(operand.clone()),
+        MapExpr::Sqrt(x) => {
+            let inner = emit_map_scalar_tree(
+                x,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let sqrt_op = match pattern.elem_ty {
+                IrType::F64 => IntrinsicOp::SqrtF64,
+                IrType::F32 => IntrinsicOp::SqrtF32,
+                _ => return None,
+            };
+            remainder_insts.push(Instruction::Intrinsic {
+                dest: Some(dest),
+                op: sqrt_op,
+                dest_ptr: None,
+                args: vec![inner],
+            });
+            Some(Operand::Value(dest))
+        }
+        MapExpr::BinOp(op, l, r) => {
+            let lhs = emit_map_scalar_tree(
+                l,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let rhs = emit_map_scalar_tree(
+                r,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            remainder_insts.push(Instruction::BinOp {
+                dest,
+                op: *op,
+                lhs,
+                rhs,
+                ty: pattern.elem_ty,
+            });
+            Some(Operand::Value(dest))
+        }
+    }
 }
 
 /// Recognize a fixed-width squared-distance expression and pack its independent
@@ -10779,6 +11178,15 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
     vectorize_function_mode(func, false, FpContract::default(), false)
+}
+
+/// `-ffp-contract=fast` without `-fassociative-math`: FP reductions keep
+/// their scalar-order legality gate (reassociation still off), but map
+/// expression trees may contract mul+add into fused madd — the same
+/// distinction GCC makes (`-ffp-contract=fast` alone contracts loops;
+/// reduction reassociation needs `-fassociative-math`).
+pub(crate) fn vectorize_function_contract(func: &mut IrFunction) -> usize {
+    vectorize_function_mode(func, false, FpContract::Fast, false)
 }
 
 /// Run x86 vectorization with reassociation but without FMA contraction.
