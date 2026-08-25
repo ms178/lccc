@@ -2506,7 +2506,9 @@ impl X86Codegen {
     /// Destination register for loads. movzbl/movzwl/movl use 32-bit %eax.
     pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
-            IrType::U8 | IrType::U16 | IrType::U32 | IrType::F32 => "%eax",
+            IrType::I8 | IrType::U8 => "%al",
+            IrType::I16 | IrType::U16 => "%ax",
+            IrType::U32 | IrType::F32 => "%eax",
             _ => "%rax",
         }
     }
