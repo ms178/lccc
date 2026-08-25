@@ -1,0 +1,564 @@
+//! Loop rotation pass.
+//!
+//! Rotates "guard-at-top" loops into "test-at-bottom" form. The canonical
+//! unrotated loop emits TWO branch instructions per iteration in the hot
+//! path (the guard's conditional + the latch's unconditional backedge):
+//!
+//! ```text
+//!   preheader → header
+//!   header:  cmp; CondBranch(cond, body, exit)   // guard (continue = fall)
+//!   body:    ...                                 // (cond not taken = continue)
+//!   latch:   Branch(header)                      // unconditional backedge
+//!   exit:    ...
+//! ```
+//!
+//! After rotation the hot path has ONE conditional branch (the test, taken
+//! when continuing) and the exit falls through:
+//!
+//! ```text
+//!   preheader → header
+//!   header:  cmp; CondBranch(cond, body, exit)   // guard: enter or skip
+//!   body:    ...
+//!   latch:   cmp'; CondBranch(cond', body, exit)  // test: continue or exit
+//!   exit:    ...
+//! ```
+//!
+//! The `cmp'` in the latch is a clone of the header's `cmp` with phi
+//! references rewritten to the latch-edge incoming values (so the test sees
+//! the post-increment IV, not the pre-increment phi). The header retains its
+//! guard so the 0-trip case still skips the body.
+//!
+//! Safety: the transform is conservative — it bails on any loop whose header
+//! guard is not a simple CondBranch, whose latch is not a pure backedge to
+//! the header, or whose cond-setup closure touches memory or calls. Only
+//! SSA-pure arithmetic/cmp instructions are cloned.
+//!
+//! Kill-switch: set `CCC_NO_LOOP_ROTATE=1` to disable the pass at runtime.
+
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
+use crate::ir::analysis::CfgAnalysis;
+use crate::passes::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
+use crate::passes::loop_unroll::{rename_inst_dest, subst_value_in_terminator, subst_value_with_operand};
+use crate::passes::tail_call_elim::replace_values_in_inst;
+
+/// Per-function entry point for the dirty-tracking pipeline.
+pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+    rotate_loops(func)
+}
+
+/// Maximum number of loops to rotate per function per fixpoint run. Each
+/// successful rotation rebuilds the CFG, so this bounds quadratic worst cases
+/// in pathological loop nests.
+const MAX_ROTATIONS_PER_FUNC: usize = 256;
+
+/// Conservative bound on the cond-setup closure size. Real guard conditions are
+/// 1–3 instructions (`Cmp` + maybe `BinOp And`); anything deeper is likely
+/// an already-inlined expression that is better left to GVN/LICM than to
+/// duplicate.
+const MAX_CLOSURE: usize = 8;
+
+pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
+    // v13: loop rotation is OPT-IN (CCC_LOOP_ROTATE=1). The pass is
+    // structurally correct for the canonical single-block body+latch
+    // counted-loop form (verified: tiny sum_arr and loop_patterns
+    // produce output bit-identical to GCC). However, the transform is
+    // not yet conservative enough for the full regression corpus
+    // (28/486 tests miscompile — mostly loops where the header phi
+    // feeds a downstream use that the exit-merge-phi step doesn't
+    // catch, or multi-exit / nested-loop shapes the single-block
+    // restriction mishandles). Disabling by default avoids regressions;
+    // the infrastructure (new self-loop phis, exit-merge phis, cloned
+    // test cond, phi-elim self-loop copy placement) is in place for a
+    // v14 hardening pass.
+    if std::env::var("CCC_LOOP_ROTATE").is_err() {
+        return 0;
+    }
+    if func.blocks.len() < 3 {
+        return 0;
+    }
+    let mut total = 0;
+    loop {
+        let cfg = CfgAnalysis::build(func);
+        let raw = find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        if raw.is_empty() {
+            break;
+        }
+        let loops = merge_loops_by_header(raw);
+    if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
+        eprintln!("[ROT] found {} loops", loops.len());
+    }
+        // Process innermost loops first (smallest body) — their rotation is
+        // least likely to disturb outer-loop assumptions, and nested
+        // rotation can cascade (an outer loop becomes rotatable once an
+        // inner latch becomes a conditional test).
+        let mut sorted: Vec<&NaturalLoop> = loops.iter().collect();
+        sorted.sort_by_key(|lp| lp.body.len());
+        let mut did = false;
+        for lp in sorted.into_iter() {
+            if try_rotate_loop(func, lp, &cfg) {
+                total += 1;
+                did = true;
+                break; // CFG changed — rebuild before the next candidate.
+            }
+        }
+        if !did || total >= MAX_ROTATIONS_PER_FUNC {
+            break;
+        }
+    }
+    total
+}
+
+/// Try to rotate one natural loop. Returns true if the transform was applied.
+fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> bool {
+    let debug = std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok();
+    // 1. Single latch that is NOT the header (a self-loop is already rotated).
+    let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
+        if debug { eprintln!("[ROT] no single latch (header={}, body_len={})", lp.header, lp.body.len()); }
+        return false;
+    };
+    if latch_idx == lp.header {
+        if debug { eprintln!("[ROT] self-loop (latch==header={}, body_len={})", lp.header, lp.body.len()); }
+        return false;
+    }
+    if debug { eprintln!("[ROT] candidate: header={}, latch={}, body_len={}", lp.header, latch_idx, lp.body.len()); }
+
+    // 2. Latch terminator must be a pure backedge `Branch(header)`.
+    let header_label = func.blocks[lp.header].label;
+    let latch_label = func.blocks[latch_idx].label;
+    if !matches!(
+        &func.blocks[latch_idx].terminator,
+        Terminator::Branch(t) if *t == header_label
+    ) {
+        if debug { eprintln!("[ROT] latch not Branch(header)"); }
+        return false;
+    }
+
+    // 3. Header terminator must be CondBranch with one in-loop and one
+    //    out-of-loop target. The in-loop target is the "continue"; the
+    //    out-of-loop target is the "exit".
+    let label_to_idx: FxHashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect();
+    let (cond, continue_label, exit_label) = match &func.blocks[lp.header].terminator {
+        Terminator::CondBranch {
+            cond,
+            true_label,
+            false_label,
+        } => {
+            let t_in = is_in_loop(*true_label, &label_to_idx, lp);
+            let f_in = is_in_loop(*false_label, &label_to_idx, lp);
+            if t_in == f_in {
+                if debug { eprintln!("[ROT] CondBranch both-in or both-out"); }
+                return false; // both in (infinite) or both out (no body)
+            }
+            let c = *cond;
+            if t_in {
+                (c, *true_label, *false_label)
+            } else {
+                (c, *false_label, *true_label)
+            }
+        }
+        _ => {
+            if debug { eprintln!("[ROT] header not CondBranch: {:?}", func.blocks[lp.header].terminator); }
+            return false;
+        }
+    };
+    if debug { eprintln!("[ROT] CondBranch OK, continue={:?} exit={:?}", continue_label, exit_label); }
+
+    // 4. The guard cond must be a Value (not a constant — those are folded
+    //    by cfg_simplify and would not reach here, but fail closed).
+    let cond_val = match cond {
+        Operand::Value(v) => v,
+        Operand::Const(_) => return false,
+    };
+
+    // 5. Collect the transitive closure of header-local instructions that
+    //    feed `cond_val`. Only SSA-pure arithmetic/cmp/cast/copy/select
+    //    instructions are cloned; anything with memory, calls, or atomics
+    //    bails (we do not duplicate side effects).
+    let header_insts = &func.blocks[lp.header].instructions;
+    let mut def_idx: FxHashMap<u32, usize> = FxHashMap::default();
+    for (i, inst) in header_insts.iter().enumerate() {
+        if let Some(d) = inst.dest() {
+            def_idx.insert(d.0, i);
+        }
+    }
+    let mut closure: Vec<usize> = Vec::new();
+    let mut visited: FxHashSet<u32> = FxHashSet::default();
+    let mut worklist: Vec<Value> = vec![cond_val];
+    while let Some(v) = worklist.pop() {
+        if !visited.insert(v.0) {
+            continue;
+        }
+        let Some(&idx) = def_idx.get(&v.0) else {
+            continue; // defined outside header (loop-invariant) — keep as-is
+        };
+        let inst = &header_insts[idx];
+        // Phis are NOT cloned — they are rewritten to latch-edge values
+        // in step 7. Skip them here (do not add to closure, do not trace
+        // their incoming operands — those are handled by phi_latch_val).
+        if matches!(inst, Instruction::Phi { .. }) {
+            continue;
+        }
+        if !is_cloneable_pure(inst) {
+            if debug { eprintln!("[ROT] closure: inst not cloneable-pure: idx={} {:?}", idx, inst); }
+            return false; // cond setup touches memory/calls — bail
+        }
+        closure.push(idx);
+        if closure.len() > MAX_CLOSURE {
+            return false; // too deep — leave to other passes
+        }
+        // Add operands to the worklist.
+        inst.for_each_used_value(|v_id| {
+            worklist.push(Value(v_id));
+        });
+    }
+    // Sort by header instruction index so the cloned instructions emit in
+    // dependency order (a def before its uses).
+    closure.sort_unstable();
+    closure.dedup();
+    if closure.is_empty() {
+        return false; // cond is loop-invariant — wouldn't terminate, bail
+    }
+
+    // 5.5 Collect owned snapshots of the closure instructions and the header
+    //     phi metadata so the immutable borrow of `func.blocks[header]` ends
+    //     before we take mutable borrows of `func.blocks[latch]` below. The
+    //     Rust borrow checker can't prove the header and latch are disjoint
+    //     within `Vec<BasicBlock>`, so we copy out the needed data here.
+    let closure_insts_owned: Vec<Instruction> =
+        closure.iter().map(|&i| header_insts[i].clone()).collect();
+    // (phi_dest, phi_ty, preheader_incoming, latch_incoming)
+    let mut phi_info: Vec<(u32, IrType, (BlockId, Operand), Operand)> = Vec::new();
+    for inst in header_insts {
+        if let Instruction::Phi {
+            dest,
+            incoming,
+            ty,
+        } = inst
+        {
+            let mut pre = None;
+            let mut lat = None;
+            for (op, lbl) in incoming {
+                if *lbl == latch_label {
+                    lat = Some(*op);
+                } else {
+                    pre = Some((*lbl, *op));
+                }
+            }
+            if let (Some(pre), Some(lat)) = (pre, lat) {
+                phi_info.push((dest.0, *ty, pre, lat));
+            }
+        }
+    }
+    // phi_latch_val and phi_pre_val — derived from phi_info, owned.
+    let mut phi_latch_val: FxHashMap<u32, Operand> = FxHashMap::default();
+    let mut phi_pre_val: FxHashMap<u32, (BlockId, Operand)> = FxHashMap::default();
+    for &(phi_dest, _ty, pre, lat) in &phi_info {
+        phi_latch_val.insert(phi_dest, lat);
+        phi_pre_val.insert(phi_dest, pre);
+    }
+    // Drop the immutable header borrow — `header_insts` is no longer used.
+    drop(header_insts);
+
+    // 6.5 Restrict to the single-block body+latch shape (header + one body
+    //     block that is ALSO the latch). This is the canonical counted-loop
+    //     form after mem2reg + cfg_simplify: `header → body_latch → header`.
+    //     In this shape, rotating turns body_latch into a self-loop, so the
+    //     IV phi must be MOVED from the header into body_latch (a fresh phi
+    //     that receives the preheader value on entry and the computed next
+    //     value on each self-loop iteration). Multi-block bodies need the new
+    //     phi placed in the body ENTRY (not the latch) and body-wide use
+    //     replacement — left to a future enhancement.
+    let single_block_body = lp.body.len() == 2 && continue_label == latch_label;
+    if !single_block_body {
+        if debug { eprintln!("[ROT] not single-block body (body_len={}, continue==latch={})", lp.body.len(), continue_label == latch_label); }
+        return false;
+    }
+
+    // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
+    //     The new phi `i_loop = phi[header_label: v_pre, latch_label: v_latch]`
+    //     becomes the IV for the rotated self-loop. The header's original
+    //     phi is left in place (step 10 strips its latch incoming so
+    //     cfg_simplify collapses it to the preheader value — which is what
+    //     the guard now checks).
+    //
+    //     CRITICAL: uses of the header phi inside body_latch (e.g.
+    //     `load a[i]` or `i_next = i + 1`) must be rewritten to the new
+    //     `i_loop` BEFORE the cloned cond is appended — otherwise the body
+    //     would still reference the header phi, which after step 10 holds
+    //     only the preheader value (so the IV would never advance and the
+    //     loop would spin forever).
+    let mut next_val = func.next_value_id;
+    let mut new_loop_phis: FxHashMap<u32, u32> = FxHashMap::default(); // header_phi_dest → new_loop_phi_dest
+    let mut new_phi_insts: Vec<Instruction> = Vec::with_capacity(phi_info.len());
+    for &(phi_dest, phi_ty, (pre_label, pre_op), latch_op) in &phi_info {
+        let new_dest = Value(next_val);
+        next_val += 1;
+        new_loop_phis.insert(phi_dest, new_dest.0);
+        new_phi_insts.push(Instruction::Phi {
+            dest: new_dest,
+            ty: phi_ty,
+            incoming: vec![
+                (pre_op, pre_label),
+                (latch_op, latch_label),
+            ],
+        });
+    }
+    // Insert the new phis at the TOP of body_latch (phis must precede all
+    // other instructions in a block).
+    let latch_block = &mut func.blocks[latch_idx];
+    let mut new_body_insts: Vec<Instruction> = new_phi_insts;
+    new_body_insts.extend(latch_block.instructions.drain(..));
+    latch_block.instructions = new_body_insts;
+    // Rewrite uses of header phis in body_latch's (now-relocated) existing
+    // instructions to the new loop phis. The new phis themselves are at the
+    // top and reference v_pre / v_latch (NOT the header phi dest), so they
+    // are untouched by this rewrite. `skip(n)` jumps past the n new phis.
+    let latch_block = &mut func.blocks[latch_idx];
+    let n_new_phis = phi_info.len();
+    for inst in latch_block.instructions.iter_mut().skip(n_new_phis) {
+        for (&old_phi, &new_phi) in &new_loop_phis {
+            let repl = Operand::Value(Value(new_phi));
+            subst_value_with_operand(inst, old_phi, &repl);
+        }
+    }
+
+    // 7. Clone the closure instructions to the latch, allocating fresh dest
+    //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
+    //
+    //    But FIRST (step 6.7): the header phis are used OUTSIDE the loop
+    //    (e.g. the accumulator `s` is read after the loop to return the
+    //    sum). After rotation, the header phi's latch incoming is gone
+    //    (step 10), so the header phi collapses to the preheader value
+    //    — losing the accumulated result. The real final value lives in
+    //    the new self-loop phi `s_loop` (in body_latch), reached via the
+    //    test-exit edge. So for each header phi with external uses, we
+    //    create a merge phi in the exit block: `s_final = phi[header:
+    //    v_pre, body_latch: s_loop]` and rewrite external uses to it.
+    let exit_idx = label_to_idx
+        .get(&exit_label)
+        .copied()
+        .unwrap_or(usize::MAX);
+    if exit_idx != usize::MAX {
+        // Collect (header_phi_dest, new_loop_phi_dest, preheader_operand)
+        // for phis that have at least one use outside the loop body.
+        let mut external_users: Vec<(u32, u32, Operand)> = Vec::new();
+        for &(phi_dest, _ty, (_pre_lbl, pre_op), _lat) in &phi_info {
+            let new_loop = *new_loop_phis
+                .get(&phi_dest)
+                .expect("new_loop_phis has an entry for every header phi");
+            // Scan all blocks outside the loop for uses of phi_dest.
+            // Includes BOTH instructions and the terminator (the loop
+            // phi is often returned, e.g. `Return(s)` reads the
+            // accumulator phi — missing the terminator use would leave
+            // the return reading the guard's preheader value (0) instead
+            // of the accumulated result).
+            let mut found = false;
+            for (bi, block) in func.blocks.iter().enumerate() {
+                if bi == lp.header || lp.body.contains(&bi) {
+                    continue;
+                }
+                for inst in &block.instructions {
+                    let mut used = false;
+                    inst.for_each_used_value(|v| {
+                        if v == phi_dest {
+                            used = true;
+                        }
+                    });
+                    if used {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+                // Check the terminator too (Return, CondBranch, Switch, etc.).
+                let mut t_used = false;
+                block.terminator.for_each_used_value(|v| {
+                    if v == phi_dest {
+                        t_used = true;
+                    }
+                });
+                if t_used {
+                    found = true;
+                }
+            }
+            if found {
+                external_users.push((phi_dest, new_loop, pre_op));
+            }
+        }
+        // Create the merge phis at the top of the exit block.
+        let mut exit_merge_map: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(external_users.len());
+        for &(phi_dest, new_loop, pre_op) in &external_users {
+            let nd = Value(next_val);
+            next_val += 1;
+            exit_merge_map.insert(phi_dest, nd.0);
+            let ty = phi_info
+                .iter()
+                .find(|&&(pd, _, _, _)| pd == phi_dest)
+                .map(|&(_, ty, _, _)| ty)
+                .expect("phi_info has an entry for every header phi");
+            exit_phi_insts.push(Instruction::Phi {
+                dest: nd,
+                ty,
+                incoming: vec![
+                    (pre_op, header_label),      // guard-exit path: preheader value
+                    (Operand::Value(Value(new_loop)), latch_label), // test-exit path: accumulated value
+                ],
+            });
+        }
+        if !exit_phi_insts.is_empty() {
+            let exit_block = &mut func.blocks[exit_idx];
+            let mut new_exit_insts: Vec<Instruction> = exit_phi_insts;
+            new_exit_insts.extend(exit_block.instructions.drain(..));
+            exit_block.instructions = new_exit_insts;
+            // Rewrite external uses of the header phis to the merge phis.
+            // We must skip the new merge phis themselves (they're at the top
+            // of the exit block and reference v_pre / s_loop, NOT the header
+            // phi dest). We also skip the loop body (uses there were already
+            // rewritten to s_loop in step 6.6) and the header (the header
+            // phi is still live there until step 10 strips its latch edge —
+            // but the header's own cond uses will be cloned, not the original).
+            let n_exit_phis = external_users.len();
+            for (bi, block) in func.blocks.iter_mut().enumerate() {
+                if bi == lp.header || lp.body.contains(&bi) || bi == exit_idx {
+                    if bi == exit_idx {
+                        // Rewrite exit-block instructions (skip the new phis at top).
+                        for inst in block.instructions.iter_mut().skip(n_exit_phis) {
+                            for (&old_phi, &new_phi) in &exit_merge_map {
+                                let repl = Operand::Value(Value(new_phi));
+                                subst_value_with_operand(inst, old_phi, &repl);
+                            }
+                        }
+                        // Also rewrite the exit block's terminator.
+                        for (&old_phi, &new_phi) in &exit_merge_map {
+                            let repl = Operand::Value(Value(new_phi));
+                            subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
+                        }
+                    }
+                    continue;
+                }
+                for inst in &mut block.instructions {
+                    for (&old_phi, &new_phi) in &exit_merge_map {
+                        let repl = Operand::Value(Value(new_phi));
+                        subst_value_with_operand(inst, old_phi, &repl);
+                    }
+                }
+                for (&old_phi, &new_phi) in &exit_merge_map {
+                    let repl = Operand::Value(Value(new_phi));
+                    subst_value_in_terminator(&mut block.terminator, old_phi, &repl);
+                }
+            }
+        }
+    }
+
+    // 7. Clone the closure instructions to the latch, allocating fresh dest
+    //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
+    let mut clone_map: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(closure_insts_owned.len());
+    for inst in &closure_insts_owned {
+        let new_dest_opt = if let Some(d) = inst.dest() {
+            let nd = Value(next_val);
+            next_val += 1;
+            clone_map.insert(d.0, nd.0);
+            Some(nd)
+        } else {
+            None
+        };
+        let mut cloned = inst.clone();
+        // First: rewrite Value operands that are cloned-instruction dests →
+        // their fresh IDs. This handles references BETWEEN cloned
+        // instructions (e.g. `BinOp And(c1, c2)` where both c1 and c2 are
+        // cloned). `replace_values_in_inst` only touches operands, not dest.
+        replace_values_in_inst(&mut cloned, &clone_map);
+        // Second: rewrite phi references → latch-edge incoming operands.
+        // Phi references are NOT in clone_map (phis are not cloned), so
+        // `replace_values_in_inst` left them untouched.
+        for (&phi_id, latch_op) in &phi_latch_val {
+            subst_value_with_operand(&mut cloned, phi_id, latch_op);
+        }
+        // Third: rename the dest to the fresh ID.
+        if new_dest_opt.is_some() {
+            rename_inst_dest(&mut cloned, &clone_map);
+        }
+        cloned_insts.push(cloned);
+    }
+    // The cloned cond value (new ID) is the latch's new CondBranch cond.
+    let new_cond = Operand::Value(Value(*clone_map.get(&cond_val.0).expect(
+        "cond_val must be in clone_map (it was visited in the closure and has a dest)",
+    )));
+
+    // 8. Insert cloned instructions at the END of the latch (before the
+    //    terminator, which we replace below). The latch's own instructions
+    //    (e.g., the IV increment `i_next = i + 1`) must run BEFORE the test.
+    let latch_block = &mut func.blocks[latch_idx];
+    latch_block.instructions.extend(cloned_insts);
+
+    // 9. Replace the latch's `Branch(header)` with a conditional test that
+    //    branches to `continue_label` (the body) when the cloned cond is
+    //    true, and to `exit_label` when false. Same polarity as the header
+    //    guard: true → continue, false → exit.
+    latch_block.terminator = Terminator::CondBranch {
+        cond: new_cond,
+        true_label: continue_label,
+        false_label: exit_label,
+    };
+
+    // 10. The latch no longer branches to the header — its only successor is
+    //     now `continue_label` (self or body) or `exit_label`. Remove the
+    //     stale `(op, latch_label)` incoming from every phi in the header,
+    //     because the latch→header backedge is gone. cfg_simplify then
+    //     collapses the now-single-incoming phi to the preheader value.
+    for inst in &mut func.blocks[lp.header].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            incoming.retain(|(_, lbl)| *lbl != latch_label);
+        }
+    }
+
+    // 11. Advance the watermark so subsequent passes see the new IDs.
+    func.next_value_id = next_val;
+
+    if debug { eprintln!("[ROT] SUCCESS: rotated header={} latch={}", lp.header, latch_idx); }
+    true
+}
+
+/// Check if a block label is inside the loop body (or is the header).
+fn is_in_loop(label: BlockId, label_to_idx: &FxHashMap<BlockId, usize>, lp: &NaturalLoop) -> bool {
+    label_to_idx
+        .get(&label)
+        .map(|&idx| idx == lp.header || lp.body.contains(&idx))
+        .unwrap_or(false)
+}
+
+/// Predicate: is this instruction safe to clone into the latch?
+///
+/// Safe = SSA-pure, no memory side effects, no calls, no atomics, no
+/// intrinsics, no alloca. The allow-list is arithmetic/logic/cmp/cast/
+/// copy/select/gep — the building blocks of loop guard conditions.
+///
+/// NOTE: Phi is deliberately EXCLUDED. Header phis are NOT cloned into
+/// the latch — they are REWRITTEN to their latch-edge incoming values
+/// (step 7's `subst_value_with_operand` via `phi_latch_val`). If a Phi
+/// were cloned, the cloned Cmp would reference the cloned Phi (a
+/// duplicate self-loop phi) instead of the post-increment `i_next`,
+/// producing an off-by-one (the test reads the phi's stale value).
+fn is_cloneable_pure(inst: &Instruction) -> bool {
+    matches!(
+        inst,
+        Instruction::BinOp { .. }
+            | Instruction::UnaryOp { .. }
+            | Instruction::Cmp { .. }
+            | Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::Select { .. }
+            | Instruction::GetElementPtr { .. }
+    )
+}

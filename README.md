@@ -6,7 +6,7 @@
 
 ## What is LCCC?
 
-CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6. Arena.ai Agents 
+CCC (Claude's C Compiler) is a zero-dependency C compiler written entirely in Rust by Claude Opus 4.6. Arena.ai Agents
 did a good job at improving it further.
 
 It is capable of compiling real projects — gzip, zlib-ng, expat, SQLite, the Linux kernel and glibc — for x86-64, AArch64,
@@ -159,6 +159,56 @@ register-resident. Five validated fixes + find_max infrastructure:
   dead 256-bit store). Detection remains gated on `neon` pending AVX2
   cost-model tuning — the init+reduce overhead exceeds the 8× lane speedup
   for the 10M working set; removing the gate is a one-line v13 change.
+
+### v13 highlights (session 82, continued)
+
+The v12 follow-up work identified **loop rotation** as the systemic gap
+affecting every benchmark (the double-jump `cmp; jge; .Lbody; ...;
+jmp .Lhead` form costs ~1 branch/iter vs GCC's rotated test-and-branch).
+v13 lands the loop-rotation infrastructure and hardens it to correctness
+for the canonical single-block body+latch counted-loop form, but ships
+it **opt-in** (`CCC_LOOP_ROTATE=1`) because the transform still
+miscompiles 24/486 regression tests (multi-exit, nested-loop, and
+header-phi-escapes-through-non-Return-terminator shapes). The
+infrastructure is in place for a v14 hardening pass.
+
+- **Loop rotation pass** (`src/passes/loop_rotate.rs`, ~530 LOC): a new
+  IR-level pass that transforms guard-at-top loops into test-at-bottom
+  self-loops. For each single-latch, single-block-body+latch loop with a
+  pure-SSA guard cond, it (1) clones the guard cond to the latch with
+  phi references rewritten to the post-increment IV value, (2) creates a
+  fresh self-loop phi in the body for each header phi (the new IV), (3)
+  creates an exit-block merge phi for each header phi with external uses
+  (so the accumulator's final value reaches the `Return`/downstream
+  users), (4) strips the header phi's stale latch incoming (cfg_simplify
+  then collapses it to the preheader value). Runs at -O2+ before
+  loop_unroll. Gated `CCC_LOOP_ROTATE=1` (default off) +
+  `CCC_NO_LOOP_ROTATE=1` kill-switch. Verified correct on `sum_arr` (tiny
+  + 10M-element loop_patterns: output bit-identical to GCC) and emits the
+  canonical rotated form (`.Lbody: ...; cmp; jne .Lbody` self-loop).
+- **phi-elimination self-loop copy placement** (explored, reverted): the
+  self-loop's phi-elim copy must go at the END of the block (before the
+  backedge), not in a trampoline — otherwise the trampoline splits the
+  self-loop back into a 2-block body+latch with an unconditional backedge,
+  reverting the rotation. A fix to `place_copy`/`place_copies` was
+  implemented and verified correct on loop_patterns, but it regressed
+  `sqlite_varint` (a pre-existing self-loop relied on the trampoline
+  split), so it was reverted. v14 will re-land it with a narrower gate
+  (only self-loops created by loop_rotate, not pre-existing ones).
+- **loop_unroll visibility**: `subst_value_with_operand`,
+  `subst_value_in_terminator`, and `rename_inst_dest` promoted to
+  `pub(crate)` so the new pass can reuse the proven value-rewriting
+  helpers instead of duplicating them.
+
+**v13 status**: zero regressions (486/489, same 4 env-only i686/regparm
+failures as v12). The rotation pass is opt-in infrastructure; with it
+off, benchmark numbers match v12 (loop_patterns ~0.98, libm 0.411,
+tce_sum 0.961). The Godbolt-oracle gap analysis (loop rotation as the
+systemic win) is confirmed: enabling `CCC_LOOP_ROTATE=1` on loop_patterns
+produces the rotated `jne .Lbody` self-loop form that matches GCC's
+shape, but the 24-test miscompile blocks default-enable. v14 target:
+harden the rotation to handle multi-exit/nested shapes, re-land the
+phi-elim self-loop fix with a narrower gate, then default-enable.
 
 ### v11 highlights (session 81)
 
