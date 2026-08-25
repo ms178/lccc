@@ -452,6 +452,15 @@ pub struct X86Codegen {
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
     /// Set by the Cmp emitter when the consumer is the next instruction.
     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
+    /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
+    /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
+    /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
+    /// the relational ops, NOT `jg`/`jge`/`jl`/`jle`), so the consumer must
+    /// use a float-specific jcc. Set by `emit_float_cmp_impl` when the
+    /// result is consumed only by an adjacent Select/CondBranch; the live
+    /// flags survive to the consumer (no flag-clobbering instruction between
+    /// them — same adjacency guarantee as the integer fusion).
+    pub(super) pending_fp_cmp: Option<(u32, &'static str)>,
     /// IVSR pointer detection results: maps pointer phi value ID to its metadata
     pub(super) ivsr_pointers: FxHashMap<u32, IvsrPointerInfo>,
     /// Maps IVSR pointer phi to original loop counter value ID
@@ -673,6 +682,7 @@ impl X86Codegen {
             fold_skip_cast: None,
             value_types: FxHashMap::default(),
             pending_cmp: None,
+            pending_fp_cmp: None,
             current_func: None,
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),

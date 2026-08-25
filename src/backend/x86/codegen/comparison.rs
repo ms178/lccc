@@ -34,6 +34,36 @@ impl X86Codegen {
         } else {
             self.state.emit("    ucomiss %xmm1, %xmm0");
         }
+
+        // FLAG FUSION: when this FP Cmp's boolean result is consumed ONLY by
+        // an immediately-following Select/CondBranch (precomputed in
+        // fused_cmp_dests), skip the boolean materialization. The ucomisd
+        // above set EFLAGS; the relational ordered comparisons map cleanly
+        // to `ja`/`jae` (NaN → unordered → not-taken = false, which is the
+        // C99 result for NaN in any relational). Eq/Ne are never fused
+        // (the prologue gate excludes them), so the parity bit is irrelevant
+        // here. The consumer reads `pending_fp_cmp` for the pre-computed
+        // jcc — distinct from the integer `pending_cmp` because the FP
+        // flag→jcc mapping differs (ja vs jg).
+        let fusion_disabled = std::env::var("CCC_NO_FLAG_FUSION").is_ok();
+        if !fusion_disabled {
+            if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
+                let jcc: Option<&'static str> = match op {
+                    IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("ja"),
+                    IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("jae"),
+                    // Eq/Ne are excluded from FP fusion by the prologue gate;
+                    // reaching here is unreachable, but materialize anyway
+                    // for safety rather than risk a skipped boolean.
+                    IrCmpOp::Eq | IrCmpOp::Ne => None,
+                };
+                if let Some(jcc) = jcc {
+                    self.pending_fp_cmp = Some((chain_end, jcc));
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+            }
+        }
+
         match op {
             IrCmpOp::Eq => {
                 self.state.emit("    setnp %al");
@@ -55,6 +85,21 @@ impl X86Codegen {
         self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
+    }
+
+    /// Consume a pending FP fused-Cmp's live flags for a boolean condition.
+    /// Returns the pre-computed jcc if `cond` matches the fused Cmp's dest
+    /// (or the chain-end value of a flag-neutral Copy/Cast chain), else None.
+    fn take_pending_fp_cmp(&mut self, cond: &Operand) -> Option<&'static str> {
+        if let Operand::Value(v) = cond {
+            if let Some((dest, jcc)) = self.pending_fp_cmp {
+                if dest == v.0 {
+                    self.pending_fp_cmp = None;
+                    return Some(jcc);
+                }
+            }
+        }
+        None
     }
 
     pub(super) fn emit_f128_cmp_impl(
@@ -467,6 +512,32 @@ impl X86Codegen {
         };
         let hot_next = next == Some(hot);
         let cold_next = next == Some(cold);
+
+        // FLAG FUSION (FP): the condition is the direct result of an
+        // immediately-preceding float Cmp whose ucomisd flags are still
+        // live. Branch on the pre-computed FP jcc (ja/jae family) directly,
+        // skipping the setcc + movzbl + testq chain — the mandelbrot
+        // `if (zr*zr + zi*zi > 4.0) break` drops from 6 instructions
+        // (ucomisd; seta; movzbl; movq; test; jne) to 2 (ucomisd; ja).
+        if let Some(jcc) = self.take_pending_fp_cmp(cond) {
+            let jcc_hot = if pref_true {
+                jcc
+            } else {
+                Self::invert_jcc(jcc)
+            };
+            if hot_next {
+                self.state
+                    .out
+                    .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+            } else {
+                self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                if !cold_next {
+                    self.state.out.emit_jmp_block(cold.0);
+                }
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
 
         // FLAG FUSION: the condition is the direct result of the immediately
         // preceding Cmp; its flags are live — branch on them directly,
