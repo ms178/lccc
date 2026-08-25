@@ -36,6 +36,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_memory_promote;
+pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
@@ -1021,6 +1022,24 @@ pub(crate) fn run_passes(
         // Phase 2b: Loop unrolling — iter 0 only, before GVN/LICM so that
         // subsequent passes can optimize the unrolled copies.
         // Pass name for CCC_DISABLE_PASSES: "unroll"
+        //
+        // Loop rotation runs first (at -O2 and above): it transforms
+        // "guard-at-top" loops into "test-at-bottom" form, eliminating the
+        // unconditional backedge jump (one fewer branch per iteration in the
+        // hot path) and letting the loop exit fall through. Every counted
+        // loop benefits. The transform is conservative (pure-SSA cond setup
+        // only) and gated by `CCC_NO_LOOP_ROTATE`. -Os/-Oz skip it (the
+        // cloned cond grows code size slightly). Runs at iter 0 so the
+        // rotated form flows through GVN/LICM/if-convert/dce/cfg_simplify,
+        // which clean up any redundancy before the backend.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+            let n = timed_pass!(
+                "loop_rotate",
+                run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
         if iter == 0 && opt_level >= 3 && !optimize_for_size && !dis.unroll {
             let n = timed_pass!(
                 "loop_unroll",

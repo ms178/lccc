@@ -1392,7 +1392,7 @@ fn try_complete_unroll_two_block(
     true
 }
 
-fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
+pub(crate) fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operand) {
     inst.for_each_operand_mut(|operand| {
         if matches!(operand, Operand::Value(value) if value.0 == old_id) {
             *operand = new_op.clone();
@@ -1407,7 +1407,7 @@ fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_op: &Operan
     }
 }
 
-fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &Operand) {
+pub(crate) fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &Operand) {
     terminator.for_each_operand_mut(|operand| {
         if matches!(operand, Operand::Value(value) if value.0 == old_id) {
             *operand = new_op.clone();
@@ -2031,7 +2031,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
 
 /// Rename the SSA *definition* site (dest) of an instruction using `map`.
 /// Only variants that produce an SSA value are affected; others are a no-op.
-fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
+pub(crate) fn rename_inst_dest(inst: &mut Instruction, map: &FxHashMap<u32, u32>) {
     match inst {
         Instruction::PgoCounterInc { .. } => {}
         // Nested-function support: GetStaticChain defines a dest; the others
