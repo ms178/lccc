@@ -602,6 +602,21 @@ impl X86Codegen {
     /// (mov/movl/movslq/leaq family), so only constants are handled here.
     fn select_operand_to_reg(&mut self, op: &Operand, reg64: &str, reg32: &str) {
         if let Operand::Const(c) = op {
+            // The raw immediate emitters below bypass the register cache
+            // bookkeeping that `operand_to_rcx`/`operand_to_rax` maintain.
+            // Writing %rcx/%rax without invalidating the corresponding
+            // cache entry left a STALE "rcx holds K" claim alive: the next
+            // `operand_to_rcx(K)` then skipped the reload and the consumer
+            // read the clobbered register (`(h^v)*K` after a
+            // `movq $0,%rcx; cmoveq` select returned 0-multiplied garbage —
+            // bitops_builtins). The copy-propagation peephole had been
+            // masking this by rewriting the consumers off %rcx; any RA
+            // perturbation that broke that rescue exposed the miscompile.
+            if reg64 == "rcx" {
+                self.state.reg_cache.invalidate_sec();
+            } else if reg64 == "rax" {
+                self.state.reg_cache.invalidate_acc();
+            }
             if c.is_zero() {
                 self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
                 return;

@@ -242,6 +242,28 @@ fn can_indexed_addr_fold(
     if cg.get_phys_reg_for_value(info.base.0).is_some() {
         return true;
     }
+    // Alloca bases fold as `disp(%rbp/%rsp,%idx,scale)`: the frame slot is
+    // re-computable at every use site, exactly like the const-offset alloca
+    // fold (see can_const_addr_fold). This is the dominant shape for
+    // inlined array kernels — the callee's `const double *v` parameter
+    // becomes a caller alloca after inlining, and without this arm every
+    // access paid a 4-instruction address materialisation
+    // (`leaq slot,%rcx; shlq $3,%rax; addq; load`) instead of one SIB
+    // operand (spectral_norm mul_Av/mul_Atv inner loops).
+    //
+    // ONLY plain Direct slots: an OverAligned alloca's runtime address is
+    // `(slot+align-1)&~(align-1)`, which the frame-SIB emitter cannot
+    // express — and a can-fold/emitter disagreement here is not merely a
+    // missed fold: the dead-offset producer walk skips the offset chain
+    // based on THIS answer, and the emitter's rematerialise fallback would
+    // then reference the skipped producer (vzeroupper_after_ymm: compare
+    // loop read `dst[i]` through a never-written index register).
+    if cg.state_ref().is_alloca(info.base.0) {
+        return matches!(
+            cg.state_ref().resolve_slot_addr(info.base.0),
+            Some(crate::backend::state::SlotAddr::Direct(_))
+        );
+    }
     // Symbol-base indexed addressing (`sym(,%idx,scale)`): the GlobalAddr
     // base was never materialised and has no register home.  Only backends
     // that emit the symbol form may take this path — otherwise the skipped
@@ -1105,6 +1127,38 @@ fn build_indexed_gep_map(
                     // iv-update Copy uses.
                     if let Some(ar) = add_result {
                         if iv_coalesce_pairs.contains(&(iv_id, ar)) {
+                            // Retarget instead of refusing. The offset
+                            // chain semantically IS
+                            // `base + add_result << shift` here (the
+                            // peel walked through the add: address =
+                            // base + ((iv + k) << shift_at_add) <<
+                            // shift_after = base + add_result <<
+                            // shift_final; disp held only the add's own
+                            // `k << shift_at_add` because nested adds
+                            // are refused above, so dropping it and
+                            // indexing by the add's result is exact).
+                            // The old-iv SIB form `k<<(base, iv, scale)`
+                            // would read the iv's register after the
+                            // coalesced in-place add overwrote it; the
+                            // retargeted form reads the register the add
+                            // WROTE, and liveness of add_result extends
+                            // to the access (can_indexed_addr_fold), so
+                            // the add is ordered before the SIB by a
+                            // true dependence — no scheduling hazard
+                            // regardless of block layout. This is the
+                            // `i++; a[i]` post-increment scan shape
+                            // (linux_find_bit: 2 extra instructions per
+                            // scanned word; GCC folds it too).
+                            map.insert(
+                                dest.0,
+                                IndexedGepInfo {
+                                    base: *base,
+                                    index: Value(ar),
+                                    shift,
+                                    disp: 0,
+                                    orig_offset: *off,
+                                },
+                            );
                             continue;
                         }
                     }
@@ -3532,35 +3586,52 @@ fn generate_function(
             }
         }
         let single_defs = index_single_defs(func, &stab);
+        // Fixed-point dead-offset analysis. The old walk required
+        // `use_count == 1` per chain node, which stops at SHARED offsets:
+        // `a[i]; b[i]` both GEP the same `i*8` value (use_count 2), and the
+        // scaled-offset producer stayed live as dead code after both GEPs
+        // folded (linux_find_bit: `movq %r13,%rbx; shlq $3,%rbx` per scanned
+        // word). Instead, count uses ATTRIBUTABLE to the fold: (a) offset
+        // operands of foldable GEPs, (b) operand positions of other dead
+        // chain nodes. A node is dead iff every one of its uses is
+        // fold-attributable. The walk still stops at the fold's index value:
+        // the terminal index is live by construction (the RA keeps it
+        // register-resident to the access).
+        let mut fold_uses: FxHashMap<u32, u32> = FxHashMap::default();
+        for dest in &foldable_folds {
+            if let Some(info) = indexed_gep_map.get(dest) {
+                *fold_uses.entry(info.orig_offset.0).or_insert(0) += 1;
+            }
+        }
         for (dest, info) in indexed_gep_map.iter() {
             if !foldable_folds.contains(dest) || has_store_consumer.contains(dest) {
                 continue;
             }
-            // Walk the offset's single-use producer chain; every node whose
-            // only use is within this dead chain is skipped.  Nodes with
-            // other uses (loop IVs, shared subexpressions) stop the walk.
-            // CRITICAL: the walk must stop AT the fold's index value —
-            // resolve_index may return an UNPEELED terminal (e.g. a
-            // const-materialised offset: `movl $132,%edi; leal (%esi,%edi)`
-            // folds to `movl (%esi,%edi)` and READS the index at the
-            // access).  Peeling intermediates are dead; the terminal index
-            // is live by construction.
             let index_val = info.index.0;
             let mut stack = vec![info.orig_offset.0];
             while let Some(v) = stack.pop() {
                 if v == index_val {
                     continue;
                 }
-                if value_use_counts.get(v as usize).copied() != Some(1) {
+                if idx_dead_producers.contains(&v) {
                     continue;
                 }
-                if !idx_dead_producers.insert(v) {
+                let total = value_use_counts.get(v as usize).copied().unwrap_or(0);
+                let attributed = fold_uses.get(&v).copied().unwrap_or(0);
+                if attributed < total {
+                    // Some use is outside the folded chains: keep the node
+                    // (and do not traverse through it — its operands may
+                    // still be live for those other uses).
                     continue;
                 }
+                idx_dead_producers.insert(v);
                 if let Some(inst) = single_defs.get(&v) {
                     for_each_operand_in_instruction(inst, |op| {
                         if let Operand::Value(x) = op {
                             stack.push(x.0);
+                            // This operand use is now attributable to the
+                            // fold (its consumer is dead).
+                            *fold_uses.entry(x.0).or_insert(0) += 1;
                         }
                     });
                 }

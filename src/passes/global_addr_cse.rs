@@ -104,11 +104,62 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 /// GlobalAddr values feeding variable-index GEPs stay at their original sites.
 /// Hoisting/CSE lengthens the base live range and can evict the natural index,
 /// destroying x86 `sym(,%idx,scale)` selection (gzip CRC regression).
+///
+/// OP-34 stride gate: site-locality exists solely to protect that SIB form.
+/// When the variable offset carries a constant stride SIB cannot encode
+/// (struct strides like 24/32/56, negative or oversized scales), the indexed
+/// form is unreachable no matter where the base lives — site-locality then
+/// only duplicates the address chain. Every `s.field` access of a stride-56
+/// struct loop re-materialised `GA + j*56` (nbody: seven marching pointers,
+/// GPR flood, stack-slot relay). Such bases are ordinary CSE candidates: GVN
+/// unifies the `GA + idx*stride` GEPs into one, IVSR produces a single
+/// marching pointer, and field offsets fold into displacements at the uses.
 pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
     let mut globals = FxHashSet::default();
     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
     let mut indexed_bases = Vec::new();
+    // Constant multiplicands of index expressions: dest value id -> constant.
+    // `Mul(idx, C)` / `C * idx` and `Shl(idx, K)` (the frontend's two forms of
+    // byte-stride scaling). Used to decide whether the indexed GEP could ever
+    // select `sym(,%idx,scale)` addressing.
+    let mut mul_const: FxHashMap<u32, i64> = FxHashMap::default();
+    let mut shl_const: FxHashMap<u32, i64> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Mul,
+                    rhs: Operand::Const(c),
+                    ..
+                }
+                | Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Mul,
+                    lhs: Operand::Const(c),
+                    ..
+                } => {
+                    if let Some(c) = c.to_i64() {
+                        mul_const.insert(dest.0, c);
+                    }
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: crate::ir::reexports::IrBinOp::Shl,
+                    rhs: Operand::Const(c),
+                    ..
+                } => {
+                    // Guard the `1 << k` below: shifts outside 0..63 are
+                    // either nonsense or would overflow i64.
+                    if let Some(k) = c.to_i64().filter(|&k| (0..63).contains(&k)) {
+                        shl_const.insert(dest.0, k);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
@@ -143,10 +194,19 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
                 }
                 Instruction::GetElementPtr {
                     base,
-                    offset: Operand::Value(_),
+                    offset: Operand::Value(idx),
                     ..
                 } => {
-                    indexed_bases.push(base.0);
+                    // Stride of this index: a Mul/Shl constant when the offset
+                    // is a scaled index, 1 when it is a bare (opaque) index.
+                    let stride = mul_const
+                        .get(&idx.0)
+                        .copied()
+                        .or_else(|| shl_const.get(&idx.0).map(|&k| 1i64 << k))
+                        .unwrap_or(1);
+                    if matches!(stride, 1 | 2 | 4 | 8) {
+                        indexed_bases.push(base.0);
+                    }
                 }
                 Instruction::BinOp {
                     dest,
