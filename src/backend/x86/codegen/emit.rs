@@ -2513,11 +2513,24 @@ impl X86Codegen {
         Self::load_dest_reg(ty)
     }
 
-    /// Destination register for loads. movzbl/movzwl/movl use 32-bit %eax.
+    /// Destination register for loads. The width must match the mnemonic
+    /// chosen by `mov_load_for_type`, not the source type:
+    ///
+    ///   * I8   -> `movsbq` (sign-extend 8 -> 64) takes a 64-bit dest (`%rax`);
+    ///   * U8   -> `movzbl` (zero-extend 8 -> 32) takes a 32-bit dest (`%eax`);
+    ///   * I16  -> `movswq` (sign-extend 16 -> 64) takes a 64-bit dest (`%rax`);
+    ///   * U16  -> `movzwl` (zero-extend 16 -> 32) takes a 32-bit dest (`%eax`);
+    ///   * U32/F32 -> `movl` zero-extends to 64 implicitly -> 32-bit dest (`%eax`);
+    ///   * else  -> `movq` -> 64-bit dest (`%rax`).
+    ///
+    /// GNU as rejects `movzbl %sil, %al` / `movsbq %sil, %al` ("incorrect
+    /// register ... used with suffix"); this is the same mnemonic-driven
+    /// width contract as `asm_load_dest_reg` in inline_asm.rs. It also keeps
+    /// `%rax` zero/sign-extended for the `store_rax_to` spill that follows.
     pub(super) fn load_dest_reg(ty: IrType) -> &'static str {
         match ty {
-            IrType::I8 | IrType::U8 => "%al",
-            IrType::I16 | IrType::U16 => "%ax",
+            IrType::I8 | IrType::I16 => "%rax",   // movsbq/movswq -> 64-bit dest
+            IrType::U8 | IrType::U16 => "%eax",   // movzbl/movzwl -> 32-bit dest
             IrType::U32 | IrType::F32 => "%eax",
             _ => "%rax",
         }

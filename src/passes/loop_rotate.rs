@@ -263,8 +263,12 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         phi_latch_val.insert(phi_dest, lat);
         phi_pre_val.insert(phi_dest, pre);
     }
-    // Drop the immutable header borrow — `header_insts` is no longer used.
-    drop(header_insts);
+    // `header_insts` is no longer used from this point on; NLL ends the
+    // immutable borrow of `func.blocks[header]` here automatically, so the
+    // later mutable borrows of `func.blocks[latch_idx]` are sound.  (The
+    // historical `drop(header_insts)` was a no-op on a reference and is a
+    // `-D dropping-references` error; removing it is the correct fix.)
+    let _ = header_insts;
 
     // 6.5 Restrict to the single-block body+latch shape (header + one body
     //     block that is ALSO the latch). This is the canonical counted-loop

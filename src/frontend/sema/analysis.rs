@@ -2065,6 +2065,16 @@ impl SemanticAnalyzer {
             (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
                 e.packed_size() == other.size()
             }
+            // GNU C: pointers to the character types (char, signed char,
+            // unsigned char) are mutually assignment-compatible. GCC emits
+            // only a `-Wpointer-sign` warning for the mismatch — it never
+            // classifies it as `-Wincompatible-pointer-types`/hard error,
+            // even under `-Werror=incompatible-pointer-types`. The kernel
+            // relies on this constantly (e.g. `const char *` -> `const
+            // unsigned char *` in fs/namei.c `nd->last.name = name;`).
+            // `Char` represents both plain and signed char here (there is no
+            // distinct `SChar` variant), so this covers all three combos.
+            (CType::Char, CType::UChar) | (CType::UChar, CType::Char) => true,
             // For basic types, use equality (ignoring qualifiers)
             _ => a == b,
         }
