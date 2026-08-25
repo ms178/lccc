@@ -842,6 +842,8 @@ impl X86Codegen {
                     let load_instr = self.mov_load_for_value(ty, dest.0);
                     let p_name = phys_reg_name(p_reg);
                     let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                    let use_16bit_dest = load_instr == "movw";
+                    let use_8bit_dest = load_instr == "movb";
 
                     // W2 Load->Cast fold target takes precedence: load straight
                     // into the consumer Cast dest's register.
@@ -851,6 +853,8 @@ impl X86Codegen {
                         if !is_xmm_reg(d_reg) {
                             let d_name = if use_32bit_dest {
                                 phys_reg_name_32(d_reg)
+                            } else if use_16bit_dest || use_8bit_dest {
+                                typed_phys_reg_name(d_reg, ty)
                             } else {
                                 phys_reg_name(d_reg)
                             };
@@ -866,7 +870,7 @@ impl X86Codegen {
                     }
 
                     // Dest is on stack — load to rax as before (no fold target).
-                    let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
+                    let dest_reg = if use_32bit_dest { "%eax" } else if use_16bit_dest { "%ax" } else if use_8bit_dest { "%al" } else { "%rax" };
                     self.state.emit_fmt(format_args!(
                         "    {} (%{}), {}",
                         load_instr, p_name, dest_reg
@@ -894,6 +898,8 @@ impl X86Codegen {
         {
             let load_instr = self.mov_load_for_value(ty, dest.0);
             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                    let use_16bit_dest = load_instr == "movw";
+                    let use_8bit_dest = load_instr == "movb";
             // W2 Load->Cast fold target takes precedence over dest's own home.
             let fold_reg = fold_target.map(|(r, _)| r);
             let d_reg_opt = fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
@@ -901,6 +907,8 @@ impl X86Codegen {
                 if !is_xmm_reg(d_reg) {
                     let d_name = if use_32bit_dest {
                         phys_reg_name_32(d_reg)
+                    } else if use_16bit_dest || use_8bit_dest {
+                        typed_phys_reg_name(d_reg, ty)
                     } else {
                         phys_reg_name(d_reg)
                     };
@@ -912,7 +920,7 @@ impl X86Codegen {
                     return;
                 }
             }
-            let dest_reg = if use_32bit_dest { "%eax" } else { "%rax" };
+            let dest_reg = if use_32bit_dest { "%eax" } else if use_16bit_dest { "%ax" } else if use_8bit_dest { "%al" } else { "%rax" };
             self.state
                 .emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
             self.state.reg_cache.set_acc(dest.0, false);
@@ -1617,6 +1625,8 @@ impl X86Codegen {
                                 let u = matches!(load_instr, "movl" | "movzbl" | "movzwl");
                                 let d = if u {
                                     phys_reg_name_32(dr)
+                                } else if load_instr == "movb" || load_instr == "movw" {
+                                    typed_phys_reg_name(dr, ty)
                                 } else {
                                     phys_reg_name(dr)
                                 };
@@ -1657,8 +1667,12 @@ impl X86Codegen {
                     if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
                         if !is_xmm_reg(d_reg) {
                             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                    let use_16bit_dest = load_instr == "movw";
+                    let use_8bit_dest = load_instr == "movb";
                             let d_name = if use_32bit_dest {
                                 phys_reg_name_32(d_reg)
+                            } else if use_16bit_dest || use_8bit_dest {
+                                typed_phys_reg_name(d_reg, ty)
                             } else {
                                 phys_reg_name(d_reg)
                             };
@@ -1796,8 +1810,12 @@ impl X86Codegen {
         if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
             if !is_xmm_reg(d_reg) {
                 let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
+                    let use_16bit_dest = load_instr == "movw";
+                    let use_8bit_dest = load_instr == "movb";
                 let d_name = if use_32bit_dest {
                     phys_reg_name_32(d_reg)
+                } else if use_16bit_dest || use_8bit_dest {
+                    typed_phys_reg_name(d_reg, ty)
                 } else {
                     phys_reg_name(d_reg)
                 };
@@ -1809,6 +1827,10 @@ impl X86Codegen {
         }
         let acc_reg = if matches!(load_instr, "movl" | "movzbl" | "movzwl") {
             "%eax"
+        } else if load_instr == "movw" {
+            "%ax"
+        } else if load_instr == "movb" {
+            "%al"
         } else {
             "%rax"
         };
@@ -2026,7 +2048,16 @@ impl X86Codegen {
         ty: IrType,
         slot: StackSlot,
     ) {
-        let reg = Self::reg_for_type("rax", ty);
+        // The instruction suffix is authoritative here.  `reg_for_type`
+        // describes the IR value, but a narrow copy must use the matching
+        // architectural subregister; `%rax` with `movb`/`movw` is rejected by
+        // GAS and, worse, used to hide this bug behind a late assembler error.
+        let reg = match instr {
+            "movb" => "al",
+            "movw" => "ax",
+            "movl" | "movzbl" | "movzwl" | "movsbl" | "movswl" => "eax",
+            _ => Self::reg_for_type("rax", ty),
+        };
         let out = &mut self.state.out;
         out.write_str("    ");
         out.write_str(instr);
