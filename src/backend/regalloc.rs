@@ -285,23 +285,6 @@ fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     false
 }
 
-/// Minimum loop-weighted use pressure for a *single-piece* residual-fill
-/// candidate (Agent B). Multi-piece values always qualify. Default 8 is
-/// roughly one use inside a depth-1 loop (`loop_weight(1) = 10`); 1
-/// (unrestricted) miscompiled sqlite's exit code in Agent B's A/B runs —
-/// junk single-piece temps grabbed holes before hot values and perturbed
-/// the two-address / copy-folding decisions downstream.
-fn residual_min_pressure() -> u64 {
-    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("CCC_SEGMENT_FILL_MIN_USES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(8)
-            .clamp(1, 10_000)
-    })
-}
-
 /// Merge two sorted segment sets into a normalized union. Adjacent pieces are
 /// combined: no candidate can use the zero-width boundary between them.
 fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
@@ -326,6 +309,57 @@ fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
         all.push(next);
     }
     *into = all;
+}
+
+/// RA-05: attach hole-aware live coverage to scan ranges so the linear scan's
+/// interference test can see through liveness holes (values on mutually
+/// exclusive diamond/switch arms — the xmltok/inflate 12×/15× stack-memory
+/// pathology). Coverage is per coalesce-group OWNER (union of the leader's
+/// and every member's segments) exactly like the Phase 2f residual filler:
+/// `propagate_coalesce_members` later hands the leader's register to every
+/// member, so the scan must reason about the whole web's coverage.
+///
+/// Fail-closed: a value keeps fat-envelope semantics when it has no segment
+/// data or its segments do not lie inside the scan's fat envelope (merged
+/// envelopes are the only case where the envelope exceeds the raw interval).
+fn attach_scan_segments(
+    ranges: &mut [crate::backend::live_range::LiveRange],
+    liveness: &LivenessResult,
+    coalesce_member_of: &FxHashMap<u32, u32>,
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
+    let mut owned: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for seg in &liveness.segments {
+        let owner = owner_of(seg.value_id);
+        owned.entry(owner).or_default().push((seg.start, seg.end));
+    }
+    if owned.is_empty() {
+        return;
+    }
+    for pieces in owned.values_mut() {
+        pieces.sort_unstable();
+        let source = std::mem::take(pieces);
+        insert_segment_union(pieces, &source);
+    }
+    for range in ranges.iter_mut() {
+        let Some(segs) = owned.get(&range.value_id) else {
+            continue;
+        };
+        if segs.is_empty() {
+            continue;
+        }
+        // The union must lie inside the range's fat envelope; otherwise the
+        // envelope came from a different construction (defensive) and the
+        // range keeps conservative fat semantics.
+        let inside = segs.first().is_some_and(|&(s, _)| s >= range.start)
+            && segs.last().is_some_and(|&(_, e)| e <= range.end);
+        if inside {
+            range.set_segments(segs.clone());
+        }
+    }
 }
 
 /// Live *across* a clobber: defined before it, used after it.
@@ -1185,40 +1219,17 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
-
-    // RA-05: hole-aware live pieces as the scan's primary interference
-    // representation. `liveness.segments` is computed by the same dataflow
-    // as the fat intervals (and shares their program-point numbering), so a
-    // value's pieces are a sound under-approximation of its fat hull: a
-    // register may only be shared across a hole when the value is dead on
-    // EVERY path through that hole. Coalesced members attribute their
-    // pieces to the group leader (the leader's merged interval is what the
-    // scan sees; `build_live_ranges_ex` unions the pieces).
-    // `CCC_NO_SEGMENT_RA` restores the fat-hull interference model exactly.
-    let scan_segments: FxHashMap<u32, live_range::SegmentList> =
-        if env_on("CCC_NO_SEGMENT_RA") {
-            FxHashMap::default()
-        } else {
-            let mut map: FxHashMap<u32, live_range::SegmentList> = FxHashMap::default();
-            for seg in &liveness.segments {
-                map.entry(seg.value_id).or_default().push((seg.start, seg.end));
-            }
-            map
-        };
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
-        let mut ranges = live_range::build_live_ranges_ex(
-            intervals,
-            &liveness.block_loop_depth,
-            func,
-            &scan_segments,
-            &coalesce_groups,
-        );
+        let mut ranges = live_range::build_live_ranges(intervals, &liveness.block_loop_depth, func);
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
             &mut ranges,
             &config.folded_index_uses,
             &safe_folded_index_homes,
         );
+        // RA-05: hole-aware coverage for the scan's interference tests.
+        // Values without segment data keep their fat semantics.
+        attach_scan_segments(&mut ranges, &liveness, &coalesce_member_of);
         ranges
     };
 
@@ -1800,179 +1811,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Phase 2f: residual hole-fill of already-saved callee-saved registers.
-    // Default ON everywhere (validated: full regression corpus with
-    // CCC_VERIFY_REGALLOC hard-abort clean, 300/300 differential fuzz at
-    // O2/O3, byte-identical outputs on nbody/spectral/mandelbrot/libm, and
-    // stack-mem 318->294 / -7.5% on the golden set). `CCC_NO_SEGMENT_FILL`
-    // restores the pre-fill behaviour; `CCC_SEGMENT_FILL` is kept for
-    // explicitness. Candidates are ranked: multi-piece values first (the
-    // actual diamond/switch win), then high-pressure single-piece leftovers
-    // (`CCC_SEGMENT_FILL_MIN_USES`, default 8). Unrestricted fill put junk
-    // temps in callee-saved holes and raised Expat/nbody stack-mem while CRC
-    // went 7->0 (Agent B session: measured, then gated). Fail-closed when a
-    // value lacks segment data (fat interval is the fallback).
-    //
-    // This phase cannot add a callee-save push/pop: its pool is restricted to
-    // registers already present in used_regs_set. It cannot displace an
-    // existing home either. A previously slotted value gets a register only
-    // when none of its segments intersects current occupancy. Thus the
-    // treatment is monotonic in register capacity.
-    //
-    // Callee-saved only: caller-saved residual fill on x86-64 was measured to
-    // RAISE stack-mem on expat (+11) and nbody (+11) because a leftover in a
-    // caller-saved hole still needs a reload after every clobber the
-    // call-spanning oracle missed. The already-pushed callee-saved set is
-    // monotonic: no extra prologue, no new clobber window.
-    let residual_on = !env_on("CCC_NO_SEGMENT_FILL") && !used_regs_set.is_empty();
-    if residual_on {
-        let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
-
-        let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
-        for seg in &liveness.segments {
-            let owner = owner_of(seg.value_id);
-            owned_segments
-                .entry(owner)
-                .or_default()
-                .push((seg.start, seg.end));
-        }
-        // Coalesced members can contribute overlapping/adjacent pieces. Merge
-        // them so the interference test remains linear and deterministic.
-        for pieces in owned_segments.values_mut() {
-            pieces.sort_unstable();
-            let source = std::mem::take(pieces);
-            insert_segment_union(pieces, &source);
-        }
-        for iv in &scan_ivs {
-            owned_segments
-                .entry(iv.value_id)
-                .or_insert_with(|| vec![(iv.start, iv.end)]);
-        }
-
-        // Collapse current holders to one sorted occupancy set per register.
-        // Testing candidates against owner-by-owner vectors is quadratic on
-        // sqlite-sized CFGs; the union makes each query independent of the
-        // number of SSA holders.
-        let mut occupied_by_reg: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
-        let mut seen_holders: FxHashSet<(u8, u32)> = FxHashSet::default();
-        for (&value, &reg) in &assignments {
-            if !used_regs_set.contains(&reg.0) {
-                continue;
-            }
-            let owner = owner_of(value);
-            if seen_holders.insert((reg.0, owner)) {
-                if let Some(segments) = owned_segments.get(&owner) {
-                    occupied_by_reg.entry(reg.0).or_default().extend(segments);
-                }
-            }
-        }
-        for occupied in occupied_by_reg.values_mut() {
-            occupied.sort_unstable();
-            let source = std::mem::take(occupied);
-            insert_segment_union(occupied, &source);
-        }
-
-        let group_pressure = |value: u32| -> u64 {
-            let own = use_count.get(&value).copied().unwrap_or(0);
-            let group = coalesce_groups.get(&value).map_or(0, |members| {
-                members
-                    .iter()
-                    .map(|m| use_count.get(m).copied().unwrap_or(0))
-                    .sum()
-            });
-            own.max(group)
-        };
-
-        // Stack-layout copy aliases may intentionally suppress a Copy's
-        // materialization. Assigning such a destination only at this late RA
-        // phase creates a register home the alias layer never populates
-        // (alias_fuzz_m32 seed 3 caught exactly this). Ordinary producers are
-        // authoritative; defer Copy webs to the dedicated coalescers until the
-        // location model is unified.
-        let copy_dests: FxHashSet<u32> = func
-            .blocks
-            .iter()
-            .flat_map(|b| b.instructions.iter())
-            .filter_map(|inst| match inst {
-                Instruction::Copy { dest, .. } => Some(dest.0),
-                _ => None,
-            })
-            .collect();
-        let min_pressure = residual_min_pressure();
-        let mut candidates: Vec<(bool, u64, u32, u32)> = scan_ivs
-            .iter()
-            .filter(|iv| !assignments.contains_key(&iv.value_id))
-            .filter(|iv| !copy_dests.contains(&iv.value_id))
-            .filter_map(|iv| {
-                let nsegs = owned_segments
-                    .get(&iv.value_id)
-                    .map(|s| s.len())
-                    .unwrap_or(1);
-                let multi = nsegs >= 2;
-                let pressure = group_pressure(iv.value_id);
-                // Single-piece junk (pressure < min) is the Expat/nbody tax:
-                // they steal holes from later hot values and the extra homes
-                // perturb two-address / copy folding.
-                if !multi && pressure < min_pressure {
-                    return None;
-                }
-                Some((multi, pressure, iv.end.saturating_sub(iv.start), iv.value_id))
-            })
-            .collect();
-        // Multi-piece first (the actual diamond/switch win), then hot/high-use,
-        // then shorter envelopes (they consume fewer holes and admit more
-        // followers).
-        candidates.sort_unstable_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then(b.1.cmp(&a.1))
-                .then(a.2.cmp(&b.2))
-                .then(a.3.cmp(&b.3))
-        });
-
-        let callee_pool: Vec<PhysReg> = config
-            .available_regs
-            .iter()
-            .copied()
-            .filter(|r| used_regs_set.contains(&r.0))
-            .collect();
-        let mut added = 0usize;
-        for (_, _, _, value) in candidates {
-            let Some(candidate_segments) = owned_segments.get(&value) else {
-                continue;
-            };
-            let Some(reg) = callee_pool.iter().copied().find(|reg| {
-                occupied_by_reg
-                    .get(&reg.0)
-                    .is_none_or(|occupied| !segment_sets_overlap(candidate_segments, occupied))
-            }) else {
-                continue;
-            };
-            if env_on("CCC_DEBUG_SEGMENT_FILL") {
-                eprintln!(
-                    "[RA-SEGMENT-FILL] fn={} v{} group={:?} segs={:?} -> r{} occupied={:?}",
-                    func.name,
-                    value,
-                    coalesce_groups.get(&value),
-                    candidate_segments,
-                    reg.0,
-                    occupied_by_reg.get(&reg.0)
-                );
-            }
-            assignments.insert(value, reg);
-            insert_segment_union(
-                occupied_by_reg.entry(reg.0).or_default(),
-                candidate_segments,
-            );
-            added += 1;
-        }
-        if added != 0 {
-            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
-        }
-        if env_on("CCC_DEBUG_SEGMENT_FILL") {
-            eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
-        }
-    }
-
     // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
     // x86 stays out — same eviction already lost gzip inside the scan.
     if !env_on("CCC_NO_LOOP_PIN") && arm_fp_pool && !all_phi_pairs.is_empty() {
@@ -2052,6 +1890,163 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
     }
+    // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
+    // using the CFG-aware liveness segments. The primary scan deliberately
+    // retains one fat [def,last_use] interval per value, which is simple but
+    // makes values on mutually-exclusive diamond/switch arms interfere
+    // (the xmltok/inflate 12×/15× stack-memory pathology). Liveness already
+    // computes exact conservative segments for call classification; use those
+    // segments here as a no-eviction residual coloring step. This is RA-05
+    // phase A: `segments` become the primary interference representation for
+    // this allocation decision (not just call classification).
+    //
+    // This phase cannot add a callee-save push/pop: its pool is restricted to
+    // registers already present in used_regs_set. It cannot displace an
+    // existing home either. A previously slotted value gets a register only
+    // when none of its segments intersects current occupancy. Thus the
+    // treatment is monotonic in register capacity and fail-closed when a value
+    // lacks segment data (its fat interval is used as fallback).
+    //
+    // Ordering: this runs AFTER the AArch64 loop-pin steal. The steal's
+    // holder/evict logic reasons about fat intervals against single-holder
+    // registers; a segment-shared co-holder introduced here must not be
+    // visible to it (the steal would only evict one of the two holders and
+    // could hand the register to a value that fat-overlaps the survivor).
+    // i686 validated this fill first (boot C text -1,573 B, stack refs
+    // -13.1%); x86-64/AArch64/RISC-V get the same treatment now.
+    if !env_on("CCC_NO_SEGMENT_FILL") && !used_regs_set.is_empty() {
+        let owner_of = |v: u32| coalesce_member_of.get(&v).copied().unwrap_or(v);
+
+        let mut owned_segments: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+        for seg in &liveness.segments {
+            let owner = owner_of(seg.value_id);
+            owned_segments
+                .entry(owner)
+                .or_default()
+                .push((seg.start, seg.end));
+        }
+        // Coalesced members can contribute overlapping/adjacent pieces. Merge
+        // them so the interference test remains linear and deterministic.
+        for pieces in owned_segments.values_mut() {
+            pieces.sort_unstable();
+            let source = std::mem::take(pieces);
+            insert_segment_union(pieces, &source);
+        }
+        for iv in &scan_ivs {
+            owned_segments
+                .entry(iv.value_id)
+                .or_insert_with(|| vec![(iv.start, iv.end)]);
+        }
+
+        // Collapse current holders to one sorted occupancy set per register.
+        // Testing candidates against owner-by-owner vectors is quadratic on
+        // sqlite-sized CFGs; the union makes each query independent of the
+        // number of SSA holders.
+        let mut occupied_by_reg: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut seen_holders: FxHashSet<(u8, u32)> = FxHashSet::default();
+        for (&value, &reg) in &assignments {
+            if !used_regs_set.contains(&reg.0) {
+                continue;
+            }
+            let owner = owner_of(value);
+            if seen_holders.insert((reg.0, owner)) {
+                if let Some(segments) = owned_segments.get(&owner) {
+                    occupied_by_reg.entry(reg.0).or_default().extend(segments);
+                }
+            }
+        }
+        for occupied in occupied_by_reg.values_mut() {
+            occupied.sort_unstable();
+            let source = std::mem::take(occupied);
+            insert_segment_union(occupied, &source);
+        }
+
+        let group_pressure = |value: u32| -> u64 {
+            let own = use_count.get(&value).copied().unwrap_or(0);
+            let group = coalesce_groups.get(&value).map_or(0, |members| {
+                members
+                    .iter()
+                    .map(|m| use_count.get(m).copied().unwrap_or(0))
+                    .sum()
+            });
+            own.max(group)
+        };
+
+        // Stack-layout copy aliases may intentionally suppress a Copy's
+        // materialization. Assigning such a destination only at this late RA
+        // phase creates a register home the alias layer never populates
+        // (alias_fuzz_m32 seed 3 caught exactly this). Ordinary producers are
+        // authoritative; defer Copy webs to the dedicated coalescers until the
+        // location model is unified.
+        let copy_dests: FxHashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|inst| match inst {
+                Instruction::Copy { dest, .. } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        let mut candidates: Vec<(u64, u32, u32)> = scan_ivs
+            .iter()
+            .filter(|iv| !assignments.contains_key(&iv.value_id))
+            .filter(|iv| !copy_dests.contains(&iv.value_id))
+            .map(|iv| {
+                (
+                    group_pressure(iv.value_id),
+                    iv.end.saturating_sub(iv.start),
+                    iv.value_id,
+                )
+            })
+            .collect();
+        // Hot/high-use values first; for equal pressure prefer shorter
+        // envelopes because they consume fewer holes and admit more followers.
+        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+        let pool: Vec<PhysReg> = config
+            .available_regs
+            .iter()
+            .copied()
+            .filter(|r| used_regs_set.contains(&r.0))
+            .collect();
+        let mut added = 0usize;
+        for (_, _, value) in candidates {
+            let Some(candidate_segments) = owned_segments.get(&value) else {
+                continue;
+            };
+            let Some(reg) = pool.iter().copied().find(|reg| {
+                occupied_by_reg
+                    .get(&reg.0)
+                    .is_none_or(|occupied| !segment_sets_overlap(candidate_segments, occupied))
+            }) else {
+                continue;
+            };
+            if env_on("CCC_DEBUG_SEGMENT_FILL") {
+                eprintln!(
+                    "[RA-SEGMENT-FILL] fn={} v{} group={:?} segs={:?} -> r{} occupied={:?}",
+                    func.name,
+                    value,
+                    coalesce_groups.get(&value),
+                    candidate_segments,
+                    reg.0,
+                    occupied_by_reg.get(&reg.0)
+                );
+            }
+            assignments.insert(value, reg);
+            insert_segment_union(
+                occupied_by_reg.entry(reg.0).or_default(),
+                candidate_segments,
+            );
+            added += 1;
+        }
+        if added != 0 {
+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+        }
+        if env_on("CCC_DEBUG_SEGMENT_FILL") {
+            eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
+        }
+    }
+
 
     if env_on("CCC_DEBUG_RA") {
         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
@@ -2110,13 +2105,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         };
         if !env_on("CCC_NO_MAP_VECREG") {
             values.extend(collect_x86_map_broadcast_values(func));
-        }
-        if !env_on("CCC_NO_DEFER_OVERFLOW_VECREG") {
-            // OP-05a: transient packed values whose consumer is separated
-            // from their producer by another vector producer overflow the
-            // single-register deferred-store chain; without a home each one
-            // pays a stack round-trip per iteration.
-            values.extend(collect_x86_defer_overflow_vector_values(func));
         }
         values
     } else {
@@ -2192,13 +2180,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .collect();
 
         if !f64_intervals.is_empty() {
-            let f64_ranges = live_range::build_live_ranges_ex(
-                &f64_intervals,
-                &liveness.block_loop_depth,
-                func,
-                &scan_segments,
-                &FxHashMap::default(),
-            );
+            let mut f64_ranges =
+                live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
+            // RA-05: hole-aware coverage for the XMM scan as well — FP phi
+            // webs spanning mutually exclusive arms get the same treatment
+            // as the GPR scan.
+            attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
             let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
             for (vid, reg) in xmm_allocator.assignments {
@@ -3466,214 +3453,6 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
     }
     classes.retain(|value, _| copy_web.contains(value));
     classes.into_keys().collect()
-}
-
-/// Transient packed values that cannot ride the `%ymm0` deferred-store
-/// chain (OP-05a stencils and any multi-load vector body).
-///
-/// The deferred-store path keeps ONE vector result in flight: the producer
-/// leaves it in `%ymm0` and the consuming intrinsic folds it. That is
-/// optimal for single chains (zero moves). But when a single-use vector
-/// SSA value's consumer is separated from its producer by ANOTHER vector
-/// producer, the pending store is flushed and the value pays a full stack
-/// round-trip per iteration. Five-tap stencils measured five round-trips.
-///
-/// This collector homes exactly those overflow values: same-class packed
-/// SSA values (classes shared with the reduction collector, extended with
-/// broadcasts and madds) whose def→use span crosses at least one other
-/// vector producer, or crosses a basic-block boundary. Clean single
-/// chains keep the zero-move deferred path — homing those would ADD a
-/// YMM-to-YMM move per producer.
-///
-/// Kill switch: `CCC_NO_DEFER_OVERFLOW_VECREG`.
-fn collect_x86_defer_overflow_vector_values(func: &IrFunction) -> FxHashSet<u32> {
-    use crate::ir::intrinsics::IntrinsicOp as O;
-
-    // Same class ids as collect_x86_reduction_vector_values so the two
-    // sets compose without class collisions; broadcasts and madds are
-    // full producers of their width class.
-    let class_of = |op: &O| -> Option<u8> {
-        match op {
-            O::VecZeroF32x8
-            | O::VecLoadF32x8
-            | O::VecAddF32x8
-            | O::VecMulF32x8
-            | O::VecFmaF32x8
-            | O::VecMaddF32x8
-            | O::VecBroadcastF32x8 => Some(1),
-            O::VecZeroF64x4
-            | O::VecLoadF64x4
-            | O::VecAddF64x4
-            | O::VecMulF64x4
-            | O::VecFmaF64x4
-            | O::VecMaddF64x4
-            | O::VecBroadcastF64x4 => Some(2),
-            O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4
-            | O::VecBroadcastF32x4 => Some(3),
-            O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2
-            | O::VecBroadcastF64x2 => Some(4),
-            O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8
-            | O::VecBroadcastI32x8 => Some(5),
-            O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4
-            | O::VecBroadcastI32x4 => Some(6),
-            O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
-            _ => None,
-        }
-    };
-    let legal_consumer = |op: &O, class: u8| -> bool {
-        match class {
-            1 => matches!(
-                op,
-                O::VecAddF32x8
-                    | O::VecMulF32x8
-                    | O::VecFmaF32x8
-                    | O::VecMaddF32x8
-                    | O::VecHorizontalAddF32x8
-                    | O::VecStoreF32x8
-            ),
-            2 => matches!(
-                op,
-                O::VecAddF64x4
-                    | O::VecMulF64x4
-                    | O::VecFmaF64x4
-                    | O::VecMaddF64x4
-                    | O::VecHorizontalAddF64x4
-                    | O::VecStoreF64x4
-            ),
-            3 => matches!(
-                op,
-                O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4 | O::VecStoreF32x4
-            ),
-            4 => matches!(
-                op,
-                O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2 | O::VecStoreF64x2
-            ),
-            5 => matches!(
-                op,
-                O::VecAddI32x8 | O::VecMulI32x8 | O::VecHorizontalAddI32x8 | O::VecStoreI32x8
-            ),
-            6 => matches!(
-                op,
-                O::VecAddI32x4 | O::VecMulI32x4 | O::VecHorizontalAddI32x4 | O::VecStoreI32x4
-            ),
-            7 => matches!(
-                op,
-                O::VecAddI64x2 | O::VecMulI64x2 | O::VecHorizontalAddI64x2 | O::VecStoreI64x2
-            ),
-            _ => false,
-        }
-    };
-
-    // Class-agreeing SSA vector values, all of whose uses are legal packed
-    // consumers (fail closed on any non-intrinsic or class-mismatched use).
-    let mut classes: FxHashMap<u32, u8> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Intrinsic {
-                dest: Some(d), op, ..
-            } = inst
-            {
-                if let Some(class) = class_of(op) {
-                    classes.insert(d.0, class);
-                }
-            }
-        }
-    }
-    if classes.is_empty() {
-        return FxHashSet::default();
-    }
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            // Uses through non-intrinsic instructions disqualify.
-            let mut allowed_here: FxHashSet<u32> = FxHashSet::default();
-            if let Instruction::Intrinsic { op, args, .. } = inst {
-                for arg in args {
-                    if let Operand::Value(v) = arg {
-                        if classes
-                            .get(&v.0)
-                            .is_some_and(|&c| legal_consumer(op, c))
-                        {
-                            allowed_here.insert(v.0);
-                        }
-                    }
-                }
-            }
-            let is_legal = |v: &u32| allowed_here.contains(v);
-            for_each_operand_in_instruction(inst, |op| {
-                if let Operand::Value(v) = op {
-                    if classes.contains_key(&v.0) && !is_legal(&v.0) {
-                        classes.remove(&v.0);
-                    }
-                }
-            });
-            for_each_value_use_in_instruction(inst, |v| {
-                if classes.contains_key(&v.0) && !is_legal(&v.0) {
-                    classes.remove(&v.0);
-                }
-            });
-        }
-        for_each_operand_in_terminator(&block.terminator, |op| {
-            if let Operand::Value(v) = op {
-                classes.remove(&v.0);
-            }
-        });
-    }
-
-    // Single-use check + producer-crossing check, per block.
-    let mut out: FxHashSet<u32> = FxHashSet::default();
-    for block in &func.blocks {
-        let insts = &block.instructions;
-        // (value, class, def_idx)
-        let mut defs: Vec<(u32, u8, usize)> = Vec::new();
-        let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-        let mut producer_positions: Vec<Vec<usize>> = vec![Vec::new(); 8];
-        for (ii, inst) in insts.iter().enumerate() {
-            if let Instruction::Intrinsic {
-                dest: Some(d), op, ..
-            } = inst
-            {
-                if let Some(class) = class_of(op) {
-                    defs.push((d.0, class, ii));
-                    producer_positions[class as usize].push(ii);
-                }
-            }
-            if let Instruction::Intrinsic { args, .. } = inst {
-                for arg in args {
-                    if let Operand::Value(v) = arg {
-                        uses.entry(v.0).or_default().push(ii);
-                    }
-                }
-            }
-        }
-        for (vid, class, def_idx) in defs {
-            let Some(class) = classes.get(&vid).copied() else {
-                continue;
-            };
-            let use_sites: Vec<usize> = uses.get(&vid).cloned().unwrap_or_default();
-            if use_sites.len() != 1 {
-                // Zero uses (dead) or multi-use: not a defer-chain value.
-                // Multi-use values get homed conservatively (each reload
-                // from a slot would be redundant traffic).
-                if !use_sites.is_empty() {
-                    out.insert(vid);
-                }
-                continue;
-            }
-            let use_idx = use_sites[0];
-            if use_idx <= def_idx {
-                continue; // use-before-def: not ours
-            }
-            // Count same-class producers strictly between def and use.
-            let between = producer_positions[class as usize]
-                .iter()
-                .filter(|&&p| p > def_idx && p < use_idx)
-                .count();
-            if between > 0 {
-                out.insert(vid);
-            }
-        }
-    }
-    out
 }
 
 /// Loop-invariant map broadcasts whose only uses are same-width packed
