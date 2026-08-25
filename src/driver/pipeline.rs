@@ -1455,6 +1455,35 @@ impl Driver {
             }
         }
 
+        // GCC's __builtin_setjmp creates a returns-twice edge that is not an
+        // ordinary IR CFG edge. Keep automatic objects in memory in such a
+        // function: promoting them to one-way SSA lets the normal path's value
+        // dominate the resume path and drops stores that builtin_longjmp must
+        // observe (gcc.c-torture pr60003). `semantic_volatile` stays false —
+        // this is an SSA barrier, not a source-level volatile access.
+        for func in &mut module.functions {
+            let has_builtin_setjmp = func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    matches!(
+                        inst,
+                        crate::ir::reexports::Instruction::Intrinsic {
+                            op: crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                            ..
+                        }
+                    )
+                })
+            });
+            if has_builtin_setjmp {
+                for block in &mut func.blocks {
+                    for inst in &mut block.instructions {
+                        if let crate::ir::reexports::Instruction::Alloca { volatile, .. } = inst {
+                            *volatile = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // Run optimization passes
         let t5 = std::time::Instant::now();
         promote_allocas(&mut module);

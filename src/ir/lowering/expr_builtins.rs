@@ -874,6 +874,39 @@ impl Lowerer {
 
             // __builtin_frame_address(level) / __builtin_return_address(level)
             // Only level 0 is supported; higher levels return 0.
+            BuiltinIntrinsic::BuiltinSetjmp => {
+                let buffer = args
+                    .first()
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                let dest = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: IntrinsicOp::BuiltinSetjmp,
+                    dest_ptr: None,
+                    args: vec![buffer],
+                });
+                Some(Operand::Value(dest))
+            }
+            BuiltinIntrinsic::BuiltinLongjmp => {
+                let buffer = args
+                    .first()
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                // Evaluate the required value argument for source side effects;
+                // GCC constrains it to one for __builtin_longjmp.
+                let value = args
+                    .get(1)
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I32(1)));
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::BuiltinLongjmp,
+                    dest_ptr: None,
+                    args: vec![buffer, value],
+                });
+                Some(Operand::Const(IrConst::I32(0)))
+            }
             BuiltinIntrinsic::FrameAddress | BuiltinIntrinsic::ReturnAddress => {
                 // Evaluate the level argument
                 let level = if !args.is_empty() {

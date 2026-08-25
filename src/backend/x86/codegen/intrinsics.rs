@@ -987,6 +987,35 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            IntrinsicOp::BuiltinSetjmp => {
+                let buffer = args.first().expect("BuiltinSetjmp requires a buffer");
+                self.operand_to_reg(buffer, "r11");
+                let resume = self.state.fresh_label("builtin_setjmp_resume");
+                let done = self.state.fresh_label("builtin_setjmp_done");
+                self.state.emit("    movq %rbp, 0(%r11)");
+                self.state
+                    .emit_fmt(format_args!("    leaq {}(%rip), %rax", resume));
+                self.state.emit("    movq %rax, 8(%r11)");
+                self.state.emit("    movq %rsp, 16(%r11)");
+                self.state.emit("    xorl %eax, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&resume);
+                self.state.emit("    movl $1, %eax");
+                self.state.out.emit_named_label(&done);
+                if let Some(dest) = dest {
+                    self.store_rax_to(dest);
+                }
+            }
+            IntrinsicOp::BuiltinLongjmp => {
+                let buffer = args.first().expect("BuiltinLongjmp requires a buffer");
+                self.operand_to_reg(buffer, "rax");
+                self.state.emit("    movq 8(%rax), %rdx");
+                self.state.emit("    movq 0(%rax), %rcx");
+                self.state.emit("    movq 16(%rax), %rsp");
+                self.state.emit("    movq %rcx, %rbp");
+                self.state.emit("    jmp *%rdx");
+                self.state.reg_cache.invalidate_all();
+            }
             IntrinsicOp::FrameAddress => {
                 // __builtin_frame_address(0): return current frame pointer (rbp)
                 self.state.emit("    movq %rbp, %rax");

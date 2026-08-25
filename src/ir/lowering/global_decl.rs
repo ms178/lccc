@@ -35,6 +35,23 @@ impl Lowerer {
             if declarator.name.is_empty() {
                 continue;
             }
+            let is_function_decl = declarator
+                .derived
+                .iter()
+                .any(|d| matches!(d, DerivedDeclarator::Function(_, _)))
+                && !declarator
+                    .derived
+                    .iter()
+                    .any(|d| matches!(d, DerivedDeclarator::FunctionPointer(_, _)));
+            if is_function_decl {
+                if let Some(align) = decl.alignment {
+                    self.module
+                        .function_alignments
+                        .entry(declarator.name.clone())
+                        .and_modify(|old| *old = (*old).max(align))
+                        .or_insert(align);
+                }
+            }
             if self.should_skip_global_declarator(decl, declarator) {
                 continue;
             }

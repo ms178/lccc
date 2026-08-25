@@ -3314,7 +3314,11 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
         },
         Instruction::LabelAddr { dest, label } => Instruction::LabelAddr {
             dest: remap_value(*dest, vo),
-            label: label.clone(),
+            // A label address is local to the cloned callee body just like a
+            // branch target. Keeping the original BlockId made every inline
+            // clone point at another function/clone's label (or an undefined
+            // .LBB symbol), violating GCC's per-clone label identity.
+            label: remap_block(*label, bo),
         },
         Instruction::GetReturnF64Second { dest } => Instruction::GetReturnF64Second {
             dest: remap_value(*dest, vo),
