@@ -521,8 +521,13 @@ impl Driver {
             Target::Aarch64 | Target::Riscv64
         ));
         // 4-byte width-partitioned spill slots are only enabled where the
-        // backend's store/load paths are proven width-consistent (x86-64).
-        crate::common::types::set_target_small_slots(matches!(self.target, Target::X86_64));
+        // backend's store/load paths are proven width-consistent.  x86-64
+        // narrows ≤32-bit spills; i686 naturally accesses every non-wide
+        // scalar/pointer spill with one 32-bit word.
+        crate::common::types::set_target_small_slots(matches!(
+            self.target,
+            Target::X86_64 | Target::I686
+        ));
 
         match self.mode {
             CompileMode::PreprocessOnly => self.run_preprocess_only(),
@@ -1529,6 +1534,7 @@ impl Driver {
             &mut module,
             self.opt_level,
             self.target,
+            self.code16gcc,
             self.fp_reassoc,
             self.fp_contract,
             self.target == Target::X86_64

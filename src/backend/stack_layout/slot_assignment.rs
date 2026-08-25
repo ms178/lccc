@@ -94,6 +94,64 @@ pub(super) fn classify_instructions(
 ) {
     let mut collected_values: FxHashSet<u32> = FxHashSet::default();
 
+    // Copy has no result type in the IR, but on i686 a copy of a value no
+    // wider than one GPR is itself no wider than one GPR.  Infer that fact to
+    // a fixed point before assigning slots.  Doing this during the allocation
+    // walk is insufficient: phi elimination may put a backedge Copy before
+    // the typed producer in block order, and an 8-byte fallback slot then
+    // prevents otherwise-safe copy-slot coalescing with its 4-byte source.
+    //
+    // This set is intentionally i686-only.  x86-64's established small-slot
+    // contract remains unchanged; pointers and ordinary integer Copy webs are
+    // eight bytes there unless an instruction carries an explicit narrow type.
+    let mut compact_i686_values: FxHashSet<u32> = FxHashSet::default();
+    if crate::common::types::target_is_32bit()
+        && crate::common::types::target_small_slots()
+        && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none()
+    {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let (Some(dest), Some(ty)) = (inst.dest(), inst.result_type()) {
+                    if ty != IrType::Void && ty.size() <= 4 {
+                        compact_i686_values.insert(dest.0);
+                    }
+                }
+                if let Instruction::Copy {
+                    dest,
+                    src:
+                        Operand::Const(
+                            IrConst::I8(_)
+                            | IrConst::I16(_)
+                            | IrConst::I32(_)
+                            | IrConst::F32(_),
+                        ),
+                } = inst
+                {
+                    compact_i686_values.insert(dest.0);
+                }
+            }
+        }
+        loop {
+            let before = compact_i686_values.len();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    } = inst
+                    {
+                        if compact_i686_values.contains(&src.0) {
+                            compact_i686_values.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            if compact_i686_values.len() == before {
+                break;
+            }
+        }
+    }
+
     // Build set of values that are defined (as dest) by non-InlineAsm
     // instructions. This identifies "indirect" asm output pointers:
     //
@@ -334,6 +392,7 @@ pub(super) fn classify_instructions(
                     inst,
                     ctx,
                     reg_assigned,
+                    &compact_i686_values,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -345,6 +404,7 @@ pub(super) fn classify_instructions(
                     inst,
                     ctx,
                     reg_assigned,
+                    &compact_i686_values,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -460,6 +520,7 @@ fn classify_value(
     inst: &Instruction,
     ctx: &StackLayoutContext,
     reg_assigned: &FxHashMap<u32, PhysReg>,
+    compact_i686_values: &FxHashSet<u32>,
     collected_values: &mut FxHashSet<u32>,
     multi_block_values: &mut Vec<MultiBlockValue>,
     block_local_values: &mut Vec<BlockLocalValue>,
@@ -490,29 +551,30 @@ fn classify_value(
         }
     }
 
-    // Detect small values (types that fit in 4 bytes on 64-bit targets).
-    // These get width-partitioned 4-byte spill slots on backends whose store/
-    // load paths are fully width-consistent (x86-64, see is_small_slot).
-    // Halving the slot width halves the frame of spill-heavy functions
-    // (pcre2's compile_branch: 10320-byte frames overflowed the 8 MiB stack
-    // at 792 levels of recursion). Slot sharing is partitioned by exact
-    // size class (Tier 3 free lists, Tier 2 graph coloring, copy aliases),
-    // so a 4-byte slot is never shared with an 8-byte value — the stale-
-    // upper-half hazard that forced the old 8-byte minimum cannot arise.
+    // Detect values whose spill representation fits in four bytes.  x86-64
+    // uses this for explicitly typed ≤32-bit results.  i686 additionally uses
+    // the fixed-point Copy inference above because pointers and all ordinary
+    // scalar GPR values are naturally four bytes, while Copy itself carries no
+    // result type after phi elimination.
+    //
+    // Slot sharing is partitioned by exact size class (Tier 3 free lists,
+    // Tier 2 graph coloring, copy aliases), so a 4-byte slot is never shared
+    // with an 8-byte value.  That makes the old stale-upper-half hazard
+    // structurally impossible rather than dependent on allocation order.
     let small_slots_enabled = crate::common::types::target_small_slots()
         && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none();
     let is_small = small_slots_enabled
-        && !crate::common::types::target_is_32bit()
-        && matches!(
-            inst.result_type(),
-            Some(IrType::I8)
-                | Some(IrType::U8)
-                | Some(IrType::I16)
-                | Some(IrType::U16)
-                | Some(IrType::I32)
-                | Some(IrType::U32)
-                | Some(IrType::F32)
-        );
+        && (compact_i686_values.contains(&dest.0)
+            || matches!(
+                inst.result_type(),
+                Some(IrType::I8)
+                    | Some(IrType::U8)
+                    | Some(IrType::I16)
+                    | Some(IrType::U16)
+                    | Some(IrType::I32)
+                    | Some(IrType::U32)
+                    | Some(IrType::F32)
+            ));
     let is_vector = state.vector_values.contains(&dest.0);
     let is_vector128 = state.vector128_values.contains(&dest.0);
     let memcpy_width = ctx.memcpy_value_sizes.get(&dest.0).copied().unwrap_or(0) as i64;

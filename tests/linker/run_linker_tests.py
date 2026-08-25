@@ -2326,6 +2326,129 @@ def _elf32_script_test(args, oracles):
             shutil.rmtree(td, ignore_errors=True)
 
 
+def _elf32_script_gc_keep_test(args, oracles):
+    """ELF32 script GC: ENTRY + KEEP roots, transitive REL reachability.
+
+    This is the exact mechanism used by the Linux real-mode setup build:
+    functions live in .text.<name>, while boot protocol payloads and registry
+    tables have no incoming machine relocation and must be rooted by KEEP.
+    """
+    name = "script_elf32_gc_keep"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        asm = r'''
+            .section .bootproto,"a",@progbits
+            .globl bootproto
+        bootproto:
+            .long 0x13579bdf
+
+            .section .text.start,"ax",@progbits
+            .globl _start
+        _start:
+            call live_fn
+            ret
+
+            .section .text.live,"ax",@progbits
+            .globl live_fn
+        live_fn:
+            movl $7, %eax
+            ret
+
+            .section .text.kept,"ax",@progbits
+            .globl kept_fn
+        kept_fn:
+            movl $9, %eax
+            ret
+
+            .section .text.dead,"ax",@progbits
+            .globl dead_fn
+        dead_fn:
+            movl $0xdead, %eax
+            ret
+
+            .section .registry,"a",@progbits
+            .long kept_fn
+        '''
+        script = r'''
+            OUTPUT_FORMAT("elf32-i386")
+            OUTPUT_ARCH(i386)
+            ENTRY(_start)
+            SECTIONS {
+              . = 0;
+              .bootproto : { KEEP(*(.bootproto)) }
+              .text : { *(.text.*) }
+              .registry : { KEEP(*(.registry)) }
+              _end = .;
+              /DISCARD/ : { *(.note*) *(.comment) }
+            }
+        '''
+        with open(os.path.join(td, "gc.s"), "w") as f:
+            f.write(textwrap.dedent(asm))
+        with open(os.path.join(td, "gc.ld"), "w") as f:
+            f.write(textwrap.dedent(script))
+        r = sh(["as", "--32", "-o", "gc.o", "gc.s"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", r.stderr.decode()[:200])
+
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        common = ["--gc-sections", "-m", "elf_i386", "-T", "gc.ld", "gc.o"]
+        r = sh([lccc_ld] + common + ["-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc-ld failed: {r.stderr.decode()[:400]}")
+        r = sh(["ld.bfd"] + common + ["-o", "out.bfd"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"bfd unavailable: {r.stderr.decode()[:200]}")
+
+        for stem in ("lccc", "bfd"):
+            r = sh(["objcopy", "-O", "binary", f"out.{stem}", f"out.{stem}.bin"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"objcopy rejected {stem}: {r.stderr.decode()[:200]}")
+        with open(os.path.join(td, "out.lccc.bin"), "rb") as f:
+            lccc_bytes = f.read()
+        with open(os.path.join(td, "out.bfd.bin"), "rb") as f:
+            bfd_bytes = f.read()
+        if lccc_bytes != bfd_bytes:
+            return Result(name, "FAIL",
+                          f"flat image differs from bfd ({len(lccc_bytes)} vs {len(bfd_bytes)} bytes)")
+
+        syms = sh(["nm", "out.lccc"], cwd=td).stdout.decode()
+        for required in ("_start", "live_fn", "kept_fn", "bootproto"):
+            if not re.search(rf"\b{required}$", syms, re.M):
+                return Result(name, "FAIL", f"GC dropped required root {required}")
+        if re.search(r"\bdead_fn$", syms, re.M):
+            return Result(name, "FAIL", "unreachable function survived --gc-sections")
+
+        # GNU options are positional: a later --no-gc-sections must restore the
+        # original layout rather than leaving the earlier forwarded flag active.
+        override = ["--gc-sections", "--no-gc-sections", "-m", "elf_i386",
+                    "-T", "gc.ld", "gc.o"]
+        r = sh([lccc_ld] + override + ["-o", "out.nogc.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL", f"lccc no-GC override failed: {r.stderr.decode()[:300]}")
+        r = sh(["ld.bfd"] + override + ["-o", "out.nogc.bfd"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", f"bfd no-GC override failed: {r.stderr.decode()[:200]}")
+        nogc_syms = sh(["nm", "out.nogc.lccc"], cwd=td).stdout.decode()
+        if not re.search(r"\bdead_fn$", nogc_syms, re.M):
+            return Result(name, "FAIL", "--no-gc-sections did not restore dead section")
+        for stem in ("nogc.lccc", "nogc.bfd"):
+            r = sh(["objcopy", "-O", "binary", f"out.{stem}", f"out.{stem}.bin"], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "FAIL", f"objcopy rejected {stem}: {r.stderr.decode()[:200]}")
+        with open(os.path.join(td, "out.nogc.lccc.bin"), "rb") as f:
+            nogc_lccc = f.read()
+        with open(os.path.join(td, "out.nogc.bfd.bin"), "rb") as f:
+            nogc_bfd = f.read()
+        if nogc_lccc != nogc_bfd:
+            return Result(name, "FAIL", "--no-gc-sections image differs from bfd")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        if not args.keep:
+            shutil.rmtree(td, ignore_errors=True)
+
+
 def _elf32_vdso_test(args, oracles):
     """ELF32 ET_DYN metadata, i386 PIC relocations and multi-node versions."""
     name = "script_elf32_vdso_multiversion"
@@ -4287,6 +4410,7 @@ def main():
     if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
             and (not args.tag or args.tag in ("script", "kernel")):
         results.append(_elf32_script_test(args, oracles))
+        results.append(_elf32_script_gc_keep_test(args, oracles))
         results.append(_elf32_vdso_test(args, oracles))
     if (not args.filter or "hidden" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_script_hidden_visibility_test(args, oracles))

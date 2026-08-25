@@ -148,4 +148,7 @@ pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_ver
 pub use eh_frame::{build_eh_frame_hdr, count_eh_frame_fdes};
 
 // gc_sections.rs
-pub use gc_sections::{gc_collect_sections_elf64, gc_collect_sections_elf64_roots};
+pub use gc_sections::{
+    gc_collect_sections_elf64, gc_collect_sections_elf64_roots,
+    gc_collect_sections_elf64_roots_and_sections,
+};

@@ -28,6 +28,18 @@ pub fn gc_collect_sections_elf64_roots(
     objects: &[Elf64Object],
     extra_roots: &[String],
 ) -> FxHashSet<(usize, usize)> {
+    gc_collect_sections_elf64_roots_and_sections(objects, extra_roots, &FxHashSet::default())
+}
+
+/// Script-link variant with explicit input-section roots (the sections matched
+/// by GNU linker-script `KEEP(...)` commands).  A script symbol at the start or
+/// end of an output section is not itself a relocation and therefore cannot
+/// keep a registry/table alive; `KEEP` is the authoritative escape hatch.
+pub fn gc_collect_sections_elf64_roots_and_sections(
+    objects: &[Elf64Object],
+    extra_roots: &[String],
+    extra_section_roots: &FxHashSet<(usize, usize)>,
+) -> FxHashSet<(usize, usize)> {
     // Build the set of all allocatable input sections
     let mut all_sections: FxHashSet<(usize, usize)> = FxHashSet::default();
     for (obj_idx, obj) in objects.iter().enumerate() {
@@ -114,6 +126,9 @@ pub fn gc_collect_sections_elf64_roots(
         if let Some(&key) = sym_to_section.get(root.as_str()) {
             mark_live(key, &mut live, &mut worklist);
         }
+    }
+    for &key in extra_section_roots {
+        mark_live(key, &mut live, &mut worklist);
     }
 
     // Mark init/fini array sections as live (these are called by the runtime)

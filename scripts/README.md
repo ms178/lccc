@@ -9,7 +9,7 @@ Developer and research tooling. None of these are needed to build LCCC.
 | `ensure_swap.sh` | Idempotently verify swap or recreate/activate the disposable 8 GiB `/swapfile` after a constrained-harness root reset; both compiler build scripts invoke it. |
 | `arena_session_restore.sh` | Rehydrates swap, the persisted Rust/Cargo 1.98.0 toolchain, host multilib/kernel packages, git metadata and fastbuild after an Arena reset. |
 | `prepare_kernel_tree.sh` | Recreate Linux 6.18.44 with the linux-cachymod patch series and generated boot headers after a harness wipe. |
-| `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC, link with `lccc-ld`, and report the exact 32 KiB `_end` overflow through a non-bootable diagnostic link when the real ASSERT fires. |
+| `build_kernel_boot.sh` | Build all x86 real-mode setup objects with LCCC (`-ffunction-sections`), link with `lccc-ld --gc-sections`, preserve non-relocation boot payloads through a build-local `KEEP` script, enforce the authentic 32 KiB ASSERTs, and require flat-image byte identity with available BFD/LLD oracles. |
 | `realmode_corpus.sh` | Compare LCCC/GCC executable text per `arch/x86/boot` C file under the real `-m16 -Os` flags. |
 | `asmdiff.py` | Whole-object differential against GNU as: section bytes, relocations, and symbols. See `tests/asm-diff/README.md`. |
 | `insndiff.py` | Per-instruction encoding differential against GNU as. Reduces an encoding bug to a single mnemonic in one step; supports `--sweep` over register/immediate matrices. A shorter-than-GAS encoding is reported as `BETTER` only after the tool disassembles both forms and confirms they decode identically. |

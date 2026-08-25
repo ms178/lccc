@@ -743,6 +743,17 @@ fn trimmed<'a>(store: &'a LineStore, info: &LineInfo, idx: usize) -> &'a str {
     &store.get(idx)[info.trim_start as usize..]
 }
 
+/// Source-location directives carry no machine state and may be crossed by
+/// local data-flow proofs.  Other directives remain barriers: section, symbol,
+/// alignment and CFI changes delimit regions even though most do not emit an
+/// instruction.  Keeping `.loc` in the output preserves debug line tables;
+/// treating it as transparent here merely prevents `-g` from disabling the
+/// same peepholes that run without debug information.
+#[inline]
+fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
+    infos[idx].kind == LineKind::Directive && trimmed(store, &infos[idx], idx).starts_with(".loc ")
+}
+
 /// Check if the next instruction reads the carry flag (CF).
 /// Instructions like `adcl`, `sbbl`, `rcl`, `rcr` depend on CF.
 /// `incl`/`decl` do NOT set CF (unlike `addl`/`subl`), so converting
@@ -910,7 +921,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
 
         // Find next non-nop line
         let mut j = i + 1;
-        while j < len && infos[j].is_nop() {
+        while j < len && (infos[j].is_nop() || is_debug_location(store, infos, j)) {
             j += 1;
         }
         if j >= len {
@@ -949,7 +960,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 let mut cnt = 0;
                                 let mut dead = false;
                                 while k < len && cnt < 24 {
-                                    if infos[k].is_nop() {
+                                    if infos[k].is_nop() || is_debug_location(store, infos, k) {
                                         k += 1;
                                         continue;
                                     }
@@ -1045,7 +1056,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     let mut cnt = 0;
                     let mut dead = false;
                     while k < len && cnt < 24 {
-                        if infos[k].is_nop() {
+                        if infos[k].is_nop() || is_debug_location(store, infos, k) {
                             k += 1;
                             continue;
                         }
@@ -1131,7 +1142,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     let mut cnt = 0;
                     let mut dead = false;
                     while k < len && cnt < 24 {
-                        if infos[k].is_nop() {
+                        if infos[k].is_nop() || is_debug_location(store, infos, k) {
                             k += 1;
                             continue;
                         }
@@ -1231,7 +1242,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                 let mut cnt = 0;
                                 let mut dead = false;
                                 while k < len && cnt < 24 {
-                                    if infos[k].is_nop() {
+                                    if infos[k].is_nop() || is_debug_location(store, infos, k) {
                                         k += 1;
                                         continue;
                                     }
@@ -1313,7 +1324,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             let mut cnt = 0;
                             let mut dead = false;
                             while k < len && cnt < 24 {
-                                if infos[k].is_nop() {
+                                if infos[k].is_nop() || is_debug_location(store, infos, k) {
                                     k += 1;
                                     continue;
                                 }
@@ -1378,7 +1389,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             let mut cnt = 0;
                             let mut dead = false;
                             while k < len && cnt < 24 {
-                                if infos[k].is_nop() {
+                                if infos[k].is_nop() || is_debug_location(store, infos, k) {
                                     k += 1;
                                     continue;
                                 }
@@ -1445,7 +1456,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         let mut cnt = 0;
                         let mut dead = false;
                         while k < len && cnt < 24 {
-                            if infos[k].is_nop() {
+                            if infos[k].is_nop() || is_debug_location(store, infos, k) {
                                 k += 1;
                                 continue;
                             }
@@ -1512,7 +1523,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         let is_incdec = op_s == "incl %eax" || op_s == "decl %eax";
                         if is_imm_alu || is_incdec {
                             let mut k = j + 1;
-                            while k < len && infos[k].is_nop() {
+                            while k < len && (infos[k].is_nop() || is_debug_location(store, infos, k)) {
                                 k += 1;
                             }
                             if k < len {
@@ -1528,7 +1539,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                         let mut cnt = 0;
                                         let mut dead = false;
                                         while m < len && cnt < 24 {
-                                            if infos[m].is_nop() {
+                                            if infos[m].is_nop() || is_debug_location(store, infos, m) {
                                                 m += 1;
                                                 continue;
                                             }
@@ -1656,7 +1667,7 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         // Pattern 4: Branch inversion: jCC .L1; jmp .L2; .L1: → j!CC .L2; .L1:
         if infos[i].kind == LineKind::CondJmp {
             let mut k = j + 1;
-            while k < len && infos[k].is_nop() {
+            while k < len && (infos[k].is_nop() || is_debug_location(store, infos, k)) {
                 k += 1;
             }
             if k < len && infos[j].kind == LineKind::Jmp && infos[k].kind == LineKind::Label {
@@ -1963,7 +1974,7 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let mut j = i + 1;
         let mut count = 0;
         while j < len && count < WINDOW {
-            if infos[j].is_nop() {
+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
                 j += 1;
                 continue;
             }
@@ -2207,7 +2218,7 @@ fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -> bool {
             let mut j = i + 1;
             let mut count = 0;
             while j < len && count < WINDOW {
-                if infos[j].is_nop() {
+                if infos[j].is_nop() || is_debug_location(store, infos, j) {
                     j += 1;
                     continue;
                 }
@@ -2421,7 +2432,7 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let mut j = i + 1;
         let mut count = 0;
         while j < len && count < WINDOW {
-            if infos[j].is_nop() {
+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
                 j += 1;
                 continue;
             }
@@ -3091,7 +3102,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     // O(n) and cannot be fooled by a function that only *pushes* %ebp as a
     // callee-saved register without establishing a frame.
     let frame_pointer_in_use = (0..len).any(|k| {
-        if infos[k].is_nop() {
+        if infos[k].is_nop() || is_debug_location(store, infos, k) {
             return false;
         }
         let l = trimmed(store, &infos[k], k);
@@ -3123,7 +3134,7 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         let mut j = i + 1;
         let mut count = 0;
         while j < len && count < WINDOW {
-            if infos[j].is_nop() {
+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
                 j += 1;
                 continue;
             }
@@ -3821,7 +3832,7 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 let mut safe = true;
                 let mut k = j + 1;
                 while k < len {
-                    if infos[k].is_nop() {
+                    if infos[k].is_nop() || is_debug_location(store, infos, k) {
                         k += 1;
                         continue;
                     }
@@ -4078,7 +4089,7 @@ fn fold_global_fnptr_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             let mut found: Option<usize> = None;
             let mut cnt = 0;
             while k < fend && cnt < 12 {
-                if infos[k].is_nop() {
+                if infos[k].is_nop() || is_debug_location(store, infos, k) {
                     k += 1;
                     continue;
                 }
@@ -4180,7 +4191,7 @@ fn fold_global_fnptr_calls(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             let linear_seal = |m: &Triple| -> bool {
                 let mut k = m.ck + 1;
                 while k < fend {
-                    if infos[k].is_nop() {
+                    if infos[k].is_nop() || is_debug_location(store, infos, k) {
                         k += 1;
                         continue;
                     }
@@ -4686,7 +4697,7 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                     let mut k = idx;
                     while k > start {
                         k -= 1;
-                        if infos[k].is_nop() {
+                        if infos[k].is_nop() || is_debug_location(store, infos, k) {
                             continue;
                         }
                         match infos[k].kind {
@@ -5539,6 +5550,29 @@ mod tests {
             !result.contains("32(%esp)"),
             "store/load survived:\n{result}"
         );
+    }
+
+    #[test]
+    fn slot_forwarding_crosses_loc_without_dropping_debug_metadata() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subl $12, %esp\n",
+            "    movl $7, %eax\n",
+            "    movl %eax, 8(%esp)\n",
+            ".loc 1 42 3\n",
+            "    movl 8(%esp), %edx\n",
+            "    addl %edx, %ecx\n",
+            "    addl $12, %esp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(result.contains(".loc 1 42 3"), "debug metadata lost:\n{result}");
+        assert!(result.contains("addl %eax, %ecx"), "load was not forwarded:\n{result}");
+        assert!(!result.contains("8(%esp)"), "dead spill survived:\n{result}");
     }
 
     #[test]
