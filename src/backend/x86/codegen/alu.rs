@@ -887,6 +887,43 @@ impl X86Codegen {
         }
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
+        // v12 Fix B improvement 1: 3-operand immediate multiply from a
+        // register-homed lhs — `imull $imm, %lhs, %eax` — drops the leading
+        // `movl %lhs, %eax` entirely. Only fires when lhs is a register-homed
+        // GPR (so the 3-operand form reads it in place) and rhs is a constant
+        // that fits in imm32. Order matters: try this BEFORE the memory-source
+        // and operand_to_eax paths so the register-homed lhs is not staged.
+        if let Operand::Value(lhs_val) = mul_lhs {
+            if let Some(lhs_reg) = self.dest_reg(lhs_val).filter(|r| !super::emit::is_xmm_reg(*r))
+            {
+                if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
+                    if use_32bit {
+                        let lhs_name = super::emit::phys_reg_name_32(lhs_reg);
+                        // If lhs and eax coincide, the 2-operand form is fine;
+                        // otherwise use the 3-operand form to keep lhs intact.
+                        if lhs_name == "eax" {
+                            self.state
+                                .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    imull ${}, %{}, %eax", imm, lhs_name));
+                        }
+                    } else {
+                        let lhs_name = super::emit::phys_reg_name(lhs_reg);
+                        if lhs_name == "rax" {
+                            self.state
+                                .emit_fmt(format_args!("    imulq ${}, %rax, %rax", imm));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    imulq ${}, %{}, %rax", imm, lhs_name));
+                        }
+                    }
+                    self.emit_fused_add_acc(acc, add_dest, use_32bit);
+                    return;
+                }
+            }
+        }
+
         // Step 1: Compute mul_lhs * mul_rhs into %eax.
         // Strategy: load one operand to %eax, imul the other (prefer memory-source).
         if use_32bit {
@@ -949,12 +986,38 @@ impl X86Codegen {
 
     /// Helper for fused mul-add: add %eax to the accumulator operand and store to dest.
     fn emit_fused_add_acc(&mut self, acc: &Operand, add_dest: &Value, use_32bit: bool) {
-        // If add_dest is register-allocated, add %eax to it directly.
+        // v12 Fix B improvement 2: constant accumulator with a REGISTER-HOMED
+        // dest. Adding the immediate directly to %eax (`addl $imm, %eax`) then
+        // moving to the dest register avoids staging the constant through the
+        // dest (`movq $imm, %dest`; 7 bytes for i64-sign-extended constants, 10
+        // for true imm64) before the add. Restricted to register-dest so the
+        // memory-dest / GEP-dest paths keep the original, well-exercised store
+        // sequencing — the LCG loop (the hot beneficiary) is register-homed by
+        // Fix A's precise-span seed.
         if let Some(dest_phys) = self
             .dest_reg(add_dest)
             .filter(|r| !super::emit::is_xmm_reg(*r))
         {
-            // Ensure acc is in the dest register first
+            if let Some(imm) = Self::const_as_imm32_typed(acc, use_32bit) {
+                if use_32bit {
+                    self.state.emit_fmt(format_args!("    addl ${}, %eax", imm));
+                } else {
+                    self.state.emit_fmt(format_args!("    addq ${}, %rax", imm));
+                }
+                let dest_name = super::emit::phys_reg_name_32(dest_phys);
+                let dest_name_64 = super::emit::phys_reg_name(dest_phys);
+                if use_32bit {
+                    if dest_name != "eax" {
+                        self.state.emit_fmt(format_args!("    movl %eax, %{}", dest_name));
+                    }
+                } else if dest_name_64 != "rax" {
+                    self.state.emit_fmt(format_args!("    movq %rax, %{}", dest_name_64));
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+
+            // Register-dest, non-constant acc: stage acc into dest, then add %eax.
             self.operand_to_callee_reg(acc, dest_phys);
             if use_32bit {
                 self.state.emit_fmt(format_args!(

@@ -2884,32 +2884,21 @@ impl X86Codegen {
                 // dest(I64x2 accumulator) += sext(load4×I32(base, off)).
                 // args = [accumulator, base, byte_offset].
                 //
-                // Lane math (full I64 precision per lane):
+                // Lane math (full I64 precision per lane), v12 Fix D:
                 //   xmm0 = 4×I32 {a0,a1,a2,a3}
-                //   xmm1 = vpmovsxdq(xmm0)      -> {sext(a0), sext(a1)}
-                //   xmm2 = vextracti128(xmm0,1) -> {a2,a3}
-                //   xmm2 = vpmovsxdq(xmm2)      -> {sext(a2), sext(a3)}
-                //   xmm1 = paddq(xmm1, xmm2)   -> per-lane partial sums
-                //   dst  = paddq(acc, xmm1)    -> new accumulator
-                // The ACCUMULATOR/DEST live in the 128-bit XMM view of the
-                // assigned home; both widened halves first reduce into xmm1,
-                // then a single paddq folds them into the accumulator. When
-                // the accumulator is slot-homed, the acc value loads through
-                // xmm3 and the result stores back to the dest's home.
+                //   vpmovsxdq xmm0 → xmm1   = {sext(a0), sext(a1)}   (low half)
+                //   vpunpckhqdq xmm0,xmm0,xmm0 = {a2,a3,a2,a3} (in-place, frees xmm2)
+                //   vpmovsxdq xmm0 → xmm0   = {sext(a2), sext(a3)}   (high half, in-place)
+                //   vpaddq xmm0, xmm1, xmm1  = per-lane I64 partial sums
+                //   dst  = vpaddq(acc, xmm1)  — accumulator touched ONLY here.
+                // Scratch is confined to the reserved pair xmm0/xmm1; the
+                // accumulator's XMM home (xmm2..xmm15) is never clobbered, so
+                // the v12 Fix C whitelist can safely keep the accumulator
+                // register-resident. (A 256-bit vmovdqu would load EIGHT I32s
+                // while the IV advances only four — lanes 4..7 double-counted.)
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
-                // 128-bit LOAD of 4×I32: xmm0 = {a0,a1,a2,a3} (qword
-                // lanes q0={a0,a1}, q1={a2,a3}). Split + widen + fold:
-                //   vmovdqu (mem)      → xmm0 = {a0,a1,a2,a3}
-                //   vpunpckhqdq x0,x0  → xmm2 = {a2,a3,a2,a3}
-                //   vpmovsxdq xmm0     → xmm1 = {sext(a0), sext(a1)}
-                //   vpmovsxdq xmm2     → xmm2 = {sext(a2), sext(a3)}
-                //   paddq xmm2, xmm1   → {a0+a2, a1+a3} per-lane I64 sums
-                // (A 256-bit vmovdqu would load EIGHT I32s while the IV
-                // advances only four — lanes 4..7 would be double-counted
-                // on the next iteration's overlap. vextracti128 cannot be
-                // used: after a 128-bit store ymm0's upper half is stale.)
                 match index {
                     Some(idx) => self.state.emit_fmt(format_args!(
                         "    vmovdqu (%{},%{}), %xmm0",
@@ -2919,10 +2908,13 @@ impl X86Codegen {
                         .state
                         .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
                 }
-                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
+                // Widen low half into xmm1, then in-place shuffle + widen
+                // high half into xmm0 (freeing the old xmm0 contents), then
+                // sum both halves into xmm1.
                 self.state.emit("    vpmovsxdq %xmm0, %xmm1");
-                self.state.emit("    vpmovsxdq %xmm2, %xmm2");
-                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
+                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm0");
+                self.state.emit("    vpmovsxdq %xmm0, %xmm0");
+                self.state.emit("    vpaddq %xmm0, %xmm1, %xmm1");
                 if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
                     let acc_reg = self
                         .reg_assignments
@@ -2951,21 +2943,21 @@ impl X86Codegen {
                             self.state.vec_last_store_reg_name = Some(dst);
                         }
                         _ => {
-                            // Slot-homed accumulator or dest: round-trip
-                            // through xmm3 (the reserved scratch pair is
-                            // xmm0/xmm1; xmm2 is allocatable, so use xmm3
-                            // only when it is provably free — safest is the
-                            // accumulator's own SLOT as the staging area).
+                            // Slot-homed accumulator/dest: xmm0 is free now
+                            // (high-half sum already folded into xmm1), so
+                            // reuse it for the accumulator round-trip — never
+                            // touch an allocatable XMM (xmm2..xmm15).
                             if let Some(slot) = self.state.get_slot(acc.0) {
-                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
-                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
+                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
+                                self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                                 if let Some(dslot) = self.state.get_slot(d.0) {
                                     self.state
                                         .out
-                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
+                                        .emit_instr_reg_rbp("    vmovdqu", "xmm0", dslot.0);
                                 }
                             } else {
-                                self.state.emit("    paddq %xmm1, %xmm1");
+                                // No slot, no register (dead acc): fold in-place.
+                                self.state.emit("    vpaddq %xmm1, %xmm1, %xmm1");
                             }
                         }
                     }
@@ -2975,23 +2967,21 @@ impl X86Codegen {
                 // dest(I64x2 accumulator) += sext(load4×I32(base, off))
                 // where lane > guard_rhs. args = [acc, base, off, guard_rhs].
                 //
-                // Same lane geometry as VecWidenAddI32x4ToI64x2, plus the
-                // per-lane mask: the I32 0/-1 compare result sign-extends
-                // through the SAME vpmovsxdq splits to all-ones/all-zeros
-                // I64 masks, so vpand zero-masks the widened values exactly
-                // per lane (GCC's canonical conditional-reduction form):
-                //   vmovdqu (mem)            → xmm0 = {a0,a1,a2,a3}
-                //   vpunpckhqdq x0,x0 → xmm2 = {a2,a3,a2,a3}
-                //   vpmovsxdq xmm0 → xmm1    = {sext(a0), sext(a1)}
-                //   vpmovsxdq xmm2 → xmm2    = {sext(a2), sext(a3)}
-                //   <mask into xmm4>         = {a0>r, a1>r, a2>r, a3>r}
-                //   vpcmpgtd x4,x0 → x4      = per-lane I32 0/-1 mask
-                //   vpunpckhqdq x4,x4 → x5   = mask lanes 2,3
-                //   vpmovsxdq xmm4 → xmm3    = {m0, m1} as I64
-                //   vpmovsxdq xmm5 → xmm5    = {m2, m3} as I64
-                //   vpand x3,x1 → x1 ; vpand x5,x2 → x2   (zero-mask)
-                //   paddq x2,x1              → per-lane guarded sums
-                //   dst = paddq(acc, xmm1)
+                // v12 Fix D lane math (scratch confined to xmm0/xmm1):
+                //   vmovdqu (mem)             → xmm0 = {a0,a1,a2,a3}  (values)
+                //   <broadcast rhs → xmm1>
+                //   vpcmpgtd xmm1,xmm0 → xmm1 = {m0,m1,m2,m3} (0/-1 per lane)
+                //   vpand xmm1,xmm0 → xmm0    = {a0&m0,a1&m1,a2&m2,a3&m3} (I32)
+                //   vpmovsxdq xmm0 → xmm1     = {sext(a0&m0), sext(a1&m1)}
+                //   vpunpckhqdq xmm0,xmm0,xmm0 = {a2&m2,a3&m3,..} (in-place)
+                //   vpmovsxdq xmm0 → xmm0     = {sext(a2&m2), sext(a3&m3)}
+                //   vpaddq xmm0,xmm1 → xmm1   = per-lane I64 partial sums
+                //   dst = vpaddq(acc, xmm1)
+                // Masking at I32 (before widen) is equivalent to masking at
+                // I64 (after widen) ONLY because the mask is 0/-1 from
+                // vpcmpgtd — sext(a & m) == sext(a) & sext(m) when m∈{0,-1}.
+                // This confines scratch to xmm0/xmm1 so the accumulator's
+                // XMM home (xmm2..xmm15) is never clobbered (v12 Fix C safe).
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
@@ -3004,14 +2994,10 @@ impl X86Codegen {
                         .state
                         .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
                 }
-                // Split + widen the VALUES.
-                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
-                self.state.emit("    vpmovsxdq %xmm0, %xmm1");
-                self.state.emit("    vpmovsxdq %xmm2, %xmm2");
-                // Build the mask in xmm4 = broadcast(guard_rhs).
+                // Build the mask in xmm1 = broadcast(guard_rhs).
                 match &args[3] {
                     Operand::Const(c) if c.to_i64() == Some(0) => {
-                        self.state.emit("    vpxor %xmm4, %xmm4, %xmm4");
+                        self.state.emit("    vpxor %xmm1, %xmm1, %xmm1");
                     }
                     Operand::Const(c) => {
                         if let Some(v) = c.to_i64() {
@@ -3020,26 +3006,25 @@ impl X86Codegen {
                         } else {
                             self.state.emit("    xorl %eax, %eax");
                         }
-                        self.state.emit("    vmovd %eax, %xmm4");
-                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
+                        self.state.emit("    vmovd %eax, %xmm1");
+                        self.state.emit("    vpshufd $0, %xmm1, %xmm1");
                     }
                     op => {
                         // Scalar value operand: materialize into %eax.
                         self.operand_to_reg(op, "rax");
-                        self.state.emit("    vmovd %eax, %xmm4");
-                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
+                        self.state.emit("    vmovd %eax, %xmm1");
+                        self.state.emit("    vpshufd $0, %xmm1, %xmm1");
                     }
                 }
                 // mask = lanes > rhs (AT&T: vpcmpgtd src2=rhs, src1=lanes).
-                self.state.emit("    vpcmpgtd %xmm4, %xmm0, %xmm4");
-                // Split + widen the MASK (same lane geometry).
-                self.state.emit("    vpunpckhqdq %xmm4, %xmm4, %xmm5");
-                self.state.emit("    vpmovsxdq %xmm4, %xmm3");
-                self.state.emit("    vpmovsxdq %xmm5, %xmm5");
-                // Zero-mask the widened values per lane.
-                self.state.emit("    vpand %xmm3, %xmm1, %xmm1");
-                self.state.emit("    vpand %xmm5, %xmm2, %xmm2");
-                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
+                self.state.emit("    vpcmpgtd %xmm1, %xmm0, %xmm1");
+                // Apply mask to I32 values in-place, then widen-then-sum
+                // exactly like the non-masked path (xmm0/xmm1 only).
+                self.state.emit("    vpand %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vpmovsxdq %xmm0, %xmm1");
+                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm0");
+                self.state.emit("    vpmovsxdq %xmm0, %xmm0");
+                self.state.emit("    vpaddq %xmm0, %xmm1, %xmm1");
                 if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
                     let acc_reg = self
                         .reg_assignments
@@ -3068,14 +3053,18 @@ impl X86Codegen {
                             self.state.vec_last_store_reg_name = Some(dst);
                         }
                         _ => {
+                            // Slot-homed: reuse xmm0 (free after the fold
+                            // into xmm1) for the accumulator round-trip.
                             if let Some(slot) = self.state.get_slot(acc.0) {
-                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
-                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
+                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
+                                self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                                 if let Some(dslot) = self.state.get_slot(d.0) {
                                     self.state
                                         .out
-                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
+                                        .emit_instr_reg_rbp("    vmovdqu", "xmm0", dslot.0);
                                 }
+                            } else {
+                                self.state.emit("    vpaddq %xmm1, %xmm1, %xmm1");
                             }
                         }
                     }

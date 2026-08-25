@@ -1024,13 +1024,22 @@ impl LinearScanAllocator {
         self.run_with_seed(&FxHashMap::default());
     }
 
-    /// Like [`Self::run`], but the given `(register, free-until)` pairs are
+    /// Like [`Self::run`], but the given `(register, spans)` pairs are
     /// applied on top of the cleared occupancy BEFORE the allocation loop.
     /// Lets a second allocation wave see the homes already handed out by an
     /// earlier wave (e.g. Phase 2's arg-register-free pass for call-argument
     /// values) so it cannot reuse a register that is still occupied by one of
     /// those values.
-    pub fn run_with_seed(&mut self, seed: &FxHashMap<PhysReg, u32>) {
+    ///
+    /// RA-precise-seed (v12): each register's seed is a list of half-open
+    /// `[start, end)` occupancy spans — the *actual* live ranges of the
+    /// values earlier waves homed there. The previous fat `[0, until)` seed
+    /// starved the whole function of a register whenever an earlier wave
+    /// homed a value whose `end` reached a late call (e.g. printf at function
+    /// end), forcing every early loop value into a stack slot. Precise spans
+    /// let wave 4 reuse that register inside the loop so long as the new
+    /// value's range does not overlap any seeded span.
+    pub fn run_with_seed(&mut self, seed: &FxHashMap<PhysReg, Vec<(u32, u32)>>) {
         self.active.clear();
         self.handled.clear();
         self.assignments.clear();
@@ -1039,15 +1048,20 @@ impl LinearScanAllocator {
         self.next_reg_idx = 0;
         self.init_registers();
         self.reg_occupancy.clear();
-        for (reg, until) in seed {
-            let cur = self.reg_free_until.entry(*reg).or_insert(0);
-            *cur = (*cur).max(*until);
-            if self.segment_mode {
-                // Seeds are fat "occupied until" facts from earlier waves;
-                // record them as half-open [0, until) occupancy.
-                if *until > 0 {
-                    self.insert_occupancy(*reg, &[(0, *until)]);
-                }
+        for (reg, spans) in seed {
+            // Fat-mode invariant: reg_free_until is the latest occupied point
+            // (max end across spans). Fat mode cannot represent holes, so a
+            // multi-span seed collapses to [0, max_end) there; segment mode
+            // records each span precisely.
+            let max_end = spans.iter().map(|&(_, e)| e).max().unwrap_or(0);
+            if max_end > 0 {
+                let cur = self.reg_free_until.entry(*reg).or_insert(0);
+                *cur = (*cur).max(max_end);
+            }
+            if self.segment_mode && !spans.is_empty() {
+                let mut sorted: Vec<(u32, u32)> = spans.iter().copied().collect();
+                sorted.sort_unstable_by_key(|&(s, _)| s);
+                self.insert_occupancy(*reg, &sorted);
             }
         }
 

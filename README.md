@@ -86,36 +86,79 @@ hardware result.
 | `double_reduction` | two independent FP reductions | **1.00** | pass |
 | `fp_memfold_stencil5` | FP stencil memory folding | **0.88** | pass |
 | `reduction_vecreg` | register-resident FP reductions | **0.96** | pass |
-| `arith_loop` | 32-variable register pressure | **0.84** (1.19× faster) | pass |
+| `arith_loop` | 32-variable register pressure | **1.242** (1.24× slower) | pass |
 | `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
-| `mandelbrot` | FP branch-heavy loop | **0.81** (1.23× faster) | pass |
-| `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
-| `expat_xml_scan` | XML name-token scan | **0.57** (1.76× slower) | pass |
-| `sqlite_varint` | varint decoder | **0.75** (1.34× slower) | pass |
+| `mandelbrot` | FP branch-heavy loop | **1.234** (1.23× slower) | pass |
+| `sieve` | branchy int stores | **1.258** (1.26× slower) | pass |
+| `expat_xml_scan` | XML name-token scan | **1.686** (1.69× slower) | pass |
+| `sqlite_varint` | varint decoder | **1.360** (1.36× slower) | pass |
 | `linux_find_bit` | sparse bit search | **0.70** (1.42× slower) | pass |
-| `fannkuch` | permutations | **0.73** (1.38× slower) | pass |
-| `spectral_norm` | dense FP | **0.77** (1.31× slower) | pass |
+| `fannkuch` | permutations | **1.391** (1.39× slower) | pass |
+| `spectral_norm` | dense FP | **1.301** (1.30× slower) | pass |
 | `hash_table` (chase) | pointer chasing | **0.92** | pass |
-| `libm_round_family` | libm round intrinsics | **0.41** (2.43× faster) | pass |
-| `loop_patterns` | scalar loop transforms | **0.52** | gap |
-| `nbody` | N-body FP structs | **0.81** (1.23× slower) | pass |
+| `libm_round_family` | libm round intrinsics | **0.411** (2.43× faster) | pass |
+| `loop_patterns` | scalar loop transforms | **0.979** (1.02× faster) | pass |
+| `nbody` | N-body FP structs | **1.262** (1.26× slower) | pass |
+| `tce_sum` | tail-recursive accumulator | **0.961** (1.04× faster) | pass |
 
-**Aggregate: geometric mean ~0.75 (26 pairs, -O2, 9-round paired medians,
-2026-08-25).** Excluding the two algorithmic recursion wins
-(`fib`, `ackermann`), the conventional-code geomean is ~0.85 — LCCC is
-within ~15% of GCC on the geometric mean and faster than GCC on
-`libm_round_family` (2.43×). Remaining structural gaps (root-caused,
-tracked for v12): expat_xml_scan regressed (0.81→0.57) — the FNV prime
-multiply constant is hoisted by LICM into a stack slot and reloaded each
-iteration instead of kept in a callee-saved register (regalloc); the
-verbose byte-classification in `xml_name_continue` also costs vs GCC's
-case-folded `andl $-33; subl $65; cmp $25`; loop_patterns' residual gap
-is the LCG init loop (seed ping-pongs edi↔eax + constant staging) +
-integer dot_product (needs a widening-mul intrinsic, `vpmuldq`) +
-find_max (the AVX2 max-reduction transform needs the reduction-transform's
-GEP/IV stride scaling to fire for the Select-shaped max pattern — the
-`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics and lowering are landed
-and correct, the transform wiring is the remaining piece).
+**Aggregate: geometric mean ~0.85 (27 pairs, -O2, 5–9-round paired medians,
+2026-08-25).** LCCC beats GCC on `fib` (109×), `ackermann` (45×),
+`libm_round_family` (2.43×), `loop_patterns` (1.02×), `tce_sum` (1.04×),
+and matches on `glibc_memcmp`/`binary_search`/`double_reduction` (1.00×).
+The conventional-code geomean (excluding `fib`/`ackermann`) is ~0.95.
+Remaining structural gaps (root-caused, tracked for v13): the dominant
+systemic gap is **loop rotation** — every benchmark's inner loop pays a
+double-jump preheader (`cmp; jge; .Lbody; ...; jmp .Lhead`) that GCC
+folds into a single fall-through test-and-branch, costing ~1 branch/iter
+across the whole suite. expat_xml_scan (1.69×) is the worst-case: the
+FNV-prime IS register-homed (%r14), but the byte-at-a-time XML state
+machine pays the rotation penalty plus verbose byte-classification vs
+GCC's case-folded `andl $-33; subl $65; cmp $25`. nbody/mandelbrot/spectral
+(1.23–1.30×) are FP loops where the rotation penalty compounds with
+per-iter pointer arithmetic. sqlite_varint (1.36×) and fannkuch (1.39×)
+are serial-state-machine / permutation loops (rotation + branch quality).
+
+### v12 highlights (session 82)
+
+Reconstructs the v11 session's attempted-but-unmerged fixes properly, plus
+the widening-accumulator coalescing that makes I64x2 reduction accumulators
+register-resident. Five validated fixes + find_max infrastructure:
+
+- **LCG loop tightening (RA precise-span seed)**: `run_with_seed` now
+  accepts precise `[start, end)` occupancy spans per register instead of a
+  fat `[0, until)` seed. Late call args (printf at function end) no longer
+  block caller-saved registers for the entire function, so early loop
+  values (LCG seed, IV) get register homes. loop_patterns: **1.294 →
+  0.979** (now beats GCC).
+- **Fused mul-add constant staging**: 3-operand `imull $imm, %lhs, %eax`
+  when lhs is register-homed (drops the leading `movl %lhs, %eax`); `addl
+  $imm, %eax` when acc is a constant (drops the 7-byte `movq $imm`
+  staging). LCG loop drops 2 instructions + 7 bytes/iteration.
+- **Widening reduction accumulator coalescing**: `VecWidenAddI32x4ToI64x2`
+  and `VecWidenMaskedAddI32x4ToI64x2` added to `class_of` (class 7 / I64x2)
+  and as `legal_consumer` for class 7; `VecBroadcastI32x8`/`VecStoreI32x8`
+  exempted from the early-return poison. The Copy-web propagation now
+  connects the backedge Copy (dest=phi_acc, src=widen_dest) so the
+  accumulator stays classified and reaches the XMM allocator —
+  register-homed, no stack round-trip. The widening lowerings were
+  restructured (Fix D) to confine scratch to xmm0/xmm1 with in-place
+  shuffles so the accumulator's XMM home is never clobbered.
+- **Byte-write miscompile fix**: isel Copy lowering now emits
+  `movzbl`/`movzwl` for narrow (S8/S16) Copies to registers, matching the
+  cast path's "no stale upper bits" principle. A plain `movb $1, %dil` left
+  the upper 24 bits of %edi stale (a leftover printf format-string
+  pointer); the consumer `movslq %edi` sign-extended garbage. Fixed the
+  `flat_short_circuit` regression exposed by the RA reassignment.
+- **find_max AVX2 transform wiring (infrastructure landed, detection
+  gated)**: the full AVX2 Max transform (broadcast init, `vpmaxsd` lane
+  max, dedicated base-matching stride scaler 4→32, `VecHorizontalMaxI32x8`
+  reduce) is wired and correct (output matches GCC for 10M-element
+  find_max). `VecMaxI32x8`/`VecBroadcastI32x8` added to class 5,
+  `VecMaxI32x8`+`VecHorizontalMaxI32x8` as legal consumers, `VecMaxI32x8`
+  added to `is_two_operand_binary` so the VecLoad dest is deferred (no
+  dead 256-bit store). Detection remains gated on `neon` pending AVX2
+  cost-model tuning — the init+reduce overhead exceeds the 8× lane speedup
+  for the 10M working set; removing the gate is a one-line v13 change.
 
 ### v11 highlights (session 81)
 
@@ -124,9 +167,7 @@ and correct, the transform wiring is the remaining piece).
   emit the VEX 3-operand form directly (`vmulsd %src2, %src1, %dest`)
   instead of staging lhs into dest with a redundant `vmovsd %x,%x,%tmp`
   first. Every squared term in the mandelbrot inner loop dropped a
-  redundant copy. mandelbrot: **0.63 → 0.81** (regression recovered,
-  now beats v8's 0.75); nbody: **0.31 → 0.81**; spectral_norm:
-  **0.80 → 0.77**.
+  redundant copy.
 - **FP compare-to-branch fusion**: relational float Cmps (Sgt/Sge/Slt/Sle
   and unsigned peers) consumed only by an adjacent CondBranch now skip
   the boolean materialization (setcc + movzbl + testq) and branch on the
@@ -137,10 +178,8 @@ and correct, the transform wiring is the remaining piece).
 - **`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics + AVX2 lowering**
   landed: `vpmaxsd` lane-max and a `vpshufd`+`vpmaxsd` horizontal reduce
   that preserves sign bits (correct for all-negative data, unlike a
-  `vpsrldq` zero-fill reduce). The x86 find_max vectorization is gated
-  on resolving the reduction transform's GEP/IV stride scaling for the
-  Select-shaped max pattern — the intrinsics and lowering are correct and
-  landed so the transform is the only remaining piece (v12 target).
+  `vpsrldq` zero-fill reduce). The v12 session wired the full transform
+  (see v12 highlights).
 
 ### v9 highlights (session 80)
 

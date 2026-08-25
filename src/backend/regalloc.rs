@@ -1417,7 +1417,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // (a naive split once gave the format string and a div-by-const
                 // sign temp the same %r11). Most-constrained wave first so its
                 // values are not starved by the later, freer waves.
-                let mut seeded: FxHashMap<PhysReg, u32> = FxHashMap::default();
+                let mut seeded: FxHashMap<PhysReg, Vec<(u32, u32)>> = FxHashMap::default();
 
                 // Wave 1: indirect-call args at index ≥ 1 — avoid the arg
                 // registers AND the indirect-target register (r10).
@@ -1435,9 +1435,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(_, end)) = iv_map.get(vid) {
-                            let cur = seeded.entry(*reg).or_insert(0);
-                            *cur = (*cur).max(end);
+                        if let Some(&(start, end)) = iv_map.get(vid) {
+                            if end > start {
+                                seeded.entry(*reg).or_default().push((start, end));
+                            }
                         }
                     }
                 }
@@ -1458,9 +1459,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(_, end)) = iv_map.get(vid) {
-                            let cur = seeded.entry(*reg).or_insert(0);
-                            *cur = (*cur).max(end);
+                        if let Some(&(start, end)) = iv_map.get(vid) {
+                            if end > start {
+                                seeded.entry(*reg).or_default().push((start, end));
+                            }
                         }
                     }
                 }
@@ -1481,9 +1483,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in &alloc.assignments {
                         assignments.insert(*vid, *reg);
                         caller_used_regs_set.insert(reg.0);
-                        if let Some(&(_, end)) = iv_map.get(vid) {
-                            let cur = seeded.entry(*reg).or_insert(0);
-                            *cur = (*cur).max(end);
+                        if let Some(&(start, end)) = iv_map.get(vid) {
+                            if end > start {
+                                seeded.entry(*reg).or_default().push((start, end));
+                            }
                         }
                     }
                 }
@@ -3262,8 +3265,26 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecZeroF32x4 | O::VecLoadF32x4 | O::VecAddF32x4 | O::VecMulF32x4 => Some(3),
             O::VecZeroF64x2 | O::VecLoadF64x2 | O::VecAddF64x2 | O::VecMulF64x2 => Some(4),
             O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8 => Some(5),
+            // v12 Fix F: Max reduction producers. VecBroadcastI32x8 seeds the
+            // max accumulator (init = arr[0] broadcast), VecMaxI32x8 produces
+            // the new accumulator each iteration. Classifying them as class 5
+            // (I32x8) lets the Copy-web connect the backedge so the accumulator
+            // stays register-homed (no per-iter stack round-trip, which made
+            // the vectorized find_max SLOWER than scalar).
+            O::VecBroadcastI32x8 | O::VecMaxI32x8 => Some(5),
             O::VecZeroI32x4 | O::VecLoadI32x4 | O::VecAddI32x4 | O::VecMulI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
+            // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
+            // new accumulator). Classifying them as class 7 lets the Copy-web
+            // propagation connect the backedge Copy (dest=phi_acc,
+            // src=widen_dest) so the phi-merge Copy does not strand the
+            // accumulator (src_class=None → evicted as bad). Combined with
+            // the legal_consumer entry above, the full I64x2 accumulator
+            // web — VecZero → Copy(phi) → VecWiden → Copy(backedge) →
+            // VecHorizontalAdd — stays classified and reaches the XMM
+            // allocator (register-homed accumulator, no stack round-trip).
+            O::VecWidenAddI32x4ToI64x2 | O::VecWidenMaskedAddI32x4ToI64x2 => Some(7),
+            O::VecLoadWidenI32ToI64x2 => Some(7),
             _ => None,
         }
     };
@@ -3287,7 +3308,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             5 => matches!(
                 op,
-                O::VecAddI32x8 | O::VecMulI32x8 | O::VecHorizontalAddI32x8
+                O::VecAddI32x8
+                    | O::VecMulI32x8
+                    | O::VecHorizontalAddI32x8
+                    // v12 Fix F: the lane-wise max consumes the I32x8
+                    // accumulator (read+write); the horizontal max reduces
+                    // it. Both lowerings confine scratch to xmm0/xmm1.
+                    | O::VecMaxI32x8
+                    | O::VecHorizontalMaxI32x8
             ),
             6 => matches!(
                 op,
@@ -3295,7 +3323,17 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             ),
             7 => matches!(
                 op,
-                O::VecAddI64x2 | O::VecMulI64x2 | O::VecHorizontalAddI64x2
+                O::VecAddI64x2
+                    | O::VecMulI64x2
+                    | O::VecHorizontalAddI64x2
+                    // v12 Fix C: the widening reductions consume an I64x2
+                    // accumulator (read+write). Their lowerings (v12 Fix D)
+                    // confine scratch to xmm0/xmm1, so a register-homed
+                    // I64x2 accumulator is safe to keep across the widening
+                    // step — whitelist them as legal consumers so the
+                    // verification fixpoint does not evict the accumulator.
+                    | O::VecWidenAddI32x4ToI64x2
+                    | O::VecWidenMaskedAddI32x4ToI64x2
             ),
             _ => false,
         }
@@ -3318,6 +3356,47 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                                 | O::VecHorizontalAddI32x8
                                 | O::VecHorizontalAddI32x4
                                 | O::VecHorizontalAddI64x2
+                                // v12 Fix C: widening reductions consume an
+                                // I64x2 accumulator (whitelisted above). Their
+                                // lowerings confine scratch to xmm0/xmm1 so an
+                                // XMM-homed accumulator is safe — do NOT let
+                                // them poison the whole function.
+                                | O::VecWidenAddI32x4ToI64x2
+                                | O::VecWidenMaskedAddI32x4ToI64x2
+                                // v12 Fix C: broadcast/store intrinsics do
+                                // not themselves need an accumulator, but
+                                // they appear in the SAME function as
+                                // reductions (e.g. loop_patterns' main has
+                                // scale_add's VecBroadcastI32x8 +
+                                // VecStoreI32x8 alongside sum_positive's
+                                // widening reduction). Exempt them from the
+                                // poison so the reduction's accumulator stays
+                                // register-homed; the verification fixpoint
+                                // evicts any genuine conflict (a store-feeding
+                                // temp that overlaps the accumulator's live
+                                // range).
+                                | O::VecBroadcastI32x8
+                                | O::VecBroadcastI32x4
+                                | O::VecBroadcastF32x8
+                                | O::VecBroadcastF32x4
+                                | O::VecBroadcastF64x4
+                                | O::VecBroadcastF64x2
+                                | O::VecBroadcastI64x2
+                                | O::VecStoreI32x8
+                                | O::VecStoreI32x4
+                                | O::VecStoreF32x8
+                                | O::VecStoreF32x4
+                                | O::VecStoreF64x4
+                                | O::VecStoreF64x2
+                                | O::VecStoreI64x2
+                                // v12 Fix C: max reductions (find_max) and
+                                // their horizontal reduce — lowerings
+                                // confine scratch to xmm0/xmm1, exempt them.
+                                | O::VecMaxI32x8
+                                | O::VecHorizontalMaxI32x8
+                                | O::VecHorizontalMaxI32x4
+                                | O::VecSmaxI32x4
+                                | O::VecLoadWidenI32ToI64x2
                         ) =>
                 {
                     return FxHashSet::default();
