@@ -123,8 +123,24 @@ impl X86Codegen {
                 if is_xmm_reg(r) {
                     let name = phys_reg_name(r);
                     if name != reg {
-                        self.state
-                            .emit_fmt(format_args!("    {} %{}, %{}", mov_instr, name, reg));
+                        // Register-to-register scalar FP copies use the VEX
+                        // 3-operand form (`vmovsd %src, %src, %dst`): the
+                        // legacy `movsd %src, %dst` is a MERGING move that
+                        // preserves the destination's upper 64 bits, i.e. it
+                        // READS the destination's previous content. That false
+                        // dependence chains onto whatever last wrote the
+                        // destination — in loops, typically the previous
+                        // iteration's FP result — and serialises otherwise
+                        // independent iterations at full FP latency (nbody's
+                        // sqrt: 3.1x vs GCC purely from this). The VEX form
+                        // reads only the source. Scalar consumers only read
+                        // the low lane, so the upper-bit difference is
+                        // unobservable; the vectorizer's packed pairs never
+                        // route through this scalar helper.
+                        self.state.emit_fmt(format_args!(
+                            "    v{} %{}, %{}, %{}",
+                            mov_instr, name, name, reg
+                        ));
                     }
                     return;
                 }
@@ -335,6 +351,33 @@ impl X86Codegen {
             if let Some(&reg) = self.reg_assignments.get(&d.0) {
                 if is_xmm_reg(reg) {
                     let dname = phys_reg_name(reg);
+                    // Source-direct 3-operand form: when the argument already
+                    // lives in a different XMM register, compute straight from
+                    // it — `vsqrtsd %src, %src, %dst`. The old copy-first form
+                    // (`load_fp_to_reg` → legacy `movsd %src, %dst`; then
+                    // `vsqrtsd %dst, %dst`) cost more than one instruction:
+                    // legacy movsd is a MERGING move that preserves the
+                    // destination's upper 64 bits, so it carries a WAR/WAW
+                    // dependence on the destination's previous content. In a
+                    // loop where the destination held the previous iteration's
+                    // sqrt result, every iteration's sqrt serialized on the
+                    // last one at full latency instead of pipelining in the
+                    // divider (nbody: 668 ms → near-GCC-scalar once the false
+                    // loop-carried dependency is gone). Same shape as the
+                    // vroundsd source-direct path below.
+                    if let Operand::Value(sv) = arg {
+                        if let Some(&sreg) = self.reg_assignments.get(&sv.0) {
+                            if is_xmm_reg(sreg) && sreg != reg {
+                                let sname = phys_reg_name(sreg);
+                                self.state.emit_fmt(format_args!(
+                                    "    {} %{}, %{}, %{}",
+                                    inst, sname, sname, dname
+                                ));
+                                self.state.reg_cache.invalidate_acc();
+                                return;
+                            }
+                        }
+                    }
                     self.load_fp_to_reg(arg, ty, dname);
                     self.state
                         .emit_fmt(format_args!("    {} %{}, %{}", inst, dname, dname));
@@ -798,19 +841,22 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let name = phys_reg_name(reg);
                         if name != xmm {
-                            // Use the type-appropriate scalar move (movsd for
-                            // F64, movss for F32). `movaps` here was a domain-
-                            // crossing bug: on scalar FP values it is 1) a
-                            // partial-register dependency on the old content
-                            // of `xmm` (since movaps writes the full register
-                            // but downstream code only consumes the low 64/32
-                            // bits, creating false dependencies) and 2) can
-                            // trigger SSE/AVX transition stalls on non-VEX
-                            // paths. Scalar moves zero-extend the high lanes
-                            // exactly like GCC/Clang/ICX produce.
-                            let mv = if ty == IrType::F32 { "movss" } else { "movsd" };
+                            // VEX 3-operand scalar move (`vmovsd %src, %src,
+                            // %dst`): writes the destination from the SOURCE
+                            // alone. The legacy 2-operand `movsd %src, %dst`
+                            // only zero-extends when the source is MEMORY;
+                            // register-to-register it MERGES, preserving the
+                            // destination's upper bits and therefore reading
+                            // the destination's previous content — a false
+                            // dependence on whatever last wrote the register
+                            // (previous loop iteration's FP result), which
+                            // serialises independent iterations at FP latency.
+                            // `movaps` was rejected here for full-register
+                            // partial-dependency reasons; the VEX scalar form
+                            // has neither defect: it reads only the source.
+                            let mv = if ty == IrType::F32 { "vmovss" } else { "vmovsd" };
                             self.state
-                                .emit_fmt(format_args!("    {} %{}, %{}", mv, name, xmm));
+                                .emit_fmt(format_args!("    {} %{}, %{}, %{}", mv, name, name, xmm));
                         }
                     } else {
                         let gpr = phys_reg_name(reg);

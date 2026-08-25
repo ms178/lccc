@@ -1903,6 +1903,61 @@ impl X86Codegen {
         true
     }
 
+    /// SIB memory operand anchored at the frame register with an alloca slot
+    /// offset: `slot+disp(%rbp/%rsp,%idx,scale)`. Mirrors `slot_ref`'s
+    /// rsp-frame-size adjustment for `use_rsp_addressing` functions. When
+    /// the final displacement is zero on an rbp frame, "0" is kept: a bare
+    /// `(%rbp,%idx,s)` with no displacement is ambiguous in the encoder.
+    fn sib_mem64_frame(&self, slot_off: i64, index_reg: &str, shift: u8, disp: i64) -> String {
+        // NOTE: no leading '%' — the format literals below supply it
+        // (`%{}`), matching phys_reg_name's no-prefix convention.
+        let frame = if self.state.out.use_rsp_addressing {
+            "rsp"
+        } else {
+            "rbp"
+        };
+        let off = if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size + slot_off
+        } else {
+            slot_off
+        } + disp;
+        // On an rbp frame the displacement is always materialised: a bare
+        // `(%rbp,%idx,s)` with mod=00 would relocate the base to RIP. On an
+        // rsp frame SIB base=rsp is unambiguous, so 0 can be omitted.
+        let d = if off == 0 && frame == "rsp" {
+            String::new()
+        } else {
+            format!("{}", off)
+        };
+        if shift == 0 {
+            format!("{}(%{}, %{})", d, frame, index_reg)
+        } else {
+            format!("{}(%{}, %{}, {})", d, frame, index_reg, 1u32 << shift)
+        }
+    }
+
+    /// Alloca-base arm for indexed addressing: the base is a frame slot
+    /// (Direct), the SIB anchors at %rbp/%rsp. Returns None when the base is
+    /// not a plain Direct alloca slot (register-held, Indirect, OverAligned).
+    fn frame_sib_for_alloca_base(
+        &self,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+    ) -> Option<String> {
+        let idx_reg = self.reg_assignments.get(&index.0).copied()?;
+        if is_xmm_reg(idx_reg) {
+            return None;
+        }
+        match self.state.resolve_slot_addr(base.0) {
+            Some(SlotAddr::Direct(slot)) => {
+                Some(self.sib_mem64_frame(slot.0 as i64, phys_reg_name(idx_reg), shift, disp))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn emit_load_indexed_impl(
         &mut self,
         dest: &Value,
@@ -1913,6 +1968,10 @@ impl X86Codegen {
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
+                return self.emit_load_indexed_common(dest, index, shift, ty, mem);
+            }
             return false;
         };
         if is_xmm_reg(b)
@@ -1943,6 +2002,10 @@ impl X86Codegen {
         ty: IrType,
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
+            // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
+                return self.emit_store_indexed_common(val, index, shift, ty, mem);
+            }
             return false;
         };
         if is_xmm_reg(b)

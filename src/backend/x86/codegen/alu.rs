@@ -607,7 +607,146 @@ impl X86Codegen {
             }
         }
 
-        // General case: load lhs to rax, rhs to rcx
+        // General case: load lhs to rax, rhs to rcx.
+        //
+        // Two source-direct shortcuts avoid the rcx staging copy entirely:
+        //   1. Commutative-eligible immediates (Add/Sub/And/Or/Xor and the
+        //      `imull $imm` form above) emit `op $imm, %eax` directly.
+        //   2. A register-homed rhs (not rax itself — lhs just landed there)
+        //      emits `op %rhs, %eax` straight from its home register.
+        // Before this, every scalar add in a loop paid `movl %rN, %ecx`
+        // (loop_patterns prefix-sum remainder: 9 → 7 instructions/element).
+        // Div/rem keep the rcx contract (idiv reads it); shifts need %cl.
+        let alu_reg_direct: Option<String> = match (op, rhs) {
+            (
+                IrBinOp::Add
+                | IrBinOp::Sub
+                | IrBinOp::Mul
+                | IrBinOp::And
+                | IrBinOp::Or
+                | IrBinOp::Xor,
+                Operand::Value(v),
+            ) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                // Only NON-SCRATCH homes qualify: the emitter uses rax/rcx/rdx
+                // as internal scratch (Select's `movq $0,%rcx; cmoveq`,
+                // accumulator staging), which can clobber a statically-homed
+                // value between its def and this use — `reg_assignments` is a
+                // point-insensitive map, so trusting a scratch-register home
+                // here miscompiled `(h^v)*K` when K was homed %rcx
+                // (bitops_builtins: mix() returned garbage). Callee-saved and
+                // rsi/rdi/r8-r11 homes are RA-managed end-to-end and safe.
+                .filter(|&r| {
+                    let name = super::emit::phys_reg_name(r);
+                    !super::emit::is_xmm_reg(r)
+                        && name != "rax"
+                        && name != "rcx"
+                        && name != "rdx"
+                })
+                .map(|r| {
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(r).to_string()
+                    } else {
+                        super::emit::phys_reg_name(r).to_string()
+                    }
+                }),
+            _ => None,
+        };
+        let alu_imm_direct: Option<i64> = match op {
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
+                match rhs {
+                    Operand::Const(c) => c.to_i64().filter(|&imm| {
+                        imm >= i32::MIN as i64 && imm <= i32::MAX as i64
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(reg_name) = alu_reg_direct {
+            if use_32bit {
+                self.operand_to_eax(lhs);
+            } else {
+                self.operand_to_rax(lhs);
+            }
+            match op {
+                IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul => {
+                    let mnem = match op {
+                        IrBinOp::Add => "add",
+                        IrBinOp::Sub => "sub",
+                        IrBinOp::Mul => "imul",
+                        _ => unreachable!("unexpected i64 binop: {:?}", op),
+                    };
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {}l %{}, %eax", mnem, reg_name));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {}q %{}, %rax", mnem, reg_name));
+                    }
+                }
+                IrBinOp::And => {
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    andl %{}, %eax", reg_name));
+                    } else {
+                        self.state.emit_fmt(format_args!("    andq %{}, %rax", reg_name));
+                    }
+                }
+                IrBinOp::Or => {
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    orl %{}, %eax", reg_name));
+                    } else {
+                        self.state.emit_fmt(format_args!("    orq %{}, %rax", reg_name));
+                    }
+                }
+                IrBinOp::Xor => {
+                    if use_32bit {
+                        self.state.emit_fmt(format_args!("    xorl %{}, %eax", reg_name));
+                    } else {
+                        self.state.emit_fmt(format_args!("    xorq %{}, %rax", reg_name));
+                    }
+                }
+                _ => unreachable!("register-direct path gated to ALU ops"),
+            }
+            self.state.reg_cache.invalidate_acc();
+            if use_32bit {
+                self.store_eax_to(dest);
+            } else {
+                self.store_rax_to(dest);
+            }
+            return;
+        }
+        if let Some(imm) = alu_imm_direct {
+            if use_32bit {
+                self.operand_to_eax(lhs);
+            } else {
+                self.operand_to_rax(lhs);
+            }
+            let mnem = match op {
+                IrBinOp::Add => "add",
+                IrBinOp::Sub => "sub",
+                IrBinOp::And => "and",
+                IrBinOp::Or => "or",
+                IrBinOp::Xor => "xor",
+                _ => unreachable!("imm-direct path gated to ALU ops"),
+            };
+            if use_32bit {
+                self.state
+                    .emit_fmt(format_args!("    {}l ${}, %eax", mnem, imm));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    {}q ${}, %rax", mnem, imm));
+            }
+            self.state.reg_cache.invalidate_acc();
+            if use_32bit {
+                self.store_eax_to(dest);
+            } else {
+                self.store_rax_to(dest);
+            }
+            return;
+        }
         if use_32bit {
             self.operand_to_eax(lhs);
         } else {
