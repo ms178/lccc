@@ -1963,6 +1963,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecFmaF64x4
             | O::VecAddI32x8
             | O::VecMulI32x8
+            // v12 Fix F: VecMaxI32x8 is a two-operand binary (vpmaxsd) —
+            // the consumer reads the deferred vec_load from %ymm0 and folds
+            // it into the 3-operand form. Without this, the vec_load is
+            // stored to a slot every iteration (a dead 256-bit store that
+            // made the vectorized find_max SLOWER than scalar).
+            | O::VecMaxI32x8
             | O::VecBroadcastI32x8
             | O::VecBroadcastF32x8
             | O::VecMulF32x8

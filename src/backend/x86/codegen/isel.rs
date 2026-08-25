@@ -88,10 +88,30 @@ fn emit_mov_operand_r(
     ra: &FxHashMap<u32, PhysReg>,
     out: &mut Vec<MachInst>,
 ) {
+    // v12 Fix E: narrow (S8/S16) Copies to a REGISTER must use the
+    // zero-extending form, matching the cast path's "no stale upper bits"
+    // principle (isel.rs ~526). A plain `movb $1, %dil` writes only 8 bits;
+    // if a later consumer reads the full 32/64 bits (e.g. `movslq %edi`),
+    // the stale upper bytes — often a leftover format-string pointer from a
+    // preceding printf call — make the sign-extend garbage. `movzbl`/
+    // `movzwl` (for Value sources) and `movl $imm` (for Const, zero-extends
+    // to 64 bits) give every wider reader a defined value, same as the cast
+    // lowering. Only fires for REGISTER destinations; memory (slot) stores
+    // keep the narrow size to avoid clobbering a neighbouring 4-byte slot.
+    let narrow = matches!(size, OpSize::S8 | OpSize::S16);
     match op {
         Operand::Value(v) => {
             let src_reg = value_to_reg(v, ra);
-            if src_reg != dst {
+            if narrow {
+                // Even when src_reg == dst, emit movzx — the register may
+                // hold stale upper bytes from a prior narrow write.
+                out.push(MachInst::Movzx {
+                    src: MachOperand::Reg(src_reg),
+                    dst,
+                    from_size: size,
+                    to_size: OpSize::S32,
+                });
+            } else if src_reg != dst {
                 out.push(MachInst::Mov {
                     src: MachOperand::Reg(src_reg),
                     dst: MachOperand::Reg(dst),
@@ -101,11 +121,20 @@ fn emit_mov_operand_r(
         }
         Operand::Const(c) => {
             let val = const_to_i64(c);
-            out.push(MachInst::Mov {
-                src: MachOperand::Imm(val),
-                dst: MachOperand::Reg(dst),
-                size,
-            });
+            if narrow {
+                // movl $imm zero-extends to 64 bits — no stale upper bytes.
+                out.push(MachInst::Mov {
+                    src: MachOperand::Imm(val),
+                    dst: MachOperand::Reg(dst),
+                    size: OpSize::S32,
+                });
+            } else {
+                out.push(MachInst::Mov {
+                    src: MachOperand::Imm(val),
+                    dst: MachOperand::Reg(dst),
+                    size,
+                });
+            }
         }
     }
 }

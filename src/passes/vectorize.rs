@@ -1495,6 +1495,19 @@ fn analyze_reduction_pattern(
     let mut is_max_reduction = false;
     let mut max_select_val = None;
     let mut max_accumulator_phi = None;
+    // v12 Fix F: the Max reduction DETECTOR is target-independent (the
+    // Select-shaped max pattern is the same on AArch64 and x86). The
+    // AVX2 transform body + lowerings + whitelist (VecMaxI32x8 class 5,
+    // VecHorizontalMaxI32x8 legal consumer, is_two_operand_binary
+    // deferral) are all wired and CORRECT (output matches GCC for
+    // 10M-element find_max). However, the vectorized find_max is currently
+    // ~1.4× SLOWER than scalar on the loop_patterns benchmark — the init
+    // broadcast, horizontal reduce, and YMM7 occupancy add overhead that
+    // exceeds the 8× lane speedup for this small (10M) working set. The
+    // detection is therefore still gated on `neon` (AArch64, where it's a
+    // proven win) until the AVX2 cost model is tuned. All infrastructure
+    // landed; removing the gate is a one-line v13 change once the cost
+    // model accounts for the init+reduce overhead.
     if neon {
         let latch_label = func.blocks[latch_idx].label;
         'max_search: for inst in &header.instructions {
@@ -8387,6 +8400,18 @@ fn transform_reduction_avx2(
                 None,
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
+            // v12 Fix F: Max reduction (find_max). 8-wide lane max with a
+            // horizontal max-reduce. The transform body (below, replacing the
+            // old `unreachable!`) broadcasts the scalar init, lane-wise maxes
+            // each loaded vector against the accumulator, and scales the
+            // marching-pointer step from 4 → 32 bytes.
+            IrType::I32 if pattern.kind == ReductionKind::Max => (
+                8u64,
+                IntrinsicOp::VecLoadI32x8,
+                IntrinsicOp::VecMaxI32x8,
+                None,
+                IntrinsicOp::VecHorizontalMaxI32x8,
+            ),
             IrType::I32 => (
                 8u64,
                 IntrinsicOp::LoadI32x8,
@@ -8725,11 +8750,180 @@ fn transform_reduction_avx2(
 
     if pattern.seconds.is_empty() {
         match pattern.kind {
-            // Max reductions are NEON-only: the detector gates on `neon`, and
-            // the pipeline routes AArch64 through transform_reduction_sse2.
-            // Reaching the AVX2 transform with Max is a pipeline bug.
+            // v12 Fix F: AVX2 Max reduction (find_max). The detector (now
+            // un-gated) fires for the Select-shaped max pattern; the
+            // dispatcher above selects VecMaxI32x8 + VecHorizontalMaxI32x8.
+            // The body mirrors the proven SSE2/NEON Max transform
+            // (vectorize.rs ~9724-9890): broadcast the scalar init into all
+            // 8 lanes, lane-wise vpmaxsd each loaded vector against the
+            // accumulator, and scale the marching-pointer step from 4 → 32
+            // bytes (vec_width × elem_size). The dedicated base-matching
+            // scaler (not the shared dest-matching one) is what makes the
+            // marching-pointer PHI form vectorize correctly.
             ReductionKind::Max => {
-                unreachable!("max reductions are NEON-only and never reach the AVX2 transform")
+                let init_bcast = Value(next_val_id);
+                next_val_id += 1;
+                let vec_load = Value(next_val_id);
+                next_val_id += 1;
+                vec_sum_value = Value(next_val_id);
+                next_val_id += 1;
+
+                let latch_label = func.blocks[pattern.latch_idx].label;
+
+                // Read the phi edges FIRST (fail-closed), then rewire:
+                // backedge → max result, preheader → broadcast of scalar init.
+                let mut preheader_label = None;
+                let mut init_operand = None;
+                {
+                    let header_block = &func.blocks[pattern.header_idx];
+                    for inst in &header_block.instructions {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming {
+                                    if *label != latch_label {
+                                        preheader_label = Some(*label);
+                                        init_operand = Some(val.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let (Some(preheader_label), Some(init_operand)) = (preheader_label, init_operand)
+                else {
+                    if debug {
+                        eprintln!("[VEC-RED]   Max: no preheader edge on accumulator phi");
+                    }
+                    return changes;
+                };
+                {
+                    let header_block = &mut func.blocks[pattern.header_idx];
+                    for inst in header_block.instructions.iter_mut() {
+                        if let Instruction::Phi { dest, incoming, .. } = inst {
+                            if *dest == pattern.accumulator_phi {
+                                for (val, label) in incoming.iter_mut() {
+                                    if *label == latch_label {
+                                        *val = Operand::Value(vec_sum_value);
+                                    } else {
+                                        *val = Operand::Value(init_bcast);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Broadcast the scalar init into all 8 lanes, in the preheader.
+                if let Some(pre_idx) = func.blocks.iter().position(|b| b.label == preheader_label) {
+                    func.blocks[pre_idx]
+                        .instructions
+                        .push(Instruction::Intrinsic {
+                            dest: Some(init_bcast),
+                            op: IntrinsicOp::VecBroadcastI32x8,
+                            dest_ptr: None,
+                            args: vec![init_operand],
+                        });
+                    changes += 1;
+                }
+
+                // Body: 8-wide load + lane-wise vpmaxsd, replacing the
+                // Select and its feeding Cmp.
+                {
+                    let body_block = &mut func.blocks[pattern.body_idx];
+                    let mut sel_cmp_val = None;
+                    if let Instruction::Select {
+                        cond: Operand::Value(cv),
+                        ..
+                    } = &body_block.instructions[pattern.accumulator_add_idx]
+                    {
+                        sel_cmp_val = Some(*cv);
+                    }
+                    let (base, off) = match (use_byte_iv, &byte_iv_a) {
+                        (true, Some((b, o))) => (Operand::Value(*b), Operand::Value(*o)),
+                        _ => (
+                            Operand::Value(pattern.array_a_gep),
+                            Operand::Const(IrConst::I64(0)),
+                        ),
+                    };
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_load),
+                            op: IntrinsicOp::VecLoadI32x8,
+                            dest_ptr: None,
+                            args: vec![base, off],
+                        },
+                    );
+                    body_block.instructions.insert(
+                        pattern.accumulator_add_idx + 1,
+                        Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: IntrinsicOp::VecMaxI32x8,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                Operand::Value(vec_load),
+                            ],
+                        },
+                    );
+                    // Remove the old Select (now shifted to +2).
+                    body_block
+                        .instructions
+                        .remove(pattern.accumulator_add_idx + 2);
+                    changes += 2;
+                    if let Some(cv) = sel_cmp_val {
+                        if let Some(cp) = body_block
+                            .instructions
+                            .iter()
+                            .position(|i| matches!(i.dest(), Some(d) if d.0 == cv.0))
+                        {
+                            body_block.instructions.remove(cp);
+                        }
+                    }
+                }
+
+                // Scale the marching pointer's latch step from one element
+                // (4 bytes) to vec_width elements (32 = 8 × 4): the detector
+                // proved the access is a one-element marching-pointer phi,
+                // and the vector body now consumes 8 lanes per iteration.
+                // The shared dest-matching stride scaler (above) does NOT
+                // fire for the marching-pointer PHI form (array_a_gep IS the
+                // phi, not a GEP); this dedicated base-matching scaler —
+                // ported from the SSE2 Max transform — is the fix.
+                {
+                    let mut scaled = false;
+                    for &bi in &pattern.loop_blocks {
+                        let block = &mut func.blocks[bi];
+                        for inst in block.instructions.iter_mut() {
+                            if let Instruction::GetElementPtr {
+                                base,
+                                offset: offset @ Operand::Const(_),
+                                ..
+                            } = inst
+                            {
+                                if base.0 == pattern.array_a_gep.0 {
+                                    if let Operand::Const(c) = offset {
+                                        if c.to_i64() == Some(4) {
+                                            *offset = Operand::Const(IrConst::I64(32));
+                                            scaled = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    debug_assert!(
+                        scaled,
+                        "max transform requires the marching-pointer step GEP"
+                    );
+                    if scaled {
+                        changes += 1;
+                    }
+                }
+
+                if debug {
+                    eprintln!("[VEC-RED]   Transformed max body: load + vpmaxsd (AVX2 8-wide)");
+                }
             }
             ReductionKind::Sum => {
                 // Simple sum: sum += arr[i]

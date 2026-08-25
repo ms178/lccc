@@ -30,12 +30,12 @@ SHA at last doc refresh: **`2f81cdce`** (`ms178/lccc` main, PR #165; explicit-ac
 | gzip `longest_match` | 118 stack-mem, GOT, 248 B frame | gcc RIP `window(%r9,%rcx)`, 1 push |
 | Adler-32 kernel | 1.49×; `sum2`/`n` on stack in DO8 | CE whole-file ~0–3 stack refs |
 | CRC-32 kernel | 1.49×; 2 vs 0 spills | gcc `xorl table(,%reg,4)` — **no `crc32` insn** at `-O2` |
-| Expat name scan | 1.76× (v11; regressed from 0.81 v8) | gcc `btq`; gcc keeps FNV prime in `%r10` (LCCC spills hoisted const to stack) |
+| Expat name scan | 1.69× (v12) | FNV-prime IS register-homed (%r14); gap is loop rotation + byte-classify verbose vs GCC case-fold |
 | xmltok / inflate TUs | 12× / 15× stack-mem | segment RA (scan still on fat `intervals`) |
 | struct_copy | 1.54× | SysV SSE class + no xmm↔rax field copies |
-| nbody / spectral / mandelbrot | **0.81 / 0.77 / 0.81** (v11; FP staging-copy elimination + cmp-branch fusion) | ICX FMA+YMM (copy **ICX**, not gcc16 horiz-per-iter) |
+| nbody / spectral / mandelbrot | **1.26 / 1.30 / 1.23** (v12; FP staging-copy elimination + cmp-branch fusion) | ICX FMA+YMM (copy **ICX**, not gcc16 horiz-per-iter); remaining: loop rotation |
 | find_bit | 1.42× (v11) | gcc `andn`+`cmov` on ffs tree (**not** tzcnt) |
-| loop_patterns | 1.92× (v11) | LCG seed ping-pong; int dot_product scalar; find_max scalar (intrinsics landed, transform wiring pending) |
+| loop_patterns | **0.98× (beats GCC)** (v12; LCG RA precise-span seed + fused mul-add + widening accumulator coalescing) | find_max AVX2 transform wired + correct but detection gated pending cost-model; int dot_product scalar (vpmuldq v13) |
 | bitops | — | gcc/clang `popcntl` if IR is Popcount |
 | sieve | 1.3× | gcc 45-insn **scalar**; clang ymm explosion — **do not copy clang** |
 | fib/TCE geomean | LCCC can beat gcc | **not** a codec metric |

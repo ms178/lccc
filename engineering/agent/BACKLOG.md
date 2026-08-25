@@ -96,17 +96,17 @@ Build: `scripts/ensure_swap.sh` then `scripts/build_lccc_fast.sh` → `target/fa
 | gzip `longest_match` | 118 vs 0 stack-mem, 248 B frame, GOT | **RA remat + RIP + IV homes** | gcc `window(%r9,%rcx)`, 1× push rbx |
 | zlib-ng Adler kernel | **1.49×** | **RA next-use** (`sum2`/`n` on stack in DO8) | icx/clang: 0 stack |
 | gzip CRC kernel | **1.47–1.49×**, 2 vs 0 spills | **ISel SIB** `crc_table(,%rcx,4)` | gcc 20-line loop; **no `crc32` insn** |
-| Expat name scan | **1.76×** (v11; regressed from 0.81 in v8) | **FNV-prime LICM hoist spills to stack** (regalloc keep-in-reg); byte-classify verbose vs GCC case-fold | gcc `btq`; gcc keeps FNV prime in `%r10` |
+| Expat name scan | **1.69×** (v12) | FNV-prime IS register-homed (%r14); gap is loop rotation + byte-classify verbose vs GCC case-fold | gcc `btq`; gcc keeps FNV prime in `%r10` |
 | xmltok.c TU | **12×** stack-mem | **RA segments** | — |
 | inflate.c TU | **15×** stack-mem | **RA segments + switch** | — |
 | `struct_copy` | **1.54×** (41 vs 26 ms; was 21.06×, then 3.11×) | aggregate copy-forward fixed (param-set staleness, GEP-hoist, window over-rejection); remainder = scalar movsd chains vs GCC's paired mulpd | gcc/icx: 2× ymm for 64 B `*dst=*src` |
 | `dot` (int, loop_patterns) | **scalar** (1.99× with find_max) | **needs `vpmuldq` widening-mul intrinsic** + vectorizer dot for I32→I64 | gcc scalar too; widening-mul can beat |
 | double I32 reduction | **0.7251×** stack-home control (95% CI 0.6007..0.8807); **0.895× GCC** | integer reduction homes complete; shared-load/temp forwarding remains | 215 vs control 227 instructions; 39 vs 63 stack refs |
 | multi-use SSE sat chain | register homes **0.9410×** stack control (95% CI 0.9182..0.9627) | **RA-21 done**; remaining loop-invariant/DSE gap | LCCC 58 insn; GCC 19, Clang 11, ICC 16, ICX 23 |
-| nbody / spectral / mandelbrot | **0.81 / 0.77 / 0.81** (v11; FP staging-copy elimination + cmp-branch fusion) | remaining: non-reduction FP YMM vectorize | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
+| nbody / spectral / mandelbrot | **1.26 / 1.30 / 1.23** (v12; FP staging-copy elimination + cmp-branch fusion) | remaining: loop rotation + non-reduction FP YMM vectorize | ICX nbody 97 ymm / 58 FMA; gcc 0 ymm / 24 FMA |
 | sqlite varint | **1.34×** (v11) | **ISel branches**, not inline | — |
 | linux_find_bit | **1.42×** (v11) | gcc **`andn`+`cmov`** on C ffs tree, **not tzcnt** | CE corpus |
-| loop_patterns | **1.92×** (v11) | LCG seed ping-pong + const staging; int dot_product scalar; find_max scalar (intrinsics landed, transform wiring pending) | gcc `vpmaxsd` would beat its scalar |
+| loop_patterns | **0.98× (beats GCC)** (v12; LCG RA precise-span seed + fused mul-add + widening accumulator coalescing) | find_max AVX2 transform wired + correct but detection gated pending cost-model; int dot_product scalar (vpmuldq v13) | gcc `vpmaxsd` would beat its scalar |
 | bitops | — | gcc/clang `popcntl` | recognize hand-rolled popcount |
 | sieve | 1.3× S | gcc **45 scalar**; clang **365 ymm** | **do not copy clang** |
 | geomean micros | 0.92× | **fib TCE** — ignore for codecs | — |
