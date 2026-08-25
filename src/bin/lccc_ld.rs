@@ -139,6 +139,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut emit_symtab = true;
     let mut relocatable = false;
     let mut emit_relocs = false;
+    let mut gc_sections = false;
     let mut is_pie = false;
     let mut build_id = false;
     let mut entry_override: Option<String> = None;
@@ -263,8 +264,14 @@ fn run(args: &[String]) -> Result<(), String> {
                 passthrough.push("-static".to_string());
             }
             "-Bdynamic" | "-dy" | "-call_shared" => {}
-            "--gc-sections" => passthrough.push("-Wl,--gc-sections".to_string()),
-            "--no-gc-sections" => {}
+            "--gc-sections" => {
+                gc_sections = true;
+                passthrough.push("-Wl,--gc-sections".to_string());
+            }
+            "--no-gc-sections" => {
+                gc_sections = false;
+                passthrough.push("-Wl,--no-gc-sections".to_string());
+            }
             "--no-undefined" => {
                 // Script links resolve every non-weak relocation eagerly.
                 passthrough.push(a.to_string());
@@ -503,6 +510,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 emit_symtab,
                 is_pie || shared,
                 emit_relocs,
+                gc_sections,
                 soname.as_deref(),
                 bsymbolic,
                 max_page_size,
@@ -515,6 +523,7 @@ fn run(args: &[String]) -> Result<(), String> {
             emit_symtab,
             is_pie || shared,
             emit_relocs,
+            gc_sections,
             soname.as_deref(),
             bsymbolic,
             max_page_size,

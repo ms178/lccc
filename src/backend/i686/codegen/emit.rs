@@ -2202,7 +2202,20 @@ impl ArchCodegen for I686Codegen {
         let is_wide = match src {
             Operand::Value(v) => self.state.is_wide_value(v.0),
             Operand::Const(IrConst::F64(_)) => true,
-            Operand::Const(IrConst::I64(_)) => true,
+            // Integer constants are represented as I64 even when their
+            // semantic destination is U32 (for example a U32 phi incoming
+            // value).  Treating every I64 container as a wide value wrote a
+            // gratuitous zero high word.  That was merely bloat with legacy
+            // 8-byte slots, but corrupts the neighbouring value once i686
+            // uses its natural 4-byte scalar slots.  Stack classification and
+            // generate_copy propagate the authoritative semantic width to the
+            // destination; the range fallback preserves standalone constants
+            // that genuinely cannot fit one 32-bit word.
+            Operand::Const(IrConst::I64(v)) => {
+                self.state.is_wide_value(dest.0)
+                    || *v < i32::MIN as i64
+                    || *v > u32::MAX as i64
+            }
             _ => false,
         };
         if is_wide {

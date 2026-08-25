@@ -782,6 +782,7 @@ pub fn link_with_script(
     emit_symtab: bool,
     is_pie: bool,
     emit_relocs: bool,
+    gc_sections: bool,
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
@@ -793,6 +794,7 @@ pub fn link_with_script(
         emit_symtab,
         is_pie,
         emit_relocs,
+        gc_sections,
         soname,
         bsymbolic,
         max_page_size,
@@ -810,6 +812,7 @@ pub fn link_with_script_i386(
     emit_symtab: bool,
     is_pie: bool,
     emit_relocs: bool,
+    gc_sections: bool,
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
@@ -821,6 +824,7 @@ pub fn link_with_script_i386(
         emit_symtab,
         is_pie,
         emit_relocs,
+        gc_sections,
         soname,
         bsymbolic,
         max_page_size,
@@ -838,6 +842,7 @@ fn link_with_script_machine(
     // `--emit-relocs`: retain the (already applied) relocations in `.rela.*`
     // for ELF64 or `.rel.*` for ELF32.
     emit_relocs: bool,
+    gc_sections: bool,
     soname: Option<&str>,
     bsymbolic: bool,
     max_page_size: u64,
@@ -845,12 +850,49 @@ fn link_with_script_machine(
 ) -> Result<(), String> {
     let script: LinkerScript = linker_script::parse_linker_script(script_src)?;
 
+    // `--gc-sections` for script links uses the same relocation-reachability
+    // engine as ordinary links, with two script-specific root classes:
+    // ENTRY(symbol) and every input section matched by KEEP(...).  Merely
+    // assigning `start = .; *(registry); stop = .` does not root a registry in
+    // GNU ld; the script author must say KEEP, which is why the distinction is
+    // retained in the parsed AST.
+    let dead_sections: FxHashSet<(usize, usize)> = if gc_sections {
+        let mut kept: FxHashSet<(usize, usize)> = FxHashSet::default();
+        for item in &script.sections {
+            let SectionsItem::Output(def) = item else {
+                continue;
+            };
+            for body_item in &def.items {
+                let SecItem::Input(spec) = body_item else {
+                    continue;
+                };
+                if !spec.keep {
+                    continue;
+                }
+                for (oi, obj) in objects.iter().enumerate() {
+                    for (si, sec) in obj.sections.iter().enumerate() {
+                        if spec.patterns.iter().any(|pattern| glob_match(pattern, &sec.name)) {
+                            kept.insert((oi, si));
+                        }
+                    }
+                }
+            }
+        }
+        let roots: Vec<String> = script.entry.iter().cloned().collect();
+        linker_common::gc_collect_sections_elf64_roots_and_sections(objects, &roots, &kept)
+    } else {
+        FxHashSet::default()
+    };
+
     // ── Global symbol table from objects (defined globals + weak) ──
     // name -> (obj_idx, sec_idx(SHN), value, size, info)
     let mut def_syms: FxHashMap<String, (usize, u16, u64, u64, u8)> = FxHashMap::default();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
             if sym.name.is_empty() || sym.is_local() {
+                continue;
+            }
+            if dead_sections.contains(&(oi, sym.shndx as usize)) {
                 continue;
             }
             if sym.is_undefined() || sym.shndx == SHN_COMMON {
@@ -943,6 +985,9 @@ fn link_with_script_machine(
     let mut unassigned: Vec<(usize, usize)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, sec) in obj.sections.iter().enumerate() {
+            if dead_sections.contains(&(oi, si)) {
+                continue;
+            }
             // Ordinary object string/symbol/relocation tables are linker
             // metadata rather than input sections.  An allocated string table
             // is different: .dynstr must participate in script matching.
@@ -2239,11 +2284,13 @@ fn link_with_script_machine(
                     None if !os.is_alloc && {
                         if sym.is_local() || sym.sym_type() == STT_SECTION {
                             discard.contains(&(oi, sym.shndx as usize))
+                                || dead_sections.contains(&(oi, sym.shndx as usize))
                         } else {
                             def_syms
                                 .get(sym.name.as_str())
                                 .is_some_and(|&(doi, shndx, _, _, _)| {
                                     discard.contains(&(doi, shndx as usize))
+                                        || dead_sections.contains(&(doi, shndx as usize))
                                 })
                         }
                     } =>

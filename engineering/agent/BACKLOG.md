@@ -291,7 +291,7 @@ Each row: `ID | P | item | files | evidence | accept | do-not`.
 | 124 | AB-10 | P2 | Postgres frame size | ideas | **C** | | |
 | 125 | AB-11 | P1 | Alloca escape analysis more GEP | stack_layout | **C** | | |
 | 126 | AB-12 | P2 | Two coalescers unify | RA vs stack | **C** | one policy | |
-| 127 | AB-13 | P2 | i686 boot 32K | external_tools TODO | **C** | | |
+| 127 | AB-13 | DONE (2026-08-25 session 82) | i686 Linux setup 32 KiB gate | natural 4-byte i686 slots + `.loc`-transparent peepholes + measured `-m16 -Os` phase policy + ELF32 script `--gc-sections`/`KEEP` | **C/M** patched linux-cachymod 6.18.44: `_end=0x79c0`, 1,600 B headroom; 26,208-byte flat image byte-identical across lccc-ld/BFD/LLD; `.pecompat` and `.videocards` retained | authentic ASSERTs + ELF32 GC oracle + m32/regparm fuzz | weaken ASSERT or drop protocol registries |
 | 128 | AB-14 | DONE | Preserve positional parameter-Alloca prefixes and fuse adjacent F128 Load→Store into exact 16-byte backend memcpy; fixes pointer-as-x87-argument corruption and removes approximation/intermediate churn | DCE + shared generation | **G/M** runtime exact; LCCC 15→8 instructions (oracles 3); unit prefix invariant; cross-backend 16-byte copy path | correct stack ABI/runtime | delete earlier live-prefix homes |
 | 129 | AB-15 | P1 | Dead XMM save in integer varargs remaining | vararg_fp_save | **C** | | |
 

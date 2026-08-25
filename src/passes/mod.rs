@@ -685,6 +685,18 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     iphase_dump!("post-inline cleanup");
 }
 
+fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
+    if !code16gcc || opt_level < 4 {
+        return;
+    }
+    for pass in ["postinline", "ifconv", "gaddrcse", "licm"] {
+        if !disabled.is_empty() {
+            disabled.push(',');
+        }
+        disabled.push_str(pass);
+    }
+}
+
 /// Run optimization passes for the requested optimization level.
 ///
 /// `opt_level`: 0=-O0, 1=-O1, 2=-O2, 3=-O3, 4=-Os, 5=-Oz.
@@ -692,6 +704,7 @@ pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
     target: crate::backend::Target,
+    code16gcc: bool,
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
     x86_avx: bool,
@@ -701,7 +714,16 @@ pub(crate) fn run_passes(
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
     vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
-    let disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
+    // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
+    // and only six generally usable GPRs.  On the real linux-cachymod setup
+    // corpus these four transformations increase final machine-code size by
+    // merging live ranges faster than they remove operations.  This is not a
+    // generic i686 policy: ordinary -m32 keeps the throughput-oriented
+    // pipeline.  Restrict the measured size profile to explicit -m16 -Os/-Oz.
+    if std::env::var_os("CCC_M16_FULL_PIPELINE").is_none() {
+        apply_m16_size_policy(&mut disabled, code16gcc, opt_level);
+    }
     // Debug hook: dump the module IR to stderr before optimization.
     if std::env::var("CCC_DUMP_IR").is_ok() {
         eprintln!("==== IR before passes (opt_level={}) ====", opt_level);
@@ -1595,5 +1617,26 @@ pub(crate) fn run_passes(
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);
         eprintln!("==== END IR after all passes ====");
+    }
+}
+
+#[cfg(test)]
+mod m16_size_policy_tests {
+    use super::apply_m16_size_policy;
+
+    #[test]
+    fn policy_is_limited_to_size_optimized_code16() {
+        for (code16, level) in [(false, 4), (true, 0), (true, 2), (false, 5)] {
+            let mut disabled = String::new();
+            apply_m16_size_policy(&mut disabled, code16, level);
+            assert!(disabled.is_empty(), "code16={code16} level={level}");
+        }
+
+        let mut disabled = "vectorize".to_string();
+        apply_m16_size_policy(&mut disabled, true, 4);
+        assert_eq!(
+            disabled,
+            "vectorize,postinline,ifconv,gaddrcse,licm"
+        );
     }
 }

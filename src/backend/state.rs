@@ -727,8 +727,9 @@ impl CodegenState {
     ///
     /// Soundness contract (enforced by the slot allocator):
     ///   1. Small slots are only allocated on targets whose store/load paths
-    ///      are width-consistent (x86-64; see set_target_small_slots), and
-    ///      only for values whose IR type is ≤ 4 bytes.
+    ///      are width-consistent (x86-64 and i686; see
+    ///      set_target_small_slots), and only for values proven no wider than
+    ///      four bytes. i686's proof propagates through untyped Copy webs.
     ///   2. Slot sharing is partitioned by exact size class — Tier 3 free
     ///      lists, Tier 2 graph coloring and copy-alias resolution never mix
     ///      4-byte and 8-byte occupants of the same physical slot. A 4-byte

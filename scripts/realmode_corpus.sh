@@ -60,7 +60,7 @@ RMF=(
   -march=i386 -mregparm=3
   -fno-strict-aliasing -fomit-frame-pointer -fno-pic
   -mno-mmx -mno-sse -mpreferred-stack-boundary=2
-  -ffreestanding -fno-stack-protector
+  -ffreestanding -ffunction-sections -fno-stack-protector
   -fno-asynchronous-unwind-tables
   -fcf-protection=none
   -fno-jump-tables
