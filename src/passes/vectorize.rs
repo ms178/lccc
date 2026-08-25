@@ -454,6 +454,14 @@ struct ReductionPattern {
     /// the primary; chains share only loads and the induction variable, never
     /// state.
     seconds: Vec<SecondaryAccumulator>,
+    /// Conditional-sum guard: the Cmp value feeding the Select that wraps
+    /// the accumulator update (`if (a[i] > 0) s += a[i]`). None for plain
+    /// reductions. The transform emits the MASKED widening add
+    /// (VecWidenMaskedAddI32x4ToI64x2) for this shape.
+    guard_cond: Option<Value>,
+    /// The guard comparison's rhs operand (validated: the comparison is
+    /// `loaded_lane > guard_rhs`, signed, lhs = the loaded element).
+    guard_rhs: Option<Operand>,
 }
 
 /// Value IDs of one extra accumulator's scalar remainder chain.
@@ -1223,6 +1231,7 @@ fn reduction_pattern_is_sound(
                         | Instruction::Cast { .. }
                         | Instruction::Phi { .. }
                         | Instruction::Cmp { .. }
+                        | Instruction::Select { .. }
                 )
             {
                 continue;
@@ -1665,6 +1674,11 @@ fn analyze_reduction_pattern(
     let mut body_idx = None;
     let mut accumulator_add_idx = None;
     let mut add_result = None;
+    // Conditional-sum guard (if_convert output): the Select wrapping the
+    // accumulator update. `s' = Select(cond, s + x, s)` — the guard Cmp's
+    // value id; validated after the added-value chain resolves.
+    let mut guard_select_cond: Option<Value> = None;
+    let mut guard_rhs: Option<Operand> = None;
     for &block_idx in &loop_info.body {
         if block_idx == header_idx {
             continue;
@@ -1720,6 +1734,34 @@ fn analyze_reduction_pattern(
                     body_idx = Some(block_idx);
                     accumulator_add_idx = Some(idx);
                     add_result = Some(*dest);
+                    // Conditional-sum detection: if this Add's result feeds
+                    // a Select whose other arm is the accumulator phi, the
+                    // update is GUARDED. Record the guard's cond value; the
+                    // plain unguarded path must NOT run (it would drop the
+                    // guard and miscompile), so validation failure later
+                    // rejects the loop entirely.
+                    for sin in block.instructions.iter().skip(idx + 1) {
+                        if let Instruction::Select {
+                            cond,
+                            true_val,
+                            false_val,
+                            ..
+                        } = sin
+                        {
+                            let tv_is_add =
+                                matches!(true_val, Operand::Value(v) if v.0 == dest.0);
+                            let fv_is_phi = matches!(
+                                false_val,
+                                Operand::Value(v) if v.0 == accumulator_phi.0
+                            );
+                            if tv_is_add && fv_is_phi {
+                                if let Operand::Value(cv) = cond {
+                                    guard_select_cond = Some(*cv);
+                                }
+                                break;
+                            }
+                        }
+                    }
                     break;
                 }
             }
@@ -1902,6 +1944,8 @@ fn analyze_reduction_pattern(
         return Some(ReductionPattern {
             kind: ReductionKind::Max,
             seconds: Vec::new(),
+                guard_cond: None,
+                guard_rhs: None,
             element_type: IrType::I32,
             accumulator_type: IrType::I32,
             header_idx,
@@ -1979,6 +2023,68 @@ fn analyze_reduction_pattern(
         );
     }
 
+    // Conditional-sum guard validation. A Select wrapping the accumulator
+    // update was detected in the search; the guarded vector form is only
+    // expressible when the guard compares the LOADED element (the root of
+    // the added-value chain) with signed greater-than against any operand:
+    //   Select(a[iv] > rhs, acc + sext(a[iv]), acc)
+    // The added-value chain's root load: Load directly, or Cast(Load).
+    // Anything else (or no Select at all when one was detected) stays
+    // scalar — the unguarded vector form would silently drop the guard.
+    let mut select_guard_cond: Option<Value> = None;
+    if let Some(gcv) = guard_select_cond {
+        // Resolve the chain root: the loaded I32 element.
+        let chain_root = match added_inst {
+            Instruction::Load { dest, .. } => Some(*dest),
+            Instruction::Cast {
+                src: Operand::Value(sv),
+                ..
+            } => {
+                // The cast's source must be (or feed) the load; accept the
+                // direct-load case and one intervening cast chain link.
+                if let Some(src_inst) = find_inst_by_dest(body, *sv) {
+                    match src_inst {
+                        Instruction::Load { dest, .. } => Some(*dest),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let mut valid = false;
+        if let Some(root_load) = chain_root {
+            'gc: for &bi in &loop_info.body {
+                for inst in &func.blocks[bi].instructions {
+                    if let Instruction::Cmp {
+                        dest, op, lhs, rhs, ..
+                    } = inst
+                    {
+                        if dest.0 == gcv.0
+                            && *op == IrCmpOp::Sgt
+                            && matches!(lhs, Operand::Value(lv) if lv.0 == root_load.0)
+                        {
+                            select_guard_cond = Some(gcv);
+                            guard_rhs = Some(*rhs);
+                            valid = true;
+                            break 'gc;
+                        }
+                    }
+                }
+            }
+        }
+        if !valid {
+            if debug {
+                eprintln!(
+                    "[VEC-RED]   Rejecting: conditional-sum guard is not `loaded > rhs` (staying scalar)"
+                );
+            }
+            set_reject("conditional-sum guard shape not expressible (needs loaded > rhs)");
+            return None;
+        }
+    }
+
     let mut primary_loads: Vec<Value> = Vec::new();
     let mut pattern = match added_inst {
         // Simple sum pattern: sum += arr[i]
@@ -2021,6 +2127,8 @@ fn analyze_reduction_pattern(
                 exit_cmp_dest,
                 loop_blocks: loop_info.body.clone(),
                 seconds: Vec::new(),
+                guard_cond: select_guard_cond,
+                guard_rhs,
             }
         }
 
@@ -2130,6 +2238,8 @@ fn analyze_reduction_pattern(
                     exit_cmp_dest,
                     loop_blocks: loop_info.body.clone(),
                     seconds: Vec::new(),
+                guard_cond: select_guard_cond,
+                guard_rhs,
                 }
             } else {
                 if debug {
@@ -2250,6 +2360,8 @@ fn analyze_reduction_pattern(
                 exit_cmp_dest,
                 loop_blocks: loop_info.body.clone(),
                 seconds: Vec::new(),
+                guard_cond: select_guard_cond,
+                guard_rhs,
             }
         }
 
@@ -4252,6 +4364,7 @@ fn analyze_stencil_pattern(
                     | Instruction::Cmp { .. }
                     | Instruction::Cast { .. }
                     | Instruction::Copy { .. }
+                    | Instruction::Select { .. }
                     | Instruction::GetElementPtr { .. }
                     | Instruction::GlobalAddr { .. } => {}
                     _ => {
@@ -7927,14 +8040,45 @@ fn insert_reduction_remainder_loop(
     // Add pattern-specific operations
     match pattern.kind {
         ReductionKind::Sum => {
-            // Simple sum: sum += array_a[i]
-            remainder_body_instructions.push(Instruction::BinOp {
-                dest: sum_rem_next,
-                op: IrBinOp::Add,
-                lhs: Operand::Value(sum_rem_phi),
-                rhs: Operand::Value(scalar_a),
-                ty: pattern.accumulator_type,
-            });
+            if let Some(guard_rhs) = &pattern.guard_rhs {
+                // Conditional sum: `if (a[i] > rhs) sum += a[i]` — mirror
+                // the guard in the scalar tail (element-type compare on the
+                // UNCAST loaded value, matching the original C semantics).
+                let cmp_rem = Value(*next_val_id);
+                *next_val_id += 1;
+                let add_rem = Value(*next_val_id);
+                *next_val_id += 1;
+                remainder_body_instructions.push(Instruction::Cmp {
+                    dest: cmp_rem,
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(load_rem_a),
+                    rhs: guard_rhs.clone(),
+                    ty: pattern.element_type,
+                });
+                remainder_body_instructions.push(Instruction::BinOp {
+                    dest: add_rem,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(sum_rem_phi),
+                    rhs: Operand::Value(scalar_a),
+                    ty: pattern.accumulator_type,
+                });
+                remainder_body_instructions.push(Instruction::Select {
+                    dest: sum_rem_next,
+                    cond: Operand::Value(cmp_rem),
+                    true_val: Operand::Value(add_rem),
+                    false_val: Operand::Value(sum_rem_phi),
+                    ty: pattern.accumulator_type,
+                });
+            } else {
+                // Simple sum: sum += array_a[i]
+                remainder_body_instructions.push(Instruction::BinOp {
+                    dest: sum_rem_next,
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(sum_rem_phi),
+                    rhs: Operand::Value(scalar_a),
+                    ty: pattern.accumulator_type,
+                });
+            }
         }
         ReductionKind::Max => {
             // mx = max(mx, x) as a scalar Select: take x when x > mx.
@@ -8687,7 +8831,58 @@ fn transform_reduction_avx2(
                         ),
                     };
 
-                    if widening_i64 {
+                    if widening_i64 && pattern.guard_cond.is_some() {
+                        // CONDITIONAL (guarded) widening: the composite
+                        // masked intrinsic carries the guard's rhs operand;
+                        // the lowering builds the per-lane compare mask
+                        // internally. Splice: remove the Select first (it
+                        // sits after the Add), then replace the Add.
+                        let guard_rhs = pattern.guard_rhs.clone().unwrap_or(Operand::Const(
+                            IrConst::I32(0),
+                        ));
+                        let masked_inst = Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                base,
+                                off,
+                                guard_rhs,
+                            ],
+                        };
+                        // The Add's result id (the Select's true_val),
+                        // read BEFORE any splice shifts indices.
+                        let add_result_id = body_block
+                            .instructions
+                            .get(pattern.accumulator_add_idx)
+                            .and_then(|i| i.dest())
+                            .map(|d| d.0);
+                        // Locate the Select (true_val == the Add's result)
+                        // to remove it together with the old Add.
+                        let mut select_idx = None;
+                        for (sidx, sin) in body_block.instructions.iter().enumerate() {
+                            if let Instruction::Select { true_val, .. } = sin {
+                                if matches!(
+                                    true_val,
+                                    Operand::Value(tv) if Some(tv.0) == add_result_id
+                                ) {
+                                    select_idx = Some(sidx);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(si) = select_idx {
+                            body_block.instructions.remove(si);
+                        }
+                        body_block
+                            .instructions
+                            .insert(pattern.accumulator_add_idx, masked_inst);
+                        body_block
+                            .instructions
+                            .remove(pattern.accumulator_add_idx + 1);
+                        changes += 1;
+                    } else if widening_i64 {
                         // One composite intrinsic: acc += sext(load4×I32).
                         let widen_inst = Instruction::Intrinsic {
                             dest: Some(vec_sum_value),

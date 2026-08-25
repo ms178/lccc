@@ -90,26 +90,42 @@ hardware result.
 | `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
 | `mandelbrot` | FP branch-heavy loop | **0.75** (1.33× faster) | pass |
 | `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
-| `expat_xml_scan` | XML name-token scan | **0.81** (1.23× faster) | pass |
-| `sqlite_varint` | varint decoder | **0.72** (1.39× faster) | pass |
+| `expat_xml_scan` | XML name-token scan | **0.62** (1.61× faster) | pass |
+| `sqlite_varint` | varint decoder | **0.63** (1.59× faster) | pass |
 | `linux_find_bit` | sparse bit search | **0.71** (1.41× faster) | pass |
 | `fannkuch` | permutations | **0.75** (1.33× faster) | pass |
 | `spectral_norm` | dense FP | **0.80** (1.25× faster) | pass |
 | `hash_table` (chase) | pointer chasing | **0.92** | pass |
 | `libm_round_family` | libm round intrinsics | **0.47** | gap |
-| `loop_patterns` | scalar loop transforms | **0.13** | gap |
+| `loop_patterns` | scalar loop transforms | **0.39** | gap |
 | `nbody` | N-body FP structs | **0.31** | gap |
 
 **Aggregate: geometric mean ~0.72 (26 pairs, -O3 -march=x86-64-v3, 3-round
 medians, 2026-08-24).** Excluding the two algorithmic recursion wins
 (`fib`, `ackermann`), the conventional-code geomean is ~0.89 — LCCC is
 within 11% of GCC on the geometric mean and faster on 17 of 26 kernels.
-Remaining structural gaps (root-caused, tracked in BACKLOG): loop_patterns
-conditional-sum vectorization needs the masked-add transform; nbody needs
+Remaining structural gaps (root-caused, tracked in BACKLOG): nbody needs
 multi-store scatter (OP-05b); libm_round needs XMM-homed FP call results
-(IS-29a).
+(IS-29a); loop_patterns' residual gap is the LCG init loop + integer dot
+product (widening multiply) + find_max (AVX2 max reduction).
 
 
+
+### v9 highlights (session 80)
+
+- **Conditional-sum vectorization (masked widening reductions)**:
+  `long s = 0; for (...) if (a[i] > K) s += a[i];` now vectorizes as
+  GCC's canonical form — vpcmpgtd lane mask, sign-extended through the
+  widening pipeline, vpand zero-mask, paddq — via the new
+  VecWidenMaskedAddI32x4ToI64x2 composite intrinsic and x86 late
+  vectorization (post-if_convert). The conditional-sum kernel: 62ms
+  scalar → 38ms cmov → **25ms masked** (2.5×; gcc 21ms).
+- **AVX-SSE transition penalty fix in widening codegen**: the widening
+  reductions mixed legacy SSE with VEX instructions — after any
+  YMM-writing loop every legacy op re-triggered the transition penalty
+  (measured 9× on init+map+sum sequences: 318ms → 35ms). All
+  widening-loop instructions are now VEX three-operand forms.
+- **loop_patterns: 381ms → 99ms (3.9×)**; ratio vs GCC 0.11 → 0.39.
 
 ### v8 highlights (sessions 73–78, this tree)
 

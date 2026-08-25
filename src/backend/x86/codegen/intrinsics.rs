@@ -2922,7 +2922,7 @@ impl X86Codegen {
                 self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
                 self.state.emit("    vpmovsxdq %xmm0, %xmm1");
                 self.state.emit("    vpmovsxdq %xmm2, %xmm2");
-                self.state.emit("    paddq %xmm2, %xmm1");
+                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
                 if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
                     let acc_reg = self
                         .reg_assignments
@@ -2940,10 +2940,10 @@ impl X86Codegen {
                         (Some(a), Some(dst)) => {
                             if dst != a {
                                 self.state
-                                    .emit_fmt(format_args!("    movdqa %{}, %{}", a, dst));
+                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
                             }
                             self.state
-                                .emit_fmt(format_args!("    paddq %xmm1, %{}", dst));
+                                .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
                             self.state.vector_values.insert(d.0);
                             self.state.vec_live_regs.insert(d.0, dst);
                             self.state.vec_last_store_val = Some(d.0);
@@ -2957,15 +2957,125 @@ impl X86Codegen {
                             // only when it is provably free — safest is the
                             // accumulator's own SLOT as the staging area).
                             if let Some(slot) = self.state.get_slot(acc.0) {
-                                self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, "xmm3");
-                                self.state.emit("    paddq %xmm1, %xmm3");
+                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
+                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
                                 if let Some(dslot) = self.state.get_slot(d.0) {
                                     self.state
                                         .out
-                                        .emit_instr_reg_rbp("    movdqu", "xmm3", dslot.0);
+                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
                                 }
                             } else {
                                 self.state.emit("    paddq %xmm1, %xmm1");
+                            }
+                        }
+                    }
+                }
+            }
+            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
+                // dest(I64x2 accumulator) += sext(load4×I32(base, off))
+                // where lane > guard_rhs. args = [acc, base, off, guard_rhs].
+                //
+                // Same lane geometry as VecWidenAddI32x4ToI64x2, plus the
+                // per-lane mask: the I32 0/-1 compare result sign-extends
+                // through the SAME vpmovsxdq splits to all-ones/all-zeros
+                // I64 masks, so vpand zero-masks the widened values exactly
+                // per lane (GCC's canonical conditional-reduction form):
+                //   vmovdqu (mem)            → xmm0 = {a0,a1,a2,a3}
+                //   vpunpckhqdq x0,x0 → xmm2 = {a2,a3,a2,a3}
+                //   vpmovsxdq xmm0 → xmm1    = {sext(a0), sext(a1)}
+                //   vpmovsxdq xmm2 → xmm2    = {sext(a2), sext(a3)}
+                //   <mask into xmm4>         = {a0>r, a1>r, a2>r, a3>r}
+                //   vpcmpgtd x4,x0 → x4      = per-lane I32 0/-1 mask
+                //   vpunpckhqdq x4,x4 → x5   = mask lanes 2,3
+                //   vpmovsxdq xmm4 → xmm3    = {m0, m1} as I64
+                //   vpmovsxdq xmm5 → xmm5    = {m2, m3} as I64
+                //   vpand x3,x1 → x1 ; vpand x5,x2 → x2   (zero-mask)
+                //   paddq x2,x1              → per-lane guarded sums
+                //   dst = paddq(acc, xmm1)
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
+                match index {
+                    Some(idx) => self.state.emit_fmt(format_args!(
+                        "    vmovdqu (%{},%{}), %xmm0",
+                        base, idx
+                    )),
+                    None => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
+                }
+                // Split + widen the VALUES.
+                self.state.emit("    vpunpckhqdq %xmm0, %xmm0, %xmm2");
+                self.state.emit("    vpmovsxdq %xmm0, %xmm1");
+                self.state.emit("    vpmovsxdq %xmm2, %xmm2");
+                // Build the mask in xmm4 = broadcast(guard_rhs).
+                match &args[3] {
+                    Operand::Const(c) if c.to_i64() == Some(0) => {
+                        self.state.emit("    vpxor %xmm4, %xmm4, %xmm4");
+                    }
+                    Operand::Const(c) => {
+                        if let Some(v) = c.to_i64() {
+                            self.state
+                                .emit_fmt(format_args!("    movl ${}, %eax", v as i32));
+                        } else {
+                            self.state.emit("    xorl %eax, %eax");
+                        }
+                        self.state.emit("    vmovd %eax, %xmm4");
+                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
+                    }
+                    op => {
+                        // Scalar value operand: materialize into %eax.
+                        self.operand_to_reg(op, "rax");
+                        self.state.emit("    vmovd %eax, %xmm4");
+                        self.state.emit("    vpshufd $0, %xmm4, %xmm4");
+                    }
+                }
+                // mask = lanes > rhs (AT&T: vpcmpgtd src2=rhs, src1=lanes).
+                self.state.emit("    vpcmpgtd %xmm4, %xmm0, %xmm4");
+                // Split + widen the MASK (same lane geometry).
+                self.state.emit("    vpunpckhqdq %xmm4, %xmm4, %xmm5");
+                self.state.emit("    vpmovsxdq %xmm4, %xmm3");
+                self.state.emit("    vpmovsxdq %xmm5, %xmm5");
+                // Zero-mask the widened values per lane.
+                self.state.emit("    vpand %xmm3, %xmm1, %xmm1");
+                self.state.emit("    vpand %xmm5, %xmm2, %xmm2");
+                self.state.emit("    vpaddq %xmm2, %xmm1, %xmm1");
+                if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
+                    let acc_reg = self
+                        .reg_assignments
+                        .get(&acc.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name(r));
+                    let dst_reg = self
+                        .reg_assignments
+                        .get(&d.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name(r));
+                    match (acc_reg, dst_reg) {
+                        (Some(a), Some(dst)) => {
+                            if dst != a {
+                                self.state
+                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
+                            }
+                            self.state
+                                .emit_fmt(format_args!("    vpaddq %xmm1, %{}, %{}", dst, dst));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(dst);
+                        }
+                        _ => {
+                            if let Some(slot) = self.state.get_slot(acc.0) {
+                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm3");
+                                self.state.emit("    vpaddq %xmm1, %xmm3, %xmm3");
+                                if let Some(dslot) = self.state.get_slot(d.0) {
+                                    self.state
+                                        .out
+                                        .emit_instr_reg_rbp("    vmovdqu", "xmm3", dslot.0);
+                                }
                             }
                         }
                     }
