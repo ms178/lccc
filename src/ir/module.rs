@@ -12,6 +12,10 @@ use crate::common::types::IrType;
 #[derive(Debug)]
 pub struct IrModule {
     pub functions: Vec<IrFunction>,
+    /// Explicit per-function alignment requested by declarations. Kept at
+    /// module level so redeclarations/prototypes can contribute without
+    /// inflating every IrFunction and every optimization clone.
+    pub function_alignments: crate::common::fx_hash::FxHashMap<String, usize>,
     /// Linker names of functions referenced by this translation unit but not
     /// defined in it. Backends need this distinction when taking addresses:
     /// PIE may use copy relocations for ordinary extern data, but no analogous
@@ -281,6 +285,7 @@ impl IrModule {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
+            function_alignments: crate::common::fx_hash::FxHashMap::default(),
             extern_function_symbols: crate::common::fx_hash::FxHashSet::default(),
             globals: Vec::new(),
             string_literals: Vec::new(),

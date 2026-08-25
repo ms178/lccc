@@ -3012,6 +3012,14 @@ fn emit_functions_and_sections(
         if !func.is_declaration {
             let sect = function_text_section(func, function_sections);
             emit_switch_to_section(cg, &sect);
+            if let Some(&alignment) = module.function_alignments.get(&func.name) {
+                if alignment > 1 && alignment.is_power_of_two() {
+                    cg.state().emit_fmt(format_args!(
+                        ".p2align {}",
+                        alignment.trailing_zeros()
+                    ));
+                }
+            }
             generate_function(cg, func, source_mgr, file_table);
         }
     }
@@ -3283,6 +3291,18 @@ fn generate_function(
             }
         })
     });
+    let has_frame_address = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
+                        | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                    ..
+                }
+            )
+        })
+    });
     let has_vector_intrinsics = func.blocks.iter().any(|block| {
         block.instructions.iter().any(|inst| {
             matches!(inst, Instruction::Intrinsic { op, .. }
@@ -3307,8 +3327,11 @@ fn generate_function(
     // gate; previously the CLI flag was dropped entirely (so
     // `-fno-omit-frame-pointer` silently did nothing) and variadic functions
     // were unconditionally pinned to a frame pointer.
-    cg.state().omit_frame_pointer =
-        cg.state().fpo_requested && !has_dyn_alloca && !has_inline_asm_fp && !has_vector_intrinsics;
+    cg.state().omit_frame_pointer = cg.state().fpo_requested
+        && !has_dyn_alloca
+        && !has_inline_asm_fp
+        && !has_frame_address
+        && !has_vector_intrinsics;
 
     cg.state().current_func_name = func.name.clone();
     let raw_space = cg.calculate_stack_space(func);

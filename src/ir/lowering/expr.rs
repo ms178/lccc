@@ -93,6 +93,20 @@ impl Lowerer {
         true_label: BlockId,
         false_label: BlockId,
     ) {
+        if let Expr::BinaryOp(op @ (BinOp::LogicalAnd | BinOp::LogicalOr), lhs, rhs, _) = expr {
+            if let Some(value) = super::expr_ops::fold_comparison_pair(
+                lhs,
+                rhs,
+                *op == BinOp::LogicalAnd,
+            ) {
+                self.terminate(Terminator::Branch(if value {
+                    true_label
+                } else {
+                    false_label
+                }));
+                return;
+            }
+        }
         let const_side = |e: &Expr| self.eval_const_expr(e).is_some();
         match expr {
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
@@ -389,7 +403,12 @@ impl Lowerer {
             ty,
             size: ty.size(),
             align: ty.align(),
-            volatile: false,
+            // InlineAsm outputs carry destination addresses. Keep this
+            // compiler-generated home out of mem2reg even for a register
+            // constraint (`={rbx}`): promoting it removes the Load but leaves
+            // the asm writing through the old pointer, producing an undefined
+            // SSA result.
+            volatile: true,
             semantic_volatile: false,
         });
         let output_constraint = format!("={{{}}}", reg_name);

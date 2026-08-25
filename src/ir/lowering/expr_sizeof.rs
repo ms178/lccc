@@ -457,10 +457,12 @@ impl Lowerer {
     /// explicit alignment (taking the max of the natural alignment and the
     /// declared alignment).
     pub(super) fn alignof_expr(&self, expr: &Expr) -> usize {
-        // Check if the expression is a variable with an explicit alignment override.
-        // _Alignof on an identifier should return the variable's declared alignment,
-        // not just its natural type alignment.
+        // Check if the expression is a variable/function with an explicit
+        // alignment override, including an earlier function prototype.
         if let Expr::Identifier(name, _) = expr {
+            if let Some(&alignment) = self.module.function_alignments.get(name) {
+                return alignment;
+            }
             if let Some(vi) = self.lookup_var_info(name) {
                 if let Some(explicit_align) = vi.explicit_alignment {
                     // Return max of natural type alignment and explicit alignment
@@ -500,8 +502,11 @@ impl Lowerer {
         if target_ptr_size() != 4 {
             return self.alignof_expr(expr);
         }
-        // Check for explicit alignment on a variable identifier
+        // Check for explicit alignment on a variable/function identifier.
         if let Expr::Identifier(name, _) = expr {
+            if let Some(&alignment) = self.module.function_alignments.get(name) {
+                return alignment;
+            }
             if let Some(vi) = self.lookup_var_info(name) {
                 if let Some(explicit_align) = vi.explicit_alignment {
                     let natural = if let Some(ref ctype) = vi.c_type {

@@ -128,11 +128,11 @@ impl X86Codegen {
             .emit_fmt(format_args!("    movq %rbp, {}(%rax)", rbp_off));
         self.state
             .emit_fmt(format_args!("    movq %rsp, {}(%rax)", rsp_off));
-        let base = rbp_off + 16;
-        for (i, reg) in ["rbx", "r12", "r13", "r14", "r15"].iter().enumerate() {
-            self.state
-                .emit_fmt(format_args!("    movq %{}, {}(%rax)", reg, base + 8 * i as i64));
-        }
+        // Callee-saved GPRs need no explicit snapshot: every intervening
+        // ordinary call preserves them by ABI. More importantly, a global
+        // register variable may be intentionally modified immediately before
+        // the non-local goto; restoring an entry snapshot would erase that
+        // source-visible assignment. GCC saves only rbp/rsp here.
         self.state.reg_cache.invalidate_all();
     }
 
@@ -152,16 +152,10 @@ impl X86Codegen {
         for _ in 0..up {
             self.state.emit("    movq (%rax), %rax");
         }
-        // Restore the FULL register state of the target frame's entry:
-        // callee-saved GPRs first (rbx, r12..r15), then rbp; %rsp LAST —
-        // the loads address the frame through %rax, which stays valid
-        // because %rax is not callee-saved and %rsp does not affect
-        // addressing off %rax.
-        let base = rbp_off + 16;
-        for (i, reg) in ["rbx", "r12", "r13", "r14", "r15"].iter().enumerate() {
-            self.state
-                .emit_fmt(format_args!("    movq {}(%rax), %{}", base + 8 * i as i64, reg));
-        }
+        // Restore the target frame and stack. Callee-saved GPRs are already
+        // preserved by the ABI and may carry global-register assignments that
+        // must survive this transfer (GCC's implementation likewise restores
+        // only rbp/rsp).
         self.state
             .emit_fmt(format_args!("    movq {}(%rax), %rbp", rbp_off));
         self.state

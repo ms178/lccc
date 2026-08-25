@@ -200,6 +200,19 @@ impl X86Codegen {
         };
         let mut available_regs =
             crate::backend::generation::filter_available_regs(callee_base, &asm_clobbered_regs);
+        // A GNU non-local goto bypasses this nested function's epilogue, so a
+        // value assigned to rbx/r12..r15 would overwrite the parent's live
+        // callee-saved value permanently. Keep this rare function class out of
+        // the callee-saved pool; caller-saved homes and slots remain valid.
+        let has_nonlocal_goto = func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::NonlocalGoto { .. }))
+        });
+        if has_nonlocal_goto {
+            available_regs.clear();
+        }
 
         let mut caller_saved_regs = X86_CALLER_SAVED.to_vec();
         let mut has_indirect_call = false;

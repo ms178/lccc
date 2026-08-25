@@ -130,7 +130,56 @@ impl Lowerer {
             return self.lower_f128_binop(op, lhs, lhs_ct, rhs, rhs_ct);
         }
 
-        self.lower_arithmetic_binop(op, lhs, rhs)
+        let result = self.lower_arithmetic_binop(op, lhs, rhs);
+        if matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr
+        ) {
+            let lhs_bf = self.direct_bitfield_type(lhs);
+            let rhs_bf = self.direct_bitfield_type(rhs);
+            if lhs_bf.is_some() || rhs_bf.is_some() {
+                let (storage_ty, width) = match (lhs_bf, rhs_bf) {
+                    (Some((lt, lw)), Some((rt, rw))) => {
+                        (if lt.size() >= rt.size() { lt } else { rt }, lw.max(rw))
+                    }
+                    (Some(info), None) | (None, Some(info)) => info,
+                    (None, None) => unreachable!(),
+                };
+                // Standard-width fields first undergo integer promotion; only
+                // GCC's extended fields wider than unsigned int retain their
+                // declared precision (e.g. a 40-bit shift/multiply wraps at
+                // bit 40). Reapply precision only for that extension class.
+                if width > 32 {
+                    return self.truncate_to_bitfield_value(
+                        result,
+                        width,
+                        storage_ty.is_signed(),
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    fn direct_bitfield_type(&self, expr: &Expr) -> Option<(IrType, u32)> {
+        match expr {
+            Expr::MemberAccess(base, field, _) => {
+                let (_, ty, info) = self.resolve_member_access_full(base, field);
+                info.map(|(_, width)| (ty, width))
+            }
+            Expr::PointerMemberAccess(base, field, _) => {
+                let (_, ty, info) = self.resolve_pointer_member_access_full(base, field);
+                info.map(|(_, width)| (ty, width))
+            }
+            _ => None,
+        }
     }
 
     /// Lower arithmetic/comparison on _Float128 via libgcc soft-float calls.
@@ -1082,6 +1131,11 @@ impl Lowerer {
             // a&&b&&1 with a=b=1 => 1).
             return Operand::Const(make_int_const(if is_and { 1 } else { 0 }));
         }
+        if kept.len() == 2 {
+            if let Some(value) = fold_comparison_pair(kept[0], kept[1], is_and) {
+                return Operand::Const(make_int_const(i64::from(value)));
+            }
+        }
 
         // The LAST operand's value flows out as data, so it must be a
         // normalized 0/1 boolean. A comparison / logical-NOT already yields
@@ -1296,6 +1350,61 @@ impl Lowerer {
 /// Collect the flat operand list of a left-associative short-circuit chain of
 /// ONE operator (`&&` or `||`). A nested chain of the OTHER operator is kept
 /// as a single operand (it evaluates as a unit with its own merge).
+/// Ordering-relation mask for a side-effect-free scalar comparison.
+/// Bits are {less, equal, greater}. Operands are returned separately so two
+/// comparisons can be aligned (including reversed operand order).
+fn simple_comparison(expr: &Expr) -> Option<(u8, &Expr, &Expr)> {
+    let Expr::BinaryOp(op, lhs, rhs, _) = expr else {
+        return None;
+    };
+    let mask = match op {
+        BinOp::Eq => 0b010,
+        BinOp::Ne => 0b101,
+        BinOp::Lt => 0b001,
+        BinOp::Le => 0b011,
+        BinOp::Gt => 0b100,
+        BinOp::Ge => 0b110,
+        _ => return None,
+    };
+    Some((mask, lhs, rhs))
+}
+
+fn same_simple_scalar(a: &Expr, b: &Expr) -> bool {
+    match (a, b) {
+        (Expr::Identifier(a, _), Expr::Identifier(b, _)) => a == b,
+        (Expr::IntLiteral(a, _), Expr::IntLiteral(b, _))
+        | (Expr::LongLiteral(a, _), Expr::LongLiteral(b, _))
+        | (Expr::LongLongLiteral(a, _), Expr::LongLongLiteral(b, _)) => a == b,
+        (Expr::UIntLiteral(a, _), Expr::UIntLiteral(b, _))
+        | (Expr::ULongLiteral(a, _), Expr::ULongLiteral(b, _))
+        | (Expr::ULongLongLiteral(a, _), Expr::ULongLongLiteral(b, _)) => a == b,
+        _ => false,
+    }
+}
+
+/// Fold a two-comparison && contradiction or || tautology. The operand
+/// restriction proves both comparisons side-effect-free, so replacing the
+/// complete pair does not suppress observable evaluation.
+pub(super) fn fold_comparison_pair(a: &Expr, b: &Expr, is_and: bool) -> Option<bool> {
+    let (ma, al, ar) = simple_comparison(a)?;
+    let (mut mb, bl, br) = simple_comparison(b)?;
+    if same_simple_scalar(al, bl) && same_simple_scalar(ar, br) {
+        // already aligned
+    } else if same_simple_scalar(al, br) && same_simple_scalar(ar, bl) {
+        // Reverse less/greater when swapping operand order.
+        mb = (mb & 0b010) | ((mb & 0b001) << 2) | ((mb & 0b100) >> 2);
+    } else {
+        return None;
+    }
+    if is_and && (ma & mb) == 0 {
+        Some(false)
+    } else if !is_and && (ma | mb) == 0b111 {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn collect_flat_sc_operands<'a>(expr: &'a Expr, is_and: bool, ops: &mut Vec<&'a Expr>) {
     if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
         let same_op = if is_and {

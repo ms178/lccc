@@ -1509,6 +1509,14 @@ fn simplify_binop(
                     src: Operand::Const(IrConst::zero(ty)),
                 });
             }
+            if op == IrBinOp::AShr && is_all_ones(lhs, ty) {
+                // Arithmetic right shift replicates the sign bit, so -1 stays
+                // all-ones for every defined shift count.
+                return Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::from_i64(-1, ty)),
+                });
+            }
             // Reassociation: (x << C1) << C2 => x << (C1 + C2)
             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
             if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs) {
@@ -3489,6 +3497,19 @@ mod tests {
         };
         let result = try_simplify(&inst, &[], &[], &[], &binop_defs, &[], &[]).unwrap();
         assert_copy_value(&result, 0);
+    }
+
+    #[test]
+    fn arithmetic_shift_of_all_ones_stays_all_ones() {
+        let inst = Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::AShr,
+            lhs: Operand::Const(IrConst::I32(-1)),
+            rhs: Operand::Value(Value(1)),
+            ty: IrType::I32,
+        };
+        let result = simplify_default(&inst).unwrap();
+        assert_copy_const_i32(&result, -1);
     }
 
     #[test]

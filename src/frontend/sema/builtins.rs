@@ -229,6 +229,14 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "__builtin_frame_address",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::FrameAddress),
     );
+    m.insert(
+        "__builtin_setjmp",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::BuiltinSetjmp),
+    );
+    m.insert(
+        "__builtin_longjmp",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::BuiltinLongjmp),
+    );
     m.insert("__builtin_extract_return_addr", BuiltinInfo::identity());
     m.insert(
         "__builtin_thread_pointer",
@@ -2898,6 +2906,10 @@ pub enum BuiltinIntrinsic {
     FrameAddress,
     /// __builtin_return_address(level) -> returns return address
     ReturnAddress,
+    /// __builtin_setjmp(buffer) -> returns 0 initially, 1 after builtin longjmp.
+    BuiltinSetjmp,
+    /// __builtin_longjmp(buffer, 1) -> non-local transfer.
+    BuiltinLongjmp,
     /// __builtin_ia32_rdtsc() - 64-bit timestamp counter
     X86Rdtsc,
     /// __builtin_ia32_rdtscp(&aux) - rdtscp with aux store

@@ -80,6 +80,10 @@ pub enum IntrinsicOp {
     FrameAddress,
     /// __builtin_return_address(0) - returns current return address
     ReturnAddress,
+    /// GCC's local-frame setjmp primitive. Args: user buffer pointer.
+    BuiltinSetjmp,
+    /// GCC's local-frame longjmp primitive. Args: user buffer pointer, value.
+    BuiltinLongjmp,
     /// __builtin_thread_pointer() - returns thread pointer (TLS base address)
     ThreadPointer,
     /// Scalar square root: sqrtsd/sqrtss on x86, fsqrt on ARM/RISC-V

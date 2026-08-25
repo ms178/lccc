@@ -75,7 +75,18 @@ impl Lowerer {
         //     sizeof_type uses the correctly-sized global, so we must recompute.
         //     This check covers sizeof itself and any parent expression containing it,
         //     such as `sizeof(x) / sizeof(x[0]) + 1`.
-        if !matches!(expr, Expr::Identifier(_, _)) && !Self::expr_contains_sizeof(expr) {
+        let float_cast = matches!(
+            expr,
+            Expr::Cast(target, _, _)
+                if matches!(
+                    self.type_spec_to_ir(target),
+                    IrType::F32 | IrType::F64 | IrType::F128
+                )
+        );
+        if !matches!(expr, Expr::Identifier(_, _))
+            && !float_cast
+            && !Self::expr_contains_sizeof(expr)
+        {
             if let Some(val) = self.lookup_sema_const(expr) {
                 return Some(val);
             }
@@ -317,8 +328,12 @@ impl Lowerer {
             return Some(Self::cast_i128_to_ir_type(v128, target_ir_ty, src_unsigned));
         }
 
-        // Integer source: use bit-based cast chain evaluation
-        let (bits, src_signed) = self.eval_const_expr_as_bits(inner)?;
+        // Integer source: use bit-based value extraction, but take signedness
+        // from the C expression type. IrConst::I64 stores both signed and
+        // unsigned 64-bit bit patterns; `~0ULL` is represented as I64(-1) and
+        // must still convert to float as UINT64_MAX, not -1.
+        let (bits, _) = self.eval_const_expr_as_bits(inner)?;
+        let src_signed = !self.is_expr_unsigned_for_const(inner);
 
         // For 128-bit targets, sign/zero-extend based on source signedness
         if matches!(target_ir_ty, IrType::I128 | IrType::U128) {

@@ -2099,15 +2099,28 @@ impl Lowerer {
             if let (Expr::LabelAddr(lab1, _), Expr::LabelAddr(lab2, _)) = (lhs_inner, rhs_inner) {
                 let scoped1 = self.get_or_create_user_label(lab1);
                 let scoped2 = self.get_or_create_user_label(lab2);
+                let func_name = self.func().name.clone();
+                let resolved1 = self.resolve_local_label(lab1);
+                let resolved2 = self.resolve_local_label(lab2);
+                let alias1 = format!(".LLDIFF.{}.{}", func_name, resolved1);
+                let alias2 = format!(".LLDIFF.{}.{}", func_name, resolved2);
                 if let Some(ref mut fs) = self.func_state {
                     fs.global_init_label_blocks.push(scoped1);
                     fs.global_init_label_blocks.push(scoped2);
+                    for (resolved, alias) in [
+                        (resolved1.clone(), alias1.clone()),
+                        (resolved2.clone(), alias2.clone()),
+                    ] {
+                        let aliases = fs.pending_label_aliases.entry(resolved).or_default();
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    }
                 }
-                return Some(GlobalInit::GlobalLabelDiff(
-                    scoped1.as_label(),
-                    scoped2.as_label(),
-                    byte_size,
-                ));
+                // Basic-block labels may be renumbered by CFG cleanup. Named
+                // aliases are emitted at the label statements and remain
+                // stable, so static label-difference data never goes stale.
+                return Some(GlobalInit::GlobalLabelDiff(alias1, alias2, byte_size));
             }
         }
         None

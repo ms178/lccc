@@ -14,6 +14,34 @@ use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl Lowerer {
     pub(super) fn lower_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
+        // A file-scope register variable has no addressable storage. Stage the
+        // assigned value into its fixed physical register with an empty inline
+        // asm input constraint; this is the standard compiler representation
+        // of `register void *p asm("rbx")` writes.
+        if let Expr::Identifier(name, _) = lhs {
+            if let Some((reg_name, ty)) = self.globals.get(name).and_then(|info| {
+                info.asm_register
+                    .as_ref()
+                    .filter(|reg| crate::ir::lowering::lower::is_x86_register_name(reg))
+                    .map(|reg| (reg.clone(), info.ty))
+            }) {
+                let raw = self.lower_expr(rhs);
+                let rhs_ty = self.value_ir_type(rhs);
+                let value = self.emit_implicit_cast(raw, rhs_ty, ty);
+                self.emit(Instruction::InlineAsm {
+                    template: String::new(),
+                    outputs: vec![],
+                    inputs: vec![(format!("{{{}}}", reg_name), value, None)],
+                    clobbers: vec![],
+                    operand_types: vec![ty],
+                    goto_labels: vec![],
+                    input_symbols: vec![],
+                    seg_overrides: vec![AddressSpace::Default],
+                });
+                return value;
+            }
+        }
+
         // Vector assignment: memcpy the whole vector
         let lhs_ct = self.expr_ctype(lhs);
         if let Some((_, _num_elems)) = lhs_ct.vector_info() {
@@ -182,8 +210,13 @@ impl Lowerer {
         bit_width: u32,
         is_signed: bool,
     ) -> Operand {
-        // Use the target's widened op type: I32 on i686, I64 on 64-bit targets.
-        let op_ty = widened_op_type(IrType::I32);
+        // Widths above int precision use the declared 64-bit extended
+        // bit-field type; narrower fields use ordinary integer promotion.
+        let op_ty = if bit_width > 32 {
+            if is_signed { IrType::I64 } else { IrType::U64 }
+        } else {
+            widened_op_type(IrType::I32)
+        };
         let op_bits = (op_ty.size() * 8) as u32;
         if bit_width >= op_bits {
             return val;
