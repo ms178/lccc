@@ -3267,6 +3267,14 @@ impl X86Codegen {
                     self.emit_avx_binary_256(d, args, "vpmulld", true);
                 }
             }
+            IntrinsicOp::VecMaxI32x8 => {
+                // Lane-wise signed max of two 8×I32 vectors (vpmaxsd). Used by
+                // the max-reduction vectorizer: the accumulator (running max)
+                // and the freshly-loaded 8 lanes fold into a new accumulator.
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpmaxsd", true);
+                }
+            }
             IntrinsicOp::VecBroadcastI32x4 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
@@ -3581,6 +3589,32 @@ impl X86Codegen {
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vpsrldq $4, %xmm0, %xmm1");
                 self.state.emit("    vpaddd %xmm1, %xmm0, %xmm0");
+                self.state.emit("    vmovd %xmm0, %eax");
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::VecHorizontalMaxI32x8 => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // %scalar = horizontal_max(%vec) - AVX2 8×I32 → I32.
+                // x86 has no single smaxv, so reduce in three vpmaxsd steps.
+                // CRITICAL: use vpshufd (lane permute, preserves sign bits)
+                // — NOT vpsrldq (byte shift, zero-fills). A zero-fill would
+                // compute max(lane, 0) which is WRONG for all-negative data
+                // (find_max on negative integers): max(-5, 0) = 0 ≠ -5.
+                // vpshufd keeps every lane's real value so the final max is
+                // the true signed maximum.
+                self.avx_load_arg(&args[0]);
+                // Halve 8→4: max of low 128 and high 128.
+                self.state.emit("    vextracti128 $1, %ymm0, %xmm1");
+                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
+                // Reduce 4→2: permute lanes {2,3,0,1}, max-merge.
+                self.state.emit("    vpshufd $0x4e, %xmm0, %xmm1");
+                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
+                // Reduce 2→1: permute lanes {1,0,3,2}, max-merge.
+                self.state.emit("    vpshufd $0xb1, %xmm0, %xmm1");
+                self.state.emit("    vpmaxsd %xmm1, %xmm0, %xmm0");
                 self.state.emit("    vmovd %xmm0, %eax");
                 if let Some(d) = dest {
                     self.store_rax_to(d);

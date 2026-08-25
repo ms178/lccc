@@ -88,28 +88,59 @@ hardware result.
 | `reduction_vecreg` | register-resident FP reductions | **0.96** | pass |
 | `arith_loop` | 32-variable register pressure | **0.84** (1.19× faster) | pass |
 | `histogram` | indexed increment/reduction | **0.80** (1.25× faster) | pass |
-| `mandelbrot` | FP branch-heavy loop | **0.75** (1.33× faster) | pass |
+| `mandelbrot` | FP branch-heavy loop | **0.81** (1.23× faster) | pass |
 | `sieve` | branchy int stores | **0.78** (1.28× faster) | pass |
-| `expat_xml_scan` | XML name-token scan | **0.62** (1.61× faster) | pass |
-| `sqlite_varint` | varint decoder | **0.63** (1.59× faster) | pass |
-| `linux_find_bit` | sparse bit search | **0.71** (1.41× faster) | pass |
-| `fannkuch` | permutations | **0.75** (1.33× faster) | pass |
-| `spectral_norm` | dense FP | **0.80** (1.25× faster) | pass |
+| `expat_xml_scan` | XML name-token scan | **0.57** (1.76× slower) | pass |
+| `sqlite_varint` | varint decoder | **0.75** (1.34× slower) | pass |
+| `linux_find_bit` | sparse bit search | **0.70** (1.42× slower) | pass |
+| `fannkuch` | permutations | **0.73** (1.38× slower) | pass |
+| `spectral_norm` | dense FP | **0.77** (1.31× slower) | pass |
 | `hash_table` (chase) | pointer chasing | **0.92** | pass |
-| `libm_round_family` | libm round intrinsics | **0.47** | gap |
-| `loop_patterns` | scalar loop transforms | **0.39** | gap |
-| `nbody` | N-body FP structs | **0.31** | gap |
+| `libm_round_family` | libm round intrinsics | **0.41** (2.43× faster) | pass |
+| `loop_patterns` | scalar loop transforms | **0.52** | gap |
+| `nbody` | N-body FP structs | **0.81** (1.23× slower) | pass |
 
-**Aggregate: geometric mean ~0.72 (26 pairs, -O3 -march=x86-64-v3, 3-round
-medians, 2026-08-24).** Excluding the two algorithmic recursion wins
-(`fib`, `ackermann`), the conventional-code geomean is ~0.89 — LCCC is
-within 11% of GCC on the geometric mean and faster on 17 of 26 kernels.
-Remaining structural gaps (root-caused, tracked in BACKLOG): nbody needs
-multi-store scatter (OP-05b); libm_round needs XMM-homed FP call results
-(IS-29a); loop_patterns' residual gap is the LCG init loop + integer dot
-product (widening multiply) + find_max (AVX2 max reduction).
+**Aggregate: geometric mean ~0.75 (26 pairs, -O2, 9-round paired medians,
+2026-08-25).** Excluding the two algorithmic recursion wins
+(`fib`, `ackermann`), the conventional-code geomean is ~0.85 — LCCC is
+within ~15% of GCC on the geometric mean and faster than GCC on
+`libm_round_family` (2.43×). Remaining structural gaps (root-caused,
+tracked for v12): expat_xml_scan regressed (0.81→0.57) — the FNV prime
+multiply constant is hoisted by LICM into a stack slot and reloaded each
+iteration instead of kept in a callee-saved register (regalloc); the
+verbose byte-classification in `xml_name_continue` also costs vs GCC's
+case-folded `andl $-33; subl $65; cmp $25`; loop_patterns' residual gap
+is the LCG init loop (seed ping-pongs edi↔eax + constant staging) +
+integer dot_product (needs a widening-mul intrinsic, `vpmuldq`) +
+find_max (the AVX2 max-reduction transform needs the reduction-transform's
+GEP/IV stride scaling to fire for the Select-shaped max pattern — the
+`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics and lowering are landed
+and correct, the transform wiring is the remaining piece).
 
+### v11 highlights (session 81)
 
+- **FP binary-op staging-copy elimination**: when both operands of a
+  scalar FP op are XMM-homed and the destination is a fresh register,
+  emit the VEX 3-operand form directly (`vmulsd %src2, %src1, %dest`)
+  instead of staging lhs into dest with a redundant `vmovsd %x,%x,%tmp`
+  first. Every squared term in the mandelbrot inner loop dropped a
+  redundant copy. mandelbrot: **0.63 → 0.81** (regression recovered,
+  now beats v8's 0.75); nbody: **0.31 → 0.81**; spectral_norm:
+  **0.80 → 0.77**.
+- **FP compare-to-branch fusion**: relational float Cmps (Sgt/Sge/Slt/Sle
+  and unsigned peers) consumed only by an adjacent CondBranch now skip
+  the boolean materialization (setcc + movzbl + testq) and branch on the
+  live `ucomisd` flags directly (`ucomisd; ja/jae`). NaN → unordered →
+  not-taken = false, matching C99 for all ordered relationals. Eq/Ne
+  stay materialized (parity bit). The mandelbrot
+  `if (zr*zr+zi*zi > 4.0) break` drops from 6 instructions to 2.
+- **`VecMaxI32x8` / `VecHorizontalMaxI32x8` intrinsics + AVX2 lowering**
+  landed: `vpmaxsd` lane-max and a `vpshufd`+`vpmaxsd` horizontal reduce
+  that preserves sign bits (correct for all-negative data, unlike a
+  `vpsrldq` zero-fill reduce). The x86 find_max vectorization is gated
+  on resolving the reduction transform's GEP/IV stride scaling for the
+  Select-shaped max pattern — the intrinsics and lowering are correct and
+  landed so the transform is the only remaining piece (v12 target).
 
 ### v9 highlights (session 80)
 

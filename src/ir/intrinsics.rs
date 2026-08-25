@@ -391,6 +391,17 @@ pub enum IntrinsicOp {
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - AVX2 8×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x8,
+    /// AVX2 lane-wise signed max: %dest_vec = max(%src1_vec, %src2_vec) per
+    /// lane, 8×I32 (vpmaxsd). args[0] = src1, args[1] = src2; dest = result.
+    /// Signed max is associative, commutative, and idempotent, so lane-wise
+    /// reduction matches the scalar max bit-for-bit (same property NEON's
+    /// smax relies on for the I32x4 path).
+    VecMaxI32x8,
+    /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
+    /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
+    /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
+    /// to the dest GPR. args[0] = source vector value; dest = scalar I32.
+    VecHorizontalMaxI32x8,
     /// Horizontal reduction: %scalar = horizontal_add(%vec) - SSE2 4×I32 → I32
     /// args[0] = source vector value; dest = scalar I32 result
     VecHorizontalAddI32x4,
@@ -1110,7 +1121,7 @@ impl IntrinsicOp {
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
-            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8
+            | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
@@ -1220,6 +1231,8 @@ impl IntrinsicOp {
             IntrinsicOp::AddI32x8 | IntrinsicOp::AddI32x4 |
             IntrinsicOp::HorizontalAddF64x4 | IntrinsicOp::HorizontalAddF64x2 |
             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
+            | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecHorizontalMaxI32x8
         )
     }
 
@@ -1244,6 +1257,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecAddF64x4
                 | IntrinsicOp::VecAddF64x2
                 | IntrinsicOp::VecAddI32x8
+                | IntrinsicOp::VecMaxI32x8
                 | IntrinsicOp::VecAddI32x4
                 | IntrinsicOp::VecAddF32x8
                 | IntrinsicOp::VecAddF32x4

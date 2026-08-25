@@ -579,17 +579,40 @@ impl X86Codegen {
             for block in &func.blocks {
                 let insts = &block.instructions;
                 for (ii, inst) in insts.iter().enumerate() {
-                    if let Instruction::Cmp { dest, ty, .. } = inst {
+                    if let Instruction::Cmp { dest, ty, op, .. } = inst {
                         if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
                             continue;
                         }
-                        // Only scalar-integer compares fuse: emit_cmp routes
-                        // I128/U128 to emit_i128_cmp and floats to
-                        // emit_float_cmp — neither participates in the
-                        // pending_cmp handshake, so fusing them would strand
-                        // the forward chain (consumer reads a boolean that was
-                        // never materialized).
-                        if !ty.is_integer() || crate::backend::generation::is_wide_int_type(*ty) {
+                        // Wide ints (I128/U128) route to emit_i128_cmp and
+                        // never participate in pending_cmp. Float compares
+                        // now fuse for the RELATIONAL operators only
+                        // (Sgt/Sge/Slt/Sle and unsigned peers): ucomisd sets
+                        // CF/ZF/PF such that `ja`/`jae`/`jb`/`jbe` give the
+                        // correct ordered result (NaN → unordered → false on
+                        // all of them). Eq/Ne need the parity bit, so they
+                        // stay materialized (setnp+sete / setp+setne) and are
+                        // NOT fused here.
+                        if crate::backend::generation::is_wide_int_type(*ty) {
+                            continue;
+                        }
+                        let is_fp = matches!(ty, crate::common::types::IrType::F32
+                            | crate::common::types::IrType::F64);
+                        if is_fp {
+                            let relational = matches!(
+                                op,
+                                crate::ir::reexports::IrCmpOp::Sgt
+                                | crate::ir::reexports::IrCmpOp::Sge
+                                | crate::ir::reexports::IrCmpOp::Slt
+                                | crate::ir::reexports::IrCmpOp::Sle
+                                | crate::ir::reexports::IrCmpOp::Ugt
+                                | crate::ir::reexports::IrCmpOp::Uge
+                                | crate::ir::reexports::IrCmpOp::Ult
+                                | crate::ir::reexports::IrCmpOp::Ule
+                            );
+                            if !relational {
+                                continue;
+                            }
+                        } else if !ty.is_integer() {
                             continue;
                         }
                         // Walk forward over Copies that forward the cmp value.
@@ -659,8 +682,16 @@ impl X86Codegen {
                                 } if v.0 == cur => {
                                     // The copy chain must terminate here (the
                                     // final value has exactly one use: this
-                                    // select).
-                                    if use_counts.get(&cur).copied().unwrap_or(0) == 1 {
+                                    // select). FP relational Cmps may NOT
+                                    // fuse into a Select: the Select consumer
+                                    // reads `pending_cmp` (integer jcc), not
+                                    // `pending_fp_cmp`, so fusing would skip
+                                    // the boolean materialization while the
+                                    // Select still expects to read it — a
+                                    // miscompile. FP fusion is CondBranch-only.
+                                    if !is_fp
+                                        && use_counts.get(&cur).copied().unwrap_or(0) == 1
+                                    {
                                         is_consumer = true;
                                     }
                                     break;

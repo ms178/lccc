@@ -272,7 +272,44 @@ impl X86Codegen {
             return true;
         }
 
-        // dest holds neither operand. Load lhs into dest, then op with rhs.
+        // dest holds neither operand. The VEX 3-operand form
+        // `vop src2, src1, dest` can take src1 and src2 from ANY XMM
+        // register distinct from dest, so when both operands are XMM-homed
+        // we emit the operation directly — no `vmovsd` staging copy into
+        // dest first. This is the dominant case in FP-heavy inner loops
+        // (mandelbrot's `zr*zr`, `zi*zi`, `tr*tr`, `zi*zi`): each squared
+        // term dropped a redundant `vmovsd %x,%x,%tmp` before the `vmulsd`.
+        // NOTE: `emit_vop`'s format string prepends `%` to src1 and dest
+        // itself, so src1 is passed as the bare register name (no `%`).
+        if let (Some(l), Some(r)) = (lhs_home, rhs_home) {
+            emit_vop(self, &format!("%{}", r), l);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // dest holds neither operand, and at least one operand is not
+        // XMM-homed (memory/const). Prefer the XMM-homed operand as src1
+        // so the 3-operand form folds the memory/const source directly:
+        //   vop <mem/const src2>, %xmm_src1, %dest   (one instruction)
+        // For non-commutative ops (sub/div), src1 MUST be lhs, so only the
+        // lhs-homed case applies; the rhs-homed commutative case swaps.
+        if let Some(l) = lhs_home {
+            // src1 = lhs (in a register); src2 = rhs via the mem/const folder.
+            self.emit_fp_src2_then_vop_with_src1(rhs, ty, reg, mnemonic, suffix, l);
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        if commutative {
+            if let Some(r) = rhs_home {
+                // commutative: dest = rhs op lhs == lhs op rhs.
+                // src1 = rhs (register), src2 = lhs (mem/const).
+                self.emit_fp_src2_then_vop_with_src1(lhs, ty, reg, mnemonic, suffix, r);
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+
+        // dest holds neither operand and neither is XMM-homed (both memory
+        // or constants). Load lhs into dest, then op with rhs.
         // NOTE: `0.0 + rhs` is NOT folded to `rhs` here: +0.0 + (-0.0) = +0.0
         // per IEEE-754 (observable via signbit), and GCC keeps the add for
         // exactly this reason at -O2. Only -fno-signed-zeros may fold it,
@@ -281,6 +318,59 @@ impl X86Codegen {
         self.emit_fp_src2_then_vop(rhs, ty, reg, mnemonic, suffix);
         self.state.reg_cache.invalidate_acc();
         true
+    }
+
+    /// Emit `vop src2, src1, dest` where src1 is an EXPLICIT named XMM
+    /// register (not necessarily dest), and src2 is the rhs/lhs operand
+    /// resolved via the memory/const/register folder. At most one memory
+    /// operand is legal per x86 instruction; if the explicit src1 is a
+    /// register, a memory src2 is always sound. The operand folder falls
+    /// back to xmm0 only when src2 is a second memory/const source AND no
+    /// XMM home exists — the caller guarantees src1 is register-homed.
+    fn emit_fp_src2_then_vop_with_src1(
+        &mut self,
+        src: &Operand,
+        ty: IrType,
+        dest: &str,
+        mnemonic: &str,
+        suffix: &str,
+        src1: &'static str,
+    ) {
+        let vop = |this: &mut Self, src2: String| {
+            this.state.emit_fmt(format_args!(
+                "    {}{} {}, %{}, %{}",
+                mnemonic, suffix, src2, src1, dest
+            ));
+        };
+        match src {
+            Operand::Value(v) => {
+                if let Some(&r) = self.reg_assignments.get(&v.0) {
+                    if is_xmm_reg(r) {
+                        vop(self, format!("%{}", phys_reg_name(r)));
+                        return;
+                    }
+                }
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    vop(self, self.slot_ref(slot.0));
+                    return;
+                }
+                // No XMM home and no slot: load into xmm0 (scratch).
+                self.load_fp_to_reg(src, ty, "xmm0");
+                vop(self, "%xmm0".into());
+            }
+            Operand::Const(IrConst::F64(c)) => {
+                let label = self.state.get_fp_const_label(c.to_bits());
+                vop(self, format!("{}(%rip)", label));
+            }
+            Operand::Const(IrConst::F32(c)) => {
+                let label = self.state.get_fp_const_label(c.to_bits() as u64);
+                vop(self, format!("{}(%rip)", label));
+            }
+            _ => {
+                self.load_fp_to_reg(src, ty, "xmm0");
+                vop(self, "%xmm0".into());
+            }
+        }
     }
 
     /// Emit `vop src2, %reg, %reg` where src2 is rhs (mem / xmm / const / scratch).
