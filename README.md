@@ -210,6 +210,76 @@ shape, but the 24-test miscompile blocks default-enable. v14 target:
 harden the rotation to handle multi-exit/nested shapes, re-land the
 phi-elim self-loop fix with a narrower gate, then default-enable.
 
+### v14 highlights (session 83)
+
+v14 delivers the **loop-rotation correctness hardening** that unblocks the
+canonical counted-loop shape, and resolves the benchmark-metric confusion
+that clouded v12/v13 reporting.
+
+- **Exit-merge-phi correctness fix** (the root cause): the v13 pass built
+  the exit-merge-phi's test-exit incoming as `Value(new_loop)` — the new
+  self-loop phi. But at the latch's CondBranch point that phi still holds
+  the **start-of-iteration** value (its backedge writeback only fires on
+  the NEXT iteration's entry), so the exit read the sum **before** the
+  final `a[i]` was added (off-by-one accumulator). v14 reads
+  `latch_operand` (the original header phi's latch incoming — the
+  post-iteration value `s_new = s + a[i]`, or `i_next = i + 1`) on the
+  test-exit edge. This single fix dropped rotation miscompiles from
+  **122/486 → ~24** (24 real + 4 env-only). Verified on `sum_arr`:
+  output bit-identical to GCC; the `.LBB4: movl %r8d, %r9d` exit-merge
+  copy is now correctly inserted (v13 omitted it).
+- **Pipeline reorder: rotation after vectorize.** v13 ran loop_rotate
+  BEFORE vectorize, which corrupted the vectorizer's base-dependence
+  analysis on the rotated self-loop form
+  (`vectorize_iv_dependent_base` SIGSEGV, `simd_vecreg` miscode). v14
+  moves loop_rotate to AFTER vectorize+post-unroll+gaddr-cse. Vector
+  bodies contain `Vec*` intrinsics which `is_cloneable_pure` rejects,
+  so rotation bails on vectorized loops and only fires on the residual
+  scalar counted loops the vectorizer left alone.
+- **Conservative body guards**: bail if the body contains a
+  `Call`/`CallIndirect` (clobbers caller-saved values the exit-merge-phi
+  references across the call boundary; also keeps `fib`'s recursive-call
+  CFG — spuriously detected as a loop by `find_natural_loops` —
+  untouched), any volatile `Load`/`Store` (observable ordering), or an
+  `Intrinsic` (XMM phi / vector-reg home mismatch; the vectorizer has
+  already run). Fixed `fp_memfold_stencil5` (intrinsic bail).
+- **Dead `drop(header_insts)` removed**: was a no-op on a `&T` (references
+  are `Copy`) and tripped the `dropping_references` lint under
+  `-D warnings`; NLL ends the borrow at last use without it.
+- **Metric clarification (resolves the v12 "0.81 faster than 0.63"
+  confusion)**: the benchmark runner reports `LCCC/GCC` (ratio > 1 =
+  LCCC slower, < 1 = LCCC faster). Prior worklog entries used the inverse
+  `GCC/LCCC` (> 1 = LCCC faster), so "nbody 0.81" meant GCC/LCCC = lccc
+  is 1.23× slower — the SAME reality as the runner's `1.229`. The "0.31"
+  nbody figure was a miscompile (no-op). The README results table is in
+  the runner's convention (LCCC/GCC, < 1 = faster) and is authoritative.
+
+**v14 status**: zero regressions (486/489, same 4 env-only i686/regparm
+failures as v13). Default-path benchmark numbers match v13 (no-rotation
+path unchanged): 10-kernel 9-rep paired medians vs GCC -O2 — `libm_round`
+0.413 (2.42× faster), `gzip_crc32` 0.874 (1.14× faster), `loop_patterns`
+1.033 (near parity), `nbody` 1.229, `mandelbrot` 1.231, `spectral_norm`
+1.302, `expat_xml_scan` 1.728, `sqlite_varint` 1.294, `linux_find_bit`
+1.441, `fannkuch` 1.397; geomean 1.127. The FNV prime `1099511628211` is
+register-homed (`%r14`, matching GCC's `%r10`) — the v12 spill/reload
+concern is closed. With `CCC_LOOP_ROTATE=1`, the canonical `sum_arr`
+loop rotates to the test-at-bottom self-loop form bit-identical to GCC.
+
+**v15 roadmap** (the rotation pass is correctness-clean for the canonical
+shape; remaining ~24 miscompiles block default-enable): (1) harden
+multi-exit / nested-loop / header-phi-escapes-through-non-Return-terminator
+shapes so rotation can default-on at -O2+; (2) re-land the phi-elim
+self-loop copy-placement fix with a narrower gate (only rotation-created
+self-loops, not pre-existing `sqlite_varint`-style ones) to eliminate the
+residual double-jump the backend's critical-edge split re-creates; (3)
+**IV widening** — keep the loop IV I64-typed in the vectorizer/loop
+optimizer so the per-iteration `movslq %i32d, %i64` (seen in loop_patterns
+LCG: `addl $1, %r12d; movslq %r12d, %r12`) is eliminated (GCC keeps an
+I64 IV); (4) wire the find_max AVX2 `vpmaxsd` reduction transform (the
+intrinsics + lowering landed in v11; the reduction analyzer's GEP/IV
+stride scaling must fire for the Select-shaped max pattern); (5) integer
+`dot_product` `vpmuldq` widening-mul.
+
 ### v11 highlights (session 81)
 
 - **FP binary-op staging-copy elimination**: when both operands of a
