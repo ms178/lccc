@@ -115,6 +115,12 @@ impl X86Arch for I686Arch {
     } // R_386_PC8
     fn reloc_patch_size(reloc_type: u32) -> u8 {
         match reloc_type {
+            // R_386_8 / R_386_PC8: 1-byte fields. A 4-byte addend patch of a
+            // 1-byte slot clobbers the three bytes after it — the kernel's
+            // arch/x86/boot/header.S lost the 'H' of its "HdrS" signature
+            // exactly this way (`.byte start_of_setup-1f` precedes the
+            // `.ascii "HdrS"`), and QEMU refused the bzImage as "too old".
+            22 | 23 => 1,
             // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
             20 | 21 => 2,
             _ => 4,
@@ -273,3 +279,76 @@ impl X86Arch for I686Arch {
 
 /// Builds a 32-bit ELF relocatable object file from parsed assembly items.
 pub type ElfWriter = ElfWriterCore<I686Arch>;
+
+#[cfg(test)]
+mod tests {
+    use super::super::assemble;
+
+    /// R_386_PC8 owns a 1-byte field: the REL-format addend patch must write
+    /// exactly one byte, or the bytes after the field get clobbered. Linux
+    /// arch/x86/boot/header.S puts `.byte start_of_setup-1f` immediately
+    /// before `.ascii "HdrS"`; the old 4-byte patch turned "HdrS" into
+    /// "GdrS" and QEMU refused the bzImage ("kernel too old").
+    #[test]
+    fn rel_pc8_addend_patch_writes_one_byte() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_pc8_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("hdr.o");
+        let asm = concat!(
+            ".code16\n",
+            ".section \".header\", \"a\"\n",
+            "hdr:\n",
+            "\t.byte 0xeb\n",
+            "\t.byte start_of_setup-1f\n",
+            "1:\n",
+            "\t.ascii \"HdrS\"\n",
+            "\t.word 0x020f\n",
+            ".section \".entrytext\", \"ax\"\n",
+            "start_of_setup:\n",
+            "\t.byte 0x90\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        // The 1-byte addend (-1 = 0xff) must sit in the field, with the
+        // string "HdrS" intact immediately after it.
+        assert!(
+            data.windows(6).any(|w| w == b"\xeb\xffHdrS"),
+            "PC8 addend patch clobbered bytes after the field"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R_386_PC16 keeps working through the same patch path (2-byte slot).
+    #[test]
+    fn rel_pc16_addend_patch_writes_two_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_pc16_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("j.o");
+        let asm = concat!(
+            ".code16\n",
+            ".section \".text\", \"ax\"\n",
+            "\t.word ext_sym\n",
+            "\t.byte 0xaa\n",
+            ".section \".data\"\n",
+            "ext_sym:\n",
+            "\t.byte 0xbb\n",
+        );
+        assemble(asm, out.to_str().unwrap()).unwrap();
+        let data = std::fs::read(&out).unwrap();
+        // `.word ext_sym` is an R_386_16 with addend 0: the 2-byte patch must
+        // write 00 00 into the field and leave the 0xaa marker byte intact.
+        assert!(
+            data.windows(3).any(|w| w == b"\x00\x00\xaa"),
+            "R_386_16 addend patch clobbered bytes after the field"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
