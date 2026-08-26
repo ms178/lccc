@@ -18,7 +18,8 @@
 
 use crate::backend::elf::{
     self as elf_mod, parse_section_flags, resolve_numeric_labels, ElfConfig, ObjReloc, ObjSection,
-    ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHT_NOBITS, SHT_PROGBITS, STB_GLOBAL,
+    ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS,
+    STB_GLOBAL,
     STB_LOCAL,
     STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN,
     STV_INTERNAL, STV_PROTECTED,
@@ -143,6 +144,18 @@ pub trait X86Arch {
         section_data_len: u64,
     ) -> Result<EncodeResult, String> {
         Self::encode_instruction(instr, section_data_len)
+    }
+
+    /// Encode an instruction in `.code16gcc` mode: 16-bit real mode where
+    /// UNSUFFIXED call/ret take 32-bit operands (GCC's -m16 ABI; the boot
+    /// hand asm uses calll/retl and esp-relative reads that expect 4-byte
+    /// return slots). Default falls back to the plain code16 encoder; the
+    /// i686 backend overrides it with the true GCC semantics.
+    fn encode_instruction_code16_gcc(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        Self::encode_instruction_code16(instr, section_data_len)
     }
 
     fn encode_instruction_code32(
@@ -688,6 +701,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
         self.emit_elf()
     }
 
+    /// GAS creates `.text`, `.data` and `.bss` at assembler startup, so even
+    /// an object that only ever uses `.text` carries empty `.data`/`.bss`
+    /// sections right after it. Recreate that layout on first section use so
+    /// emitted objects are byte-identical to GAS (byte-exact regression
+    /// diffs and tooling that expects the trio depend on it).
+    fn ensure_default_sections(&mut self) {
+        if !self.sections.is_empty() {
+            return;
+        }
+        // Push the trio directly (not through get_or_create_section) to
+        // avoid recursing through this hook.
+        for (name, ty, fl) in [
+            (".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR),
+            (".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE),
+            (".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE),
+        ] {
+            let idx = self.sections.len();
+            self.sections.push(Section {
+                name: name.to_string(),
+                section_type: ty,
+                flags: fl,
+                data: Vec::new(),
+                alignment: 1,
+                relocations: Vec::new(),
+                jumps: Vec::new(),
+                align_markers: Vec::new(),
+                comdat_group: None,
+            });
+            self.section_map.insert(name.to_string(), idx);
+        }
+    }
+
     fn get_or_create_section(
         &mut self,
         name: &str,
@@ -695,6 +740,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
         flags: u64,
         comdat_group: Option<String>,
     ) -> Result<usize, String> {
+        self.ensure_default_sections();
         if let Some(&idx) = self.section_map.get(name) {
             let existing = &self.sections[idx];
             // GNU as errors on a re-declaration with different attributes:
@@ -1527,16 +1573,22 @@ impl<A: X86Arch> ElfWriterCore<A> {
             A::encode_instruction_code64(instr, base_offset)?
         } else if self.code_mode == 32 && A::default_code_mode() == 64 {
             A::encode_instruction_code32(instr, base_offset)?
+        } else if self.code_mode == 17 && A::default_code_mode() != 64 {
+            // `.code16gcc`: like .code16, but unsuffixed call/ret take
+            // 32-bit operands (GCC's -m16 calling convention).
+            A::encode_instruction_code16_gcc(instr, base_offset)?
         } else if self.code_mode == 16 && A::default_code_mode() != 64 {
             if std::env::var("LCCC_DBG16").is_ok() {
                 eprintln!("[C16] dispatch code16 for {}", instr.mnemonic);
             }
             A::encode_instruction_code16(instr, base_offset)?
-        } else if self.code_mode == 16 && A::default_code_mode() == 64 {
-            // .code16 inside a 64-bit TU: real-mode code must be assembled via
-            // the -m16 (i686) path where operand-size semantics are modeled.
-            // Encoding it with the 64-bit encoder would silently produce wrong
-            // machine code, so reject loudly instead.
+        } else if (self.code_mode == 16 || self.code_mode == 17)
+            && A::default_code_mode() == 64
+        {
+            // .code16/.code16gcc inside a 64-bit TU: real-mode code must be
+            // assembled via the -m16 (i686) path where operand-size
+            // semantics are modeled. Encoding it with the 64-bit encoder
+            // would silently produce wrong machine code, so reject loudly.
             return Err(format!(
                 ".code16 in 64-bit assembly is not supported; compile real-mode \
                  code with -m16 (instruction: {})",
@@ -2114,6 +2166,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
     // ─── ELF emission ─────────────────────────────────────────────────
 
     fn emit_elf(mut self) -> Result<Vec<u8>, String> {
+        // GAS always carries the .text/.data/.bss trio, even for empty input.
+        self.ensure_default_sections();
         // `.skip` sizing and jump relaxation are MUTUALLY dependent, and the
         // fixed-point they reach depends on the order. Two real kernel shapes
         // pull in opposite directions:

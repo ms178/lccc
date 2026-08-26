@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.44}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
 BZIMAGE=${1:-$K/arch/x86/boot/bzImage}
 QEMU=${QEMU:-qemu-system-x86_64}
 WORK=${BOOT_WORK:-/tmp/boottest}

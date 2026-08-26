@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.44}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 LOG=${BUILD_LOG:-/tmp/kernel-build-lccc.log}
@@ -85,7 +85,15 @@ fi
 
 echo "build: SUCCESS in ${elapsed}s"
 ls -l arch/x86/boot/bzImage vmlinux
-size arch/x86/boot/bzImage vmlinux
+size vmlinux
 # The 32 KiB setup gate must hold for a bootable bzImage.
-nm -n arch/x86/boot/setup.elf 2>/dev/null | awk '$3=="_end"{printf "setup _end: 0x%s (%d bytes, %s of 32768)\n", $1, strtonum("0x"$1), strtonum("0x"$1)>32768 ? "OVER" : "ok"}'
+# (mawk has no strtonum — convert via bash arithmetic.)
+while read -r hex; do
+  dec=$((16#$hex))
+  if (( dec > 32768 )); then
+    echo "setup _end: 0x$hex ($dec bytes, OVER the 32768-byte gate)"
+    exit 1
+  fi
+  echo "setup _end: 0x$hex ($dec bytes, ok of 32768)"
+done < <(nm -n arch/x86/boot/setup.elf 2>/dev/null | awk '$3=="_end"{print $1}')
 sha256sum arch/x86/boot/bzImage

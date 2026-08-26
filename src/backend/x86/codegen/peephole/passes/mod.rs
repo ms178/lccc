@@ -1833,6 +1833,18 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_parse_i32_int32_min_no_panic() {
+        // Kernel constant folding emits genuine INT32_MIN immediands
+        // (`addq $-2147483648, %rax`); parsing must not overflow and
+        // must yield exactly i32::MIN.
+        assert_eq!(fast_parse_i32("-2147483648"), i32::MIN);
+        assert_eq!(fast_parse_i32("2147483648"), i32::MIN); // wrapping digits
+        assert_eq!(fast_parse_i32("-8"), -8);
+        assert_eq!(fast_parse_i32("0"), 0);
+        assert_eq!(parse_rbp_offset("addq $-2147483648, 40(%rsp)"), 40);
+    }
+
+    #[test]
     fn test_compare_branch_fusion_no_fuse_cross_block_store() {
         let asm = [
             "    cmpq $0, %rbx",

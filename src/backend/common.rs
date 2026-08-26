@@ -1610,20 +1610,28 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
         } else {
             "aw"
         };
-        // Sections starting with ".bss" are NOBITS (no file space, BSS semantics).
-        // A zero-initialized writable global in any OTHER custom section is also
-        // NOBITS: it costs no file space and is zero-filled at load time (used
-        // by PGO counter arrays in .lccc_pgo_cnts). Well-known section names
-        // (.data, .text, .rodata, ...) are exempt: GNU as assigns them a fixed
-        // type, and the kernel's `static int lines __section(".data")` pattern
-        // shares .data with relocatable pointer data — a NOBITS .data silently
-        // drops that content (compressed misc.c boot hang).
-        let is_zero = matches!(g.init, GlobalInit::Zero);
-        let well_known =
-            crate::backend::elf::well_known_section_type(section_name).is_some();
-        let section_type = if section_name.starts_with(".bss")
-            || (flags == "aw" && is_zero && !well_known)
-        {
+        // GCC parity (verified against GCC 16.2 / GAS 2.47): a C `section`
+        // attribute on a zero-initialized global still materializes PROGBITS
+        // zero bytes — GCC never emits @nobits for a section attribute. Both
+        // `static int done __section(".init.data");` and initialized members
+        // like `initcall_levels[]` therefore coexist in ONE PROGBITS
+        // `.init.data`. The kernel depends on this for `.init.data`,
+        // `.data..percpu` and `.data..read_mostly` (all mix zero-initialized
+        // and initialized members within a TU). The old shortcut that marked
+        // every zero-initialized writable custom section @nobits collided
+        // with a later PROGBITS member of the SAME section
+        // ("changed section type for .init.data", kernel boot build).
+        //
+        // NOBITS stays correct only for .bss-named sections: GNU as assigns
+        // them SHT_NOBITS by name regardless of the directive, and `.zero`
+        // inside a NOBITS section legitimately grows the size without file
+        // content (kernel `.bss..page_aligned` style layouts).
+        // Well-known section names (.data, .text, .rodata, ...) are handled
+        // by the writer's fixed-type table anyway: GNU as assigns them a
+        // fixed type, and the kernel's `static int lines __section(".data")`
+        // pattern shares .data with relocatable pointer data — a NOBITS
+        // .data silently drops that content (compressed misc.c boot hang).
+        let section_type = if section_name.starts_with(".bss") {
             "@nobits"
         } else {
             "@progbits"

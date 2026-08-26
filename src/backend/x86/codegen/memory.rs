@@ -2621,7 +2621,14 @@ impl X86Codegen {
                     offset += 32;
                     remaining -= 32;
                     used_ymm = true;
-                } else if remaining >= 16 {
+                } else if remaining >= 16 && !self.state.no_sse {
+                    // GCC's -mno-sse contract forbids ALL xmm/ymm usage (the
+                    // kernel decompressor and early boot run with CR4.OSFXSR=0,
+                    // where any SSE instruction faults -- reproduced: 16-byte
+                    // gate_desc copy in load_stage2_idt crashed the Cachymod
+                    // 6.18.46 QEMU boot). With SSE disabled the 16 bytes fall
+                    // through to two movq, matching GCC.
+                    //
                     // AVX->SSE TRANSITION PENALTY. A 48-byte struct copies as
                     // one 32-byte ymm chunk plus a 16-byte tail. Emitting the
                     // tail as legacy SSE (`movdqu %xmm0`) while the upper half
@@ -2705,6 +2712,16 @@ impl X86Codegen {
                 }
             }
         } else {
+            // Under -mno-sse no vector instruction may be emitted at all
+            // (kernel boot runs with CR4.OSFXSR=0): use rep movsb.
+            if self.state.no_sse {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", size as i64, "rcx");
+                self.state.emit("    rep movsb");
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
             // For copies > 64 bytes, use an unrolled AVX2 loop instead of rep movsb.
             // This is faster for medium copies (65-512 bytes) because vmovdqu ymm
             // has higher throughput than rep movsb on modern Intel CPUs without ERMS.
@@ -2740,7 +2757,7 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
                     offset += 32;
                     remaining -= 32;
-                } else if remaining >= 16 {
+                } else if remaining >= 16 && !self.state.no_sse {
                     self.state
                         .emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
                     self.state

@@ -116,12 +116,31 @@ impl super::InstructionEncoder {
                     self.bytes.push(0x66);
                 }
                 self.bytes.push(if size == 1 { 0xC6 } else { 0xC7 });
-                self.bytes.push(self.modrm(0, 0, 5));
-                if let Ok(addr) = label.parse::<i64>() {
-                    self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
+                // Absolute-address ModRM: the width participates in the
+                // addressing mode, not just the operand size. `.code16`
+                // defaults to 16-bit addressing — mod=00 rm=101 (disp32)
+                // without a 0x67 override misdecodes in real mode (the
+                // low two address bytes are consumed as disp16 and the
+                // instruction stream desyncs; reproduced: boot setup's
+                // `movb $1, loaded_flags` ate the following call's stack
+                // slot and get_cpuflags returned into garbage). GAS emits
+                // mod=00 rm=110 + disp16 + R_386_16 there.
+                if self.code16 {
+                    self.bytes.push(self.modrm(0, 0, 6));
+                    if let Ok(addr) = label.parse::<i64>() {
+                        self.bytes.extend_from_slice(&(addr as i16).to_le_bytes());
+                    } else {
+                        self.add_relocation_for_label(label, R_386_16);
+                        self.bytes.extend_from_slice(&[0, 0]);
+                    }
                 } else {
-                    self.add_relocation_for_label(label, R_386_32);
-                    self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    self.bytes.push(self.modrm(0, 0, 5));
+                    if let Ok(addr) = label.parse::<i64>() {
+                        self.bytes.extend_from_slice(&(addr as i32).to_le_bytes());
+                    } else {
+                        self.add_relocation_for_label(label, R_386_32);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    }
                 }
                 match imm {
                     ImmediateValue::Integer(val) => match size {

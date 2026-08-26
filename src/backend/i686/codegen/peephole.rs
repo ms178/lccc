@@ -4700,6 +4700,18 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             let first_dealloc = addls.iter().map(|&(i, _)| i).min();
             let is_registered_adjust =
                 |idx: usize| -> bool { subls.iter().chain(&addls).any(|&(i, _)| i == idx) };
+            // Label name (without ':') -> line index, for resolving jump
+            // targets in the envelope soundness check below.
+            let mut label_pos: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for i in start..end {
+                if infos[i].kind == LineKind::Label {
+                    let t = trimmed(store, &infos[i], i);
+                    if let Some(name) = t.strip_suffix(':') {
+                        label_pos.insert(name.to_string(), i);
+                    }
+                }
+            }
             let mut envelope_ok = true;
             if let Some(fd) = first_dealloc {
                 // 1) Geometry: every %esp engagement must live strictly
@@ -4737,14 +4749,39 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                         }
                     }
                     if k > alloc_idx && k < fd {
+                        // Control flow INSIDE the envelope. The transform's
+                        // invariant is "esp identical at every program point"
+                        // (+4k alloc and +4k deallocs cancel everywhere
+                        // between them), so most edges are harmless:
+                        //
+                        //  * Jmp/CondJmp whose target lies strictly AFTER the
+                        //    alloc executes at the identical depth in both
+                        //    versions (multi-epilogue early-return shape).
+                        //  * Ret inside the envelope returns at identical
+                        //    esp; the dead register's epilogue pop is simply
+                        //    skipped in both versions.
+                        //
+                        // What is NOT provable at text level:
+                        //  * A Label inside the envelope: an edge entering
+                        //    from before the alloc arrives 4 bytes shallower
+                        //    (one fewer push) than the interior expects.
+                        //  * JmpIndirect / a jump to an unresolvable or
+                        //    pre-alloc target: same depth mismatch.
                         match infos[k].kind {
-                            LineKind::Label
-                            | LineKind::Jmp
-                            | LineKind::JmpIndirect
-                            | LineKind::CondJmp
-                            | LineKind::Ret => {
+                            LineKind::Label | LineKind::JmpIndirect => {
                                 envelope_ok = false;
                                 break;
+                            }
+                            LineKind::Jmp | LineKind::CondJmp => {
+                                let t = trimmed(store, &infos[k], k);
+                                let target = t.split_whitespace().next_back();
+                                let ok = target
+                                    .and_then(|name| label_pos.get(name))
+                                    .is_some_and(|&ti| ti > alloc_idx);
+                                if !ok {
+                                    envelope_ok = false;
+                                    break;
+                                }
                             }
                             _ => {}
                         }
