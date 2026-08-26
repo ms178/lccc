@@ -32,6 +32,7 @@ pub(crate) mod inline;
 pub(crate) mod int_const_hoist;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
+pub(crate) mod iv_widen;
 pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
@@ -1111,8 +1112,30 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
-        // Phase 2b-rot: Loop rotation — iter 0, AFTER vectorize+post-unroll+
-        // gaddr-cse. Transforms "guard-at-top" loops into "test-at-bottom"
+        // Phase 2b-ivw: Induction-variable widening — iter 0, BEFORE
+        // loop_rotate (so loops are still in guard-at-top form: preheader
+        // + header + latch, the shape the pass's phi candidacy expects).
+        // Also AFTER vectorize+unroll (vectorizer-managed loops keep
+        // their own I32 IVs and are not touched here; the residual scalar
+        // counted loops the vectorizer left alone are the widening
+        // candidates). Widens I32/U32 IVs whose only 64-bit use is
+        // addressing (a Cast I32→I64 that feeds a GEP offset) to I64,
+        // eliminating the per-iteration `movslq` the x86 backend must
+        // emit after every 32-bit `addl` (the upper 32 bits are clobbered
+        // and the next GEP use would read garbage without re-extension).
+        // Gated by `CCC_NO_IV_WIDEN`. -O2+, not -Os/-Oz.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+            let n = timed_pass!(
+                "iv_widen",
+                run_on_visited(module, &dirty, &mut changed, iv_widen::run_function)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
+        // widened phi flows through the rotated form and emits `addq`
+        // directly). Transforms "guard-at-top" loops into "test-at-bottom"
         // self-loop form (one fewer branch per iteration in the hot path;
         // the exit falls through). Every scalar counted loop the vectorizer
         // left alone benefits. The transform is conservative (pure-SSA cond

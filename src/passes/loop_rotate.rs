@@ -60,25 +60,23 @@ const MAX_ROTATIONS_PER_FUNC: usize = 256;
 const MAX_CLOSURE: usize = 8;
 
 pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
-    // v14: loop rotation is still OPT-IN (CCC_LOOP_ROTATE=1). v14 fixed
+    // v15: loop rotation is still OPT-IN (CCC_LOOP_ROTATE=1). v14 fixed
     // the critical exit-merge-phi correctness bug (the test-exit incoming
     // now reads the body's post-iteration value `latch_op`, not the
     // start-of-iteration self-loop phi — off-by-one accumulator that
-    // caused 122/486 miscompiles in v13, now down to ~24), moved the
-    // pass to run AFTER vectorize (running before corrupted the
-    // vectorizer's base-dependence analysis on the rotated self-loop
-    // form), and added conservative body guards (Call/CallIndirect,
-    // volatile memory, Intrinsic bail — keeps recursion and vectorized
-    // loops untouched). The canonical single-block counted loop (e.g.
-    // `for(i=0;i<n;i++) s+=a[i];`) now rotates correctly and produces
-    // bit-identical output to GCC (verified on sum_arr, loop_patterns).
+    // caused 122/486 miscompiles in v13) and moved the pass to run AFTER
+    // vectorize (running before corrupted the vectorizer's base-dependence
+    // analysis on the rotated self-loop form). v15 keeps the v14 placement
+    // (now runs after IV-widen so the widened phi flows through the
+    // rotated form and emits `addq` directly).
     //
-    // The remaining ~24 miscompiles are multi-exit / nested-loop /
-    // header-phi-escapes-through-non-Return-terminator shapes the
-    // single-block-body restriction mishandles, plus a second class of
-    // scalar loops where the exit-merge-phi placement still misses a
-    // downstream use. Default-off avoids regressions; v15 will harden
-    // these shapes and flip the default. Kill-switch: CCC_NO_LOOP_ROTATE.
+    // The remaining ~18 miscompiles when default-on are multi-exit /
+    // nested-loop / header-phi-escapes-through-non-Return-terminator
+    // shapes the single-block-body restriction mishandles, plus a second
+    // class of scalar loops where the exit-merge-phi placement still
+    // misses a downstream use. Default-off avoids regressions; a future
+    // session will harden these shapes and flip the default.
+    // Kill-switch: `CCC_NO_LOOP_ROTATE=1`. Opt-in: `CCC_LOOP_ROTATE=1`.
     if std::env::var("CCC_LOOP_ROTATE").is_err() {
         return 0;
     }

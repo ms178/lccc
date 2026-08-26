@@ -1065,11 +1065,22 @@ fn apply_diamond(func: &mut IrFunction, diamond: &DiamondInfo) -> bool {
         if !merge_block.source_spans.is_empty() {
             let mut idx = 0;
             let insts = &merge_block.instructions;
+            // Guard against source_spans having more entries than
+            // instructions (a prior pass — IV widen, loop_rotate, DCE —
+            // may have removed instructions without shrinking
+            // source_spans to match). An out-of-bounds index here was a
+            // hard panic that took simd_sse2_arith / simd_vecreg_new_ops
+            // down with it. Drop the surplus spans rather than crashing.
             merge_block.source_spans.retain(|_| {
-                let keep = if let Instruction::Phi { dest, .. } = &insts[idx] {
-                    !converted_dests.contains(&dest.0)
+                let keep = if idx < insts.len() {
+                    if let Instruction::Phi { dest, .. } = &insts[idx] {
+                        !converted_dests.contains(&dest.0)
+                    } else {
+                        true
+                    }
                 } else {
-                    true
+                    // No matching instruction (span is stale): drop it.
+                    false
                 };
                 idx += 1;
                 keep
