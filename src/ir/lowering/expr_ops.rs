@@ -49,6 +49,34 @@ impl Lowerer {
             }
         }
 
+        // Vector comparisons (==, !=, <, <=, >, >=).  These must be lowered
+        // element-wise here; the scalar/pointer fall-through below would
+        // otherwise compare a vector's stack address against the scalar
+        // operand (miscompiling PR 110817 and friends).  Only integer element
+        // types take this path — float element vectors have no integer IrCmpOp
+        // and are intentionally left to their existing lowering.
+        if matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        ) {
+            let lhs_ct = self.expr_ctype(lhs);
+            if lhs_ct.is_vector() {
+                if let Some((elem_ct, _)) = lhs_ct.vector_info() {
+                    if !elem_ct.is_floating() {
+                        return self.lower_vector_cmp(*op, lhs, rhs, &lhs_ct);
+                    }
+                }
+            }
+            let rhs_ct = self.expr_ctype(rhs);
+            if rhs_ct.is_vector() {
+                if let Some((elem_ct, _)) = rhs_ct.vector_info() {
+                    if !elem_ct.is_floating() {
+                        return self.lower_vector_cmp(*op, lhs, rhs, &rhs_ct);
+                    }
+                }
+            }
+        }
+
         // Fast path: constant-fold pure integer arithmetic at lowering time.
         // This ensures correct C type semantics (e.g., 32-bit int width for
         // expressions like (1 << 31) / N) which the IR-level fold pass may lose
@@ -563,6 +591,15 @@ impl Lowerer {
             }
             UnaryOp::Neg => {
                 let inner_ct = self.expr_ctype(inner);
+                // Integer-element vector negation: element-wise.  The scalar
+                // path would negate the vector's address (PR 110817 family).
+                if inner_ct.is_vector() {
+                    if let Some((elem, _)) = inner_ct.vector_info() {
+                        if !elem.is_floating() {
+                            return self.lower_vector_unary(IrUnaryOp::Neg, inner, &inner_ct);
+                        }
+                    }
+                }
                 if inner_ct.is_complex() {
                     let val = self.lower_expr(inner);
                     let ptr = self.operand_to_value(val);
@@ -627,6 +664,15 @@ impl Lowerer {
             }
             UnaryOp::BitNot => {
                 let inner_ct = self.expr_ctype(inner);
+                // Integer-element vector bitwise-not: element-wise (see
+                // lower_vector_unary; the scalar path would Not the address).
+                if inner_ct.is_vector() {
+                    if let Some((elem, _)) = inner_ct.vector_info() {
+                        if !elem.is_floating() {
+                            return self.lower_vector_unary(IrUnaryOp::Not, inner, &inner_ct);
+                        }
+                    }
+                }
                 if inner_ct.is_complex() {
                     return self.lower_complex_conj(inner);
                 }

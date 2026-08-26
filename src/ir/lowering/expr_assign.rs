@@ -10,7 +10,7 @@
 use super::lower::Lowerer;
 use crate::common::types::{widened_op_type, AddressSpace, CType, IrType};
 use crate::frontend::parser::ast::{BinOp, Expr};
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
 
 impl Lowerer {
     pub(super) fn lower_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
@@ -1428,5 +1428,247 @@ impl Lowerer {
         }
 
         Operand::Value(result_alloca)
+    }
+
+    /// Lower an element-wise vector comparison (`==`, `!=`, `<`, `<=`, `>`,
+    /// `>=`) to per-lane integer compares that produce an all-ones/all-zeros
+    /// mask in the element type, matching GCC's vector-extension semantics.
+    ///
+    /// GCC vector comparison: each lane compares the corresponding element
+    /// (with a scalar operand broadcast/splatted to all lanes) and yields a
+    /// vector whose element is all-ones when the predicate is true and
+    /// all-zeros otherwise.  This is the vector analogue of
+    /// `lower_vector_binary_op`.
+    ///
+    /// Comparisons must take this path rather than the scalar/pointer
+    /// fall-through in `lower_binary_op`: the fall-through lowers both operands
+    /// to values and emits a single `Cmp`.  For a vector operand the lowered
+    /// value is the vector's stack address, so the comparison would test the
+    /// *pointer* against the scalar — miscompiling e.g. `((V){0} <= 0)` (PR
+    /// 110817) into `ptr <= 0` and dereferencing the result mask as an address.
+    pub(super) fn lower_vector_cmp(
+        &mut self,
+        op: BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        vec_ct: &CType,
+    ) -> Operand {
+        let (elem_ct, num_elems) = match vec_ct.vector_info() {
+            Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
+            None => return Operand::Const(IrConst::I64(0)),
+        };
+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let elem_size = elem_ct.size();
+        let total_size = match vec_ct {
+            CType::Vector(_, ts) => *ts,
+            _ => unreachable!(
+                "lower_vector_cmp called with non-vector type: {:?}",
+                vec_ct
+            ),
+        };
+        let is_unsigned = elem_ct.is_unsigned();
+        let cmp_op = Self::binop_to_cmp(op, is_unsigned);
+
+        let lhs_is_vector = self.expr_ctype(lhs).is_vector();
+        let rhs_is_vector = self.expr_ctype(rhs).is_vector();
+
+        // Allocate the result mask vector on the stack.
+        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+
+        let lhs_lowered = self.lower_expr(lhs);
+        let lhs_val = self.operand_to_value(lhs_lowered);
+        let rhs_lowered = self.lower_expr(rhs);
+        let rhs_val = self.operand_to_value(rhs_lowered);
+
+        // For a scalar operand, cast it to the element type once (the
+        // broadcast value); for a vector operand we load each lane.
+        let lhs_scalar = if !lhs_is_vector {
+            let src_ty = self.get_expr_type(lhs);
+            Some(self.emit_implicit_cast(Operand::Value(lhs_val), src_ty, elem_ir_ty))
+        } else {
+            None
+        };
+        let rhs_scalar = if !rhs_is_vector {
+            let src_ty = self.get_expr_type(rhs);
+            Some(self.emit_implicit_cast(Operand::Value(rhs_val), src_ty, elem_ir_ty))
+        } else {
+            None
+        };
+
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        for i in 0..num_elems {
+            let offset = i * elem_size;
+
+            // LHS element: load the lane from the vector, or reuse the
+            // broadcast scalar.
+            let lhs_elem_op = if let Some(ref scalar_op) = lhs_scalar {
+                *scalar_op
+            } else {
+                let lhs_elem_ptr = if offset > 0 {
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(lhs_val),
+                        Operand::Const(IrConst::ptr_int(offset as i64)),
+                        ptr_int_ty,
+                    )
+                } else {
+                    lhs_val
+                };
+                let lhs_elem = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: lhs_elem,
+                    ptr: lhs_elem_ptr,
+                    ty: elem_ir_ty,
+                    seg_override: AddressSpace::Default,
+                });
+                Operand::Value(lhs_elem)
+            };
+
+            // RHS element.
+            let rhs_elem_op = if let Some(ref scalar_op) = rhs_scalar {
+                *scalar_op
+            } else {
+                let rhs_elem_ptr = if offset > 0 {
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(rhs_val),
+                        Operand::Const(IrConst::ptr_int(offset as i64)),
+                        ptr_int_ty,
+                    )
+                } else {
+                    rhs_val
+                };
+                let rhs_elem = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: rhs_elem,
+                    ptr: rhs_elem_ptr,
+                    ty: elem_ir_ty,
+                    seg_override: AddressSpace::Default,
+                });
+                Operand::Value(rhs_elem)
+            };
+
+            let result_elem_ptr = if offset > 0 {
+                self.emit_binop_val(
+                    IrBinOp::Add,
+                    Operand::Value(result_alloca),
+                    Operand::Const(IrConst::ptr_int(offset as i64)),
+                    ptr_int_ty,
+                )
+            } else {
+                result_alloca
+            };
+
+            // Lane predicate -> all-ones/all-zeros mask.  `Cmp` yields an I32
+            // 0/1 boolean; widen to the element type, then `0 - x` produces
+            // the all-ones mask (two's complement) for the true lane and 0 for
+            // the false lane, at any element width.
+            let cond = self.emit_cmp_val(cmp_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
+            let cond_ext = self.emit_cast_val(Operand::Value(cond), IrType::I32, elem_ir_ty);
+            let zero = Operand::Const(Self::ir_zero_const(elem_ir_ty));
+            let mask = self.emit_binop_val(IrBinOp::Sub, zero, Operand::Value(cond_ext), elem_ir_ty);
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(mask),
+                ptr: result_elem_ptr,
+                ty: elem_ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+        }
+
+        Operand::Value(result_alloca)
+    }
+
+    /// Lower a unary vector operation (`-` negation, `~` bitwise-not) to an
+    /// element-wise operation, producing a result vector.  Without this the
+    /// generic scalar path in `lower_unary_op` applies the operation to the
+    /// vector's stack *address*, so `~v` becomes `~&v` and the downstream
+    /// memcpy/load further misuses it (PR 110817: `~((V){0} <= 0)` segfaulted
+    /// because `Not` was applied to the alloca pointer).
+    pub(super) fn lower_vector_unary(
+        &mut self,
+        ir_unary: IrUnaryOp,
+        inner: &Expr,
+        vec_ct: &CType,
+    ) -> Operand {
+        let (elem_ct, num_elems) = match vec_ct.vector_info() {
+            Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
+            None => return Operand::Const(IrConst::I64(0)),
+        };
+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let elem_size = elem_ct.size();
+        let total_size = match vec_ct {
+            CType::Vector(_, ts) => *ts,
+            _ => unreachable!(
+                "lower_vector_unary called with non-vector type: {:?}",
+                vec_ct
+            ),
+        };
+        let result_alloca = self.emit_entry_alloca(IrType::Ptr, total_size, total_size, false);
+        let val = self.lower_expr(inner);
+        let val = self.operand_to_value(val);
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+
+        for i in 0..num_elems {
+            let offset = i * elem_size;
+            let elem_ptr = if offset > 0 {
+                self.emit_binop_val(
+                    IrBinOp::Add,
+                    Operand::Value(val),
+                    Operand::Const(IrConst::ptr_int(offset as i64)),
+                    ptr_int_ty,
+                )
+            } else {
+                val
+            };
+            let elem = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: elem,
+                ptr: elem_ptr,
+                ty: elem_ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+            let result_elem_ptr = if offset > 0 {
+                self.emit_binop_val(
+                    IrBinOp::Add,
+                    Operand::Value(result_alloca),
+                    Operand::Const(IrConst::ptr_int(offset as i64)),
+                    ptr_int_ty,
+                )
+            } else {
+                result_alloca
+            };
+            let result_elem = self.fresh_value();
+            self.emit(Instruction::UnaryOp {
+                dest: result_elem,
+                op: ir_unary,
+                src: Operand::Value(elem),
+                ty: elem_ir_ty,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(result_elem),
+                ptr: result_elem_ptr,
+                ty: elem_ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        Operand::Value(result_alloca)
+    }
+
+    /// Build an integer zero constant for the given IR type. Element types we
+    /// lower vector compares on are always integer, so this is total over the
+    /// integer set; anything else falls back to I64(0) defensively.
+    fn ir_zero_const(ty: IrType) -> IrConst {
+        match ty {
+            IrType::I8 => IrConst::I8(0),
+            IrType::I16 => IrConst::I16(0),
+            IrType::I32 => IrConst::I32(0),
+            IrType::I128 => IrConst::I128(0),
+            _ => IrConst::I64(0),
+        }
     }
 }

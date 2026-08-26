@@ -568,6 +568,29 @@ impl Lowerer {
     pub(super) fn expr_ctype(&self, expr: &Expr) -> CType {
         // Handle complex-specific cases that get_expr_ctype doesn't cover
         match expr {
+            // Vector comparison: GCC vector extensions give a relational or
+            // equality operator on vector operands a result of the operand
+            // vector type (a per-lane all-ones/all-zeros mask).  The unary `~`
+            // in `~(V <= s)` therefore must see a vector (PR 110817).  We keep
+            // this in its own arm so that *non-vector* comparisons — including
+            // complex equality — fall through to get_expr_ctype exactly as
+            // before, preserving the long-standing complex behavior.
+            Expr::BinaryOp(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                lhs,
+                rhs,
+                _,
+            ) => {
+                let lt = self.expr_ctype(lhs);
+                let rt = self.expr_ctype(rhs);
+                if lt.is_vector() {
+                    return lt;
+                }
+                if rt.is_vector() {
+                    return rt;
+                }
+                // Scalar/complex comparisons: fall through to get_expr_ctype.
+            }
             Expr::BinaryOp(
                 BinOp::Add
                 | BinOp::Sub
