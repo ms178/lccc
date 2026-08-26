@@ -4094,23 +4094,48 @@ impl ArchCodegen for X86Codegen {
         }
         self.state.out.emit_jcc_label("    jae", &default_label);
 
-        self.state
-            .out
-            .emit_instr_sym_base_reg("    leaq", &table_label, "rip", "rcx");
-        self.state.emit("    movslq (%rcx,%rax,4), %rdx");
-        self.state.emit("    addq %rcx, %rdx");
-        // Switch-table dispatch is an indirect branch: it needs the same
-        // retpoline protection as calls (Spectre v2 via the BTB applies to
-        // any indirect JMP; kernel objtool flags naked ones in vDSO too).
-        self.emit_retpoline_jump("rdx");
+        // Kernel / non-PIC code model: emit the GCC-canonical ABSOLUTE jump
+        // table — `jmp *jt_table(,%rax,8)` (R_X86_64_32S against .rodata)
+        // plus `.quad` entries (R_X86_64_64 with absolute target offsets).
+        // This is the only shape the kernel's objtool can validate: its
+        // add_jump_table() reads each entry's RELA addend as an absolute
+        // instruction offset, but PIC-style `.long target - table` entries
+        // carry position-baked addends (the GAS convention adds the entry's
+        // own offset, so S + A - P resolves at link time), which objtool
+        // then resolves mid-instruction and rejects the object with
+        // "can't find switch jump table" (observed on
+        // arch/x86/kernel/platform-quirks.o). GCC avoids this entirely by
+        // using absolute tables under -mcmodel=kernel/-fno-pic, so mirror
+        // that shape here.
+        let absolute_table = self.state.code_model_kernel || !self.state.pic_mode;
+        if absolute_table {
+            self.state
+                .emit_fmt(format_args!("    jmpq *{}(,%rax,8)", table_label));
+        } else {
+            // PIC: RIP-relative table base + PC32 differences. Correct for
+            // user-space PIC (no objtool validation there).
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", &table_label, "rip", "rcx");
+            self.state.emit("    movslq (%rcx,%rax,4), %rdx");
+            self.state.emit("    addq %rcx, %rdx");
+            // Switch-table dispatch is an indirect branch: it needs the same
+            // retpoline protection as calls (Spectre v2 via the BTB applies to
+            // any indirect JMP; kernel objtool flags naked ones in vDSO too).
+            self.emit_retpoline_jump("rdx");
+        }
 
         self.state.emit(".section .rodata");
-        self.state.emit(".align 4");
+        self.state.emit(if absolute_table { ".align 8" } else { ".align 4" });
         self.state.out.emit_named_label(&table_label);
         for target in &table {
             let target_label = target.as_label();
-            self.state
-                .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
+            if absolute_table {
+                self.state.emit_fmt(format_args!("    .quad {}", target_label));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    .long {} - {}", target_label, table_label));
+            }
         }
         let sect = self.state.current_text_section.clone();
         self.state

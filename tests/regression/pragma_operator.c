@@ -25,9 +25,33 @@ APPLY(_Pragma("push_macro(\"N\")"))
 APPLY(_Pragma("pop_macro(\"N\")"))
 int c = N;
 
+/* _Pragma whose argument is produced by MACRO REPLACEMENT of the argument
+ * (C11 6.10.9: the argument undergoes full macro replacement before the
+ * operator takes effect). The kernel's __diag chain relies on this —
+ *   __diag_str1(s) -> #s ; __diag_str(s) -> __diag_str1(s) ;
+ *   __diag(s)      -> _Pragma(__diag_str(GCC diagnostic s))
+ * so _Pragma receives a macro INVOCATION that only becomes a string
+ * literal after replacement (mm/slab_common.c, __bpf_kfunc_start_defs). */
+#define diag_str1(s) #s
+#define diag_str(s) diag_str1(s)
+#define do_pragma(s) _Pragma(diag_str(s))
+
+/* Kernel-shaped expansion must be accepted (compile-only check). */
+do_pragma(GCC diagnostic push)
+do_pragma(GCC diagnostic ignored "-Wpointer-sign")
+do_pragma(GCC diagnostic pop)
+
+#define R 41
+do_pragma(push_macro("R"))
+#undef R
+#define R 42
+do_pragma(pop_macro("R"))
+int e = R;  /* push/pop via expanded-arg _Pragma must restore R = 41 */
+
 int main(void) {
     if (a != 2) return 1;   /* M was 2 when `a` was defined */
     if (b != 1) return 2;   /* pop_macro restored M = 1 */
     if (c != 10) return 3;  /* N was pushed as 10, pop restores 10 */
+    if (e != 41) return 4;  /* expanded-arg _Pragma push/pop restored R */
     return 0;
 }

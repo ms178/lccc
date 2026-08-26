@@ -834,6 +834,10 @@ impl Parser {
         self.expect_context(&TokenKind::LBrace, "for struct/union body");
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             self.skip_gcc_extensions();
+            // Per-field reset: an `address_space(__seg_gs)` attribute parsed
+            // for one field must not leak into the next (fields without a
+            // declarator — anonymous/bitfield arms — never snapshot it).
+            self.attrs.parsing_address_space = AddressSpace::Default;
             if matches!(self.peek(), TokenKind::Semicolon) {
                 self.advance();
                 continue;
@@ -884,6 +888,16 @@ impl Parser {
         // in struct field declarations: e.g., "char _Alignas(32) c;"
         self.consume_struct_field_qualifiers(&mut alignas_from_type);
 
+        // Snapshot the field's address-space qualifier NOW (before the
+        // declarator parser runs — the abstract-declarator path consumes and
+        // clears `parsing_address_space`, so reading it afterwards loses the
+        // qualifier). The kernel's percpu fields depend on this:
+        // `unsigned int __percpu *read_count;` must type the field as a
+        // %gs-qualified pointer, otherwise assigning `alloc_percpu(int)`
+        // (a `__seg_gs int *`) trips "incompatible pointer types".
+        let field_addr_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+
         loop {
             // Handle unnamed bitfield: `: constant-expr`
             if matches!(self.peek(), TokenKind::Colon) {
@@ -932,7 +946,15 @@ impl Parser {
             // directly, fold simple derived declarators (pointers, arrays) into
             // type_spec. Only use the derived field for complex cases with function
             // pointers that require build_full_ctype().
-            let (field_type, field_derived) = Self::fold_simple_derived(type_spec, &derived);
+            let (mut field_type, field_derived) = Self::fold_simple_derived(type_spec, &derived);
+            // Attach the address-space qualifier (e.g. `__percpu`) to the
+            // outermost pointer: `unsigned int __percpu *read_count` declares a
+            // %gs-qualified POINTER, and the load through it must use %gs:.
+            if field_addr_space != AddressSpace::Default {
+                if let TypeSpecifier::Pointer(_, addr_slot) = &mut field_type {
+                    *addr_slot = field_addr_space;
+                }
+            }
 
             fields.push(StructFieldDecl {
                 type_spec: field_type,

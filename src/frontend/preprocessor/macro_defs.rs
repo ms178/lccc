@@ -532,7 +532,7 @@ impl MacroTable {
         // de-escaped string content as a pragma for the pipeline to execute
         // (`_Pragma("foo")` is equivalent to `#pragma foo`).
         if ident == "_Pragma" {
-            return self.handle_pragma_operator(bytes, i, ident, result);
+            return self.handle_pragma_operator(bytes, i, ident, result, expanding);
         }
 
         // Handle __COUNTER__ built-in
@@ -600,13 +600,30 @@ impl MacroTable {
         }
     }
 
-    /// Handle a `_Pragma("...")` operator: queue the de-escaped string
+        /// Handle a `_Pragma("...")` operator: queue the de-escaped string
     /// literal content as a pending pragma (C99 §6.10.9.1 — `\\"` becomes
     /// `"`, `\\\\` becomes `\\`), removing the operator from the token
     /// stream. Returns the index just past the closing `)`. On any parse
-    /// failure the identifier is preserved verbatim for a downstream
+    /// failure the operator text is preserved verbatim for a downstream
     /// diagnostic.
-    fn handle_pragma_operator(&self, bytes: &[u8], i: usize, ident: &str, result: &mut String) -> usize {
+    ///
+    /// Per C11 §6.10.9 the argument undergoes FULL MACRO REPLACEMENT first
+    /// and the result must be a string literal. The kernel's __diag macros
+    /// depend on this: `__diag(s)` is `_Pragma(__diag_str(GCC diagnostic
+    /// s))` where __diag_str stringizes — so the operator is routinely fed
+    /// an unexpanded macro invocation that only becomes a string after
+    /// expansion. Requiring a pre-formed string literal (as this handler
+    /// previously did) left the whole `_Pragma(...)` text in the token
+    /// stream, which the parser then rejected ("expected ')' before string
+    /// literal", mm/slab_common.c via __bpf_kfunc_start_defs).
+    fn handle_pragma_operator(
+        &self,
+        bytes: &[u8],
+        i: usize,
+        ident: &str,
+        result: &mut String,
+        expanding: &mut FxHashSet<String>,
+    ) -> usize {
         let len = bytes.len();
         let mut j = i;
         while j < len && bytes[j].is_ascii_whitespace() {
@@ -616,30 +633,72 @@ impl MacroTable {
             result.push_str(ident);
             return i;
         }
-        j += 1;
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
+        // Scan the balanced parenthesized argument, respecting nested
+        // parentheses and string literals.
+        let mut depth = 0usize;
+        let mut k = j;
+        let mut in_string = false;
+        let mut escaped = false;
+        while k < len {
+            let b = bytes[k];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            k += 1;
         }
-        // Optional encoding prefix (L, u, U, u8) before the string literal.
-        while j < len && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'8') {
-            j += 1;
-        }
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        if j >= len || bytes[j] != b'"' {
+        if k >= len || bytes[k] != b')' {
             result.push_str(ident);
             return i;
         }
-        j += 1;
+        let arg_text = std::str::from_utf8(&bytes[j + 1..k]).unwrap_or("");
+        // C11 §6.10.9: macro-replace the argument, then require a string.
+        let expanded = self.expand_text(arg_text, expanding);
+        let et = expanded.trim();
+        // Optional encoding prefix (L, u, U, u8) before the string literal.
+        let mut p = 0;
+        while p < et.len()
+            && (et.as_bytes()[p].is_ascii_alphabetic() || et.as_bytes()[p] == b'8')
+        {
+            p += 1;
+        }
+        let et = et[p..].trim_start();
+        if !et.starts_with('"') {
+            // Not a string literal after expansion: preserve the operator
+            // verbatim for a downstream diagnostic.
+            result.push_str(ident);
+            result.push('(');
+            result.push_str(arg_text);
+            result.push(')');
+            return k + 1;
+        }
         let mut content = String::new();
+        let mut q = 1;
+        let eb = et.as_bytes();
         let mut closed = false;
-        while j < len {
-            match bytes[j] {
-                b'\\' if j + 1 < len => {
+        while q < eb.len() {
+            match eb[q] {
+                b'\\' if q + 1 < eb.len() => {
                     // De-stringize: only quote and backslash escapes alter the
                     // pragma text; unknown escapes keep the character as-is.
-                    match bytes[j + 1] {
+                    match eb[q + 1] {
                         b'"' => content.push('"'),
                         b'\\' => content.push('\\'),
                         c => {
@@ -647,10 +706,10 @@ impl MacroTable {
                             content.push(c as char);
                         }
                     }
-                    j += 2;
+                    q += 2;
                 }
                 b'"' => {
-                    j += 1;
+                    q += 1;
                     closed = true;
                     break;
                 }
@@ -658,7 +717,7 @@ impl MacroTable {
                     // Preserve bytes verbatim (pragma text may be non-ASCII in
                     // the source encoding).
                     content.push(c as char);
-                    j += 1;
+                    q += 1;
                 }
             }
         }
@@ -666,16 +725,8 @@ impl MacroTable {
             result.push_str(ident);
             return i;
         }
-        while j < len && bytes[j].is_ascii_whitespace() {
-            j += 1;
-        }
-        if j >= len || bytes[j] != b')' {
-            result.push_str(ident);
-            return i;
-        }
-        j += 1;
         self.pending_pragmas.borrow_mut().push(content);
-        j
+        k + 1
     }
 
     /// Expand a macro invocation (function-like or object-like).

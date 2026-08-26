@@ -1115,15 +1115,23 @@ pub(super) fn is_conditional_jump(s: &str) -> bool {
         b'g' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // jg, jge
         b'b' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // jb, jbe
         b'a' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'e' && b[3] == b' '), // ja, jae
+        // GAS aliases: `jc` = jb, `jnc` = jae. The kernel's bit-test idiom
+        // (`bt $bit,%r; jc .Lx`) relies on these; missing them here left the
+        // lines unclassified as CondJmp, the identical_blocks predecessor
+        // analysis saw no incoming edge, and the pass merged live blocks
+        // away (kernel/events/core.c is_sb_event lost its return-false block,
+        // dangling `jnc` relocation -> sym index 0 -> link failure).
+        b'c' => b[2] == b' ' || (b.len() >= 4 && b[2] == b'n' && b[3] == b' '), // jc, jnc
         b's' => b[2] == b' ',                                                   // js
         b'o' => b[2] == b' ',                                                   // jo
         b'p' => b[2] == b' ',                                                   // jp
         b'z' => b[2] == b' ',                                                   // jz
         b'n' => {
-            // jne, jns, jno, jnp, jnz
+            // jne, jns, jno, jnp, jnz, jnc (jnc = jae alias; must live here —
+            // the `n` arm runs before the `c` arm in this dispatch)
             if b.len() >= 4 {
                 match b[2] {
-                    b'e' | b's' | b'o' | b'p' | b'z' => b[3] == b' ',
+                    b'e' | b's' | b'o' | b'p' | b'z' | b'c' => b[3] == b' ',
                     _ => false,
                 }
             } else {

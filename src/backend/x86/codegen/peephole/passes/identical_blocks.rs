@@ -256,6 +256,18 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
                     blocks.push((start, end, label_name.to_string(), current_func_id));
                     i = end;
                     continue;
+                } else if !label_name.starts_with(".L") {
+                    // Global (non-local) label: a new function entry point.
+                    // Function identity must NOT rely on .cfi_startproc —
+                    // the kernel builds with -fno-asynchronous-unwind-tables
+                    // and emits no CFI directives at all, which previously
+                    // left every block in the whole object sharing
+                    // func_id = 0 and let identical return blocks merge
+                    // ACROSS FUNCTIONS: update_srbds_msr's early-return
+                    // block was redirected into mds_apply_mitigation in
+                    // .init.text (modpost section mismatch + a wrong
+                    // cross-section jump at runtime).
+                    current_func_id += 1;
                 }
             }
         }
@@ -354,8 +366,11 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
         }
         if instr_count >= 4 {
             hasher ^= instr_count as u64;
-            block_hashes.entry((hasher, func_id)).or_default().push(idx);
         }
+        // The push must NOT be nested inside the `instr_count >= 4` refinement:
+        // blocks with fewer than 4 instructions would never be registered and
+        // could never merge (e.g. 2-instruction `call; ret` trampolines).
+        block_hashes.entry((hasher, func_id)).or_default().push(idx);
     }
 
     // Build label → block index map, for predecessor-cleanliness checks.
@@ -365,18 +380,25 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     }
 
     // SOUNDNESS: collect labels referenced from JUMP TABLES
-    // (`.long .LBBxxx - .Ljt_n` entries in .rodata). Redirecting/eliminating a
-    // block whose label appears in a jump table leaves the jump-table entry
-    // pointing at a removed (NOP) block — `jmp *%rdx` then lands on garbage and
-    // crashes. The pass cannot rewrite those `.long` entries, so any block that
-    // is a jump-table target must be excluded from merging entirely.
+    // (`.long .LBBxxx - .Ljt_n` entries for i686 REL tables and
+    // `.quad .LBBxxx` entries for x86-64 absolute tables, both in .rodata).
+    // Redirecting/eliminating a block whose label appears in a jump table
+    // leaves the jump-table entry pointing at a removed (NOP) block — the
+    // indirect jump then lands on garbage (or, for `.quad` entries, the
+    // relocation is emitted against a label that no longer exists, and the
+    // ELF writer silently resolves it to symbol index 0, which the linker
+    // reports as an undefined `<section 0 ''>`). The pass cannot rewrite
+    // those entries, so any block that is a jump-table target must be
+    // excluded from merging entirely. (Linux 6.18 syscall_64.o: 104
+    // `__x64_sys_ni_syscall` switch cases are byte-identical; merging them
+    // left 98 `.quad` entries dangling and broke the vmlinux link.)
     let mut jump_table_targets: FxHashSet<String> = FxHashSet::default();
     for i in 0..len {
         if infos[i].is_nop() {
             continue;
         }
         let line = infos[i].trimmed(store.get(i));
-        if line.starts_with(".long ") {
+        if line.starts_with(".long ") || line.starts_with(".quad ") {
             // Extract every `.LBB...` label mentioned in the entry.
             // The token is ".LBB" followed by the name characters; start scanning
             // the name AFTER the ".LBB" prefix so `j` always advances past pos.
@@ -547,4 +569,158 @@ pub(super) fn merge_identical_blocks(store: &mut LineStore, infos: &mut [LineInf
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    /// x86-64 absolute jump tables (`.quad .LBBn` in `.Ljt_0`) must protect
+    /// their target blocks from identical-block merging, exactly like the
+    /// i686 `.long .LBBn - .Ljt_n` form. Merging a `.quad` target leaves the
+    /// jump-table relocation pointing at a removed label; the ELF writer then
+    /// emits symbol index 0 and the link dies with `<section 0 ''>`.
+    ///
+    /// Mirrors Linux 6.18 `arch/x86/entry/syscall_64.c`: 104 `case nr:
+    /// return __x64_sys_ni_syscall(regs);` blocks are byte-identical; merging
+    /// them (with only `.long` tables protected) left 98 dangling `.quad`
+    /// entries and broke the vmlinux link.
+    #[test]
+    fn quad_jump_table_targets_are_not_merged() {
+        let out = run(concat!(
+            "x64_sys_call:\n",
+            ".cfi_startproc\n",
+            "    cmpq $3, %rax\n",
+            "    jae .LBB2\n",
+            "    jmpq *.Ljt_0(,%rax,8)\n",
+            ".LBB0:\n",
+            "    call __x64_sys_ni_syscall\n",
+            "    ret\n",
+            ".LBB1:\n",
+            "    call __x64_sys_ni_syscall\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".section .rodata\n",
+            ".align 8\n",
+            ".Ljt_0:\n",
+            "    .quad .LBB0\n",
+            "    .quad .LBB1\n",
+        ));
+        // Both jump-table targets must survive with their labels defined.
+        assert!(out.contains(".LBB0:\n"), "case 0 block was merged away:\n{out}");
+        assert!(out.contains(".LBB1:\n"), "case 1 block was merged away:\n{out}");
+        assert!(out.contains(".quad .LBB0"), "{out}");
+        assert!(out.contains(".quad .LBB1"), "{out}");
+    }
+
+    /// `jc`/`jnc` are GAS aliases for jb/jae and MUST classify as
+    /// conditional jumps: the kernel's bit-test idiom branches with them,
+    /// and a predecessor edge that goes missing lets identical_blocks merge
+    /// a block that still has a live branch. kernel/events/core.c
+    /// is_sb_event lost its return-false block exactly this way.
+    #[test]
+    fn jc_jnc_branch_targets_are_live_predecessors() {
+        let out = run(concat!(
+            "f:\n",
+            "    jmp .LBB0\n",
+            ".LBB1:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB0:\n",
+            "    btq $8, %r9\n",
+            "    jc .LBB2\n",
+            ".LBB4:\n",
+            "    btq $30, %r9\n",
+            "    jnc .LBB3\n",
+            ".LBB2:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+        ));
+        // .LBB3 is the jnc target: it must survive even though .LBB1 has
+        // identical text (their predecessor sets differ once jnc counts).
+        assert!(out.contains(".LBB3:\n"), "jnc target block was merged away:\n{out}");
+        assert!(out.contains("jnc .LBB3"), "{out}");
+        // And the genuinely unreferenced twin may still be canonicalised.
+        assert!(out.matches("xorl %eax, %eax").count() >= 1, "{out}");
+    }
+
+    /// Two functions with byte-identical epilogue blocks must NEVER merge
+    /// across the function boundary. The kernel builds with
+    /// -fno-asynchronous-unwind-tables and emits no .cfi_startproc at all;
+    /// when func_id grouping relied on CFI directives every block in the
+    /// object shared func_id 0, and update_srbds_msr's early-return block
+    /// was merged into mds_apply_mitigation (a cross-section branch from
+    /// .text into .init.text: modpost mismatch + wrong jump at runtime).
+    /// Function identity must come from global (non-.L) labels instead.
+    #[test]
+    fn identical_blocks_never_merge_across_functions_without_cfi() {
+        let out = run(concat!(
+            "update_srbds_msr:\n",
+            "    cmpq $0, %rdi\n",
+            "    je .LBB1\n",
+            ".LBB0:\n",
+            "    movq %rbp, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".LBB1:\n",
+            "    movq %rbp, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            "mds_apply_mitigation:\n",
+            "    cmpq $0, %rdi\n",
+            "    je .LBB4\n",
+            ".LBB3:\n",
+            "    movq %rbp, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    movq %rbp, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+        ));
+        // Within each function the pair may merge (1 survivor per function),
+        // but the functions' blocks must never merge into a single one.
+        assert_eq!(out.matches("popq %rbp").count(), 2, "{out}");
+        // And each function's own epilogue must stay reachable from its own
+        // function: two disjoint "movq %rbp, %rsp" survivors, one per function.
+        assert_eq!(out.matches("movq %rbp, %rsp").count(), 2, "{out}");
+        // No branch in update_srbds_msr may target a block defined after the
+        // mds_apply_mitigation label. (Cheap proxy: the label itself survives.)
+        assert!(out.contains("mds_apply_mitigation:\n"), "{out}");
+    }
+
+    /// Control: blocks that are NOT jump-table targets still merge.
+    #[test]
+    fn non_jump_table_blocks_still_merge() {
+        // Both .LBB2 and .LBB3 are reached from the same dispatcher block,
+        // have identical text, and neither is a jump-table target — the pass
+        // must still merge them (the .quad protection must not disable the
+        // pass wholesale).
+        let out = run(concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    cmpq $1, %rdi\n",
+            "    je .LBB2\n",
+            "    jmp .LBB3\n",
+            ".LBB2:\n",
+            "    call ext_a\n",
+            "    ret\n",
+            ".LBB3:\n",
+            "    call ext_a\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // One canonical block survives; the duplicate is redirected.
+        let defs = out.matches("call ext_a").count();
+        assert_eq!(defs, 1, "expected 1 surviving call block:\n{out}");
+    }
 }

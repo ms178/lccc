@@ -1,0 +1,97 @@
+# ============================================================================
+# lccc VM kernel config fragment — derived from the linux-cachymod-6.18
+# package config, reduced to what a QEMU/busybox boot validation needs while
+# keeping every CachyMod patch FUNCTIONAL (not just applied):
+#
+#   * BORE scheduler            CONFIG_SCHED_BORE=y   (0001-bore.patch)
+#   * 800 Hz tick               CONFIG_HZ_800=y       (0100-kconfig-add-800Hz.patch)
+#   * CachyOS kernel tweaks     CONFIG_CACHY=y        (0005-cachy.patch)
+#   * cache-aware scheduling    CONFIG_SCHED_CACHE=y  (0400/0410-*.patch)
+#   * sched-ext (SCX)           CONFIG_SCHED_CLASS_EXT=y (0010-sched-ext.patch)
+#   * BBRv3 congestion control  CONFIG_TCP_CONG_BBR=y (0004-bbr3.patch)
+#   * full preemption           CONFIG_PREEMPT=y      (package default)
+#
+# Applied on top of `make allnoconfig` so the object count stays small enough
+# for a full LCCC build on a 2-core research VM (few hundred TUs instead of
+# ~5000), then `make olddefconfig` resolves the remaining dependencies.
+#
+# Boot validation targets: QEMU (TCG), serial console, busybox initramfs.
+# ============================================================================
+CONFIG_64BIT=y
+
+# --- processor / SMP (SCHED_CACHE depends on SMP) ----------------------------
+CONFIG_SMP=y
+CONFIG_NR_CPUS=4
+CONFIG_X86_64_SMP=y
+
+# --- tick / scheduler / preemption (CachyMod patches) ------------------------
+CONFIG_HZ_800=y
+CONFIG_PREEMPT=y
+CONFIG_PREEMPTION=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_SCHED_BORE=y
+CONFIG_SCHED_CACHE=y
+CONFIG_SCHED_DEBUG=y
+CONFIG_DEBUG_FS=y
+CONFIG_CACHY=y
+
+# --- core kernel facilities ---------------------------------------------------
+CONFIG_PRINTK=y
+CONFIG_PRINTK_TIME=y
+CONFIG_BUG=y
+CONFIG_KALLSYMS=y
+CONFIG_ELF_CORE=n
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+CONFIG_TTY=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+CONFIG_EARLY_PRINTK=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+
+# --- serial console (QEMU -nographic, ISA 16550) ------------------------------
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+# --- networking for BBRv3 validation (no NIC needed to list congestion algos) -
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_TCP_CONG_ADVANCED=y
+CONFIG_TCP_CONG_BBR=y
+
+# --- BPF for sched-ext --------------------------------------------------------
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_PERF_EVENTS=y
+
+# --- keep the generated code simple for the first full-LCCC milestone ---------
+CONFIG_MODULES=n
+CONFIG_OBJTOOL=n
+CONFIG_NOINSTR_VALIDATION=n
+CONFIG_STACK_VALIDATION=n
+CONFIG_DEBUG_INFO_BTF=n
+CONFIG_DEBUG_INFO=n
+CONFIG_RANDOMIZE_BASE=n
+CONFIG_KASAN=n
+CONFIG_KCSAN=n
+CONFIG_UBSAN=n
+CONFIG_STACKPROTECTOR=n
+CONFIG_GCC_PLUGINS=n
+CONFIG_RETPOLINE=n
+CONFIG_X86_KERNEL_IBT=n
+CONFIG_X86_USER_SHADOW_STACK=n
+CONFIG_UNWINDER_FRAME_POINTER=y
+CONFIG_UNWINDER_ORC=n
+
+# --- compression: zstd host tool is installed and fast ------------------------
+CONFIG_KERNEL_ZSTD=y
