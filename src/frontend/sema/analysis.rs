@@ -2102,6 +2102,14 @@ impl SemanticAnalyzer {
             // `Char` represents both plain and signed char here (there is no
             // distinct `SChar` variant), so this covers all three combos.
             (CType::Char, CType::UChar) | (CType::UChar, CType::Char) => true,
+            // GCC -Wpointer-sign: pointers to integer types of the SAME SIZE
+            // are assignment-compatible regardless of signedness — the
+            // difference is a warning at most, never
+            // `-Wincompatible-pointer-types`. The kernel passes
+            // -Wno-pointer-sign and relies on this constantly (e.g.
+            // percpu-rwsem.c assigns `alloc_percpu(int)` — a `__seg_gs int *`
+            // — to the `unsigned int __percpu *read_count` field).
+            (a, b) if a.is_integer() && b.is_integer() && a.size() == b.size() => true,
             // For basic types, use equality (ignoring qualifiers)
             _ => a == b,
         }

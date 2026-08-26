@@ -41,10 +41,21 @@ tag=$(printf 'S%02d-%s' "$seq" "$slug")
 cd "$REPO"
 
 # ---- base ref: the upstream commit this session is rebased on ---------------
+# The deliverable must contain exactly this session's work, so the base is the
+# UPSTREAM commit the session started from, never the session's own commits.
+# On first use that is origin/main (the clone point / rebase target); a
+# recorded base survives between sessions so a later snapshot keeps the full
+# session history even after the branch has diverged further.
+BASE=""
 if [[ -f "$BASE_REF_FILE" ]]; then
   BASE=$(cat "$BASE_REF_FILE")
-else
-  BASE=$(git rev-parse HEAD)
+  if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+    echo "lccc-snapshot: recorded base $BASE no longer exists; resetting to origin/main" >&2
+    BASE=""
+  fi
+fi
+if [[ -z "$BASE" ]]; then
+  BASE=$(git rev-parse --verify --quiet origin/main || git rev-parse HEAD)
   printf '%s\n' "$BASE" > "$BASE_REF_FILE"
 fi
 

@@ -187,25 +187,33 @@ fn extract_extended_name(ext: &[u8], name_off: usize) -> String {
     String::from_utf8_lossy(&slice[..end]).into_owned()
 }
 
-/// Parse a `/<decimal>` extended-name-table offset (`/123` or `/123/`).
-/// Returns `None` for empty or non-decimal remainders.
+/// Parse a `/<decimal>` extended-name-table offset with GNU `strtol` semantics:
+/// consume the leading decimal digits and stop at the first non-digit.
+///
+/// GNU ar / binutils write long-name references as `/123` (space-padded to 16
+/// bytes), but the thin-archive rewrite pass (`ar mPi --thin`) can leave the
+/// name field space-padded *after* the terminating `/`, producing forms like
+/// `/4611          /`. BFD reads these via plain `strtol` in
+/// `get_extended_arelt_filename`, so trailing slashes, padding spaces and
+/// `/NNN:origin` compounds (emitted by binutils thin rewrites) are all parsed
+/// by their decimal prefix. The kernel's `vmlinux.a` (produced by
+/// `scripts/Makefile.vmlinux_a`'s `ar mPi --thin` rewrite) contains exactly
+/// such slash-suffixed references alongside clean `/4635       ` ones; a
+/// strict "digits to the end (minus one optional trailing slash)" parser
+/// rejects them.
+///
+/// Returns `None` when there is no leading decimal digit.
 #[inline]
 fn parse_long_name_offset(rest: &[u8]) -> Option<usize> {
-    let mut end = rest.len();
-    if end > 0 && rest[end - 1] == b'/' {
-        end -= 1;
-    }
-    if end == 0 {
-        return None;
-    }
+    let mut i = 0;
     let mut value: usize = 0;
-    for &b in &rest[..end] {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        value = value.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    while i < rest.len() && rest[i].is_ascii_digit() {
+        value = value
+            .checked_mul(10)?
+            .checked_add((rest[i] - b'0') as usize)?;
+        i += 1;
     }
-    Some(value)
+    (i > 0).then_some(value)
 }
 
 /// Resolve a member name from the raw 16-byte name field + optional `//` table.
@@ -1017,6 +1025,86 @@ mod tests {
             vec!["dir/file.o".to_string()]
         );
     }
+
+    // ── Linux vmlinux.a / binutils thin-rewrite name-field shapes ──
+
+    /// GNU `strtol` prefix semantics for extended-name refs: leading decimal
+    /// digits only, anything after the first non-digit is ignored. Covers the
+    /// exact 16-byte name-field shapes found in a Linux 6.18 `vmlinux.a`
+    /// produced by GNU ar 2.44's `ar mPi --thin` rewrite:
+    /// `/4611          /` (space padding *after* the terminator slash),
+    /// `/4628           ` (plain space padding) and `/123:origin` compounds.
+    #[test]
+    fn parse_long_name_offset_strtol_prefix_semantics() {
+        // Slash-suffixed + space-padded (kernel `ar mPi --thin` rewrite).
+        assert_eq!(parse_long_name_offset(b"4611          /"), Some(4611));
+        // Plain space-padded (normal GNU ar thin write).
+        assert_eq!(parse_long_name_offset(b"4628           "), Some(4628));
+        // `/NNN:origin` compound (binutils thin rewrites).
+        assert_eq!(parse_long_name_offset(b"123:0xabcdef"), Some(123));
+        // No leading digit → no reference.
+        assert_eq!(parse_long_name_offset(b""), None);
+        assert_eq!(parse_long_name_offset(b" 5"), None);
+        assert_eq!(parse_long_name_offset(b"x.o"), None);
+    }
+
+    /// End-to-end: resolve every vmlinux.a name-field shape against the `//`
+    /// extended-name table, exactly as the kernel link does.
+    #[test]
+    fn parse_vmlinux_a_and_binutils_thin_name_ref() {
+        // `//` table: "kernel/sysctl.o/" (16 B) at 0, newline at 16;
+        // "arch/x86/entry/syscall_64.o/" (28 B) at 17;
+        // "another/name.o/" (15 B) at 46; "objtool.o/" (10 B) at 62.
+        let table = b"kernel/sysctl.o/\narch/x86/entry/syscall_64.o/\nanother/name.o/\nobjtool.o/\n";
+
+        // Reference shapes as they appear in the 16-byte name fields of
+        // real GNU-ar thin archives (vmlinux.a mix). Built as exactly
+        // 16 bytes: `{:<15}/` = slash terminator after space padding,
+        // `{:<16}` = plain space padding, `{:<16}` on a compound ref.
+        let slash0 = format!("{:<15}/", "/0");
+        let slash17 = format!("{:<15}/", "/17");
+        let compound46 = format!("{:<16}", "/46:3");
+        let clean62 = format!("{:<16}", "/62");
+        assert!(slash0.len() == 16 && slash17.len() == 16);
+        assert!(compound46.len() == 16 && clean62.len() == 16);
+
+        assert_eq!(
+            resolve_member_name(slash0.as_bytes(), Some(table)),
+            "kernel/sysctl.o"
+        );
+        assert_eq!(
+            resolve_member_name(slash17.as_bytes(), Some(table)),
+            "arch/x86/entry/syscall_64.o"
+        );
+        assert_eq!(
+            resolve_member_name(compound46.as_bytes(), Some(table)),
+            "another/name.o"
+        );
+        assert_eq!(
+            resolve_member_name(clean62.as_bytes(), Some(table)),
+            "objtool.o"
+        );
+
+        // Full thin-archive round trip with all shapes mixed.
+        let mut data = Vec::new();
+        data.extend_from_slice(MAGIC_THIN);
+        push_member(&mut data, b"//", table);
+        push_thin_member(&mut data, slash0.as_bytes(), 1462);
+        push_thin_member(&mut data, slash17.as_bytes(), 8216);
+        push_thin_member(&mut data, compound46.as_bytes(), 120);
+        push_thin_member(&mut data, clean62.as_bytes(), 4096);
+
+        assert_eq!(
+            parse_thin_archive_members(&data).unwrap(),
+            vec![
+                "kernel/sysctl.o".to_string(),
+                "arch/x86/entry/syscall_64.o".to_string(),
+                "another/name.o".to_string(),
+                "objtool.o".to_string(),
+            ]
+        );
+    }
+
 
     #[test]
     fn thin_archive_with_symbol_table() {
