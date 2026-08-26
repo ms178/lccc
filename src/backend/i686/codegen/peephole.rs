@@ -4673,11 +4673,99 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             && addls.iter().all(|&(_, v)| v == subls[0].1)
             && addls.iter().all(|&(i, _)| i > subls[0].0)
         {
+            // STACK-WINDOW SOUNDNESS GUARD for the framed transformation.
+            //
+            // Removing a prologue push/pop pair grows the sole alloc/subl
+            // and every matching dealloc/addl by 4 * removed bytes. That
+            // keeps every %esp-relative reference UNCHANGED only for
+            // references living strictly inside the [alloc .. first
+            // dealloc] envelope — the +N/-N growth cancels exactly there.
+            //
+            // References OUTSIDE that window break silently:
+            //  * BEFORE the alloc: incoming-parameter homes addressed
+            //    against the raw entry CFA. This function canonically
+            //    materialises them when the callee stages params into
+            //    register homes before opening its outgoing-argument area
+            //    (`wrap(y){ return inc(y*2) }`, GCC torture nestfunc-2/
+            //    -3/-5, 20000822-1: the load kept its displacement while
+            //    the removed push raised the real esp by 4, so the loaded
+            //    value shifted one slot up = stale/garbage argument).
+            //  * AFTER the first dealloc: rarely shaped similarly once
+            //    multiple epilogues exist.
+            //
+            // A text-level pass cannot renumber arbitrary outside
+            // references safely (it lacks the slot-liveness map), so the
+            // only sound choice is to leave such functions untouched.
+            let alloc_idx = subls[0].0;
+            let first_dealloc = addls.iter().map(|&(i, _)| i).min();
+            let is_registered_adjust =
+                |idx: usize| -> bool { subls.iter().chain(&addls).any(|&(i, _)| i == idx) };
+            let mut envelope_ok = true;
+            if let Some(fd) = first_dealloc {
+                // 1) Geometry: every %esp engagement must live strictly
+                //    inside the uniformly-shifted interior.
+                // 2) Control flow: entries into the interior must all pass
+                //    through the grown alloc. A label/branch edge into or
+                //    out of the middle would execute the surrounding code
+                //    under two different depths; text-level knowledge
+                //    cannot prove both paths consistent.
+                let mut k = start;
+                while k < end {
+                    if infos[k].is_nop() {
+                        k += 1;
+                        continue;
+                    }
+                    match infos[k].kind {
+                        LineKind::Directive | LineKind::Empty => {
+                            k += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    if is_registered_adjust(k) {
+                        k += 1;
+                        continue;
+                    }
+                    match infos[k].kind {
+                        LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::Call => {}
+                        _ => {
+                            let t = trimmed(store, &infos[k], k);
+                            if t.contains("%esp") && !(k > alloc_idx && k < fd) {
+                                envelope_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if k > alloc_idx && k < fd {
+                        match infos[k].kind {
+                            LineKind::Label
+                            | LineKind::Jmp
+                            | LineKind::JmpIndirect
+                            | LineKind::CondJmp
+                            | LineKind::Ret => {
+                                envelope_ok = false;
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                    k += 1;
+                }
+            } else {
+                envelope_ok = false;
+            }
+            if !envelope_ok {
+                start = end.saturating_add(1);
+                continue;
+            }
             Shape::Framed
         } else if subls.is_empty() && addls.is_empty() {
-            let any_esp_slot = (start..end)
-                .any(|i| !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("(%esp)"));
-            if any_esp_slot {
+            // Any %esp engagement (slots or pointer copies) makes depth
+            // shifting observable; frameless candidates must be pure.
+            let any_esp_text = (start..end).any(|i| {
+                !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp")
+            });
+            if any_esp_text {
                 start = end.saturating_add(1);
                 continue;
             }
@@ -5355,10 +5443,44 @@ fn eliminate_redundant_sign_ext_i686(store: &mut LineStore, infos: &mut [LineInf
 ///    epilogue between call and ret (callee-saved pointers are restored
 ///    before the jmp would use them). We only accept `call *%e{c,d}x` /
 ///    memory-free operands that no epilogue pop touches.
+///
+/// **Stack-window soundness (argument forwarding) — decisive rule.**
+/// Converting a stack-argument call to a jmp silently *re-bases* where the
+/// tail-callee reads its incoming arguments from. At `call time` the callee
+/// would have read its parameter bytes at [C, C+N), where C = %esp at the
+/// call (before the return address push). After conversion it instead reads
+/// them at [E', E'+N) where E' = %esp after the epilogue unwind = function
+/// entry CFA. Those windows differ whenever any caller-frame scratch /
+/// outgoing-argument area existed below the CFA — which on i386 cdecl is
+/// the *normal* shape (`return g(y*2)` stores y*2 into that area). The
+/// converted code then hands the callee stale parent-incoming slots:
+/// empirically this miscompiled `int f0(int (*fn)(int*), int*p)
+/// { return (*fn)(p); }` into reading the trampoline template bytes as data
+/// (GCC torture nestfunc-2/-3/-5, 20000822-1 at O1/O2; minimal repros
+/// `wrap: return inc(y*2)` aborting because inc received y). A text-level
+/// peephole has no interprocedural signature knowledge, so it can never
+/// shuffle/move prepared outgoing arguments into place above the return
+/// address soundly. The ONLY locally provable equivalence is window
+/// identity: if the simulated %esp depth at the call is exactly 0 (equal to
+/// the entry CFA) then unconverted reads [C=CFA ..] and converted reads
+/// [E'=CFA ..] are the SAME addresses holding the SAME bytes, making the
+/// transform observable-equivalent regardless of the callee's ABI.
+/// Therefore conversion additionally requires simulated esp-depth == 0 at
+/// the call site. Anything deeper (locals, outstanding pushes, any
+/// outgoing-arg preparation) suppresses the conversion. Simulation is
+/// deliberately conservative: entering an internal join label (.L*) marks
+/// the depth unknown (= suppressed); control-flow joins without full
+/// re-derivation cannot justify window identity.
 fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
     let mut suppress = false;
+    // Simulated net %esp displacement vs. function entry, in bytes.
+    // `None` = unknown (after an internal control-flow join / mid-block
+    // entry): treated as "unsafe to convert" per the soundness argument
+    // above. Depth 0 with no outstanding scratch means the argument
+    // window coincides bit-for-bit before and after the conversion.
+    let mut depth: Option<i64> = None;
 
     let mut i = 0;
     while i < len {
@@ -5372,6 +5494,16 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
                 let t = trimmed(store, &infos[i], i);
                 if !t.starts_with(".L") {
                     suppress = false; // new function
+                    // Function boundary: known depth again. Any pending
+                    // outer depth is irrelevant here — a global label only
+                    // starts a new translation unit's function stream in
+                    // generated output.
+                    depth = Some(0);
+                } else {
+                    // Internal join point: fallthrough or branch target.
+                    // We do not trace predecessors, so the incoming depth
+                    // must be assumed unequal/uncontrolled.
+                    depth = None;
                 }
                 i += 1;
                 continue;
@@ -5380,11 +5512,51 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
                 let t = trimmed(store, &infos[i], i);
                 if t == ".cfi_startproc" {
                     suppress = false;
+                    depth = Some(0);
                 }
                 i += 1;
                 continue;
             }
             _ => {}
+        }
+
+        // Track ESP arithmetic so call-site depth stays meaningful. Only
+        // constant-immediate %esp adjustments and push/pop contribute;
+        // anything else (register forms, leave, and-l alignments)
+        // invalidates knowledge conservatively.
+        {
+            let t = trimmed(store, &infos[i], i);
+            if t.starts_with("pushl ") {
+                if let Some(d) = depth.as_mut() {
+                    *d += 4;
+                }
+            } else if t.starts_with("popl ") {
+                let rhs = t["popl ".len()..].trim();
+                if rhs == "%esp" {
+                    // `popl %esp` reassigns the pointer itself.
+                    depth = None;
+                } else if let Some(d) = depth.as_mut() {
+                    *d -= 4;
+                }
+            } else if (t.starts_with("subl $") || t.starts_with("addl $"))
+                && t.ends_with(", %esp")
+            {
+                let num_part = &t["addl $".len()..t.len() - ", %esp".len()];
+                if let Ok(n) = num_part.parse::<i64>() {
+                    if let Some(d) = depth.as_mut() {
+                        *d += if t.starts_with("addl $") { n } else { -n };
+                    }
+                } else {
+                    depth = None;
+                }
+            } else if t.ends_with(", %esp") {
+                // Any remaining %esp-ending form (movl reg,%esp, andl
+                // alignment, xchg…) makes the displacement unknowable.
+                // The classic FP-teardown `movl %ebp, %esp` only occurs in
+                // epilogue windows which are skipped anyway, but treating
+                // it uniformly here costs nothing and stays conservative.
+                depth = None;
+            }
         }
 
         if !suppress {
@@ -5398,7 +5570,7 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
             }
         }
 
-        if infos[i].kind != LineKind::Call || suppress {
+        if infos[i].kind != LineKind::Call || suppress || depth != Some(0) {
             i += 1;
             continue;
         }
@@ -6639,9 +6811,17 @@ mod tests {
     }
 
     #[test]
-    fn test_tail_call_with_live_callee_save_restores_before_jmp() {
-        // %ebx is genuinely used (feeds the tail-callee's argument), so the
-        // pair must SURVIVE and the pop must precede the jmp.
+    fn test_tail_call_suppressed_outstanding_callee_save() {
+        // STACK-WINDOW SOUNDNESS REGRESSION TEST. %ebx is live across the
+        // call (the pair survives liveness cleanup), so the call happens at
+        // simulated esp-depth 4 ≠ entry CFA. Converting to a jmp would make
+        // the tail-callee read its incoming stack arguments from the
+        // parent's incoming-argument window above the return address while
+        // the pre-conversion code would have passed values prepared in the
+        // caller's own frame below — observably different for every
+        // non-register ABI. This is exactly the shape that miscompiled GCC
+        // torture nestfunc-2/-3/-5 and 20000822-1 into reading trampoline
+        // template bytes as data (see optimize_tail_calls_i686 doc comment).
         let asm = concat!(
             "f:\n",
             "    pushl %ebx\n",
@@ -6655,13 +6835,76 @@ mod tests {
         .to_string();
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("jmp target"),
-            "expected tail call, got:\n{}",
+            !result.contains("jmp target"),
+            "conversion must be suppressed at nonzero depth:\n{}",
             result
         );
-        let jmp_pos = result.find("jmp target").unwrap();
-        let pop_pos = result.find("popl %ebx").unwrap();
-        assert!(pop_pos < jmp_pos, "restore must precede jmp:\n{}", result);
+        assert!(
+            result.contains("call target"),
+            "original call must survive:\n{}",
+            result
+        );
+        assert!(
+            result.contains("ret"),
+            "plain ret must remain (no early transformation):\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_outgoing_arg_store_below_cfa() {
+        // The canonical i386 cdecl wrapper: `return inc(y * 2)` stores the
+        // prepared argument into a scratch area BELOW the entry CFA and
+        // unwinds it afterwards. At the call, depth ≠ 0, so the argument
+        // window after an epilogue+jmp would be a DIFFERENT memory range —
+        // conversion must stay off regardless of value coincidence
+        // (`fwd: return inc(a)` used to pass by luck).
+        let asm = concat!(
+            "wrap:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    movl 16(%esp), %esi\n",
+            "    addl %esi, %esi\n",
+            "    subl $20, %esp\n",
+            "    movl %esi, 0(%esp)\n",
+            "    call inc@PLT\n",
+            "    addl $20, %esp\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("jmp inc@PLT"),
+            "stack-arg forwarding must not convert:\n{result}"
+        );
+        assert!(result.contains("call inc@PLT"), "call must survive:\n{result}");
+    }
+
+    #[test]
+    fn test_tail_call_suppressed_after_internal_join_label() {
+        // After an internal .L label the straight-line esp simulation ends:
+        // fallthrough and branch predecessors may disagree on depth, so no
+        // conversion may fire inside such a region.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    call helper\n",
+            "    addl $4, %esp\n",
+            ".Ljoin:\n",
+            "    call target\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("jmp target"),
+            "post-join calls have unknown depth; must not convert:\n{result}"
+        );
     }
 
     #[test]
