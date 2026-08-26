@@ -18,8 +18,71 @@
 //! (`make LD=lccc-ld`) and lets the differential benchmark compare the same
 //! CLI against bfd/mold instead of routing through the compiler driver.
 
+/// Expand `@file` response-file arguments (GNU ld convention).
+/// Each `@path` argument is replaced by the file's contents split on
+/// whitespace (respecting simple single/double quoting and backslash
+/// escapes). Non-`@` arguments pass through unchanged. If the file
+/// cannot be read, the original `@path` string is preserved so the
+/// downstream parser reports it as a missing input (matching GNU ld).
+///
+/// The kernel's `cmd_ld_multi_m` (scripts/Makefile.build) invokes the
+/// linker as `$(LD) $(ld_flags) -r -o $@ @$<` where `$<` is a `.mod`
+/// file listing the module's constituent `.o` files. Without this
+/// expansion lccc-ld tried to open a file literally named
+/// `@arch/.../foo.mod` and failed with ENOENT, breaking every
+/// multi-object module link.
+fn expand_response_files(args: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    for arg in args {
+        if let Some(path) = arg.strip_prefix('@') {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                for token in split_response_file(&contents) {
+                    result.push(token);
+                }
+            } else {
+                result.push(arg.clone());
+            }
+        } else {
+            result.push(arg.clone());
+        }
+    }
+    result
+}
+
+/// Split response-file contents into tokens, handling simple quoting.
+fn split_response_file(contents: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    for ch in contents.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escape = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = expand_response_files(&raw_args);
 
     // Last line of defence against a panic on malformed input.
     //

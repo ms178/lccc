@@ -1298,6 +1298,26 @@ pub trait ArchCodegen {
         self.emit_gep_add_const_to_acc_from_secondary(offset);
     }
 
+    /// Emit `leaq sym(,%index,scale), %dest` for a GEP whose base is a
+    /// GlobalAddr (symbol) and whose offset is a register-resident value.
+    /// This is the per_cpu() pattern (`var + __per_cpu_offset[cpu]`):
+    /// the GlobalAddr base has no register home (it's materialised to a
+    /// slot), so the default `emit_gep` register-offset path (which
+    /// requires both base and offset in registers) strands the dest and
+    /// the consumer hits the `operand_to_rax` ICE. Backends that can
+    /// fold the symbol base into a SIB leaq override this and return
+    /// true; otherwise the caller falls back to the default emit_gep.
+    fn emit_leaq_sym_index(
+        &mut self,
+        _dest: &Value,
+        _sym: &str,
+        _index: &Value,
+        _shift: u8,
+        _disp: i64,
+    ) -> bool {
+        false
+    }
+
     /// Emit leaq (%base_reg, %index_reg), %dest for GEP with both operands
     /// in registers. Default: falls back to accumulator path.
     fn emit_leaq_base_index(

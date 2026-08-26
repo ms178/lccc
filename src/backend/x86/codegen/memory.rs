@@ -2313,6 +2313,58 @@ impl X86Codegen {
         }
     }
 
+    /// Emit `leaq sym(, %index, scale), %dest` for a GEP with a symbol
+    /// (GlobalAddr) base and a register-resident index. Mirrors
+    /// `emit_load_indexed_sym_impl` but emits `leaq` (address compute)
+    /// instead of `movq` (load), and records the dest's home via the
+    /// acc-cache handoff (store_rax_to) so the consumer does not hit the
+    /// operand_to_rax "no register home" ICE.
+    pub(super) fn emit_leaq_sym_index_impl(
+        &mut self,
+        dest: &Value,
+        sym: &str,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+    ) -> bool {
+        let base_sym = sym.split(['+', '-']).next().unwrap_or(sym);
+        if self.state.needs_got_for_addr(base_sym) {
+            return false;
+        }
+        if shift > 3 {
+            return false;
+        }
+        let Some(&x) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(x) {
+            return false;
+        }
+        let index_name = phys_reg_name(x);
+        let mem = if self.state.pic_mode {
+            self.state
+                .out
+                .emit_instr_sym_base_reg("    leaq", sym, "rip", "rcx");
+            Self::sib_mem64("rcx", index_name, shift, disp)
+        } else {
+            Self::sib_mem64_sym(sym, index_name, shift, disp)
+        };
+        if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
+            if !is_xmm_reg(d_reg) {
+                let d_name = phys_reg_name(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    leaq {}, %{}", mem, d_name));
+                self.state.reg_cache.invalidate_acc();
+                return true;
+            }
+        }
+        self.state
+            .emit_fmt(format_args!("    leaq {}, %rax", mem));
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+        true
+    }
+
     pub(super) fn emit_gep_add_const_to_acc_impl(&mut self, offset: i64) {
         if offset != 0 {
             self.state.out.emit_instr_imm_reg("    addq", offset, "rax");
