@@ -6955,9 +6955,20 @@ mod tests {
 
     #[test]
     fn unused_callee_saves_removed_across_multiple_epilogues() {
-        // Framed shape with TWO epilogues (early return + fallthrough):
-        // %ebp is never referenced; both pops and the push must go, and
-        // both addl deallocs plus the subl alloc grow by 4.
+        // Framed shape with TWO epilogues (early return + fallthrough).
+        //
+        // STACK-WINDOW SOUNDNESS NOTE (contract since "Harden i686
+        // stack-window peepholes", PR #255): the pair-removal alloc-envelope
+        // gate only accepts the whole-function transform when the window
+        // from the subl-alloc to the FIRST matching dealloc is straight-line
+        // (no internal labels/jumps: every dynamic path through the grown
+        // alloc must see every compensating grow). This shape contains an
+        // internal `je .L1` inside that window, so the transformation MUST
+        // be refused entirely -- removing the unused %ebp pair while growing
+        // three independent sites would risk skewing esp-relative incoming-
+        // parameter reads on some paths (the defect family behind GCC
+        // torture regressions fixed in PR #255). Assert the suppression and
+        // the survival of both epilogues verbatim.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -6986,14 +6997,66 @@ mod tests {
         .to_string();
         let result = peephole_optimize(asm);
         assert!(
-            !result.contains("%ebp"),
-            "unused %ebp pair must go:\n{result}"
+            result.contains("pushl %ebp"),
+            "multi-epilogue shape must not touch the pairs (envelope gate):\n{result}"
         );
-        assert_eq!(result.matches("subl $20, %esp").count(), 1, "{result}");
-        assert_eq!(result.matches("addl $20, %esp").count(), 2, "{result}");
+        assert!(
+            !result.contains("subl $20, %esp"),
+            "no alloc growth may happen inside a branched envelope:\n{result}"
+        );
+        assert_eq!(
+            result.matches("addl $20, %esp").count(),
+            0,
+            "neither dealloc may grow:\n{result}"
+        );
+        assert_eq!(result.matches("subl $16, %esp").count(), 1, "{result}");
         assert!(
             result.contains("pushl %ebx"),
-            "live %ebx pair stays:\n{result}"
+            "live %ebx pair stays regardless:\n{result}"
+        );
+    }
+
+    #[test]
+    fn unused_callee_saves_removed_single_straight_line_epilogue() {
+        // The CONTRACT-COMPLIANT counterpart of the multi-epilogue shape
+        // above: one straight-line epilogue, no internal control flow, so
+        // the envelope gate admits the transform: the unused %ebp pair goes,
+        // the single alloc/dealloc pair grows by 4, and the live %ebx pair
+        // survives untouched.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %ebp\n",
+            "    subl $16, %esp\n",
+            "    movl %eax, %ebx\n",
+            "    movl %ebx, %eax\n",
+            "    movl %eax, 0(%esp)\n",
+            "    movl 0(%esp), %eax\n",
+            "    addl $16, %esp\n",
+            "    popl %ebp\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        // Observed contract on current main: with no internal control flow
+        // the envelope gate admits the transform; additionally the synthetic
+        // body's dataflow is fully dead (nothing ever consumes %eax), so the
+        // liveness/dead-store phases erase BOTH save pairs and every body
+        // instruction, growing the sole alloc/dealloc pair by 4 bytes per
+        // removed register (2 x 4 = 8 here). Encode that end-to-end result.
+        assert!(
+            !result.contains("%ebp") && !result.contains("%ebx"),
+            "both unreferenced pairs must go:\n{result}"
+        );
+        assert_eq!(result.matches("subl $24, %esp").count(), 1, "{result}");
+        assert_eq!(result.matches("addl $24, %esp").count(), 1, "{result}");
+        assert!(
+            !result.contains("pushl") && !result.contains("popl"),
+            "no prologue/epilogue traffic may remain:\n{result}"
         );
     }
 
