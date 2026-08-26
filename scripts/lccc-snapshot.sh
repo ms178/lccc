@@ -21,10 +21,7 @@ set -euo pipefail
 REPO=${LCCC_REPO:-/home/user/lccc}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
-# Deliverable location is overridable so the script works in any workspace
-# (the Arena harness persists /home/user; other environments point it at their
-# own durable directory, e.g. a CI artifact mount).
-DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}
+DELIVERABLE=/home/user/ms178-1.patch
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}
@@ -41,21 +38,10 @@ tag=$(printf 'S%02d-%s' "$seq" "$slug")
 cd "$REPO"
 
 # ---- base ref: the upstream commit this session is rebased on ---------------
-# The deliverable must contain exactly this session's work, so the base is the
-# UPSTREAM commit the session started from, never the session's own commits.
-# On first use that is origin/main (the clone point / rebase target); a
-# recorded base survives between sessions so a later snapshot keeps the full
-# session history even after the branch has diverged further.
-BASE=""
 if [[ -f "$BASE_REF_FILE" ]]; then
   BASE=$(cat "$BASE_REF_FILE")
-  if ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-    echo "lccc-snapshot: recorded base $BASE no longer exists; resetting to origin/main" >&2
-    BASE=""
-  fi
-fi
-if [[ -z "$BASE" ]]; then
-  BASE=$(git rev-parse --verify --quiet origin/main || git rev-parse HEAD)
+else
+  BASE=$(git rev-parse HEAD)
   printf '%s\n' "$BASE" > "$BASE_REF_FILE"
 fi
 
@@ -103,19 +89,14 @@ mv -f "$ART/lccc.bundle.tmp.$$" "$ART/lccc.bundle" 2>/dev/null || true
 # ---- 5. ledger --------------------------------------------------------------
 files=$(git diff --stat "$BASE" HEAD | tail -1 | sed 's/^ *//')
 if [[ ! -f "$LEDGER" ]]; then
-  echo "# LCCC Snapshot Ledger" > "$LEDGER"
-fi
-# A merged session starts from a new upstream base while retaining historical
-# artifacts. Start a fresh ledger section instead of silently appending rows
-# under the previous base's heading.
-if ! grep -Fq "Base (upstream): \`$BASE\`" "$LEDGER"; then
   {
+    echo "# LCCC Snapshot Ledger"
     echo
-    echo "## Base (upstream): \`$BASE\`"
+    echo "Base (upstream): \`$BASE\`"
     echo
     echo "| # | UTC | Tag | Description | Cumulative diffstat |"
     echo "|---|-----|-----|-------------|---------------------|"
-  } >> "$LEDGER"
+  } > "$LEDGER"
 fi
 printf '| %d | %s | `%s` | %s | %s |\n' "$seq" "$stamp" "$tag" "$desc" "${files:-none}" >> "$LEDGER"
 
