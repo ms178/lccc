@@ -269,8 +269,43 @@ impl InstructionEncoder {
             "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
             "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
 
-            // LEA
-            "leal" | "lea" => self.encode_lea(ops, 4),
+            // LEA. The operand-size override participates in the .code16
+            // inversion like any size choice: `leal` is 32-bit (66 8d, with
+            // 67 when the address needs 32 bits — GAS: `67 66 8d`), `leaw`
+            // is 16-bit (no 66 in .code16, 66 8d in .code32). Dropping the
+            // 66 for leal silently truncated %esp-relative address
+            // computations to 16 bits and left stale high register halves —
+            // the boot CPUID probe then stored cpuid(1).eax through a garbage
+            // pointer (kernel died at validate_cpu with "detected an i086").
+            "leal" => {
+                self.sized_op = true;
+                self.encode_lea(ops, 4)
+            }
+            "leaw" => {
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.encode_lea(ops, 2)
+            }
+            "lea" => {
+                // GAS: the unsuffixed form takes its operand size from the
+                // destination register.
+                let is_word = matches!(
+                    ops.get(1),
+                    Some(Operand::Register(r))
+                        if matches!(
+                            r.name.as_str(),
+                            "ax" | "bx" | "cx" | "dx" | "si" | "di" | "bp" | "sp"
+                        )
+                );
+                if is_word {
+                    self.sized_op = true;
+                    self.bytes.push(0x66);
+                    self.encode_lea(ops, 2)
+                } else {
+                    self.sized_op = true;
+                    self.encode_lea(ops, 4)
+                }
+            }
 
             // Stack ops (32-bit default)
             "pushl" | "push" => self.encode_push(ops),
@@ -419,13 +454,17 @@ impl InstructionEncoder {
             // 32-bit mode it is the plain CALL encoding (kernel realmode
             // wakeup_asm.S/copy.S use it from .code16 files to force a
             // 4-byte return address).
-            "call" | "calll" => {
+            "call" | "calll" | "callw" => {
                 // `calll` in .code16 selects the 32-bit form: 66 E8 rel32
                 // (wakeup_asm.S uses it to force a 4-byte return address).
-                // Plain `call` is the mode-default width (rel16 in .code16).
-                // sized_op routes both through the prefix inversion; the
-                // rel width is chosen inside encode_call.
-                if mnemonic == "calll" {
+                // Plain `call` is the mode-default width: rel16 in .code16,
+                // but in `.code16gcc` GCC's -m16 convention makes the
+                // unsuffixed call 32-bit (66 E8 rel32, 4-byte return slot) —
+                // the boot asm's retl/calll and bioscall.S's esp-relative
+                // argument reads depend on it. `callw` is the explicit
+                // 16-bit spelling everywhere (e8 rel16). sized_op routes the
+                // width through encode_call + the prefix inversion.
+                if mnemonic == "calll" || (self.code16 && self.code16gcc && mnemonic == "call") {
                     self.sized_op = true;
                 }
                 self.encode_call(ops)
@@ -436,11 +475,15 @@ impl InstructionEncoder {
                 // Width follows the suffix. .code32: retw = 66 C3, ret/retl
                 // = C3. .code16 (via the prefix inversion): retl marks
                 // sized_op -> 66 C3 (retl); ret/retw stay C3. GAS verified.
+                // .code16gcc: the UNSUFFIXED ret is 32-bit (66 C3) — GCC's
+                // -m16 ABI, matching the calll-sized return slot; a plain C3
+                // there pops only 2 of the 4 pushed bytes and destroys the
+                // stack (observed: boot died at the first function return).
                 if mnemonic == "retw" {
                     self.sized_op = true;
                     self.bytes.push(0x66);
                 }
-                if mnemonic == "retl" {
+                if mnemonic == "retl" || (self.code16 && self.code16gcc && mnemonic == "ret") {
                     self.sized_op = true;
                 }
                 if ops.is_empty() {
@@ -673,6 +716,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             "movsl" if ops.is_empty() => {
+                self.sized_op = true;
                 self.bytes.push(0xA5);
                 Ok(())
             }
@@ -681,6 +725,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             "stosl" => {
+                self.sized_op = true;
                 self.bytes.push(0xAB);
                 Ok(())
             }
@@ -689,6 +734,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             "cmpsl" => {
+                self.sized_op = true;
                 self.bytes.push(0xA7);
                 Ok(())
             }
@@ -697,6 +743,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             "scasl" => {
+                self.sized_op = true;
                 self.bytes.push(0xAF);
                 Ok(())
             }
@@ -705,6 +752,7 @@ impl InstructionEncoder {
                 Ok(())
             }
             "lodsl" => {
+                self.sized_op = true;
                 self.bytes.push(0xAD);
                 Ok(())
             }
@@ -715,10 +763,12 @@ impl InstructionEncoder {
                 Ok(())
             }
             "insw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x6D]);
                 Ok(())
             }
             "insl" => {
+                self.sized_op = true;
                 self.bytes.push(0x6D);
                 Ok(())
             }
@@ -727,10 +777,12 @@ impl InstructionEncoder {
                 Ok(())
             }
             "outsw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0x6F]);
                 Ok(())
             }
             "outsl" => {
+                self.sized_op = true;
                 self.bytes.push(0x6F);
                 Ok(())
             }
@@ -1365,22 +1417,27 @@ impl InstructionEncoder {
 
             // 16-bit string operations
             "movsw" if ops.is_empty() => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xA5]);
                 Ok(())
             }
             "stosw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xAB]);
                 Ok(())
             }
             "lodsw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xAD]);
                 Ok(())
             }
             "scasw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xAF]);
                 Ok(())
             }
             "cmpsw" => {
+                self.sized_op = true;
                 self.bytes.extend_from_slice(&[0x66, 0xA7]);
                 Ok(())
             }

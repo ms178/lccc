@@ -813,7 +813,11 @@ pub(super) fn fast_parse_i32(s: &str) -> i32 {
         }
     }
     if neg {
-        -v
+        // wrapping_neg: the one edge case is a genuine INT32_MIN
+        // operand (e.g. `addq $-2147483648, %rax` from kernel constant
+        // folding), whose magnitude overflows i32; wrapping_neg maps it
+        // to exactly INT32_MIN, which is the correct parsed value.
+        v.wrapping_neg()
     } else {
         v
     }

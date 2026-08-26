@@ -806,7 +806,15 @@ fn parse_directive(line: &str) -> Result<AsmItem, String> {
         }
         ".popsection" => Ok(AsmItem::PopSection),
         ".previous" => Ok(AsmItem::Previous),
-        ".code16gcc" | ".code16" => Ok(AsmItem::CodeMode(16)),
+        // 16 = plain .code16 (call/jmp/ret default to 16-bit operands),
+        // 17 = .code16gcc (GCC -m16 convention: unsuffixed call/ret
+        // take 32-bit operands; everything else keeps 16-bit defaults).
+        // Conflating the two mis-sized the C call/ret ABI against hand
+        // asm using calll/retl (arch/x86/boot) and corrupted the stack:
+        // every return popped 2 bytes off a 4-byte slot and the boot died
+        // at the first function return (ret landed at 0x10000).
+        ".code16gcc" => Ok(AsmItem::CodeMode(17)),
+        ".code16" => Ok(AsmItem::CodeMode(16)),
         ".code32" => Ok(AsmItem::CodeMode(32)),
         ".code64" => Ok(AsmItem::CodeMode(64)),
         ".option" => Ok(AsmItem::OptionDirective(args.to_string())),

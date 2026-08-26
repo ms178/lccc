@@ -158,55 +158,14 @@ impl X86Arch for I686Arch {
         instr: &Instruction,
         section_data_len: u64,
     ) -> Result<EncodeResult, String> {
-        let mut encoder = InstructionEncoder::new();
-        encoder.offset = section_data_len;
-        encoder.code16 = true;
-        encoder.encode(instr)?;
+        code16_encode_inner(instr, section_data_len, false)
+    }
 
-        let instr_len = encoder.bytes.len();
-        let jump = {
-            let mnem = &instr.mnemonic;
-            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_conditional = mnem != "jmp";
-                    // In 16-bit mode a near jump carries a 16-bit
-                    // displacement, so the long forms are one byte shorter
-                    // than in 32-bit mode.
-                    let expected_len = if is_conditional { 4 } else { 3 };
-                    if instr_len == expected_len {
-                        Some(JumpDetection {
-                            is_conditional,
-                            already_short: false,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-
-        let relocations = encoder
-            .relocations
-            .into_iter()
-            .map(|r| EncoderReloc {
-                offset: r.offset,
-                symbol: r.symbol,
-                reloc_type: r.reloc_type,
-                addend: r.addend,
-                diff_symbol: None,
-            })
-            .collect();
-
-        Ok(EncodeResult {
-            bytes: encoder.bytes,
-            relocations,
-            jump,
-        })
+    fn encode_instruction_code16_gcc(
+        instr: &Instruction,
+        section_data_len: u64,
+    ) -> Result<EncodeResult, String> {
+        code16_encode_inner(instr, section_data_len, true)
     }
 
     fn encode_instruction_code64(
@@ -352,3 +311,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+fn code16_encode_inner(
+    instr: &Instruction,
+    section_data_len: u64,
+    gcc_mode: bool,
+) -> Result<EncodeResult, String> {
+    let mut encoder = InstructionEncoder::new();
+    encoder.offset = section_data_len;
+    encoder.code16 = true;
+    encoder.code16gcc = gcc_mode;
+    encoder.encode(instr)?;
+
+        let instr_len = encoder.bytes.len();
+        let jump = {
+            let mnem = &instr.mnemonic;
+            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+            if is_jump && instr.operands.len() == 1 {
+                if let Operand::Label(_) = &instr.operands[0] {
+                    let is_conditional = mnem != "jmp";
+                    // In 16-bit mode a near jump carries a 16-bit
+                    // displacement, so the long forms are one byte shorter
+                    // than in 32-bit mode.
+                    let expected_len = if is_conditional { 4 } else { 3 };
+                    if instr_len == expected_len {
+                        Some(JumpDetection {
+                            is_conditional,
+                            already_short: false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        let relocations = encoder
+            .relocations
+            .into_iter()
+            .map(|r| EncoderReloc {
+                offset: r.offset,
+                symbol: r.symbol,
+                reloc_type: r.reloc_type,
+                addend: r.addend,
+                diff_symbol: None,
+            })
+            .collect();
+
+        Ok(EncodeResult {
+            bytes: encoder.bytes,
+            relocations,
+            jump,
+        })
+    }
