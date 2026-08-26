@@ -1023,23 +1023,13 @@ pub(crate) fn run_passes(
         // subsequent passes can optimize the unrolled copies.
         // Pass name for CCC_DISABLE_PASSES: "unroll"
         //
-        // Loop rotation runs first (at -O2 and above): it transforms
-        // "guard-at-top" loops into "test-at-bottom" form, eliminating the
-        // unconditional backedge jump (one fewer branch per iteration in the
-        // hot path) and letting the loop exit fall through. Every counted
-        // loop benefits. The transform is conservative (pure-SSA cond setup
-        // only) and gated by `CCC_NO_LOOP_ROTATE`. -Os/-Oz skip it (the
-        // cloned cond grows code size slightly). Runs at iter 0 so the
-        // rotated form flows through GVN/LICM/if-convert/dce/cfg_simplify,
-        // which clean up any redundancy before the backend.
-        if iter == 0 && opt_level >= 2 && !optimize_for_size {
-            let n = timed_pass!(
-                "loop_rotate",
-                run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
-            );
-            total_changes += n;
-            total_changes_excl_dce += n;
-        }
+        // Loop rotation runs AFTER vectorize+post-unroll+gaddr-cse (see the
+        // block below). Running it before vectorize corrupted the
+        // vectorizer's base-dependence analysis on the rotated self-loop
+        // form (vectorize_iv_dependent_base SIGSEGV, simd_vecreg miscode).
+        // Vector bodies contain Vec* intrinsics which `is_cloneable_pure`
+        // rejects, so rotation bails on vectorized loops and only fires on
+        // the residual scalar counted loops the vectorizer left alone.
         if iter == 0 && opt_level >= 3 && !optimize_for_size && !dis.unroll {
             let n = timed_pass!(
                 "loop_unroll",
@@ -1116,6 +1106,26 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "global_addr_cse_post_unroll",
                 global_addr_cse::run_module(module)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Phase 2b-rot: Loop rotation — iter 0, AFTER vectorize+post-unroll+
+        // gaddr-cse. Transforms "guard-at-top" loops into "test-at-bottom"
+        // self-loop form (one fewer branch per iteration in the hot path;
+        // the exit falls through). Every scalar counted loop the vectorizer
+        // left alone benefits. The transform is conservative (pure-SSA cond
+        // setup only, `is_cloneable_pure` rejects Vec* intrinsics so
+        // vectorized loops bail) and the exit-merge-phi reads the body's
+        // post-iteration value (latch incoming) on the test-exit edge.
+        // -O2+, not -Os/-Oz (cloned cond grows code size). Gated by
+        // `CCC_NO_LOOP_ROTATE`. Runs at iter 0 so the rotated form flows
+        // through GVN/LICM/if-convert/dce/cfg_simplify.
+        if iter == 0 && opt_level >= 2 && !optimize_for_size {
+            let n = timed_pass!(
+                "loop_rotate",
+                run_on_visited(module, &dirty, &mut changed, loop_rotate::run_function)
             );
             total_changes += n;
             total_changes_excl_dce += n;

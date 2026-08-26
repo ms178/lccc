@@ -60,18 +60,25 @@ const MAX_ROTATIONS_PER_FUNC: usize = 256;
 const MAX_CLOSURE: usize = 8;
 
 pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
-    // v13: loop rotation is OPT-IN (CCC_LOOP_ROTATE=1). The pass is
-    // structurally correct for the canonical single-block body+latch
-    // counted-loop form (verified: tiny sum_arr and loop_patterns
-    // produce output bit-identical to GCC). However, the transform is
-    // not yet conservative enough for the full regression corpus
-    // (28/486 tests miscompile — mostly loops where the header phi
-    // feeds a downstream use that the exit-merge-phi step doesn't
-    // catch, or multi-exit / nested-loop shapes the single-block
-    // restriction mishandles). Disabling by default avoids regressions;
-    // the infrastructure (new self-loop phis, exit-merge phis, cloned
-    // test cond, phi-elim self-loop copy placement) is in place for a
-    // v14 hardening pass.
+    // v14: loop rotation is still OPT-IN (CCC_LOOP_ROTATE=1). v14 fixed
+    // the critical exit-merge-phi correctness bug (the test-exit incoming
+    // now reads the body's post-iteration value `latch_op`, not the
+    // start-of-iteration self-loop phi — off-by-one accumulator that
+    // caused 122/486 miscompiles in v13, now down to ~24), moved the
+    // pass to run AFTER vectorize (running before corrupted the
+    // vectorizer's base-dependence analysis on the rotated self-loop
+    // form), and added conservative body guards (Call/CallIndirect,
+    // volatile memory, Intrinsic bail — keeps recursion and vectorized
+    // loops untouched). The canonical single-block counted loop (e.g.
+    // `for(i=0;i<n;i++) s+=a[i];`) now rotates correctly and produces
+    // bit-identical output to GCC (verified on sum_arr, loop_patterns).
+    //
+    // The remaining ~24 miscompiles are multi-exit / nested-loop /
+    // header-phi-escapes-through-non-Return-terminator shapes the
+    // single-block-body restriction mishandles, plus a second class of
+    // scalar loops where the exit-merge-phi placement still misses a
+    // downstream use. Default-off avoids regressions; v15 will harden
+    // these shapes and flip the default. Kill-switch: CCC_NO_LOOP_ROTATE.
     if std::env::var("CCC_LOOP_ROTATE").is_err() {
         return 0;
     }
@@ -263,12 +270,11 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         phi_latch_val.insert(phi_dest, lat);
         phi_pre_val.insert(phi_dest, pre);
     }
-    // `header_insts` is no longer used from this point on; NLL ends the
-    // immutable borrow of `func.blocks[header]` here automatically, so the
-    // later mutable borrows of `func.blocks[latch_idx]` are sound.  (The
-    // historical `drop(header_insts)` was a no-op on a reference and is a
-    // `-D dropping-references` error; removing it is the correct fix.)
-    let _ = header_insts;
+    // The immutable header borrow (`header_insts`) ends here under NLL —
+    // its last use was the phi_info collection above. The mutable borrows
+    // of `func.blocks[...]` below are disjoint from that borrow. (A prior
+    // `drop(header_insts)` here was a no-op on a `&T` and tripped the
+    // `dropping_references` lint under `-D warnings`.)
 
     // 6.5 Restrict to the single-block body+latch shape (header + one body
     //     block that is ALSO the latch). This is the canonical counted-loop
@@ -283,6 +289,38 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
     if !single_block_body {
         if debug { eprintln!("[ROT] not single-block body (body_len={}, continue==latch={})", lp.body.len(), continue_label == latch_label); }
         return false;
+    }
+
+    // 6.55 Conservative bail: reject bodies that contain a Call/CallIndirect
+    //     or any volatile memory op. The transform's exit-merge-phi and
+    //     latch-phi rewriting assume the body is straight-line SSA-pure
+    //     arithmetic + non-volatile memory. A call in the body can clobber
+    //     caller-saved values that the exit-merge-phi references across the
+    //     call boundary, and the recursive-call CFG of `fib` is detected as
+    //     a spurious loop by `find_natural_loops` (no C-level loop) — bailing
+    //     here keeps recursion untouched. Volatile ops must not have their
+    //     ordering relative to the rotated test perturbed either.
+    let body_block = &func.blocks[latch_idx];
+    for inst in &body_block.instructions {
+        match inst {
+            Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                if debug { eprintln!("[ROT] body has Call/CallIndirect — bail (call clobbers exit-merge values)"); }
+                return false;
+            }
+            Instruction::Load { volatile: true, .. } | Instruction::Store { volatile: true, .. } => {
+                if debug { eprintln!("[ROT] body has volatile mem op — bail (ordering)"); }
+                return false;
+            }
+            // Intrinsics (Vec*/SSE/AVX) are also rejected: the rotated
+            // self-loop form's XMM phi handling doesn't match the backend's
+            // vector-register home assignment, and the vectorizer has already
+            // had a chance to run (rotation is post-vectorize).
+            Instruction::Intrinsic { .. } => {
+                if debug { eprintln!("[ROT] body has Intrinsic — bail (XMM phi / vector-reg home mismatch)"); }
+                return false;
+            }
+            _ => {}
+        }
     }
 
     // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
@@ -350,10 +388,19 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         .copied()
         .unwrap_or(usize::MAX);
     if exit_idx != usize::MAX {
-        // Collect (header_phi_dest, new_loop_phi_dest, preheader_operand)
-        // for phis that have at least one use outside the loop body.
-        let mut external_users: Vec<(u32, u32, Operand)> = Vec::new();
-        for &(phi_dest, _ty, (_pre_lbl, pre_op), _lat) in &phi_info {
+        // Collect (header_phi_dest, new_loop_phi_dest, preheader_operand,
+        // latch_operand) for phis that have at least one use outside the
+        // loop body. `latch_operand` is the value the body computed THIS
+        // iteration (the original header phi's latch incoming — e.g. the
+        // post-add accumulator `s_new = s + a[i]`, or the post-increment
+        // IV `i_next = i + 1`). On the test-exit edge the body has already
+        // computed this value but it has NOT been written back to the new
+        // self-loop phi yet (that only happens on the NEXT iteration's
+        // entry via the backedge), so the exit-merge-phi must read
+        // `latch_operand`, NOT the self-loop phi (which still holds the
+        // start-of-iteration value).
+        let mut external_users: Vec<(u32, u32, Operand, Operand)> = Vec::new();
+        for &(phi_dest, _ty, (_pre_lbl, pre_op), latch_op) in &phi_info {
             let new_loop = *new_loop_phis
                 .get(&phi_dest)
                 .expect("new_loop_phis has an entry for every header phi");
@@ -395,13 +442,13 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
                 }
             }
             if found {
-                external_users.push((phi_dest, new_loop, pre_op));
+                external_users.push((phi_dest, new_loop, pre_op, latch_op));
             }
         }
         // Create the merge phis at the top of the exit block.
         let mut exit_merge_map: FxHashMap<u32, u32> = FxHashMap::default();
         let mut exit_phi_insts: Vec<Instruction> = Vec::with_capacity(external_users.len());
-        for &(phi_dest, new_loop, pre_op) in &external_users {
+        for &(phi_dest, _new_loop, pre_op, latch_op) in &external_users {
             let nd = Value(next_val);
             next_val += 1;
             exit_merge_map.insert(phi_dest, nd.0);
@@ -410,12 +457,19 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
                 .find(|&&(pd, _, _, _)| pd == phi_dest)
                 .map(|&(_, ty, _, _)| ty)
                 .expect("phi_info has an entry for every header phi");
+            // The test-exit incoming is `latch_op` (the value the body
+            // computed this iteration, e.g. `s_new = s + a[i]`), NOT the
+            // new self-loop phi `Value(new_loop)`. The self-loop phi holds
+            // the START-of-iteration value at the CondBranch point (its
+            // backedge writeback only fires on the next iteration's
+            // entry); reading it on the exit edge would lose the final
+            // iteration's contribution (off-by-one accumulator).
             exit_phi_insts.push(Instruction::Phi {
                 dest: nd,
                 ty,
                 incoming: vec![
-                    (pre_op, header_label),      // guard-exit path: preheader value
-                    (Operand::Value(Value(new_loop)), latch_label), // test-exit path: accumulated value
+                    (pre_op, header_label),      // guard-exit path: preheader value (0-trip)
+                    (latch_op, latch_label),     // test-exit path: post-iteration value
                 ],
             });
         }
