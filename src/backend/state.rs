@@ -215,6 +215,13 @@ pub struct CodegenState {
     /// stack must be executable for trampolines to work; the output's
     /// .note.GNU-stack section is emitted with the "x" flag.
     pub requires_executable_stack: bool,
+    /// Fully-formed `.section .data.rel.ro` template/slot blocks for i686
+    /// nested-function trampolines. Collected while functions emit code and
+    /// flushed once at the end of the module (AFTER the last text byte) —
+    /// switching sections in the middle of a function body interleaves
+    /// data directives into the peephole/assembler stream and corrupted
+    /// instruction/label mapping at -O1 (see 20000822-1).
+    pub trampoline_data_blocks: Vec<String>,
     /// Counter for generating unique labels (e.g., memcpy loops).
     label_counter: u32,
     /// Whether any position-independent code generation is enabled. Backends
@@ -466,6 +473,7 @@ impl CodegenState {
             vec_live_regs: FxHashMap::default(),
             dirty_upper_ymm: false,
             requires_executable_stack: false,
+            trampoline_data_blocks: Vec::new(),
             label_counter: 0,
             pic_mode: false,
             pie_mode: false,

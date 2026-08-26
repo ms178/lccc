@@ -590,16 +590,63 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
     gcc_package_hint: "Is the gcc-aarch64-linux-gnu package installed?",
 };
 
+// ── LCCC_SYSROOT: prefix-aware multilib discovery ────────────────────────────
+//
+// Rootless research sandboxes and reproducible CI images frequently install
+// their 32-bit / cross multilib trees as *unpacked packages* under a private
+// prefix instead of the canonical FHS locations. When LCCC_SYSROOT is set,
+// every absolute discovery candidate below is first probed beneath that
+// prefix (mirroring GNU ld's --sysroot semantics); the un-prefixed host path
+// remains a fallback so behaviour on normal installations is unchanged.
+//
+//   LCCC_SYSROOT=/home/user/i686-root \
+//       target/fastbuild/lccc-i686 -O2 t.c -lm -o t
+// then discovers crt1.o under $LCCC_SYSROOT/usr/lib32 and crtbegin.o under
+// $LCCC_SYSROOT/usr/lib/gcc/i686-linux-gnu/<ver> when those exist.
+
+/// Map an absolute candidate path onto the active sysroot (if any).
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn with_sysroot_prefix(path: &str) -> String {
+    match std::env::var("LCCC_SYSROOT") {
+        Ok(root) if !root.is_empty() => format!("{}{}", root.trim_end_matches('/'), path),
+        _ => path.to_string(),
+    }
+}
+
+/// Existence probe honouring LCCC_SYSROOT (prefixed path first, host fallback).
+#[cfg(not(feature = "gcc_linker"))]
+pub(crate) fn exists_with_sysroot(path: &str) -> bool {
+    std::path::Path::new(&with_sysroot_prefix(path)).exists()
+        || std::path::Path::new(path).exists()
+}
+
+/// Resolve a discovery candidate to an existing directory.
+/// Prefers the LCCC_SYSROOT-prefixed variant when populated, then the host
+/// path, otherwise reports absence via `None`.
+#[cfg(not(feature = "gcc_linker"))]
+fn resolve_sysroot_dir(path: &str) -> Option<String> {
+    let prefixed = with_sysroot_prefix(path);
+    if std::path::Path::new(&prefixed).exists() {
+        return Some(prefixed);
+    }
+    if std::path::Path::new(path).exists() {
+        return Some(path.to_string());
+    }
+    None
+}
+
 /// Discover GCC's library directory by probing well-known paths.
 /// Returns the path containing crtbegin.o (e.g., "/usr/lib/gcc/x86_64-linux-gnu/13").
+/// Honouring LCCC_SYSROOT: the returned directory always points at the same
+/// root whose crtbegin.o satisfied the probe.
 #[cfg(not(feature = "gcc_linker"))]
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for base in arch.gcc_lib_base_paths {
         for ver in arch.gcc_versions {
             let dir = format!("{}/{}", base, ver);
             let crtbegin = format!("{}/crtbegin.o", dir);
-            if std::path::Path::new(&crtbegin).exists() {
-                return Some(dir);
+            if exists_with_sysroot(&crtbegin) {
+                return resolve_sysroot_dir(&dir);
             }
         }
     }
@@ -607,13 +654,13 @@ fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
 }
 
 /// Discover the system CRT directory containing crt1.o.
-/// Returns the path (e.g., "/usr/lib/x86_64-linux-gnu").
+/// Returns the path (e.g., "/usr/lib/x86_64-linux-gnu"); LCCC_SYSROOT-aware.
 #[cfg(not(feature = "gcc_linker"))]
 fn find_crt_dir(arch: &DirectLdArchConfig) -> Option<String> {
     for dir in arch.crt_dir_candidates {
         let crt1 = format!("{}/crt1.o", dir);
-        if std::path::Path::new(&crt1).exists() {
-            return Some(dir.to_string());
+        if exists_with_sysroot(&crt1) {
+            return resolve_sysroot_dir(dir);
         }
     }
     None
@@ -655,8 +702,8 @@ fn resolve_builtin_link_setup(
         system_lib_paths.push(crt.clone());
     }
     for dir in arch.system_lib_dirs {
-        if std::path::Path::new(dir).exists() {
-            system_lib_paths.push(dir.to_string());
+        if let Some(resolved) = resolve_sysroot_dir(dir) {
+            system_lib_paths.push(resolved);
         }
     }
 

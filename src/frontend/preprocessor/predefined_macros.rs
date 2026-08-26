@@ -9,6 +9,26 @@ use std::path::PathBuf;
 use super::macro_defs::MacroDef;
 use super::pipeline::Preprocessor;
 
+/// LCCC_SYSROOT-aware candidate mapping for built-in include discovery.
+///
+/// Mirrors GNU `--sysroot` semantics: when `LCCC_SYSROOT` is set and the
+/// prefixed variant of the path exists, it is preferred; otherwise the
+/// original path is returned unchanged. This lets an *unpacked multilib
+/// tree* (rootless sandbox, reproducible CI image) act as the system root
+/// without any code-path divergence on normal hosts. See the linker-side
+/// twin in `backend/common.rs` for CRT/library discovery.
+fn sysroot_candidate(path: &str) -> PathBuf {
+    if let Ok(root) = std::env::var("LCCC_SYSROOT") {
+        if !root.is_empty() {
+            let prefixed = format!("{}{}", root.trim_end_matches('/'), path);
+            if PathBuf::from(&prefixed).is_dir() {
+                return PathBuf::from(prefixed);
+            }
+        }
+    }
+    PathBuf::from(path)
+}
+
 impl Preprocessor {
     /// Define standard predefined macros.
     ///
@@ -1077,7 +1097,12 @@ impl Preprocessor {
                     "/usr/i686-linux-gnu/include",
                     "/usr/include/i386-linux-gnu",
                 ];
-                self.insert_arch_paths_after_bundled(&i686_paths);
+                let mapped: Vec<String> = i686_paths
+                    .iter()
+                    .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
+                    .collect();
+                let mapped_refs: Vec<&str> = mapped.iter().map(String::as_str).collect();
+                self.insert_arch_paths_after_bundled(&mapped_refs);
                 // Override width macros for ILP32 (pointer/long/size_t/ptrdiff are 32-bit)
                 self.define_simple_macro("__LONG_WIDTH__", "32");
                 self.define_simple_macro("__PTRDIFF_WIDTH__", "32");

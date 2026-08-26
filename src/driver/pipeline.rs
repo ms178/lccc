@@ -1164,17 +1164,34 @@ impl Driver {
         // (infinite recursion or wrong control flow). Undefining _FORTIFY_SOURCE
         // prevents these wrappers from being emitted.
         preprocessor.undefine_macro("_FORTIFY_SOURCE");
+        // User/system include directories: map through LCCC_SYSROOT when set
+        // (GNU --sysroot analogy; prefixed path preferred when it exists,
+        // un-prefixed fallback keeps normal hosts bit-identical). See the
+        // linker-side twin in `backend/common.rs` and the built-in include
+        // list mapping in `frontend/preprocessor/predefined_macros.rs`.
+        fn sysroot_include_path(path: &str) -> String {
+            match std::env::var("LCCC_SYSROOT") {
+                Ok(root) if !root.is_empty() => {
+                    let prefixed = format!("{}{}", root.trim_end_matches('/'), path);
+                    if std::path::Path::new(&prefixed).is_dir() {
+                        return prefixed;
+                    }
+                    path.to_string()
+                }
+                _ => path.to_string(),
+            }
+        }
         for path in &self.include_paths {
-            preprocessor.add_include_path(path);
+            preprocessor.add_include_path(&sysroot_include_path(path));
         }
         for path in &self.quote_include_paths {
-            preprocessor.add_quote_include_path(path);
+            preprocessor.add_quote_include_path(&sysroot_include_path(path));
         }
         for path in &self.isystem_include_paths {
-            preprocessor.add_system_include_path(path);
+            preprocessor.add_system_include_path(&sysroot_include_path(path));
         }
         for path in &self.after_include_paths {
-            preprocessor.add_after_include_path(path);
+            preprocessor.add_after_include_path(&sysroot_include_path(path));
         }
     }
 

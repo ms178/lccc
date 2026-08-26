@@ -2823,6 +2823,17 @@ pub fn generate_module(
     cg.emit_runtime_stubs();
     cg.state().emit_fp_const_pool();
 
+    // Flush collected nested-function trampoline template/slot blocks.
+    // They switch to .data.rel.ro and MUST live outside any function body:
+    // interleaving data directives mid-function corrupted the peephole /
+    // assembler stream at -O1 (label/instruction mapping shifted; see
+    // 20000822-1). At the very end of the text section this is safe — the
+    // trailing GNU-stack note below switches sections again anyway.
+    for block in std::mem::take(&mut cg.state().trampoline_data_blocks) {
+        cg.state().emit(&block);
+        cg.state().emit("");
+    }
+
     cg.state().emit("");
     // Nested-function trampolines execute code on the stack: mark the
     // stack executable (GCC does the same for trampoline-using units).
