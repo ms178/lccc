@@ -1292,6 +1292,26 @@ impl Driver {
                     // frame. x86-64 keeps 16 (SSE spill slots + psABI).
                     self.preferred_stack_bytes = bytes.max(4) as u8;
                 }
+                // Function-entry mcount sub-mode flags. MUST be matched before
+                // the `-mno-` and `-m` catch-alls below: `-mnop-mcount` starts
+                // with the literal prefix `-mno`, so the permissive disable
+                // arm would silently swallow it. Matching GCC's contract, the
+                // sub-mode flags are INERT on their own — `-pg` is the trigger
+                // that activates instrumentation. The kernel relies on this:
+                // `CFLAGS_REMOVE_xxx = -pg` (e.g. arch/x86/entry/vdso) strips
+                // `-pg` from objects that can't be instrumented but leaves
+                // `-mfentry`/`-mrecord-mcount` in CFLAGS expecting no-ops;
+                // activating on `-mfentry` alone would break their link with
+                // an undefined `__fentry__`.
+                "-mfentry" => {
+                    self.mcount_submode.use_fentry = true;
+                }
+                "-mrecord-mcount" => {
+                    self.mcount_submode.record = true;
+                }
+                "-mnop-mcount" => {
+                    self.mcount_submode.nop = true;
+                }
                 // `-mno-<feature>` for an ISA extension LCCC never emits.
                 //
                 // Rejecting these is wrong in principle: the flag asks the
@@ -1497,17 +1517,15 @@ impl Driver {
                     }
                     // Unknown values silently ignored (matching GCC)
                 }
-                // Function instrumentation for tracers/profilers. LCCC emits no
-                // `call __fentry__` / `call mcount` at function entry, so
-                // accepting these silently yields a kernel whose ftrace
-                // infrastructure exists but is never called -- a silently dead
-                // tracer. Refuse; the kernel then needs CONFIG_FUNCTION_TRACER=n.
-                a @ ("-pg" | "-mfentry" | "-mrecord-mcount" | "-mnop-mcount") => {
-                    return Err(format!(
-                        "{}: LCCC does not implement function-entry instrumentation \
-                         (no __fentry__/mcount call is emitted)",
-                        a
-                    ));
+                // Function-entry mcount instrumentation: `-pg` is the trigger
+                // that activates emission (see McountInstrumentation). The
+                // `-m`-prefixed sub-mode flags (-mfentry, -mrecord-mcount,
+                // -mnop-mcount) are matched above — before the `-mno-`/`-m`
+                // catch-alls — and mutate mcount_submode; they stay inert
+                // unless `-pg` activates them, matching the GCC contract the
+                // kernel's CFLAGS_REMOVE mechanism depends on.
+                "-pg" => {
+                    self.mcount_pg = true;
                 }
                 // Stack-protector request. LCCC does NOT emit canaries, so
                 // silently accepting these would hand the caller a binary it
@@ -1748,12 +1766,11 @@ mod cli_tests {
         }
     }
 
-    /// LCCC emits no stack-protector canary and no function-entry
-    /// instrumentation. Accepting these silently would hand the caller a
-    /// binary it believes is hardened / traceable but is not -- the worst
-    /// failure mode for a security or observability feature. The kernel then
-    /// needs CONFIG_STACKPROTECTOR=n / CONFIG_FUNCTION_TRACER=n, which is a
-    /// decision the build system can only make if we say so.
+    /// LCCC emits no stack-protector canary. Accepting these silently would
+    /// hand the caller a binary it believes is hardened but is not -- the
+    /// worst failure mode for a security feature. The kernel then needs
+    /// CONFIG_STACKPROTECTOR=n, a decision the build system can only make if
+    /// we say so.
     #[test]
     fn unimplemented_hardening_is_refused_not_ignored() {
         for f in [
@@ -1764,10 +1781,6 @@ mod cli_tests {
             "-mstack-protector-guard=global",
             "-mstack-protector-guard-reg=gs",
             "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
-            "-pg",
-            "-mfentry",
-            "-mrecord-mcount",
-            "-mnop-mcount",
         ] {
             assert!(
                 try_flag(f).is_err(),
@@ -1777,6 +1790,49 @@ mod cli_tests {
         }
         // The opposite request is exactly what LCCC already does.
         assert!(try_flag("-fno-stack-protector").is_ok());
+    }
+
+    /// The GCC mcount flag family (kernel CONFIG_FUNCTION_TRACER) must parse.
+    /// `-pg` is the trigger; the `-m` sub-modes configure the shape and are
+    /// inert without it (the kernel's `CFLAGS_REMOVE_x = -pg` VDSO pattern
+    /// depends on that). NOTE the ordering hazard under test: `-mnop-mcount`
+    /// starts with the literal prefix `-mno` and must not be swallowed by the
+    /// permissive disable-flag arm.
+    #[test]
+    fn mcount_flag_family_parses() {
+        for f in ["-pg", "-mfentry", "-mrecord-mcount", "-mnop-mcount"] {
+            assert!(try_flag(f).is_ok(), "{} must parse", f);
+        }
+        let mut d = Driver::new();
+        let args: Vec<String> = [
+            "ccc",
+            "-pg",
+            "-mfentry",
+            "-mrecord-mcount",
+            "-mnop-mcount",
+            "x.c",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.mcount_pg);
+        assert_eq!(
+            d.mcount_submode,
+            crate::backend::McountInstrumentation {
+                use_fentry: true,
+                record: true,
+                nop: true,
+            }
+        );
+        // Sub-modes alone stay inert (no instrumentation without -pg).
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-mfentry", "-mrecord-mcount", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(!d2.mcount_pg);
     }
 
     /// `-mskip-rax-setup` is honoured only together with `-mno-sse`, where no

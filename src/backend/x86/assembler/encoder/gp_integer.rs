@@ -210,6 +210,22 @@ impl super::InstructionEncoder {
                     self.bytes.push(0xB8 + (dst_num & 7));
                     self.add_diff_relocation(sym_a, sym_b, R_X86_64_32, 0);
                     self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                } else if size == 8 {
+                    // movabs $sym_a - sym_b, %reg — 64-bit symbol-difference
+                    // immediate. arch/x86/mm/mem_encrypt_boot.S emits
+                    // `movq $(.L__enc_copy_end - __enc_copy), %rcx` to load
+                    // the encrypted-memory copy routine's length. Both labels
+                    // live in the same object, so the difference resolves at
+                    // link time to a constant; a R_X86_64_64 diff-relocation
+                    // folds to the absolute 64-bit value. movabs (REX.W +
+                    // B8+rd) is the only 64-bit-immediate mov form.
+                    let b = needs_rex_ext(&dst.name);
+                    // REX.W (0x48) selects 64-bit operand size; REX.B (the
+                    // low REX bit) extends the register field for r8-r15.
+                    self.bytes.push(self.rex(true, false, false, b));
+                    self.bytes.push(0xB8 + (dst_num & 7));
+                    self.add_diff_relocation(sym_a, sym_b, R_X86_64_64, 0);
+                    self.bytes.extend_from_slice(&[0; 8]);
                 } else {
                     return Err(format!(
                         "symbol-difference mov immediate only supported at 32-bit width (got size {})", size));

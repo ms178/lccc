@@ -65,6 +65,8 @@ pub mod func_attr_flag {
     pub const NAKED: u16 = 1 << 11;
     /// `__attribute__((noreturn))` or `_Noreturn` — function never returns.
     pub const NORETURN: u16 = 1 << 12;
+    /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
+    pub const NO_INSTRUMENT: u16 = 1 << 13;
 }
 
 impl FunctionAttributes {
@@ -127,6 +129,10 @@ impl FunctionAttributes {
     pub fn is_noreturn(&self) -> bool {
         self.flags & func_attr_flag::NORETURN != 0
     }
+    #[inline]
+    pub fn is_no_instrument(&self) -> bool {
+        self.flags & func_attr_flag::NO_INSTRUMENT != 0
+    }
 
     // --- flag setters ---
 
@@ -181,6 +187,10 @@ impl FunctionAttributes {
     #[inline]
     pub fn set_noreturn(&mut self, v: bool) {
         self.set_flag(func_attr_flag::NORETURN, v)
+    }
+    #[inline]
+    pub fn set_no_instrument(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::NO_INSTRUMENT, v)
     }
 
     #[inline]
@@ -535,6 +545,8 @@ pub mod decl_attr_flag {
     pub const FASTCALL: u16 = 1 << 6;
     /// `__attribute__((naked))` — emit no prologue/epilogue.
     pub const NAKED: u16 = 1 << 7;
+    /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
+    pub const NO_INSTRUMENT: u16 = 1 << 8;
 }
 
 impl DeclAttributes {
@@ -572,6 +584,10 @@ impl DeclAttributes {
     pub fn is_naked(&self) -> bool {
         self.flags & decl_attr_flag::NAKED != 0
     }
+    #[inline]
+    pub fn is_no_instrument(&self) -> bool {
+        self.flags & decl_attr_flag::NO_INSTRUMENT != 0
+    }
 
     // --- flag setters ---
 
@@ -606,6 +622,10 @@ impl DeclAttributes {
     #[inline]
     pub fn set_naked(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NAKED, v)
+    }
+    #[inline]
+    pub fn set_no_instrument(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::NO_INSTRUMENT, v)
     }
 
     #[inline]

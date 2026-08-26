@@ -3258,6 +3258,14 @@ fn generate_function(
                     ".section __patchable_function_entries,\"awo\",@progbits,{}",
                     pfe_label
                 ));
+                // We just left the text section via a RAW `.section` directive,
+                // which does not update `current_text_section`. Without
+                // invalidating it, `emit_switch_to_section` below would see the
+                // stale text-section name, skip the switch back, and leave this
+                // function's body inside the writable, non-executable
+                // __patchable_function_entries section (reproduced on main:
+                // `-fpatchable-function-entry=2,0` buried whole bodies there).
+                cg.state().invalidate_text_section();
                 let pfe_align = crate::common::types::target_ptr_size();
                 let pfe_dir = cg.ptr_directive();
                 cg.state().emit_fmt(format_args!(".align {}", pfe_align));
@@ -3300,6 +3308,94 @@ fn generate_function(
             let after = total.saturating_sub(before);
             for _ in 0..after {
                 cg.state().emit("nop");
+            }
+        }
+    }
+
+    // Function-entry mcount instrumentation (-pg / -mfentry / -mrecord-mcount /
+    // -mnop-mcount). The site is the very first program point of the function
+    // (after any patchable_function_entry 'after' NOPs, before any prologue
+    // save), matching measured GCC 14.2 output. objtool --mcount reads the
+    // __mcount_loc entries at link time and patches the site as DYNAMIC_FTRACE
+    // needs. Skipped for: inline functions (no standalone body is emitted for
+    // purely-inlined code), naked functions (no prologue to instrument; the
+    // body is pure asm), and __attribute__((no_instrument_function)) — the
+    // kernel marks early-boot / NMI / .noinstr.text functions that way because
+    // the tracer infrastructure isn't mapped yet and calling it would
+    // triple-fault. Classic (non-fentry) mcount is deferred to the backend
+    // prologue: its ABI requires the frame to be established first.
+    if !func.is_inline && !func.is_naked && !func.no_instrument {
+        if let Some(mc) = cg.state().mcount {
+            let classic = !mc.nop && !mc.use_fentry;
+            if classic && !cg.supports_classic_mcount() {
+                if !cg.state().mcount_unsupported_warned {
+                    cg.state().mcount_unsupported_warned = true;
+                    eprintln!(
+                        "ccc: warning: classic -pg (call mcount) is not yet implemented \
+                         for this target; use -mfentry/-mnop-mcount or disable ftrace"
+                    );
+                }
+            } else if cg.supports_mcount() {
+                let mcount_label = if mc.record {
+                    Some(format!(".LMC{}", cg.state().next_label_id()))
+                } else {
+                    None
+                };
+                // __mcount_loc entry: a pointer to the call site (mirrors
+                // __patchable_function_entries' layout). Only emitted with
+                // -mrecord-mcount (CONFIG_FTRACE_MCOUNT_USE_CC=y); without it,
+                // objtool finds the call by scanning.
+                if mc.record {
+                    let lbl = mcount_label.as_deref().unwrap();
+                    cg.state().emit_fmt(format_args!(
+                        ".section __mcount_loc,\"a\",@progbits,{}",
+                        lbl
+                    ));
+                    // Raw non-text `.section` emission: invalidate so the
+                    // switch back below cannot be skipped (same class of bug
+                    // as the PFE section leak — skipping it would leave the
+                    // mcount site AND the entire function body in the
+                    // non-executable __mcount_loc section).
+                    cg.state().invalidate_text_section();
+                    let ptr_align = crate::common::types::target_ptr_size();
+                    let ptr_dir = cg.ptr_directive();
+                    cg.state().emit_fmt(format_args!(".align {}", ptr_align));
+                    cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
+                    emit_switch_to_section(cg, &func_sect);
+                }
+                if mc.nop {
+                    // 5-byte NOP, the exact encoding the kernel mandates
+                    // (arch/x86/include/asm/nops.h GENERIC_NOP5 =
+                    // 0f 1f 44 00 00). The runtime patcher overwrites these
+                    // five bytes with a 5-byte `call ftrace_caller`. `.byte`
+                    // is used instead of `nopl 0(%rax,%rax,1)` because the
+                    // assembler peephole may shorten a zero-displacement SIB
+                    // form to 4 bytes, leaving the patcher one byte short and
+                    // corrupting the next instruction.
+                    if let Some(lbl) = &mcount_label {
+                        cg.state().emit_fmt(format_args!("{}:", lbl));
+                    }
+                    cg.state().emit(".byte 0x0f, 0x1f, 0x44, 0x00, 0x00");
+                } else if mc.use_fentry {
+                    if let Some(lbl) = &mcount_label {
+                        cg.state().emit_fmt(format_args!("{}:", lbl));
+                    }
+                    cg.state().emit("call __fentry__");
+                } else {
+                    // Classic `call mcount`: deferred until AFTER the frame is
+                    // set up (push %rbp; mov %rsp,%rbp) — the mcount ABI reads
+                    // the parent PC through the frame; GCC measures to the
+                    // same shape and rejects -pg with -fomit-frame-pointer.
+                    // The label is emitted at the site only when recording.
+                    cg.state().pending_classic_mcount_label =
+                        mcount_label.or_else(|| Some(format!(".LMC{}", cg.state().next_label_id())));
+                }
+            } else if !cg.state().mcount_unsupported_warned {
+                cg.state().mcount_unsupported_warned = true;
+                eprintln!(
+                    "ccc: warning: -pg function-entry instrumentation is not yet \
+                     implemented for this target; no mcount/__fentry__ sites are emitted"
+                );
             }
         }
     }
@@ -3385,7 +3481,11 @@ fn generate_function(
         && !has_dyn_alloca
         && !has_inline_asm_fp
         && !has_frame_address
-        && !has_vector_intrinsics;
+        && !has_vector_intrinsics
+        // Classic `call mcount` (non-fentry -pg) reads the parent PC through
+        // the frame; GCC rejects `-pg` together with `-fomit-frame-pointer`.
+        // Keep a frame pointer so the deferred prologue site is well-defined.
+        && cg.state().pending_classic_mcount_label.is_none();
 
     cg.state().current_func_name = func.name.clone();
     let raw_space = cg.calculate_stack_space(func);
@@ -4455,9 +4555,37 @@ pub(super) fn generate_instruction(
                     "backend accepted GlobalAddr rematerialisation but refused its audited use"
                 );
             } else {
-                cg.emit_binop(dest, *op, lhs, rhs, *ty);
-                if is_wide_int_type(*ty) {
-                    cg.state().reg_cache.invalidate_all();
+                // per_cpu_ptr()-style Add: Cast(GlobalAddr) base (symbol) +
+                // register-resident offset. The Cast result IS in
+                // global_addr_map (copy edges are followed for same-size
+                // non-float casts) but is NOT rematerializable (the remat set
+                // only roots original GlobalAddr defs with allowed uses), so
+                // the remat path above doesn't fire and emit_binop would
+                // strand the dest without a register home (the Cast result is
+                // slot-resident) → operand_to_rax ICE
+                // (workqueue_prepare_cpu: "value N has no register home").
+                // Fold the symbol base + register index into a SIB leaq,
+                // mirroring the GEP fold above (commit 804ce8c upstream).
+                let mut folded = false;
+                if *op == IrBinOp::Add && !ty.is_float() && ty.size() == 8 {
+                    for (base, index) in [(lhs, rhs), (rhs, lhs)] {
+                        if let (Operand::Value(b), Operand::Value(idx)) = (base, index) {
+                            if let Some(sym) = global_addr_map.get(&b.0) {
+                                if !rip_rel_blocked(cg, sym)
+                                    && cg.emit_leaq_sym_index(dest, sym, idx, 0, 0)
+                                {
+                                    folded = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !folded {
+                    cg.emit_binop(dest, *op, lhs, rhs, *ty);
+                    if is_wide_int_type(*ty) {
+                        cg.state().reg_cache.invalidate_all();
+                    }
                 }
             }
         }

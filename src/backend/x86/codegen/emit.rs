@@ -722,6 +722,13 @@ impl X86Codegen {
         self.state.patchable_function_entry = entry;
     }
 
+    /// Set function-entry mcount instrumentation (-pg / -mfentry /
+    /// -mrecord-mcount / -mnop-mcount). When set, codegen emits a 5-byte call
+    /// (or NOP) at function entry, optionally recorded in __mcount_loc.
+    pub fn set_mcount(&mut self, m: Option<crate::backend::McountInstrumentation>) {
+        self.state.mcount = m;
+    }
+
     /// Enable CF protection branch (-fcf-protection=branch) to emit endbr64.
     pub fn set_cf_protection_branch(&mut self, enabled: bool) {
         self.state.cf_protection_branch = enabled;
@@ -753,6 +760,7 @@ impl X86Codegen {
         self.set_indirect_branch_thunk(opts.indirect_branch_thunk);
         self.set_indirect_branch_thunk_inline(opts.indirect_branch_thunk_inline);
         self.set_patchable_function_entry(opts.patchable_function_entry);
+        self.set_mcount(opts.mcount);
         self.set_cf_protection_branch(opts.cf_protection_branch);
         self.function_alignment = opts.function_alignment;
         self.skip_rax_setup = opts.skip_rax_setup;
@@ -3519,6 +3527,14 @@ impl ArchCodegen for X86Codegen {
     }
     fn ptr_directive(&self) -> PtrDirective {
         PtrDirective::Quad
+    }
+
+    fn supports_mcount(&self) -> bool {
+        true
+    }
+
+    fn supports_classic_mcount(&self) -> bool {
+        true
     }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {

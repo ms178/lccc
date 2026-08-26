@@ -173,6 +173,7 @@ impl I686Codegen {
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_no_jump_tables(opts.no_jump_tables);
+        self.state.mcount = opts.mcount;
         self.regparm = opts.regparm;
         self.omit_frame_pointer = opts.omit_frame_pointer;
         self.state.emit_cfi = opts.emit_cfi;
@@ -1429,6 +1430,13 @@ impl ArchCodegen for I686Codegen {
 
     fn ptr_directive(&self) -> PtrDirective {
         PtrDirective::Long
+    }
+
+    /// fentry/nop/record modes emit through the generic path (i686 assembler
+    /// accepts `call __fentry__` / `.byte`); classic frame-ABI mcount is not
+    /// wired on i686 yet and warns (see supports_classic_mcount).
+    fn supports_mcount(&self) -> bool {
+        true
     }
 
     fn get_phys_reg_for_value(&self, val_id: u32) -> Option<PhysReg> {

@@ -896,6 +896,7 @@ fn build_outlined_function(
         is_used: false,
         is_fastcall: false,
         is_naked: false,
+        no_instrument: false,
         has_inlined_calls: false,
         param_alloca_values: Vec::new(),
         uses_sret: false,

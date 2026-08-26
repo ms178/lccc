@@ -1875,3 +1875,29 @@ pool; this revision's per-class x64 nohome audit enables six consumer
 classes (ret/store/copy/cast/unary/binop) with cmp scoped by root cause.
 Linker-side unchanged: lccc-ld setup.ld handling faithful, gate codegen-bound.
 Oracle preferences intact (mold X86_64;I386, binutils 2.47, git-HEAD builds).
+
+---
+
+## Session-85 addendum (2026-08-26) — oracle environment & build preferences
+
+Standing oracle preferences (honor in every future linker session):
+mold X86_64;I386 presets, binutils/GAS 2.47 class, GCC 16.2, latest Clang +
+lld, ICX/ICC where obtainable; oracles built from git HEAD, not distro
+releases (§0 lesson stands).
+
+This session's constrained sandbox used:
+* mold **2.37.1 (Debian package)** — acceptable ONLY as the lccc build/link
+  backend; NOT a benchmark oracle (too old for verdict work).
+* GNU ld 2.44, GCC 14.2.0, no clang/lld installed.
+* lccc itself always built with the **fastbuild preset** (`scripts/build_lccc_fast.sh`,
+  `-O1`, no LTO, incremental, `-j2`) and a 6 GiB swapfile (`scripts/ensure_swap.sh`
+  pattern; this sandbox HAS sudo: `fallocate`+`mkswap`+`swapon` worked).
+
+Fast mold-from-git on constrained boxes (cmake, exact options):
+```
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+      -DMOLD_LTO=OFF -DMOLD_USE_MOLD=ON   # MOLD_USE_MOLD only if a mold exists already
+cmake --build build -j2
+```
+`-DMOLD_MOSTLY_STATIC=ON` only for a relocatable oracle binary. Budget:
+~25 min mold, ~12 min wild at -j2 (unchanged from §0).

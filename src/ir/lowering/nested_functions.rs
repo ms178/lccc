@@ -1144,6 +1144,7 @@ impl Lowerer {
             has_inlined_calls: false,
             is_fastcall: false,
             is_naked: false,
+            no_instrument: false,
             param_alloca_values: param_alloca_vals,
             uses_sret,
             global_init_label_blocks: Vec::new(),

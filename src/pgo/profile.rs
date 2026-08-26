@@ -720,6 +720,7 @@ mod tests {
             uses_sret: false,
             is_fastcall: false,
             is_naked: false,
+            no_instrument: false,
             global_init_label_blocks: vec![],
             ret_eightbyte_classes: vec![],
             ret_is_f128_sse: false,

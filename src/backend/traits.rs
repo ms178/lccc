@@ -76,7 +76,17 @@ use crate::ir::reexports::{
 
 /// Minimum number of switch cases required to consider a jump table.
 /// Fewer cases are better served by a linear compare-and-branch chain.
-pub const MIN_JUMP_TABLE_CASES: usize = 4;
+///
+/// 5 matches GCC's effective x86 threshold, verified empirically against GCC
+/// 14.2 (`-O2`, side-effecting dense switches): 4 cases lower to a
+/// compare-and-branch chain, 5+ lower to a jump table. A modern predictor
+/// absorbs a <=4-deep chain cheaper than a table load + indirect jump
+/// (rodata + I-cache cost included), so parity with GCC here is both the
+/// kernel-compatible and the performance-sound choice. NOTE: this constant is
+/// shared by the i686/ARM/RISC-V switch paths; GCC's generic default is 4, so
+/// those paths keep 4-case chains there — a benign, documented deviation
+/// (chains are never wrong, only a different size/speed point).
+pub const MIN_JUMP_TABLE_CASES: usize = 5;
 
 /// Maximum number of entries in a generated jump table.
 /// Tables larger than this waste too much memory for sparse switches.
@@ -108,6 +118,23 @@ pub trait ArchCodegen {
 
     /// The pointer directive for this architecture's data emission.
     fn ptr_directive(&self) -> PtrDirective;
+
+    /// Whether this backend emits function-entry mcount instrumentation
+    /// (-pg / -mfentry / -mrecord-mcount / -mnop-mcount). x86-64 and i686 do;
+    /// other targets currently warn once and skip (honest degradation — a
+    /// silently dead tracer is the worst failure mode for observability).
+    fn supports_mcount(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend supports the CLASSIC mcount mode (`call mcount`
+    /// after frame setup, i.e. `-pg` without `-mfentry`/`-mnop-mcount`). The
+    /// classic ABI reads the parent PC through the frame; only x86-64 wires
+    /// the deferred prologue site today. Backends that report false fall back
+    /// to a one-shot warning instead of emitting an ABI-invalid call.
+    fn supports_classic_mcount(&self) -> bool {
+        false
+    }
 
     /// Calculate stack space and assign locations for all values in the function.
     /// Returns the raw stack space needed (before alignment).

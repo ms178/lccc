@@ -1524,6 +1524,19 @@ impl X86Codegen {
                 self.state.emit("    .cfi_def_cfa_register %rbp");
             }
 
+            // Classic mcount site (-pg without -mfentry/-mnop-mcount): the
+            // call belongs AFTER the frame is established — the mcount ABI
+            // reads the parent PC through the frame, and GCC measures to the
+            // identical shape (frame first, then `call mcount`; GCC rejects
+            // -pg together with -fomit-frame-pointer). The label is recorded
+            // in __mcount_loc when -mrecord-mcount is active.
+            if let Some(lbl) = self.state.pending_classic_mcount_label.take() {
+                if self.state.mcount.map(|m| m.record).unwrap_or(false) {
+                    self.state.emit_fmt(format_args!("{}:", lbl));
+                }
+                self.state.emit("    call mcount");
+            }
+
             // Save callee-saved registers with pushq
             for &reg in &used_regs {
                 let reg_name = phys_reg_name(reg);
