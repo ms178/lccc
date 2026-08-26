@@ -2217,17 +2217,23 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 }
 
                 // For REL format (i686): patch addend into section data.
-                // The patch width must match the relocation width: R_386_16
-                // (`.word sym` — kernel realmode segment words) owns a 2-byte
-                // slot, and a 4-byte write would clobber the field after it.
+                // The patch width must match the relocation width: R_386_8 /
+                // R_386_PC8 (`.byte sym` fields) own a 1-byte slot, R_386_16
+                // (`.word sym` — kernel realmode segment words) a 2-byte
+                // slot, and a wider write would clobber the field after it.
                 if A::uses_rel_format() {
                     let off = reloc.offset as usize;
+                    let patch1 = reloc.patch_size == 1;
                     let patch16 = reloc.patch_size == 2;
-                    if patch16 && off + 2 <= data.len() {
+                    if patch1 && off + 1 <= data.len() {
+                        let existing = data[off] as i8;
+                        let patched = existing.wrapping_add(addend as i8);
+                        data[off] = patched as u8;
+                    } else if patch16 && off + 2 <= data.len() {
                         let existing = i16::from_le_bytes([data[off], data[off + 1]]);
                         let patched = existing.wrapping_add(addend as i16);
                         data[off..off + 2].copy_from_slice(&patched.to_le_bytes());
-                    } else if !patch16 && off + 4 <= data.len() {
+                    } else if !patch1 && !patch16 && off + 4 <= data.len() {
                         let existing = i32::from_le_bytes([
                             data[off],
                             data[off + 1],
