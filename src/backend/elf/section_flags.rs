@@ -72,3 +72,45 @@ pub fn parse_section_flags(
 
     (section_type, flags)
 }
+
+/// Fixed section type for the classic section names, mirroring GNU as.
+///
+/// GNU as assigns well-known section names a hard-coded type and ignores (with
+/// a warning) any contradicting `@type` suffix: `.section .data,"aw",@nobits`
+/// produces PROGBITS, because `.data` is always PROGBITS. Without this rule a
+/// single stray `@nobits` declaration poisons every later `.section .data` in
+/// the file — the kernel's compressed misc.c (`static int lines
+/// __section(".data")` next to relocatable pointer data) lost its `.data`
+/// contents exactly this way, and QEMU could not boot the resulting bzImage.
+pub fn well_known_section_type(name: &str) -> Option<u32> {
+    match name {
+        ".bss" | ".tbss" | ".sbss" | ".lbss" => Some(SHT_NOBITS),
+        ".init_array" => Some(SHT_INIT_ARRAY),
+        ".fini_array" => Some(SHT_FINI_ARRAY),
+        ".preinit_array" => Some(SHT_PREINIT_ARRAY),
+        ".text" | ".data" | ".rodata" | ".tdata" | ".sdata" | ".init"
+        | ".fini" | ".ctors" | ".dtors" | ".got" | ".got.plt" | ".plt"
+        | ".comment" | ".note.GNU-stack" | ".eh_frame" | ".interp"
+        | ".dynamic" | ".dynsym" | ".dynstr" | ".hash" | ".gnu.hash"
+        | ".symtab" | ".strtab" | ".shstrtab" | ".jcr" => Some(SHT_PROGBITS),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn well_known_types_are_fixed() {
+        assert_eq!(well_known_section_type(".data"), Some(SHT_PROGBITS));
+        assert_eq!(well_known_section_type(".text"), Some(SHT_PROGBITS));
+        assert_eq!(well_known_section_type(".rodata"), Some(SHT_PROGBITS));
+        assert_eq!(well_known_section_type(".bss"), Some(SHT_NOBITS));
+        assert_eq!(well_known_section_type(".tbss"), Some(SHT_NOBITS));
+        assert_eq!(well_known_section_type(".init_array"), Some(SHT_INIT_ARRAY));
+        // Custom sections are not fixed.
+        assert_eq!(well_known_section_type(".lccc_pgo_cnts"), None);
+        assert_eq!(well_known_section_type(".my_section"), None);
+    }
+}

@@ -56,7 +56,7 @@ pub use linker_symbols::{
 };
 
 // section_flags
-pub use section_flags::parse_section_flags;
+pub use section_flags::{parse_section_flags, well_known_section_type};
 
 // parse_string
 pub use parse_string::parse_string_literal;

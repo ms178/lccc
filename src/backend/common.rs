@@ -1564,11 +1564,19 @@ fn emit_globals(out: &mut AsmOutput, globals: &[IrGlobal], ptr_dir: PtrDirective
             "aw"
         };
         // Sections starting with ".bss" are NOBITS (no file space, BSS semantics).
-        // A zero-initialized writable global in any custom section is also NOBITS:
-        // it costs no file space and is zero-filled at load time (used by PGO
-        // counter arrays in .lccc_pgo_cnts).
+        // A zero-initialized writable global in any OTHER custom section is also
+        // NOBITS: it costs no file space and is zero-filled at load time (used
+        // by PGO counter arrays in .lccc_pgo_cnts). Well-known section names
+        // (.data, .text, .rodata, ...) are exempt: GNU as assigns them a fixed
+        // type, and the kernel's `static int lines __section(".data")` pattern
+        // shares .data with relocatable pointer data — a NOBITS .data silently
+        // drops that content (compressed misc.c boot hang).
         let is_zero = matches!(g.init, GlobalInit::Zero);
-        let section_type = if section_name.starts_with(".bss") || (flags == "aw" && is_zero) {
+        let well_known =
+            crate::backend::elf::well_known_section_type(section_name).is_some();
+        let section_type = if section_name.starts_with(".bss")
+            || (flags == "aw" && is_zero && !well_known)
+        {
             "@nobits"
         } else {
             "@progbits"
