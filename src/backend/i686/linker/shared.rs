@@ -1207,12 +1207,21 @@ pub(super) fn emit_shared_library_32(
     );
     ph_off += 32;
 
-    // GNU_STACK
+    // GNU_STACK — executable when ANY input object requests it (GNU
+    // semantics: .note.GNU-stack with SHF_EXECINSTR, e.g. nested-function
+    // trampolines). GNU ld ORs the flag across all inputs; mirror the
+    // executable path (emit.rs) here so shared libraries agree.
+    let exec_stack = inputs.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|sec| sec.name == ".note.GNU-stack" && sec.flags & SHF_EXECINSTR != 0)
+    });
+    let stack_flags = if exec_stack { PF_R | PF_W | PF_X } else { PF_R | PF_W };
     write_phdr(
         &mut output,
         ph_off,
         PT_GNU_STACK,
-        PF_R | PF_W,
+        stack_flags,
         0,
         0,
         0,

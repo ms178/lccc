@@ -12,6 +12,7 @@ mod i128_ops;
 mod inline_asm;
 mod intrinsics;
 mod memory;
+mod nested_fn;
 pub(crate) mod peephole;
 mod prologue;
 mod returns;

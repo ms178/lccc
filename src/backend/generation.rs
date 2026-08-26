@@ -36,8 +36,8 @@ pub(super) struct GepFoldInfo {
 }
 
 /// `GEP(base, idx<<shift)` foldable into `[base, index, lsl #shift]`.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct IndexedGepInfo {
+#[derive(Debug, Clone)]
+pub(crate) struct IndexedGepInfo {
     pub(super) base: Value,
     pub(super) index: Value,
     /// Log2 scale in `0..=3`.
@@ -50,6 +50,18 @@ pub(super) struct IndexedGepInfo {
     /// Original GEP offset operand, used to rematerialize if the backend
     /// refuses the indexed encoding after the GEP was skipped.
     pub(super) orig_offset: Value,
+    /// Access types of the Load/Store consumers of this GEP (collected in
+    /// [`build_indexed_gep_map`]).  Part of the can-fold/emitter agreement
+    /// contract: the fold is only *guaranteed* when the backend's indexed
+    /// emitter accepts EVERY consumer's access shape, so the skip and
+    /// dead-offset-producer decisions must consult the backend via
+    /// [`ArchCodegen::indexed_fold_ok`] instead of assuming a uniform
+    /// "any scalar type" capability.
+    pub(crate) access_tys: Vec<IrType>,
+    /// True when any consumer is a Store.  Stores may need to stage the
+    /// stored value through a scratch register at the access site, which
+    /// narrows the emitter's acceptance (base/index must survive staging).
+    pub(crate) feeds_store: bool,
 }
 
 fn env_flag_set(name: &str) -> bool {
@@ -234,6 +246,15 @@ fn can_indexed_addr_fold(
     info: &IndexedGepInfo,
     global_addr_map: &FxHashMap<u32, String>,
 ) -> bool {
+    // Backend agreement on the ACCESS profile first: types (and store
+    // staging) the backend's indexed emitter refuses must also refuse the
+    // fold here, or the skip/rematerialise path would read expired offset
+    // homes (see ArchCodegen::indexed_fold_ok).  An empty profile means the
+    // entry only feeds alias Copies/Casts — the access-site lookup governs
+    // those and the skip alone stays harmless.
+    if !cg.indexed_fold_ok(info) {
+        return false;
+    }
     // The index is consumed at the access in every indexed form; it must be
     // register-resident (the RA link extension keeps it live to there).
     if cg.get_phys_reg_for_value(info.index.0).is_none() {
@@ -485,7 +506,7 @@ fn compose_const_gep_folds(map: &mut FxHashMap<u32, GepFoldInfo>) {
 /// Copy / same-size integer-or-pointer Cast of an *already-stable* fold is
 /// the same address. Must run AFTER the stability retain so a `Copy; Load`
 /// adjacency cannot launder a multi-def base.
-fn propagate_stable_aliases<T: Copy>(
+fn propagate_stable_aliases<T: Clone>(
     func: &IrFunction,
     stab: &BaseStability,
     map: &mut FxHashMap<u32, T>,
@@ -521,7 +542,7 @@ fn propagate_stable_aliases<T: Copy>(
                 if stab.def_count.get(&dest.0).copied() != Some(1) || map.contains_key(&dest.0) {
                     continue;
                 }
-                if let Some(&info) = map.get(&src.0) {
+                if let Some(info) = map.get(&src.0).cloned() {
                     map.insert(dest.0, info);
                     changed = true;
                 }
@@ -1157,6 +1178,8 @@ fn build_indexed_gep_map(
                                     shift,
                                     disp: 0,
                                     orig_offset: *off,
+                                    access_tys: Vec::new(),
+                                    feeds_store: false,
                                 },
                             );
                             continue;
@@ -1171,6 +1194,8 @@ fn build_indexed_gep_map(
                         shift,
                         disp,
                         orig_offset: *off,
+                        access_tys: Vec::new(),
+                        feeds_store: false,
                     },
                 );
             }
@@ -1185,6 +1210,33 @@ fn build_indexed_gep_map(
     propagate_stable_aliases(func, stab, &mut map);
     retain_indexed_ptr_only_uses(func, &mut map);
     retain_used(&mut map, use_counts);
+
+    // Consumer-access profile: every surviving entry is consumed exclusively
+    // by Load/Store (retained above).  Record each consumer's access type and
+    // whether any consumer is a Store, so can_indexed_addr_fold can ask the
+    // backend whether its indexed emitter accepts EVERY access shape before
+    // the GEP's emission is skipped and its offset chain declared dead.
+    {
+        let mut access: FxHashMap<u32, (Vec<IrType>, bool)> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let (ptr, ty, is_store) = match inst {
+                    Instruction::Load { ptr, ty, .. } => (ptr, ty, false),
+                    Instruction::Store { ptr, ty, .. } => (ptr, ty, true),
+                    _ => continue,
+                };
+                let e = access.entry(ptr.0).or_insert_with(|| (Vec::new(), false));
+                e.0.push(*ty);
+                e.1 |= is_store;
+            }
+        }
+        for (dest, info) in map.iter_mut() {
+            if let Some((tys, feeds_store)) = access.get(dest) {
+                info.access_tys = tys.clone();
+                info.feeds_store = *feeds_store;
+            }
+        }
+    }
     map
 }
 

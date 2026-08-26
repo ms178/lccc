@@ -65,7 +65,7 @@ macro_rules! delegate_to_impl {
 
 use super::cast::{FloatOp, classify_float_binop};
 use super::common::PtrDirective;
-use super::generation::is_i128_type;
+use super::generation::{is_i128_type, is_wide_int_type};
 use super::regalloc::PhysReg;
 use super::state::{CodegenState, SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
@@ -386,6 +386,30 @@ pub trait ArchCodegen {
     /// Returns false by default; AArch64 returns true.
     fn supports_indexed_addr(&self) -> bool {
         false
+    }
+
+    /// Backend agreement hook for the indexed-GEP fold: given the consumer
+    /// access profile of a candidate GEP (access types, whether any consumer
+    /// is a Store) and the resolved shift, report whether THIS backend's
+    /// `emit_load_indexed`/`emit_store_indexed` will accept every access.
+    ///
+    /// SOUNDNESS CONTRACT: the fold's skip decisions (GEP emission skipped,
+    /// offset chain declared dead) rely on the indexed encoding being
+    /// *guaranteed*.  If this predicate accepts an access the emitter later
+    /// refuses, `rematerialize_skipped_indexed` re-emits the GEP at the
+    /// consumer — reading offset producers after their homes/slots expired
+    /// (i686: `20080122-1` reloaded a never-written spill slot; a local
+    /// `long long a[i]` loop reloaded a %edx home after `cltd` clobbered
+    /// it).  The default therefore accepts exactly what the shared
+    /// `generate_load`/`generate_store` guards already accept — non-wide
+    /// integer access types — and every backend with a narrower emitter
+    /// must override to mirror its emitter's acceptance conditions exactly
+    /// (an override stricter than the emitter is always sound; the reverse
+    /// never is).  `feeds_store` matters because stores may stage the
+    /// stored value through a scratch register at the access site, which
+    /// narrows acceptance further.
+    fn indexed_fold_ok(&self, info: &super::generation::IndexedGepInfo) -> bool {
+        info.access_tys.iter().all(|t| !is_wide_int_type(*t))
     }
 
     /// Whether `emit_fused_cmp_branch_blocks` handles floating-point compares
