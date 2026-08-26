@@ -12,6 +12,7 @@ mod inline_asm;
 mod intrinsics;
 mod magic_div;
 mod memory;
+mod nested_fn;
 pub(crate) mod peephole;
 mod prologue;
 mod returns;

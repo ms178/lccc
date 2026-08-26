@@ -15,13 +15,18 @@
 #   * A machine-readable ledger records what each save contains.
 #
 # Usage:  ./lccc-snapshot.sh "<slug>" "<one-line description>"
+#
+# Paths can be overridden for alternative workspaces:
+#   LCCC_REPO       repository root        (default /home/user/lccc)
+#   LCCC_ARTIFACTS  snapshot artifact dir  (default /home/user/artifacts)
+#   LCCC_DELIVERABLE canonical patch file  (default /home/user/ms178-1.patch)
 # ============================================================================
 set -euo pipefail
 
 REPO=${LCCC_REPO:-/home/user/lccc}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
-DELIVERABLE=/home/user/ms178-1.patch
+DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}

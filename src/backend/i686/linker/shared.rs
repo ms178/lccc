@@ -11,6 +11,7 @@ use super::gnu_hash::build_gnu_hash_32;
 use super::reloc::{resolve_got_reloc, resolve_tls_gotie, resolve_tls_ie, RelocContext};
 use super::types::*;
 use super::DynStrTab;
+use crate::backend::common::{exists_with_sysroot, with_sysroot_prefix};
 use crate::backend::linker_common;
 
 /// Discover NEEDED shared library dependencies for a shared library build.
@@ -63,7 +64,8 @@ pub(super) fn resolve_dynamic_symbols_for_shared(
             }
         }
     }
-    // Also check i686-specific paths
+    // Also check i686-specific paths (LCCC_SYSROOT-aware so unpacked
+    // multilib sysroots work on rootless hosts).
     let extra_dirs = [
         "/lib/i386-linux-gnu",
         "/usr/lib/i386-linux-gnu",
@@ -72,7 +74,10 @@ pub(super) fn resolve_dynamic_symbols_for_shared(
     ];
     for lib_name in &lib_names {
         for dir in &extra_dirs {
-            let candidate = format!("{}/{}", dir, lib_name);
+            if !exists_with_sysroot(dir) {
+                continue;
+            }
+            let candidate = with_sysroot_prefix(&format!("{}/{}", dir, lib_name));
             if Path::new(&candidate).exists() && !libs.contains(&candidate) {
                 libs.push(candidate);
                 break;

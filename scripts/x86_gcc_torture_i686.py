@@ -9,9 +9,24 @@ with 32-bit CRT/C-runtime libs, we drive compilation **and** linking through
 compile+run establishes native-host eligibility; GCC output is not compared
 (gcc.c-torture/execute's contract is the exit status).
 
+Sandbox / cross-host support:
+  * ``LCCC_SYSROOT`` (read by the compiler itself): when set, lccc's CRT and
+    multilib discovery probes the absolute candidates beneath that prefix
+    first, e.g. an unpacked ``libc6-dev-i386`` tree at ``$LCCC_SYSROOT``.
+  * ``--runner`` / ``GCC_I686_RUNNER``: argv prefix used to *execute* both
+    the gcc reference and the LCCC-produced binaries (e.g.
+    ``/path/qemu-i386``). Empty by default. Needed whenever the host cannot
+    execute ELF32 binaries natively (pure amd64 seccomp hosts).
+  * ``--append``: extra arguments appended to every compile+link invocation
+    of BOTH compilers (e.g. ``-static`` so produced binaries need no i386
+    dynamic loader). Applied after per-test dg-options so they win.
+
 Examples:
   scripts/x86_gcc_torture_i686.py --flags=-O2 -j2
   scripts/x86_gcc_torture_i686.py pr110817-1.c pr23135.c --flags=-O0,-O2
+  LCCC_SYSROOT=$HOME/i686-root \
+      scripts/x86_gcc_torture_i686.py --runner $HOME/qemu-root/usr/bin/qemu-i386 \
+          --append=-static --flags=-O0,-O1,-O2 -j4
 """
 from __future__ import annotations
 
@@ -106,10 +121,12 @@ def execute_case(
     suite: Path,
     compile_timeout: float,
     run_timeout: float,
+    runner: Sequence[str] = (),
+    append: Sequence[str] = (),
 ) -> Result:
     started = time.monotonic()
     all_flags = [case.opt_flags, *case.directive_flags]
-    common = ["-w", *all_flags, *["-I", str(suite)], *_I686_INCLUDES]
+    common = ["-w", *all_flags, *list(append), *["-I", str(suite)], *_I686_INCLUDES]
 
     with tempfile.TemporaryDirectory(prefix="lccc-i686-gcc-torture-") as temp_name:
         temp = Path(temp_name)
@@ -126,7 +143,7 @@ def execute_case(
                 "reference-compile-skip", "reference-compile", proc.returncode,
                 time.monotonic() - started, detail_of(proc),
             )
-        proc = run([str(reference)], run_timeout)
+        proc = run([*runner, str(reference)], run_timeout)
         if proc.returncode:
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
@@ -148,7 +165,7 @@ def execute_case(
                 time.monotonic() - started, detail_of(proc),
             )
 
-        proc = run([str(binary)], run_timeout)
+        proc = run([*runner, str(binary)], run_timeout)
         if proc.returncode:
             return Result(
                 case.source.name, case.opt_flags, list(case.directive_flags),
@@ -206,6 +223,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
     parser.add_argument("--lccc", type=Path, default=DEFAULT_LCCC)
     parser.add_argument("--gcc", default=os.environ.get("GCC_BIN", "gcc"))
+    parser.add_argument(
+        "--runner",
+        default=os.environ.get("GCC_I686_RUNNER", ""),
+        help="argv prefix to execute compiled binaries (e.g. qemu-i386); "
+             "default: env GCC_I686_RUNNER or none",
+    )
+    parser.add_argument(
+        "--append",
+        default=os.environ.get("GCC_I686_APPEND", ""),
+        help="extra args appended to every compile (both compilers), "
+             "comma-separated; default: env GCC_I686_APPEND or none",
+    )
     parser.add_argument("--flags", default=",".join(DEFAULT_FLAGS),
                         help="comma-separated optimization configurations")
     parser.add_argument("--filter", default="", help="regular expression over basenames")
@@ -237,6 +266,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not sources or not flags:
         print("error: no tests/configurations selected", file=sys.stderr)
         return 2
+    runner = shlex.split(args.runner) if args.runner else []
+    append = [item for item in args.append.split(",") if item]
+    if (
+        not append
+        and os.environ.get("GCC_I686_APPEND") is None
+        and os.environ.get("LCCC_TORTURE_STATIC") == "1"
+    ):
+        append = ["-static"]  # convenience switch for pure-amd64 sandbox hosts
 
     cases = [
         Case(source, opt, native_directive_flags(source))
@@ -260,6 +297,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 suite=args.suite,
                 compile_timeout=args.compile_timeout,
                 run_timeout=args.run_timeout,
+                runner=runner,
+                append=append,
             ): case
             for case in cases
         }

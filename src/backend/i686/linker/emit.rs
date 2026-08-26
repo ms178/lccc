@@ -33,6 +33,19 @@ pub(super) fn emit_executable(
 ) -> Result<(), String> {
     let num_ifunc = ifunc_symbols.len();
 
+    // ── Stack executability (GNU C nested-function trampolines) ────────────
+    // The compiler emits `.note.GNU-stack,"x"` whenever a unit initialises
+    // trampoline code; binutils ORs all input notes into the final
+    // PT_GNU_STACK flags. Mirror that here: any input marking its note
+    // section SHF_EXECINSTR makes the final stack executable. Without this,
+    // PIE-default builds segfault on the first indirect nested call.
+    let exec_stack = inputs.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
+    });
+    let stack_flags = PF_R | PF_W | if exec_stack { PF_X } else { 0 };
+
     // ── Build dynamic symbol/string tables ────────────────────────────────
     let mut needed_libs: Vec<String> = Vec::new();
     if !is_static && !is_nostdlib {
@@ -1185,7 +1198,7 @@ pub(super) fn emit_executable(
         0,
         0,
         0,
-        PF_R | PF_W,
+        stack_flags,
         0x10,
     );
     write_ph(
