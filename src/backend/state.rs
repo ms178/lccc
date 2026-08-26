@@ -318,6 +318,20 @@ pub struct CodegenState {
     /// When set, emits NOP padding around function entry points and records
     /// them in __patchable_function_entries for runtime patching (ftrace).
     pub patchable_function_entry: Option<(u32, u32)>,
+    /// Function-entry mcount instrumentation (-pg / -mfentry / -mrecord-mcount /
+    /// -mnop-mcount). When set, emits a 5-byte call (or NOP) at function entry,
+    /// optionally recorded in __mcount_loc for the runtime patcher.
+    pub mcount: Option<crate::backend::McountInstrumentation>,
+    /// Set by generate_function for classic (non-fentry) mcount: the `call
+    /// mcount` must be emitted AFTER the frame is established (push %rbp; mov
+    /// %rsp, %rbp) — GCC measures to the same shape and the classic mcount ABI
+    /// reads the parent PC through the frame. Holds the site label when the
+    /// site is recorded in __mcount_loc. The backend prologue consumes
+    /// (take()s) the label right after frame setup.
+    pub pending_classic_mcount_label: Option<String>,
+    /// One-shot warning latch: -pg requested on a target whose backend does
+    /// not yet emit mcount sites (honest degradation, never silent).
+    pub mcount_unsupported_warned: bool,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     pub cf_protection_branch: bool,
     /// Current program point during codegen (incremented per instruction).
@@ -478,6 +492,9 @@ impl CodegenState {
             indirect_branch_thunk_inline: false,
             call_is_variadic: false,
             patchable_function_entry: None,
+            mcount: None,
+            pending_classic_mcount_label: None,
+            mcount_unsupported_warned: false,
             cf_protection_branch: false,
             current_program_point: 0,
             f128_load_sources: FxHashMap::default(),
@@ -512,6 +529,20 @@ impl CodegenState {
         let id = self.label_counter;
         self.label_counter += 1;
         id
+    }
+
+    /// Mark that a `.section` directive for a NON-TEXT section has just been
+    /// emitted (e.g. `__patchable_function_entries`, `__mcount_loc`).
+    /// `emit_switch_to_section` compares `current_text_section` against the
+    /// requested section to skip no-op switches; without invalidating here,
+    /// `current_text_section` would still read as the last text section
+    /// (`.text` or a custom `-ffunction-sections` name) and the switch back
+    /// would be skipped, leaving the function body in the writable, non-
+    /// executable data section — calling the function would then segfault
+    /// (reproduced on main: `-fpatchable-function-entry=2,0` placed whole
+    /// function bodies into `__patchable_function_entries,"awo"`).
+    pub fn invalidate_text_section(&mut self) {
+        self.current_text_section.clear();
     }
 
     /// Generate a fresh label with the given prefix.
@@ -616,6 +647,7 @@ impl CodegenState {
         self.promoted_global_addr_homes.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
+        self.pending_classic_mcount_label = None;
         self.frame_size = 0;
         self.reg_cache.invalidate_all();
         self.f128_direct_slots.clear();

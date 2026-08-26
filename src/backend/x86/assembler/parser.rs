@@ -2045,6 +2045,43 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                         None => (lhs_raw.clone(), 0),
                     }
                 };
+            // Parenthesized RHS: probe with parse_sym_addend FIRST. It strips
+            // balanced parens and correctly handles forms like `(. + 4)` (the
+            // Linux kernel's static_call trampoline: `.long func - (. + 4)`).
+            // The rfind-based probes below cannot: rfind(" + ") finds the `+`
+            // INSIDE the parens and mis-splits `(. + 4)` into `(." / "4`,
+            // both of which fail is_label_like, and the fall-through then
+            // silently emits a bogus SymbolDiff against the literal string
+            // ". + 4" — resolved as ZERO with no diagnostic (reproduced:
+            // `.long target_fn - (. + 4)` came out 00000000; GAS emits
+            // R_X86_64_PC32 target_fn-4). With the paren stripped,
+            // parse_sym_addend yields (".", 4) and the writer emits the
+            // correct PC-relative diff.
+            //
+            // The guard to `starts_with('(')` is load-bearing: WITHOUT it, a
+            // non-parenthesized `a - b + N` would be read as `a - (b + N)`
+            // and the trailing addend flipped in sign (broke
+            // kernel_altinstr_layout's `.long 760b - 770b + 5`). Un-paren
+            // `sym ± N` tails stay on the rfind path below, which folds them
+            // with the correct sign.
+            if rhs_full.starts_with('(') {
+                if let Some((rhs_sym, rhs_add)) = parse_sym_addend(rhs_full) {
+                    // Reject BARE numbers: is_label_like accepts a leading
+                    // digit (numeric labels like `770b`), but a digit-only
+                    // string is a constant expression, not a label —
+                    // `a - (1 + 2)` must not become a diff against "1".
+                    let is_real_label = is_label_like(&rhs_sym)
+                        && !rhs_sym.bytes().all(|c| c.is_ascii_digit());
+                    if is_real_label {
+                        vals.push(DataValue::SymbolDiffAddend(
+                            lhs,
+                            rhs_sym,
+                            lhs_addend - rhs_add,
+                        ));
+                        continue;
+                    }
+                }
+            }
             // Check if rhs has an addend: "sym - N" or "sym + N"
             if let Some(rhs_minus) = rhs_full.rfind(" - ") {
                 let rhs_sym = strip_sym_parens(rhs_full[..rhs_minus].trim());
@@ -3736,6 +3773,54 @@ mod tests {
         ];
         let out2 = expand_gas_macros(&lines2);
         assert!(out2.is_ok(), "extable_type_reg shape failed: {:?}", out2);
+    }
+
+    /// Session-85 (Agent-Z audit, hunk #7): the static_call trampoline shape
+    /// `.long func - (. + 4)` must parse to SymbolDiffAddend(func, ".", -4).
+    /// Before the fix the naive ` - ` split grabbed the parenthesized RHS,
+    /// the rfind probes failed on `(."`, and the fall-through emitted a bogus
+    /// SymbolDiff against the literal string ". + 4" — resolved as a SILENT
+    /// ZERO with no relocation (GAS: R_X86_64_PC32 func-4).
+    #[test]
+    fn test_static_call_parenthesized_dot_addend() {
+        let vals = parse_data_values("target_fn - (. + 4)").unwrap();
+        assert_eq!(vals.len(), 1, "expected a single data value: {:?}", vals);
+        match &vals[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "target_fn");
+                assert_eq!(b, ".");
+                assert_eq!(*add, -4);
+            }
+            other => panic!("func - (. + 4) misparsed: {:?}", other),
+        }
+        // The LHS may carry its own addend (JUMP_TABLE_ENTRY chains):
+        // `sym+8 - (. + 4)` == sym - . + 4.
+        let vals2 = parse_data_values("sym+8 - (. + 4)").unwrap();
+        match &vals2[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "sym");
+                assert_eq!(b, ".");
+                assert_eq!(*add, 4);
+            }
+            other => panic!("sym+8 - (. + 4) misparsed: {:?}", other),
+        }
+    }
+
+    /// The paren-RHS probe must NOT steal unparenthesized trailing addends:
+    /// `760b - 770b + 5` is `(760b - 770b) + 5`, NOT `760b - (770b + 5)`.
+    /// Kernel alt_instr layout (kernel_altinstr_layout regression) depends on
+    /// the sign staying positive.
+    #[test]
+    fn test_diff_trailing_addend_sign_preserved() {
+        let vals = parse_data_values("760b - 770b + 5").unwrap();
+        match &vals[0] {
+            DataValue::SymbolDiffAddend(a, b, add) => {
+                assert_eq!(a, "760b");
+                assert_eq!(b, "770b");
+                assert_eq!(*add, 5);
+            }
+            other => panic!("760b - 770b + 5 misparsed: {:?}", other),
+        }
     }
 
     /// Spaceless label arithmetic in data directives (vdso32 sigreturn.S):

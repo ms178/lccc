@@ -72,7 +72,29 @@ fi
 # ---- 2. extract -------------------------------------------------------------
 echo "prepare_kernel_tree: extracting"
 rm -rf "$KDIR"
-tar -xf "linux-$KVER.tar.xz"
+# tar may exit non-zero on benign "Directory renamed before its status could
+# be extracted" warnings (a GNU tar quirk when a directory's metadata changes
+# between tar's open and its later utime/chmod pass, seen under load on
+# FUSE/overlayfs). Real corruption is caught by the `xz -t` above and by the
+# sentinel check below; tolerate the warning stream but verify the tree.
+tar_err=$(mktemp)
+tar -xf "linux-$KVER.tar.xz" 2>"$tar_err" || true
+grep -v "Directory renamed before its status could be extracted" "$tar_err" >&2 || true
+rm -f "$tar_err"
+# Post-extract integrity: the archive passed `xz -t`, so a short tree means a
+# filesystem-level extraction problem. Check sentinel files spread across the
+# tree (not just the top-level Makefile) before trusting it.
+for sentinel in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c include/linux/sched.h; do
+  if [ ! -f "$KDIR/$sentinel" ]; then
+    echo "prepare_kernel_tree: extraction incomplete (missing $sentinel); retrying" >&2
+    rm -rf "$KDIR"
+    tar -xf "linux-$KVER.tar.xz" || { echo "prepare_kernel_tree: tar failed on retry" >&2; exit 1; }
+    break
+  fi
+done
+for sentinel in Makefile init/main.c arch/x86/Makefile kernel/sched/core.c include/linux/sched.h; do
+  [ -f "$KDIR/$sentinel" ] || { echo "prepare_kernel_tree: tar extraction incomplete ($sentinel missing)" >&2; exit 1; }
+done
 cd "$KDIR"
 
 # ---- 3. apply the CachyMod patch series (PKGBUILD source order) -------------

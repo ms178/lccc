@@ -123,6 +123,15 @@ pub struct Driver {
     /// how many go before the entry point (the rest go after).
     /// Used by the Linux kernel for ftrace and static call patching.
     pub(super) patchable_function_entry: Option<(u32, u32)>,
+    /// Function-entry mcount sub-mode configuration, mutated by -mfentry /
+    /// -mrecord-mcount / -mnop-mcount. Inert on its own; only takes effect
+    /// when mcount_pg is true (matching GCC: -pg is the trigger, the -m flags
+    /// only configure how the call is emitted).
+    pub(super) mcount_submode: crate::backend::McountInstrumentation,
+    /// Set by -pg: activates function-entry mcount instrumentation using the
+    /// configured mcount_submode. The kernel's CFLAGS_REMOVE mechanism strips
+    /// -pg (e.g. for VDSO objects) leaving the sub-modes inert, matching GCC.
+    pub(super) mcount_pg: bool,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required by the Linux kernel for Intel CET/IBT (Indirect Branch Tracking).
     pub(super) cf_protection_branch: bool,
@@ -405,6 +414,8 @@ impl Driver {
             function_return_thunk: false,
             indirect_branch_thunk: false,
             patchable_function_entry: None,
+            mcount_submode: crate::backend::McountInstrumentation::default(),
+            mcount_pg: false,
             cf_protection_branch: false,
             cf_protection_value: None,
             no_sse: false,
@@ -1940,6 +1951,11 @@ impl Driver {
             indirect_branch_thunk: self.indirect_branch_thunk,
             indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,
             patchable_function_entry: self.patchable_function_entry,
+            mcount: if self.mcount_pg {
+                Some(self.mcount_submode)
+            } else {
+                None
+            },
             cf_protection_branch: self.cf_protection_branch,
             // GCC/Clang align function entries to 16 bytes at -O1..-O3 and
             // leave them unaligned at -Os/-Oz. Emitted as a real `.p2align` so

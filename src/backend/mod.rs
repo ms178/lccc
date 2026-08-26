@@ -33,6 +33,41 @@ pub mod x86;
 
 use crate::ir::reexports::IrModule;
 
+/// Function-entry mcount instrumentation, derived from `-pg` (and its `-m`
+/// sub-mode flags).
+///
+/// GCC's mcount flag family is implemented at the codegen level by emitting a
+/// single 5-byte instruction (a `call` or a NOP) at function entry, optionally
+/// recorded in `__mcount_loc` for the runtime patcher. Measured GCC 14.2
+/// reference shapes:
+///
+/// - `-pg` alone: frame is set up FIRST (`push %rbp; mov %rsp,%rbp`), then
+///   `call mcount` — the classic mcount ABI reads the parent PC through the
+///   frame. GCC rejects `-pg` together with `-fomit-frame-pointer`.
+/// - `-pg -mfentry`: `call __fentry__` is the very FIRST instruction (before
+///   any prologue save) — the kernel x86_64 default.
+/// - `-pg -mrecord-mcount`: also emit a pointer-sized entry in a
+///   `__mcount_loc,"a",@progbits` section pointing at each call site
+///   (`CONFIG_FTRACE_MCOUNT_USE_CC=y`; no post-link recordmcount step).
+/// - `-pg -mnop-mcount`: replace the call with the kernel's canonical 5-byte
+///   NOP (`0f 1f 44 00 00`); the location is still recorded when `record` is
+///   also set. With `CONFIG_HAVE_OBJTOOL_NOP_MCOUNT` objtool converts the
+///   recorded sites at link time.
+///
+/// Contract: `-pg` is the trigger; the `-m` sub-mode flags are inert without
+/// it. The kernel relies on this — `CFLAGS_REMOVE_xxx = -pg` (e.g. for VDSO
+/// objects) leaves `-mfentry`/`-mrecord-mcount` in CFLAGS expecting no-ops.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct McountInstrumentation {
+    /// `-mfentry`: emit `call __fentry__` instead of `call mcount`.
+    pub use_fentry: bool,
+    /// `-mrecord-mcount`: record each call site in `__mcount_loc`.
+    pub record: bool,
+    /// `-mnop-mcount`: emit a 5-byte NOP instead of a call. The location is
+    /// still recorded in `__mcount_loc` when `record` is also set.
+    pub nop: bool,
+}
+
 /// Options that control code generation, parsed from CLI flags.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CodegenOptions {
@@ -58,6 +93,9 @@ pub(crate) struct CodegenOptions {
     /// -fpatchable-function-entry=N[,M] emits NOP padding around function entry points
     /// and records them in __patchable_function_entries for runtime patching (ftrace).
     pub(crate) patchable_function_entry: Option<(u32, u32)>,
+    /// Function-entry mcount instrumentation: -pg / -mfentry / -mrecord-mcount /
+    /// -mnop-mcount. See `McountInstrumentation` for the measured GCC contract.
+    pub(crate) mcount: Option<McountInstrumentation>,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required for Intel CET/IBT (Indirect Branch Tracking).
     pub(crate) cf_protection_branch: bool,

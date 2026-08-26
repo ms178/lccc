@@ -180,6 +180,7 @@ impl Parser {
         let is_used = self.attrs.parsing_used();
         let is_fastcall = self.attrs.parsing_fastcall();
         let is_naked = self.attrs.parsing_naked();
+        let no_instrument = self.attrs.parsing_no_instrument();
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
@@ -191,6 +192,7 @@ impl Parser {
         decl_attrs.set_used(is_used);
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.set_naked(is_naked);
+        decl_attrs.set_no_instrument(no_instrument);
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
@@ -297,6 +299,7 @@ impl Parser {
                 attrs.set_used(decl_attrs.is_used());
                 attrs.set_fastcall(decl_attrs.is_fastcall());
                 attrs.set_naked(decl_attrs.is_naked());
+                attrs.set_no_instrument(decl_attrs.is_no_instrument());
                 attrs.set_noreturn(decl_attrs.is_noreturn());
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
@@ -605,6 +608,9 @@ impl Parser {
         if self.attrs.parsing_naked() {
             last_decl.attrs.set_naked(true);
         }
+        if self.attrs.parsing_no_instrument() {
+            last_decl.attrs.set_no_instrument(true);
+        }
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
@@ -618,6 +624,7 @@ impl Parser {
         self.attrs.set_used(false);
         self.attrs.set_fastcall(false);
         self.attrs.set_naked(false);
+        self.attrs.set_no_instrument(false);
         ctx.is_common = ctx.is_common || extra_common;
         if let Some(a) = extra_aligned {
             ctx.alignment = Some(ctx.alignment.map_or(a, |prev| prev.max(a)));
@@ -650,6 +657,7 @@ impl Parser {
             self.attrs.set_used(false);
             self.attrs.set_fastcall(false);
             self.attrs.set_naked(false);
+            self.attrs.set_no_instrument(false);
             self.attrs.set_noreturn(false);
             self.attrs.set_error_attr(false);
             let dinit = if self.consume_if(&TokenKind::Assign) {
@@ -812,6 +820,7 @@ impl Parser {
                     da.set_weak(self.attrs.parsing_weak());
                     da.set_fastcall(self.attrs.parsing_fastcall());
                     da.set_naked(self.attrs.parsing_naked());
+                    da.set_no_instrument(self.attrs.parsing_no_instrument());
                     da.set_error_attr(self.attrs.parsing_error_attr());
                     if let Some(ref target) = self.attrs.parsing_alias_target {
                         da.alias_target = Some(target.clone());

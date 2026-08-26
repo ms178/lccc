@@ -974,6 +974,7 @@ impl Lowerer {
             uses_sret,
             is_fastcall: func.attrs.is_fastcall(),
             is_naked: func.attrs.is_naked(),
+            no_instrument: func.attrs.is_no_instrument(),
             global_init_label_blocks: global_init_labels,
             ret_eightbyte_classes,
             ret_is_f128_sse,

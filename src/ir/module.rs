@@ -218,6 +218,11 @@ pub struct IrFunction {
     pub is_fastcall: bool,
     /// __attribute__((naked)) - emit no prologue/epilogue; function body is pure asm.
     pub is_naked: bool,
+    /// __attribute__((no_instrument_function)) - skip mcount/__fentry__ entry
+    /// instrumentation. The Linux kernel marks early-boot, NMI, and
+    /// .noinstr.text functions this way: the tracer infrastructure isn't
+    /// mapped there yet (or must not run), so emitting the call would fault.
+    pub no_instrument: bool,
     /// Set by the inlining pass when call sites were inlined into this function.
     /// Used by post-inlining passes (mem2reg re-run, symbol resolution) to know
     /// that non-entry blocks may contain allocas from inlined callees.
@@ -349,6 +354,7 @@ impl IrFunction {
             uses_sret: false,
             is_fastcall: false,
             is_naked: false,
+            no_instrument: false,
             global_init_label_blocks: Vec::new(),
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,

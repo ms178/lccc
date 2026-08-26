@@ -130,6 +130,10 @@ pub(super) mod parsed_attr_flag {
     pub const FASTCALL: u32 = 1 << 17;
     /// `__attribute__((naked))` encountered — emit no prologue/epilogue.
     pub const NAKED: u32 = 1 << 18;
+    /// `__attribute__((no_instrument_function))` encountered — skip the mcount
+    /// / __fentry__ prologue emission. Critical for the Linux kernel's noinstr
+    /// functions (early boot, NMI, RCU) where the tracer can't run.
+    pub const NO_INSTRUMENT: u32 = 1 << 19;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -258,6 +262,10 @@ impl ParsedDeclAttrs {
     pub fn parsing_naked(&self) -> bool {
         self.flags & parsed_attr_flag::NAKED != 0
     }
+    #[inline]
+    pub fn parsing_no_instrument(&self) -> bool {
+        self.flags & parsed_attr_flag::NO_INSTRUMENT != 0
+    }
 
     // --- flag setters ---
 
@@ -336,6 +344,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_naked(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::NAKED, v)
+    }
+    #[inline]
+    pub fn set_no_instrument(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::NO_INSTRUMENT, v)
     }
 
     #[inline]
@@ -1197,6 +1209,13 @@ impl Parser {
             }
             "naked" | "__naked__" => {
                 self.attrs.set_naked(true);
+                self.advance();
+            }
+            // __attribute__((no_instrument_function)) — skip the mcount/__fentry__
+            // prologue. The Linux kernel marks early-boot, NMI, and other
+            // contexts where the tracer infrastructure can't run with this.
+            "no_instrument_function" | "__no_instrument_function__" => {
+                self.attrs.set_no_instrument(true);
                 self.advance();
             }
             "optimize" | "__optimize__" => {

@@ -210,3 +210,38 @@ All snapshots: squashed `ms178-1.patch` + per-commit series + full source
 tarball + git bundle + ledger in `/home/z/my-project/artifacts/`. The
 canonical deliverable `/home/z/my-project/ms178-1.patch` is refreshed on every
 snapshot and APPLIES-CLEAN against the recorded base.
+
+---
+
+## Session-85 addendum (2026-08-26) — red-team audit of Agent Z's bringup patch
+
+Full audit: `docs/history/2026-08-26-session85-redteam-audit-agent-z-kernel-bringup.md`;
+continuity: `updates/followup_2026-08-26_session04.md`.
+
+**Integrated from Agent Z (validated):**
+1. `invalidate_text_section()` after raw non-text `.section` emissions —
+   fixes the REAL, reproduced bug where `-fpatchable-function-entry=N,M`
+   buried whole function bodies in `__patchable_function_entries,"awo"`
+   (non-executable → segfault-on-call).
+2. mcount family `-pg / -mfentry / -mrecord-mcount / -mnop-mcount`
+   (kernel `CC_FLAGS_FTRACE`, CONFIG_FUNCTION_TRACER): GCC-contract emission
+   incl. `__mcount_loc` records and the 5-byte GENERIC_NOP5 site;
+   `no_instrument_function` attribute plumbed end to end; `-pg` is the
+   trigger, sub-modes inert without it (VDSO CFLAGS_REMOVE contract).
+3. per_cpu_ptr()-style `Add(Cast(GlobalAddr), reg)` → SIB `leaq sym(reg)`
+   fold (closes the `workqueue_prepare_cpu` "no register home" ICE class).
+4. `movq $(sym_a - sym_b), %reg` (movabs + R_X86_64_64 diff reloc) —
+   unblocks `arch/x86/mm/mem_encrypt_boot.S`.
+5. `.long func - (. + 4)` static_call shape now yields
+   `R_X86_64_PC32 func-4` (was: SILENT ZERO — reproduced).
+6. `MIN_JUMP_TABLE_CASES` 4→5 = measured GCC-x86 parity.
+
+**Rejected from Agent Z:** `LCCC_BEST_EFFORT_NO_HOME` (fabricated-zero
+diagnostic mode — correctness charter) and the `_Pragma` rewrite (obsolete:
+main already implements C11 §6.10.9 full macro replacement).
+
+**Kernel build status after this session:** all assembler/codegen blockers
+identified by Agent Z are fixed and regression-tested on main
+(467 PASS / 0 FAIL). Next gate: object-count progression of the full
+Cachymod 6.18.46 build with ftrace flags enabled, then objtool pass
+(see session04 followup §4 P0).
