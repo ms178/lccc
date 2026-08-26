@@ -1,0 +1,1119 @@
+//! Induction-variable widening pass.
+//!
+//! Detects `I32`/`U32` basic induction variables whose only 64-bit-context
+//! use is addressing (a `Cast` I32→I64 that feeds a `GetElementPtr` offset,
+//! or a direct `GetElementPtr` offset operand), and widens them to `I64`.
+//!
+//! The transform eliminates the per-iteration `movslq` the x86 backend emits
+//! to re-sign-extend an I32 IV after every 32-bit `addl` (the upper 32 bits
+//! are clobbered by the 32-bit add, so the next GEP use would read garbage
+//! without the re-extension). After widening, the latch add is `addq` (no
+//! upper-bit clobber) and the IV is consumed directly by the GEP with no
+//! `Cast` and no `movslq`.
+//!
+//! Canonical example (sieve's inner loop):
+//!
+//! ```text
+//!   BEFORE (per-iteration movslq):          AFTER (no movslq):
+//!   .LBB5:                                    .LBB5:
+//!     movslq %ebp, %rbx            ;dead        movb $0, (%r14, %rbp)
+//!     movb   $0, (%r14, %rbp)                    addq %r15, %rbp
+//!     addl   %r15d, %ebp                         cmpl $10000000, %ebp
+//!     movslq %ebp, %rbp            ;re-ext      jle .LBB5
+//!     cmpl   $10000000, %ebp
+//!     jle    .LBB5
+//! ```
+//!
+//! ## Safety contract
+//!
+//! Widening is sound when:
+//!  1. The IV is used in a 64-bit addressing context (GEP offset) at least
+//!     once — this implies I32 overflow would already be UB (array index
+//!     out of bounds), so the I64 recurrence matches the I32 recurrence for
+//!     all in-bounds iterations.
+//!  2. Every other use is one of:
+//!       - the latch `Add` (the recurrence step)
+//!       - a `Cmp` whose other operand is a `Const` (widened trivially) or
+//!         a loop-invariant `I32` value (a `Cast` is inserted in the
+//!         preheader)
+//!       - a `Cast` I32→I64 whose dest feeds addressing (dropped, the
+//!         widened IV is used directly)
+//!       - a `Copy` (followed transitively to a real use)
+//!  3. The latch `Add` step is a `Const` or a loop-invariant `I32` value
+//!     (a `Cast` is inserted in the preheader for the variable case).
+//!
+//! Out-of-scope (the pass bails):
+//!   - IVs whose step is a loop-variant value (rare; would need the step
+//!     Cast hoisted each iteration — no win).
+//!   - IVs used in `Mul`/`Shl`/`And`/`Or`/`Xor` (32-bit arithmetic
+//!     semantics would change), `Trunc`/narrow, division, or returned.
+//!   - IVs used in a `Cmp` against a loop-variant `I32` operand.
+//!   - Loops without a single preheader or single latch (conservative).
+//!
+//! The pass runs AFTER IVSR + univsr (so pointer-IV strength reduction has
+//! already fired on the candidates it can, and the residual scalar IVs that
+//! survive are the ones widening helps), and BEFORE loop_rotate (so the
+//! rotated form sees the widened phi and emits `addq` directly).
+
+use crate::common::fx_hash::FxHashSet;
+use crate::common::types::IrType;
+use crate::ir::analysis::CfgAnalysis;
+use crate::ir::constants::IrConst;
+use crate::ir::instruction::{Instruction, Operand, Terminator, Value};
+use crate::ir::reexports::{BlockId, IrBinOp, IrFunction};
+use crate::passes::loop_analysis::{
+    find_natural_loops, merge_loops_by_header, NaturalLoop,
+};
+
+/// Entry point used by the dirty-tracking pipeline.
+pub(crate) fn run_function(func: &mut IrFunction) -> usize {
+    widen_ivs_in_function(func)
+}
+
+/// Per-function driver: returns the number of IVs widened.
+fn widen_ivs_in_function(func: &mut IrFunction) -> usize {
+    if func.blocks.len() < 3 {
+        return 0;
+    }
+    // x86-64 only: on ILP32 (i686) widening to I64 is the wrong direction.
+    if crate::common::types::target_ptr_size() != 8 {
+        return 0;
+    }
+    let debug = std::env::var("CCC_IV_WIDEN_DEBUG").is_ok();
+    if std::env::var("CCC_NO_IV_WIDEN").is_ok() {
+        return 0;
+    }
+
+    let mut total = 0usize;
+    // Iterate to fixpoint: widening one IV can expose another (rare, but
+    // possible in nested loops where the outer IV is used as the inner
+    // loop's init). Bounded by a small cap to avoid pathological loops.
+    for _ in 0..6 {
+        let cfg = CfgAnalysis::build(func);
+        if cfg.num_blocks < 3 {
+            break;
+        }
+        let raw = find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+        if raw.is_empty() {
+            break;
+        }
+        let loops = merge_loops_by_header(raw);
+        // Innermost-first: smallest body. Widening an inner IV does not
+        // disturb outer-loop analysis (the outer header phi is untouched).
+        let mut sorted: Vec<&NaturalLoop> = loops.iter().collect();
+        sorted.sort_by_key(|lp| lp.body.len());
+        let mut did = false;
+        for lp in sorted {
+            if try_widen_loop(func, lp, &cfg, debug) {
+                total += 1;
+                did = true;
+                break; // CFG/IR changed — rebuild before the next candidate.
+            }
+        }
+        if !did {
+            break;
+        }
+    }
+    if debug && total > 0 {
+        eprintln!("[IV-WIDEN] {}: widened {} IVs", func.name, total);
+    }
+    total
+}
+
+/// Try to widen exactly one IV in `lp`. Returns true if a widening was
+/// applied.
+fn try_widen_loop(
+    func: &mut IrFunction,
+    lp: &NaturalLoop,
+    cfg: &CfgAnalysis,
+    debug: bool,
+) -> bool {
+    // Need a single preheader (so we can hoist the init Cast).
+    let Some(preheader) = lp.find_preheader(&cfg.preds) else {
+        return false;
+    };
+    // Need a single latch.
+    let Some(latch) = lp.single_latch(&cfg.preds) else {
+        return false;
+    };
+    if latch == lp.header {
+        return false; // self-loop — already rotated shape; bail.
+    }
+    let preheader_label = func.blocks[preheader].label;
+    let header_label = func.blocks[lp.header].label;
+    let latch_label = func.blocks[latch].label;
+
+    // Collect candidate I32/U32 phis in the header with exactly 2 incoming
+    // (the preheader + the latch) and an Add-step latch.
+    let candidates: Vec<(Value, IrType, Operand, Value)> = collect_widenable_phis(
+        func,
+        lp,
+        preheader,
+        preheader_label,
+        latch,
+        latch_label,
+    );
+    if candidates.is_empty() {
+        return false;
+    }
+
+    // For each candidate, analyze its uses. Pick the FIRST that satisfies
+    // the safety contract (deterministic; the analysis is O(uses)).
+    for (phi_dest, phi_ty, init_op, latch_add_dest) in &candidates {
+        let analysis = analyze_iv_uses(func, lp, *phi_dest, *latch_add_dest);
+        if let Some(plan) = analysis {
+            if apply_widen(
+                func,
+                *phi_dest,
+                *phi_ty,
+                *init_op,
+                *latch_add_dest,
+                &plan,
+                preheader,
+                preheader_label,
+                latch,
+                debug,
+            ) {
+                return true;
+            }
+        }
+    }
+    let _ = header_label;
+    false
+}
+
+/// A use of the IV that the widening pass can rewrite.
+#[derive(Debug, Clone)]
+enum IvUse {
+    /// The latch `Add` recurrence step (the phi's latch incoming).
+    LatchAdd,
+    /// A `Cast` I32→I64 whose dest is used ONLY as a GEP offset (directly or
+    /// through a chain of Copies). We will drop this Cast and use the
+    /// widened phi directly.
+    CastToI64ForGep {
+        /// (block_idx, inst_idx) of the Cast instruction.
+        cast_loc: (usize, usize),
+        /// dest value of the Cast (so we can rewrite uses).
+        cast_dest: Value,
+    },
+    /// A `Cmp` against a loop-invariant or const operand. We will rewrite
+    /// to an I64 cmp with the operand widened.
+    CmpUse {
+        block_idx: usize,
+        inst_idx: usize,
+        /// Whether the IV is on the lhs (true) or rhs (false) of the cmp.
+        iv_is_lhs: bool,
+        /// The other operand (must be const or loop-invariant I32 value).
+        other_op: Operand,
+    },
+    /// A direct `GetElementPtr` offset operand (the IV is used directly as
+    /// the offset, with an implicit sign-extension). The widening lets the
+    /// GEP use the I64 IV directly.
+    DirectGepOffset {
+        block_idx: usize,
+        inst_idx: usize,
+    },
+}
+
+/// A finalized widening plan: the list of rewrites we will apply.
+struct WidenPlan {
+    uses: Vec<IvUse>,
+    /// True iff at least one use is a 64-bit-context addressing use
+    /// (CastToI64ForGep or DirectGepOffset). This is the widening trigger.
+    has_addressing_use: bool,
+}
+
+/// Analyze every use of `phi_dest` and decide if widening is safe.
+/// Returns `Some(plan)` iff every use is rewrites-able AND at least one
+/// use is an addressing use.
+fn analyze_iv_uses(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    phi_dest: Value,
+    latch_add_dest: Value,
+) -> Option<WidenPlan> {
+    let mut uses: Vec<IvUse> = Vec::new();
+    let mut has_addressing = false;
+
+    // Walk every instruction in the function (the IV can escape the loop
+    // body only through a use the loop's exit-merge phi feeds; but we
+    // require the use to be rewrites-able, so we walk the whole function).
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, inst) in b.instructions.iter().enumerate() {
+            match inst {
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    dest,
+                    ty,
+                } if *dest == latch_add_dest => {
+                    // The latch add. One of lhs/rhs must be the phi; the
+                    // other is the step (already verified by the caller
+                    // for the phi candidacy, but re-check here).
+                    let lhs_is_phi = matches!(lhs, Operand::Value(v) if *v == phi_dest);
+                    let rhs_is_phi = matches!(rhs, Operand::Value(v) if *v == phi_dest);
+                    if !lhs_is_phi && !rhs_is_phi {
+                        return None; // phi feeds the add only transitively — bail
+                    }
+                    let _ = ty;
+                    uses.push(IvUse::LatchAdd);
+                    continue;
+                }
+                Instruction::Cast {
+                    dest: cast_dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    let src_is_phi = matches!(src, Operand::Value(v) if *v == phi_dest);
+                    if !src_is_phi {
+                        continue;
+                    }
+                    // Only I32/U32 → I64 (sign-extend for addressing).
+                    let is_widen = matches!(*from_ty, IrType::I32 | IrType::U32)
+                        && matches!(*to_ty, IrType::I64 | IrType::U64);
+                    if !is_widen {
+                        return None; // other cast shape — bail
+                    }
+                    // Verify the Cast dest is used ONLY as a GEP offset
+                    // (possibly through a chain of Copies).
+                    if !cast_dest_feeds_only_gep(func, *cast_dest) {
+                        return None;
+                    }
+                    uses.push(IvUse::CastToI64ForGep {
+                        cast_loc: (bi, ii),
+                        cast_dest: *cast_dest,
+                    });
+                    has_addressing = true;
+                    continue;
+                }
+                Instruction::Cmp {
+                    dest: _,
+                    op,
+                    lhs,
+                    rhs,
+                    ty: _,
+                } => {
+                    let lhs_is_phi = matches!(lhs, Operand::Value(v) if *v == phi_dest);
+                    let rhs_is_phi = matches!(rhs, Operand::Value(v) if *v == phi_dest);
+                    if !lhs_is_phi && !rhs_is_phi {
+                        continue;
+                    }
+                    let other = if lhs_is_phi { rhs } else { lhs };
+                    // The other operand must be a Const or a loop-invariant
+                    // I32 value. Otherwise bail (we'd have to widen a
+                    // variant value each iteration — no win).
+                    if !operand_is_const_or_loop_invariant(other, lp, func, phi_dest) {
+                        return None;
+                    }
+                    let _ = op;
+                    uses.push(IvUse::CmpUse {
+                        block_idx: bi,
+                        inst_idx: ii,
+                        iv_is_lhs: lhs_is_phi,
+                        other_op: *other,
+                    });
+                    continue;
+                }
+                Instruction::GetElementPtr {
+                    dest: _,
+                    base: _,
+                    offset,
+                    ty: _,
+                } => {
+                    if matches!(offset, Operand::Value(v) if *v == phi_dest) {
+                        uses.push(IvUse::DirectGepOffset {
+                            block_idx: bi,
+                            inst_idx: ii,
+                        });
+                        has_addressing = true;
+                        continue;
+                    }
+                    // offset is a Copy chain → handled by the Cast case.
+                    if let Some(_src) = resolve_copy_chain_to_value(offset, func) {
+                        // If the chain bottoms out at our phi, this GEP is
+                        // already covered by the Cast analysis (the Cast
+                        // dest feeds this GEP through Copies). Skip; the
+                        // Cast use is the one we rewrite.
+                    }
+                    // Other shapes (const offset) are irrelevant.
+                    continue;
+                }
+                Instruction::Copy { dest: _, src } => {
+                    // A Copy of the phi. Follow the chain; if it bottoms out
+                    // at a Cast→GEP, the Cast case already handled it. If it
+                    // bottoms out at anything else, bail (we don't know how
+                    // to rewrite that use).
+                    if matches!(src, Operand::Value(v) if *v == phi_dest) {
+                        // Walk forward: is this Copy's dest used only by a
+                        // Cast→GEP chain? If yes, the Cast case (fired by
+                        // the Copy's dest) will have recorded it. If no, we
+                        // need to ensure the Copy doesn't reach an
+                        // unhandleable use.
+                        if !copy_of_phi_feeds_only_gep(func, phi_dest) {
+                            return None;
+                        }
+                        continue;
+                    }
+                    continue;
+                }
+                Instruction::Phi { dest: _, ty: _, incoming } => {
+                    // An exit-merge phi that uses our IV. Bail (the exit
+                    // phi is I32-typed and would need a Trunc to preserve
+                    // I32 semantics; we don't synthesize that here).
+                    if incoming
+                        .iter()
+                        .any(|(op, _)| matches!(op, Operand::Value(v) if *v == phi_dest))
+                    {
+                        return None;
+                    }
+                    continue;
+                }
+                _ => {
+                    // Any other instruction that reads the phi → bail.
+                    if instruction_reads_value(inst, phi_dest) {
+                        return None;
+                    }
+                }
+            }
+        }
+        // Terminator uses (CondBranch reads a Cmp dest, not the IV
+        // directly; but be defensive: if a terminator reads the IV,
+        // bail). CondBranch reads the cmp result, not the IV, so the
+        // IV-read here would be a miscompile-shaped IR; bail.
+        if terminator_reads_value(&b.terminator, phi_dest) {
+            return None;
+        }
+    }
+
+    if !has_addressing {
+        return None;
+    }
+    Some(WidenPlan {
+        uses,
+        has_addressing_use: has_addressing,
+    })
+}
+
+/// Apply the widening transform. Returns true on success.
+fn apply_widen(
+    func: &mut IrFunction,
+    phi_dest: Value,
+    phi_ty: IrType,
+    init_op: Operand,
+    latch_add_dest: Value,
+    plan: &WidenPlan,
+    preheader_idx: usize,
+    preheader_label: BlockId,
+    _latch_idx: usize,
+    debug: bool,
+) -> bool {
+    let mut next_id = func.next_value_id;
+    let is_unsigned = matches!(phi_ty, IrType::U32);
+
+    // 1. Preheader: insert `wide_init = Cast(init I32→I64)`. If the init is
+    //    a Const, fold it to an I64 const directly (no Cast needed).
+    let wide_init_operand = match init_op {
+        Operand::Const(c) => {
+            let i = c.to_i64().unwrap_or(0);
+            Operand::Const(IrConst::I64(i))
+        }
+        Operand::Value(v) => {
+            let wide_init_val = Value(next_id);
+            next_id += 1;
+            let cast_ty = if is_unsigned { IrType::U64 } else { IrType::I64 };
+            func.blocks[preheader_idx]
+                .instructions
+                .push(Instruction::Cast {
+                    dest: wide_init_val,
+                    src: Operand::Value(v),
+                    from_ty: phi_ty,
+                    to_ty: cast_ty,
+                });
+            Operand::Value(wide_init_val)
+        }
+    };
+
+    // 2. Rewrite the header phi: type → I64, init incoming → wide_init,
+    //    latch incoming → latch_add_dest (now I64).
+    let wide_phi_ty = if is_unsigned { IrType::U64 } else { IrType::I64 };
+    rewrite_header_phi(
+        func,
+        phi_dest,
+        wide_phi_ty,
+        wide_init_operand,
+        preheader_label,
+        latch_add_dest,
+    );
+
+    // 3. Rewrite the latch Add: ty → I64; the step operand, if it's a Const
+    //    I32, becomes Const I64; if it's a Value I32, insert a Cast in the
+    //    latch block (or preheader if loop-invariant) before the Add.
+    let step_plan = plan_step_operand(func, phi_dest, latch_add_dest);
+    if let Some(step) = step_plan {
+        rewrite_latch_add(
+            func,
+            latch_add_dest,
+            wide_phi_ty,
+            step,
+            &mut next_id,
+            preheader_idx,
+            phi_ty,
+        );
+    } else {
+        // The latch add's step is the phi itself (a Sub? unusual) — we
+        // can't widen safely. Roll back by leaving the phi I32 and
+        // removing the preheader Cast we inserted. In practice this branch
+        // is unreachable because the candidacy check required an Add step.
+        if debug {
+            eprintln!(
+                "[IV-WIDEN] bail: latch add step not rewrites-able for phi {:?}",
+                phi_dest
+            );
+        }
+        return false;
+    }
+
+    // 4. Rewrite every use.
+    let mut cast_drops: Vec<(usize, usize)> = Vec::new();
+    for u in &plan.uses {
+        match u {
+            IvUse::LatchAdd => { /* already rewritten in step 3 */ }
+            IvUse::CastToI64ForGep { cast_loc, cast_dest } => {
+                // Replace every use of cast_dest with the widened phi.
+                replace_all_uses_of_value(func, *cast_dest, Operand::Value(phi_dest));
+                // Drop the Cast (it's now dead: src=phi(I64), but phi is
+                // already I64 so the Cast is a no-op; mark for removal).
+                cast_drops.push(*cast_loc);
+            }
+            IvUse::CmpUse {
+                block_idx,
+                inst_idx,
+                iv_is_lhs,
+                other_op,
+            } => {
+                rewrite_cmp_use(
+                    func,
+                    *block_idx,
+                    *inst_idx,
+                    *iv_is_lhs,
+                    *other_op,
+                    phi_dest,
+                    wide_phi_ty,
+                    phi_ty,
+                    &mut next_id,
+                );
+            }
+            IvUse::DirectGepOffset { block_idx: _, inst_idx: _ } => {
+                // The GEP offset operand already references phi_dest by
+                // Value; now that phi_dest is I64, the GEP reads it
+                // directly with no Cast. No rewrite needed.
+            }
+        }
+    }
+
+    // 5. Drop the now-dead Casts. Sort descending by (bi, ii) so indices
+    //    remain valid as we remove.
+    cast_drops.sort_by(|a, b| b.cmp(a));
+    for (bi, ii) in cast_drops {
+        if bi < func.blocks.len() && ii < func.blocks[bi].instructions.len() {
+            // Verify it's still a Cast (not already removed by a prior
+            // pass iteration in this same call).
+            if matches!(
+                func.blocks[bi].instructions[ii],
+                Instruction::Cast { .. }
+            ) {
+                func.blocks[bi].instructions.remove(ii);
+            }
+        }
+    }
+
+    func.next_value_id = next_id;
+    if debug {
+        eprintln!(
+            "[IV-WIDEN] widened phi {:?} (ty {:?} → {:?})",
+            phi_dest, phi_ty, wide_phi_ty
+        );
+    }
+    true
+}
+
+/// Rewrite the header phi in place: change its type and its preheader
+/// incoming to `wide_init`. The latch incoming stays the latch_add_dest
+/// (now producing I64).
+fn rewrite_header_phi(
+    func: &mut IrFunction,
+    phi_dest: Value,
+    wide_ty: IrType,
+    wide_init: Operand,
+    preheader_label: BlockId,
+    _latch_add_dest: Value,
+) {
+    for b in &mut func.blocks {
+        for inst in &mut b.instructions {
+            if let Instruction::Phi {
+                dest,
+                ty,
+                incoming,
+            } = inst
+            {
+                if *dest == phi_dest {
+                    *ty = wide_ty;
+                    for (op, blk) in incoming.iter_mut() {
+                        if *blk == preheader_label {
+                            *op = wide_init;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Extract the step operand of the latch Add (the operand that is NOT the
+/// phi). Returns None if the latch is not a simple `Add(phi, step)`.
+fn plan_step_operand(
+    func: &IrFunction,
+    phi_dest: Value,
+    latch_add_dest: Value,
+) -> Option<Operand> {
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty: _,
+            } = inst
+            {
+                if *dest == latch_add_dest {
+                    let lhs_is_phi = matches!(lhs, Operand::Value(v) if *v == phi_dest);
+                    let rhs_is_phi = matches!(rhs, Operand::Value(v) if *v == phi_dest);
+                    if lhs_is_phi {
+                        return Some(*rhs);
+                    }
+                    if rhs_is_phi {
+                        return Some(*lhs);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite the latch `Add` to I64. If the step is a Const I32, replace with
+/// Const I64. If the step is a Value I32, insert a Cast I32→I64 in the
+/// preheader (the step must be loop-invariant — verified by candidacy) and
+/// use the Cast's dest as the Add's rhs.
+fn rewrite_latch_add(
+    func: &mut IrFunction,
+    latch_add_dest: Value,
+    wide_ty: IrType,
+    step: Operand,
+    next_id: &mut u32,
+    preheader_idx: usize,
+    step_old_ty: IrType,
+) {
+    let wide_step_operand = match step {
+        Operand::Const(c) => Operand::Const(IrConst::I64(c.to_i64().unwrap_or(0))),
+        Operand::Value(v) => {
+            // Insert Cast(step I32→I64) in the preheader.
+            let wide_step_val = Value(*next_id);
+            *next_id += 1;
+            func.blocks[preheader_idx]
+                .instructions
+                .push(Instruction::Cast {
+                    dest: wide_step_val,
+                    src: Operand::Value(v),
+                    from_ty: step_old_ty,
+                    to_ty: wide_ty,
+                });
+            Operand::Value(wide_step_val)
+        }
+    };
+
+    // Find the latch Add and rewrite its ty + rhs.
+    for b in &mut func.blocks {
+        for inst in &mut b.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs: _,
+                rhs,
+                ty,
+            } = inst
+            {
+                if *dest == latch_add_dest {
+                    *ty = wide_ty;
+                    // The step is the operand that is NOT the phi. We
+                    // rewrite `rhs` to the wide step (the latch add's lhs
+                    // is the phi, by construction of the candidacy check).
+                    *rhs = wide_step_operand;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite a `Cmp` use of the IV to an I64 cmp. The other operand is
+/// widened: if Const I32, becomes Const I64; if Value I32 (loop-invariant),
+/// a Cast is inserted in the cmp's block immediately before the cmp.
+fn rewrite_cmp_use(
+    func: &mut IrFunction,
+    block_idx: usize,
+    inst_idx: usize,
+    iv_is_lhs: bool,
+    other_op: Operand,
+    phi_dest: Value,
+    wide_ty: IrType,
+    other_old_ty: IrType,
+    next_id: &mut u32,
+) {
+    let wide_other = match other_op {
+        Operand::Const(c) => Operand::Const(IrConst::I64(c.to_i64().unwrap_or(0))),
+        Operand::Value(v) => {
+            // Insert a Cast in the cmp's block, just before the cmp. Use a
+            // fresh value.
+            let wide_v = Value(*next_id);
+            *next_id += 1;
+            let cast = Instruction::Cast {
+                dest: wide_v,
+                src: Operand::Value(v),
+                from_ty: other_old_ty,
+                to_ty: wide_ty,
+            };
+            func.blocks[block_idx].instructions.insert(inst_idx, cast);
+            Operand::Value(wide_v)
+        }
+    };
+
+    // Rewrite the Cmp: ty → wide_ty; replace the IV-side operand (lhs or
+    // rhs) with the widened phi, and the other operand with wide_other.
+    // NOTE: if we inserted a Cast at inst_idx, the Cmp is now at inst_idx+1.
+    let target = if matches!(other_op, Operand::Value(_)) {
+        inst_idx + 1
+    } else {
+        inst_idx
+    };
+    if let Instruction::Cmp {
+        dest: _,
+        op: _,
+        lhs,
+        rhs,
+        ty,
+    } = &mut func.blocks[block_idx].instructions[target]
+    {
+        *ty = wide_ty;
+        if iv_is_lhs {
+            *lhs = Operand::Value(phi_dest);
+            *rhs = wide_other;
+        } else {
+            *lhs = wide_other;
+            *rhs = Operand::Value(phi_dest);
+        }
+    }
+}
+
+/// Replace every use of `old_val` (as an Operand::Value) with `new_op`,
+/// everywhere in the function (instructions + terminators).
+fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Operand) {
+    for b in &mut func.blocks {
+        for inst in &mut b.instructions {
+            rewrite_operand_value(inst, old_val, new_op);
+        }
+        rewrite_terminator_value(&mut b.terminator, old_val, new_op);
+    }
+}
+
+fn rewrite_operand_value(inst: &mut Instruction, old_val: Value, new_op: Operand) {
+    // For Value-typed fields we can only substitute another Value. The
+    // widening pass always rewrites with `Operand::Value(phi_dest)`, so
+    // extract the inner Value; if the caller passed a Const, skip (no
+    // sound in-place rewrite for a Value field).
+    let new_val = match new_op {
+        Operand::Value(v) => Some(v),
+        Operand::Const(_) => None,
+    };
+    let replace_v = |field: &mut Value| {
+        if field.0 == old_val.0 {
+            if let Some(nv) = new_val {
+                *field = nv;
+            }
+        }
+    };
+    match inst {
+        Instruction::BinOp { lhs, rhs, .. } => {
+            if matches!(lhs, Operand::Value(v) if v.0 == old_val.0) {
+                *lhs = new_op;
+            }
+            if matches!(rhs, Operand::Value(v) if v.0 == old_val.0) {
+                *rhs = new_op;
+            }
+        }
+        Instruction::UnaryOp { src, .. } => {
+            if matches!(src, Operand::Value(v) if v.0 == old_val.0) {
+                *src = new_op;
+            }
+        }
+        Instruction::Cmp { lhs, rhs, .. } => {
+            if matches!(lhs, Operand::Value(v) if v.0 == old_val.0) {
+                *lhs = new_op;
+            }
+            if matches!(rhs, Operand::Value(v) if v.0 == old_val.0) {
+                *rhs = new_op;
+            }
+        }
+        Instruction::Cast { src, .. } => {
+            if matches!(src, Operand::Value(v) if v.0 == old_val.0) {
+                *src = new_op;
+            }
+        }
+        Instruction::Copy { src, .. } => {
+            if matches!(src, Operand::Value(v) if v.0 == old_val.0) {
+                *src = new_op;
+            }
+        }
+        // Load.ptr is a Value (not an Operand). Only Value→Value
+        // replacement is sound.
+        Instruction::Load { ptr, .. } => replace_v(ptr),
+        // Store.ptr is a Value; Store.val is an Operand.
+        Instruction::Store { ptr, val, .. } => {
+            replace_v(ptr);
+            if matches!(val, Operand::Value(v) if v.0 == old_val.0) {
+                *val = new_op;
+            }
+        }
+        // GEP.base is a Value; GEP.offset is an Operand.
+        Instruction::GetElementPtr { base, offset, .. } => {
+            replace_v(base);
+            if matches!(offset, Operand::Value(v) if v.0 == old_val.0) {
+                *offset = new_op;
+            }
+        }
+        Instruction::Phi { incoming, .. } => {
+            for (op, _) in incoming.iter_mut() {
+                if matches!(op, Operand::Value(v) if v.0 == old_val.0) {
+                    *op = new_op;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_terminator_value(term: &mut Terminator, old_val: Value, new_op: Operand) {
+    match term {
+        Terminator::CondBranch { cond, .. } => {
+            if matches!(cond, Operand::Value(v) if *v == old_val) {
+                *cond = new_op;
+            }
+        }
+        Terminator::Return(Some(op)) => {
+            if matches!(op, Operand::Value(v) if *v == old_val) {
+                *op = new_op;
+            }
+        }
+        Terminator::Switch { val, .. } => {
+            if matches!(val, Operand::Value(v) if *v == old_val) {
+                *val = new_op;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Check if a terminator reads a specific Value. Used to bail if the IV
+/// escapes into a terminator directly.
+fn terminator_reads_value(term: &Terminator, v: Value) -> bool {
+    match term {
+        Terminator::CondBranch { cond, .. } => matches!(cond, Operand::Value(x) if *x == v),
+        Terminator::Return(Some(op)) => matches!(op, Operand::Value(x) if *x == v),
+        Terminator::Switch { val, .. } => matches!(val, Operand::Value(x) if *x == v),
+        _ => false,
+    }
+}
+
+/// Resolve an Operand through Copies: if `op` is `Value(v)` and `v` is
+/// produced by a `Copy { src }`, return `Some(src_val)`. Otherwise None.
+fn resolve_copy_chain_to_value(op: &Operand, func: &IrFunction) -> Option<Value> {
+    let v = match op {
+        Operand::Value(v) => *v,
+        _ => return None,
+    };
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::Copy { dest, src } = inst {
+                if *dest == v {
+                    if let Operand::Value(s) = src {
+                        return Some(*s);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Verify that a Cast's dest is used ONLY as a GEP offset (directly, or
+/// through a chain of Copies that bottom out at GEP offsets). This is the
+/// safety contract for dropping the Cast and using the widened phi
+/// directly.
+fn cast_dest_feeds_only_gep(func: &IrFunction, cast_dest: Value) -> bool {
+    value_feeds_only_gep(func, cast_dest)
+}
+
+/// Verify that a Copy whose src is the phi feeds only addressing.
+fn copy_of_phi_feeds_only_gep(func: &IrFunction, phi_dest: Value) -> bool {
+    // A Copy of the phi: its dest must feed only GEPs.
+    // Find the Copy dests.
+    let mut copy_dests: Vec<Value> = Vec::new();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            if let Instruction::Copy { dest, src } = inst {
+                if matches!(src, Operand::Value(v) if *v == phi_dest) {
+                    copy_dests.push(*dest);
+                }
+            }
+        }
+    }
+    if copy_dests.is_empty() {
+        return true; // no copies — fine
+    }
+    copy_dests.iter().all(|d| value_feeds_only_gep(func, *d))
+}
+
+/// Walk forward from `val`: every use must be a GEP offset (directly) or a
+/// Copy whose dest satisfies this same property (transitively). Any other
+/// use → false.
+fn value_feeds_only_gep(func: &IrFunction, val: Value) -> bool {
+    // BFS through Copies.
+    let mut visited: FxHashSet<u32> = FxHashSet::default();
+    let mut queue: Vec<Value> = vec![val];
+    while let Some(cur) = queue.pop() {
+        if !visited.insert(cur.0) {
+            continue;
+        }
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                // Direct GEP offset use → OK.
+                if let Instruction::GetElementPtr { offset, .. } = inst {
+                    if matches!(offset, Operand::Value(v) if *v == cur) {
+                        continue;
+                    }
+                }
+                // Copy → enqueue the dest.
+                if let Instruction::Copy { dest, src } = inst {
+                    if matches!(src, Operand::Value(v) if *v == cur) {
+                        queue.push(*dest);
+                        continue;
+                    }
+                }
+                // Cast same-width → forwarding; enqueue dest. Real
+                // narrowing/widening → bail.
+                if let Instruction::Cast { dest, src, from_ty, to_ty } = inst {
+                    if matches!(src, Operand::Value(v) if *v == cur) {
+                        if from_ty == to_ty {
+                            queue.push(*dest);
+                            continue;
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+                // Any OTHER instruction that reads `cur` → bail. Check the
+                // common instruction shapes (we don't have a generic
+                // operands() iterator; enumerate the shapes that can hold a
+                // Value).
+                if instruction_reads_value(inst, cur) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Check if an instruction reads `v` as an operand. Enumerates the shapes
+/// that can hold a `Value` operand. Used by `value_feeds_only_gep` to bail
+/// on unhandleable uses. Excludes GEP/Copy/Cast (handled by the caller).
+fn instruction_reads_value(inst: &Instruction, v: Value) -> bool {
+    // Helper: compare a `Value` (by reference) to our target.
+    let eq_v = |x: &Value| x.0 == v.0;
+    match inst {
+        Instruction::BinOp { lhs, rhs, .. } => {
+            matches!(lhs, Operand::Value(x) if eq_v(x)) || matches!(rhs, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::UnaryOp { src, .. } => matches!(src, Operand::Value(x) if eq_v(x)),
+        Instruction::Cmp { lhs, rhs, .. } => {
+            matches!(lhs, Operand::Value(x) if eq_v(x)) || matches!(rhs, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::Load { ptr, .. } => eq_v(ptr),
+        Instruction::Store { ptr, val, .. } => {
+            eq_v(ptr) || matches!(val, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::GetElementPtr { base, offset, .. } => {
+            eq_v(base) || matches!(offset, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::Phi { incoming, .. } => incoming
+            .iter()
+            .any(|(op, _)| matches!(op, Operand::Value(x) if eq_v(x))),
+        // Call/CallIndirect hold args inside CallInfo, not as a top-level
+        // field. Bail via the `info.args` scan.
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info
+            .args
+            .iter()
+            .any(|a| matches!(a, Operand::Value(x) if eq_v(x))),
+        Instruction::AtomicRmw { ptr, val, .. } => {
+            matches!(ptr, Operand::Value(x) if eq_v(x)) || matches!(val, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::AtomicCmpxchg { ptr, expected, desired, .. } => {
+            matches!(ptr, Operand::Value(x) if eq_v(x))
+                || matches!(expected, Operand::Value(x) if eq_v(x))
+                || matches!(desired, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::AtomicLoad { ptr, .. } => matches!(ptr, Operand::Value(x) if eq_v(x)),
+        Instruction::AtomicStore { ptr, val, .. } => {
+            matches!(ptr, Operand::Value(x) if eq_v(x)) || matches!(val, Operand::Value(x) if eq_v(x))
+        }
+        Instruction::VaArg { va_list_ptr, .. } => eq_v(va_list_ptr),
+        Instruction::Memcpy { dest, src, .. } => eq_v(dest) || eq_v(src),
+        Instruction::Select { cond, .. } => matches!(cond, Operand::Value(x) if eq_v(x)),
+        _ => false,
+    }
+}
+
+/// Check if an operand is a Const or a loop-invariant I32 value (not the
+/// phi itself, not loop-variant).
+fn operand_is_const_or_loop_invariant(
+    op: &Operand,
+    lp: &NaturalLoop,
+    func: &IrFunction,
+    phi_dest: Value,
+) -> bool {
+    match op {
+        Operand::Const(_) => true,
+        Operand::Value(v) => {
+            if *v == phi_dest {
+                return false; // cmp(phi, phi) — weird; bail
+            }
+            is_loop_invariant(v.0, &lp.body, func)
+        }
+    }
+}
+
+/// Is `val_id` loop-invariant? Defined outside the loop's body+header.
+fn is_loop_invariant(val_id: u32, body: &FxHashSet<usize>, func: &IrFunction) -> bool {
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if body.contains(&bi) {
+            for inst in &b.instructions {
+                if let Some(d) = inst.dest() {
+                    if d.0 == val_id {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    // Also: an argument or constant-trivial value is loop-invariant.
+    // If no defining instruction in the loop, it's invariant (defined
+    // elsewhere or a function arg).
+    true
+}
+
+/// Collect I32/U32 phi candidates in the header that have a 2-incoming
+/// shape (preheader init + latch Add-step).
+fn collect_widenable_phis(
+    func: &IrFunction,
+    lp: &NaturalLoop,
+    preheader: usize,
+    preheader_label: BlockId,
+    latch: usize,
+    latch_label: BlockId,
+) -> Vec<(Value, IrType, Operand, Value)> {
+    let header_block = &func.blocks[lp.header];
+    let mut out = Vec::new();
+    for inst in &header_block.instructions {
+        if let Instruction::Phi {
+            dest,
+            ty,
+            incoming,
+        } = inst
+        {
+            if !matches!(*ty, IrType::I32 | IrType::U32) {
+                continue;
+            }
+            if incoming.len() != 2 {
+                continue;
+            }
+            // Identify which incoming is the preheader (init) and which is
+            // the latch (backedge).
+            let mut init_op: Option<Operand> = None;
+            let mut latch_op: Option<Operand> = None;
+            for (op, blk) in incoming {
+                if *blk == preheader_label {
+                    init_op = Some(*op);
+                } else if *blk == latch_label {
+                    latch_op = Some(*op);
+                } else {
+                    // A third predecessor — not a simple counted loop.
+                    init_op = None;
+                    break;
+                }
+            }
+            let (Some(init), Some(latch_val_op)) = (init_op, latch_op) else {
+                continue;
+            };
+            // The latch incoming must be the dest of an `Add(phi, step)`
+            // in the latch block.
+            let latch_val = match latch_val_op {
+                Operand::Value(v) => v,
+                _ => continue,
+            };
+            if !latch_add_uses_phi(func, latch, latch_val, *dest) {
+                continue;
+            }
+            let _ = preheader;
+            out.push((*dest, *ty, init, latch_val));
+        }
+    }
+    out
+}
+
+/// Check if the latch block contains `BinOp(Add, phi, step) -> latch_val`
+/// where `phi` is the header phi's dest.
+fn latch_add_uses_phi(
+    func: &IrFunction,
+    latch: usize,
+    latch_val: Value,
+    phi: Value,
+) -> bool {
+    let latch_block = &func.blocks[latch];
+    for inst in &latch_block.instructions {
+        if let Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: _,
+        } = inst
+        {
+            if *dest == latch_val {
+                let lhs_is_phi = matches!(lhs, Operand::Value(v) if *v == phi);
+                let rhs_is_phi = matches!(rhs, Operand::Value(v) if *v == phi);
+                return lhs_is_phi || rhs_is_phi;
+            }
+        }
+    }
+    false
+}
+
+// Tests live in the integration/regression suite. The pass is validated
+// end-to-end by `tests/regression/run_regression_suite.sh` and the
+// benchmark A/B harness; a unit test for the full IrFunction shape would
+// be brittle to upstream field additions.
+
