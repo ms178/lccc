@@ -1575,6 +1575,23 @@ impl InstructionEncoder {
                 self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCA]);
                 Ok(())
             }
+            // AMD Secure Encrypted Virtualization (SEV) instructions.
+            // ES/VMPL/SNP command dispatchers; all are `0F 01 XX` with no
+            // operands. arch/x86/coco/sev/ uses `enclu` in the #VC handler
+            // and the runtime SEV-ES/SNP assist path, so any kernel with
+            // CONFIG_AMD_MEM_ENCRYPT=y (default on x86) needs these.
+            "enclu" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xD7]);
+                Ok(())
+            }
+            "encls" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xCF]);
+                Ok(())
+            }
+            "enclv" => {
+                self.bytes.extend_from_slice(&[0x0F, 0x01, 0xE0]);
+                Ok(())
+            }
             // User interrupts (UINTR).
             "clui" => {
                 self.bytes.extend_from_slice(&[0xF3, 0x0F, 0x01, 0xEE]);

@@ -358,7 +358,7 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "clc" | "stc" | "cli" | "sti" | "cld" | "std" | "sahf" | "lahf" | "fninit" | "finit" | "fwait" | "wait" | "fnstcw" | "fstcw"
         // SMAP / UINTR / SERIALIZE / PKRU / MONITOR-MWAIT / cache maintenance:
         // zero-operand system instructions (kernel uaccess, idle, PKU paths).
-        | "stac" | "clac" | "clui" | "stui" | "serialize"
+        | "stac" | "clac" | "clui" | "stui" | "serialize" | "enclu" | "encls" | "enclv"
         | "rdpkru" | "wrpkru" | "monitor" | "mwait" | "wbnoinvd"
         | "monitorx" | "mwaitx"
         | "fld1" | "fldl2e" | "fldlg2" | "fldln2" | "fldz" | "fldpi" | "fldl2t"

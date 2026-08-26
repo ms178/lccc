@@ -4504,7 +4504,28 @@ pub(super) fn generate_instruction(
                         .gep_base_offset
                         .insert(dest.0, (base.0, off_val.0));
                 }
-                cg.emit_gep(dest, base, offset);
+                // per_cpu()-style GEP: GlobalAddr base (symbol) + register
+                // offset. The GlobalAddr base has no register home (it is
+                // materialised to a slot), so the default emit_gep's
+                // register-offset path strands the dest and the consumer
+                // hits the operand_to_rax "no register home" ICE
+                // (workqueue_prepare_cpu / cpu_to_node). Fold the symbol
+                // base into a SIB leaq directly, mirroring
+                // emit_load_indexed_sym_impl but emitting `leaq` (address
+                // compute) instead of `movq` (load).
+                let mut folded = false;
+                if let Operand::Value(off_val) = offset {
+                    if let Some(sym) = global_addr_map.get(&base.0) {
+                        if !rip_rel_blocked(cg, sym)
+                            && cg.emit_leaq_sym_index(dest, sym, off_val, 0, 0)
+                        {
+                            folded = true;
+                        }
+                    }
+                }
+                if !folded {
+                    cg.emit_gep(dest, base, offset);
+                }
             }
         }
         Instruction::GlobalAddr { dest, name } => {
