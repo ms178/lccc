@@ -27,6 +27,13 @@ impl ArmCodegen {
         }
 
         if is_f128 {
+            // AAPCS64: `long double` (fp128) variadic arguments are saved in the
+            // FP register save area (or, once __vr_offs is exhausted, on the
+            // stack at a 16-byte boundary) and va_arg must deliver the FULL
+            // 16-byte value.  The value must stay in q0 end to end: routing it
+            // through __trunctfdf2 (fp128 -> f64) silently drops the low-order
+            // mantissa bits, so any later comparison against a long double
+            // constant (e.g. va-arg-5/va-arg-6) fails.
             let label_id = self.state.next_label_id();
             let label_stack = format!(".Lva_stack_{}", label_id);
             let label_done = format!(".Lva_done_{}", label_id);
@@ -39,8 +46,6 @@ impl ArmCodegen {
             self.state.emit("    add w2, w2, #16");
             self.state.emit("    str w2, [x1, #28]");
             self.state.emit("    ldr q0, [x3]");
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
             self.state.emit_fmt(format_args!("    b {}", label_done));
 
             self.state.emit_fmt(format_args!("{}:", label_stack));
@@ -51,8 +56,6 @@ impl ArmCodegen {
             self.state.emit("    ldr q0, [x3]");
             self.state.emit("    add x3, x3, #16");
             self.state.emit("    str x3, [x4]");
-            self.state.emit("    bl __trunctfdf2");
-            self.state.emit("    fmov x0, d0");
 
             self.state.emit_fmt(format_args!("{}:", label_done));
             self.state.reg_cache.invalidate_all();
@@ -111,7 +114,18 @@ impl ArmCodegen {
         }
 
         if let Some(slot) = self.state.get_slot(dest.0) {
-            self.emit_store_to_sp("x0", slot.0, "str");
+            if is_f128 {
+                // Store the full 16-byte value and register the slot as the
+                // value's authoritative f128 source.  Without the tracking
+                // entry, f128_softfloat::f128_operand_to_arg1 falls back to
+                // path 3 (load the 8-byte f64 "approximation" and extend it
+                // back with __extenddftf2), silently truncating every
+                // long-double vararg (va-arg-5/va-arg-6).
+                self.emit_store_to_sp("q0", slot.0, "str");
+                self.state.track_f128_self(dest.0);
+            } else {
+                self.emit_store_to_sp("x0", slot.0, "str");
+            }
         }
     }
 

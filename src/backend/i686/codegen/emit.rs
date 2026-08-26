@@ -1865,6 +1865,38 @@ impl ArchCodegen for I686Codegen {
         std::env::var_os("CCC_NO_I686_SIB").is_none()
     }
 
+    /// i686 mirror of emit_load_indexed_impl/emit_store_indexed_impl's
+    /// acceptance conditions, consulted by can_indexed_addr_fold BEFORE the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// Loads never stage: any SIB-scalar type at shift <= 3 is accepted.
+    /// Stores may need to stage the value through %eax (operand_to_eax),
+    /// which only callee-saved GPRs (PhysReg 0..=3 = ebx/esi/edi/ebp)
+    /// survive; a frame-anchored base (%esp/%ebp slot, the alloca-Direct
+    /// arm) is immune to staging by construction.  This is deliberately
+    /// STRICTER than the emitter (a directly-storable source would not
+    /// stage): strictness only costs a redundant address materialisation,
+    /// while the reverse disagreement reads expired offset homes/slots
+    /// after rematerialisation (20080122-1, i64 local-array loops).
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        let scalar = info.shift <= 3 && info.access_tys.iter().all(|t| Self::sib_scalar_ty(*t));
+        if !scalar || !info.feeds_store {
+            return scalar;
+        }
+        let idx_ok = self
+            .reg_assignments
+            .get(&info.index.0)
+            .map_or(false, |r| matches!(r.0, 0..=3));
+        let base_ok = match self.reg_assignments.get(&info.base.0) {
+            Some(r) => matches!(r.0, 0..=3),
+            None => matches!(
+                self.state.resolve_slot_addr(info.base.0),
+                Some(crate::backend::state::SlotAddr::Direct(_))
+            ),
+        };
+        idx_ok && base_ok
+    }
+
     /// Symbol-base SIB form `sym(,%idx,scale)`: legal only in non-PIC mode
     /// (PIC would need @GOT/@GOTOFF indirection through %ebx).
     fn supports_indexed_sym_base(&self) -> bool {

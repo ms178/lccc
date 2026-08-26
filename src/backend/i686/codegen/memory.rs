@@ -839,7 +839,7 @@ impl I686Codegen {
     // sit in callee-saved GPRs (staging never touches ebx/esi/edi/ebp).
 
     /// Types addressable by a single SIB load/store (no pair/x87 handling).
-    fn sib_scalar_ty(ty: IrType) -> bool {
+    pub(super) fn sib_scalar_ty(ty: IrType) -> bool {
         matches!(
             ty,
             IrType::I8
@@ -882,6 +882,66 @@ impl I686Codegen {
         }
     }
 
+    /// Frame-SIB memory operand for an indexed access whose base is a plain
+    /// Direct alloca slot: `disp(SLOT, %idx, scale)`.  This is the i686 port
+    /// of x86-64's `frame_sib_for_alloca_base`, and it closes a
+    /// can-fold/emitter disagreement: `can_indexed_addr_fold` accepts
+    /// alloca-Direct bases (the frame slot re-computes at every access),
+    /// but the i686 emitters only implemented the register-base form.  With
+    /// the fold "guaranteed", the dead-offset-producer walk skipped the
+    /// offset chain (`idx_dead_producers`) and the emitter's rematerialise
+    /// fallback then reloaded the offset from a slot no producer ever wrote
+    /// — gcc.c-torture/execute 20080122-1 read `0(%esp)` as the `2*i+1`
+    /// offset, then stored through the garbage address (PR 34628 shape).
+    ///
+    /// Anchors at %esp (omit_frame_pointer — same accounting as `slot_ref`:
+    /// `slot.0 + frame_base_offset + esp_adjust`) or %ebp.  The combined
+    /// displacement is ALWAYS printed, even when zero: mod=00 with base=%ebp
+    /// would relocate the base to disp32, and an esp-based SIB with no
+    /// displacement is the index-only encoding — an explicit displacement
+    /// keeps both encodings unambiguous.
+    fn frame_sib_for_alloca_base(
+        &self,
+        base: &Value,
+        index: &Value,
+        shift: u8,
+        disp: i64,
+    ) -> Option<String> {
+        let idx = self.reg_assignments.get(&index.0).copied()?;
+        // GPR index only (PhysReg 0..=6 are the i686 GPRs; %eax=6 is a legal
+        // index for the single-instruction forms, which read all inputs
+        // before writing any output).
+        if idx.0 > 6 {
+            return None;
+        }
+        let Some(SlotAddr::Direct(slot)) = self.state.resolve_slot_addr(base.0) else {
+            return None;
+        };
+        let (frame, off) = if self.omit_frame_pointer {
+            ("esp", slot.0 + self.frame_base_offset + self.esp_adjust + disp)
+        } else {
+            ("ebp", slot.0 + disp)
+        };
+        // Frame slots and PF-06 displacements are i32 by construction; keep
+        // the guard so a pathological frame cannot emit an unencodable
+        // disp32 operand (silently wrong would be worse than refusing).
+        if off < i32::MIN as i64 || off > i32::MAX as i64 {
+            return None;
+        }
+        let idx_name = phys_reg_name(idx);
+        if shift == 0 {
+            Some(format!("{}(%{}, %{})", off, frame, idx_name))
+        } else {
+            Some(format!(
+                "{}(%{}, %{}, {})",
+                off,
+                frame,
+                idx_name,
+                1u32 << shift
+            ))
+        }
+    }
+
     pub(super) fn emit_load_indexed_impl(
         &mut self,
         dest: &Value,
@@ -894,13 +954,22 @@ impl I686Codegen {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
             return false;
         }
-        let Some(&b) = self.reg_assignments.get(&base.0) else {
-            return false;
-        };
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
+        let mem = match self.reg_assignments.get(&base.0) {
+            Some(&b) => Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp),
+            // Alloca-base indexed addressing: `disp(%esp/%ebp,%idx,scale)`.
+            // Must mirror can_indexed_addr_fold's Direct-slot arm — a
+            // refusal here after the fold was deemed guaranteed would make
+            // rematerialise_skipped_indexed read a skipped producer.
+            None => {
+                let Some(m) = self.frame_sib_for_alloca_base(base, index, shift, disp) else {
+                    return false;
+                };
+                m
+            }
+        };
         let load_instr = self.load_instr_for_type(ty);
         // Single instruction — no staging, so dest may alias base/index
         // (x86 computes the address before writing the destination).
@@ -933,13 +1002,24 @@ impl I686Codegen {
         if !Self::sib_scalar_ty(ty) || shift > 3 {
             return false;
         }
-        let Some(&b) = self.reg_assignments.get(&base.0) else {
-            return false;
-        };
         let Some(&x) = self.reg_assignments.get(&index.0) else {
             return false;
         };
-        let mem = Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp);
+        // Frame-anchored base: the SIB anchors at %esp/%ebp, which value
+        // staging through %eax can never touch.
+        let (mem, frame_base, b) = match self.reg_assignments.get(&base.0) {
+            Some(&b) => (
+                Self::sib_mem(phys_reg_name(b), phys_reg_name(x), shift, disp),
+                false,
+                b,
+            ),
+            None => {
+                let Some(m) = self.frame_sib_for_alloca_base(base, index, shift, disp) else {
+                    return false;
+                };
+                (m, true, PhysReg(0))
+            }
+        };
         let store_instr = self.store_instr_for_type(ty);
         // Immediate or register-resident value: single instruction, no
         // staging.  A register source equal to the index register can only
@@ -949,10 +1029,12 @@ impl I686Codegen {
             emit!(self.state, "    {} {}, {}", store_instr, src, mem);
             return true;
         }
-        // Value must be staged through %eax: require base and index in
-        // callee-saved GPRs (PhysReg 0..=3 = ebx/esi/edi/ebp), which the
-        // staging paths never touch.
-        if !matches!(b.0, 0 | 1 | 2 | 3) || !matches!(x.0, 0 | 1 | 2 | 3) {
+        // Value must be staged through %eax: require every REGISTER member
+        // of the address to sit in a callee-saved GPR (PhysReg 0..=3 =
+        // ebx/esi/edi/ebp), which the staging paths never touch.  A
+        // frame-anchored base is immune by construction, so only the index
+        // register needs to qualify there.
+        if (!frame_base && !matches!(b.0, 0 | 1 | 2 | 3)) || !matches!(x.0, 0 | 1 | 2 | 3) {
             return false;
         }
         self.operand_to_eax(val);

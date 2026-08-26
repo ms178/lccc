@@ -2621,7 +2621,7 @@ impl X86Codegen {
                     offset += 32;
                     remaining -= 32;
                     used_ymm = true;
-                } else if remaining >= 16 && !self.state.no_sse {
+                } else if remaining >= 16 && !self.no_sse {
                     // GCC's -mno-sse contract forbids ALL xmm/ymm usage (the
                     // kernel decompressor and early boot run with CR4.OSFXSR=0,
                     // where any SSE instruction faults -- reproduced: 16-byte
@@ -2714,7 +2714,7 @@ impl X86Codegen {
         } else {
             // Under -mno-sse no vector instruction may be emitted at all
             // (kernel boot runs with CR4.OSFXSR=0): use rep movsb.
-            if self.state.no_sse {
+            if self.no_sse {
                 self.state
                     .out
                     .emit_instr_imm_reg("    movq", size as i64, "rcx");
@@ -2757,7 +2757,7 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
                     offset += 32;
                     remaining -= 32;
-                } else if remaining >= 16 && !self.state.no_sse {
+                } else if remaining >= 16 && !self.no_sse {
                     self.state
                         .emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
                     self.state

@@ -2393,6 +2393,42 @@ impl ArchCodegen for ArmCodegen {
     fn supports_indexed_addr(&self) -> bool {
         true
     }
+
+    /// AArch64 mirror of `indexed_addr` + the `emit_load/store_indexed`
+    /// `disp == 0` gate, consulted by `can_indexed_addr_fold` before the
+    /// GEP's emission is skipped and its offset chain declared dead.
+    ///
+    /// AArch64 addressing has no `base + index<<scale + imm` form, so a
+    /// peeled PF-06 displacement forces the wrapper to refuse (folding
+    /// anyway would DROP the displacement — a miscompile), and there is no
+    /// frame-anchored form: a slot-homed alloca base must refuse too.  The
+    /// shared predicate accepts alloca-Direct bases on every backend, so
+    /// without this override a slot-based `a[i]` loop would skip its offset
+    /// producers and the rematerialise fallback would reload them after
+    /// their homes expired (the i686 20080122-1 / local-i64-loop class).
+    /// Sub-word accesses have no shifted register-offset form, and both
+    /// address registers must be GPR homes; value staging goes through
+    /// x0/d0/s0, which no GPR home can alias, so stores add no constraint.
+    fn indexed_fold_ok(&self, info: &crate::backend::generation::IndexedGepInfo) -> bool {
+        if info.disp != 0 || info.shift > 3 {
+            return false;
+        }
+        let sub_word = info
+            .access_tys
+            .iter()
+            .any(|t| matches!(t, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16));
+        if sub_word && info.shift != 0 {
+            return false;
+        }
+        if self
+            .get_phys_reg_for_value(info.index.0)
+            .map_or(true, is_arm_fp_phys)
+        {
+            return false;
+        }
+        self.get_phys_reg_for_value(info.base.0)
+            .map_or(false, |r| !is_arm_fp_phys(r))
+    }
     fn supports_fused_fp_cmp_branch(&self) -> bool {
         true
     }
@@ -2997,6 +3033,10 @@ impl ArchCodegen for ArmCodegen {
         // GNU C nested-function direct static-chain calls.
         fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
         fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
+        // GNU C nested-function trampolines + non-local goto.
+        fn emit_init_trampoline(&mut self, buffer: &Value, chain: &Operand, func: &str) => emit_init_trampoline_impl;
+        fn emit_nonlocal_goto_save(&mut self, frame: &Value, rbp_off: i64, rsp_off: i64) => emit_nonlocal_goto_save_impl;
+        fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;
