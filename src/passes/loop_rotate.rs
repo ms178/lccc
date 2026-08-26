@@ -34,6 +34,28 @@
 //! SSA-pure arithmetic/cmp instructions are cloned.
 //!
 //! Kill-switch: set `CCC_NO_LOOP_ROTATE=1` to disable the pass at runtime.
+//! Opt-in: set `CCC_LOOP_ROTATE=1` to enable the pass at -O2+ (it is a
+//! no-op otherwise).
+//!
+//! v17: REVERTED to opt-in. The v16 default-enable introduced 16
+//! miscompiles (15 remaining after the v17 cross-phi self-loop-phi
+//! latch-incoming rewrite fixed `fib`). The 9-worst-benchmark suite is
+//! unaffected (rotation bails on multi-exit loops via Guard A/B), so
+//! reverting loses no perf on the 9 worst while eliminating all 15
+//! remaining v16 miscompiles. The v16/v17 hardening (Guard A exit-block
+//! single-predecessor, Guard B dominance-checked external phi uses,
+//! v17 undo-on-bail for `next_value_id` consistency, v17 cross-phi
+//! self-loop-phi latch-incoming rewrite) is KEPT — it makes the pass
+//! safer when opt-in. A future session will root-cause the 15 remaining
+//! miscompiles before flipping the default again.
+//!
+//! v16: the pass was DEFAULT-ON at -O2+. The v14 hardening (exit-merge-phi
+//! off-by-one fix, post-vectorize placement, conservative body guards)
+//! plus the v16 stricter guards (exit-block single-predecessor check,
+//! dominance-checked external phi uses) make the transform safe for the
+//! canonical single-block-body counted-loop shape. The ~18 v15 miscompile
+//! shapes (multi-exit, header-phi-escapes-through-non-Return-terminator,
+//! missing-downstream-use) all bail under the stricter guards.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -60,23 +82,27 @@ const MAX_ROTATIONS_PER_FUNC: usize = 256;
 const MAX_CLOSURE: usize = 8;
 
 pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
-    // v15: loop rotation is still OPT-IN (CCC_LOOP_ROTATE=1). v14 fixed
-    // the critical exit-merge-phi correctness bug (the test-exit incoming
-    // now reads the body's post-iteration value `latch_op`, not the
-    // start-of-iteration self-loop phi — off-by-one accumulator that
-    // caused 122/486 miscompiles in v13) and moved the pass to run AFTER
-    // vectorize (running before corrupted the vectorizer's base-dependence
-    // analysis on the rotated self-loop form). v15 keeps the v14 placement
-    // (now runs after IV-widen so the widened phi flows through the
-    // rotated form and emits `addq` directly).
+    // v17: REVERTED to OPT-IN (CCC_LOOP_ROTATE=1). The v16 default-enable
+    // introduced 16 miscompiles (15 remaining after the v17 cross-phi
+    // self-loop-phi latch-incoming rewrite fixed fib): vectorize_sse2_path,
+    // vectorize_reduction_dyn, simd_crc_adler, simd_vecreg, backedge_pre_*,
+    // bitops_builtins, adler_inline_tail, aggregate_dse_soundness,
+    // alloca_bare_builtin, alu_peepholes, arm_vec_load_offset,
+    // huft_build_crash, loop_promote_affine_alias, stmt_expr_asm_typeof,
+    // vectorize_iv_dependent_base. The 9-worst-benchmark suite is UNAFFECTED
+    // by default-enable (rotation bails on multi-exit loops via Guard A/B),
+    // so reverting loses no perf on the 9 worst while eliminating all 15
+    // remaining v16 miscompiles. The v16 hardening (Guard A exit-block
+    // single-predecessor, Guard B dominance-checked external phi uses,
+    // v17 undo-on-bail for next_value_id consistency, v17 cross-phi
+    // self-loop-phi latch-incoming rewrite) is KEPT — it makes the pass
+    // safer when opt-in. A future session will root-cause the 15 remaining
+    // miscompiles (likely the exit-merge-phi off-by-one for cross-phi
+    // latch_ops used externally, plus the cloned-closure header-phi
+    // reference collapse) before flipping the default again.
     //
-    // The remaining ~18 miscompiles when default-on are multi-exit /
-    // nested-loop / header-phi-escapes-through-non-Return-terminator
-    // shapes the single-block-body restriction mishandles, plus a second
-    // class of scalar loops where the exit-merge-phi placement still
-    // misses a downstream use. Default-off avoids regressions; a future
-    // session will harden these shapes and flip the default.
-    // Kill-switch: `CCC_NO_LOOP_ROTATE=1`. Opt-in: `CCC_LOOP_ROTATE=1`.
+    // Kill-switch: `CCC_NO_LOOP_ROTATE=1` (still honored, no-op when
+    // opt-in is already off). Opt-in: `CCC_LOOP_ROTATE=1`.
     if std::env::var("CCC_LOOP_ROTATE").is_err() {
         return 0;
     }
@@ -356,10 +382,60 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
     let mut new_body_insts: Vec<Instruction> = new_phi_insts;
     new_body_insts.extend(latch_block.instructions.drain(..));
     latch_block.instructions = new_body_insts;
+
+    // v17 fix: rewrite the new self-loop phis' latch incomings to
+    // reference the NEW self-loop phis (when the latch_op referenced a
+    // header phi), NOT the OLD header phis. Without this rewrite, the
+    // new self-loop phi's latch incoming references the OLD header phi,
+    // which after step 10 (strip header phi's latch edge) collapses to
+    // its preheader value (a constant), breaking the value rotation
+    // in loops with cross-phi dependencies.
+    //
+    // Example (iterative Fibonacci, lccc's recursion-elimination output):
+    //   Pre-rotation header:
+    //     fib_a = phi(0, fib_b)        // fib_a_next = fib_b_old (cross-phi)
+    //     fib_b = phi(1, fib_new)
+    //   Body:
+    //     fib_new = fib_a + fib_b
+    //
+    //   Without this fix (BUGGY, verified by IR dump + assembly diff):
+    //     fib_a_loop = phi(0, fib_b)        // fib_b is OLD header phi
+    //     fib_b_loop = phi(1, fib_new)
+    //   After step 10, fib_b collapses to 1 (its preheader value),
+    //   so fib_a_loop always reads 1 — fib(40) returns 39 (N-1) instead
+    //   of 102334155.
+    //
+    //   With this fix (CORRECT):
+    //     fib_a_loop = phi(0, fib_b_loop)   // fib_b_loop is NEW self-loop phi
+    //     fib_b_loop = phi(1, fib_new)
+    //   fib_a_loop correctly tracks the rotating fib_b value.
+    //
+    // The latch_op of a new phi is the pre-rotation header phi's latch
+    // incoming. When that latch incoming is itself a header phi (the
+    // cross-phi dependency), it must be rewritten to the corresponding
+    // new self-loop phi. The `new_loop_phis` map (header_phi_dest ->
+    // new_loop_phi_dest) provides the lookup. Only Operand::Value
+    // variants can reference a header phi; Operand::Const and others
+    // are left untouched.
+    let latch_block = &mut func.blocks[latch_idx];
+    let n_new = phi_info.len();
+    for inst in latch_block.instructions.iter_mut().take(n_new) {
+        if let Instruction::Phi { incoming, .. } = inst {
+            for (op, _) in incoming.iter_mut() {
+                if let Operand::Value(v) = op {
+                    if let Some(&new_phi) = new_loop_phis.get(&v.0) {
+                        *op = Operand::Value(Value(new_phi));
+                    }
+                }
+            }
+        }
+    }
+
     // Rewrite uses of header phis in body_latch's (now-relocated) existing
     // instructions to the new loop phis. The new phis themselves are at the
-    // top and reference v_pre / v_latch (NOT the header phi dest), so they
-    // are untouched by this rewrite. `skip(n)` jumps past the n new phis.
+    // top and were already processed by the v17 latch-incoming rewrite
+    // above; `skip(n)` jumps past the n new phis so this loop only touches
+    // the body's existing instructions.
     let latch_block = &mut func.blocks[latch_idx];
     let n_new_phis = phi_info.len();
     for inst in latch_block.instructions.iter_mut().skip(n_new_phis) {
@@ -385,7 +461,56 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         .get(&exit_label)
         .copied()
         .unwrap_or(usize::MAX);
+    // v16 Guard A: the exit block must have exactly ONE predecessor (the
+    // header's guard-exit edge). After rotation the latch's test-exit edge
+    // adds a SECOND predecessor, so the exit-merge-phi (which has exactly 2
+    // incomings: (pre_op, header) and (latch_op, latch)) is correct ONLY when
+    // no third block branches to exit. A third predecessor would leave the
+    // merge-phi missing an incoming — the classic
+    // "header-phi-escapes-through-non-Return-terminator" miscompile class,
+    // where the phi's value is read on an edge the phi does not cover.
+    // This also subsumes the "multi-exit" class: any loop whose body or
+    // header has a second edge to exit (or to a block that branches to
+    // exit) is rejected here.
     if exit_idx != usize::MAX {
+        let exit_preds = cfg.preds.row(exit_idx);
+        if exit_preds.len() != 1 || exit_preds[0] as usize != lp.header {
+            if debug {
+                eprintln!(
+                    "[ROT] exit block has {} predecessors (expected 1 = header); bailing",
+                    exit_preds.len()
+                );
+            }
+            // v17 fix: undo step 6.6's state changes before bailing. Step
+            // 6.6 added `n_new_phis` new self-loop phis at the top of
+            // body_latch and rewrote body_latch's uses of the header phis
+            // to the new self-loop phis. Without undoing, the new phi IDs
+            // (allocated from `next_val`, which is bumped past
+            // `func.next_value_id`) exceed the cached `next_value_id`
+            // watermark, so the next pass (bit_idioms) sizes its defs vec
+            // from `max_value_id() == next_value_id - 1` and panics with
+            // index-out-of-bounds (sieve/expat at -O2). Undoing restores
+            // the IR to its pre-6.6 state (no orphaned IDs referenced)
+            // and keeps `next_value_id` consistent with the IR's actual
+            // content. The undo is safe here because Guard A is NOT
+            // inside any `func.blocks.iter()` loop (no borrow conflict).
+            let latch_block = &mut func.blocks[latch_idx];
+            latch_block.instructions.drain(..n_new_phis);
+            let latch_block = &mut func.blocks[latch_idx];
+            for inst in latch_block.instructions.iter_mut() {
+                for (&old_phi, &new_phi) in &new_loop_phis {
+                    let repl = Operand::Value(Value(old_phi));
+                    subst_value_with_operand(inst, new_phi, &repl);
+                }
+            }
+            // Defensive: bump the watermark past the now-unused IDs so
+            // any future pass that reads `next_value_id` sees a value
+            // that bounds all live instructions (the undo removed all
+            // references to the new IDs, so the original watermark is
+            // also correct; this just guards against a missed reference).
+            func.next_value_id = next_val;
+            return false;
+        }
         // Collect (header_phi_dest, new_loop_phi_dest, preheader_operand,
         // latch_operand) for phis that have at least one use outside the
         // loop body. `latch_operand` is the value the body computed THIS
@@ -397,6 +522,15 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         // entry via the backedge), so the exit-merge-phi must read
         // `latch_operand`, NOT the self-loop phi (which still holds the
         // start-of-iteration value).
+        //
+        // v16 Guard B: every external use of a header phi must be in a
+        // block DOMINATED by the exit block. The exit-merge-phi is defined
+        // at the top of the exit block; it dominates only exit and exit's
+        // dominator-tree descendants. A use in a block NOT dominated by
+        // exit (reachable via a path that bypasses exit) would read the
+        // merge-phi before it is defined — use-before-def, the
+        // "missing-downstream-use" miscompile class. Bail conservatively
+        // rather than risk an unverified rewrite.
         let mut external_users: Vec<(u32, u32, Operand, Operand)> = Vec::new();
         for &(phi_dest, _ty, (_pre_lbl, pre_op), latch_op) in &phi_info {
             let new_loop = *new_loop_phis
@@ -409,35 +543,78 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
             // the return reading the guard's preheader value (0) instead
             // of the accumulated result).
             let mut found = false;
-            for (bi, block) in func.blocks.iter().enumerate() {
+            // v17 fix: Guard B previously did `return false;` directly
+            // from inside the `for (bi, block) in func.blocks.iter()` loop
+            // below, which (a) held an immutable borrow of `func.blocks`
+            // for the loop's duration, blocking the mutable borrow needed
+            // to undo step 6.6, and (b) left step 6.6's new self-loop phis
+            // orphaned in body_latch (their IDs exceeded the cached
+            // `next_value_id` watermark, causing bit_idioms to panic with
+            // index-out-of-bounds). Now we collect the failing block
+            // index into `guard_b_fail` and break the loop, then undo
+            // step 6.6 AFTER the immutable borrow is released.
+            let mut guard_b_fail: Option<usize> = None;
+            'outer: for (bi, block) in func.blocks.iter().enumerate() {
                 if bi == lp.header || lp.body.contains(&bi) {
                     continue;
                 }
+                let mut used_here = false;
                 for inst in &block.instructions {
-                    let mut used = false;
                     inst.for_each_used_value(|v| {
                         if v == phi_dest {
-                            used = true;
+                            used_here = true;
                         }
                     });
-                    if used {
-                        found = true;
+                    if used_here {
                         break;
                     }
                 }
-                if found {
-                    break;
+                if !used_here {
+                    // Check the terminator too (Return, CondBranch, Switch, etc.).
+                    block.terminator.for_each_used_value(|v| {
+                        if v == phi_dest {
+                            used_here = true;
+                        }
+                    });
                 }
-                // Check the terminator too (Return, CondBranch, Switch, etc.).
-                let mut t_used = false;
-                block.terminator.for_each_used_value(|v| {
-                    if v == phi_dest {
-                        t_used = true;
+                if used_here {
+                    // v16 Guard B: external use must be dominated by exit.
+                    if exit_idx != usize::MAX
+                        && !is_dominated_by(bi, exit_idx, cfg)
+                    {
+                        if debug {
+                            eprintln!(
+                                "[ROT] header phi {} has external use in block {} \
+                                 not dominated by exit {} — bailing",
+                                phi_dest, bi, exit_idx
+                            );
+                        }
+                        guard_b_fail = Some(bi);
+                        break 'outer;
                     }
-                });
-                if t_used {
                     found = true;
                 }
+            }
+            if let Some(bi) = guard_b_fail {
+                // v17 fix: undo step 6.6's state changes before bailing.
+                // See the Guard A path above for the full rationale.
+                // The immutable borrow of `func.blocks` from the loop
+                // above has been released (the loop ended via `break`),
+                // so we can mutably borrow `func.blocks[latch_idx]` here.
+                // `bi` is preserved for the debug eprintln above; we keep
+                // it in scope via the `if let Some(bi)` pattern.
+                let latch_block = &mut func.blocks[latch_idx];
+                latch_block.instructions.drain(..n_new_phis);
+                let latch_block = &mut func.blocks[latch_idx];
+                for inst in latch_block.instructions.iter_mut() {
+                    for (&old_phi, &new_phi) in &new_loop_phis {
+                        let repl = Operand::Value(Value(old_phi));
+                        subst_value_with_operand(inst, new_phi, &repl);
+                    }
+                }
+                func.next_value_id = next_val;
+                let _ = bi; // bi was used in the debug eprintln above
+                return false;
             }
             if found {
                 external_users.push((phi_dest, new_loop, pre_op, latch_op));
@@ -592,6 +769,39 @@ fn is_in_loop(label: BlockId, label_to_idx: &FxHashMap<BlockId, usize>, lp: &Nat
         .get(&label)
         .map(|&idx| idx == lp.header || lp.body.contains(&idx))
         .unwrap_or(false)
+}
+
+/// Returns true if `block_idx` is dominated by `dom_idx` — i.e. every path
+/// from the function entry to `block_idx` passes through `dom_idx`. Walks the
+/// `idom` chain: `dom_idx` must be an ancestor of `block_idx` in the dominator
+/// tree. `block_idx == dom_idx` returns true (a block dominates itself).
+///
+/// Used by the v16 Guard B in `try_rotate_loop`: an external use of a header
+/// phi is only safe to rewrite to the exit-merge-phi if the use's block is
+/// dominated by the exit block (where the merge-phi is defined). A use in a
+/// block reachable via a path that bypasses exit would be a use-before-def.
+///
+/// Complexity: O(depth of dom tree) — bounded by `num_blocks`. The walk
+/// terminates because `idom[entry] == entry` (the entry block is its own
+/// immediate dominator), so the chain always reaches a fixed point.
+fn is_dominated_by(block_idx: usize, dom_idx: usize, cfg: &CfgAnalysis) -> bool {
+    if block_idx == dom_idx {
+        return true;
+    }
+    let mut cur = block_idx;
+    // Bounded by num_blocks: the idom chain is at most num_blocks deep (a
+    // degenerate chain that visits every block). Defensive guard against a
+    // pathological cycle (shouldn't happen — idom is a tree — but a corrupt
+    // CfgAnalysis could loop forever without this).
+    for _ in 0..cfg.num_blocks {
+        match cfg.idom.get(cur).copied() {
+            Some(p) if p == dom_idx => return true,
+            Some(p) if p == cur => return false, // reached root without finding dom_idx
+            Some(p) => cur = p,
+            None => return false, // block_idx out of range (shouldn't happen)
+        }
+    }
+    false // dom chain longer than num_blocks — corrupt CfgAnalysis, fail closed
 }
 
 /// Predicate: is this instruction safe to clone into the latch?
