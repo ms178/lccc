@@ -5639,12 +5639,13 @@ pub fn peephole_optimize(asm: String) -> String {
     // Phase 3.5: redundant zero-extension elimination (may expose dead
     // stores and moves by shortening def-use chains, so it runs before DSE
     // and the liveness cleanup).
+    let pair_changed = fold_sext_zext_pairs(&mut store, &mut infos);
     let zext_changed = eliminate_redundant_zext_i686(&mut store, &mut infos);
     // Redundant SIGN-extension elimination runs right after: it turns
     // `movsbl %al,%REG` into a `movl` copy or a no-op, which the cleanup
     // loop below then propagates/deletes like any other move.
     let sext_changed = eliminate_redundant_sign_ext_i686(&mut store, &mut infos);
-    if zext_changed || sext_changed {
+    if pair_changed || zext_changed || sext_changed {
         let mut changed3 = true;
         let mut pass_count3 = 0;
         while changed3 && pass_count3 < MAX_POST_GLOBAL_ITERATIONS {
@@ -5739,11 +5740,116 @@ fn is_low_byte_register(name: &str) -> bool {
 ///
 /// The setup-code i686 emitter re-extends after EVERY sub-int operation
 /// (43 movzbl in video-bios.o alone, 15 of them provably redundant), because
-/// operand_to_eax cannot see the producer. Same state machine as the x86-64
-/// pass (redundant_ext.rs): flags cleared at labels/calls/barriers, updated
-/// by extensions, copies, and byte-preserving andl; anything else clears the
-/// written family. Fail-closed: implicit multi-register writers clear all.
+/// `movsbl SRC, %R32` + `movzbl %R8, %R32` (same register family, adjacent)
+/// → `movzbl SRC, %R32`: the zero-extension truncates the sign-extension's
+/// high bits anyway, so the signed load is pure wasted work. The classic
+/// source is `(u8)(i8)*p` char handling (strncmp/strchr) where the frontend
+/// lowers the signed load and the unsigned cast as separate instructions.
+/// Adjacency (nop lines aside) makes the sext's wider result provably dead:
+/// nothing can read it between the two lines, and the movz overwrites the
+/// register afterwards.
+fn fold_sext_zext_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    let len = infos.len();
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        if infos[i + 1].is_nop() {
+            // Allow the pair to be separated by nop lines: find the next
+            // real instruction, but a barrier or label kills the fold.
+            let mut j = i + 1;
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len || infos[j].is_barrier() {
+                i = j;
+                continue;
+            }
+            if !try_fold_sext_zext_at(store, infos, i, j) {
+                i += 1;
+            } else {
+                changed = true;
+                i = j + 1;
+            }
+            continue;
+        }
+        if infos[i + 1].is_barrier() {
+            i += 2;
+            continue;
+        }
+        if try_fold_sext_zext_at(store, infos, i, i + 1) {
+            changed = true;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    changed
+}
+
+fn try_fold_sext_zext_at(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    sext_idx: usize,
+    zext_idx: usize,
+) -> bool {
+    let sext = trimmed(store, &infos[sext_idx], sext_idx);
+    let zext = trimmed(store, &infos[zext_idx], zext_idx);
+    // movs{b,w}l SRC, %DST  followed by  movz{b,w}l %SRC-low, %DST
+    let (byte_reg, sext_mnem, zext_mnem) = if sext.starts_with("movsbl ") {
+        (true, "movsbl ", "movzbl ")
+    } else if sext.starts_with("movswl ") {
+        (false, "movswl ", "movzwl ")
+    } else {
+        return false;
+    };
+    let Some((src, sdst)) = sext.split_once(',') else {
+        return false;
+    };
+    let src = src.strip_prefix(sext_mnem).unwrap_or(src).trim();
+    let sdst = sdst.trim();
+    let Some((zsrc, zdst)) = zext.split_once(',') else {
+        return false;
+    };
+    let zsrc = zsrc.strip_prefix(zext_mnem).unwrap_or(zsrc).trim();
+    let zdst = zdst.trim();
+    if !zext.starts_with(zext_mnem) {
+        return false;
+    }
+    if sdst != zdst {
+        return false;
+    }
+    let sf = register_family(sdst);
+    if sf > REG_GP_MAX {
+        return false;
+    }
+    // The zext source register must be the sext destination's low part.
+    let low_ok = if byte_reg {
+        is_low_byte_register(zsrc) && register_family(zsrc) == sf
+    } else {
+        register_family(zsrc) == sf && zsrc.ends_with('x')
+    };
+    if !low_ok {
+        return false;
+    }
+    // Fold: replace the sext with the zero-extending load, nop the zext.
+    store.replace(
+        sext_idx,
+        format!("    {} {}, {}", if byte_reg { "movzbl" } else { "movzwl" }, src, zdst),
+    );
+    infos[sext_idx] = classify_line(store.get(sext_idx));
+    infos[zext_idx].kind = LineKind::Nop;
+    true
+}
+
 fn eliminate_redundant_zext_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    // Same state machine as the x86-64 pass (redundant_ext.rs): flags cleared
+    // at labels/calls/barriers, updated by extensions, copies, and
+    // byte-preserving andl; anything else clears the written family.
+    // Fail-closed: implicit multi-register writers clear all.
     let mut changed = false;
     let len = infos.len();
     let mut is_byte = [false; 8]; // per family: value < 256

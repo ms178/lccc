@@ -1663,6 +1663,9 @@ impl ArchCodegen for I686Codegen {
     /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if matches!(ty, IrType::I64 | IrType::U64) {
+            if self.try_emit_i64_binop_fast(dest, op, lhs, rhs) {
+                return;
+            }
             self.emit_i128_binop(dest, op, lhs, rhs);
             self.state.reg_cache.invalidate_all();
             return;
@@ -1691,6 +1694,11 @@ impl ArchCodegen for I686Codegen {
             return;
         }
         if matches!(ty, IrType::I64 | IrType::U64) || crate::backend::generation::is_i128_type(ty) {
+            if !crate::backend::generation::is_i128_type(ty)
+                && self.try_emit_i64_cmp_fast(dest, op, lhs, rhs)
+            {
+                return;
+            }
             self.emit_i128_cmp(dest, op, lhs, rhs);
             return;
         }
@@ -2318,6 +2326,40 @@ impl ArchCodegen for I686Codegen {
                         emit!(self.state, "    movl {}, {}", imm, sr);
                         return;
                     }
+                }
+            }
+        }
+
+        // Register→register copy: when the source value and the destination
+        // value both hold non-accumulator GPR homes, emit ONE direct
+        // `movl %src, %dest` instead of relaying through the accumulator
+        // (`movl %s, %eax; movl %eax, %d`). Smaller per site, no accumulator
+        // clobber (the register cache stays valid), no flags touched. A
+        // same-register copy (phi-coalesced web transport) is elided
+        // entirely. eax-homed sources/destinations stay on the generic path:
+        // it already emits a single mov and maintains the accumulator cache.
+        // Wide/f128/alloca values are excluded: their copies have
+        // upper-word/segment semantics the single movl must not skip.
+        if let Operand::Value(v) = src {
+            if let (Some(sphys), Some(dphys)) = (
+                self.reg_assignments.get(&v.0).copied(),
+                self.reg_assignments.get(&dest.0).copied(),
+            ) {
+                if sphys.0 != 6
+                    && dphys.0 != 6
+                    && !self.state.is_wide_value(dest.0)
+                    && !self.state.is_wide_value(v.0)
+                    && !self.state.f128_direct_slots.contains(&dest.0)
+                    && !self.state.f128_direct_slots.contains(&v.0)
+                    && !self.state.is_alloca(v.0)
+                {
+                    if sphys != dphys {
+                        let s = phys_reg_name(sphys);
+                        let d = phys_reg_name(dphys);
+                        emit!(self.state, "    movl %{}, %{}", s, d);
+                    }
+                    // Same home: the copy is a no-op.
+                    return;
                 }
             }
         }
