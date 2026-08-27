@@ -938,9 +938,6 @@ impl Lowerer {
         let entry_label = self.fresh_label();
         self.start_block(entry_label);
         self.func_mut().sret_ptr = None;
-        self.allocate_function_params(&nf_clone, &param_info);
-        self.evaluate_vla_param_side_effects(&nf_clone);
-        self.handle_kr_float_promotion(&nf_clone);
 
         // 3e. Pre-register captured enclosing locals in the nested
         // function's locals map with chain-walk address values.
@@ -1023,6 +1020,12 @@ impl Lowerer {
             info.alloca = Value(u32::MAX); // never dereferenced: GlobalAddr path
             self.func_mut().locals.insert(name, info);
         }
+
+        // Allocate function params and evaluate VLA parameter expressions
+        // now that enclosing captured variables are in scope.
+        self.allocate_function_params(&nf_clone, &param_info);
+        self.evaluate_vla_param_side_effects(&nf_clone);
+        self.handle_kr_float_promotion(&nf_clone);
 
 
         // 3f. Non-local goto targets for the nested function, keyed by the
