@@ -170,6 +170,15 @@ impl I686Codegen {
                 self.state.emit("    fabs");
                 self.emit_f32_store_from_x87(dest);
             }
+            IntrinsicOp::CopysignF64 => {
+                self.emit_f64_copysign(dest, &args[0], &args[1]);
+            }
+            IntrinsicOp::CopysignF32 => {
+                self.emit_f32_copysign(dest, &args[0], &args[1]);
+            }
+            IntrinsicOp::F128Copysign | IntrinsicOp::LDCopysign => {
+                self.emit_f128_copysign(dest, &args[0], &args[1]);
+            }
             // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
             IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
@@ -712,5 +721,155 @@ impl I686Codegen {
         } else {
             self.state.emit("    fstp %st(0)");
         }
+    }
+
+    /// Emit copysign for 64-bit float (F64): magnitude of x, sign of y.
+    fn emit_f64_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
+        let Some(d) = dest else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let dsr0 = self.slot_ref(dest_slot);
+        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+
+        // Copy lower 32 bits of x directly to dest_slot low word
+        match x {
+            Operand::Const(IrConst::F64(f)) => {
+                let lo = f.to_bits() as u32 as i32;
+                emit!(self.state, "    movl ${}, {}", lo, dsr0);
+            }
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                let x_slot = self.state.get_slot(v.0).unwrap();
+                let sr0 = self.slot_ref(x_slot);
+                emit!(self.state, "    movl {}, %eax", sr0);
+                emit!(self.state, "    movl %eax, {}", dsr0);
+            }
+            _ => {
+                self.operand_to_eax(x);
+                emit!(self.state, "    movl %eax, {}", dsr0);
+            }
+        }
+
+        // Load x_hi into %eax and clear sign bit (bit 31)
+        match x {
+            Operand::Const(IrConst::F64(f)) => {
+                let hi = (((f.to_bits() >> 32) as u32) & 0x7FFF_FFFF) as i32;
+                emit!(self.state, "    movl ${}, %eax", hi);
+            }
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                let x_slot = self.state.get_slot(v.0).unwrap();
+                let sr4 = self.slot_ref_offset(x_slot, 4);
+                emit!(self.state, "    movl {}, %eax", sr4);
+                self.state.emit("    andl $0x7fffffff, %eax");
+            }
+            _ => {
+                self.state.emit("    andl $0x7fffffff, %eax");
+            }
+        }
+
+        // Load y_hi sign bit into %ecx and OR into %eax
+        match y {
+            Operand::Const(IrConst::F64(f)) => {
+                let sign = (((f.to_bits() >> 32) as u32) & 0x8000_0000) as i32;
+                if sign != 0 {
+                    emit!(self.state, "    orl ${}, %eax", sign);
+                }
+            }
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                let y_slot = self.state.get_slot(v.0).unwrap();
+                let sr4 = self.slot_ref_offset(y_slot, 4);
+                emit!(self.state, "    movl {}, %ecx", sr4);
+                self.state.emit("    andl $0x80000000, %ecx");
+                self.state.emit("    orl %ecx, %eax");
+            }
+            _ => {
+                self.operand_to_ecx(y);
+                self.state.emit("    andl $0x80000000, %ecx");
+                self.state.emit("    orl %ecx, %eax");
+            }
+        }
+
+        emit!(self.state, "    movl %eax, {}", dsr4);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Emit copysign for 32-bit float (F32): magnitude of x, sign of y.
+    fn emit_f32_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
+        let Some(d) = dest else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let dsr = self.slot_ref(dest_slot);
+
+        match x {
+            Operand::Const(IrConst::F32(f)) => {
+                let bits = ((f.to_bits() as u32) & 0x7FFF_FFFF) as i32;
+                emit!(self.state, "    movl ${}, %eax", bits);
+            }
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                let x_slot = self.state.get_slot(v.0).unwrap();
+                let sr = self.slot_ref(x_slot);
+                emit!(self.state, "    movl {}, %eax", sr);
+                self.state.emit("    andl $0x7fffffff, %eax");
+            }
+            _ => {
+                self.operand_to_eax(x);
+                self.state.emit("    andl $0x7fffffff, %eax");
+            }
+        }
+
+        match y {
+            Operand::Const(IrConst::F32(f)) => {
+                let sign = ((f.to_bits() as u32) & 0x8000_0000) as i32;
+                if sign != 0 {
+                    emit!(self.state, "    orl ${}, %eax", sign);
+                }
+            }
+            Operand::Value(v) if self.state.get_slot(v.0).is_some() => {
+                let y_slot = self.state.get_slot(v.0).unwrap();
+                let sr = self.slot_ref(y_slot);
+                emit!(self.state, "    movl {}, %ecx", sr);
+                self.state.emit("    andl $0x80000000, %ecx");
+                self.state.emit("    orl %ecx, %eax");
+            }
+            _ => {
+                self.operand_to_ecx(y);
+                self.state.emit("    andl $0x80000000, %ecx");
+                self.state.emit("    orl %ecx, %eax");
+            }
+        }
+
+        emit!(self.state, "    movl %eax, {}", dsr);
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Emit copysign for 80-bit x87 float: magnitude of x, sign of y.
+    fn emit_f128_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
+        let Some(d) = dest else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let dsr0 = self.slot_ref(dest_slot);
+        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+        let dsr8 = self.slot_ref_offset(dest_slot, 8);
+
+        if let Operand::Value(xv) = x {
+            if let Some(x_slot) = self.state.get_slot(xv.0) {
+                let xsr0 = self.slot_ref(x_slot);
+                let xsr4 = self.slot_ref_offset(x_slot, 4);
+                let xsr8 = self.slot_ref_offset(x_slot, 8);
+                emit!(self.state, "    movl {}, %eax", xsr0);
+                emit!(self.state, "    movl %eax, {}", dsr0);
+                emit!(self.state, "    movl {}, %eax", xsr4);
+                emit!(self.state, "    movl %eax, {}", dsr4);
+                emit!(self.state, "    movzwl {}, %eax", xsr8);
+                self.state.emit("    andl $0x7fff, %eax");
+            }
+        }
+        if let Operand::Value(yv) = y {
+            if let Some(y_slot) = self.state.get_slot(yv.0) {
+                let ysr8 = self.slot_ref_offset(y_slot, 8);
+                emit!(self.state, "    movzwl {}, %ecx", ysr8);
+                self.state.emit("    andl $0x8000, %ecx");
+                self.state.emit("    orl %ecx, %eax");
+            }
+        }
+        emit!(self.state, "    movw %ax, {}", dsr8);
+        self.state.f128_direct_slots.insert(d.0);
+        self.state.reg_cache.invalidate_all();
     }
 }

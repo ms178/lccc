@@ -1052,7 +1052,24 @@ impl Lowerer {
             for (i, dim_info) in dim_infos.iter().enumerate().rev() {
                 if dim_info.is_vla {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let dim_val = self.load_vla_dim_value(&dim_info.dim_expr_name);
+                    let dim_val = if let Some(ref expr) = dim_info.dim_expr {
+                        let op = self.lower_expr(expr);
+                        let expr_ty = self.get_expr_type(expr);
+                        let casted = self.emit_implicit_cast(op, expr_ty, ptr_int_ty);
+                        match casted {
+                            Operand::Value(v) => v,
+                            Operand::Const(c) => {
+                                let v = self.fresh_value();
+                                self.emit(Instruction::Copy {
+                                    dest: v,
+                                    src: Operand::Const(c),
+                                });
+                                v
+                            }
+                        }
+                    } else {
+                        self.load_vla_dim_value(&dim_info.dim_expr_name)
+                    };
                     let stride_val = if let Some(prev) = current_stride {
                         self.emit_binop_val(
                             IrBinOp::Mul,
@@ -1119,27 +1136,28 @@ impl Lowerer {
     }
 
     /// Collect VLA dimension information from a pointer-to-array type.
-    fn collect_vla_dims(&self, inner: &TypeSpecifier) -> Vec<VlaDimInfo> {
+    pub(super) fn collect_vla_dims(&self, inner: &TypeSpecifier) -> Vec<VlaDimInfo> {
         let mut dims = Vec::new();
         let mut current = inner;
         loop {
             let resolved = self.resolve_type_spec(current);
             if let TypeSpecifier::Array(elem, size_expr) = resolved {
-                let (is_vla, dim_name, const_size) = if let Some(expr) = size_expr {
+                let (is_vla, dim_expr, dim_name, const_size) = if let Some(expr) = size_expr {
                     if let Some(val) = self.expr_as_array_size(expr) {
-                        (false, String::new(), Some(val))
+                        (false, None, String::new(), Some(val))
                     } else {
                         let name = Self::extract_dim_expr_name(expr);
-                        (true, name, None)
+                        (true, Some((**expr).clone()), name, None)
                     }
                 } else {
-                    (false, String::new(), None)
+                    (false, None, String::new(), None)
                 };
 
                 let base_elem_size = self.sizeof_type(elem);
 
                 dims.push(VlaDimInfo {
                     is_vla,
+                    dim_expr,
                     dim_expr_name: dim_name,
                     const_size,
                     base_elem_size,
