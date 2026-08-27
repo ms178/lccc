@@ -388,19 +388,75 @@ impl Lowerer {
     /// Get the VLA runtime stride value for a subscript expression, if available.
     /// For `m[i]` where m has VLA strides, returns the runtime stride at depth 0.
     /// For `m[i][j]` where the outer subscript `m[i]` already used VLA, returns stride at depth 1.
-    fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
-        let root_name = self.get_array_root_name_from_base(base)?;
+    pub(super) fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
         let depth = self.count_subscript_depth(base);
 
-        if let Some(info) = self
-            .func_state
-            .as_ref()
-            .and_then(|fs| fs.locals.get(&root_name))
-        {
-            if !info.vla_strides.is_empty() && depth < info.vla_strides.len() {
-                return info.vla_strides[depth];
+        if let Some(root_name) = self.get_array_root_name_from_base(base) {
+            if let Some(info) = self
+                .func_state
+                .as_ref()
+                .and_then(|fs| fs.locals.get(&root_name))
+            {
+                if !info.vla_strides.is_empty() && depth < info.vla_strides.len() {
+                    if let Some(stride) = info.vla_strides[depth] {
+                        return Some(stride);
+                    }
+                }
             }
         }
+
+        // Check if the element/pointee type of `base` is a VLA type (struct, union, typedef, or VLA array)
+        if let Some(fs) = self.func_state.as_ref() {
+            if let Some(ctype) = self.get_expr_ctype(base) {
+                let mut ty = &ctype;
+                for _ in 0..depth {
+                    match ty {
+                        CType::Pointer(inner, _) | CType::Array(inner, _) => ty = inner,
+                        _ => break,
+                    }
+                }
+                match ty {
+                    CType::Pointer(pointee, _) | CType::Array(pointee, _) => match &**pointee {
+                        CType::Struct(key) | CType::Union(key) => {
+                            if let Some(&vla_size) = fs.vla_typedef_sizes.get(key.as_ref()) {
+                                return Some(vla_size);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            if let Some(root_name) = self.get_array_root_name_from_base(base) {
+                if let Some(vi) = self.lookup_var_info(&root_name) {
+                    if let Some(ref ctype) = vi.c_type {
+                        let mut ty = ctype;
+                        for _ in 0..depth {
+                            match ty {
+                                CType::Pointer(inner, _) | CType::Array(inner, _) => ty = inner,
+                                _ => break,
+                            }
+                        }
+                        match ty {
+                            CType::Pointer(pointee, _) | CType::Array(pointee, _) => {
+                                match &**pointee {
+                                    CType::Struct(key) | CType::Union(key) => {
+                                        if let Some(&vla_size) =
+                                            fs.vla_typedef_sizes.get(key.as_ref())
+                                        {
+                                            return Some(vla_size);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
         None
     }
 

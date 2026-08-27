@@ -2496,6 +2496,7 @@ fn detect_mul_add_fusions(
         };
         if (mul_ty.is_float() && !fuse_float)
             || matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128)
+            || (crate::common::types::target_is_32bit() && matches!(mul_ty, IrType::I64 | IrType::U64))
         {
             continue;
         }

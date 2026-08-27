@@ -486,7 +486,7 @@ fn assign_program_points(
         let mut kill = BitSet::new(num_values);
 
         for inst in &block.instructions {
-            if is_returns_twice_call(inst) {
+            if is_returns_twice_call(inst) || matches!(inst, Instruction::NonlocalGotoSave { .. }) {
                 setjmp_points.push(point);
             }
             if instruction_is_call_point(inst) {
@@ -1559,7 +1559,7 @@ fn build_intervals(
     intervals
 }
 
-fn is_returns_twice_call(inst: &Instruction) -> bool {
+pub(crate) fn is_returns_twice_call(inst: &Instruction) -> bool {
     if let Instruction::Call { func, .. } = inst {
         matches!(
             func.as_str(),

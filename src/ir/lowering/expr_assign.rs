@@ -207,6 +207,7 @@ impl Lowerer {
     pub(super) fn truncate_to_bitfield_value(
         &mut self,
         val: Operand,
+        val_ty: IrType,
         bit_width: u32,
         is_signed: bool,
     ) -> Operand {
@@ -217,6 +218,7 @@ impl Lowerer {
         } else {
             widened_op_type(IrType::I32)
         };
+        let val = self.emit_implicit_cast(val, val_ty, op_ty);
         let op_bits = (op_ty.size() * 8) as u32;
         if bit_width >= op_bits {
             return val;
@@ -253,14 +255,15 @@ impl Lowerer {
         let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
         let rhs_val = self.lower_expr(rhs);
+        let rhs_ty = self.value_ir_type(rhs);
         // C standard 6.3.1.2: assigning to _Bool converts the value to 0 or 1
         // (any nonzero becomes 1) BEFORE bitfield truncation. Without this,
         // e.g. `s.bool_bf = 2` would mask 2 (0b10) to 1 bit = 0, not 1.
         let store_val = if is_bool {
-            let rhs_ty = self.value_ir_type(rhs);
-            self.emit_bool_normalize_typed(rhs_val, rhs_ty)
+            let normalized = self.emit_bool_normalize_typed(rhs_val, rhs_ty);
+            self.emit_implicit_cast(normalized, IrType::I32, storage_ty)
         } else {
-            rhs_val
+            self.emit_implicit_cast(rhs_val, rhs_ty, storage_ty)
         };
         self.store_bitfield(
             field_addr,
@@ -270,7 +273,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(lhs),
         );
-        Some(self.truncate_to_bitfield_value(store_val, bit_width, storage_ty.is_signed()))
+        Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
     }
 
     /// Try to lower compound assignment to a bitfield member (e.g., s.bf += val).
@@ -285,20 +288,28 @@ impl Lowerer {
 
         let current_val =
             self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width);
+        let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
+            storage_ty,
+            Some((bit_offset, bit_width)),
+        );
 
         let rhs_val = self.lower_expr(rhs);
+        let rhs_ty = self.value_ir_type(rhs);
 
         let is_unsigned = storage_ty.is_unsigned();
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
         let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
-        let result = self.emit_binop_val(ir_op, current_val, rhs_val, wt);
+        let current_casted = self.emit_implicit_cast(current_val, current_ty, wt);
+        let rhs_casted = self.emit_implicit_cast(rhs_val, rhs_ty, wt);
+        let result = self.emit_binop_val(ir_op, current_casted, rhs_casted, wt);
 
         // C standard 6.3.1.2: when the target is _Bool, normalize the result
         // to 0 or 1 before storing into the bitfield.
         let store_val = if is_bool {
-            self.emit_bool_normalize_typed(Operand::Value(result), wt)
+            let normalized = self.emit_bool_normalize_typed(Operand::Value(result), wt);
+            self.emit_implicit_cast(normalized, IrType::I32, storage_ty)
         } else {
-            Operand::Value(result)
+            self.emit_implicit_cast(Operand::Value(result), wt, storage_ty)
         };
 
         self.store_bitfield(
@@ -309,7 +320,7 @@ impl Lowerer {
             store_val,
             self.expr_access_is_volatile(lhs),
         );
-        Some(self.truncate_to_bitfield_value(store_val, bit_width, storage_ty.is_signed()))
+        Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
     }
 
     /// Store a value into a bitfield: load storage unit, clear field bits, OR in new value, store back.
@@ -376,6 +387,8 @@ impl Lowerer {
         // Use the target-appropriate operation type: I32 on i686 for <=32-bit storage, I64 on 64-bit targets.
         let op_ty = widened_op_type(storage_ty);
         let op_bits = (op_ty.size() * 8) as u32;
+
+        let val = self.emit_implicit_cast(val, storage_ty, op_ty);
 
         let mask = if bit_width >= op_bits {
             u64::MAX
@@ -454,6 +467,8 @@ impl Lowerer {
         // Use the target-appropriate operation type: I32 on i686 for <=32-bit storage, I64 on 64-bit targets.
         let op_ty = widened_op_type(storage_ty);
         let op_bits = (op_ty.size() * 8) as u32;
+
+        let val = self.emit_implicit_cast(val, storage_ty, op_ty);
 
         let mask = if bit_width >= op_bits {
             u64::MAX
@@ -584,8 +599,13 @@ impl Lowerer {
         let op_ty = widened_op_type(storage_ty);
         let op_bits = (op_ty.size() * 8) as u32;
 
+        let promoted_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
+            storage_ty,
+            Some((bit_offset, bit_width)),
+        );
+
         if bit_width >= op_bits && bit_offset == 0 {
-            return Operand::Value(loaded);
+            return self.emit_implicit_cast(Operand::Value(loaded), storage_ty, promoted_ty);
         }
 
         // Widen the loaded value to the operation type before performing shift/mask.
@@ -601,7 +621,7 @@ impl Lowerer {
 
         // If the loaded value doesn't cover all bits (split case), the caller
         // should use extract_bitfield_from_addr instead. But handle the non-split case.
-        if storage_ty.is_signed() {
+        let raw = if storage_ty.is_signed() {
             let shl_amount = op_bits - bit_offset - bit_width;
             let ashr_amount = op_bits - bit_width;
             let mut val = Operand::Value(widened);
@@ -648,7 +668,9 @@ impl Lowerer {
                 );
                 Operand::Value(masked)
             }
-        }
+        };
+
+        self.emit_implicit_cast(raw, op_ty, promoted_ty)
     }
 
     /// Extract a bitfield from memory, handling the case where it spans two storage units.
@@ -737,7 +759,7 @@ impl Lowerer {
             );
 
             // Sign extend if the field type is signed
-            if storage_ty.is_signed() && bit_width < op_bits {
+            let raw = if storage_ty.is_signed() && bit_width < op_bits {
                 let shl_amount = op_bits - bit_width;
                 let shifted = self.emit_binop_val(
                     IrBinOp::Shl,
@@ -754,7 +776,13 @@ impl Lowerer {
                 Operand::Value(result)
             } else {
                 Operand::Value(combined)
-            }
+            };
+
+            let promoted_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
+                storage_ty,
+                Some((bit_offset, bit_width)),
+            );
+            self.emit_implicit_cast(raw, op_ty, promoted_ty)
         } else {
             // Normal case: load single storage unit and extract
             let loaded = self.fresh_value();

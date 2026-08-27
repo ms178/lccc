@@ -4525,9 +4525,9 @@ fn eliminate_never_read_stores_range(
                 if !esp_walk_ok {
                     continue;
                 }
-                if has_call && any_esp_read {
+                if has_call {
                     continue;
-                } // shift-immune rule only
+                }
             } else if !ebp_is_frame {
                 // ebp-domain "store" without a frame pointer = write through
                 // the %ebp DATA register (pointer store). Never a dead slot.

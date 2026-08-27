@@ -667,8 +667,8 @@ pub trait ArchCodegen {
         // compiled to `imull; movl $1,%eax; xorl %ecx,%ecx; addl %ecx,%eax`
         // = 1 at -m32 (matmul rows all 0.25). Add is commutative, so the
         // swap is semantics-preserving on every backend using this default.
-        self.emit_int_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
-        self.emit_int_binop(
+        self.emit_binop(_mul_dest, IrBinOp::Mul, mul_lhs, mul_rhs, ty);
+        self.emit_binop(
             add_dest,
             IrBinOp::Add,
             &Operand::Value(Value(_mul_dest.0)),

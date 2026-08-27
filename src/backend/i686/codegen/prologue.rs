@@ -48,7 +48,8 @@ impl I686Codegen {
                 match inst {
                     Instruction::GlobalAddr { .. }
                     | Instruction::LabelAddr { .. }
-                    | Instruction::InlineAsm { .. } => return true,
+                    | Instruction::InlineAsm { .. }
+                    | Instruction::InitTrampoline { .. } => return true,
                     // A `call sym@PLT` is the i386 PSABI's OTHER consumer of
                     // %ebx: the lazy-binding PLT stub is
                     //     jmp *name@GOT(%ebx); push $reloc; jmp .plt0
