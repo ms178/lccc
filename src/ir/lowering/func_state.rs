@@ -46,6 +46,10 @@ pub(super) struct FuncScopeFrame {
     pub vla_field_strides_added: Vec<String>,
     /// Keys that were overwritten in `vla_field_strides`: (key, previous_value).
     pub vla_field_strides_shadowed: Vec<(String, Vec<Value>)>,
+    /// Keys newly inserted into `vla_field_offsets`.
+    pub vla_field_offsets_added: Vec<String>,
+    /// Keys that were overwritten in `vla_field_offsets`: (key, previous_value).
+    pub vla_field_offsets_shadowed: Vec<(String, Value)>,
     /// Nested-function names newly declared in this scope.
     pub nested_fns_added: Vec<String>,
     /// Nested-function names shadowed by this scope: (name, previous entry).
@@ -75,6 +79,8 @@ impl FuncScopeFrame {
             vla_typedef_sizes_shadowed: Vec::new(),
             vla_field_strides_added: Vec::new(),
             vla_field_strides_shadowed: Vec::new(),
+            vla_field_offsets_added: Vec::new(),
+            vla_field_offsets_shadowed: Vec::new(),
             nested_fns_added: Vec::new(),
             nested_fns_shadowed: Vec::new(),
             scope_stack_save: None,
@@ -140,6 +146,9 @@ pub(super) struct FunctionBuildState {
     /// Dynamic dimension strides for VLA fields in struct types defined inside functions.
     /// Keyed by struct type key (e.g. tag or type name), value is the vector of dimension stride values.
     pub vla_field_strides: FxHashMap<String, Vec<Value>>,
+    /// Dynamic field byte offsets for fields following a VLA member in local structs.
+    /// Keyed by "struct_key::field_name", value is the IR Value holding the byte offset.
+    pub vla_field_offsets: FxHashMap<String, Value>,
     /// Per-function value counter (reset for each function)
     pub next_value: u32,
     /// Current statement root for FP expression tagging (OP-36): bumped by
@@ -291,6 +300,7 @@ impl FunctionBuildState {
             var_ctypes: FxHashMap::default(),
             vla_typedef_sizes: FxHashMap::default(),
             vla_field_strides: FxHashMap::default(),
+            vla_field_offsets: FxHashMap::default(),
             next_value: 0,
             fp_expr_root: 0,
             vla_stack_save: None,
@@ -380,6 +390,12 @@ impl FunctionBuildState {
             for (key, val) in frame.vla_field_strides_shadowed {
                 self.vla_field_strides.insert(key, val);
             }
+            for key in frame.vla_field_offsets_added {
+                self.vla_field_offsets.remove(&key);
+            }
+            for (key, val) in frame.vla_field_offsets_shadowed {
+                self.vla_field_offsets.insert(key, val);
+            }
             for key in frame.nested_fns_added {
                 self.nested_functions.remove(&key);
             }
@@ -414,6 +430,18 @@ impl FunctionBuildState {
             }
         }
         self.vla_field_strides.insert(key, strides);
+    }
+
+    /// Insert a VLA dynamic field offset for a struct type, tracking for scope management.
+    pub fn insert_vla_field_offset_scoped(&mut self, key: String, offset: Value) {
+        if let Some(frame) = self.scope_stack.last_mut() {
+            if let Some(prev) = self.vla_field_offsets.remove(&key) {
+                frame.vla_field_offsets_shadowed.push((key.clone(), prev));
+            } else {
+                frame.vla_field_offsets_added.push(key.clone());
+            }
+        }
+        self.vla_field_offsets.insert(key, offset);
     }
 
     /// Insert a local variable, tracking the change in the current scope frame.
