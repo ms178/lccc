@@ -125,12 +125,18 @@ impl Lowerer {
                 // s.field as lvalue -> compute address of the field
                 let addr_space = self.get_addr_space_of_struct_expr(base_expr);
                 let (field_offset, _field_ty) = self.resolve_member_access(base_expr, field_name);
+                let vla_offset = self.get_vla_field_offset(base_expr, field_name, false);
+                let offset = if let Some(vo) = vla_offset {
+                    Operand::Value(vo)
+                } else {
+                    Operand::Const(IrConst::ptr_int(field_offset as i64))
+                };
                 let base_addr = self.get_struct_base_addr(base_expr);
                 let field_addr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
                     dest: field_addr,
                     base: base_addr,
-                    offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
+                    offset,
                     ty: IrType::Ptr,
                 });
                 Some(LValue::address(field_addr, addr_space, vol))
@@ -152,11 +158,17 @@ impl Lowerer {
                 };
                 let (field_offset, _field_ty) =
                     self.resolve_pointer_member_access(base_expr, field_name);
+                let vla_offset = self.get_vla_field_offset(base_expr, field_name, true);
+                let offset = if let Some(vo) = vla_offset {
+                    Operand::Value(vo)
+                } else {
+                    Operand::Const(IrConst::ptr_int(field_offset as i64))
+                };
                 let field_addr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
                     dest: field_addr,
                     base: base_addr,
-                    offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
+                    offset,
                     ty: IrType::Ptr,
                 });
                 Some(LValue::address(field_addr, addr_space, vol))
@@ -632,12 +644,18 @@ impl Lowerer {
                 if field_is_array {
                     // Return address of the array field (array decays to pointer)
                     let (field_offset, _) = self.resolve_member_access(base_expr, field_name);
+                    let vla_offset = self.get_vla_field_offset(base_expr, field_name, false);
+                    let offset = if let Some(vo) = vla_offset {
+                        Operand::Value(vo)
+                    } else {
+                        Operand::Const(IrConst::ptr_int(field_offset as i64))
+                    };
                     let base_addr = self.get_struct_base_addr(base_expr);
                     let field_addr = self.fresh_value();
                     self.emit(Instruction::GetElementPtr {
                         dest: field_addr,
                         base: base_addr,
-                        offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
+                        offset,
                         ty: IrType::Ptr,
                     });
                     return Operand::Value(field_addr);
@@ -684,11 +702,17 @@ impl Lowerer {
                     };
                     let (field_offset, _) =
                         self.resolve_pointer_member_access(base_expr, field_name);
+                    let vla_offset = self.get_vla_field_offset(base_expr, field_name, true);
+                    let offset = if let Some(vo) = vla_offset {
+                        Operand::Value(vo)
+                    } else {
+                        Operand::Const(IrConst::ptr_int(field_offset as i64))
+                    };
                     let field_addr = self.fresh_value();
                     self.emit(Instruction::GetElementPtr {
                         dest: field_addr,
                         base: base_addr,
-                        offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
+                        offset,
                         ty: IrType::Ptr,
                     });
                     return Operand::Value(field_addr);

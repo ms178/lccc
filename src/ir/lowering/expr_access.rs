@@ -1159,10 +1159,16 @@ impl Lowerer {
         };
 
         let field_addr = self.fresh_value();
+        let vla_offset = self.get_vla_field_offset(base_expr, field_name, is_pointer);
+        let offset = if let Some(vo) = vla_offset {
+            Operand::Value(vo)
+        } else {
+            Operand::Const(IrConst::ptr_int(field_offset as i64))
+        };
         self.emit(Instruction::GetElementPtr {
             dest: field_addr,
             base: base_addr,
-            offset: Operand::Const(IrConst::ptr_int(field_offset as i64)),
+            offset,
             ty: field_ty,
         });
 

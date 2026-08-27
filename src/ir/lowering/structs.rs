@@ -43,6 +43,7 @@ impl Lowerer {
                             .insert_vla_typedef_size_scoped(key.clone(), vla_size);
                     }
                     self.compute_vla_field_strides_for_decl(&key, fields);
+                    self.compute_vla_field_offsets_for_decl(&key, fields, *is_packed);
                 }
             }
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
@@ -1260,6 +1261,34 @@ impl Lowerer {
         (0, IrType::I32, None, None)
     }
 
+    pub(super) fn get_vla_field_offset(
+        &self,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Option<Value> {
+        let fs = self.func_state.as_ref()?;
+        let ctype = self.get_expr_ctype(base_expr)?;
+        let mut struct_key = None;
+        if is_pointer {
+            match &ctype {
+                CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                    CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                    _ => {}
+                },
+                _ => {}
+            }
+        } else {
+            match &ctype {
+                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                _ => {}
+            }
+        }
+        let k = struct_key?;
+        let field_key = format!("{k}::{field_name}");
+        fs.vla_field_offsets.get(&field_key).copied()
+    }
+
     /// Given a CType that should be a Pointer to a struct, resolve the struct layout.
     /// Handles self-referential structs by looking up the cache when fields are empty.
     /// Also handles array types (e.g., `typedef struct S my_arr[1]` parameters decay
@@ -1367,6 +1396,124 @@ impl Lowerer {
             let field_key = format!("{struct_key}::{field_name}");
             self.func_mut()
                 .insert_vla_field_strides_scoped(field_key, strides);
+        }
+    }
+
+    pub(super) fn compute_vla_field_offsets_for_decl(
+        &mut self,
+        struct_key: &str,
+        fields: &[StructFieldDecl],
+        is_packed: bool,
+    ) {
+        use crate::ir::ops::IrBinOp;
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        let mut current_offset: Option<Value> = None;
+        let mut current_const_offset: usize = 0;
+        let mut has_seen_vla = false;
+
+        for f in fields {
+            if f.bit_width.is_some() {
+                continue;
+            }
+            let ct = self.struct_field_ctype(f);
+            let align = if is_packed {
+                1
+            } else {
+                self.ctype_align(&ct).max(1)
+            };
+
+            // Align current offset to field's alignment
+            if align > 1 {
+                if let Some(mut cur_val) = current_offset {
+                    if current_const_offset > 0 {
+                        cur_val = self.emit_binop_val(
+                            IrBinOp::Add,
+                            Operand::Value(cur_val),
+                            Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
+                            ptr_int_ty,
+                        );
+                        current_const_offset = 0;
+                    }
+                    let align_mask = !(align as i64 - 1);
+                    let add_align = self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(cur_val),
+                        Operand::Const(IrConst::ptr_int(align as i64 - 1)),
+                        ptr_int_ty,
+                    );
+                    let aligned = self.emit_binop_val(
+                        IrBinOp::And,
+                        Operand::Value(add_align),
+                        Operand::Const(IrConst::ptr_int(align_mask)),
+                        ptr_int_ty,
+                    );
+                    current_offset = Some(aligned);
+                } else {
+                    current_const_offset = (current_const_offset + align - 1) & !(align - 1);
+                }
+            }
+
+            // If we have already seen a VLA field in this struct, record this field's dynamic offset
+            if has_seen_vla {
+                let field_offset_val = if current_const_offset > 0 {
+                    let v = self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(current_offset.unwrap()),
+                        Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
+                        ptr_int_ty,
+                    );
+                    current_offset = Some(v);
+                    current_const_offset = 0;
+                    v
+                } else {
+                    current_offset.unwrap()
+                };
+                if let Some(ref name) = f.name {
+                    let field_key = format!("{struct_key}::{name}");
+                    self.func_mut()
+                        .insert_vla_field_offset_scoped(field_key, field_offset_val);
+                }
+            }
+
+            // Advance offset by field size
+            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
+                has_seen_vla = true;
+                let next_val = if let Some(prev) = current_offset {
+                    let p = if current_const_offset > 0 {
+                        let tmp = self.emit_binop_val(
+                            IrBinOp::Add,
+                            Operand::Value(prev),
+                            Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
+                            ptr_int_ty,
+                        );
+                        current_const_offset = 0;
+                        tmp
+                    } else {
+                        prev
+                    };
+                    self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(p),
+                        Operand::Value(vla_sz),
+                        ptr_int_ty,
+                    )
+                } else if current_const_offset > 0 {
+                    let added = self.emit_binop_val(
+                        IrBinOp::Add,
+                        Operand::Value(vla_sz),
+                        Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
+                        ptr_int_ty,
+                    );
+                    current_const_offset = 0;
+                    added
+                } else {
+                    vla_sz
+                };
+                current_offset = Some(next_val);
+            } else {
+                let sz = self.ctype_size(&ct);
+                current_const_offset += sz;
+            }
         }
     }
 }

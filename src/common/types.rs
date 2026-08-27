@@ -94,20 +94,9 @@ pub fn widened_op_type(common_ty: IrType) -> IrType {
     {
         return common_ty;
     }
-    if target_is_32bit() {
-        // On 32-bit: use the actual type width.
-        // I64/U64 stay I64; everything else uses I32 (machine word).
-        if common_ty == IrType::I64 || common_ty == IrType::U64 {
-            IrType::I64
-        } else {
-            IrType::I32
-        }
-    } else {
-        // On 64-bit: preserve I32/U32 types for correct 32-bit semantics.
-        match common_ty {
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
-            _ => common_ty,
-        }
+    match common_ty {
+        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
+        _ => common_ty,
     }
 }
 

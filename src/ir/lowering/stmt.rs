@@ -1919,7 +1919,7 @@ impl Lowerer {
     }
 
     /// Runtime byte size of a struct field if it is (or contains) a VLA.
-    fn field_vla_runtime_size(&mut self, field: &StructFieldDecl) -> Option<Value> {
+    pub(super) fn field_vla_runtime_size(&mut self, field: &StructFieldDecl) -> Option<Value> {
         if !field.derived.is_empty() {
             if let Some(v) = self.compute_vla_runtime_size(&field.type_spec, &field.derived) {
                 return Some(v);
