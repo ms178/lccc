@@ -8,9 +8,253 @@ use crate::backend::state::StackSlot;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
-use crate::ir::reexports::{IrCmpOp, IrConst, Operand, Value};
+use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, Operand, Value};
 
 impl I686Codegen {
+    /// Direct 64-bit RHS reference for the i64 fast paths: a constant pair
+    /// (immediates) or a wide value's slot pair (memory operands). This is
+    /// what lets `res & mask`, `res * base` and 64-bit compares avoid the
+    /// i128 stack-staging dance (`pushl` both halves, operate through
+    /// `(%esp)`, `addl $8`) — the boot corpus' number parsers paid ~25
+    /// extra bytes per 64-bit ALU site for it.
+    fn i64_rhs_ref(&self, rhs: &Operand) -> Option<(String, String)> {
+        match rhs {
+            Operand::Const(c) => {
+                let v: u128 = match c {
+                    IrConst::I64(v) => *v as u128,
+                    IrConst::I128(v) => (*v as u128) & 0xFFFF_FFFF_FFFF_FFFF,
+                    IrConst::F64(f) => f.to_bits() as u128,
+                    IrConst::Zero => 0,
+                    other => other.to_i64()? as u128,
+                };
+                let lo = (v & 0xFFFF_FFFF) as i32;
+                let hi = ((v >> 32) & 0xFFFF_FFFF) as i32;
+                Some((format!("${}", lo), format!("${}", hi)))
+            }
+            Operand::Value(v) => {
+                if !self.state.wide_values.contains(&v.0) {
+                    return None;
+                }
+                let slot = self.state.get_slot(v.0)?;
+                Some((self.slot_ref(slot), self.slot_ref_offset(slot, 4)))
+            }
+            _ => None,
+        }
+    }
+
+    /// i64 ALU fast path (i686): load the LHS pair into %eax:%edx, then
+    /// apply the RHS through immediates or direct memory operands — GCC's
+    /// shape — instead of staging both operands through the stack. Handles
+    /// Add/Sub/And/Or/Xor/Mul. Returns false (caller falls back to the i128
+    /// path) for shapes it cannot express: `mull` has no immediate form, so
+    /// a constant RHS multiplies through %ecx.
+    pub(super) fn try_emit_i64_binop_fast(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> bool {
+        if std::env::var_os("CCC_NO_I64_FAST").is_some() {
+            return false;
+        }
+        if !matches!(
+            op,
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor | IrBinOp::Mul
+        ) {
+            return false;
+        }
+        let Some((rlo, rhi)) = self.i64_rhs_ref(rhs) else {
+            return false;
+        };
+        let rlo_imm = rlo.starts_with('$');
+        let rhi_imm = rhi.starts_with('$');
+
+        match op {
+            IrBinOp::Mul => {
+                self.emit_load_acc_pair(lhs);
+                if !rlo_imm {
+                    // Memory RHS: every product reads its operand directly —
+                    // no stack staging at all.
+                    self.state.emit("    movl %edx, %ecx");
+                    emit!(self.state, "    imull {}, %ecx", rlo); // ahi*blo
+                    self.state.emit("    movl %eax, %edx");
+                    emit!(self.state, "    imull {}, %edx", rhi); // alo*bhi
+                    self.state.emit("    addl %edx, %ecx");
+                    emit!(self.state, "    mull {}", rlo); // eax:edx = alo*blo
+                    self.state.emit("    addl %ecx, %edx");
+                } else {
+                    // Constant RHS: `mull` has no immediate form, so the low
+                    // factor stages through %edx after the cross terms.
+                    let blo = rlo.trim_start_matches('$');
+                    let bhi = rhi.trim_start_matches('$');
+                    self.state.emit("    movl %edx, %ecx");
+                    emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
+                    self.state.emit("    movl %eax, %edx");
+                    emit!(self.state, "    imull ${}, %edx", bhi); // alo*bhi
+                    self.state.emit("    addl %edx, %ecx");
+                    emit!(self.state, "    movl ${}, %edx", blo);
+                    self.state.emit("    mull %edx"); // eax:edx = alo*blo
+                    self.state.emit("    addl %ecx, %edx");
+                }
+            }
+            IrBinOp::Add | IrBinOp::Sub => {
+                self.emit_load_acc_pair(lhs);
+                let (mn, mn_carry) = if op == IrBinOp::Add {
+                    ("addl", "adcl")
+                } else {
+                    ("subl", "sbbl")
+                };
+                emit!(self.state, "    {} {}, %eax", mn, rlo);
+                emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
+            }
+            IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
+                self.emit_load_acc_pair(lhs);
+                let mn = match op {
+                    IrBinOp::And => "andl",
+                    IrBinOp::Or => "orl",
+                    _ => "xorl",
+                };
+                // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
+                // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
+                // x|-1 / x^-1 likewise reduce.
+                let zero_lo = rlo_imm && rlo == "$0";
+                let zero_hi = rhi_imm && rhi == "$0";
+                let m1_lo = rlo_imm && rlo == "$-1";
+                let m1_hi = rhi_imm && rhi == "$-1";
+                if op == IrBinOp::And {
+                    if zero_lo {
+                        self.state.emit("    xorl %eax, %eax");
+                    } else if !m1_lo {
+                        emit!(self.state, "    andl {}, %eax", rlo);
+                    }
+                    if zero_hi {
+                        self.state.emit("    xorl %edx, %edx");
+                    } else if !m1_hi {
+                        emit!(self.state, "    andl {}, %edx", rhi);
+                    }
+                } else if op == IrBinOp::Or {
+                    if !zero_lo && !m1_lo {
+                        emit!(self.state, "    orl {}, %eax", rlo);
+                    } else if m1_lo {
+                        self.state.emit("    movl $-1, %eax");
+                    }
+                    if !zero_hi && !m1_hi {
+                        emit!(self.state, "    orl {}, %edx", rhi);
+                    } else if m1_hi {
+                        self.state.emit("    movl $-1, %edx");
+                    }
+                } else {
+                    if !zero_lo {
+                        emit!(self.state, "    xorl {}, %eax", rlo);
+                    }
+                    if !zero_hi {
+                        emit!(self.state, "    xorl {}, %edx", rhi);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        self.emit_store_acc_pair(dest);
+        self.state.reg_cache.invalidate_all();
+        true
+    }
+
+    /// i64 compare fast path (i686): LHS pair in %eax:%edx, RHS applied
+    /// through immediates or memory. Eq/Ne collapse to the branchless
+    /// xor-normalize-or-test sequence (5 instructions); ordered compares
+    /// keep the hi-then-lo label shape but read the RHS directly.
+    pub(super) fn try_emit_i64_cmp_fast(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> bool {
+        if std::env::var_os("CCC_NO_I64_FAST").is_some() {
+            return false;
+        }
+        let Some((rlo, rhi)) = self.i64_rhs_ref(rhs) else {
+            return false;
+        };
+        match op {
+            IrCmpOp::Eq | IrCmpOp::Ne => {
+                self.emit_load_acc_pair(lhs);
+                emit!(self.state, "    xorl {}, %eax", rlo);
+                emit!(self.state, "    xorl {}, %edx", rhi);
+                self.state.emit("    orl %eax, %edx");
+                let set = if op == IrCmpOp::Eq { "sete" } else { "setne" };
+                emit!(self.state, "    {} %al", set);
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_eax_to(dest);
+                true
+            }
+            IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => {
+                // Two-word signed compare: when the high words differ they
+                // decide in the signed domain; otherwise the low words
+                // decide in the unsigned domain. The hi-decided branch keeps
+                // the signed setcc, the equal-hi fallthrough takes the
+                // unsigned low setcc — the classic i386 sequence, minus the
+                // stack staging of the i128 form.
+                let label_id = self.state.next_label_id();
+                let label_hi = format!(".Li64hidec_{}", label_id);
+                let label_done = format!(".Li64done_{}", label_id);
+                self.emit_load_acc_pair(lhs);
+                emit!(self.state, "    cmpl {}, %edx", rhi);
+                emit!(self.state, "    jne {}", label_hi);
+                emit!(self.state, "    cmpl {}, %eax", rlo);
+                let low_set = match op {
+                    IrCmpOp::Slt => "setb",
+                    IrCmpOp::Sle => "setbe",
+                    IrCmpOp::Sgt => "seta",
+                    IrCmpOp::Sge => "setae",
+                    _ => unreachable!("signed i64 low-word cmp: {:?}", op),
+                };
+                emit!(self.state, "    {} %al", low_set);
+                emit!(self.state, "    jmp {}", label_done);
+                emit!(self.state, "{}:", label_hi);
+                let high_set = match op {
+                    IrCmpOp::Slt | IrCmpOp::Sle => "setl",
+                    IrCmpOp::Sgt | IrCmpOp::Sge => "setg",
+                    _ => unreachable!("signed i64 high-word cmp: {:?}", op),
+                };
+                emit!(self.state, "    {} %al", high_set);
+                emit!(self.state, "{}:", label_done);
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_eax_to(dest);
+                true
+            }
+            IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => {
+                let label_id = self.state.next_label_id();
+                let label_hi = format!(".Li64u_{}", label_id);
+                self.emit_load_acc_pair(lhs);
+                emit!(self.state, "    cmpl {}, %edx", rhi);
+                emit!(self.state, "    jne {}", label_hi);
+                emit!(self.state, "    cmpl {}, %eax", rlo);
+                emit!(self.state, "{}:", label_hi);
+                // Unsigned: the SAME setcc serves both words (both compares
+                // are in the unsigned domain), so the flags at the label
+                // decide directly.
+                let set = match op {
+                    IrCmpOp::Ult => "setb",
+                    IrCmpOp::Ule => "setbe",
+                    IrCmpOp::Ugt => "seta",
+                    IrCmpOp::Uge => "setae",
+                    _ => unreachable!(),
+                };
+                emit!(self.state, "    {} %al", set);
+                self.state.emit("    movzbl %al, %eax");
+                self.state.reg_cache.invalidate_acc();
+                self.store_eax_to(dest);
+                true
+            }
+            _ => false,
+        }
+    }
+
+
     pub(super) fn emit_sign_extend_acc_high_impl(&mut self) {
         self.state.emit("    cltd");
     }

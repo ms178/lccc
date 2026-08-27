@@ -520,18 +520,18 @@ struct DisabledPasses {
 impl DisabledPasses {
     fn from_env(disabled: &str) -> Self {
         DisabledPasses {
-            cfg: disabled.contains("cfg"),
-            copyprop: disabled.contains("copyprop"),
-            narrow: disabled.contains("narrow"),
-            simplify: disabled.contains("simplify"),
-            constfold: disabled.contains("constfold"),
-            gvn: disabled.contains("gvn"),
-            licm: disabled.contains("licm"),
-            ifconv: disabled.contains("ifconv"),
-            dce: disabled.contains("dce"),
-            dse: disabled.contains("dse"),
-            ipcp: disabled.contains("ipcp"),
-            unroll: disabled.contains("unroll"),
+            cfg: pass_disabled(&disabled, "cfg"),
+            copyprop: pass_disabled(&disabled, "copyprop"),
+            narrow: pass_disabled(&disabled, "narrow"),
+            simplify: pass_disabled(&disabled, "simplify"),
+            constfold: pass_disabled(&disabled, "constfold"),
+            gvn: pass_disabled(&disabled, "gvn"),
+            licm: pass_disabled(&disabled, "licm"),
+            ifconv: pass_disabled(&disabled, "ifconv"),
+            dce: pass_disabled(&disabled, "dce"),
+            dse: pass_disabled(&disabled, "dse"),
+            ipcp: pass_disabled(&disabled, "ipcp"),
+            unroll: pass_disabled(&disabled, "unroll"),
         }
     }
 }
@@ -565,11 +565,11 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     // Class-aware GlobalAddr CSE *before* the first GVN. GVN already CSEs
     // GlobalAddr into same-block Copies, so a late-only run after
     // post-structural-inline never sees duplicates.
-    if !disabled.contains("gaddrcse") {
+    if !pass_disabled(&disabled, "gaddrcse") {
         global_addr_cse::run_module(module);
     }
     iphase_dump!("global_addr_cse-pre-gvn");
-    if !disabled.contains("gvn") {
+    if !pass_disabled(&disabled, "gvn") {
         // Use the module context (GNU alias canonicalization, global epoch
         // facts) exactly like the main pass loop: with the default context,
         // loads across stores to GNU-alias'd globals are CSE'd and produce
@@ -581,7 +581,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     constant_fold::run(module);
     copy_prop::run(module);
 
-    if !disabled.contains("inline") {
+    if !pass_disabled(&disabled, "inline") {
         if size_profile {
             // -Os/-Oz: retain tiny/small and profitable one-use/loop
             // inlines, but reject repeated cold medium-body expansion.
@@ -688,11 +688,41 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     iphase_dump!("post-inline cleanup");
 }
 
+/// Exact-token pass-disable matching for the comma-separated list shared by
+/// `CCC_DISABLE_PASSES` and the m16 size policy. The previous substring test
+/// let a longer pass name disable an unrelated shorter one: the m16 policy's
+/// "postinline" entry silently disabled the primary "inline" phase (every
+/// -m16 -Os/-Oz compile ran without ANY inlining — the exact corpus where
+/// helper inlining matters most), and "univsr" likewise disabled "ivsr".
+/// Tokens are compared trimmed and exactly; "all" keeps its global meaning.
+fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
+    disabled
+        .as_ref()
+        .split(',')
+        .any(|tok| {
+            let tok = tok.trim();
+            tok == "all" || tok == pass
+        })
+}
+
 fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
     if !code16gcc || opt_level < 4 {
         return;
     }
+    // Measurement hook: CCC_M16_KEEP=<pass,...> removes individual passes
+    // from the disable list so each can be A/B-measured in isolation. The
+    // defaults are unchanged — this exists so the policy's entries stay
+    // evidence-backed instead of cargo-culted from a conflated measurement.
+    let keep: Vec<String> = std::env::var("CCC_M16_KEEP")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
     for pass in ["postinline", "ifconv", "gaddrcse", "licm"] {
+        if keep.iter().any(|k| k == pass) {
+            continue;
+        }
         if !disabled.is_empty() {
             disabled.push(',');
         }
@@ -733,7 +763,7 @@ pub(crate) fn run_passes(
         eprintln!("{:#?}", module);
         eprintln!("==== END IR ====");
     }
-    if disabled.contains("all") {
+    if pass_disabled(&disabled, "all") {
         return;
     }
 
@@ -818,7 +848,7 @@ pub(crate) fn run_passes(
     // compile with an unreachable threshold (999999), paying a full module
     // walk for guaranteed no-ops; now the walk is skipped entirely unless
     // explicitly requested for experiments.
-    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !disabled.contains("outline") {
+    if std::env::var("CCC_OUTLINE_SWITCH").is_ok() && !pass_disabled(&disabled, "outline") {
         outline_switch::run(module);
     }
     preloop_dump!("outline");
@@ -827,20 +857,20 @@ pub(crate) fn run_passes(
     // Converts self-recursive tail calls into back-edge branches before the
     // main optimization loop so that LICM, IVSR, and GVN can optimize the
     // resulting loops (e.g., hoist invariants, reduce induction variables).
-    if !disabled.contains("tce") {
+    if !pass_disabled(&disabled, "tce") {
         module.for_each_function(tail_call_elim::tail_calls_to_loops);
     }
     // Collapse the canonical accumulator-sum loop after TCE. This is a
     // semantics-preserving closed form for the strict int/long recurrence and
     // removes O(n) work without touching arbitrary loops.
-    if !disabled.contains("tail_sum_formula") {
+    if !pass_disabled(&disabled, "tail_sum_formula") {
         module.for_each_function(tail_call_elim::closed_form_tail_sum);
     }
     preloop_dump!("tce");
 
     // Binary recursion → iterative accumulator (e.g., Fibonacci).
     // Runs after TCE so it catches patterns TCE can't handle (non-tail binary recursion).
-    if !disabled.contains("rec2iter") {
+    if !pass_disabled(&disabled, "rec2iter") {
         module.for_each_function(recursion_to_iter::recursion_to_iteration);
     }
     preloop_dump!("rec2iter");
@@ -856,7 +886,7 @@ pub(crate) fn run_passes(
     // uses the size-aware policy at -Os/-Oz, so running the unrestricted
     // inliner unconditionally in this later phase defeats that decision and
     // can clone medium helpers at every call site after the first cleanup.
-    if !disabled.contains("postinline") {
+    if !pass_disabled(&disabled, "postinline") {
         if optimize_for_size {
             inline::run_size_optimized(module);
         } else {
@@ -902,7 +932,7 @@ pub(crate) fn run_passes(
     // Second GlobalAddr CSE: post-structural inlining can clone callers and
     // re-duplicate address materializations after the pre-GVN run.
     // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
-    if !disabled.contains("gaddrcse") {
+    if !pass_disabled(&disabled, "gaddrcse") {
         global_addr_cse::run_module(module);
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -1011,7 +1041,7 @@ pub(crate) fn run_passes(
         // sequences produce wrong results. Fall back to hardware idiv/div instead.
         // TODO: Re-enable once i686 has proper 64-bit arithmetic support, or implement
         // a 32-bit-aware variant that uses single-operand imull for mulhi.
-        if iter == 0 && !disabled.contains("divconst") && !target.is_32bit() {
+        if iter == 0 && !pass_disabled(&disabled, "divconst") && !target.is_32bit() {
             let n = timed_pass!(
                 "div_by_const",
                 run_on_visited(
@@ -1068,7 +1098,7 @@ pub(crate) fn run_passes(
                 target,
                 crate::backend::Target::X86_64 | crate::backend::Target::Aarch64
             )
-            && !disabled.contains("vectorize")
+            && !pass_disabled(&disabled, "vectorize")
         {
             let vectorize_fn = match (target, fp_reassoc, fp_contract, x86_avx) {
                 (crate::backend::Target::Aarch64, true, _, _) => {
@@ -1108,7 +1138,7 @@ pub(crate) fn run_passes(
 
         // Unroll/vectorize can clone loop bodies that still contained
         // GlobalAddr. Re-CSE is O(n) and idempotent once addresses live in entry.
-        if iter == 0 && !disabled.contains("gaddrcse") {
+        if iter == 0 && !pass_disabled(&disabled, "gaddrcse") {
             let n = timed_pass!(
                 "global_addr_cse_post_unroll",
                 global_addr_cse::run_module(module)
@@ -1200,7 +1230,7 @@ pub(crate) fn run_passes(
         // dependency between the two chains (ICC's Adler-32 rotation). Idempotent
         // (the pattern no longer matches after the rewrite). Pass name for
         // CCC_DISABLE_PASSES: "reassoc_accum".
-        if !disabled.contains("reassoc_accum") {
+        if !pass_disabled(&disabled, "reassoc_accum") {
             let n = timed_pass!(
                 "reassoc_accum",
                 run_on_visited(module, &dirty, &mut changed, reassoc_accum::run_function)
@@ -1235,13 +1265,13 @@ pub(crate) fn run_passes(
             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
             let run_ivsr =
-                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !disabled.contains("ivsr");
+                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !pass_disabled(&disabled, "ivsr");
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
                 && matches!(target, crate::backend::Target::X86_64)
                 && std::env::var("CCC_NO_UNIVSR").is_err()
-                && !disabled.contains("univsr");
+                && !pass_disabled(&disabled, "univsr");
 
             if run_gvn || run_licm || run_ivsr {
                 let (gvn_n, licm_n, ivsr_n) = run_gvn_licm_ivsr_shared(
@@ -1300,7 +1330,7 @@ pub(crate) fn run_passes(
         // as Linux __ffs are initially CFG diamonds; only this placement sees
         // the parallel value/count Select chains needed for Ctz recognition.
         // The pass is idempotent and remains behind the normal disable switch.
-        if !disabled.contains("bit_idioms") {
+        if !pass_disabled(&disabled, "bit_idioms") {
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let n = timed_pass!(
                 "bit_idioms_post_ifconv",
@@ -1319,7 +1349,7 @@ pub(crate) fn run_passes(
         // short-circuit branches. Idempotent and O(instructions), so it also
         // folds Selects produced earlier (mem2reg in the pre-loop phase).
         // Pass name for CCC_DISABLE_PASSES: "range_fold".
-        if !disabled.contains("range_fold") {
+        if !pass_disabled(&disabled, "range_fold") {
             let n = timed_pass!(
                 "range_fold",
                 run_on_visited(module, &dirty, &mut changed, range_check::run_function)
@@ -1335,7 +1365,7 @@ pub(crate) fn run_passes(
         // consumes the BitTest op (IS-06). Runs right after range_fold so
         // folded ranges join the chain as bit runs.
         // Pass name for CCC_DISABLE_PASSES: "set_membership".
-        if !disabled.contains("set_membership") {
+        if !pass_disabled(&disabled, "set_membership") {
             let n = timed_pass!(
                 "set_membership",
                 run_on_visited(module, &dirty, &mut changed, set_membership::run_function)
@@ -1494,8 +1524,8 @@ pub(crate) fn run_passes(
     // CCC_DISABLE_PASSES=latevec disables.
     if matches!(target, crate::backend::Target::Aarch64)
         && !optimize_for_size
-        && !disabled.contains("latevec")
-        && !disabled.contains("vectorize")
+        && !pass_disabled(&disabled, "latevec")
+        && !pass_disabled(&disabled, "vectorize")
     {
         let n = module.for_each_function(vectorize::vectorize_function_two_wide_late);
         if n > 0 {
@@ -1520,8 +1550,8 @@ pub(crate) fn run_passes(
     // cleanup contract as the AArch64 branch above.
     if matches!(target, crate::backend::Target::X86_64)
         && !optimize_for_size
-        && !disabled.contains("latevec")
-        && !disabled.contains("vectorize")
+        && !pass_disabled(&disabled, "latevec")
+        && !pass_disabled(&disabled, "vectorize")
     {
         let n = module.for_each_function(vectorize::vectorize_function_late);
         if n > 0 {
@@ -1555,7 +1585,7 @@ pub(crate) fn run_passes(
     // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
     // default-closed transfer function, volatile/escape/segment guards.
     // Iterate: each round can expose new dead stores for the next.
-    if !disabled.contains("slforward") {
+    if !pass_disabled(&disabled, "slforward") {
         for _ in 0..4 {
             if module.for_each_function(store_load_forward::run) == 0 {
                 break;
@@ -1587,7 +1617,7 @@ pub(crate) fn run_passes(
     // Late redundant-load elimination: post-IVSR field accesses have constant
     // offsets, so same-address loads merge when intervening stores are
     // provably non-aliasing (volatile loads are exempt by construction).
-    if !disabled.contains("redundantloads") {
+    if !pass_disabled(&disabled, "redundantloads") {
         module.for_each_function(redundant_loads::run);
         // Merged loads orphan their (now dead) address computations.
         module.for_each_function(dce::eliminate_dead_code);
@@ -1596,7 +1626,7 @@ pub(crate) fn run_passes(
     // (t(t+1)/2 recurrences): carries the index as two counters instead of
     // recomputing mul+corrected-div every iteration. Exact: t(t+1) is always
     // even, so the accumulator is bit-identical including wraparound.
-    if !disabled.contains("quadsr") {
+    if !pass_disabled(&disabled, "quadsr") {
         module.for_each_function(quadratic_sr::run);
         module.for_each_function(dce::eliminate_dead_code);
     }
@@ -1604,7 +1634,7 @@ pub(crate) fn run_passes(
     // Hoist FP constants used in loop bodies into preheader Copies so they can
     // stay in FP registers across the loop (AArch64 constant-pool literal loads
     // otherwise sit in the loop's dependency path every iteration).
-    if !disabled.contains("fpconst") {
+    if !pass_disabled(&disabled, "fpconst") {
         module.for_each_function(fp_const_hoist::run);
     }
 
@@ -1621,7 +1651,7 @@ pub(crate) fn run_passes(
     //   in-place; hoisting them burns a register and a callee-saved push —
     //   the old sieve regression the AArch64-only gate existed for).
     // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
-    if !disabled.contains("intconst")
+    if !pass_disabled(&disabled, "intconst")
         && matches!(
             target,
             crate::backend::Target::Aarch64 | crate::backend::Target::X86_64
@@ -1631,7 +1661,7 @@ pub(crate) fn run_passes(
         module.for_each_function(int_const_hoist::run);
     }
 
-    if !disabled.contains("bepre") {
+    if !pass_disabled(&disabled, "bepre") {
         let n = module.for_each_function(backedge_pre::run);
         if n > 0 { module.for_each_function(dce::eliminate_dead_code); }
     }
@@ -1652,7 +1682,7 @@ pub(crate) fn run_passes(
     // removes the temp alloca + Memcpy that vector intrinsic lowering introduces
     // for `__m256i x = _mm256_*(...)`, writing results directly into the variable
     // slot and enabling the backend's memory-operand folding.
-    if !disabled.contains("vecpromote") {
+    if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::promote_vector_temps(module);
     }
 
@@ -1660,14 +1690,14 @@ pub(crate) fn run_passes(
     // the original alignment facts are still available. This must precede
     // alignment relaxation: deleting a load can make its temporary's expensive
     // >16-byte alignment completely unobservable.
-    if !disabled.contains("vecpromote") {
+    if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::fuse_vector_loads(module);
     }
 
     // Phase 11d: Relax only the alignment left unobservable by the final use
     // set. Aligned/non-temporal, atomic, volatile, address-observing and
     // unaudited intrinsic positions retain their required alignment.
-    if !disabled.contains("vecpromote") {
+    if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::downgrade_nonescaping_vector_align(module);
     }
 

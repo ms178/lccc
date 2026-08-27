@@ -1922,6 +1922,137 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
     }
+    // Phase 2g (i686): hot-web steal on the narrow 4-register pool.
+    //
+    // Phase 1's start-point scan order is decisive on a pool this small:
+    // long-lived parameters (defined at the entry, spanning every helper
+    // call the m16 no-inline policy leaves behind) take ebx..ebp before any
+    // loop-carried state is considered, and mode-3 eviction cannot displace
+    // them afterwards — a victim whose next use lies anywhere inside the
+    // incoming web's span is protected, which is exactly the params' shape.
+    // The cmdline parser is the canonical case: option/buf/bufsize parked
+    // three callee-saved registers while state/len/bufptr/opptr round-trip
+    // stack slots on EVERY iteration — the exact inverse of GCC, which
+    // keeps the loop values in registers and reloads the cold parameters
+    // on the few paths that read them.
+    //
+    // Same contract as the AArch64 loop-pin steal above, tightened for the
+    // narrow pool:
+    //   * candidates are phi-dest loop webs ranked by the WHOLE web's
+    //     loop-weighted use count (a state machine's leader alone
+    //     undercounts: cmdline's `state` leader shows a fraction of the
+    //     web's dispatch reads);
+    //   * a register is stolen only when the combined use count of the
+    //     holders it would displace is STRICTLY below the candidate's —
+    //     global accounting, not the local future-use exchange that lost
+    //     gzip when tried inside the scan (mode 5);
+    //   * phi-web holders and ABI-hinted holders are never displaced;
+    //   * the pass runs once, ranked, before Phase 2f's segment fill (the
+    //     segment fill must not see co-holders the steal reasons about).
+    let i686_narrow_pool = config
+        .caller_saved_regs
+        .iter()
+        .any(|r| matches!(r.0, 4 | 5))
+        && config.available_regs.iter().all(|r| r.0 <= 3);
+    if !env_on("CCC_NO_HOT_WEB_STEAL")
+        && i686_narrow_pool
+        && !all_phi_pairs.is_empty()
+    {
+        let k: usize = std::env::var("CCC_HOT_WEB_STEAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        // Web-aware use count: the leader's own count plus every coalesce
+        // member's (the state-machine webs the phi-coalesce machinery
+        // propagates homes through).
+        let web_use_count = |v: u32| -> u64 {
+            let mut uc = use_count.get(&v).copied().unwrap_or(0);
+            if let Some(members) = coalesce_groups.get(&v) {
+                let total: u64 = members
+                    .iter()
+                    .map(|m| use_count.get(m).copied().unwrap_or(0))
+                    .sum();
+                uc = uc.max(total);
+            }
+            uc
+        };
+        let phi_pair_values: FxHashSet<u32> = phi_coalesce
+            .iter()
+            .flat_map(|c| [c.phi_dest, c.backedge_src])
+            .collect();
+        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
+            .iter()
+            .map(|c| c.phi_dest)
+            .filter(|v| eligible.contains(v))
+            .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
+            .map(|v| (v, web_use_count(v)))
+            .filter(|&(_, count)| count >= 10)
+            .collect();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        candidates.dedup_by_key(|&mut (v, _)| v);
+
+        let overlaps_vid = |a: u32, b: u32| -> bool {
+            match (iv_map.get(&a), iv_map.get(&b)) {
+                (Some(&ia), Some(&ib)) => intervals_overlap(ia, ib),
+                _ => false,
+            }
+        };
+        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
+        for (&v, &r) in &assignments {
+            holders_by_reg.entry(r.0).or_default().push(v);
+        }
+
+        let mut steals = 0;
+        for &(vid, hot_count) in &candidates {
+            if steals >= k || assignments.contains_key(&vid) {
+                continue;
+            }
+            let mut best: Option<(u8, Vec<u32>, u64)> = None;
+            for (&reg_id, holders) in &holders_by_reg {
+                if !config.available_regs.iter().any(|r| r.0 == reg_id) {
+                    continue;
+                }
+                if holders.iter().any(|h| {
+                    phi_pair_values.contains(h) || config.reg_hints.contains_key(h)
+                }) {
+                    continue;
+                }
+                let evict: Vec<u32> = holders
+                    .iter()
+                    .copied()
+                    .filter(|&h| overlaps_vid(h, vid))
+                    .collect();
+                if evict.is_empty() {
+                    continue;
+                }
+                let cost: u64 = evict
+                    .iter()
+                    .map(|&h| use_count.get(&h).copied().unwrap_or(0))
+                    .sum();
+                if cost >= hot_count {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|&(_, _, c)| cost < c) {
+                    best = Some((reg_id, evict, cost));
+                }
+            }
+            if let Some((reg_id, evict, _)) = best {
+                for &v in &evict {
+                    evict_group(
+                        &mut assignments,
+                        &mut holders_by_reg,
+                        v,
+                        &coalesce_member_of,
+                        &coalesce_groups,
+                    );
+                }
+                assignments.insert(vid, PhysReg(reg_id));
+                holders_by_reg.entry(reg_id).or_default().push(vid);
+                steals += 1;
+            }
+        }
+        propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+    }
     // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
     // using the CFG-aware liveness segments. The primary scan deliberately
     // retains one fat [def,last_use] interval per value, which is simple but
