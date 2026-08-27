@@ -1217,6 +1217,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         set
     };
 
+    let has_nonlocal_control = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::NonlocalGotoSave { .. })
+                || crate::backend::liveness::is_returns_twice_call(inst)
+        })
+    });
+    if has_nonlocal_control {
+        for &vid in &call_spanning {
+            eligible.remove(&vid);
+        }
+        for (&member, &owner) in &coalesce_member_of {
+            if call_spanning.contains(&owner) {
+                eligible.remove(&member);
+            }
+        }
+    }
+
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     let build_gpr_ranges = |intervals: &[LiveInterval]| {

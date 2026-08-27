@@ -7,6 +7,54 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{IrCmpOp, Operand, Value};
 
+fn reg_for_type(reg: &str, ty: IrType) -> Option<&'static str> {
+    match ty {
+        IrType::I8 | IrType::U8 => match reg {
+            "eax" => Some("al"),
+            "ebx" => Some("bl"),
+            "ecx" => Some("cl"),
+            "edx" => Some("dl"),
+            _ => None,
+        },
+        IrType::I16 | IrType::U16 => match reg {
+            "eax" => Some("ax"),
+            "ebx" => Some("bx"),
+            "ecx" => Some("cx"),
+            "edx" => Some("dx"),
+            "esi" => Some("si"),
+            "edi" => Some("di"),
+            "ebp" => Some("bp"),
+            _ => None,
+        },
+        _ => match reg {
+            "eax" => Some("eax"),
+            "ebx" => Some("ebx"),
+            "ecx" => Some("ecx"),
+            "edx" => Some("edx"),
+            "esi" => Some("esi"),
+            "edi" => Some("edi"),
+            "ebp" => Some("ebp"),
+            _ => None,
+        },
+    }
+}
+
+fn cmp_mnemonic(ty: IrType) -> &'static str {
+    match ty {
+        IrType::I8 | IrType::U8 => "cmpb",
+        IrType::I16 | IrType::U16 => "cmpw",
+        _ => "cmpl",
+    }
+}
+
+fn test_mnemonic(ty: IrType) -> &'static str {
+    match ty {
+        IrType::I8 | IrType::U8 => "testb",
+        IrType::I16 | IrType::U16 => "testw",
+        _ => "testl",
+    }
+}
+
 impl I686Codegen {
     /// Register name for a scalar value safe to compare in place (not an
     /// alloca address, not a wide pair). None for slot-resident values and
@@ -32,24 +80,36 @@ impl I686Codegen {
     /// %eax stays untouched). `%ecx` is the slot-operand scratch, so a LHS in
     /// %ecx never takes the direct path against a slot-resident RHS.
     fn emit_int_cmp_flags_direct(&mut self, lhs: &Operand, rhs: &Operand, ty: IrType) -> bool {
-        let Some(lreg) = self.cmp_operand_reg(lhs) else {
+        let Some(lreg_32) = self.cmp_operand_reg(lhs) else {
             return false;
         };
+        let Some(lreg) = reg_for_type(lreg_32, ty) else {
+            return false;
+        };
+        let cmp_op = cmp_mnemonic(ty);
+        let test_op = test_mnemonic(ty);
+
         if let Some(imm) = Self::const_as_imm32(rhs) {
             let imm = Self::normalize_cmp_imm(imm, ty);
             if imm == 0 {
-                emit!(self.state, "    testl %{}, %{}", lreg, lreg);
+                emit!(self.state, "    {} %{}, %{}", test_op, lreg, lreg);
             } else {
-                emit!(self.state, "    cmpl ${}, %{}", imm, lreg);
+                emit!(self.state, "    {} ${}, %{}", cmp_op, imm, lreg);
             }
-        } else if let Some(rreg) = self.cmp_operand_reg(rhs) {
-            emit!(self.state, "    cmpl %{}, %{}", rreg, lreg);
+        } else if let Some(rreg_32) = self.cmp_operand_reg(rhs) {
+            let Some(rreg) = reg_for_type(rreg_32, ty) else {
+                return false;
+            };
+            emit!(self.state, "    {} %{}, %{}", cmp_op, rreg, lreg);
         } else {
-            if lreg == "ecx" {
+            if lreg_32 == "ecx" {
                 return false; // staging rhs into %ecx would clobber lhs
             }
+            let Some(ecx_sub) = reg_for_type("ecx", ty) else {
+                return false;
+            };
             self.operand_to_ecx(rhs);
-            emit!(self.state, "    cmpl %ecx, %{}", lreg);
+            emit!(self.state, "    {} %{}, %{}", cmp_op, ecx_sub, lreg);
         }
         true
     }
@@ -279,35 +339,39 @@ impl I686Codegen {
         // `movl %R,%eax; cmpl …, %eax` round-trip.
         if !folded && !self.emit_int_cmp_flags_direct(lhs, rhs, ty) {
             self.operand_to_eax(lhs);
+            let eax_sub = reg_for_type("eax", ty).unwrap_or("eax");
+            let cmp_op = cmp_mnemonic(ty);
+            let test_op = test_mnemonic(ty);
+
             // Constant rhs: compare against the immediate directly instead of
-            // staging it in %ecx. `movl $C,%ecx; cmpl %ecx,%eax` is 8 bytes where
-            // `cmpl $C,%eax` is 3..6 and `testl %eax,%eax` is 2 (flags are
-            // identical for ALL Jcc: eax-0 and eax&eax both clear CF/OF and set
-            // SF/ZF/PF from eax). GCC emits exactly these forms. This also keeps
-            // %ecx untouched, which the register allocator relies on when it
-            // places a value in %ecx across a constant compare.
+            // staging it in %ecx.
             if let Some(imm) = Self::const_as_imm32(rhs) {
                 let imm = Self::normalize_cmp_imm(imm, ty);
                 if imm == 0 {
-                    self.state.emit("    testl %eax, %eax");
+                    emit!(self.state, "    {} %{}, %{}", test_op, eax_sub, eax_sub);
                 } else {
-                    emit!(self.state, "    cmpl ${}, %eax", imm);
+                    emit!(self.state, "    {} ${}, %{}", cmp_op, imm, eax_sub);
                 }
             } else if let Operand::Value(rv) = rhs {
-                // A REGISTER-resident rhs compares in place (`cmpl %reg,%eax`);
+                // A REGISTER-resident rhs compares in place;
                 // the read is identical to the `movl %reg,%ecx` staging it
                 // replaces. Slot values keep staging (deferred-slot safety;
                 // the peephole folds them post-materialization).
-                match self.direct_reg_src_ref(rv) {
-                    Some(r) => emit!(self.state, "    cmpl {}, %eax", r),
+                let rreg = self
+                    .direct_reg_src_ref(rv)
+                    .and_then(|r| reg_for_type(r.trim_start_matches('%'), ty));
+                match rreg {
+                    Some(r) => emit!(self.state, "    {} %{}, %{}", cmp_op, r, eax_sub),
                     None => {
+                        let ecx_sub = reg_for_type("ecx", ty).unwrap_or("ecx");
                         self.operand_to_ecx(rhs);
-                        self.state.emit("    cmpl %ecx, %eax");
+                        emit!(self.state, "    {} %{}, %{}", cmp_op, ecx_sub, eax_sub);
                     }
                 }
             } else {
+                let ecx_sub = reg_for_type("ecx", ty).unwrap_or("ecx");
                 self.operand_to_ecx(rhs);
-                self.state.emit("    cmpl %ecx, %eax");
+                emit!(self.state, "    {} %{}, %{}", cmp_op, ecx_sub, eax_sub);
             }
         }
 

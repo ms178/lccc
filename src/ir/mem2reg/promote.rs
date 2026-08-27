@@ -89,6 +89,19 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
         return;
     }
 
+    // Functions containing NonlocalGotoSave receive non-local gotos to arbitrary
+    // label blocks that have no intra-procedural CFG edges from the entry.
+    // Promoting allocas to SSA would create disconnected/undefined phi nodes and
+    // lose values across non-local gotos (which restore stack pointers but not registers).
+    let has_nonlocal_goto_save = func.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::NonlocalGotoSave { .. }))
+    });
+    if has_nonlocal_goto_save {
+        return;
+    }
+
     // Step 1: Identify promotable allocas
     let mut alloca_infos = find_promotable_allocas(func, promote_params);
     if std::env::var("CCC_DEBUG_MEM2REG").is_ok() {
@@ -291,8 +304,10 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
         return Vec::new();
     }
 
-    // Build set of candidate alloca values
+    // Build set of candidate alloca values and their declared types
     let candidate_set: FxHashSet<u32> = all_allocas.iter().map(|(v, _, _)| v.0).collect();
+    let alloca_types: FxHashMap<u32, IrType> =
+        all_allocas.iter().map(|(v, ty, _)| (v.0, *ty)).collect();
 
     // Check all uses: only Load and Store targeting the alloca pointer are allowed
     let mut disqualified: FxHashSet<u32> = FxHashSet::default();
@@ -302,14 +317,22 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
     for (block_idx, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             match inst {
-                Instruction::Load { ptr, .. } => {
-                    if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
-                        use_blocks.entry(ptr.0).or_default().insert(block_idx);
+                Instruction::Load { ptr, ty, .. } => {
+                    if let Some(&expected_ty) = alloca_types.get(&ptr.0) {
+                        if *ty != expected_ty {
+                            disqualified.insert(ptr.0);
+                        } else if !disqualified.contains(&ptr.0) {
+                            use_blocks.entry(ptr.0).or_default().insert(block_idx);
+                        }
                     }
                 }
-                Instruction::Store { val, ptr, .. } => {
-                    if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
-                        def_blocks.entry(ptr.0).or_default().insert(block_idx);
+                Instruction::Store { val, ptr, ty, .. } => {
+                    if let Some(&expected_ty) = alloca_types.get(&ptr.0) {
+                        if *ty != expected_ty {
+                            disqualified.insert(ptr.0);
+                        } else if !disqualified.contains(&ptr.0) {
+                            def_blocks.entry(ptr.0).or_default().insert(block_idx);
+                        }
                     }
                     // If a candidate alloca value appears as the stored VALUE (not ptr),
                     // it means the alloca's address is being used as data (e.g., array-to-pointer

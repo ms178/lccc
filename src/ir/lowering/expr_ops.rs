@@ -187,6 +187,7 @@ impl Lowerer {
                 if width > 32 {
                     return self.truncate_to_bitfield_value(
                         result,
+                        storage_ty,
                         width,
                         storage_ty.is_signed(),
                     );
@@ -351,6 +352,7 @@ impl Lowerer {
         let ptr_int_ty = crate::common::types::target_int_ir_type();
 
         if lhs_is_ptr && !rhs_is_ptr {
+            let vla_stride = self.get_vla_stride_for_subscript(lhs);
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
             let rhs_ty = self.get_expr_type(rhs);
             let lhs_val = self.lower_expr(lhs);
@@ -358,7 +360,17 @@ impl Lowerer {
             // Widen the integer index to pointer width (sign-extend for signed types,
             // zero-extend for unsigned) before scaling and adding to the pointer.
             let rhs_val = self.emit_implicit_cast(rhs_val, rhs_ty, ptr_int_ty);
-            let scaled_rhs = self.scale_index(rhs_val, elem_size);
+            let scaled_rhs = if let Some(stride_val) = vla_stride {
+                let mul = self.emit_binop_val(
+                    IrBinOp::Mul,
+                    rhs_val,
+                    Operand::Value(stride_val),
+                    ptr_int_ty,
+                );
+                Operand::Value(mul)
+            } else {
+                self.scale_index(rhs_val, elem_size)
+            };
             let ir_op = if *op == BinOp::Add {
                 IrBinOp::Add
             } else {
@@ -367,21 +379,38 @@ impl Lowerer {
             let dest = self.emit_binop_val(ir_op, lhs_val, scaled_rhs, ptr_int_ty);
             Some(Operand::Value(dest))
         } else if rhs_is_ptr && !lhs_is_ptr && *op == BinOp::Add {
+            let vla_stride = self.get_vla_stride_for_subscript(rhs);
             let elem_size = self.get_pointer_elem_size_from_expr(rhs);
             let lhs_ty = self.get_expr_type(lhs);
             let lhs_val = self.lower_expr(lhs);
             // Widen the integer index to pointer width before scaling and adding to the pointer.
             let lhs_val = self.emit_implicit_cast(lhs_val, lhs_ty, ptr_int_ty);
             let rhs_val = self.lower_expr(rhs);
-            let scaled_lhs = self.scale_index(lhs_val, elem_size);
+            let scaled_lhs = if let Some(stride_val) = vla_stride {
+                let mul = self.emit_binop_val(
+                    IrBinOp::Mul,
+                    lhs_val,
+                    Operand::Value(stride_val),
+                    ptr_int_ty,
+                );
+                Operand::Value(mul)
+            } else {
+                self.scale_index(lhs_val, elem_size)
+            };
             let dest = self.emit_binop_val(IrBinOp::Add, scaled_lhs, rhs_val, ptr_int_ty);
             Some(Operand::Value(dest))
         } else if lhs_is_ptr && rhs_is_ptr && *op == BinOp::Sub {
+            let vla_stride = self.get_vla_stride_for_subscript(lhs);
             let elem_size = self.get_pointer_elem_size_from_expr(lhs);
             let lhs_val = self.lower_expr(lhs);
             let rhs_val = self.lower_expr(rhs);
             let diff = self.emit_binop_val(IrBinOp::Sub, lhs_val, rhs_val, ptr_int_ty);
-            if elem_size > 1 {
+            if let Some(stride_val) = vla_stride {
+                let scale = Operand::Value(stride_val);
+                let dest =
+                    self.emit_binop_val(IrBinOp::SDiv, Operand::Value(diff), scale, ptr_int_ty);
+                Some(Operand::Value(dest))
+            } else if elem_size > 1 {
                 let scale = Operand::Const(IrConst::ptr_int(elem_size as i64));
                 let dest =
                     self.emit_binop_val(IrBinOp::SDiv, Operand::Value(diff), scale, ptr_int_ty);
@@ -1335,31 +1364,42 @@ impl Lowerer {
 
         let current_val =
             self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width);
+        let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
+            storage_ty,
+            Some((bit_offset, bit_width)),
+        );
 
         let ir_op = if is_inc { IrBinOp::Add } else { IrBinOp::Sub };
         let wt = widened_op_type(Self::bitfield_arithmetic_type(storage_ty, bit_width));
-        let one = if wt == IrType::I32 {
-            IrConst::I32(1)
-        } else {
+        let current_casted = self.emit_implicit_cast(current_val, current_ty, wt);
+        let one = if wt.size() == 8 {
             IrConst::I64(1)
+        } else {
+            IrConst::I32(1)
         };
-        let result = self.emit_binop_val(ir_op, current_val, Operand::Const(one), wt);
+        let result = self.emit_binop_val(ir_op, current_casted, Operand::Const(one), wt);
+
+        let store_val = self.emit_implicit_cast(Operand::Value(result), wt, storage_ty);
 
         self.store_bitfield(
             field_addr,
             storage_ty,
             bit_offset,
             bit_width,
-            Operand::Value(result),
+            store_val,
             self.expr_access_is_volatile(inner),
         );
 
-        let ret_val = if return_new {
-            Operand::Value(result)
+        if return_new {
+            Some(self.truncate_to_bitfield_value(
+                store_val,
+                storage_ty,
+                bit_width,
+                storage_ty.is_signed(),
+            ))
         } else {
-            current_val
-        };
-        Some(self.truncate_to_bitfield_value(ret_val, bit_width, storage_ty.is_signed()))
+            Some(current_val)
+        }
     }
 
     fn inc_dec_step_and_type(&self, ty: IrType, expr: &Expr) -> (Operand, IrType) {

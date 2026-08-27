@@ -2622,6 +2622,7 @@ impl I686Codegen {
         s.emit(".weak __udivdi3");
         s.emit(".type __udivdi3, @function");
         s.emit("__udivdi3:");
+        s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
         // Stack: ebx(0), ret(4), A_lo(8), A_hi(12), B_lo(16), B_hi(20)
@@ -2715,6 +2716,7 @@ impl I686Codegen {
         s.emit(".weak __umoddi3");
         s.emit(".type __umoddi3, @function");
         s.emit("__umoddi3:");
+        s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret(0), A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
         s.emit("    pushl %esi");
@@ -2767,6 +2769,7 @@ impl I686Codegen {
         s.emit(".weak __divdi3");
         s.emit(".type __divdi3, @function");
         s.emit("__divdi3:");
+        s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
         s.emit("    pushl %esi");
@@ -2821,6 +2824,7 @@ impl I686Codegen {
         s.emit(".weak __moddi3");
         s.emit(".type __moddi3, @function");
         s.emit("__moddi3:");
+        s.emit("# lccc-i686-return-uses-edx");
         // Stack: ret, A_lo(4), A_hi(8), B_lo(12), B_hi(16)
         s.emit("    pushl %ebx");
         s.emit("    pushl %esi");

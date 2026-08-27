@@ -31,7 +31,7 @@ fn promote_integer(ty: IrType) -> IrType {
 /// This applies regardless of the declared storage type of the bitfield. A
 /// `uint64_t arg_count : 16` bitfield has values 0..65535, which fit in int,
 /// so it promotes to int (I32).
-fn bitfield_promoted_type(field_ty: IrType, bf_info: Option<(u32, u32)>) -> IrType {
+pub(super) fn bitfield_promoted_type(field_ty: IrType, bf_info: Option<(u32, u32)>) -> IrType {
     if let Some((_bit_offset, bit_width)) = bf_info {
         let is_signed = field_ty.is_signed();
         if is_signed {
