@@ -50,7 +50,7 @@ impl I686Codegen {
     /// `None` when the value has no register-resident/imm form that can be
     /// stored directly (allocas, wide values, F64/F128, byte stores from
     /// %esi/%edi/%ebp, ...).
-    fn direct_store_src(&self, val: &Operand, ty: IrType) -> Option<String> {
+    pub(super) fn direct_store_src(&self, val: &Operand, ty: IrType) -> Option<String> {
         match val {
             Operand::Const(c) => {
                 let imm: i64 = match c {

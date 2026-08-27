@@ -21,7 +21,10 @@ set -euo pipefail
 REPO=${LCCC_REPO:-/home/user/lccc}
 ART=${LCCC_ARTIFACTS:-/home/user/artifacts}
 BASE_REF_FILE="$ART/.base_ref"
-DELIVERABLE=/home/user/ms178-1.patch
+# Canonical deliverable location.  The default keeps the historical Arena
+# layout; sandboxes with a different persisted workspace root override it
+# with LCCC_DELIVERABLE instead of editing the script.
+DELIVERABLE=${LCCC_DELIVERABLE:-/home/user/ms178-1.patch}
 LEDGER="$ART/SNAPSHOT_LEDGER.md"
 
 slug=${1:-snapshot}

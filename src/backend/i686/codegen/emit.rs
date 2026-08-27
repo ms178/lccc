@@ -2297,6 +2297,31 @@ impl ArchCodegen for I686Codegen {
             }
         }
 
+        // Constant → spilled slot: fold the immediate directly into the
+        // store instead of round-tripping it through the accumulator
+        // (`movl $imm, slot` instead of `movl $imm, %eax; movl %eax, slot`).
+        // One instruction and 2-4 bytes smaller per copy; on -m16 boot code
+        // the eliminated accumulator reload also drops one 0x66 prefix.
+        // The accumulator is not written, so its register cache entry stays
+        // valid (unlike the generic path below, which clobbers %eax).
+        // Wide dests are excluded: store_eax_to zero-fills their upper word,
+        // which this single 4-byte store must not skip.
+        if let Operand::Const(_) = src {
+            if !self.reg_assignments.contains_key(&dest.0)
+                && !self.state.is_wide_value(dest.0)
+            {
+                if let Some(slot) = self.state.get_slot(dest.0) {
+                    // Reuse the store path's immediate formatter so accepted
+                    // constant kinds and width masking stay in one place.
+                    if let Some(imm) = self.direct_store_src(src, IrType::I32) {
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    movl {}, {}", imm, sr);
+                        return;
+                    }
+                }
+            }
+        }
+
         self.emit_load_operand(src);
         self.emit_store_result(dest);
     }

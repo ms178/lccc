@@ -3582,6 +3582,510 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
     changed
 }
 
+// ── Pass: sign-extend + test fusion ──────────────────────────────────────────
+
+/// Fuse `movs{b,w}l %L, %eR` + `testl %eR, %eR` into `test{b,w} %L, %L`.
+///
+/// Sign-extension preserves both the zero-ness and the sign of the value, so
+/// `testl` over the extended register sets the same ZF and SF as `testb`/`testw`
+/// over the narrow source; CF and OF are zero for both forms.  Every flag is
+/// identical, so any consumer (jcc/setcc/cmov) is unaffected.
+///
+/// The extension's register result is destroyed by the rewrite, so the pass
+/// is gated on a forward scan proving the destination register family is not
+/// read before its next pure write (the same deadness proof
+/// `collapse_slot_rmw_i686` uses; barriers stop the scan conservatively).
+/// The narrow SOURCE register is untouched by both forms.
+fn fuse_sext_testb(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_SEXT_TEST").is_some() {
+        return false;
+    }
+    /// Parse `movsbl %al, %eax` / `movswl %ax, %eax` style same-family
+    /// sign-extensions → (narrow test mnemonic, narrow reg, family, full name).
+    fn same_family_sext(s: &str) -> Option<(&'static str, &'static str, RegId, &'static str)> {
+        for (mnem, narrow_mnem, narrow, family, full) in [
+            ("movsbl %al, %eax", "testb", "%al", REG_EAX, "%eax"),
+            ("movsbl %cl, %ecx", "testb", "%cl", REG_ECX, "%ecx"),
+            ("movsbl %dl, %edx", "testb", "%dl", REG_EDX, "%edx"),
+            ("movsbl %bl, %ebx", "testb", "%bl", REG_EBX, "%ebx"),
+            ("movswl %ax, %eax", "testw", "%ax", REG_EAX, "%eax"),
+            ("movswl %cx, %ecx", "testw", "%cx", REG_ECX, "%ecx"),
+            ("movswl %dx, %edx", "testw", "%dx", REG_EDX, "%edx"),
+            ("movswl %bx, %ebx", "testw", "%bx", REG_EBX, "%ebx"),
+        ] {
+            if s == mnem {
+                return Some((narrow_mnem, narrow, family, full));
+            }
+        }
+        None
+    }
+    let len = infos.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let Some((narrow_mnem, narrow, family, full)) =
+            same_family_sext(trimmed(store, &infos[i], i))
+        else {
+            i += 1;
+            continue;
+        };
+        // Next code line must be the matching full-width self-test.
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+            j += 1;
+        }
+        if j >= len {
+            break;
+        }
+        let expected_test = format!("testl {}, {}", full, full);
+        if trimmed(store, &infos[j], j) != expected_test {
+            i += 1;
+            continue;
+        }
+        // Forward scan: the family must be dead (overwritten) before any read.
+        let reg_bit: u16 = 1 << family;
+        let mut k = j + 1;
+        let mut reg_dead = false;
+        while k < len {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Directive {
+                k += 1;
+                continue;
+            }
+            if let LineKind::Pop { reg: popped } = infos[k].kind {
+                if popped == family {
+                    reg_dead = true;
+                    break;
+                }
+                k += 1;
+                continue;
+            }
+            if infos[k].is_barrier() {
+                break;
+            }
+            let (uses, defs) = line_reg_use_def(store, infos, k);
+            if uses & reg_bit != 0 {
+                break; // extended value would be read
+            }
+            if defs & reg_bit != 0 {
+                reg_dead = true;
+                break;
+            }
+            k += 1;
+        }
+        if !reg_dead {
+            i = j + 1;
+            continue;
+        }
+        store.replace(i, format!("    {} {}, {}", narrow_mnem, narrow, narrow));
+        infos[i] = classify_line(store.get(i));
+        infos[j].kind = LineKind::Nop;
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+// ── Pass: div/rem pair fusion ────────────────────────────────────────────────
+
+/// Fuse a recomputation of an identical division when the first division's
+/// result registers are still live.
+///
+/// The accumulator backend lowers `a % b` and `a / b` (IR `URem`/`UDiv`,
+/// `SRem`/`SDiv`) as two independent sequences with identical staging:
+///
+/// ```text
+///     movl %SRC1, %eax      ─┐
+///     movl %SRC2, %ecx       │ staging A
+///     xorl %edx, %edx        │ (or cltd)
+///     divl %ecx             ─┘  → %eax = quotient, %edx = remainder
+///     movl %edx, 4(%esp)        (remainder consumer)
+///     movl %SRC1, %eax      ─┐
+///     movl %SRC2, %ecx       │ staging B (textually identical)
+///     xorl %edx, %edx        │
+///     divl %ecx             ─┘  → recomputes the same quotient
+///     movl %eax, 8(%esp)        (quotient consumer)
+/// ```
+///
+/// Because both divisions receive identical inputs, their outputs are equal,
+/// so deleting staging B + the second `divl` leaves `%eax`/`%edx` holding
+/// exactly the values the deleted division would have produced.  This is the
+/// machine-level equivalent of GCC's divmod fusion (one `div` supplies both
+/// `/` and `%`), which the kernel's `number()` in `arch/x86/boot/printf.c`
+/// exercises in its digit loop.
+///
+/// Soundness window (strictly between the first `divl` and staging B):
+/// * no label/branch/call/ret/push/pop/ESP write (straight line only);
+/// * no write to `%eax` or `%edx` (the live quotient/remainder);
+/// * no write to any register or stack slot READ by the staging block
+///   (input equality — partial byte/word slot writes alias by range);
+/// * any instruction with an unparsed destination, or an implicit
+///   multi-register writer (`div*`, `mul*`, `imul*`, `xchg*`, `xadd`,
+///   `cmpxchg*`, string ops, `rep`), or an indirect memory store aborts the
+///   candidate (fail closed).
+fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_DIV_FUSION").is_some() {
+        return false;
+    }
+    const MAX_WINDOW: usize = 32;
+    const MAX_SETUP: usize = 4;
+
+    /// Size of a move in bytes by move width.
+    fn size_bytes(size: MoveSize) -> u32 {
+        match size {
+            MoveSize::B => 1,
+            MoveSize::W => 2,
+            MoveSize::L => 4,
+        }
+    }
+
+    /// Next code-line index treating `.loc` markers as transparent (a
+    /// non-debug directive stops the scan: section/alignment/CFI changes
+    /// delimit regions).
+    fn next_code_skip_loc(store: &LineStore, infos: &[LineInfo], start: usize) -> usize {
+        let mut k = start;
+        while k < infos.len() {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
+                k += 1;
+                continue;
+            }
+            if infos[k].kind == LineKind::Directive {
+                if is_debug_location(store, infos, k) {
+                    k += 1;
+                    continue;
+                }
+                return usize::MAX;
+            }
+            return k;
+        }
+        usize::MAX
+    }
+
+    /// Parse a `divl %R` / `idivl %R` line → register family.
+    fn div_reg(s: &str) -> Option<RegId> {
+        let rest = s
+            .strip_prefix("divl ")
+            .or_else(|| s.strip_prefix("idivl "))?;
+        let reg = register_family(rest.trim());
+        if reg == REG_NONE || reg > REG_GP_MAX {
+            return None;
+        }
+        Some(reg)
+    }
+
+    /// Collect the staging block backward from `marker`: consecutive code
+    /// lines whose destination is %eax or the divisor register.  Returns None
+    /// when the block is longer than MAX_SETUP (fail closed) or a staging
+    /// line has no parsed register destination/source shape we understand.
+    fn collect_staging(
+        store: &LineStore,
+        infos: &[LineInfo],
+        marker: usize,
+        divisor: RegId,
+    ) -> Option<(Vec<(usize, String)>, Vec<RegId>, Vec<(i32, u32)>)> {
+        let mut staging = Vec::new();
+        let mut read_regs = Vec::new();
+        let mut read_slots = Vec::new();
+        let mut k = marker;
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            if guard > 64 {
+                return None;
+            }
+            // Walk to the previous code line, treating .loc as transparent.
+            let mut p = k;
+            loop {
+                if p == 0 {
+                    return Some((staging, read_regs, read_slots));
+                }
+                p -= 1;
+                if infos[p].is_nop() || infos[p].kind == LineKind::Empty {
+                    continue;
+                }
+                if infos[p].kind == LineKind::Directive {
+                    if is_debug_location(store, infos, p) {
+                        continue;
+                    }
+                    // Non-debug directives end the staging block.
+                    return Some((staging, read_regs, read_slots));
+                }
+                break;
+            }
+            let text = trimmed(store, &infos[p], p);
+            // Stop at control flow / barriers.
+            if infos[p].is_barrier() {
+                return Some((staging, read_regs, read_slots));
+            }
+            // Only accept register-writing `movl`-family staging whose
+            // destination is %eax or the divisor register; anything else
+            // (including flags producers and unknown destinations) ends the
+            // block.
+            let dest = match &infos[p].kind {
+                LineKind::Move { dst, src } => {
+                    read_regs.push(*src);
+                    *dst
+                }
+                LineKind::LoadEbp { reg, offset, size } => {
+                    read_slots.push((*offset, size_bytes(*size)));
+                    *reg
+                }
+                LineKind::Other { dest_reg } => {
+                    // `movl %src, %dst` style: recover the source register.
+                    let rest = text
+                        .strip_prefix("movl ")
+                        .map(|r| r.trim())
+                        .unwrap_or("");
+                    if let Some(comma) = rest.find(',') {
+                        let src_name = rest[..comma].trim();
+                        if src_name.starts_with('%') && !src_name.contains('(') {
+                            let src = register_family(src_name);
+                            if src <= REG_GP_MAX {
+                                read_regs.push(src);
+                            }
+                        }
+                    }
+                    *dest_reg
+                }
+                _ => return Some((staging, read_regs, read_slots)),
+            };
+            if dest == REG_NONE || (dest != REG_EAX && dest != divisor) {
+                return Some((staging, read_regs, read_slots));
+            }
+            staging.push((p, text.to_string()));
+            if staging.len() > MAX_SETUP {
+                return None;
+            }
+            k = p;
+        }
+    }
+
+    /// Opaque multi-register writers and unknown-effect mnemonics that the
+    /// kind-based analysis below cannot prove safe.
+    fn opaque_multi_writer(text: &str) -> bool {
+        text.starts_with("div")
+            || text.starts_with("idiv")
+            || text.starts_with("mul")
+            || text.starts_with("imul")
+            || text.starts_with("xchg")
+            || text.starts_with("xadd")
+            || text.starts_with("cmpxchg")
+            || text.starts_with("lock ")
+            || text.starts_with("rep")
+            || text.starts_with("lods")
+            || text.starts_with("stos")
+            || text.starts_with("movs")
+            || text.starts_with("cmps")
+            || text.starts_with("scas")
+            || text.starts_with("bswap")
+            || text.starts_with("call")
+            || text.starts_with("cltd")
+            || text.starts_with("cdq")
+    }
+
+    /// Whether a window line may be crossed: verifies it writes neither the
+    /// quotient/remainder registers nor anything the staging reads, and is
+    /// not an opaque multi-writer.  Returns false when the candidate must be
+    /// abandoned.
+    fn window_line_ok(
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        read_regs: &[RegId],
+        read_slots: &[(i32, u32)],
+    ) -> bool {
+        let text = trimmed(store, &infos[idx], idx);
+        if opaque_multi_writer(text) {
+            return false;
+        }
+        let dest = match &infos[idx].kind {
+            LineKind::Move { dst, .. } => Some(*dst),
+            LineKind::LoadEbp { reg, .. } => Some(*reg),
+            LineKind::SetCC { reg } => Some(*reg),
+            LineKind::StoreEbp { offset, size, .. } => {
+                // Stack write: check range overlap with staging slot reads.
+                let w_lo = *offset as i64;
+                let w_hi = w_lo + size_bytes(*size) as i64;
+                for (r_off, r_size) in read_slots {
+                    let r_lo = *r_off as i64;
+                    let r_hi = r_lo + *r_size as i64;
+                    if w_lo < r_hi && r_lo < w_hi {
+                        return false;
+                    }
+                }
+                None
+            }
+            LineKind::Other { dest_reg } => {
+                if *dest_reg == REG_NONE {
+                    // Unparsed destination (includes indirect memory
+                    // operands): conservative abort.
+                    return false;
+                }
+                Some(*dest_reg)
+            }
+            LineKind::Cmp => None, // flags only
+            LineKind::Nop | LineKind::Empty => None,
+            _ => return false,
+        };
+        if let Some(dst) = dest {
+            if dst == REG_EAX || dst == REG_EDX || read_regs.contains(&dst) {
+                return false;
+            }
+        }
+        // Indirect memory reads/writes with a register base are allowed only
+        // if they cannot WRITE memory; a load through a register is a read.
+        // Stores through a register indirect destination fail the parse above
+        // (REG_NONE), so reaching here with memory operands means a load.
+        true
+    }
+
+    let len = infos.len();
+
+    // Collect every division site first: the forward scan must know where
+    // site B's STAGING starts (its first eax/divisor-writing line), which
+    // sits before B's marker and would otherwise be mistaken for a window
+    // hazard.
+    struct Site {
+        marker: usize,
+        div: usize,
+        /// First staging line index (== marker when staging is empty).
+        staging_first: usize,
+        staging: Vec<(usize, String)>,
+        read_regs: Vec<RegId>,
+        read_slots: Vec<(i32, u32)>,
+        div_text: String,
+        divisor: RegId,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    {
+        let mut i = 0;
+        while i < len {
+            if infos[i].is_nop() {
+                i += 1;
+                continue;
+            }
+            let text_a = trimmed(store, &infos[i], i);
+            let is_marker =
+                text_a == "xorl %edx, %edx" || text_a == "cltd" || text_a == "cdq";
+            if !is_marker {
+                i += 1;
+                continue;
+            }
+            let div_idx = next_code_skip_loc(store, infos, i + 1);
+            if div_idx == usize::MAX || div_idx >= len {
+                i += 1;
+                continue;
+            }
+            let div_text = trimmed(store, &infos[div_idx], div_idx).to_string();
+            let Some(divisor) = div_reg(&div_text) else {
+                i = div_idx + 1;
+                continue;
+            };
+            match collect_staging(store, infos, i, divisor) {
+                Some((staging, read_regs, read_slots)) => {
+                    let staging_first = staging.last().map(|(p, _)| *p).unwrap_or(i);
+                    sites.push(Site {
+                        marker: i,
+                        div: div_idx,
+                        staging_first,
+                        staging,
+                        read_regs,
+                        read_slots,
+                        div_text,
+                        divisor,
+                    });
+                    i = div_idx + 1;
+                }
+                None => i = div_idx + 1,
+            }
+        }
+    }
+
+    let mut changed = false;
+    // Fuse consecutive identical sites.  After fusing A-B, a further site C
+    // may still fuse with A: the deleted B lines become NOPs (transparent),
+    // and the window proof extends from A's division to C's staging start.
+    let mut a = 0;
+    while a < sites.len() {
+        let site_a = &sites[a];
+        if site_a.staging.is_empty() {
+            a += 1;
+            continue;
+        }
+        // walk candidates after a
+        let mut b_idx = a + 1;
+        while b_idx < sites.len() {
+            let site_b = &sites[b_idx];
+            // Any intervening site (before b) whose staging/marker/div lines
+            // are still live would have written %eax: only NOP-ed (fused)
+            // sites may be crossed.
+            let mut crossed_live_site = false;
+            for m in (a + 1)..b_idx {
+                if !infos[sites[m].marker].is_nop() {
+                    crossed_live_site = true;
+                    break;
+                }
+            }
+            if crossed_live_site {
+                break;
+            }
+            let same = site_a.div_text == site_b.div_text
+                && site_a.staging.len() == site_b.staging.len()
+                && site_a
+                    .staging
+                    .iter()
+                    .zip(site_b.staging.iter())
+                    .all(|(x, y)| x.1 == y.1);
+            if !same || site_b.staging.is_empty() {
+                break;
+            }
+            // Verify the window strictly between A's div and B's staging
+            // start: no barrier, no %eax/%edx write, no write to anything A
+            // reads.
+            let mut k = site_a.div;
+            let mut ok = true;
+            loop {
+                let n = next_code_skip_loc(store, infos, k + 1);
+                if n == usize::MAX {
+                    // A non-debug directive (or end of stream) inside the
+                    // window: the straight-line proof stops here, so the
+                    // window is NOT verified.
+                    ok = false;
+                    break;
+                }
+                if n >= site_b.staging_first {
+                    // Reached staging B: every line in between was checked.
+                    break;
+                }
+                k = n;
+                if !window_line_ok(store, infos, k, &site_a.read_regs, &site_a.read_slots) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                break;
+            }
+            // Delete staging B, marker B, and div B: %eax (and %edx) hold
+            // exactly the results the deleted division would have produced.
+            for (idx, _) in &site_b.staging {
+                infos[*idx].kind = LineKind::Nop;
+            }
+            infos[site_b.marker].kind = LineKind::Nop;
+            infos[site_b.div].kind = LineKind::Nop;
+            changed = true;
+            // Keep A as the anchor: eax still holds the quotient, so further
+            // identical sites can fuse too.
+            b_idx += 1;
+        }
+        a += 1;
+    }
+    changed
+}
+
 // ── Pass: slot read-modify-write collapse ────────────────────────────────────
 
 /// Collapse `movl S,%eax; OP %eax; movl %eax,S` (S = N(%esp)) into a single
@@ -5111,6 +5615,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
+    let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
 
     // Phase 3: Local cleanup after global passes
@@ -5126,6 +5631,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
+            changed2 |= fuse_sext_testb(&mut store, &mut infos);
             pass_count2 += 1;
         }
     }
@@ -5147,6 +5653,26 @@ pub fn peephole_optimize(asm: String) -> String {
             changed3 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed3 |= eliminate_dead_stores(&store, &mut infos);
             pass_count3 += 1;
+        }
+    }
+
+    // Phase 3.6: div/rem pair fusion.  Runs after the local cleanup folded
+    // the URem result extraction (`movl %edx,%eax` + store → direct store),
+    // which otherwise writes %eax between the two divisions and blocks the
+    // window proof.  May expose dead staging moves for the next phases.
+    let div_fused = fuse_div_rem_pairs(&mut store, &mut infos);
+    if div_fused {
+        let mut changed3b = true;
+        let mut pass_count3b = 0;
+        while changed3b && pass_count3b < MAX_POST_GLOBAL_ITERATIONS {
+            changed3b = false;
+            changed3b |= combined_local_pass(&mut store, &mut infos);
+            changed3b |= propagate_reg_copies(&mut store, &mut infos);
+            changed3b |= forward_slot_loads(&mut store, &mut infos);
+            changed3b |= eliminate_dead_reg_moves(&store, &mut infos);
+            changed3b |= eliminate_dead_stores(&store, &mut infos);
+            changed3b |= fuse_sext_testb(&mut store, &mut infos);
+            pass_count3b += 1;
         }
     }
 
