@@ -315,10 +315,24 @@ fn has_indirect_memory_access(s: &str) -> bool {
     let bytes = s.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i] == b'(' && i + 4 < bytes.len() && bytes[i + 1] == b'%' {
-            // Check if it's (%ebp) or (%esp) - those are stack accesses, not indirect
-            if i + 5 < bytes.len()
-                && (&bytes[i + 1..i + 5] == b"%ebp" || &bytes[i + 1..i + 5] == b"%esp")
-            {
+            // Check if it's (%ebp) or (%esp) - those are stack accesses, not
+            // indirect POINTER aliasing ...
+            if &bytes[i + 1..i + 5] == b"%ebp" || &bytes[i + 1..i + 5] == b"%esp" {
+                // ... but ONLY for BASE-ONLY forms! An INDEXED form like
+                // `12(%esp, %ebx)` computes its effective address at RUNTIME:
+                // no text-level displacement can describe the slot it writes,
+                // so it must be treated as an indirect memory access exactly
+                // like any other indexed operand. A missed marker here let
+                // store-forwarding windows sail straight past byte-granular
+                // indexed stores that alias the forwarded slot (union
+                // byte[reg]=0 vs word reload: gcc.c-torture/execute
+                // 990531-1 abort at -O2 once frame-SIB indexed addressing
+                // reached the i686 emitters). Mirrors x86-64's identical
+                // post-base-whitelist rule.
+                let after_base = &s[i + 5..];
+                if !after_base.starts_with(')') {
+                    return true;
+                }
                 continue;
             }
             return true;
@@ -6664,6 +6678,64 @@ mod tests {
     }
 
     #[test]
+    fn has_indirect_memory_access_treats_indexed_frame_forms_as_indirect() {
+        // REGRESSION PIN (990531-1 class): base-only frame operands stay
+        // non-indirect; ANY indexed form anchored at a frame register is a
+        // runtime-computed address and must be flagged indirect so every
+        // conservative guard (store forwarding, DSE, fold windows) sees it.
+        use super::has_indirect_memory_access as indirect;
+        // Base-only frame forms: frame addressing, not pointer aliasing.
+        assert!(!indirect("(%esp)"));
+        assert!(!indirect("12(%esp)"));
+        assert!(!indirect("-8(%ebp)"));
+        assert!(!indirect("movl %esi, 12(%esp)"));
+        // Non-frame bases: always indirect.
+        assert!(indirect("(%ebx)"));
+        // Indexed forms anchored at frame registers: runtime addresses.
+        assert!(indirect("12(%esp, %ebx)"));
+        assert!(indirect("12(%esp,%ebx)"));
+        assert!(indirect("0(%ebp, %esi, 4)"));
+        assert!(indirect("movb $0, 12(%esp, %ebx)"));
+    }
+
+    #[test]
+    fn slot_load_not_forwarded_across_indexed_frame_store() {
+        // END-TO-END REGRESSION PIN for gcc.c-torture/execute 990531-1:
+        // `data.word = w; data.byte[reg] = 0; return data.word;` lowers to a
+        // slot store, an INDEXED byte store aliasing that same slot, then a
+        // reload. The reload must survive verbatim -- forwarding `%esi`
+        // across the indexed store returned the stale word.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    subl $20, %esp\n",
+            "    movl 32(%esp), %ebx\n",
+            "    movl 36(%esp), %esi\n",
+            "    movl %esi, 12(%esp)\n",
+            "    movb $0, 12(%esp, %ebx)\n",
+            "    movl 12(%esp), %eax\n",
+            "    addl $20, %esp\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movl 12(%esp), %eax"),
+            "reload must NOT be forwarded across the indexed aliased store:\n{result}"
+        );
+        assert!(
+            !result.contains("movl %esi, %eax"),
+            "stale-register substitution is exactly the miscompile:\n{result}"
+        );
+    }
+
+    #[test]
     fn return_metadata_limits_edx_liveness_to_wide_functions() {
         let narrow =
             peephole_optimize("narrow:\n    movl %ebx, %edx\n    ret\n.cfi_endproc\n".to_string());
@@ -6994,18 +7066,23 @@ mod tests {
     fn unused_callee_saves_removed_across_multiple_epilogues() {
         // Framed shape with TWO epilogues (early return + fallthrough).
         //
-        // STACK-WINDOW SOUNDNESS NOTE (contract since "Harden i686
-        // stack-window peepholes", PR #255): the pair-removal alloc-envelope
-        // gate only accepts the whole-function transform when the window
-        // from the subl-alloc to the FIRST matching dealloc is straight-line
-        // (no internal labels/jumps: every dynamic path through the grown
-        // alloc must see every compensating grow). This shape contains an
-        // internal `je .L1` inside that window, so the transformation MUST
-        // be refused entirely -- removing the unused %ebp pair while growing
-        // three independent sites would risk skewing esp-relative incoming-
-        // parameter reads on some paths (the defect family behind GCC
-        // torture regressions fixed in PR #255). Assert the suppression and
-        // the survival of both epilogues verbatim.
+        // STACK-WINDOW SOUNDNESS CONTRACT (PR #255 gate + multi-epilogue
+        // relaxation): the envelope gate admits the whole-function transform
+        // when every interior control edge is provably depth-neutral:
+        //  * all entry paths cross the save-block linearly down to the
+        //    single alloc (a Label inside the alloc..first-dealloc window,
+        //    or a JmpIndirect there, still refuses);
+        //  * an interior Jmp/CondJmp is accepted ONLY when its target is a
+        //    resolvable label positioned AFTER the alloc -- such paths read
+        //    identical addresses at identical depths because the grown
+        //    alloc exactly cancels the removed push at every point that
+        //    can load/store through %esp;
+        //  * between a grown dealloc-addl and the reduced pop set nothing
+        //    reads memory through %esp (fixed emitter epilogue shape).
+        // Under this shape's `je .L1` (target after the first dealloc) the
+        // unused %ebp pair therefore goes, BOTH dealloc grows move in
+        // lockstep with the alloc (+4 each), and the live %ebx pair
+        // survives verbatim.
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -7034,19 +7111,75 @@ mod tests {
         .to_string();
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("pushl %ebp"),
-            "multi-epilogue shape must not touch the pairs (envelope gate):\n{result}"
+            !result.contains("%ebp"),
+            "unused %ebp pair must go under a resolvable forward edge:\n{result}"
         );
+        assert_eq!(
+            result.matches("subl $20, %esp").count(),
+            1,
+            "single alloc grows by 4 in lockstep:\n{result}"
+        );
+        assert_eq!(
+            result.matches("addl $20, %esp").count(),
+            2,
+            "BOTH deallocs grow by 4 (lockstep accounting):\n{result}"
+        );
+        assert_eq!(
+            result.matches("pushl %ebx").count(),
+            1,
+            "live %ebx push stays:\n{result}"
+        );
+        assert_eq!(
+            result.matches("popl %ebx").count(),
+            2,
+            "live %ebx pops stay on both epilogues:\n{result}"
+        );
+        assert_eq!(result.matches("ret").count(), 2, "{result}");
+    }
+
+    #[test]
+    fn unused_callee_saves_refused_for_backward_edge_into_envelope() {
+        // Same two-epilogue frame, but the interior `je` targets a label
+        // positioned BEFORE the alloc (loop back-edge re-entering the save
+        // block region). Depth identity cannot be proven for edges whose
+        // target lies at or above the alloc (and a Label inside the window
+        // refuses independently): the WHOLE transform must be refused --
+        // pairs stay, no growth anywhere.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %ebp\n",
+            "    subl $16, %esp\n",
+            ".Lback:\n",
+            "    movl %eax, %ebx\n",
+            "    testl %eax, %eax\n",
+            "    je .Lback\n",
+            "    movl %ebx, %eax\n",
+            "    movl %eax, 0(%esp)\n",
+            "    addl $16, %esp\n",
+            "    popl %ebp\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
         assert!(
-            !result.contains("subl $20, %esp"),
-            "no alloc growth may happen inside a branched envelope:\n{result}"
+            result.contains("pushl %ebp") && result.contains("popl %ebp"),
+            "pair must survive: interior edge targets pre-alloc label:\n{result}"
+        );
+        assert_eq!(
+            result.matches("subl $16, %esp").count(),
+            1,
+            "alloc must not grow:\n{result}"
         );
         assert_eq!(
             result.matches("addl $20, %esp").count(),
             0,
-            "neither dealloc may grow:\n{result}"
+            "no dealloc growth may leak out of a refused transform:\n{result}"
         );
-        assert_eq!(result.matches("subl $16, %esp").count(), 1, "{result}");
         assert!(
             result.contains("pushl %ebx"),
             "live %ebx pair stays regardless:\n{result}"
