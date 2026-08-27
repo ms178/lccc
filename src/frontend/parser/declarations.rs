@@ -181,6 +181,8 @@ impl Parser {
         let is_fastcall = self.attrs.parsing_fastcall();
         let is_naked = self.attrs.parsing_naked();
         let no_instrument = self.attrs.parsing_no_instrument();
+        let is_pure = self.attrs.parsing_pure();
+        let is_const_attr = self.attrs.parsing_const_attr();
 
         // Build per-declarator attributes struct from the collected flags
         let mut decl_attrs = DeclAttributes::default();
@@ -193,6 +195,8 @@ impl Parser {
         decl_attrs.set_fastcall(is_fastcall);
         decl_attrs.set_naked(is_naked);
         decl_attrs.set_no_instrument(no_instrument);
+        decl_attrs.set_pure(is_pure);
+        decl_attrs.set_const_attr(is_const_attr);
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
@@ -301,6 +305,8 @@ impl Parser {
                 attrs.set_naked(decl_attrs.is_naked());
                 attrs.set_no_instrument(decl_attrs.is_no_instrument());
                 attrs.set_noreturn(decl_attrs.is_noreturn());
+                attrs.set_pure(decl_attrs.is_pure());
+                attrs.set_const_attr(decl_attrs.is_const_attr());
                 attrs.section = decl_attrs.section;
                 attrs.visibility = decl_attrs.visibility;
                 attrs.symver = decl_attrs.symver;
@@ -611,6 +617,12 @@ impl Parser {
         if self.attrs.parsing_no_instrument() {
             last_decl.attrs.set_no_instrument(true);
         }
+        if self.attrs.parsing_pure() {
+            last_decl.attrs.set_pure(true);
+        }
+        if self.attrs.parsing_const_attr() {
+            last_decl.attrs.set_const_attr(true);
+        }
         if self.attrs.parsing_error_attr() {
             last_decl.attrs.set_error_attr(true);
         }
@@ -620,6 +632,8 @@ impl Parser {
         self.attrs.parsing_section = None;
         self.attrs.set_error_attr(false);
         self.attrs.set_noreturn(false);
+        self.attrs.set_pure(false);
+        self.attrs.set_const_attr(false);
         self.attrs.parsing_cleanup_fn = None;
         self.attrs.set_used(false);
         self.attrs.set_fastcall(false);
@@ -652,6 +666,8 @@ impl Parser {
             let d_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let d_used = self.attrs.parsing_used();
             let d_noreturn = self.attrs.parsing_noreturn();
+            let d_pure = self.attrs.parsing_pure();
+            let d_const_attr = self.attrs.parsing_const_attr();
             let d_error_attr = self.attrs.parsing_error_attr();
             self.attrs.set_weak(false);
             self.attrs.set_used(false);
@@ -659,6 +675,8 @@ impl Parser {
             self.attrs.set_naked(false);
             self.attrs.set_no_instrument(false);
             self.attrs.set_noreturn(false);
+            self.attrs.set_pure(false);
+            self.attrs.set_const_attr(false);
             self.attrs.set_error_attr(false);
             let dinit = if self.consume_if(&TokenKind::Assign) {
                 Some(self.parse_initializer())
@@ -677,6 +695,8 @@ impl Parser {
                     da.set_weak(d_weak);
                     da.set_error_attr(d_error_attr);
                     da.set_noreturn(d_noreturn);
+                    da.set_pure(d_pure);
+                    da.set_const_attr(d_const_attr);
                     da.set_used(d_used);
                     da.set_fastcall(d_fastcall);
                     da.alias_target = d_alias;
@@ -815,6 +835,8 @@ impl Parser {
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_used(self.attrs.parsing_used());
                     da.set_noreturn(self.attrs.parsing_noreturn());
+                    da.set_pure(self.attrs.parsing_pure());
+                    da.set_const_attr(self.attrs.parsing_const_attr());
                     da.set_constructor(self.attrs.parsing_constructor());
                     da.set_destructor(self.attrs.parsing_destructor());
                     da.set_weak(self.attrs.parsing_weak());

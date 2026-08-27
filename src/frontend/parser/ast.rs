@@ -67,6 +67,10 @@ pub mod func_attr_flag {
     pub const NORETURN: u16 = 1 << 12;
     /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
     pub const NO_INSTRUMENT: u16 = 1 << 13;
+    /// `__attribute__((pure))` — read-only memory access, no observable side effects.
+    pub const PURE: u16 = 1 << 14;
+    /// `__attribute__((const))` — no memory access, no observable side effects.
+    pub const CONST_ATTR: u16 = 1 << 15;
 }
 
 impl FunctionAttributes {
@@ -133,6 +137,14 @@ impl FunctionAttributes {
     pub fn is_no_instrument(&self) -> bool {
         self.flags & func_attr_flag::NO_INSTRUMENT != 0
     }
+    #[inline]
+    pub fn is_pure(&self) -> bool {
+        self.flags & func_attr_flag::PURE != 0
+    }
+    #[inline]
+    pub fn is_const_attr(&self) -> bool {
+        self.flags & func_attr_flag::CONST_ATTR != 0
+    }
 
     // --- flag setters ---
 
@@ -191,6 +203,14 @@ impl FunctionAttributes {
     #[inline]
     pub fn set_no_instrument(&mut self, v: bool) {
         self.set_flag(func_attr_flag::NO_INSTRUMENT, v)
+    }
+    #[inline]
+    pub fn set_pure(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::PURE, v)
+    }
+    #[inline]
+    pub fn set_const_attr(&mut self, v: bool) {
+        self.set_flag(func_attr_flag::CONST_ATTR, v)
     }
 
     #[inline]
@@ -547,6 +567,10 @@ pub mod decl_attr_flag {
     pub const NAKED: u16 = 1 << 7;
     /// `__attribute__((no_instrument_function))` — skip mcount/__fentry__ prologue.
     pub const NO_INSTRUMENT: u16 = 1 << 8;
+    /// `__attribute__((pure))` — read-only memory access, no observable side effects.
+    pub const PURE: u16 = 1 << 9;
+    /// `__attribute__((const))` — no memory access, no observable side effects.
+    pub const CONST_ATTR: u16 = 1 << 10;
 }
 
 impl DeclAttributes {
@@ -588,6 +612,14 @@ impl DeclAttributes {
     pub fn is_no_instrument(&self) -> bool {
         self.flags & decl_attr_flag::NO_INSTRUMENT != 0
     }
+    #[inline]
+    pub fn is_pure(&self) -> bool {
+        self.flags & decl_attr_flag::PURE != 0
+    }
+    #[inline]
+    pub fn is_const_attr(&self) -> bool {
+        self.flags & decl_attr_flag::CONST_ATTR != 0
+    }
 
     // --- flag setters ---
 
@@ -626,6 +658,14 @@ impl DeclAttributes {
     #[inline]
     pub fn set_no_instrument(&mut self, v: bool) {
         self.set_flag(decl_attr_flag::NO_INSTRUMENT, v)
+    }
+    #[inline]
+    pub fn set_pure(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::PURE, v)
+    }
+    #[inline]
+    pub fn set_const_attr(&mut self, v: bool) {
+        self.set_flag(decl_attr_flag::CONST_ATTR, v)
     }
 
     #[inline]

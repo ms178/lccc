@@ -46,7 +46,7 @@ impl std::fmt::Display for BlockId {
 pub struct Value(pub u32);
 
 /// An operand (either a value reference or a constant).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Operand {
     Value(Value),
     Const(IrConst),
@@ -101,6 +101,10 @@ pub struct CallInfo {
     pub is_sret: bool,
     /// True if the callee uses the fastcall calling convention.
     pub is_fastcall: bool,
+    /// True if the callee is marked pure (no memory writes outside local allocas, no side effects).
+    pub is_pure: bool,
+    /// True if the callee is marked const (no memory reads or writes outside local allocas, no side effects).
+    pub is_const: bool,
     /// SysV ABI eightbyte classification for the return struct (if 9-16 byte two-reg return).
     /// Used by the x86-64 backend to read SSE eightbytes from xmm0 instead of rdx.
     pub ret_eightbyte_classes: Vec<EightbyteClass>,

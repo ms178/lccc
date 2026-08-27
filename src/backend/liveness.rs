@@ -1807,6 +1807,8 @@ mod tests {
             ret_is_f128_sse: false,
             is_sret: false,
             is_fastcall: false,
+            is_pure: false,
+            is_const: false,
             ret_eightbyte_classes: Vec::new(),
         }
     }

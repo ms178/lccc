@@ -73,7 +73,7 @@
 //! analyses this file must not quietly reimplement.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::ir::reexports::{Instruction, IrFunction};
+use crate::ir::reexports::{CallInfo, Instruction, IrFunction};
 
 /// Sentinel stored in `def_loc` for values that have no removable definition
 /// in this function (parameters, globals, malformed IDs).
@@ -417,8 +417,14 @@ fn has_side_effects(inst: &Instruction) -> bool {
         // DynAlloca modifies the stack pointer at runtime.
         Instruction::DynAlloca { .. } |
         Instruction::Store { .. } |
-        Instruction::Call { .. } |
-        Instruction::CallIndirect { .. } |
+        Instruction::Call {
+            info: CallInfo { is_pure: false, is_const: false, .. },
+            ..
+        } |
+        Instruction::CallIndirect {
+            info: CallInfo { is_pure: false, is_const: false, .. },
+            ..
+        } |
         Instruction::Memcpy { .. } |
         Instruction::VaStart { .. } |
         Instruction::VaEnd { .. } |

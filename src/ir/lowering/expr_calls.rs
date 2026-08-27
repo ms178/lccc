@@ -1120,6 +1120,8 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: false,
+                            is_pure: false,
+                            is_const: false,
                             ret_eightbyte_classes: call_ret_classes,
                             ret_is_f128_sse: false,
                         },
@@ -1149,6 +1151,8 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(name.as_str());
+                    let is_pure = self.pure_functions.contains(name.as_str());
+                    let is_const = self.const_functions.contains(name.as_str());
                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
                     self.emit(Instruction::Call {
                         func: call_name,
@@ -1166,6 +1170,8 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
+                            is_pure,
+                            is_const,
                             ret_eightbyte_classes: call_ret_classes,
                             ret_is_f128_sse: call_ret_is_f128_sse,
                         },
@@ -1208,6 +1214,8 @@ impl Lowerer {
                         struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                         is_sret: sret_size.is_some(),
                         is_fastcall: false,
+                        is_pure: false,
+                        is_const: false,
                         ret_eightbyte_classes: call_ret_classes,
                         ret_is_f128_sse: false,
                     },
@@ -1265,6 +1273,8 @@ impl Lowerer {
                         }
                     }
                     let callee_is_fastcall = self.fastcall_functions.contains(call_name.as_str());
+                    let is_pure = self.pure_functions.contains(call_name.as_str());
+                    let is_const = self.const_functions.contains(call_name.as_str());
                     let call_ret_is_f128_sse = sig.map(|s| s.ret_is_f128_sse).unwrap_or(false);
                     self.emit(Instruction::Call {
                         func: call_name,
@@ -1282,6 +1292,8 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: callee_is_fastcall,
+                            is_pure,
+                            is_const,
                             ret_eightbyte_classes: call_ret_classes,
                             ret_is_f128_sse: call_ret_is_f128_sse,
                         },
@@ -1304,6 +1316,8 @@ impl Lowerer {
                             struct_arg_is_f128_sse: struct_arg_is_f128_sse.clone(),
                             is_sret: sret_size.is_some(),
                             is_fastcall: false,
+                            is_pure: false,
+                            is_const: false,
                             ret_eightbyte_classes: call_ret_classes,
                             ret_is_f128_sse: false,
                         },
