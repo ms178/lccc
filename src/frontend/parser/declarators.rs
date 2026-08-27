@@ -505,6 +505,8 @@ impl Parser {
                 // Array params: outermost dimension decays to pointer.
                 // Preserve the outermost dimension expression (if any) so side effects
                 // like `a++` in `int b[a++]` can be evaluated during IR lowering.
+                // (Inner dimensions are preserved in type_spec and evaluated by
+                // compute_vla_param_strides).
                 let mut vla_size_exprs = Vec::with_capacity(2);
                 if !array_dims.is_empty() {
                     if let Some(Some(expr)) = array_dims.first() {
