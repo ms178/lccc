@@ -21,7 +21,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp, Operand, Value,
+    CallInfo, ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp, Operand, Value,
 };
 
 /// A value number expression key. Two instructions with the same ExprKey
@@ -1231,8 +1231,27 @@ fn gvn_dfs(
 /// This is conservative: any instruction that could write to memory or call
 /// external code (which could write to memory) returns true.
 fn clobbers_memory(inst: &Instruction) -> bool {
-    matches!(
-        inst,
+    match inst {
+        Instruction::Call {
+            info:
+                CallInfo {
+                    is_pure: true, ..
+                }
+                | CallInfo {
+                    is_const: true, ..
+                },
+            ..
+        }
+        | Instruction::CallIndirect {
+            info:
+                CallInfo {
+                    is_pure: true, ..
+                }
+                | CallInfo {
+                    is_const: true, ..
+                },
+            ..
+        } => false,
         Instruction::Store { .. }
             | Instruction::Call { .. }
             | Instruction::CallIndirect { .. }
@@ -1245,14 +1264,13 @@ fn clobbers_memory(inst: &Instruction) -> bool {
             | Instruction::InlineAsm { .. }
             | Instruction::VaStart { .. }
             | Instruction::VaEnd { .. }
-            | Instruction::VaCopy { .. }
-    ) || matches!(
-        inst,
+            | Instruction::VaCopy { .. } => true,
         Instruction::Intrinsic {
             dest_ptr: Some(_),
             ..
-        }
-    )
+        } => true,
+        _ => false,
+    }
 }
 
 /// Check if a Store instruction is eligible for store-to-load forwarding.
@@ -2427,6 +2445,8 @@ mod tests {
                             struct_arg_is_f128_sse: Vec::new(),
                             is_sret: false,
                             is_fastcall: false,
+                            is_pure: false,
+                            is_const: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
                         },
@@ -2688,6 +2708,8 @@ mod tests {
                             struct_arg_is_f128_sse: Vec::new(),
                             is_sret: false,
                             is_fastcall: false,
+                            is_pure: false,
+                            is_const: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
                         },
@@ -2883,6 +2905,8 @@ mod tests {
                             struct_arg_is_f128_sse: Vec::new(),
                             is_sret: false,
                             is_fastcall: false,
+                            is_pure: false,
+                            is_const: false,
                             ret_eightbyte_classes: vec![],
                             ret_is_f128_sse: false,
                         },

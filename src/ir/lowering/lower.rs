@@ -63,6 +63,10 @@ pub struct Lowerer {
     /// Set of function names declared with __attribute__((fastcall)).
     /// On i386, these use ecx/edx for the first two integer/pointer args.
     pub(super) fastcall_functions: FxHashSet<String>,
+    /// Set of function names declared with __attribute__((pure)).
+    pub pure_functions: FxHashSet<String>,
+    /// Set of function names declared with __attribute__((const)).
+    pub const_functions: FxHashSet<String>,
     /// Set while lowering a top-level expression whose result is discarded
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
@@ -208,6 +212,8 @@ impl Lowerer {
             error_functions: FxHashSet::default(),
             noreturn_functions: FxHashSet::default(),
             fastcall_functions: FxHashSet::default(),
+            pure_functions: FxHashSet::default(),
+            const_functions: FxHashSet::default(),
             discard_expr_result: false,
             has_non_inline_decl: FxHashSet::default(),
             types: type_context,
@@ -413,6 +419,8 @@ impl Lowerer {
                     struct_arg_is_f128_sse: Vec::new(),
                     is_sret: false,
                     is_fastcall: false,
+                    is_pure: false,
+                    is_const: false,
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
                 },
@@ -557,6 +565,12 @@ impl Lowerer {
         // insert proper casts/ABI handling during lowering.
         for decl in &tu.decls {
             if let ExternalDecl::FunctionDef(func) = decl {
+                if func.attrs.is_pure() {
+                    self.pure_functions.insert(func.name.clone());
+                }
+                if func.attrs.is_const_attr() {
+                    self.const_functions.insert(func.name.clone());
+                }
                 self.register_function_meta(
                     &func.name,
                     &func.return_type,
@@ -813,6 +827,14 @@ impl Lowerer {
                         // Collect __attribute__((fastcall))
                         if declarator.attrs.is_fastcall() && !declarator.name.is_empty() {
                             self.fastcall_functions.insert(declarator.name.clone());
+                        }
+                        // Collect __attribute__((pure))
+                        if declarator.attrs.is_pure() && !declarator.name.is_empty() {
+                            self.pure_functions.insert(declarator.name.clone());
+                        }
+                        // Collect __attribute__((const))
+                        if declarator.attrs.is_const_attr() && !declarator.name.is_empty() {
+                            self.const_functions.insert(declarator.name.clone());
                         }
                         // Collect weak/visibility attributes on extern declarations (not aliases).
                         // Skip typedefs: they are not linker symbols and should never get
@@ -1554,6 +1576,8 @@ impl Lowerer {
                 struct_arg_is_f128_sse: arg_is_f128,
                 is_sret: false,
                 is_fastcall: false,
+                is_pure: false,
+                is_const: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
             },
@@ -1883,6 +1907,8 @@ impl Lowerer {
                 struct_arg_is_f128_sse: vec![false, false, false],
                 is_sret: false,
                 is_fastcall: false,
+                is_pure: false,
+                is_const: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
             },

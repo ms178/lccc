@@ -8,7 +8,7 @@
 use crate::common::types::IrType;
 
 /// IR constants.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum IrConst {
     I8(i8),
     I16(i16),

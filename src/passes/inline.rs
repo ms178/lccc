@@ -3066,6 +3066,8 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
         is_sret: info.is_sret,
         is_fastcall: info.is_fastcall,
+        is_pure: info.is_pure,
+        is_const: info.is_const,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
     }

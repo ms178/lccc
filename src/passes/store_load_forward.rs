@@ -34,7 +34,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
+use crate::ir::reexports::{CallInfo, Instruction, IrFunction, Operand, Value};
 
 /// A constant byte path from an alloca root: (root value id, byte offset).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,7 +191,7 @@ fn build_field_paths(func: &IrFunction) -> FxHashMap<u32, FieldPath> {
 fn apply_inst(
     inst: &mut Instruction,
     paths: &FxHashMap<u32, FieldPath>,
-    map: &mut FxHashMap<FieldPath, (Value, i64)>,
+    map: &mut FxHashMap<FieldPath, (Operand, i64)>,
     rewrite: bool,
     changed: &mut usize,
 ) {
@@ -218,8 +218,8 @@ fn apply_inst(
                         || ofp.offset + fs <= fp.offset
                         || fp.offset + size <= ofp.offset
                 });
-                if let Operand::Value(v) = val {
-                    map.insert(fp, (*v, size));
+                if !*volatile {
+                    map.insert(fp, (*val, size));
                 }
             } else {
                 // Store through an untracked pointer may alias anything.
@@ -243,11 +243,15 @@ fn apply_inst(
                 return;
             }
             if let Some(fp) = paths.get(&ptr.0) {
-                if let Some(&(stored_v, store_size)) = map.get(fp) {
-                    if rewrite && store_size == type_size(*ty) && stored_v.0 != dest.0 {
+                if let Some(&(stored_op, store_size)) = map.get(fp) {
+                    let is_self_copy = match stored_op {
+                        Operand::Value(v) => v.0 == dest.0,
+                        Operand::Const(_) => false,
+                    };
+                    if rewrite && store_size == type_size(*ty) && !is_self_copy {
                         *inst = Instruction::Copy {
                             dest: *dest,
-                            src: Operand::Value(stored_v),
+                            src: stored_op,
                         };
                         *changed += 1;
                     }
@@ -276,7 +280,27 @@ fn apply_inst(
         | Instruction::Phi { .. }
         | Instruction::Select { .. }
         | Instruction::ParamRef { .. }
-        | Instruction::StackSave { .. } => {}
+        | Instruction::StackSave { .. }
+        | Instruction::Call {
+            info:
+                CallInfo {
+                    is_pure: true, ..
+                }
+                | CallInfo {
+                    is_const: true, ..
+                },
+            ..
+        }
+        | Instruction::CallIndirect {
+            info:
+                CallInfo {
+                    is_pure: true, ..
+                }
+                | CallInfo {
+                    is_const: true, ..
+                },
+            ..
+        } => {}
         // DEFAULT-CLOSED: every other instruction may write memory (calls,
         // intrinsics via dest_ptr, va_arg family, ALL atomics incl.
         // AtomicInc, inline asm, stack restore, dyn alloca, PGO counters,
@@ -305,20 +329,20 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // agreement-intersection of OUT over all predecessors. Because the maps
     // only shrink at joins and kills, and grow only through stores, the
     // lattice is finite and the worklist terminates.
-    let mut in_map: Vec<FxHashMap<FieldPath, (Value, i64)>> =
+    let mut in_map: Vec<FxHashMap<FieldPath, (Operand, i64)>> =
         (0..n).map(|_| FxHashMap::default()).collect();
-    let mut out_map: Vec<FxHashMap<FieldPath, (Value, i64)>> =
+    let mut out_map: Vec<FxHashMap<FieldPath, (Operand, i64)>> =
         (0..n).map(|_| FxHashMap::default()).collect();
     let mut computed = vec![false; n];
     let mut worklist: Vec<usize> = (0..n).collect();
     while let Some(b) = worklist.pop() {
-        let mut acc: Option<FxHashMap<FieldPath, (Value, i64)>> = None;
+        let mut acc: Option<FxHashMap<FieldPath, (Operand, i64)>> = None;
         for &p in preds.row(b).iter() {
             let p = p as usize;
             acc = Some(match acc {
                 None => out_map[p].clone(),
                 Some(mut a) => {
-                    a.retain(|fp, v| out_map[p].get(fp) == Some(v));
+                    a.retain(|fp, v| out_map[p].get(fp) == Some(&*v));
                     a
                 }
             });

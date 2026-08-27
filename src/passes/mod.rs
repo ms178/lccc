@@ -30,6 +30,7 @@ pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
 pub(crate) mod int_const_hoist;
+pub(crate) mod ip_purity;
 pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
@@ -761,6 +762,7 @@ pub(crate) fn run_passes(
         if time_passes {
             eprintln!("[PASS] o1 mem2reg");
         }
+        ip_purity::run(module);
         constant_fold::run(module);
         copy_prop::run(module);
         // Same f128-builtin fold as -O0 (see above).
@@ -769,6 +771,9 @@ pub(crate) fn run_passes(
         // Same-block dead store elimination is cheap and removes the
         // store-overwritten lowering residue at -O1 too.
         module.for_each_function(dse::eliminate_dead_stores);
+        module.for_each_function(store_load_forward::run);
+        constant_fold::run(module);
+        module.for_each_function(cfg_simplify::simplify_cfg);
         module.for_each_function(dce::eliminate_dead_code);
         resolve_asm::resolve_inline_asm_symbols(module);
         constant_fold::resolve_remaining_is_constant(module);
@@ -1419,11 +1424,12 @@ pub(crate) fn run_passes(
         let mut ipcp_changes = 0;
         if !dis.ipcp {
             ipcp_changes = timed_pass!("ipcp", ipcp::run(module));
-            if ipcp_changes > 0 {
+            let purity_changes = ip_purity::run(module);
+            if ipcp_changes > 0 || purity_changes > 0 {
                 changed.iter_mut().for_each(|c| *c = true);
             }
-            total_changes += ipcp_changes;
-            total_changes_excl_dce += ipcp_changes;
+            total_changes += ipcp_changes + purity_changes;
+            total_changes_excl_dce += ipcp_changes + purity_changes;
         }
 
         if iter == 0 {

@@ -134,6 +134,10 @@ pub(super) mod parsed_attr_flag {
     /// / __fentry__ prologue emission. Critical for the Linux kernel's noinstr
     /// functions (early boot, NMI, RCU) where the tracer can't run.
     pub const NO_INSTRUMENT: u32 = 1 << 19;
+    /// `__attribute__((pure))` encountered.
+    pub const PURE: u32 = 1 << 20;
+    /// `__attribute__((const))` encountered.
+    pub const CONST_ATTR: u32 = 1 << 21;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -266,6 +270,14 @@ impl ParsedDeclAttrs {
     pub fn parsing_no_instrument(&self) -> bool {
         self.flags & parsed_attr_flag::NO_INSTRUMENT != 0
     }
+    #[inline]
+    pub fn parsing_pure(&self) -> bool {
+        self.flags & parsed_attr_flag::PURE != 0
+    }
+    #[inline]
+    pub fn parsing_const_attr(&self) -> bool {
+        self.flags & parsed_attr_flag::CONST_ATTR != 0
+    }
 
     // --- flag setters ---
 
@@ -348,6 +360,14 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_no_instrument(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::NO_INSTRUMENT, v)
+    }
+    #[inline]
+    pub fn set_pure(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::PURE, v)
+    }
+    #[inline]
+    pub fn set_const_attr(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::CONST_ATTR, v)
     }
 
     #[inline]
@@ -1077,6 +1097,10 @@ impl Parser {
                     self.attrs.set_noreturn(true);
                     self.advance();
                 }
+                TokenKind::Const => {
+                    self.attrs.set_const_attr(true);
+                    self.advance();
+                }
                 TokenKind::Identifier(name) => {
                     self.dispatch_gcc_attribute(
                         &name.clone(),
@@ -1209,6 +1233,14 @@ impl Parser {
             }
             "naked" | "__naked__" => {
                 self.attrs.set_naked(true);
+                self.advance();
+            }
+            "pure" | "__pure__" => {
+                self.attrs.set_pure(true);
+                self.advance();
+            }
+            "const" | "__const__" => {
+                self.attrs.set_const_attr(true);
                 self.advance();
             }
             // __attribute__((no_instrument_function)) — skip the mcount/__fentry__

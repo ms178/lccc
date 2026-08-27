@@ -128,6 +128,12 @@ impl Lowerer {
             if declarator.attrs.is_noreturn() && !declarator.name.is_empty() {
                 self.noreturn_functions.insert(declarator.name.clone());
             }
+            if declarator.attrs.is_pure() && !declarator.name.is_empty() {
+                self.pure_functions.insert(declarator.name.clone());
+            }
+            if declarator.attrs.is_const_attr() && !declarator.name.is_empty() {
+                self.const_functions.insert(declarator.name.clone());
+            }
             // Propagate __attribute__((weak)) and __attribute__((visibility(...)))
             // from block-scope extern function declarations.
             if !declarator.name.is_empty()
