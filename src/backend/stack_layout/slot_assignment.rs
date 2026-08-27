@@ -1282,12 +1282,14 @@ pub(super) fn propagate_wide_values(
                         }
                     }
                 }
-                Instruction::BinOp { lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
+                Instruction::BinOp { op, lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
                     if let Operand::Value(v) = lhs {
                         state.wide_values.insert(v.0);
                     }
-                    if let Operand::Value(v) = rhs {
-                        state.wide_values.insert(v.0);
+                    if !matches!(op, crate::ir::ops::IrBinOp::Shl | crate::ir::ops::IrBinOp::LShr | crate::ir::ops::IrBinOp::AShr) {
+                        if let Operand::Value(v) = rhs {
+                            state.wide_values.insert(v.0);
+                        }
                     }
                 }
                 Instruction::Cmp { lhs, rhs, ty, .. } if is_wide_ty(*ty) => {

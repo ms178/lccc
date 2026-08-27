@@ -391,6 +391,30 @@ impl Lowerer {
     pub(super) fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
         let depth = self.count_subscript_depth(base);
 
+        if let Some((root_expr, field_name, sub_depth)) = self.get_member_access_root_and_depth(base) {
+            if let Some(fs) = self.func_state.as_ref() {
+                if let Some(ctype) = self.get_expr_ctype(&root_expr) {
+                    let mut struct_key = None;
+                    match &ctype {
+                        CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                        CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                            CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                    if let Some(k) = struct_key {
+                        let field_key = format!("{k}::{field_name}");
+                        if let Some(strides) = fs.vla_field_strides.get(&field_key) {
+                            if sub_depth < strides.len() {
+                                return Some(strides[sub_depth]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(root_name) = self.get_array_root_name_from_base(base) {
             if let Some(info) = self
                 .func_state
@@ -584,7 +608,24 @@ impl Lowerer {
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers,
                 // so we return the field address (not load the value).
-                let field_is_array = self
+                let field_is_vla_array = self.func_state.as_ref().map_or(false, |fs| {
+                    self.get_expr_ctype(base_expr).map_or(false, |ctype| {
+                        let mut struct_key = None;
+                        match &ctype {
+                            CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                            CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                        struct_key.map_or(false, |k| {
+                            let field_key = format!("{k}::{field_name}");
+                            fs.vla_field_strides.contains_key(&field_key)
+                        })
+                    })
+                });
+                let field_is_array = field_is_vla_array || self
                     .resolve_field_ctype(base_expr, field_name, false)
                     .map(|ct| matches!(ct, CType::Array(_, _)))
                     .unwrap_or(false);
@@ -606,7 +647,24 @@ impl Lowerer {
             }
             Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 // Check if the field is an array type - arrays decay to pointers
-                let field_is_array = self
+                let field_is_vla_array = self.func_state.as_ref().map_or(false, |fs| {
+                    self.get_expr_ctype(base_expr).map_or(false, |ctype| {
+                        let mut struct_key = None;
+                        match &ctype {
+                            CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                            CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                        struct_key.map_or(false, |k| {
+                            let field_key = format!("{k}::{field_name}");
+                            fs.vla_field_strides.contains_key(&field_key)
+                        })
+                    })
+                });
+                let field_is_array = field_is_vla_array || self
                     .resolve_field_ctype(base_expr, field_name, true)
                     .map(|ct| matches!(ct, CType::Array(_, _)))
                     .unwrap_or(false);
@@ -830,6 +888,30 @@ impl Lowerer {
                 }
             }
 
+            if let Some((root_expr, field_name, _)) = self.get_member_access_root_and_depth(base) {
+                if let Some(fs) = self.func_state.as_ref() {
+                    if let Some(ctype) = self.get_expr_ctype(&root_expr) {
+                        let mut struct_key = None;
+                        match &ctype {
+                            CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                            CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
+                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                _ => {}
+                            },
+                            _ => {}
+                        }
+                        if let Some(k) = struct_key {
+                            let field_key = format!("{k}::{field_name}");
+                            if let Some(strides) = fs.vla_field_strides.get(&field_key) {
+                                if depth < strides.len() {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Fallback: check CType of the subscript expression itself.
             // This handles struct member multi-dim arrays (e.g., m.data[i] where data is int[4][4])
             // where get_array_root_name_from_base returns None.
@@ -845,6 +927,23 @@ impl Lowerer {
     /// For ArraySubscript(Identifier, _): depth = 1
     /// For ArraySubscript(ArraySubscript(Identifier, _), _): depth = 2
     /// For Deref(Identifier): depth = 1 (deref peels one array dimension)
+    pub(super) fn get_member_access_root_and_depth(&self, expr: &Expr) -> Option<(Expr, String, usize)> {
+        let mut curr = expr;
+        let mut depth = 0;
+        loop {
+            match curr {
+                Expr::ArraySubscript(base, _, _) | Expr::Deref(base, _) => {
+                    depth += 1;
+                    curr = base.as_ref();
+                }
+                Expr::MemberAccess(base, field, _) | Expr::PointerMemberAccess(base, field, _) => {
+                    return Some(((**base).clone(), field.clone(), depth));
+                }
+                _ => return None,
+            }
+        }
+    }
+
     pub(super) fn count_subscript_depth(&self, base: &Expr) -> usize {
         match base {
             Expr::ArraySubscript(inner, _, _) => 1 + self.count_subscript_depth(inner),

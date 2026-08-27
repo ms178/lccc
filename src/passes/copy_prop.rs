@@ -55,6 +55,15 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
         // miscompile: vs1's slot was never initialized/updated while the
         // wide/narrow loops kept reading it).
         let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+        let allocas: FxHashSet<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                Instruction::Alloca { dest, .. } => Some(dest.0),
+                _ => None,
+            })
+            .collect();
         for block in &func.blocks {
             for inst in &block.instructions {
                 for v in inst.used_values() {
@@ -77,8 +86,8 @@ pub(crate) fn forward_memcpy_chains(module: &mut IrModule) -> usize {
                     }
                 };
                 // Soundness: `tmp` may be referenced only by this memcpy's
-                // dest and the chain consumer's src (2 uses total).
-                if uses.get(&tmp.0).copied().unwrap_or(0) != 2 {
+                // dest and the chain consumer's src (2 uses total), and must be an alloca.
+                if !allocas.contains(&tmp.0) || uses.get(&tmp.0).copied().unwrap_or(0) != 2 {
                     i += 1;
                     continue;
                 }

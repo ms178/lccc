@@ -24,9 +24,13 @@ impl I686Codegen {
             Operand::Value(v) => {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr0 = self.slot_ref(slot);
-                    let sr4 = self.slot_ref_offset(slot, 4);
                     emit!(self.state, "    movl {}, %eax", sr0);
-                    emit!(self.state, "    movl {}, %edx", sr4);
+                    if self.state.wide_values.contains(&v.0) {
+                        let sr4 = self.slot_ref_offset(slot, 4);
+                        emit!(self.state, "    movl {}, %edx", sr4);
+                    } else {
+                        self.state.emit("    xorl %edx, %edx");
+                    }
                 } else if let Some(phys) = self.reg_assignments.get(&v.0).copied() {
                     let reg = super::emit::phys_reg_name(phys);
                     emit!(self.state, "    movl %{}, %eax", reg);
