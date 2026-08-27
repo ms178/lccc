@@ -532,17 +532,30 @@ impl Lowerer {
     }
 
     fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
-        if let SizeofArg::Expr(Expr::Identifier(name, _)) = arg {
-            // Check local VLA variables first
-            if let Some(info) = self.func().locals.get(name) {
-                if info.vla_size.is_some() {
-                    return info.vla_size;
+        match arg {
+            SizeofArg::Expr(Expr::Identifier(name, _)) => {
+                // Check local VLA variables first
+                if let Some(info) = self.func().locals.get(name) {
+                    if info.vla_size.is_some() {
+                        return info.vla_size;
+                    }
+                }
+                // Then check VLA typedef names (sizeof applied to a typedef identifier)
+                if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
+                    return Some(vla_size);
                 }
             }
-            // Then check VLA typedef names (sizeof applied to a typedef identifier)
-            if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
-                return Some(vla_size);
+            SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(base) {
+                    return Some(stride);
+                }
             }
+            SizeofArg::Expr(Expr::Deref(inner, _)) => {
+                if let Some(stride) = self.get_vla_stride_for_subscript(inner) {
+                    return Some(stride);
+                }
+            }
+            _ => {}
         }
         None
     }

@@ -891,13 +891,25 @@ fn collect_gpr_scan_intervals(
 }
 
 pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllocResult {
-    if config.available_regs.is_empty() && config.caller_saved_regs.is_empty() {
+    let has_builtin_setjmp = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                    ..
+                }
+            )
+        })
+    });
+    if has_builtin_setjmp || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty()) {
         return RegAllocResult {
             assignments: FxHashMap::default(),
-            accumulator_assignments: analyze_accumulator_assignments(
-                func,
-                config.accumulator_policy,
-            ),
+            accumulator_assignments: if has_builtin_setjmp {
+                Vec::new()
+            } else {
+                analyze_accumulator_assignments(func, config.accumulator_policy)
+            },
             used_regs: Vec::new(),
             caller_save_spans: FxHashMap::default(),
             liveness: None,

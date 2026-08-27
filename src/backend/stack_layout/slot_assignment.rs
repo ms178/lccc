@@ -12,7 +12,7 @@ use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator, Value};
 
 use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
 
@@ -1250,7 +1250,100 @@ pub(super) fn propagate_wide_values(
     func: &IrFunction,
     copy_alias: &FxHashMap<u32, u32>,
 ) {
-    if !crate::common::types::target_is_32bit() || state.wide_values.is_empty() {
+    if !crate::common::types::target_is_32bit() {
+        return;
+    }
+
+    let is_wide_ty = |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64);
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if let Some(ty) = inst.result_type() {
+                    if is_wide_ty(ty) {
+                        state.wide_values.insert(dest.0);
+                    }
+                }
+            }
+            match inst {
+                Instruction::Store {
+                    val: Operand::Value(v),
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::Call { info, .. } => {
+                    for (arg, &arg_ty) in info.args.iter().zip(&info.arg_types) {
+                        if is_wide_ty(arg_ty) {
+                            if let Operand::Value(v) = arg {
+                                state.wide_values.insert(v.0);
+                            }
+                        }
+                    }
+                }
+                Instruction::BinOp { lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = lhs {
+                        state.wide_values.insert(v.0);
+                    }
+                    if let Operand::Value(v) = rhs {
+                        state.wide_values.insert(v.0);
+                    }
+                }
+                Instruction::Cmp { lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = lhs {
+                        state.wide_values.insert(v.0);
+                    }
+                    if let Operand::Value(v) = rhs {
+                        state.wide_values.insert(v.0);
+                    }
+                }
+                Instruction::Cast {
+                    src: Operand::Value(v),
+                    from_ty,
+                    ..
+                } if is_wide_ty(*from_ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::UnaryOp {
+                    src: Operand::Value(v),
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(v.0);
+                }
+                Instruction::Phi { dest, ty, incoming } if is_wide_ty(*ty) => {
+                    state.wide_values.insert(dest.0);
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            state.wide_values.insert(v.0);
+                        }
+                    }
+                }
+                Instruction::Select {
+                    true_val,
+                    false_val,
+                    ty,
+                    ..
+                } if is_wide_ty(*ty) => {
+                    if let Operand::Value(v) = true_val {
+                        state.wide_values.insert(v.0);
+                    }
+                    if let Operand::Value(v) = false_val {
+                        state.wide_values.insert(v.0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Terminator::Return(Some(Operand::Value(v))) = &block.terminator {
+            if is_wide_ty(func.return_type) {
+                state.wide_values.insert(v.0);
+            }
+        }
+    }
+
+    if state.wide_values.is_empty() {
         return;
     }
 
@@ -1263,12 +1356,14 @@ pub(super) fn propagate_wide_values(
             } = inst
             {
                 copy_edges.push((dest.0, src_val.0));
+                copy_edges.push((src_val.0, dest.0));
             }
         }
     }
-    // Also propagate through copy aliases (forward only: root -> dest).
+    // Also propagate through copy aliases in both directions.
     for (&dest_id, &root_id) in copy_alias {
         copy_edges.push((dest_id, root_id));
+        copy_edges.push((root_id, dest_id));
     }
 
     if copy_edges.is_empty() {

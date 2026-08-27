@@ -33,6 +33,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Expr, ForInit, FunctionDef, Initializer, SizeofArg, Stmt,
+    TypeSpecifier,
 };
 use crate::ir::reexports::{Instruction, IrConst, Operand, Terminator, Value};
 
@@ -74,6 +75,20 @@ impl Lowerer {
         // Scope stack of names declared INSIDE the nested subtree. The
         // function's own parameters shadow enclosing locals from the start.
         let mut scopes: Vec<FxHashSet<String>> = vec![FxHashSet::default()];
+        for p in &nf.params {
+            for expr in &p.vla_size_exprs {
+                self.capture_expr(expr, visible, &mut scopes, &mut result);
+            }
+            let ts = self.resolve_type_spec(&p.type_spec);
+            if let TypeSpecifier::Pointer(inner, _) = ts {
+                let dim_infos = self.collect_vla_dims(inner);
+                for d in dim_infos {
+                    if let Some(ref expr) = d.dim_expr {
+                        self.capture_expr(expr, visible, &mut scopes, &mut result);
+                    }
+                }
+            }
+        }
         if let Some(top) = scopes.last_mut() {
             for p in &nf.params {
                 if let Some(pn) = &p.name {
