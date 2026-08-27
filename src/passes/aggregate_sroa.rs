@@ -377,7 +377,7 @@ fn run_function(func: &mut IrFunction) -> usize {
     let mut store_fields: FxHashMap<u32, Vec<(i64, IrType)>> = FxHashMap::default();
     for &(bi, ii, d, src, size) in &s.memcpy {
         let (r, off) = resolve(&s.gep, d);
-        if off == 0 {
+        if off == 0 && s.alloca_size.contains_key(&r) {
             *memcpy_writer_count.entry(r).or_insert(0) += 1;
             memcpy_writer.insert(r, (bi, ii, src, size));
         }

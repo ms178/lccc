@@ -40,8 +40,9 @@ impl Lowerer {
                 if self.func_state.is_some() {
                     if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
                         self.func_mut()
-                            .insert_vla_typedef_size_scoped(key, vla_size);
+                            .insert_vla_typedef_size_scoped(key.clone(), vla_size);
                     }
+                    self.compute_vla_field_strides_for_decl(&key, fields);
                 }
             }
             TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
@@ -1269,6 +1270,103 @@ impl Lowerer {
                 self.struct_layout_from_ctype(inner)
             }
             _ => None,
+        }
+    }
+
+    pub(super) fn compute_vla_field_strides_for_decl(
+        &mut self,
+        struct_key: &str,
+        fields: &[StructFieldDecl],
+    ) {
+        use crate::frontend::parser::ast::DerivedDeclarator;
+        use crate::ir::ops::IrBinOp;
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        for f in fields {
+            let Some(ref field_name) = f.name else { continue };
+            let mut dims: Vec<Option<Expr>> = Vec::new();
+            let mut curr_ts = &f.type_spec;
+            while let TypeSpecifier::Array(inner, dim) = curr_ts {
+                dims.push(dim.as_deref().cloned());
+                curr_ts = inner.as_ref();
+            }
+            for d in &f.derived {
+                if let DerivedDeclarator::Array(dim) = d {
+                    dims.push(dim.as_deref().cloned());
+                }
+            }
+            let mut inner_strides: Vec<Value> = Vec::new();
+            let mut elem_size_val: Option<Value> = None;
+            if let TypeSpecifier::TypedefName(tname) = curr_ts {
+                if let Some(fs) = self.func_state.as_ref() {
+                    if let Some(&sz) = fs.vla_typedef_sizes.get(tname) {
+                        elem_size_val = Some(sz);
+                    }
+                    if let Some(istrides) = fs.vla_field_strides.get(tname) {
+                        inner_strides = istrides.clone();
+                    }
+                }
+            }
+            let elem_size = self.sizeof_type(curr_ts);
+            let mut dim_ops: Vec<Option<Operand>> = Vec::new();
+            let mut has_vla = elem_size_val.is_some() || !inner_strides.is_empty();
+            for dim in &dims {
+                if let Some(dim_node) = dim {
+                    if let Some(c) = self.expr_as_array_size(dim_node) {
+                        dim_ops.push(Some(Operand::Const(IrConst::ptr_int(c as i64))));
+                    } else {
+                        let op = self.lower_expr(dim_node);
+                        dim_ops.push(Some(op));
+                        has_vla = true;
+                    }
+                } else {
+                    dim_ops.push(None);
+                }
+            }
+            if !has_vla {
+                continue;
+            }
+            let n = dim_ops.len();
+            let mut strides: Vec<Value> = Vec::with_capacity(n + inner_strides.len());
+            for dim_idx in 0..n {
+                let mut stride_op = if let Some(esz) = elem_size_val {
+                    Operand::Value(esz)
+                } else {
+                    Operand::Const(IrConst::ptr_int(elem_size as i64))
+                };
+                for dv in dim_ops.iter().skip(dim_idx + 1) {
+                    if let Some(d) = dv {
+                        let extended = self.emit_implicit_cast(
+                            d.clone(),
+                            IrType::I32,
+                            ptr_int_ty,
+                        );
+                        let mul = self.emit_binop_val(
+                            IrBinOp::Mul,
+                            stride_op,
+                            extended,
+                            ptr_int_ty,
+                        );
+                        stride_op = Operand::Value(mul);
+                    }
+                }
+                let stride_val = self.operand_to_value(stride_op);
+                strides.push(stride_val);
+            }
+            if !inner_strides.is_empty() {
+                strides.extend(inner_strides);
+            } else if elem_size_val.is_some() {
+                let cty = self.type_spec_to_ctype(curr_ts);
+                let elem_sz = match &cty {
+                    CType::Array(inner, _) | CType::Pointer(inner, _) => inner.size(),
+                    _ => 4,
+                };
+                let c_op = Operand::Const(IrConst::ptr_int(elem_sz as i64));
+                let c_val = self.operand_to_value(c_op);
+                strides.push(c_val);
+            }
+            let field_key = format!("{struct_key}::{field_name}");
+            self.func_mut()
+                .insert_vla_field_strides_scoped(field_key, strides);
         }
     }
 }

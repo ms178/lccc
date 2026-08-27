@@ -240,14 +240,6 @@ fn parse_load_from_ebp(s: &str) -> Option<(&str, &str, MoveSize)> {
         (r, MoveSize::W)
     } else if let Some(r) = s.strip_prefix("movb ") {
         (r, MoveSize::B)
-    } else if let Some(r) = s.strip_prefix("movzbl ") {
-        (r, MoveSize::L) // movzbl from stack, dest is 32-bit
-    } else if let Some(r) = s.strip_prefix("movzwl ") {
-        (r, MoveSize::L)
-    } else if let Some(r) = s.strip_prefix("movsbl ") {
-        (r, MoveSize::L)
-    } else if let Some(r) = s.strip_prefix("movswl ") {
-        (r, MoveSize::L)
     } else {
         return None;
     };
@@ -4711,7 +4703,7 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             // references safely (it lacks the slot-liveness map), so the
             // only sound choice is to leave such functions untouched.
             let alloc_idx = subls[0].0;
-            let first_dealloc = addls.iter().map(|&(i, _)| i).min();
+            let last_dealloc = addls.iter().map(|&(i, _)| i).max();
             let is_registered_adjust =
                 |idx: usize| -> bool { subls.iter().chain(&addls).any(|&(i, _)| i == idx) };
             // Label name (without ':') -> line index, for resolving jump
@@ -4727,7 +4719,7 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                 }
             }
             let mut envelope_ok = true;
-            if let Some(fd) = first_dealloc {
+            if let Some(ld) = last_dealloc {
                 // 1) Geometry: every %esp engagement must live strictly
                 //    inside the uniformly-shifted interior.
                 // 2) Control flow: entries into the interior must all pass
@@ -4756,13 +4748,13 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                         LineKind::Push { .. } | LineKind::Pop { .. } | LineKind::Call => {}
                         _ => {
                             let t = trimmed(store, &infos[k], k);
-                            if t.contains("%esp") && !(k > alloc_idx && k < fd) {
+                            if t.contains("%esp") && !(k > alloc_idx && k <= ld) {
                                 envelope_ok = false;
                                 break;
                             }
                         }
                     }
-                    if k > alloc_idx && k < fd {
+                    if k > alloc_idx && k <= ld {
                         // Control flow INSIDE the envelope. The transform's
                         // invariant is "esp identical at every program point"
                         // (+4k alloc and +4k deallocs cancel everywhere
