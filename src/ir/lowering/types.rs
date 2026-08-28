@@ -215,6 +215,10 @@ impl Lowerer {
         match ts {
             TypeSpecifier::Void => IrType::Void,
             TypeSpecifier::Bool => IrType::U8,
+            // NOTE: plain char vs signed char is resolved at PARSE time (the
+            // parser emits UnsignedChar for plain char on unsigned-char
+            // targets), so TypeSpecifier::Char here always means explicit
+            // `signed char` and lowers to I8 unconditionally.
             TypeSpecifier::Char => IrType::I8,
             TypeSpecifier::UnsignedChar => IrType::U8,
             TypeSpecifier::Short => IrType::I16,

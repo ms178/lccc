@@ -4983,6 +4983,13 @@ pub(super) fn generate_instruction(
             va_list_ptr,
             result_ty,
         } => {
+            // A 128-bit va_arg result is definitionally a 128-bit value:
+            // without this marker, later pair loads via operand_to_x0_x1
+            // and friends would read only the low 8 bytes and zero-extend
+            // (the is_i128_value fast path would never fire).
+            if is_i128_type(*result_ty) {
+                cg.state().i128_values.insert(dest.0);
+            }
             cg.emit_va_arg(dest, va_list_ptr, *result_ty);
             clobber_after_call_like(cg);
         }

@@ -1,6 +1,7 @@
 //! ArmCodegen: variadic function operations (va_arg, va_start, va_copy).
 
 use super::emit::{callee_saved_name, ArmCodegen};
+use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::Value;
 
@@ -24,6 +25,59 @@ impl ArmCodegen {
                 .emit_fmt(format_args!("    mov x1, {}", reg_name));
         } else if let Some(slot) = self.state.get_slot(va_list_ptr.0) {
             self.emit_load_from_sp("x1", slot.0, "ldr");
+        }
+
+        if is_i128_type(result_ty) {
+            // AAPCS64 va_arg for a 16-byte-aligned type (C __int128 and the
+            // _Float128 U128 carrier): read 16 bytes at an ALIGNED GP pair
+            // slot of the register save area, or from the overflow area at
+            // a 16-byte-aligned __stack. Two conditions must hold for the
+            // register path: at least 16 bytes left (gr_offs <= -16) and
+            // (gr_top + gr_offs) 16-byte aligned — the alignment hole comes
+            // from odd-register args ahead of us, which GCC's layout skips
+            // exactly the same way on the caller side.
+            let label_id = self.state.next_label_id();
+            let label_stack = format!(".Lva_stack_{}", label_id);
+            let label_done = format!(".Lva_done_{}", label_id);
+
+            // Align the offset UP to a 16-byte boundary (glibc's aarch64
+            // va_arg does exactly (__gr_offs + 15) & -16). This is what
+            // makes the caller's even-register skip round-trip: an odd
+            // offs like -56 rounds to -48, i.e. the next aligned pair —
+            // rounding the ADDRESS down instead would re-read the skipped
+            // odd slot. Exhaustion test: aligned offs > -16 means the
+            // remaining register space cannot hold an aligned pair.
+            self.state.emit("    ldrsw x2, [x1, #24]");
+            self.state.emit("    add w2, w2, #15");
+            self.state.emit("    and w2, w2, #-16");
+            self.state.emit("    cmp w2, #-16");
+            self.state
+                .emit_fmt(format_args!("    b.gt {}", label_stack));
+            self.state.emit("    ldr x3, [x1, #8]");
+            self.state.emit("    add x3, x3, w2, sxtw");
+            self.state.emit("    ldr q0, [x3]");
+            self.state.emit("    add w2, w2, #16");
+            self.state.emit("    str w2, [x1, #24]");
+            self.state
+                .emit_fmt(format_args!("    b {}", label_done));
+
+            self.state.emit_fmt(format_args!("{}:", label_stack));
+            // Overflow path: round __stack up to 16 first (per AAPCS64),
+            // and mark the GP side exhausted.
+            self.state.emit("    str wzr, [x1, #24]");
+            self.state.emit("    ldr x3, [x1]");
+            self.state.emit("    add x3, x3, #15");
+            self.state.emit("    and x3, x3, #-16");
+            self.state.emit("    ldr q0, [x3]");
+            self.state.emit("    add x3, x3, #16");
+            self.state.emit("    str x3, [x1]");
+
+            self.state.emit_fmt(format_args!("{}:", label_done));
+            self.state.reg_cache.invalidate_all();
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_sp("q0", slot.0, "str");
+            }
+            return;
         }
 
         if is_f128 {
@@ -258,7 +312,13 @@ impl ArmCodegen {
         // Or: aligned_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
         self.state.emit("    ldrsw x2, [x1, #24]"); // x2 = sign-extended __gr_offs
         if eff_align == 16 {
-            self.state.emit("    and x2, x2, #-16");
+            // Round the offset UP to the alignment (see the i128 va_arg
+            // arm): an odd aligned composite skips to the next even pair.
+            self.state.emit("    add w2, w2, #15");
+            self.state.emit("    and w2, w2, #-16");
+            // The 32-bit and zeroed the upper half of x2; every later use
+            // is 64-bit, so re-sign-extend.
+            self.state.emit("    sxtw x2, w2");
         }
         if total_reg_bytes <= 4095 {
             self.state

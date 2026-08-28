@@ -579,7 +579,7 @@ impl Parser {
             has_short,
             has_int: _,
             has_unsigned,
-            has_signed: _,
+            has_signed,
             has_struct,
             has_union,
             has_enum,
@@ -626,7 +626,20 @@ impl Parser {
             if has_unsigned {
                 TypeSpecifier::UnsignedChar
             } else {
-                TypeSpecifier::Char
+                // C11 6.7.2p5: plain char's signedness is target-defined —
+                // unsigned on AArch64/RISC-V SysV (unsigned char default),
+                // signed on x86. Resolving at the parse boundary makes
+                // TypeSpecifier::Char mean ONLY explicit `signed char`
+                // everywhere downstream (sema, IR lowering, typeof and
+                // typedef round-trips), so no later layer needs the flag.
+                if !has_signed && crate::common::types::char_is_unsigned() {
+                    // plain `char` on an unsigned-char target
+                    TypeSpecifier::UnsignedChar
+                } else {
+                    // `signed char` (explicit), or plain char on a
+                    // signed-char target
+                    TypeSpecifier::Char
+                }
             }
         } else if has_short {
             if has_unsigned {

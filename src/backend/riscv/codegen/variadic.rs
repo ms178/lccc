@@ -25,22 +25,46 @@ impl RiscvCodegen {
         // Load the current va_list pointer value (points to next arg)
         self.state.emit("    ld t2, 0(t1)");
 
-        if result_ty.is_long_double() {
-            // F128 (long double): 16 bytes, 16-byte aligned.
+        if crate::backend::generation::is_i128_type(result_ty) {
+            // __int128: 16 bytes, 16-byte aligned in the overflow area.
+            // The value rides t3/t4 — t1 holds the &va_list pointer for the
+            // write-back below, and t2 walks the arg pointer.
             self.state.emit("    addi t2, t2, 15");
             self.state.emit("    andi t2, t2, -16");
-            self.state.emit("    ld a0, 0(t2)");
-            self.state.emit("    ld a1, 8(t2)");
+            self.state.emit("    ld t3, 0(t2)");
+            self.state.emit("    ld t4, 8(t2)");
             self.state.emit("    addi t2, t2, 16");
             self.state.emit("    sd t2, 0(t1)");
-            self.state.emit("    call __trunctfdf2");
-            self.state.emit("    fmv.x.d t0, fa0");
-        } else {
-            // Standard 8-byte arg
-            self.state.emit("    ld t0, 0(t2)");
-            self.state.emit("    addi t2, t2, 8");
-            self.state.emit("    sd t2, 0(t1)");
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_s0("t3", slot.0, "sd");
+                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
+            }
+            return;
         }
+        if result_ty.is_long_double() {
+            // F128 (long double): 16 bytes, 16-byte aligned. Store the FULL
+            // binary128 value — a __trunctfdf2 round-trip here silently
+            // truncated every long-double vararg to double precision
+            // (aarch64 fixed the identical defect for va-arg-5/va-arg-6;
+            // riscv never received the equivalent).
+            self.state.emit("    addi t2, t2, 15");
+            self.state.emit("    andi t2, t2, -16");
+            // Value rides t3/t4 (t1 = &va_list must survive the round trip).
+            self.state.emit("    ld t3, 0(t2)");
+            self.state.emit("    ld t4, 8(t2)");
+            self.state.emit("    addi t2, t2, 16");
+            self.state.emit("    sd t2, 0(t1)");
+            if let Some(slot) = self.state.get_slot(dest.0) {
+                self.emit_store_to_s0("t3", slot.0, "sd");
+                self.emit_store_to_s0("t4", slot.0 + 8, "sd");
+                self.state.track_f128_self(dest.0);
+            }
+            return;
+        }
+        // Standard 8-byte arg
+        self.state.emit("    ld t0, 0(t2)");
+        self.state.emit("    addi t2, t2, 8");
+        self.state.emit("    sd t2, 0(t1)");
         self.store_t0_to(dest);
     }
 
