@@ -470,25 +470,35 @@ impl ArmCodegen {
                     }
                 }
                 if let Some(rp) = rhs_phys {
-                    if lhs_phys.is_none() && rp.0 == dest_phys.0 {
-                        if let Operand::Value(lv) = lhs {
-                            if let Some(slot) = self.state.get_slot(lv.0) {
-                                let scratch = if use_32bit { "w0" } else { "x0" };
-                                self.emit_load_from_sp(scratch, slot.0, "ldr");
-                                let r = if use_32bit {
-                                    callee_saved_name_32(rp)
-                                } else {
-                                    callee_saved_name(rp)
-                                };
-                                let out = if use_32bit { dest_name_32 } else { dest_name };
-                                self.state.emit_fmt(format_args!(
-                                    "    {} {}, {}, {}",
-                                    mnemonic, out, scratch, r
-                                ));
-                                self.state.reg_cache.invalidate_acc();
-                                return;
-                            }
-                        }
+                    let rhs_name = if use_32bit {
+                        callee_saved_name_32(rp)
+                    } else {
+                        callee_saved_name(rp)
+                    };
+                    if rp.0 == dest_phys.0 {
+                        // rhs lives in dest's home. The three-operand form
+                        // `op dest, lhs, rhs` reads rhs AFTER dest is written,
+                        // so dest==rhs turns the op into `lhs OP lhs` whenever
+                        // lhs is not itself live in that register. This is the
+                        // same machine constraint the allocator's half-open
+                        // handoff does not model locally; the previous repair
+                        // covered only a slotted VALUE lhs — a CONSTANT lhs
+                        // (repro: `(int32_t)c - 2` with the result homed over
+                        // the addend, arm_csinc_select main preheader:
+                        // `mov x23,#-1; sub x23,x23,x23` computed 0) and a
+                        // slotless lhs fell through to the broken form. Stage
+                        // lhs through x0 — that path handles constants, stack
+                        // homes and the accumulator uniformly — then read rhs
+                        // from its (dest-named) home in the same instruction.
+                        let scratch = if use_32bit { "w0" } else { "x0" };
+                        self.operand_to_x0(lhs);
+                        let out = if use_32bit { dest_name_32 } else { dest_name };
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, {}, {}",
+                            mnemonic, out, scratch, rhs_name
+                        ));
+                        self.state.reg_cache.invalidate_acc();
+                        return;
                     }
                     emit3!(|_, is32| if is32 {
                         callee_saved_name_32(rp).to_string()

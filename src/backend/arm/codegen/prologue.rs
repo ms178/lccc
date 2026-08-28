@@ -399,6 +399,7 @@ impl ArmCodegen {
 
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
+        self.func_ret_is_f128_sse = func.ret_is_f128_sse;
         self.current_frame_size = frame_size;
         self.frame_base_offset = None;
         if self.conditional_increment_leaf {

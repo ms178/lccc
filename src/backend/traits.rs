@@ -201,6 +201,18 @@ pub trait ArchCodegen {
                 self.emit_store_result(dest);
             }
         }
+
+        // F128 copies must propagate full-precision source tracking. The
+        // f128 operand loaders pick between a 16-byte slot load and the
+        // lossy `extend(f64(low qword))` fallback based on this metadata;
+        // a Copy through an untracked temporary used to drop it, silently
+        // truncating every later compare/store of the copy (observed:
+        // glibc_ld_copysign -O2, `cs(-2.0L,3.0L) == 2.0L` compared the
+        // low qword reinterpreted as a double). SSA slots are per-value,
+        // so redirecting reads at the source slot is exact.
+        if let Operand::Value(sv) = src {
+            self.state().track_f128_copy(dest.0, sv.0);
+        }
     }
 
     /// Load a stack/constant operand DIRECTLY into a physical register,

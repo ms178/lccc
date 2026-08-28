@@ -250,16 +250,88 @@ pub fn build_elf_symbol_table(input: &SymbolTableInput) -> Vec<ObjSymbol> {
 /// under PGO builds, and only there because block alignment changed the
 /// GOT-layout path).
 fn is_tls_reloc(rtype: u32) -> bool {
-    if crate::common::types::target_is_32bit() {
-        // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
-        // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
-        matches!(rtype, 14..=19 | 24..=37 | 39..=41)
-    } else {
-        // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
-        // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
-        // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
-        // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
-        // NOT TLS — deliberately excluded.
-        matches!(rtype, 16..=23 | 29..=31)
+    // Relocation numbers are per-ISA namespaces: key off the ELF machine, NOT
+    // the pointer size. The old `target_is_32bit()` split classified RISC-V
+    // objects with the x86-64 table, where 16..=23 covers R_RISCV_BRANCH(16),
+    // R_RISCV_JAL(17), R_RISCV_CALL(18), R_RISCV_CALL_PLT(19) and
+    // R_RISCV_PCREL_HI20(23) — every external call symbol was stamped STT_TLS
+    // and cross-GCC links rejected the object ("TLS reference mismatches
+    // non-TLS definition"). Tables below list exactly the TLS-form reloc
+    // numbers of each machine; anything else is not TLS.
+    match crate::common::types::target_elf_machine() {
+        crate::backend::elf::EM_386 => {
+            // i386 R_386_TLS_*: TPOFF=14, IE=15, GOTIE=16, LE=17, GD=18, LDM=19,
+            // GD_32..TPOFF32 = 24..=37, GOTDESC=39, DESC_CALL=40, DESC=41.
+            matches!(rtype, 14..=19 | 24..=37 | 39..=41)
+        }
+        crate::backend::elf::EM_X86_64 => {
+            // x86-64 TLS relocations: DTPMOD64=16, DTPOFF64=17, TPOFF64=18,
+            // TLSGD=19, TLSLD=20, DTPOFF32=21, GOTTPOFF=22, TPOFF32=23,
+            // GOTPC32_TLSDESC=29, TLSDESC_CALL=30, TLSDESC=31.
+            // 41 (GOTPCRELX) and 42 (REX_GOTPCRELX) are relaxable GOT relocations,
+            // NOT TLS — deliberately excluded.
+            matches!(rtype, 16..=23 | 29..=31)
+        }
+        crate::backend::elf::EM_AARCH64 => {
+            // AArch64 TLS: TLSLE_ADD_TPREL_HI12=549, ADD_TPREL_LO12=550,
+            // LO12_NC=551 (numbers verified against the installed
+            // aarch64 binutils by decoding emitted TLS objects).
+            matches!(rtype, 549..=551)
+        }
+        crate::backend::elf::EM_RISCV => {
+            // RISC-V TLS: TLS_GOT_HI20=21, TLS_GD_HI20=22, TPREL_HI20=29,
+            // TPREL_LO12_I=30, TPREL_LO12_S=31, TPREL_ADD=32.
+            matches!(rtype, 21..=22 | 29..=32)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: is_tls_reloc must key off the ELF machine, not the pointer
+    /// size. The old target_is_32bit() split classified RISC-V objects with the
+    /// x86-64 table — R_RISCV_CALL_PLT(19) fell inside x86-64's TLSGD=19..=
+    /// TPOFF32=23 range and every external function symbol was stamped STT_TLS
+    /// ("TLS reference mismatches non-TLS definition" at cross-GCC link).
+    #[test]
+    fn tls_classification_is_per_machine() {
+        use crate::backend::elf::{EM_386, EM_AARCH64, EM_RISCV, EM_X86_64};
+        use crate::common::types::{set_target_elf_machine, target_elf_machine};
+
+        // RISC-V: calls and PC-relative data references are NOT TLS.
+        set_target_elf_machine(EM_RISCV);
+        assert_eq!(target_elf_machine(), EM_RISCV);
+        for r in [16u32 /*BRANCH*/, 17 /*JAL*/, 18 /*CALL*/, 19 /*CALL_PLT*/, 23 /*PCREL_HI20*/, 24 /*PCREL_LO12_I*/, 51 /*RELAX*/] {
+            assert!(!is_tls_reloc(r), "RISC-V r{r} must not be TLS");
+        }
+        for r in [21u32, 22, 29, 30, 31, 32] {
+            assert!(is_tls_reloc(r), "RISC-V r{r} must be TLS");
+        }
+
+        // AArch64: call/jump/GOT relocations are NOT TLS; local-exec TPREL is.
+        set_target_elf_machine(EM_AARCH64);
+        for r in [257u32, 275, 282 /*JUMP26*/, 283 /*CALL26*/] {
+            assert!(!is_tls_reloc(r), "AArch64 r{r} must not be TLS");
+        }
+        for r in [549u32, 550, 551] {
+            assert!(is_tls_reloc(r), "AArch64 r{r} must be TLS");
+        }
+
+        // x86-64: TLSGD=19 is TLS while GOTPCRELX=41 / REX_GOTPCRELX=42 are not.
+        set_target_elf_machine(EM_X86_64);
+        assert!(is_tls_reloc(19));
+        assert!(is_tls_reloc(16));
+        assert!(!is_tls_reloc(41));
+        assert!(!is_tls_reloc(42));
+
+        // i386 keeps its proven table.
+        set_target_elf_machine(EM_386);
+        assert!(is_tls_reloc(14));
+        assert!(is_tls_reloc(37));
+        assert!(!is_tls_reloc(20));
+        assert!(!is_tls_reloc(38));
     }
 }

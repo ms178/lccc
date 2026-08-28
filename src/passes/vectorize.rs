@@ -1873,7 +1873,8 @@ fn analyze_reduction_pattern(
             }
             false
         };
-        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) && !marches_one_element()
+        if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived, 4)
+            && !marches_one_element()
         {
             if debug {
                 eprintln!("[VEC-RED]   Max-reduction array GEP doesn't use IV");
@@ -2101,10 +2102,17 @@ fn analyze_reduction_pattern(
     let mut primary_loads: Vec<Value> = Vec::new();
     let mut pattern = match added_inst {
         // Simple sum pattern: sum += arr[i]
-        Instruction::Load { ptr, .. } => {
+        Instruction::Load { ptr, ty, .. } => {
             let array_gep = *ptr;
-            // Verify GEP uses IV
-            if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
+            // Verify GEP uses IV (canonical unit stride)
+            if !gep_uses_iv(
+                func,
+                &loop_info.body,
+                array_gep,
+                iv,
+                &iv_derived,
+                reduction_element_size(*ty).unwrap_or(0),
+            ) {
                 if debug {
                     eprintln!("[VEC-RED]   Array GEP doesn't use IV");
                 }
@@ -2186,8 +2194,15 @@ fn analyze_reduction_pattern(
                 }
 
                 let array_gep = *ptr;
-                // Verify GEP uses IV
-                if !gep_uses_iv(func, &loop_info.body, array_gep, iv, &iv_derived) {
+                // Verify GEP uses IV (canonical unit stride)
+                if !gep_uses_iv(
+                    func,
+                    &loop_info.body,
+                    array_gep,
+                    iv,
+                    &iv_derived,
+                    reduction_element_size(*load_ty).unwrap_or(0),
+                ) {
                     if debug {
                         eprintln!("[VEC-RED]   Array GEP doesn't use IV");
                     }
@@ -2334,10 +2349,22 @@ fn analyze_reduction_pattern(
                 (element_type, element_type)
             };
 
-            // Verify both GEPs use IV
-            if !gep_uses_iv(func, &loop_info.body, array_a_gep, iv, &iv_derived)
-                || !gep_uses_iv(func, &loop_info.body, array_b_gep, iv, &iv_derived)
-            {
+            // Verify both GEPs use IV (canonical unit stride)
+            if !gep_uses_iv(
+                func,
+                &loop_info.body,
+                array_a_gep,
+                iv,
+                &iv_derived,
+                reduction_element_size(element_type).unwrap_or(0),
+            ) || !gep_uses_iv(
+                func,
+                &loop_info.body,
+                array_b_gep,
+                iv,
+                &iv_derived,
+                reduction_element_size(element_type).unwrap_or(0),
+            ) {
                 if debug {
                     eprintln!("[VEC-RED]   Array GEPs don't use IV");
                 }
@@ -2610,7 +2637,14 @@ fn analyze_secondary_accumulator(
                     set_reject("second accumulator element type mismatch");
                     return None;
                 }
-                if !gep_uses_iv(func, &loop_info.body, *ptr, primary.iv, &iv_derived) {
+                if !gep_uses_iv(
+                    func,
+                    &loop_info.body,
+                    *ptr,
+                    primary.iv,
+                    &iv_derived,
+                    reduction_element_size(primary.element_type).unwrap_or(0),
+                ) {
                     set_reject("second accumulator array index not based on IV");
                     return None;
                 }
@@ -2641,9 +2675,21 @@ fn analyze_secondary_accumulator(
                     set_reject("second dot product operands not loads");
                     return None;
                 };
-                if !gep_uses_iv(func, &loop_info.body, *ap, primary.iv, &iv_derived)
-                    || !gep_uses_iv(func, &loop_info.body, *bp, primary.iv, &iv_derived)
-                {
+                if !gep_uses_iv(
+                    func,
+                    &loop_info.body,
+                    *ap,
+                    primary.iv,
+                    &iv_derived,
+                    reduction_element_size(primary.element_type).unwrap_or(0),
+                ) || !gep_uses_iv(
+                    func,
+                    &loop_info.body,
+                    *bp,
+                    primary.iv,
+                    &iv_derived,
+                    reduction_element_size(primary.element_type).unwrap_or(0),
+                ) {
                     set_reject("second dot product array index not based on IV");
                     return None;
                 }
@@ -3657,13 +3703,6 @@ fn analyze_map_pattern(
         return None;
     }
 
-    // The destination GEP must be indexed by the IV.
-    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived) {
-        if debug {
-            eprintln!("[VEC-MAP]   GEPs don't use IV");
-        }
-        return None;
-    }
     let elem_size = match elem_ty {
         IrType::F64 | IrType::I64 | IrType::U64 => 8,
         IrType::F32 | IrType::I32 | IrType::U32 => 4,
@@ -3672,13 +3711,20 @@ fn analyze_map_pattern(
             return None;
         }
     };
+    // The destination GEP must be indexed by the IV (canonical unit stride).
+    if !gep_uses_iv(func, &loop_info.body, dst_gep, iv, &iv_derived, elem_size) {
+        if debug {
+            eprintln!("[VEC-MAP]   GEPs don't use IV");
+        }
+        return None;
+    }
     if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
         set_reject("map access is not a contiguous element-size stride");
         return None;
     }
     // Every source stream must be IV-indexed and contiguous as well.
     for &(_, _, src_gep, _) in &load_infos {
-        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived)
+        if !gep_uses_iv(func, &loop_info.body, src_gep, iv, &iv_derived, elem_size)
             || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
         {
             set_reject("map source access is not a contiguous element-size stride");
@@ -5633,6 +5679,7 @@ fn gep_uses_iv(
     gep: Value,
     iv: Value,
     iv_derived: &FxHashSet<Value>,
+    elem_size: u32,
 ) -> bool {
     // Find the GEP instruction in the loop
     for &block_idx in loop_blocks {
@@ -5658,17 +5705,177 @@ fn gep_uses_iv(
                     if !gep_base_is_loop_invariant(func, loop_blocks, *base, iv, iv_derived) {
                         return false;
                     }
-                    // Check if offset uses IV or IV-derived value
-                    if let Operand::Value(v) = offset {
-                        if v == &iv || iv_derived.contains(v) {
-                            return true;
-                        }
-                        // Also check if offset is computed from IV (e.g., iv * 8)
-                        // Trace back through multiply/add operations
-                        return value_depends_on_iv(func, loop_blocks, *v, iv, iv_derived);
-                    }
+                    // The packed VecLoad consumes elem_size*vec_width
+                    // CONTIGUOUS bytes per vector iteration, and the transform
+                    // re-scales the whole offset chain by vec_width. That is
+                    // only semantics-preserving when the scalar byte offset is
+                    // exactly `iv * elem_size` (unit-stride stream of
+                    // elements). Struct fields (`s[i].f`, byte stride 12) or
+                    // any other affine-but-non-contiguous shape would load
+                    // adjacent fields as if they were consecutive elements
+                    // (struct_array_sum miscompile) — and the byte-IV bound
+                    // rewrite over/under-covers the array. Require the
+                    // canonical shape; anything else stays scalar.
+                    return match offset {
+                        Operand::Value(v) => offset_is_canonical_unit_stride(
+                            func, *v, iv, iv_derived, elem_size,
+                        ),
+                        _ => false,
+                    };
                 }
             }
+        }
+    }
+    false
+}
+
+/// True when `v` is exactly the induction variable scaled by the element
+/// size: `iv`, `sext/zext/copy(iv)`, `(cast(iv)) * elem_size`,
+/// `elem_size * (cast(iv))`, or `(cast(iv)) << log2(elem_size)`.
+///
+/// GEP offsets in this IR are BYTE offsets (the remainder loop lowers
+/// `a[i]` to `GEP(base, i*elem_size)`), so offset == raw iv means a
+/// one-byte stride, which is only the canonical shape for elem_size == 1
+/// (never vectorizable) — it is rejected here.
+///
+/// Every accepted form is closed under the two rewrites the transforms
+/// perform: the vec_width scaling (`offset * w` covers w consecutive
+/// elements) and the byte-IV relatch (the offset equals the byte-stepping
+/// IV). Both require stride == elem_size exactly; this is the single gate
+/// that keeps the contiguous-stream model honest.
+fn offset_is_canonical_unit_stride(
+    func: &IrFunction,
+    v: Value,
+    iv: Value,
+    iv_derived: &FxHashSet<Value>,
+    elem_size: u32,
+) -> bool {
+    if elem_size < 2 || !elem_size.is_power_of_two() {
+        return false;
+    }
+    // Small iterative worklist instead of recursion: the chains are short
+    // (cast/copy around a mul/shl), 8 hops is far beyond any real shape.
+    let mut cur = v;
+    for _ in 0..8 {
+        if cur == iv || iv_derived.contains(&cur) {
+            // A raw iv/cast-of-iv offset (no mul/shl) is a one-byte stride,
+            // which is not the canonical elem_size shape for elem_size >= 2.
+            return false;
+        }
+        let mut def: Option<&Instruction> = None;
+        for block in &func.blocks {
+            let found = block.instructions.iter().find(|i| i.dest() == Some(cur));
+            if found.is_some() {
+                def = found;
+                break;
+            }
+        }
+        let inst = match def {
+            Some(i) => i,
+            None => return false,
+        };
+        match inst {
+            Instruction::Copy {
+                src: Operand::Value(s),
+                ..
+            } => {
+                cur = *s;
+            }
+            Instruction::Cast {
+                src: Operand::Value(s),
+                from_ty,
+                to_ty,
+                ..
+            } => {
+                // Accept only widening casts (sext/zext of the same value);
+                // narrowing casts change the value — fail closed.
+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
+                {
+                    return false;
+                }
+                cur = *s;
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(a),
+                rhs: Operand::Const(c),
+                ..
+            }
+            | Instruction::BinOp {
+                op: IrBinOp::Mul,
+                lhs: Operand::Const(c),
+                rhs: Operand::Value(a),
+                ..
+            } => {
+                return c.to_i64() == Some(elem_size as i64)
+                    && scaled_operand_is_iv(func, *a, iv, iv_derived);
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(a),
+                rhs: Operand::Const(c),
+                ..
+            } => {
+                return c.to_i64() == Some(elem_size.trailing_zeros() as i64)
+                    && scaled_operand_is_iv(func, *a, iv, iv_derived);
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True when `v` is the IV or reaches it through widening casts / copies
+/// only. Used as the scaled operand of the canonical `iv * elem_size` /
+/// `iv << log2(elem_size)` offset forms; any other derivation fails closed.
+fn scaled_operand_is_iv(
+    func: &IrFunction,
+    v: Value,
+    iv: Value,
+    iv_derived: &FxHashSet<Value>,
+) -> bool {
+    let mut cur = v;
+    for _ in 0..8 {
+        if cur == iv {
+            return true;
+        }
+        // iv_derived holds IV-plus-constant shapes (iv+1 etc.), which are NOT
+        // the canonical operand — only exact cast chains qualify beyond the
+        // IV itself.
+        let mut def: Option<&Instruction> = None;
+        for block in &func.blocks {
+            let found = block.instructions.iter().find(|i| i.dest() == Some(cur));
+            if found.is_some() {
+                def = found;
+                break;
+            }
+        }
+        let inst = match def {
+            Some(i) => i,
+            None => return false,
+        };
+        match inst {
+            Instruction::Copy {
+                src: Operand::Value(s),
+                ..
+            } => {
+                cur = *s;
+            }
+            Instruction::Cast {
+                src: Operand::Value(s),
+                from_ty,
+                to_ty,
+                ..
+            } => {
+                // Accept only widening casts (sext/zext of the same value);
+                // narrowing casts change the value — fail closed.
+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
+                {
+                    return false;
+                }
+                cur = *s;
+            }
+            _ => return false,
         }
     }
     false
@@ -5710,56 +5917,6 @@ fn gep_base_is_loop_invariant(
     }
     // Not defined in any loop block: defined before the loop — invariant.
     true
-}
-
-/// Check if a value depends on the IV (transitively through operations)
-fn value_depends_on_iv(
-    func: &IrFunction,
-    loop_blocks: &FxHashSet<usize>,
-    val: Value,
-    iv: Value,
-    iv_derived: &FxHashSet<Value>,
-) -> bool {
-    if val == iv || iv_derived.contains(&val) {
-        return true;
-    }
-
-    // Search for the instruction that produces this value
-    for &block_idx in loop_blocks {
-        let block = &func.blocks[block_idx];
-        for inst in &block.instructions {
-            if inst.dest() == Some(val) {
-                // Check if this instruction uses IV-derived values
-                match inst {
-                    Instruction::BinOp { lhs, rhs, .. } => {
-                        let lhs_uses_iv = if let Operand::Value(v) = lhs {
-                            v == &iv || iv_derived.contains(v)
-                        } else {
-                            false
-                        };
-                        let rhs_uses_iv = if let Operand::Value(v) = rhs {
-                            v == &iv || iv_derived.contains(v)
-                        } else {
-                            false
-                        };
-                        return lhs_uses_iv || rhs_uses_iv;
-                    }
-                    Instruction::Cast { src, .. } => {
-                        if let Operand::Value(v) = src {
-                            return v == &iv || iv_derived.contains(v);
-                        }
-                    }
-                    Instruction::Copy { dest: _, src } => {
-                        if let Operand::Value(v) = src {
-                            return v == &iv || iv_derived.contains(v);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Find exit block (first successor outside the loop).
