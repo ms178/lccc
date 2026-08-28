@@ -69,3 +69,8 @@ zlib-ng-validation/
 # (got swept by git add -A in aa1956b and 12eed2b)
 /-
 .base_ref
+
+# QEMU TCG plugin API header — GPLv2+ upstream, fetched on demand by
+# scripts/qemu_icount_plugin/build.sh; never vendored into this permissive tree.
+/scripts/qemu_icount_plugin/qemu-plugin.h
+/scripts/qemu_icount_plugin/*.so

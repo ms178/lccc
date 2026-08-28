@@ -39,6 +39,13 @@ extern unsigned int region_a_len, region_b_len, region_scaled;
 extern unsigned int named_addend, named_scaled;
 extern int neg_plain, neg_addend, neg_scaled;
 extern unsigned int rep_last;
+extern struct alt_len alt_empty;
+extern unsigned int empty_orig_len, empty_pad_len;
+extern struct alt_len alt_two_a, alt_two_b;
+extern unsigned int two_pad_a, two_pad_b;
+/* Both gaps are 3 bytes of padding but with DIFFERENT fill bytes, so the
+ * byte pattern distinguishes source order from spliced-backwards order. */
+extern unsigned char *two_fill_a, *two_fill_b;
 
 /* --- Case 1+2: a jump inside the measured region that relaxation shrinks.
  * The original is padded up to the replacement's length. orig_len must equal
@@ -75,6 +82,111 @@ asm(".text\n"
     "1:\n"
     "  ret\n"
     ".size probe_a, .-probe_a\n");
+
+/* --- Case 2b: an ALTERNATIVE whose ORIGINAL instruction is EMPTY.
+ *
+ * This is the shape the kernel uses to patch in an instruction that old CPUs
+ * do not have at all (`ALTERNATIVE("", "stac", X86_FEATURE_SMAP)`), and it is
+ * what produced "empty alternative entry" on every LCCC-built object.
+ *
+ * `780:` and `781:` coincide because the original is zero bytes long, so the
+ * deferred `.skip` gap starts at an offset that labels defined BEFORE it
+ * already occupy. The fill bytes must be inserted AFTER those labels. If the
+ * gap drags them forward instead, `782b-780b` collapses to 0, the recorded
+ * source length is zero, and boot-time alternative patching becomes a no-op:
+ * the SMAP/lfence-style alternatives silently never take effect. No
+ * diagnostic is emitted anywhere along the way. */
+asm(".text\n"
+    ".globl probe_empty\n"
+    ".type probe_empty, @function\n"
+    "probe_empty:\n"
+    "  nop\n"
+    "780:\n"
+    "781:\n"
+    "  .skip -(((784f-783f)-(781b-780b)) > 0) * ((784f-783f)-(781b-780b)),0x90\n"
+    "782:\n"
+    "  .pushsection .altinstr_replacement,\"ax\"\n"
+    "783:\n"
+    "  stac\n"                       /* 0f 01 cb — 3 bytes */
+    "784:\n"
+    "  .popsection\n"
+    "  .pushsection .data\n"
+    "  .globl alt_empty\n"
+    "alt_empty:\n"
+    "  .byte 782b-780b\n"            /* padded source length: 3 */
+    "  .byte 784b-783b\n"            /* replacement length:   3 */
+    "  .globl empty_orig_len\n"
+    "empty_orig_len:\n"
+    "  .long 781b-780b\n"            /* unpadded original:    0 */
+    "  .globl empty_pad_len\n"
+    "empty_pad_len:\n"
+    "  .long 782b-781b\n"            /* padding really emitted: 3 */
+    "  .popsection\n"
+    "  ret\n"
+    ".size probe_empty, .-probe_empty\n");
+
+/* --- Case 2c: TWO CONSECUTIVE empty-original ALTERNATIVEs.
+ *
+ * Neither original emits a byte, so both deferred `.skip` gaps start at the
+ * SAME section offset. Splicing them in source order pushes the first gap's
+ * fill bytes to the right of the second gap's, silently permuting the code
+ * (observed as `cc 90 90 90` where GNU as emits `90 90 90 cc`) even though
+ * every recorded LENGTH still looks correct. The two gaps must instead be
+ * materialised in reverse source order, which leaves the section contents in
+ * source order.
+ *
+ * This is the nested-ALTERNATIVE / back-to-back-ALTERNATIVE shape; six of the
+ * twelve entries in `fs/readdir.o` were affected. Length checks alone cannot
+ * catch it, so the fill bytes are distinct and checked at runtime. */
+asm(".text\n"
+    ".globl probe_two\n"
+    ".type probe_two, @function\n"
+    "probe_two:\n"
+    "  nop\n"
+    "  jmp .Ltwo_out\n"
+    "790:\n"
+    "791:\n"
+    "  .skip -(((794f-793f)-(791b-790b)) > 0) * ((794f-793f)-(791b-790b)),0x90\n"
+    "792:\n"
+    "  .pushsection .altinstr_replacement,\"ax\"\n"
+    "793:\n"
+    "  stac\n"                       /* 0f 01 cb - 3 bytes */
+    "794:\n"
+    "  .popsection\n"
+    "795:\n"
+    "796:\n"
+    "  .skip -(((799f-798f)-(796b-795b)) > 0) * ((799f-798f)-(796b-795b)),0xcc\n"
+    "797:\n"
+    "  .pushsection .altinstr_replacement,\"ax\"\n"
+    "798:\n"
+    "  stac\n"                       /* 0f 01 cb - 3 bytes */
+    "799:\n"
+    "  .popsection\n"
+    "  .pushsection .data\n"
+    "  .globl alt_two_a\n"
+    "alt_two_a:\n"
+    "  .byte 792b-790b\n"            /* first entry padded length:  3 */
+    "  .byte 794b-793b\n"            /* first entry replacement len: 3 */
+    "  .globl alt_two_b\n"
+    "alt_two_b:\n"
+    "  .byte 797b-795b\n"            /* second entry padded length:  3 */
+    "  .byte 799b-798b\n"            /* second entry replacement len: 3 */
+    "  .globl two_pad_a\n"
+    "two_pad_a:\n"
+    "  .long 792b-791b\n"            /* first gap fill:  3 */
+    "  .globl two_pad_b\n"
+    "two_pad_b:\n"
+    "  .long 797b-796b\n"            /* second gap fill: 3 */
+    "  .globl two_fill_a\n"
+    "two_fill_a:\n"
+    "  .quad 791b\n"                 /* first gap, must be 90 90 90 */
+    "  .globl two_fill_b\n"
+    "two_fill_b:\n"
+    "  .quad 796b\n"                 /* second gap, must be cc cc cc */
+    "  .popsection\n"
+    ".Ltwo_out:\n"
+    "  ret\n"
+    ".size probe_two, .-probe_two\n");
 
 /* --- Case 3: a `.p2align 4` AFTER a resolved `.skip`. The following symbol
  * must be 16-byte aligned; a stale marker offset silently mis-pads it. */
@@ -198,6 +310,34 @@ int main(void)
                fail = 1;
        }
 
+       /* Case 2b: an empty original is padded UP to the replacement length,
+        * and the padding is inserted after the coincident 780:/781: labels.
+        * orig_len == 0 here is exactly the "empty alternative entry" defect:
+        * the kernel would patch zero bytes. */
+       if (alt_empty.orig_len != 3) {
+               printf("FAIL alt_empty orig_len=%u expected 3 (empty original "
+                      "not padded to replacement length)\n",
+                      alt_empty.orig_len);
+               fail = 1;
+       }
+       if (alt_empty.repl_len != 3) {
+               printf("FAIL alt_empty repl_len=%u expected 3\n",
+                      alt_empty.repl_len);
+               fail = 1;
+       }
+       /* The unpadded original really is empty... */
+       if (empty_orig_len != 0) {
+               printf("FAIL empty_orig_len=%u expected 0\n", empty_orig_len);
+               fail = 1;
+       }
+       /* ...and the gap it opened is exactly the replacement length. If the
+        * preceding labels had been dragged forward by the fill bytes, this
+        * would read 0 and orig_len above would read 0 too. */
+       if (empty_pad_len != 3) {
+               printf("FAIL empty_pad_len=%u expected 3\n", empty_pad_len);
+               fail = 1;
+       }
+
        /* A `.p2align 4` after a resolved `.skip` must really align. */
        if (((unsigned long)(void *)aligned_after_skip & 0xf) != 0) {
                printf("FAIL aligned_after_skip=%p not 16-byte aligned\n",
@@ -259,6 +399,51 @@ int main(void)
 	/* `1b - 1b` binds both refs to the SAME nearest definition => 0. */
 	if (rep_last != 0) {
 		printf("FAIL rep_last=%u expected 0\n", rep_last);
+		fail = 1;
+	}
+
+	/* Case 2c: two consecutive empty originals, each padded to 3 bytes, in
+	 * source order and with the right fill byte in each gap. */
+	if (alt_two_a.orig_len != 3) {
+		printf("FAIL alt_two_a orig_len=%u expected 3\n",
+		       alt_two_a.orig_len);
+		fail = 1;
+	}
+	if (alt_two_a.repl_len != 3) {
+		printf("FAIL alt_two_a repl_len=%u expected 3\n",
+		       alt_two_a.repl_len);
+		fail = 1;
+	}
+	if (alt_two_b.orig_len != 3) {
+		printf("FAIL alt_two_b orig_len=%u expected 3\n",
+		       alt_two_b.orig_len);
+		fail = 1;
+	}
+	if (alt_two_b.repl_len != 3) {
+		printf("FAIL alt_two_b repl_len=%u expected 3\n",
+		       alt_two_b.repl_len);
+		fail = 1;
+	}
+	if (two_pad_a != 3) {
+		printf("FAIL two_pad_a=%u expected 3\n", two_pad_a);
+		fail = 1;
+	}
+	if (two_pad_b != 3) {
+		printf("FAIL two_pad_b=%u expected 3\n", two_pad_b);
+		fail = 1;
+	}
+	if (two_fill_a[0] != 0x90 || two_fill_a[1] != 0x90 ||
+	    two_fill_a[2] != 0x90) {
+		printf("FAIL gap 1 fill = %02x %02x %02x expected 90 90 90 "
+		       "(gaps spliced in the wrong order)\n",
+		       two_fill_a[0], two_fill_a[1], two_fill_a[2]);
+		fail = 1;
+	}
+	if (two_fill_b[0] != 0xcc || two_fill_b[1] != 0xcc ||
+	    two_fill_b[2] != 0xcc) {
+		printf("FAIL gap 2 fill = %02x %02x %02x expected cc cc cc "
+		       "(gaps spliced in the wrong order)\n",
+		       two_fill_b[0], two_fill_b[1], two_fill_b[2]);
 		fail = 1;
 	}
 

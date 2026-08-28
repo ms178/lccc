@@ -277,7 +277,10 @@ impl ArmCodegen {
                 // intrinsic/argument staging into the lossy f64-extend
                 // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
                 Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
-                _ => false,
+                // Exhaustive on purpose: `Operand` is exactly {Value, Const}.
+                // A future variant must force an explicit decision here rather
+                // than silently degrading to "not a full-precision source",
+                // which is how the lossy f64-extend fallback regressed.
             };
             if tracked_val && slot_anchored {
                 self.state.track_f128_self(ptr.0);
