@@ -32,5 +32,9 @@ int main(void) {
     // typeof of that is `struct dst_entry`. The cast `(typeof(...)*)(p)`
     // is `struct dst_entry *`. q->x should be 42.
     typeof(({ __xchg(p, 8); })) *q = (typeof(({ __xchg(p, 8); })) *)(p);
-    return (q != NULL) ? q->x : -1;
+    // The runner protocol requires exit 0: success is q pointing at
+    // global_dst with the expected payload, not the payload itself
+    // (the original form returned 42 == q->x, failing the exit-0 check
+    // for every compiler).
+    return (q == &global_dst && q->x == 42) ? 0 : -1;
 }

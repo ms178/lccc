@@ -218,6 +218,11 @@ fn lea_scale_for_mul(imm: i64) -> Option<u8> {
 // ── BinOp Lowering ───────────────────────────────────────────────────────
 
 /// Lower an IR BinOp instruction to MachInst sequence.
+///
+/// Returns false when this operation cannot be lowered safely under the
+/// current register assignment (the caller must re-emit it through the
+/// default, mature path — which sequences its moves with read-then-write
+/// IR semantics). `out` is untouched when false is returned.
 pub fn lower_binop(
     dest: &Value,
     op: IrBinOp,
@@ -226,7 +231,7 @@ pub fn lower_binop(
     ty: IrType,
     ra: &FxHashMap<u32, PhysReg>,
     out: &mut Vec<MachInst>,
-) {
+) -> bool {
     let size = OpSize::from_ir_type(ty);
     let dst = value_to_reg(dest, ra);
 
@@ -243,7 +248,7 @@ pub fn lower_binop(
                     offset: 0,
                     dst,
                 });
-                return;
+                return true;
             }
             (Operand::Value(base), Operand::Const(_)) => {
                 if let Some(offset) = const_as_imm32(rhs) {
@@ -253,7 +258,7 @@ pub fn lower_binop(
                         offset,
                         dst,
                     });
-                    return;
+                    return true;
                 }
             }
             (Operand::Const(_), Operand::Value(base)) => {
@@ -264,7 +269,7 @@ pub fn lower_binop(
                         offset,
                         dst,
                     });
-                    return;
+                    return true;
                 }
             }
             _ => {}
@@ -283,7 +288,7 @@ pub fn lower_binop(
                         offset: 0,
                         dst,
                     });
-                    return;
+                    return true;
                 }
                 if imm != 0 && imm != 1 {
                     let src = match lhs {
@@ -299,13 +304,45 @@ pub fn lower_binop(
                         dst,
                         size,
                     });
-                    return;
+                    return true;
                 }
             }
         }
+        // Two-address aliasing constraint: the lowered form
+        // `mov lhs,dst; alu rhs,dst` reads rhs AFTER dst has been written,
+        // but the allocator only guarantees the IR's read-then-write
+        // semantics — homing rhs and dest in one register is legal there
+        // (dest is born at this instruction, rhs dies at it). The machine
+        // form would silently compute `lhs OP lhs` instead of
+        // `lhs OP rhs`. Repro: sqlite3GetVarint's `b <<= 14; b |= *p` —
+        // the byte load and dest homed to %edx produced `or %edx,%edx`,
+        // dropping the byte and mis-decoding every 9-byte varint.
+        //
+        // Commutative ops (Add/And/Or/Xor/Mul) swap the operands so the
+        // register-homed non-dest operand is the one that survives the
+        // mov; Sub (and any shape where the surviving operand would still
+        // alias dst) falls back to the mature emitter. Flags are not
+        // observable through IR BinOp, so the swap is semantically
+        // transparent.
+        let rhs_home_is_dst = matches!(rhs, Operand::Value(v) if v.0 != dest.0)
+            && matches!(rhs, Operand::Value(v) if value_to_reg(v, ra) == value_to_reg(dest, ra))
+            && matches!(value_to_reg(dest, ra), MachReg::Phys(_));
+        if rhs_home_is_dst {
+            let lhs_survives = match lhs {
+                Operand::Const(_) => true,
+                Operand::Value(v) => value_to_reg(v, ra) != value_to_reg(dest, ra),
+            };
+            let commutative = !matches!(op, IrBinOp::Sub);
+            if commutative && lhs_survives {
+                emit_mov_operand_r(rhs, dst, size, ra, out);
+                emit_alu_operand_r(alu_op, lhs, dst, size, ra, out);
+                return true;
+            }
+            return false;
+        }
         emit_mov_operand_r(lhs, dst, size, ra, out);
         emit_alu_operand_r(alu_op, rhs, dst, size, ra, out);
-        return;
+        return true;
     }
 
     // ── Shift operations ─────────────────────────────────────────────
@@ -328,7 +365,7 @@ pub fn lower_binop(
                 size,
             });
         }
-        return;
+        return true;
     }
 
     // ── Division and remainder ───────────────────────────────────────
@@ -359,6 +396,7 @@ pub fn lower_binop(
                 dst: MachOperand::Reg(dst),
                 size,
             });
+            true
         }
         IrBinOp::UDiv | IrBinOp::URem => {
             emit_mov_operand_r(lhs, MachReg::Phys(RAX), size, ra, out);
@@ -383,6 +421,7 @@ pub fn lower_binop(
                 dst: MachOperand::Reg(dst),
                 size,
             });
+            true
         }
         _ => unreachable!("unhandled binop: {:?}", op),
     }
@@ -897,8 +936,7 @@ pub fn lower_instruction_typed(
             if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
                 return false;
             }
-            lower_binop(dest, *op, lhs, rhs, *ty, ra, out);
-            true
+            lower_binop(dest, *op, lhs, rhs, *ty, ra, out)
         }
         Instruction::Load {
             dest,
