@@ -1,0 +1,992 @@
+{
+  "aggregate_lccc_vs_best_reference": {
+    "arithmetic_mean_ratio": 1.0899097859727487,
+    "best": {
+      "benchmark": "hash_table",
+      "ratio": 1.0899097859727487,
+      "reference": "gcc"
+    },
+    "geometric_mean_ratio": 1.0899097859727487,
+    "interpretation": "LCCC / fastest available reference paired median; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "hash_table",
+      "ratio": 1.0899097859727487,
+      "reference": "gcc"
+    }
+  },
+  "aggregate_lccc_vs_gcc": {
+    "arithmetic_mean_ratio": 1.0899097859727487,
+    "best": {
+      "benchmark": "hash_table",
+      "ratio": 1.0899097859727487
+    },
+    "geometric_mean_ratio": 1.0899097859727487,
+    "interpretation": "LCCC/GCC paired median ratios; <1 means LCCC faster",
+    "n_correct_benchmarks": 1,
+    "worst": {
+      "benchmark": "hash_table",
+      "ratio": 1.0899097859727487
+    }
+  },
+  "benchmarks": [
+    {
+      "baseline_compiler": "gcc",
+      "compile": {
+        "gcc": {
+          "binary_bytes": 16104,
+          "child_cpu_s": 0.062136,
+          "command": [
+            "/usr/bin/gcc",
+            "-O2",
+            "-o",
+            "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc",
+            "/home/z/lccc/tests/benchmark/programs/hash_table.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "15dbc049d2ddd3c4e710209ca65c08da134d585b3a454ab59639eca274a5eb03",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1940,
+          "wall_s": 0.062970431
+        },
+        "lccc": {
+          "binary_bytes": 7736,
+          "child_cpu_s": 0.11603000000000001,
+          "command": [
+            "/home/z/lccc/target/fastbuild/lccc",
+            "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+            "-O2",
+            "-o",
+            "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc",
+            "/home/z/lccc/tests/benchmark/programs/hash_table.c"
+          ],
+          "error": "",
+          "ok": true,
+          "returncode": 0,
+          "source_sha256": "15dbc049d2ddd3c4e710209ca65c08da134d585b3a454ab59639eca274a5eb03",
+          "stderr": "",
+          "stdout": "",
+          "text_bytes": 1759,
+          "wall_s": 0.117146452
+        }
+      },
+      "correctness": {
+        "gcc": {
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000",
+          "stable_within_compiler": true
+        }
+      },
+      "description": "hash table / pointer chasing",
+      "name": "hash_table",
+      "ratios_from_lccc": {
+        "gcc": {
+          "cv": 0.022337960354956027,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0014240548810061648,
+          "max": 1.1440774270516758,
+          "mean": 1.0934546539716608,
+          "median": 1.0899097859727487,
+          "median_ci95_bootstrap": [
+            1.0889988447826267,
+            1.09923448434334
+          ],
+          "min": 1.0545480167316712,
+          "n": 8,
+          "outlier_count_mad": 3,
+          "raw": [
+            {
+              "ratio": 1.1440774270516758,
+              "round": 0
+            },
+            {
+              "ratio": 1.0545480167316712,
+              "round": 1
+            },
+            {
+              "ratio": 1.091846954544639,
+              "round": 2
+            },
+            {
+              "ratio": 1.0891119323738365,
+              "round": 3
+            },
+            {
+              "ratio": 1.0900169489972684,
+              "round": 4
+            },
+            {
+              "ratio": 1.089802622948229,
+              "round": 5
+            },
+            {
+              "ratio": 1.0889988447826267,
+              "round": 6
+            },
+            {
+              "ratio": 1.09923448434334,
+              "round": 7
+            }
+          ],
+          "stdev": 0.02442554671036112
+        }
+      },
+      "ratios_to_gcc": {
+        "lccc": {
+          "cv": 0.022337960354956027,
+          "interpretation": "numerator/denominator; <1 means numerator faster",
+          "mad": 0.0014240548810061648,
+          "max": 1.1440774270516758,
+          "mean": 1.0934546539716608,
+          "median": 1.0899097859727487,
+          "median_ci95_bootstrap": [
+            1.0889988447826267,
+            1.09923448434334
+          ],
+          "min": 1.0545480167316712,
+          "n": 8,
+          "outlier_count_mad": 3,
+          "raw": [
+            {
+              "ratio": 1.1440774270516758,
+              "round": 0
+            },
+            {
+              "ratio": 1.0545480167316712,
+              "round": 1
+            },
+            {
+              "ratio": 1.091846954544639,
+              "round": 2
+            },
+            {
+              "ratio": 1.0891119323738365,
+              "round": 3
+            },
+            {
+              "ratio": 1.0900169489972684,
+              "round": 4
+            },
+            {
+              "ratio": 1.089802622948229,
+              "round": 5
+            },
+            {
+              "ratio": 1.0889988447826267,
+              "round": 6
+            },
+            {
+              "ratio": 1.09923448434334,
+              "round": 7
+            }
+          ],
+          "stdev": 0.02442554671036112
+        }
+      },
+      "rounds": [
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 0,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 21.396298999999985,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.399519627
+            },
+            "lccc": {
+              "child_cpu_s": 24.480343000000012,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 24.482707355
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 1,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.994641,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.997964534
+            },
+            "lccc": {
+              "child_cpu_s": 21.087537999999995,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.088813838
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 2,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.100963999999976,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.10226784
+            },
+            "lccc": {
+              "child_cpu_s": 20.855428000000018,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 20.856752966
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 3,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.31948699999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.320957779
+            },
+            "lccc": {
+              "child_cpu_s": 21.04123100000004,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.042685662
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 4,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.239255999999983,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.240575406
+            },
+            "lccc": {
+              "child_cpu_s": 20.970940000000013,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 20.972553301
+            }
+          }
+        },
+        {
+          "order": [
+            "gcc",
+            "lccc"
+          ],
+          "round": 5,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.515521000000035,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.517037292
+            },
+            "lccc": {
+              "child_cpu_s": 21.268230999999957,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.269718433
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 6,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.77882699999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.780038396
+            },
+            "lccc": {
+              "child_cpu_s": 21.53909299999998,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.540438963
+            }
+          }
+        },
+        {
+          "order": [
+            "lccc",
+            "gcc"
+          ],
+          "round": 7,
+          "runs": {
+            "gcc": {
+              "child_cpu_s": 19.579991000000007,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 19.581178477
+            },
+            "lccc": {
+              "child_cpu_s": 21.52316400000001,
+              "command": [
+                "/usr/bin/taskset",
+                "-c",
+                "0",
+                "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+              ],
+              "error": "",
+              "ok": true,
+              "returncode": 0,
+              "stderr": "",
+              "stdout": "hash_table sum: 1999998000000",
+              "wall_s": 21.524306626
+            }
+          }
+        }
+      ],
+      "runs": {
+        "gcc": [
+          {
+            "child_cpu_s": 21.396298999999985,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.399519627
+          },
+          {
+            "child_cpu_s": 19.994641,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.997964534
+          },
+          {
+            "child_cpu_s": 19.100963999999976,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.10226784
+          },
+          {
+            "child_cpu_s": 19.31948699999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.320957779
+          },
+          {
+            "child_cpu_s": 19.239255999999983,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.240575406
+          },
+          {
+            "child_cpu_s": 19.515521000000035,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.517037292
+          },
+          {
+            "child_cpu_s": 19.77882699999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.780038396
+          },
+          {
+            "child_cpu_s": 19.579991000000007,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 19.581178477
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 24.480343000000012,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 24.482707355
+          },
+          {
+            "child_cpu_s": 21.087537999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.088813838
+          },
+          {
+            "child_cpu_s": 20.855428000000018,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 20.856752966
+          },
+          {
+            "child_cpu_s": 21.04123100000004,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.042685662
+          },
+          {
+            "child_cpu_s": 20.970940000000013,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 20.972553301
+          },
+          {
+            "child_cpu_s": 21.268230999999957,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.269718433
+          },
+          {
+            "child_cpu_s": 21.53909299999998,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.540438963
+          },
+          {
+            "child_cpu_s": 21.52316400000001,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 21.524306626
+          }
+        ]
+      },
+      "runtime": {
+        "gcc": {
+          "child_cpu": {
+            "cv": 0.03693648027749912,
+            "mad": 0.26978549999999757,
+            "max": 21.396298999999985,
+            "mean": 19.74062324999999,
+            "median": 19.54775600000002,
+            "median_ci95_bootstrap": [
+              19.239255999999983,
+              19.994641
+            ],
+            "min": 19.100963999999976,
+            "n": 8,
+            "outlier_count_mad": 1,
+            "stdev": 0.7291491413391653
+          },
+          "quality_warnings": [
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            21.399519627,
+            19.997964534,
+            19.10226784,
+            19.320957779,
+            19.240575406,
+            19.517037292,
+            19.780038396,
+            19.581178477
+          ],
+          "wall": {
+            "cv": 0.03696857461545668,
+            "mad": 0.2697314949999985,
+            "max": 21.399519627,
+            "mean": 19.742442418875,
+            "median": 19.549107884500003,
+            "median_ci95_bootstrap": [
+              19.240575406,
+              19.997964534
+            ],
+            "min": 19.10226784,
+            "n": 8,
+            "outlier_count_mad": 1,
+            "stdev": 0.7298499556535376
+          }
+        },
+        "lccc": {
+          "child_cpu": {
+            "cv": 0.055181656042346025,
+            "mad": 0.2647004999999609,
+            "max": 24.480343000000012,
+            "mean": 21.595746000000002,
+            "median": 21.177884499999976,
+            "median_ci95_bootstrap": [
+              20.970940000000013,
+              21.53909299999998
+            ],
+            "min": 20.855428000000018,
+            "n": 8,
+            "outlier_count_mad": 1,
+            "stdev": 1.1916890277498702
+          },
+          "quality_warnings": [
+            "wall-clock coefficient of variation is 5.5% (>5%)",
+            "1 MAD outlier(s) retained (never silently discarded)"
+          ],
+          "raw_wall_s": [
+            24.482707355,
+            21.088813838,
+            20.856752966,
+            21.042685662,
+            20.972553301,
+            21.269718433,
+            21.540438963,
+            21.524306626
+          ],
+          "wall": {
+            "cv": 0.05519297412941419,
+            "mad": 0.2646130020000008,
+            "max": 24.482707355,
+            "mean": 21.597247143,
+            "median": 21.1792661355,
+            "median_ci95_bootstrap": [
+              20.972553301,
+              21.540438963
+            ],
+            "min": 20.856752966,
+            "n": 8,
+            "outlier_count_mad": 1,
+            "stdev": 1.1920163028301636
+          }
+        }
+      },
+      "source": "/home/z/lccc/tests/benchmark/programs/hash_table.c",
+      "source_sha256": "15dbc049d2ddd3c4e710209ca65c08da134d585b3a454ab59639eca274a5eb03",
+      "tags": [
+        "synthetic",
+        "memory",
+        "branch"
+      ],
+      "warmups": {
+        "gcc": [
+          {
+            "child_cpu_s": 22.995702999999995,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_gcc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 22.997439198
+          }
+        ],
+        "lccc": [
+          {
+            "child_cpu_s": 25.197521000000002,
+            "command": [
+              "/usr/bin/taskset",
+              "-c",
+              "0",
+              "/home/z/lccc/lccc_bench_6cnnhgmt/hash_table_lccc"
+            ],
+            "error": "",
+            "ok": true,
+            "returncode": 0,
+            "stderr": "",
+            "stdout": "hash_table sum: 1999998000000",
+            "wall_s": 25.200930287
+          }
+        ]
+      },
+      "warnings": []
+    }
+  ],
+  "compilers": [
+    {
+      "binary_sha256": "c86d62b0f9b1143644d53593ded215edb799d6b41d36edb721a0a16bf4fbc68b",
+      "executable": "/home/z/lccc/target/fastbuild/lccc",
+      "flags": [
+        "-I/usr/lib/gcc/x86_64-linux-gnu/14/include",
+        "-O2"
+      ],
+      "key": "lccc",
+      "label": "LCCC"
+    },
+    {
+      "binary_sha256": "a23ecab8ff08f09ad8c80602c2c5df7f49e09c25905cb8975902e101bf72635f",
+      "executable": "/usr/bin/gcc",
+      "flags": [
+        "-O2"
+      ],
+      "key": "gcc",
+      "label": "GCC"
+    }
+  ],
+  "metadata": {
+    "compiler_versions": {
+      "gcc": "gcc (Debian 14.2.0-19) 14.2.0",
+      "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+    },
+    "cpu_governors": {},
+    "cpu_models": [
+      "Intel(R) Xeon(R) Processor"
+    ],
+    "git": {
+      "repo": "/home/z/lccc",
+      "revision": "1b3994e7e48808b9637b37a1f004d091b792f1fc",
+      "status": ""
+    },
+    "hypervisor_detected": true,
+    "meminfo": "MemTotal:        4259380 kB\nMemFree:         1414124 kB\nMemAvailable:    3129412 kB\nBuffers:            7868 kB\nCached:          1812116 kB\nSwapCached:            0 kB\nActive:           759384 kB\nInactive:        1967248 kB\nActive(anon):       6288 kB\nInactive(anon):   900400 kB\nActive(file):     753096 kB\nInactive(file):  1066848 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\nDirty:              1248 kB\nWriteback:             0 kB\nAnonPages:        900092 kB\nMapped:            79132 kB\nShmem:                48 kB\nKReclaimable:      70792 kB\nSlab:              89508 kB\nSReclaimable:      70792 kB\nSUnreclaim:        18716 kB\nKernelStack:        3936 kB\nPageTables:        10224 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:     2129688 kB\nCommitted_AS:    1541836 kB\nVmallocTotal:   13743895347199 kB\nVmallocUsed:        4284 kB\nVmallocChunk:          0 kB\nPercpu:              600 kB\nAnonHugePages:    194560 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nDupText:               0 kB\nMemZeroed:             0 kB\nUnaccepted:            0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       18432 kB\nDirectMap2M:     4741120 kB\nDirectMap1G:           0 kB",
+    "pinning": {
+      "allowed_cpus": [
+        0,
+        1
+      ],
+      "applied": true,
+      "cpu": 0,
+      "reason": "taskset pinning",
+      "requested": "auto"
+    },
+    "platform": "Linux-5.10.134-013.8.3.kangaroo.al8.x86_64-x86_64-with-glibc2.41",
+    "pmu": {
+      "available": false,
+      "perf_event_paranoid": "2",
+      "perf_path": null,
+      "probed": true,
+      "reason": "perf is not installed"
+    },
+    "python": "3.12.14 (main, Aug 14 2026, 15:34:45) [Clang 22.1.3 ]",
+    "swap": "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority",
+    "timestamp_utc": "2026-08-28T18:43:28.068648+00:00",
+    "uname": [
+      "Linux",
+      "c-6a918f12-145d6674-30ad7f0eaf77",
+      "5.10.134-013.8.3.kangaroo.al8.x86_64",
+      "#1 SMP Fri May 29 08:22:43 UTC 2026",
+      "x86_64"
+    ],
+    "work_root": {
+      "candidates": [
+        {
+          "free_bytes": 4374790144,
+          "path": "/home/z/lccc"
+        },
+        {
+          "free_bytes": 4374790144,
+          "path": "/var/tmp"
+        },
+        {
+          "free_bytes": 4374790144,
+          "path": "/tmp"
+        }
+      ],
+      "free_bytes": 4374790144,
+      "reason": "largest writable candidate among repository, /var/tmp, /tmp",
+      "selected": "/home/z/lccc"
+    }
+  },
+  "runner_warnings": [],
+  "schema": "lccc-bench-v2",
+  "settings": {
+    "common_cflags": [],
+    "compiler_order_policy": "randomized independently in every paired round",
+    "opt": "-O2",
+    "outlier_policy": "MAD outliers counted and reported; none are removed",
+    "reps": 8,
+    "seed": 20260828,
+    "skip_perf": false,
+    "timer": "time.perf_counter_ns wall-clock plus resource.RUSAGE_CHILDREN CPU time",
+    "warmup": 1
+  },
+  "unavailable_compilers": {}
+}

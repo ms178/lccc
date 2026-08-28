@@ -12,6 +12,7 @@ numbers as screening records, not current claims; the live state is
 |------|------|
 | `godbolt/` | Compiler Explorer oracle corpus (gcc16.2 / clang 22.1 / icx), scoreboard, methodology |
 | `workloads/` | gzip / zlib-ng / Expat LCCC vs GCC measurements |
+| `benchmarks/2026-08-28-1b3994e7/` | canonical 33-kernel screening run (raw JSON + verified merge) behind the root README table |
 | `aarch64/session59..61/` | AArch64 torture + VM screening records (frozen) |
 | `simd-fp-oracle.md` | SIMD/FP oracle audit methodology + 2026-08-18 record |
 | `pmu/` | (future) hardware PMU snapshots from the 14700KF metal runner (MS-14) |
