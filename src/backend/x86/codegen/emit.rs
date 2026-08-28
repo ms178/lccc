@@ -3862,16 +3862,44 @@ impl ArchCodegen for X86Codegen {
                         reject = true;
                     }
                 }
-                // Allow alloca bases (ISel handles via AllocaAddr + leaq)
-                if !state.is_alloca(base.0) {
-                    if let Some(r) = ra.get(&base.0) {
-                        if r.0 >= 20 {
-                            reject = true;
-                        }
-                    }
-                    if !ra.contains_key(&base.0) && state.get_slot(base.0).is_none() {
+                // Allow alloca bases (ISel handles via AllocaAddr + leaq).
+                // Non-alloca bases must be register-homed: ISel emits
+                // `Lea { base: Vreg }` for a stack-homed pointer, and
+                // resolve_stack_vregs cannot rewrite that to a SIB off the
+                // slot — the slot holds the POINTER VALUE, not an address
+                // to index. Fallback then re-emits with empty fold maps.
+                if !state.is_alloca(base.0) && !ra.contains_key(&base.0) {
+                    reject = true;
+                }
+                if let Some(r) = ra.get(&base.0) {
+                    if r.0 >= 20 {
                         reject = true;
                     }
+                }
+            }
+            // 64-bit Add is selected as Lea (base + index). A stack-homed
+            // operand becomes MachReg::Vreg; Lea cannot encode it, and
+            // substituting the slot as the Lea base would compute
+            // `&slot + index` instead of `*slot + index`. The unresolvable
+            // Vreg forces a default-path replay with empty GEP/global-addr
+            // fold maps, which ICEs on values the skipped producers never
+            // homed (kernel tracing_iter_reset: RELOC_HIDE ptr +
+            // `__per_cpu_offset[cpu]` after an indexed-sym load).
+            crate::ir::reexports::Instruction::BinOp {
+                op: crate::ir::reexports::IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } if ty.size() == 8 && !ty.is_float() => {
+                let add_op_is_phys = |op: &crate::ir::reexports::Operand| match op {
+                    crate::ir::reexports::Operand::Const(_) => true,
+                    crate::ir::reexports::Operand::Value(v) => ra
+                        .get(&v.0)
+                        .is_some_and(|r| r.0 < 20),
+                };
+                if !add_op_is_phys(lhs) || !add_op_is_phys(rhs) {
+                    reject = true;
                 }
             }
             _ => {}
@@ -3983,6 +4011,9 @@ impl ArchCodegen for X86Codegen {
                     if has_unresolvable_vreg(mi, &self.reg_assignments) {
                         eprintln!("[MI-FALLBACK]   unresolvable: {mi:?}");
                     }
+                }
+                for inst in &self.machinst_buf_ir {
+                    eprintln!("[MI-FALLBACK]   ir: {inst:?}");
                 }
             }
             // CORRECTNESS: never delete instructions. Re-emit the buffered IR
