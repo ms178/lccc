@@ -1946,10 +1946,27 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
         // until it is overwritten. The transform does `OP mem, %REGd`, which
         // DESTROYS %REGd; if %REGd is read before being overwritten (or is live
         // on another edge at a barrier), the transform is unsound.
+        //
+        // ms178 (session 32): the old scan had TWO soundness holes that
+        // miscompiled HUF_readDTableX2_wksp -O2 (kernel zstd):
+        //   1. It was limited to a 16-instruction window (`n < j + 16`). A
+        //      register whose next use lay beyond the window (e.g. a value
+        //      homed in %r13 whose live range continues into a loop whose
+        //      header is >16 instructions away) was treated as dead, the fold
+        //      fired, and the loop read the clobbered register — nbBits became
+        //      scaleLog (12-11=1) and HUF_fillDTableX2ForWeight overflowed the
+        //      DTable with length=1<<11.
+        //   2. In the fallback arm, an instruction that merely REFERENCES the
+        //      source register (`tn.contains(src_reg32)`) was treated as
+        //      benign and skipped. A reference is a READ: the fold destroys
+        //      the value, so any read before the next overwrite is fatal.
+        //   The scan must therefore run to the next barrier (labels/branches
+        //   delimit the region where liveness can be proven block-locally) and
+        //   treat ANY reference that is not a recognized overwrite as a use.
         let src_bit = 1u16 << src_family;
         let mut n = j + 1;
         let mut src_safe = true;
-        while n < len && n < j + 16 {
+        while n < len {
             if infos[n].is_nop() {
                 n += 1;
                 continue;
@@ -1970,11 +1987,9 @@ pub(super) fn fold_accumulator_alu_store(store: &mut LineStore, infos: &mut [Lin
                 LineKind::LoadRbp { reg, .. } if reg == src_family => break,
                 LineKind::Other { dest_reg } if dest_reg == src_family => break,
                 _ => {
-                    let tn = infos[n].trimmed(store.get(n));
-                    if tn.contains(&*src_reg32) {
-                        n += 1;
-                        continue;
-                    }
+                    // Any other reference to the source family is a READ of
+                    // the value the fold is about to destroy (or an
+                    // unrecognized write form): not provably safe.
                     src_safe = false;
                     break;
                 }

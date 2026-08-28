@@ -332,6 +332,10 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Dash-leading flag values ("--local-flags -O3", "--flags -O3 ...") are
+    # rejected by argparse as options; join them exactly like godbolt.py.
+    argv = godbolt.join_dash_values(argv)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("sources", nargs="+", type=Path)
     parser.add_argument("--function", action="append", default=[], help="function to isolate; repeatable")

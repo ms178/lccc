@@ -63,10 +63,38 @@ if [[ ! -f .lccc-vm-config ]]; then
     echo "build_kernel_vm: modules must stay disabled for milestone 1" >&2
     exit 1
   }
+  # A `choice` symbol without a default (RANDSTRUCT on 6.18.4x) cannot be
+  # auto-answered by a mid-build `syncconfig` re-run: with stdin closed it
+  # dies with "Error in reading or end of file" AFTER hundreds of objects
+  # compiled. olddefconfig answers it, but the kernel re-runs syncconfig
+  # whenever the config is touched, so VERIFY the config is fully answered
+  # up front: a syncconfig dry-run here fails in seconds, not after the
+  # compile phase.
+  make ARCH=x86_64 syncconfig >/dev/null || {
+    echo "build_kernel_vm: syncconfig cannot auto-answer the config (stale .config?); regenerating" >&2
+    make ARCH=x86_64 allnoconfig >/dev/null
+    scripts/kconfig/merge_config.sh -m .config "$FRAGMENT" >/dev/null
+    make ARCH=x86_64 olddefconfig >/dev/null
+    make ARCH=x86_64 syncconfig >/dev/null || {
+      echo "build_kernel_vm: config still fails syncconfig after regeneration" >&2
+      exit 1
+    }
+  }
   touch .lccc-vm-config
 fi
 
 start=$(date +%s)
+# Refresh include/config/auto.conf SERIALLY before the parallel build.  A
+# -j2 `bzImage` re-runs syncconfig as part of `prepare`, and when auto.conf
+# is stale that re-run can prompt for NEW symbols (cc-option-dependent
+# visibility differs between the config-generation and build contexts) and
+# die with "Error in reading or end of file" — after the config phase
+# already passed.  A serial syncconfig here makes the build's own
+# syncconfig a no-op (auto.conf is fresh), eliminating the race entirely.
+make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" HOSTCC=gcc syncconfig >/dev/null || {
+  echo "build_kernel_vm: serial syncconfig refresh failed" >&2
+  exit 1
+}
 echo "build: make CC=$LCCC LD=$LCCC_LD HOSTCC=gcc -j$JOBS bzImage (log: $LOG)"
 set +e
 make ARCH=x86_64 \
