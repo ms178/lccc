@@ -33,30 +33,36 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 # (gcc >= 12 resolves -fuse-ld=mold to ld.mold on PATH) so the fast-linker
 # preference survives with only mold installed (e.g. conda-forge mold next
 # to a system gcc).
-# CARGO_TARGET_*_LINKER alone is not enough: the committed rustflags still
-# pass `-fuse-ld=mold`, so we override both via `cargo --config`.
+# `--config` overrides the *linker*, but it cannot CANCEL the committed
+# `target.<triple>.rustflags` entry that passes `-fuse-ld=mold`: cargo keeps
+# the config-file value for a key it also finds on the command line, so
+# `--config 'target...rustflags=[]'` leaves `-fuse-ld=mold` in every link and
+# the build dies with "collect2: fatal error: cannot find 'ld'" on hosts
+# without mold.  The RUSTFLAGS environment variable is the only override that
+# outranks every config file, so the linker mode is expressed through it.
 cargo_config=()
+rustflags=""
 if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
-    : # keep .cargo/config.toml (clang -fuse-ld=mold)
+    : # keep .cargo/config.toml (clang driver, -fuse-ld=mold)
+    # Reproduce the committed flags explicitly: RUSTFLAGS is authoritative in
+    # every mode, so it must not silently drop the mold preference.
+    rustflags="-C link-arg=-fuse-ld=mold"
 elif command -v ld.mold >/dev/null 2>&1; then
     # mold without clang: gcc driver + mold backend. `-fuse-ld=mold` requires
     # an `ld.mold` on PATH (the conda-forge/make-install symlink layout);
     # `command -v ld.mold` guarantees that exact resolution.
-    cargo_config=(
+    cargo_config+=(
         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
-        --config 'target.x86_64-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold"]'
         --config 'target.i686-unknown-linux-gnu.linker="gcc"'
-        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-fuse-ld=mold","-C","link-arg=-m32"]'
     )
+    rustflags="-C link-arg=-fuse-ld=mold"
     printf '%s\n' "note: clang not found; linking with gcc driver + mold backend"
 else
-    cargo_config=(
+    cargo_config+=(
         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
-        --config 'target.x86_64-unknown-linux-gnu.rustflags=[]'
         --config 'target.i686-unknown-linux-gnu.linker="gcc"'
-        --config 'target.i686-unknown-linux-gnu.rustflags=["-C","link-arg=-m32"]'
     )
-    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld"
+    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld (bfd)"
 fi
 
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
@@ -70,8 +76,13 @@ printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"
 #
 # Set LCCC_ALLOW_WARNINGS=1 for a scratch build mid-refactor.
 if [ "${LCCC_ALLOW_WARNINGS:-0}" != "1" ]; then
-    export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
+    rustflags="${rustflags:+$rustflags }-D warnings"
 fi
+# Export unconditionally: RUSTFLAGS outranks every config file, so it is the
+# single authoritative source of rustc flags in all three link modes. (Only the
+# host target is built here; the i686 `-m32` link arg in .cargo/config.toml
+# applies to `--target i686-unknown-linux-gnu`, which this script never uses.)
+export RUSTFLAGS="$rustflags"
 
 exec cargo build --profile fastbuild --locked -j "${CARGO_BUILD_JOBS}" \
     "${cargo_config[@]}"

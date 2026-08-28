@@ -552,6 +552,38 @@ fn tokenize_expr(expr: &str) -> Result<Vec<ExprToken>, String> {
 /// Contains all the common logic for building ELF relocatable objects
 /// from parsed assembly items. Architecture-specific behavior is
 /// provided through the `X86Arch` trait parameter.
+/// A `.skip` whose size is not a compile-time constant at emission time
+/// (it references labels that are not yet resolved), so its fill bytes are
+/// spliced in later by `resolve_deferred_skips`.
+#[derive(Clone, Debug)]
+pub struct DeferredSkip {
+    /// Section the `.skip` was emitted into.
+    pub sec_idx: usize,
+    /// Section offset the gap starts at (== section length at emission time).
+    pub offset: usize,
+    /// Unresolved size expression.
+    pub expr: String,
+    /// Fill byte (the `.skip size, fill` second operand; 0 when omitted).
+    pub fill: u8,
+    /// Labels already sitting at exactly `offset` when the `.skip` was seen.
+    ///
+    /// A label defined immediately BEFORE the skip and one defined
+    /// immediately AFTER it both record the very same offset, because the
+    /// gap has no length yet. The two must be treated differently: the
+    /// fill bytes are inserted *after* the former and *before* the latter.
+    /// Without this snapshot the adjustment loop below (which keys on
+    /// `loff >= offset`) shifts both, so a preceding label is dragged
+    /// forward by the gap and any difference against it collapses —
+    /// observed as the kernel's `.byte 773b-771b` (total source length of an
+    /// ALTERNATIVE with an empty old instruction) assembling as 0 instead of
+    /// the padded length, which objtool reports as "empty alternative entry"
+    /// and which makes boot-time alternative patching a no-op.
+    pub labels_at_offset: Vec<String>,
+    /// Same, for numeric local labels: (label number, index into that
+    /// number's definition list).
+    pub numeric_at_offset: Vec<(String, usize)>,
+}
+
 pub struct ElfWriterCore<A: X86Arch> {
     sections: Vec<Section>,
     symbols: Vec<SymbolInfo>,
@@ -593,8 +625,8 @@ pub struct ElfWriterCore<A: X86Arch> {
     /// the versioned alias).
     symver_flags: FxHashMap<String, (String, crate::backend::x86::assembler::parser::SymverFlag)>,
     section_stack: Vec<(Option<usize>, Option<usize>)>,
-    /// Deferred `.skip` expressions: (section_index, offset, expression, fill_byte).
-    deferred_skips: Vec<(usize, usize, String, u8)>,
+    /// Deferred `.skip` expressions with symbolic sizes (see `DeferredSkip`).
+    deferred_skips: Vec<DeferredSkip>,
     /// Deferred byte-sized symbol diffs: (section_index, offset, sym_a, sym_b, size, addend).
     deferred_byte_diffs: Vec<(usize, usize, String, String, usize, i64)>,
     /// Deferred ULEB/SLEB128 symbol diffs: (section, offset, sym_a, sym_b, addend, signed).
@@ -995,8 +1027,19 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         section.data.extend(std::iter::repeat_n(*fill, n));
                     } else {
                         let offset = self.sections[sec_idx].data.len();
-                        self.deferred_skips
-                            .push((sec_idx, offset, expr.clone(), *fill));
+                        // Remember which labels are already parked at this
+                        // exact offset: they precede the gap and must stay put
+                        // when the fill bytes are spliced in later.
+                        let (labels_at_offset, numeric_at_offset) =
+                            self.snapshot_labels_at(sec_idx, offset);
+                        self.deferred_skips.push(DeferredSkip {
+                            sec_idx,
+                            offset,
+                            expr: expr.clone(),
+                            fill: *fill,
+                            labels_at_offset,
+                            numeric_at_offset,
+                        });
                     }
                 } else {
                     // Simple integer parse for architectures without deferred skip support
@@ -1664,11 +1707,60 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     // ─── Deferred skip resolution (x86-64 and i686) ──────────────────
 
+    /// Snapshot the labels positioned at exactly `offset` in `sec_idx`.
+    ///
+    /// Taken when a `.skip` with a symbolic size is deferred. At that moment
+    /// the gap has no length, so a label defined immediately before the
+    /// `.skip` and one defined immediately after it share the same recorded
+    /// offset and are otherwise indistinguishable later on.
+    fn snapshot_labels_at(
+        &self,
+        sec_idx: usize,
+        offset: usize,
+    ) -> (Vec<String>, Vec<(String, usize)>) {
+        let off = offset as u64;
+        let mut plain = Vec::new();
+        for (name, &(lsec, loff)) in self.label_positions.iter() {
+            if lsec == sec_idx && loff == off {
+                plain.push(name.clone());
+            }
+        }
+        let mut numeric = Vec::new();
+        for (num, positions) in self.numeric_label_positions.iter() {
+            for (i, &(lsec, loff)) in positions.iter().enumerate() {
+                if lsec == sec_idx && loff == off {
+                    numeric.push((num.clone(), i));
+                }
+            }
+        }
+        (plain, numeric)
+    }
+
     fn resolve_deferred_skips(&mut self) -> Result<(), String> {
         let mut skips = std::mem::take(&mut self.deferred_skips);
-        skips.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).reverse());
+        // Ties (two deferred skips at the SAME offset) must be spliced in
+        // REVERSE source order. Each splice inserts at `offset`, pushing
+        // already-inserted bytes to the right, so processing them in source
+        // order would put the second gap's fill BEFORE the first gap's fill
+        // and silently permute the section contents (observed as
+        // `cc 90 90 90` where GNU as emits `90 90 90 cc`). `sort_by` is
+        // stable, so reversing the VECTOR (rather than negating the
+        // comparator, which leaves ties in source order) is what yields
+        // descending offsets with reversed ties.
+        skips.sort_by(|a, b| a.sec_idx.cmp(&b.sec_idx).then(a.offset.cmp(&b.offset)));
+        skips.reverse();
 
-        for (sec_idx, offset, expr, fill) in &skips {
+        for skip in &skips {
+            // Destructure by reference: `skips` is detached from `self`, so
+            // the mutable borrows of `self` below are sound.
+            let DeferredSkip {
+                sec_idx,
+                offset,
+                expr,
+                fill,
+                labels_at_offset,
+                numeric_at_offset,
+            } = skip;
             // Temporarily insert "." (current position) into label_positions so
             // expressions like "0b + 16 - ." can reference the directive's offset.
             self.label_positions
@@ -1688,15 +1780,38 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 .data
                 .splice(*offset..*offset, fill_bytes);
 
-            // Adjust label positions
-            for (_, (lsec, loff)) in self.label_positions.iter_mut() {
-                if *lsec == *sec_idx && (*loff as usize) >= *offset {
+            // Adjust label positions.
+            //
+            // A label moves iff it lies strictly after the gap, or sits
+            // exactly at the gap start but was defined *after* the `.skip`.
+            // The second clause is what distinguishes the two kinds of
+            // same-offset label: `labels_at_offset` holds the ones that were
+            // already there when the skip was deferred, and those must stay
+            // put. Relocations, jumps, alignment markers and deferred diffs
+            // below keep `>=` because they are always emitted by items that
+            // follow the `.skip` in the stream.
+            for (name, (lsec, loff)) in self.label_positions.iter_mut() {
+                if *lsec != *sec_idx {
+                    continue;
+                }
+                let at_gap = (*loff as usize) == *offset;
+                let after = (*loff as usize) > *offset
+                    || (at_gap && !labels_at_offset.iter().any(|n| n == name));
+                if after {
                     *loff += count as u64;
                 }
             }
-            for (_, positions) in self.numeric_label_positions.iter_mut() {
-                for (lsec, loff) in positions.iter_mut() {
-                    if *lsec == *sec_idx && (*loff as usize) >= *offset {
+            for (num, positions) in self.numeric_label_positions.iter_mut() {
+                for (i, (lsec, loff)) in positions.iter_mut().enumerate() {
+                    if *lsec != *sec_idx {
+                        continue;
+                    }
+                    let at_gap = (*loff as usize) == *offset;
+                    let preceded = numeric_at_offset
+                        .iter()
+                        .any(|(n, idx)| n == num && *idx == i);
+                    let after = (*loff as usize) > *offset || (at_gap && !preceded);
+                    if after {
                         *loff += count as u64;
                     }
                 }
@@ -1767,9 +1882,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 marker.offset -= delta as usize;
             }
         }
-        for (skip_sec, skip_off, _, _) in self.deferred_skips.iter_mut() {
-            if *skip_sec == sec_idx && *skip_off >= from {
-                *skip_off -= delta as usize;
+        for skip in self.deferred_skips.iter_mut() {
+            if skip.sec_idx == sec_idx && skip.offset >= from {
+                skip.offset -= delta as usize;
             }
         }
     }
@@ -2765,9 +2880,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     marker.offset -= shrink;
                                 }
                             }
-                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
-                                if *s_idx == sec_idx && *s_off > offset {
-                                    *s_off -= shrink;
+                            for skip in self.deferred_skips.iter_mut() {
+                                if skip.sec_idx == sec_idx && skip.offset > offset {
+                                    skip.offset -= shrink;
                                 }
                             }
                             for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
@@ -2848,9 +2963,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     marker.offset += grow;
                                 }
                             }
-                            for (s_idx, s_off, _, _) in self.deferred_skips.iter_mut() {
-                                if *s_idx == sec_idx && *s_off > offset {
-                                    *s_off += grow;
+                            for skip in self.deferred_skips.iter_mut() {
+                                if skip.sec_idx == sec_idx && skip.offset > offset {
+                                    skip.offset += grow;
                                 }
                             }
                             for (s_idx, s_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
@@ -3039,9 +3154,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
             }
         }
         // Update deferred skips and byte diffs
-        for (skip_sec, skip_off, _, _) in self.deferred_skips.iter_mut() {
-            if *skip_sec == sec_idx && *skip_off >= at_offset {
-                *skip_off = (*skip_off as i64 + delta) as usize;
+        for skip in self.deferred_skips.iter_mut() {
+            if skip.sec_idx == sec_idx && skip.offset >= at_offset {
+                skip.offset = (skip.offset as i64 + delta) as usize;
             }
         }
         for (bd_sec, bd_off, _, _, _, _) in self.deferred_byte_diffs.iter_mut() {
