@@ -391,13 +391,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+DASH_VALUE_OPTIONS = {"--flags", "--local-flags"}
+
+
+def join_dash_values(argv: list[str]) -> list[str]:
+    """Join ``--flags -O3`` → ``--flags=-O3`` so dash-leading flag values parse.
+
+    argparse treats a token beginning with ``-`` as an option, so the natural
+    spelling ``godbolt.py compile gcc16.2 f.c --flags -O3`` dies with
+    ``argument --flags: expected one argument``.  ``--flags=-O3`` works, but
+    the spaced form is what every docstring and example in this repo shows,
+    so the CLI must accept it.  Only the known value options are rewritten;
+    ``--flags -O3 --function f`` must not swallow ``--function``.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in DASH_VALUE_OPTIONS:
+            # A value that starts with '-' is still a value if it is a
+            # single-dash token (-O3, -march=...): this CLI has no single-dash
+            # options other than -h, which never follows --flags.  Joining
+            # makes both "--flags -O3" and "--flags=-O3" work.
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is not None and (not nxt.startswith("-") or re.match(r"^-[^-]", nxt)):
+                out.append(f"{token}={nxt}")
+                i += 2
+                continue
+            out.append(token)  # let argparse report the missing value
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Backward-compatible spelling: godbolt.py <compiler-id> <source> ...
     if argv and argv[0] not in {"list", "compile", "compare", "-h", "--help"}:
         argv.insert(0, "compile")
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(join_dash_values(argv))
     if not hasattr(args, "func"):
         parser.print_help(sys.stderr)
         return 2
