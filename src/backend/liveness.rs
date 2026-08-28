@@ -290,6 +290,9 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &alloca_set,
         &id_to_dense,
         &ps.copy_src,
+        &ps.def_points,
+        &ps.block_start_points,
+        &ps.block_end_points,
         &mut ps.last_use_points,
         &mut ps.block_gen,
     );
@@ -692,6 +695,9 @@ fn extend_gep_base_liveness(
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     copy_src: &FxHashMap<u32, Vec<u32>>,
+    def_points: &[u32],
+    block_start_points: &[u32],
+    block_end_points: &[u32],
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
 ) -> FxHashSet<u32> {
@@ -844,6 +850,8 @@ fn extend_gep_base_liveness(
                         bi,
                         alloca_set,
                         id_to_dense,
+                        def_points,
+                        &(block_start_points[bi], block_end_points[bi]),
                         copy_src,
                         last_use_points,
                         block_gen,
@@ -856,6 +864,8 @@ fn extend_gep_base_liveness(
                             bi,
                             alloca_set,
                             id_to_dense,
+                            def_points,
+                            &(block_start_points[bi], block_end_points[bi]),
                             copy_src,
                             last_use_points,
                             block_gen,
@@ -872,12 +882,25 @@ fn extend_gep_base_liveness(
 }
 
 /// Extend `start_id` and every Copy-chain source (all phi-elim preds) to `point`.
+///
+/// The `block_gen` insertion — which keeps the value live at the consuming
+/// block's ENTRY so liveness propagates through intermediate blocks — is
+/// applied ONLY when the value's def is OUTSIDE the consuming block
+/// (cross-block fold). A value defined in the same block is NOT upward-
+/// exposed: inserting it into gen anyway inflated its fat interval to the
+/// whole block span (single-block functions: the whole function), which
+/// masqueraded as register pressure and blocked homes for values whose real
+/// ranges are a few instructions (vsprintf number()'s `num % base` digit
+/// index measured [0..22] instead of [12..15]).
+#[allow(clippy::too_many_arguments)]
 fn extend_use_following_copies(
     start_id: u32,
     point: u32,
     block_idx: usize,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
+    def_points: &[u32],
+    block_range: &(u32, u32),
     copy_src: &FxHashMap<u32, Vec<u32>>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
@@ -896,7 +919,15 @@ fn extend_use_following_copies(
             if *entry == u32::MAX || point > *entry {
                 *entry = point;
             }
-            block_gen[block_idx].insert(dense);
+            // Only values whose def is NOT inside the consuming block are
+            // live at its entry. SSA dominance guarantees a same-block def
+            // precedes the use, so the fat interval already covers it.
+            let def_in_block = def_points[dense] != u32::MAX
+                && def_points[dense] >= block_range.0
+                && def_points[dense] <= block_range.1;
+            if !def_in_block {
+                block_gen[block_idx].insert(dense);
+            }
         }
         if let Some(srcs) = copy_src.get(&id) {
             for &src in srcs {

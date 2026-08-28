@@ -187,6 +187,16 @@ impl I686Codegen {
                         | (IrType::U64, IrType::U64)
                 ) =>
             {
+                // DEAD no-op of a FUSED mul-acc chain (single-use dest whose
+                // only reader — the chain — emitted nothing): suppress the
+                // slot-pair copy. Never reached for rejected chains, whose
+                // no-ops must still materialise for the standalone tail.
+                if self.mulacc_virtual_casts.contains(&dest.0) {
+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                        eprintln!("[MULACC] virtual no-op cast dest={} (emits nothing)", dest.0);
+                    }
+                    return;
+                }
                 self.emit_load_acc_pair(src);
                 self.emit_store_acc_pair(dest);
                 self.state.reg_cache.invalidate_all();
@@ -194,6 +204,18 @@ impl I686Codegen {
 
             // --- Widening casts to I64/U64 need full 8-byte store ---
             CastKind::IntWiden { .. } if matches!(to_ty, IrType::I64 | IrType::U64) => {
+                // VIRTUAL feeder of a fused mul-acc chain: the zext emits
+                // NOTHING — its high half is provably zero and the fused
+                // chain head references the 32-bit source directly (see
+                // resolve_mulacc_plans; mulacc_virtual_casts is populated
+                // only for single-use feeds of FUSED chains, so the cast's
+                // dest has no other reader).
+                if self.mulacc_virtual_casts.contains(&dest.0) {
+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                        eprintln!("[MULACC] virtual widening feeder dest={} (emits nothing)", dest.0);
+                    }
+                    return;
+                }
                 self.operand_to_eax(src);
                 self.emit_cast_instrs_impl(from_ty, to_ty);
                 // Set high half: sign-extend for signed sources, zero-extend for unsigned
