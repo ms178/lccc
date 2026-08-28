@@ -1,0 +1,1616 @@
+//! Fortify-stdio folding: rewrite hardened variadic stdio entry points whose
+//! result is unused, whose flag is provably 1, and whose format string is a
+//! compile-time constant into the plain non-hardened equivalents.
+//!
+//! Contract (validated against GCC's -O2 folding oracle via the abort-probe
+//! torture tests gcc.c-torture/execute/{printf,vprintf,fprintf,vfprintf}-chk-1.c,
+//! which define the hardened functions `noinline` and abort iff a foldable
+//! call still reaches them):
+//!
+//! * ONLY result-unused calls fold.  A call whose return value is consumed
+//!   keeps the hardened entry point (its return value is the formatted byte
+//!   count, which no replacement preserves).
+//! * ONLY flag == 1 folds.  The flag operand is hunted through Copy/Cast
+//!   chains to a constant; any non-1 or non-constant flag refuses.
+//! * ONLY constant format strings fold.  The format operand is hunted through
+//!   Copy/Cast chains to a `GlobalAddr` of a string literal; embedded NUL
+//!   bytes refuse (the runtime would truncate the output mid-string, a shape
+//!   the byte-level replacements cannot express).
+//!
+//! Per-family rules, matching GCC's fold exactly — including its refusals:
+//!
+//! printf family (`__printf_chk(flag, fmt, ...)` / `__vprintf_chk(flag, fmt, ap)`,
+//! output goes to stdout, no stream operand):
+//!   * `""`                  → call deleted (prints nothing, result unused)
+//!   * single char `c`       → `putchar(c)`
+//!   * `%`-free, ≥2 chars, ending in `\n` → `puts(fmt[:-1])`
+//!     (the trailing newline is *stripped*: puts appends one)
+//!   * anything else `%`-free (e.g. `"hello"`) is deliberately NOT folded —
+//!     GCC keeps the hardened call (printf→fputs would be sound, but the
+//!     torture contract pins GCC's actual choice; matching it keeps the
+//!     abort-probe tests green).
+//!   * variadic `__printf_chk` only, exactly one variadic argument:
+//!       - `"%s"` + constant `S`: `""` → delete, 1 char → `putchar(S[0])`,
+//!         `S` ending in `\n` → `puts(S[:-1])` (newline stripped into a
+//!         pooled literal), otherwise NOT folded (GCC keeps `%s` with a
+//!         non-newline-terminated constant: the fputs shape is only reached
+//!         by the fprintf family).
+//!       - `"%c"` + constant `c` → `putchar(c)`
+//!       - `"%s\n"` + constant `S` → `puts(S)` (verbatim: puts appends the
+//!         newline the format requested)
+//!   * `__vprintf_chk` cannot consume its `va_list`, so the three
+//!     argument-dependent shapes above refuse (GCC likewise folds it only
+//!     for the argument-independent shapes).
+//!
+//! fprintf family (`__fprintf_chk(stream, flag, fmt, ...)` /
+//! `__vfprintf_chk(stream, flag, fmt, ap)`, stream operand reused verbatim):
+//!   * `""`                  → call deleted
+//!   * single char `c`       → `fputc(c, stream)`
+//!   * `%`-free, ≥2 chars (newline kept — fputs does not append) →
+//!     `fputs(fmt, stream)`
+//!   * variadic `__fprintf_chk` only, exactly one variadic argument:
+//!       - `"%s"` + constant `S`: `""` → delete, 1 char → `fputc(S[0], s)`,
+//!         else → `fputs(S, stream)` (the shape the printf family refuses)
+//!       - `"%c"` + constant `c` → `fputc(c, stream)`
+//!       - `"%s\n"` → refused (fputs cannot append the newline, puts cannot
+//!         target the stream — GCC keeps the call)
+//!   * `__vfprintf_chk`: argument-dependent shapes refuse.
+//!
+//! The PLAIN (non-hardened) family folds on the same oracle evidence
+//! (GCC -O2 asm of unused-result calls; result-used calls always stay):
+//!
+//! * `printf` (variadic): `""` → delete, single char → `putchar`,
+//!   `%`-free ending `\n` → `puts` (stripped), and with exactly one
+//!   variadic argument: `"%s\n"` + constant `S` → `puts(S)`,
+//!   `"%c"` + constant → `putchar`.  Everything else (notably `%`-free
+//!   formats without a trailing newline, e.g. `printf("hello")`, and
+//!   `"%s"` with a non-newline constant) is deliberately KEPT — GCC's
+//!   oracle keeps them too.
+//! * `vprintf`: `""` → delete, single char → `putchar`, and `%`-free
+//!   length ≥ 2 → `puts` (stripped) when the format ends in `\n`,
+//!   otherwise `fwrite(fmt, 1, len, stdout)` (the va_list consumes
+//!   nothing for conversion-free formats, so dropping it is sound).
+//! * `fprintf` (variadic): `""` → delete, single char / `"%c"` + constant →
+//!   `fputc`, `%`-free length ≥ 2 → `fwrite(fmt, 1, len, stream)`,
+//!   `"%s"` + constant `S` → `fwrite(S, 1, len(S), stream)`;
+//!   `"%s\n"` is kept (fputs/fwrite cannot append, puts cannot target
+//!   the stream — GCC keeps it as well).
+//! * `vfprintf`: `""` → delete, single char → `fputc`, `%`-free
+//!   length ≥ 2 (newline kept) → `fwrite(fmt, 1, len, stream)`.
+//!
+//! `fwrite`'s size_t width follows the target (U64 on LP64, U32 on ILP32),
+//! mirroring the frontend's own fwrite lowering exactly.
+//!
+//! The pass runs after the inlining phase at -O2+ and after ip_purity at -O1
+//! (the hardened calls are `noinline` in real headers, so their call sites
+//! never inline away; running after inlining keeps the Copy/Cast flag-staging
+//! shapes canonical).  Disable with `CCC_DISABLE_PASSES=fortifyfold`.
+
+use crate::common::fx_hash::FxHashMap;
+use crate::common::types::IrType;
+use crate::ir::instruction::{CallInfo, Instruction};
+use crate::ir::module::{IrFunction, IrModule};
+use crate::ir::reexports::{IrConst, Operand, Value};
+
+/// How a value is defined, for the Copy/Cast/GlobalAddr constant hunts.
+#[derive(Clone, Debug)]
+enum Def {
+    CopyOf(Operand),
+    CastFrom(Operand),
+    GlobalString(String),
+}
+
+/// Collected mutation for one call site.
+enum Action {
+    /// Instructions replacing the call in place: any `GlobalAddr` definitions
+    /// for freshly interned stripped literals precede the replacement call.
+    Replace(Vec<Instruction>),
+    /// The call prints nothing observable and its result is unused: remove it.
+    Delete,
+}
+
+/// A replacement decision plus bookkeeping for freshly spliced definitions:
+/// `new_literal` interns a stripped-newline text, `extra_values` counts the
+/// fresh Value ids the replacement instructions define (stripped-literal
+/// GlobalAddrs and vprintf's stdout GlobalAddr).  run() records both so
+/// DCE's def_loc table (sized from next_value_id) covers every new id.
+struct Decision {
+    insts: Vec<Instruction>,
+    new_literal: Option<(String, String)>,
+    extra_values: u32,
+}
+
+/// Hunt an integer constant through Copy/Cast chains.  `None` = not provable.
+fn const_int(defs: &FxHashMap<u32, Def>, op: &Operand, depth: u32) -> Option<i64> {
+    if depth > 8 {
+        return None;
+    }
+    match op {
+        Operand::Const(c) => match c {
+            IrConst::I8(v) => Some(*v as i64),
+            IrConst::I16(v) => Some(*v as i64),
+            IrConst::I32(v) => Some(*v as i64),
+            IrConst::I64(v) => Some(*v),
+            IrConst::Zero => Some(0),
+            _ => None,
+        },
+        Operand::Value(v) => match defs.get(&v.0) {
+            Some(Def::CopyOf(src)) => const_int(defs, src, depth + 1),
+            Some(Def::CastFrom(src)) => const_int(defs, src, depth + 1),
+            _ => None,
+        },
+    }
+}
+
+/// Hunt a string literal through Copy/Cast chains to its `GlobalAddr`
+/// definition.  `None` = not provable.
+fn const_string<'a>(
+    defs: &FxHashMap<u32, Def>,
+    strings: &'a FxHashMap<String, String>,
+    op: &Operand,
+    depth: u32,
+) -> Option<&'a str> {
+    if depth > 8 {
+        return None;
+    }
+    match op {
+        Operand::Const(_) => None,
+        Operand::Value(v) => match defs.get(&v.0)? {
+            Def::CopyOf(src) => const_string(defs, strings, src, depth + 1),
+            Def::CastFrom(src) => const_string(defs, strings, src, depth + 1),
+            Def::GlobalString(name) => strings.get(name).map(|s| s.as_str()),
+        },
+    }
+}
+
+/// Highest value id defined or used anywhere in the function.  Passes in
+/// this pipeline create values without always maintaining `next_value_id`,
+/// so the fresh ids for stripped literals must be allocated past a full scan
+/// (same defensive policy as univsr's value allocator).
+fn max_value_id(func: &IrFunction) -> u32 {
+    let mut max = 0u32;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                if d.0 > max {
+                    max = d.0;
+                }
+            }
+            for u in inst.used_values() {
+                if u > max {
+                    max = u;
+                }
+            }
+        }
+        for t in block.terminator.used_values() {
+            if t > max {
+                max = t;
+            }
+        }
+    }
+    max
+}
+
+/// True when no instruction or terminator in the function uses `v`.
+fn value_unused(func: &IrFunction, v: Value) -> bool {
+    let id = v.0;
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.used_values().contains(&id) {
+                return false;
+            }
+        }
+        if block.terminator.used_values().contains(&id) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build a plain non-variadic `int name(args...)` call with an unused result.
+fn mk_call(name: &str, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instruction {
+    let n = args.len();
+    Instruction::Call {
+        func: name.to_string(),
+        info: CallInfo {
+            dest: None,
+            args,
+            arg_types,
+            return_type: IrType::I32,
+            is_variadic: false,
+            num_fixed_args: n,
+            struct_arg_sizes: vec![None; n],
+            struct_arg_aligns: vec![None; n],
+            struct_arg_classes: vec![Vec::new(); n],
+            struct_arg_riscv_float_classes: vec![None; n],
+            struct_arg_is_f128_sse: vec![false; n],
+            ret_is_f128_sse: false,
+            is_sret: false,
+            is_fastcall: false,
+            is_pure: false,
+            is_const: false,
+            ret_eightbyte_classes: Vec::new(),
+        },
+    }
+}
+
+/// A `GlobalAddr` instruction defining `dest` to point at `literal`.
+fn global_addr(dest: Value, literal: &str) -> Instruction {
+    Instruction::GlobalAddr {
+        dest,
+        name: literal.to_string(),
+    }
+}
+
+/// `fwrite(ptr, 1, len, stream)` with an unused result — the byte-exact
+/// replacement for conversion-free stream writes.  size_t width follows the
+/// target exactly like the frontend's own fwrite lowering (U64 LP64,
+/// U32 ILP32; the constants stay I64 in both cases, as lowered).
+fn fwrite_call(ptr: Operand, len: usize, stream: Operand, size_t_is_u32: bool) -> Instruction {
+    let sz = if size_t_is_u32 { IrType::U32 } else { IrType::U64 };
+    mk_call(
+        "fwrite",
+        vec![
+            ptr,
+            Operand::Const(IrConst::I64(1)),
+            Operand::Const(IrConst::I64(len as i64)),
+            stream,
+        ],
+        vec![IrType::Ptr, sz, sz, IrType::Ptr],
+    )
+}
+
+/// Classification context for one function.
+struct FoldCtx<'a> {
+    defs: FxHashMap<u32, Def>,
+    strings: &'a FxHashMap<String, String>,
+}
+
+impl FoldCtx<'_> {
+    fn const_int(&self, op: &Operand) -> Option<i64> {
+        const_int(&self.defs, op, 0)
+    }
+
+    fn const_string(&self, op: &Operand) -> Option<&str> {
+        const_string(&self.defs, self.strings, op, 0)
+    }
+}
+
+/// Decide the fold for one hardened call site.  All call-shape gates
+/// (result unused, flag == 1, constant NUL-free format) are checked here;
+/// `next_val` is the next free value id for a stripped-literal definition.
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    ctx: &FoldCtx,
+    callee: &str,
+    info: &CallInfo,
+    stream_first: bool,
+    variadic: bool,
+    plain: bool,
+    size_t_is_u32: bool,
+    next_val: u32,
+    fresh_literal: &str,
+) -> Option<Decision> {
+    // Layout: hardened calls carry a flag argument; plain calls do not.
+    //   hardened: [stream,] flag, fmt[, varargs...]   fmt_idx = 1 + stream?
+    //   plain:    [stream,] fmt[, varargs...]         fmt_idx = stream?
+    // The flag gate applies only to the hardened family (plain calls have
+    // no fortify flag; their only gates are result-unused + const format).
+    let has_flag = !plain;
+    let (stream_idx, flag_idx, fmt_idx): (Option<usize>, usize, usize) = match (stream_first, has_flag) {
+        (true, true) => (Some(0), 1, 2),
+        (true, false) => (Some(0), 0, 1),
+        (false, true) => (None, 0, 1),
+        (false, false) => (None, 0, 0),
+    };
+    if info.args.len() <= fmt_idx {
+        return None;
+    }
+    // flag must be provably 1 (hardened family only).
+    if has_flag && ctx.const_int(&info.args[flag_idx]) != Some(1) {
+        return None;
+    }
+    // Format must be a NUL-free constant string.
+    let fmt = ctx.const_string(&info.args[fmt_idx])?;
+    if fmt.contains('\0') {
+        return None;
+    }
+
+    let stream_op: Option<Operand> = stream_idx.map(|i| info.args[i].clone());
+    let fmt_op = info.args[fmt_idx].clone();
+
+    // Replacement helpers.  The printf family folds to stdout routines
+    // (putchar/puts); the fprintf family reuses the stream operand verbatim
+    // (fputc/fputs).
+    let char_call = |plain: &str, streamed: &str, c: i32| {
+        let c = Operand::Const(IrConst::I32(c));
+        match &stream_op {
+            None => mk_call(plain, vec![c], vec![IrType::I32]),
+            Some(st) => mk_call(
+                streamed,
+                vec![c, st.clone()],
+                vec![IrType::I32, IrType::Ptr],
+            ),
+        }
+    };
+    let fputsish = |s: Operand, st: Operand| {
+        mk_call("fputs", vec![s, st], vec![IrType::Ptr, IrType::Ptr])
+    };
+
+    // ---- PLAIN (non-hardened) family -------------------------------------
+    // Same oracle discipline as the hardened matrix: only shapes GCC's -O2
+    // asm actually folds; everything else keeps the original call.
+    if plain {
+        let bytes = fmt.as_bytes();
+        if bytes.is_empty() {
+            return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+        }
+        if bytes.len() == 1 {
+            return Some(Decision {
+                insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
+                new_literal: None,
+                extra_values: 0,
+            });
+        }
+        // Exactly one variadic argument available (plain variadic variants
+        // only; the v- variants carry a va_list that cannot be inspected).
+        let one_vararg = variadic && info.args.len() == fmt_idx + 2;
+        let arg_op = || info.args[fmt_idx + 1].clone();
+        // "%c" + constant, variadic variants only.
+        if one_vararg && fmt == "%c" {
+            let c = ctx.const_int(&arg_op())?;
+            return Some(Decision {
+                insts: vec![char_call("putchar", "fputc", c as i32)],
+                new_literal: None,
+                extra_values: 0,
+            });
+        }
+        // "%s\n" + constant: puts(arg verbatim) — printf family only
+        // (fprintf/vfprintf cannot append a newline to a stream write).
+        if one_vararg && fmt == "%s\n" {
+            if stream_op.is_none() {
+                let s = ctx.const_string(&arg_op())?;
+                if s.contains('\0') {
+                    return None;
+                }
+                return Some(Decision {
+                    insts: vec![mk_call("puts", vec![arg_op()], vec![IrType::Ptr])],
+                    new_literal: None,
+                    extra_values: 0,
+                });
+            }
+            return None;
+        }
+        // "%s" + constant: ONLY the plain fprintf family folds (fwrite of
+        // the verbatim argument); printf keeps the call (GCC oracle).
+        if one_vararg && fmt == "%s" {
+            let s = ctx.const_string(&arg_op())?;
+            if s.contains('\0') {
+                return None;
+            }
+            if let Some(st) = &stream_op {
+                return Some(Decision {
+                    insts: vec![fwrite_call(
+                        arg_op(),
+                        s.len(),
+                        st.clone(),
+                        size_t_is_u32,
+                    )],
+                    new_literal: None,
+                    extra_values: 0,
+                });
+            }
+            return None;
+        }
+        // Argument-independent % -free shapes.
+        if !fmt.contains('%') {
+            if fmt.ends_with('\n') {
+                // printf AND vprintf families fold the trailing-newline
+                // shape to puts of the stripped format; the fprintf family
+                // writes the format verbatim via fwrite (newline kept).
+                if stream_op.is_none() {
+                    if callee == "printf" || callee == "vprintf" {
+                        let stripped = fmt[..fmt.len() - 1].to_string();
+                        return Some(Decision {
+                            insts: vec![
+                                global_addr(Value(next_val), fresh_literal),
+                                mk_call(
+                                    "puts",
+                                    vec![Operand::Value(Value(next_val))],
+                                    vec![IrType::Ptr],
+                                ),
+                            ],
+                            new_literal: Some((fresh_literal.to_string(), stripped)),
+                            extra_values: 1,
+                        });
+                    }
+                    // plain fprintf: % -free + trailing \n → fwrite verbatim
+                    // (handled by the generic % -free arm below).
+                }
+            }
+            // % -free, length >= 2:
+            //   * plain printf (variadic, stdout): GCC KEEPS the call when
+            //     the format does not end in a newline.
+            //   * vprintf / fprintf / vfprintf: fwrite(fmt, 1, len, out).
+            if !(callee == "printf" && !fmt.ends_with('\n')) {
+                if let Some(st) = &stream_op {
+                    return Some(Decision {
+                    extra_values: 0,
+                        insts: vec![fwrite_call(
+                            fmt_op,
+                            bytes.len(),
+                            st.clone(),
+                            size_t_is_u32,
+                        )],
+                        new_literal: None,
+                    });
+                }
+                if callee == "vprintf" {
+                    // vprintf has no stream operand in scope: splice a
+                    // GlobalAddr of the extern `stdout` pointer variable
+                    // PLUS a load through it — fwrite needs the FILE*
+                    // VALUE (stdout), not the address of the variable
+                    // (&stdout is an invalid stdio handle; glibc aborts
+                    // with "invalid stdio handle").
+                    let addr_id = Value(next_val);
+                    let load_id = Value(next_val + 1);
+                    return Some(Decision {
+                        insts: vec![
+                            global_addr(addr_id, "stdout"),
+                            Instruction::Load {
+                                dest: load_id,
+                                ptr: addr_id,
+                                ty: IrType::Ptr,
+                                seg_override: crate::common::types::AddressSpace::Default,
+                                volatile: false,
+                            },
+                            fwrite_call(
+                                fmt_op,
+                                bytes.len(),
+                                Operand::Value(load_id),
+                                size_t_is_u32,
+                            ),
+                        ],
+                        new_literal: None,
+                        extra_values: 2,
+                    });
+                }
+            }
+        }
+        return None;
+    }
+    // ---- hardened (_chk) family below ------------------------------------
+
+    // Argument-dependent shapes (variadic variants with exactly one tail arg).
+    if variadic && info.args.len() == fmt_idx + 2 {
+        let arg_op = info.args[fmt_idx + 1].clone();
+        if fmt == "%s" {
+            let s = ctx.const_string(&arg_op)?;
+            if s.contains('\0') {
+                return None;
+            }
+            let bytes = s.as_bytes();
+            if bytes.is_empty() {
+                return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+            }
+            if bytes.len() == 1 {
+                return Some(Decision {
+                    insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
+                    new_literal: None,
+                    extra_values: 0,
+                });
+            }
+            // Multi-byte constant: the fprintf family folds to fputs of the
+            // verbatim argument; the printf family folds ONLY when the
+            // argument ends in a newline — puts of the stripped argument
+            // (GCC pools the stripped text as a fresh literal; the argument
+            // is data, so a '%' inside it needs no refusal).
+            if let Some(st) = stream_op {
+                return Some(Decision {
+                    insts: vec![fputsish(arg_op, st)],
+                    new_literal: None,
+                    extra_values: 0,
+                });
+            }
+            if !s.ends_with('\n') {
+                return None;
+            }
+            let stripped = s[..s.len() - 1].to_string();
+            return Some(Decision {
+                insts: vec![
+                    global_addr(Value(next_val), fresh_literal),
+                    mk_call("puts", vec![Operand::Value(Value(next_val))], vec![IrType::Ptr]),
+                ],
+                new_literal: Some((fresh_literal.to_string(), stripped)),
+                extra_values: 1,
+            });
+        }
+        if fmt == "%c" {
+            let c = ctx.const_int(&arg_op)?;
+            return Some(Decision {
+                insts: vec![char_call("putchar", "fputc", c as i32)],
+                new_literal: None,
+                extra_values: 0,
+            });
+        }
+        if fmt == "%s\n" {
+            // printf family: puts(arg) verbatim.  fprintf family: refused
+            // (fputs cannot append; puts cannot target the stream).
+            if stream_op.is_none() {
+                // The argument must itself be a constant string (its global
+                // address operand is reused verbatim).
+                let s = ctx.const_string(&arg_op)?;
+                if s.contains('\0') {
+                    return None;
+                }
+                return Some(Decision {
+                    extra_values: 0,
+                    insts: vec![mk_call("puts", vec![arg_op], vec![IrType::Ptr])],
+                    new_literal: None,
+                });
+            }
+            return None;
+        }
+    }
+
+    // Argument-independent shapes.
+    let bytes = fmt.as_bytes();
+    if bytes.is_empty() {
+        return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+    }
+    if bytes.len() == 1 {
+        return Some(Decision {
+                    extra_values: 0,
+            insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
+            new_literal: None,
+        });
+    }
+    if !fmt.contains('%') {
+        if stream_op.is_none() {
+            // printf family: only the trailing-newline shape folds to puts,
+            // with the newline stripped into a fresh literal.
+            if fmt.ends_with('\n') {
+                let stripped = fmt[..fmt.len() - 1].to_string();
+                let addr = global_addr(Value(next_val), fresh_literal);
+                let call = mk_call(
+                    "puts",
+                    vec![Operand::Value(Value(next_val))],
+                    vec![IrType::Ptr],
+                );
+                return Some(Decision {
+                    extra_values: 1,
+                    insts: vec![addr, call],
+                    new_literal: Some((fresh_literal.to_string(), stripped)),
+                });
+            }
+            // % -free, no trailing newline, len>=2: GCC keeps the call.
+            return None;
+        }
+        // fprintf family: every % -free shape of len>=2 folds to fputs,
+        // newline KEPT (fputs does not append).
+        let st = stream_op.unwrap();
+        return Some(Decision {
+            extra_values: 0,
+            insts: vec![fputsish(fmt_op, st)],
+            new_literal: None,
+        });
+    }
+    None
+}
+
+/// Entry point: fold every eligible hardened or plain stdio call in the
+/// module.  `size_t_is_u32` selects fwrite's size_t width (ILP32 targets).
+pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
+    let strings: FxHashMap<String, String> = module
+        .string_literals
+        .iter()
+        .map(|(name, s)| (name.clone(), s.clone()))
+        .collect();
+    // Fresh literal labels for stripped-newline puts variants.  The counter
+    // starts past the existing pool and skips any (impossible, but cheap to
+    // guard) collision.
+    let mut literal_counter = module.string_literals.len();
+    let mut pending_literals: Vec<(String, String)> = Vec::new();
+
+    for func in &mut module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let mut defs: FxHashMap<u32, Def> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy { dest, src } => {
+                        defs.insert(dest.0, Def::CopyOf(src.clone()));
+                    }
+                    Instruction::Cast { dest, src, .. } => {
+                        defs.insert(dest.0, Def::CastFrom(src.clone()));
+                    }
+                    Instruction::GlobalAddr { dest, name } => {
+                        defs.insert(dest.0, Def::GlobalString(name.clone()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let ctx = FoldCtx {
+            defs,
+            strings: &strings,
+        };
+
+        let mut next_val = func.next_value_id.max(max_value_id(func) + 1);
+        let mut decisions: Vec<(usize, usize, Decision)> = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let Instruction::Call { func: callee, info } = inst else {
+                    continue;
+                };
+                // Result must be unused (absent or dead).
+                if let Some(dest) = info.dest {
+                    if !value_unused(func, dest) {
+                        continue;
+                    }
+                }
+                let (stream_first, variadic, plain) = match callee.as_str() {
+                    "__printf_chk" => (false, true, false),
+                    "__vprintf_chk" => (false, false, false),
+                    "__fprintf_chk" => (true, true, false),
+                    "__vfprintf_chk" => (true, false, false),
+                    "printf" => (false, true, true),
+                    "vprintf" => (false, false, true),
+                    "fprintf" => (true, true, true),
+                    "vfprintf" => (true, false, true),
+                    _ => continue,
+                };
+                let fresh = format!(".Lchkfold{}", literal_counter);
+                if let Some(decision) = classify(
+                    &ctx,
+                    callee,
+                    info,
+                    stream_first,
+                    variadic,
+                    plain,
+                    size_t_is_u32,
+                    next_val,
+                    &fresh,
+                ) {
+                    if decision.new_literal.is_some() {
+                        literal_counter += 1;
+                    }
+                    if decision.extra_values > 0 {
+                        next_val += decision.extra_values;
+                    }
+                    decisions.push((bi, ii, decision));
+                }
+            }
+        }
+        if decisions.is_empty() {
+            continue;
+        }
+        // Any stripped-literal allocation above the cached next_value_id (or
+        // above a stale cache found by the defensive max scan) must be
+        // recorded: later passes size their per-value tables from
+        // next_value_id (DCE's def_loc is def_len = max_value_id() + 1), and
+        // an unrecorded id would be silently clipped out of those tables —
+        // the definition then looks dead and DCE deletes it while the call
+        // use survives (dangling use, codegen hard-gate panic).
+        if next_val > func.next_value_id {
+            func.next_value_id = next_val;
+        }
+        // Apply in reverse (block, index) order so removals stay index-stable.
+        decisions.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        for (bi, ii, decision) in decisions.into_iter().rev() {
+            let block = &mut func.blocks[bi];
+            if decision.insts.is_empty() {
+                block.instructions.remove(ii);
+            } else {
+                block.instructions.splice(ii..ii + 1, decision.insts);
+            }
+            if let Some(lit) = decision.new_literal {
+                pending_literals.push(lit);
+            }
+        }
+    }
+    module.string_literals.extend(pending_literals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::instruction::{BasicBlock, Terminator};
+    use crate::ir::reexports::BlockId;
+
+    /// Build a hardened call with the given dest/args/types.
+    fn hardened_call(
+        name: &str,
+        dest: Option<u32>,
+        args: Vec<Operand>,
+        arg_types: Vec<IrType>,
+    ) -> Instruction {
+        let n = args.len();
+        let variadic = matches!(name, "__printf_chk" | "__fprintf_chk");
+        Instruction::Call {
+            func: name.to_string(),
+            info: CallInfo {
+                dest: dest.map(Value),
+                args,
+                arg_types,
+                return_type: IrType::I32,
+                is_variadic: variadic,
+                num_fixed_args: if variadic { n - 1 } else { n },
+                struct_arg_sizes: vec![None; n],
+                struct_arg_aligns: vec![None; n],
+                struct_arg_classes: vec![Vec::new(); n],
+                struct_arg_riscv_float_classes: vec![None; n],
+                struct_arg_is_f128_sse: vec![false; n],
+                ret_is_f128_sse: false,
+                is_sret: false,
+                is_fastcall: false,
+                is_pure: false,
+                is_const: false,
+                ret_eightbyte_classes: Vec::new(),
+            },
+        }
+    }
+
+    fn flat_calls(func: &IrFunction) -> Vec<String> {
+        func.blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| match i {
+                Instruction::Call { func, .. } => Some(func.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Standard staging prefix: v0 = flag 1 (Copy), v1..v4 = GlobalAddr of
+    /// the standard literal set; next free id = 10.
+    fn staging(insts: &mut Vec<Instruction>) {
+        insts.push(Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(1)),
+        });
+        for (id, name) in [
+            (1u32, ".LstrA"),   // "hello\n"
+            (2, ".LstrB"),      // "hello"
+            (3, ".LstrC"),      // "a"
+            (4, ".LstrEmpty"),  // ""
+        ] {
+            insts.push(Instruction::GlobalAddr {
+                dest: Value(id),
+                name: name.to_string(),
+            });
+        }
+    }
+
+    fn run_module(func: IrFunction, strings: Vec<(String, String)>) -> IrFunction {
+        let mut module = IrModule::default();
+        module.string_literals = strings;
+        module.functions = vec![func];
+        run(&mut module, false);
+        module.functions.pop().unwrap()
+    }
+
+    fn simple_func(insts: Vec<Instruction>) -> IrFunction {
+        let mut func = IrFunction::new("main".to_string(), IrType::I32, Vec::new(), false);
+        func.next_value_id = 10;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    fn std_strings() -> Vec<(String, String)> {
+        vec![
+            (".LstrA".to_string(), "hello\n".to_string()),
+            (".LstrB".to_string(), "hello".to_string()),
+            (".LstrC".to_string(), "a".to_string()),
+            (".LstrEmpty".to_string(), String::new()),
+        ]
+    }
+
+    #[test]
+    fn printf_chk_newline_terminated_folds_to_puts_stripped() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        let calls = flat_calls(&func);
+        assert_eq!(calls, vec!["puts"], "hardened call replaced by puts");
+        // The stripped literal was interned and is referenced by a fresh addr.
+        let has_addr = func.blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold")));
+        assert!(has_addr, "stripped literal GlobalAddr must be spliced in");
+    }
+
+    #[test]
+    fn printf_chk_non_newline_pctfree_stays() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(2))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
+    }
+
+    #[test]
+    fn printf_chk_empty_format_deleted() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(4))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert!(flat_calls(&func).is_empty(), "empty format deletes the call");
+    }
+
+    #[test]
+    fn printf_chk_single_char_folds_to_putchar() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(3))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["putchar"]);
+    }
+
+    #[test]
+    fn printf_chk_pct_c_const_folds_to_putchar() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtC".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I32(120)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::I32],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![(".LstrFmtC".to_string(), "%c".to_string())],
+        );
+        assert_eq!(flat_calls(&func), vec!["putchar"]);
+    }
+
+    #[test]
+    fn printf_chk_pct_s_const_stays() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s".to_string()),
+                (".LstrArg".to_string(), "hello".to_string()),
+            ],
+        );
+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
+    }
+
+    #[test]
+    fn printf_chk_pct_s_newline_terminated_arg_strips_to_puts() {
+        // "%s" + "hello\n": puts("hello") with the newline stripped into a
+        // pooled fresh literal (GCC oracle: r6 of printf-chk-1.c).
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s".to_string()),
+                (".LstrArg".to_string(), "hello\n".to_string()),
+            ],
+        );
+        let calls = flat_calls(&func);
+        assert_eq!(calls, vec!["puts"], "stripped-arg puts fold");
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold"))),
+            "stripped literal interned"
+        );
+    }
+
+    #[test]
+    fn printf_chk_pct_s_newline_folds_to_puts_of_arg() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s\n".to_string()),
+                (".LstrArg".to_string(), "hello\n".to_string()),
+            ],
+        );
+        assert_eq!(flat_calls(&func), vec!["puts"], "%s\n + const arg -> puts(arg)");
+    }
+
+    #[test]
+    fn printf_chk_result_used_stays() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "__printf_chk",
+            Some(6),
+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        // Consume the result so it is not dead.
+        insts.push(Instruction::UnaryOp {
+            dest: Value(9),
+            op: crate::ir::reexports::IrUnaryOp::Neg,
+            src: Operand::Value(Value(6)),
+            ty: IrType::I32,
+        });
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
+    }
+
+    #[test]
+    fn printf_chk_flag_not_1_stays() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        // Override the flag value: v0 = 2.
+        insts[0] = Instruction::Copy {
+            dest: Value(0),
+            src: Operand::Const(IrConst::I32(2)),
+        };
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
+    }
+
+    #[test]
+    fn fprintf_chk_pctfree_folds_to_fputs_with_stream() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrB".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__fprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(2)),
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+            ],
+            vec![IrType::Ptr, IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["fputs"]);
+        let info = match &func.blocks[0].instructions[3] {
+            Instruction::Call { info, .. } => info,
+            other => panic!("expected call, got {other:?}"),
+        };
+        assert!(
+            matches!(info.args[1], Operand::Value(Value(2))),
+            "stream operand reused verbatim"
+        );
+    }
+
+    #[test]
+    fn fprintf_chk_pct_s_multi_byte_folds_to_fputs() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(3),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__fprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s".to_string()),
+                (".LstrArg".to_string(), "hello".to_string()),
+            ],
+        );
+        assert_eq!(flat_calls(&func), vec!["fputs"]);
+    }
+
+    #[test]
+    fn fprintf_chk_pct_s_newline_stays() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(3),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__fprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s\n".to_string()),
+                (".LstrArg".to_string(), "hello\n".to_string()),
+            ],
+        );
+        assert_eq!(flat_calls(&func), vec!["__fprintf_chk"]);
+    }
+
+    #[test]
+    fn vprintf_chk_newline_folds_but_pct_s_stays() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrA".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrFmtS".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__vprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(8)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        insts.push(hardened_call(
+            "__vprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(2)),
+                Operand::Value(Value(8)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrA".to_string(), "hello\n".to_string()),
+                (".LstrFmtS".to_string(), "%s".to_string()),
+            ],
+        );
+        let calls = flat_calls(&func);
+        assert!(
+            calls.contains(&"puts".to_string()),
+            "vprintf_chk newline shape folds to puts: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"__vprintf_chk".to_string()),
+            "vprintf_chk %s shape must stay: {calls:?}"
+        );
+        // The stripped literal's fresh value id MUST be recorded in
+        // next_value_id: DCE sizes its def_loc table from max_value_id()
+        // (= next_value_id - 1); an unrecorded id is clipped out, the
+        // GlobalAddr def looks dead and is deleted while the call use
+        // survives (dangling use → codegen hard-gate panic).
+        assert!(
+            func.next_value_id > 10,
+            "next_value_id must cover the spliced literal id, got {}",
+            func.next_value_id
+        );
+    }
+
+    #[test]
+    fn vfprintf_chk_pctfree_folds_to_fputs_pct_s_stays() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrB".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(3),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__vfprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(8)),
+            ],
+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        insts.push(hardened_call(
+            "__vfprintf_chk",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(0)),
+                Operand::Value(Value(2)),
+                Operand::Value(Value(8)),
+            ],
+            vec![IrType::Ptr, IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrB".to_string(), "hello".to_string()),
+                (".LstrFmtS".to_string(), "%s".to_string()),
+            ],
+        );
+        let calls = flat_calls(&func);
+        assert!(
+            calls.contains(&"fputs".to_string()),
+            "vfprintf_chk % -free shape folds to fputs: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"__vfprintf_chk".to_string()),
+            "vfprintf_chk %s shape must stay: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn plain_printf_newline_folds_but_pctfree_no_newline_stays() {
+        let mut insts = Vec::new();
+        staging(&mut insts);
+        insts.push(hardened_call(
+            "printf",
+            None,
+            vec![Operand::Value(Value(1))],
+            vec![IrType::Ptr],
+        ));
+        insts.push(hardened_call(
+            "printf",
+            None,
+            vec![Operand::Value(Value(2))],
+            vec![IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        let calls = flat_calls(&func);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "puts").count(),
+            1,
+            "printf(\"hello\\n\") -> puts(\"hello\")"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| *c == "printf").count(),
+            1,
+            "printf(\"hello\") stays (GCC oracle)"
+        );
+    }
+
+    #[test]
+    fn plain_vprintf_pctfree_no_newline_folds_to_fwrite_stdout() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrB".to_string(), // "hello" - no newline
+            },
+        ];
+        insts.push(hardened_call(
+            "vprintf",
+            None,
+            vec![Operand::Value(Value(1)), Operand::Value(Value(8))],
+            vec![IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        let calls = flat_calls(&func);
+        assert_eq!(calls, vec!["fwrite"], "vprintf(\"hello\") -> fwrite");
+        let info = match func.blocks[0]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Call { func, .. } if func == "fwrite"))
+            .unwrap()
+        {
+            Instruction::Call { info, .. } => info,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(info.args.len(), 4);
+        assert!(
+            matches!(info.args[0], Operand::Value(Value(1))),
+            "format pointer reused"
+        );
+        assert!(
+            matches!(info.args[1], Operand::Const(IrConst::I64(1))),
+            "size 1"
+        );
+        assert!(
+            matches!(info.args[2], Operand::Const(IrConst::I64(5))),
+            "nmemb = len(\"hello\")"
+        );
+        // stdout GlobalAddr spliced before the call
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name == "stdout")),
+            "stdout addr spliced"
+        );
+        // next_value_id must cover the fresh id (DCE def_loc sizing)
+        assert!(
+            func.next_value_id > 8,
+            "next_value_id must be recorded past the spliced id, got {}",
+            func.next_value_id
+        );
+    }
+
+    #[test]
+    fn plain_fprintf_pct_s_folds_to_fwrite_and_newline_stays() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(), // "hello"
+            },
+            Instruction::GlobalAddr {
+                dest: Value(3),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "fprintf",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
+        ));
+        // "%s\n" must stay on the fprintf family (distinct literal).
+        insts.push(Instruction::GlobalAddr {
+            dest: Value(4),
+            name: ".LstrFmtSN".to_string(),
+        });
+        insts.push(hardened_call(
+            "fprintf",
+            None,
+            vec![
+                Operand::Value(Value(3)),
+                Operand::Value(Value(4)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s".to_string()),
+                (".LstrFmtSN".to_string(), "%s\n".to_string()),
+                (".LstrArg".to_string(), "hello".to_string()),
+            ],
+        );
+        let calls = flat_calls(&func);
+        assert_eq!(
+            calls.iter().filter(|c| *c == "fwrite").count(),
+            1,
+            "fprintf(\"%s\", \"hello\") -> fwrite"
+        );
+        assert_eq!(
+            calls.iter().filter(|c| *c == "fprintf").count(),
+            1,
+            "fprintf(\"%s\\n\", ...) stays"
+        );
+    }
+
+    #[test]
+    fn plain_vfprintf_pctfree_folds_to_fwrite() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrB".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "vfprintf",
+            None,
+            vec![
+                Operand::Value(Value(2)),
+                Operand::Value(Value(1)),
+                Operand::Value(Value(8)),
+            ],
+            vec![IrType::Ptr, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["fwrite"]);
+    }
+
+    #[test]
+    fn plain_fprintf_single_char_folds_to_fputc() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrC".to_string(), // "a"
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: "stdout".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "fprintf",
+            None,
+            vec![
+                Operand::Value(Value(2)),
+                Operand::Value(Value(1)),
+            ],
+            vec![IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(simple_func(insts), std_strings());
+        assert_eq!(flat_calls(&func), vec!["fputc"]);
+    }
+
+    #[test]
+    fn plain_printf_pct_s_newline_folds_to_puts_of_arg() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "printf",
+            None,
+            vec![
+                Operand::Value(Value(0)) /*placeholder*/,
+                Operand::Value(Value(1)),
+                Operand::Value(Value(2)),
+            ],
+            vec![IrType::I32, IrType::Ptr, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![
+                (".LstrFmtS".to_string(), "%s\n".to_string()),
+                (".LstrArg".to_string(), "hello\n".to_string()),
+            ],
+        );
+        // NOTE: plain printf has NO flag argument: args are [fmt, arg]. The
+        // placeholder above is wrong by construction, so rebuild properly.
+        let mut insts2 = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrFmtS".to_string(),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(2),
+                name: ".LstrArg".to_string(),
+            },
+        ];
+        insts2.push(hardened_call(
+            "printf",
+            None,
+            vec![Operand::Value(Value(1)), Operand::Value(Value(2))],
+            vec![IrType::Ptr, IrType::Ptr],
+        ));
+        let _ = insts;
+        let func2 = run_module(simple_func(insts2), vec![
+            (".LstrFmtS".to_string(), "%s\n".to_string()),
+            (".LstrArg".to_string(), "hello\n".to_string()),
+        ]);
+        assert_eq!(flat_calls(&func2), vec!["puts"], "printf(\"%s\\n\", S) -> puts(S)");
+        assert_eq!(
+            flat_calls(&func),
+            vec!["printf"],
+            "placeholder form has no constant fmt at index 0 -> stays"
+        );
+    }
+
+    #[test]
+    fn embedded_nul_refuses() {
+        let mut insts = vec![
+            Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(1)),
+            },
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: ".LstrNul".to_string(),
+            },
+        ];
+        insts.push(hardened_call(
+            "__printf_chk",
+            None,
+            vec![Operand::Value(Value(0)), Operand::Value(Value(1))],
+            vec![IrType::I32, IrType::Ptr],
+        ));
+        let func = run_module(
+            simple_func(insts),
+            vec![(".LstrNul".to_string(), "a\0b".to_string())],
+        );
+        assert_eq!(flat_calls(&func), vec!["__printf_chk"]);
+    }
+}

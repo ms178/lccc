@@ -1424,6 +1424,29 @@ impl X86Codegen {
                     self.value_to_reg(v, "rax");
                     self.state.reg_cache.set_acc(v.0, is_alloca);
                 } else {
+                    // A rematerialisable GlobalAddr deliberately has no home:
+                    // its address computation is omitted at the definition and
+                    // "every consumer is expected to rebuild it" (the contract
+                    // documented at value_to_reg_inner).  operand_to_rax is a
+                    // consumer like any other — the call-argument staging
+                    // highway reaches it — so rebuild the address here instead
+                    // of failing a handoff that the def side is entitled to
+                    // produce (fresh GlobalAddr definitions spliced in by IR
+                    // passes, e.g. fortify_fold's stripped puts literals, may
+                    // legitimately stay slot-less in variadic frames where the
+                    // packed-slot tiers skip them).  value_to_reg still fails
+                    // loudly if the value is genuinely unmaterialisable, so
+                    // the session-26 gate's soundness guarantee is preserved.
+                    let is_global_addr = self
+                        .get_defining_instruction(v.0)
+                        .is_some_and(|inst| {
+                            matches!(inst, crate::ir::reexports::Instruction::GlobalAddr { .. })
+                        });
+                    if is_global_addr {
+                        self.value_to_reg(v, "rax");
+                        self.state.reg_cache.set_acc(v.0, is_alloca);
+                        return;
+                    }
                     // HARD GATE (session 26): a live operand value with no
                     // register home, no stack slot and no accumulator-cache
                     // entry cannot be materialised — this spot used to emit a
@@ -1785,6 +1808,15 @@ impl X86Codegen {
                     Instruction::Load { dest, .. } => Some(dest.0),
                     Instruction::Cmp { dest, .. } => Some(dest.0),
                     Instruction::Phi { dest, .. } => Some(dest.0),
+                    // GlobalAddr dests must be found: rematerialisable
+                    // addresses have deliberately no home, so every
+                    // consumer-side rebuild (value_to_reg / operand_to_rax)
+                    // depends on this lookup locating the definition.  The
+                    // missing arm made the documented rebuild contract dead
+                    // code and forced slot assignment for every spliced
+                    // GlobalAddr (fortify_fold's stripped puts literals in
+                    // variadic frames hit exactly that wall).
+                    Instruction::GlobalAddr { dest, .. } => Some(dest.0),
                     _ => None,
                 };
 
