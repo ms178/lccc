@@ -1501,6 +1501,15 @@ impl ArmCodegen {
                         self.state.emit("    mov x0, #0");
                         self.state.emit("    mov x1, #0");
                     }
+                    IrConst::LongDouble(_, f128_bytes) => {
+                        // _Float128 carrier constant: the 16 bytes ARE the
+                        // value — stage bit-exactly (an f64 conversion here
+                        // would integer-reinterpret the binary128 pattern).
+                        let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
+                        let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
+                        self.emit_load_imm64("x0", lo as i64);
+                        self.emit_load_imm64("x1", hi as i64);
+                    }
                     _ => {
                         // Other consts: load into x0, zero-extend high half
                         self.operand_to_x0(op);
@@ -1518,6 +1527,34 @@ impl ArmCodegen {
                         // 128-bit value in 16-byte stack slot
                         self.emit_load_from_sp("x0", slot.0, "ldr");
                         self.emit_load_from_sp("x1", slot.0 + 8, "ldr");
+                    } else if let Some((src_id, offset, is_indirect)) =
+                        self.state.get_f128_source(v.0)
+                    {
+                        // Tracked full-precision F128 value consumed in a
+                        // 128-bit context (F128Neg/F128Fabs/F128Copysign
+                        // results are typed F128 but their U128-carrier
+                        // consumers need all 16 bytes). Loading by value
+                        // type here would fetch 8 bytes and zero the high
+                        // half, silently truncating the carrier (observed:
+                        // -a == -1.5F128 failed in f128_softfloat).
+                        if is_indirect {
+                            if let Some(ptr_slot) = self.state.get_slot(src_id) {
+                                self.emit_load_from_sp("x9", ptr_slot.0, "ldr");
+                                if offset != 0 {
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                }
+                                self.emit_load_pair_indirect_impl();
+                                return;
+                            }
+                        } else if let Some(src_slot) = self.state.get_slot(src_id) {
+                            let base = src_slot.0 + offset;
+                            self.emit_load_from_sp("x0", base, "ldr");
+                            self.emit_load_from_sp("x1", base + 8, "ldr");
+                            return;
+                        }
+                        // Tracker entry without a usable slot: fall through
+                        // to the typed load below.
+                        let _ = slot;
                     } else {
                         // Non-i128 value (e.g. shift amount): load 8 bytes, zero high
                         // Check register allocation first, since register-allocated values

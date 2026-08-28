@@ -359,6 +359,21 @@ impl RiscvCodegen {
         crate::backend::f128_softfloat::f128_operand_to_arg1(self, op);
     }
 
+    /// Store the a0:a1 GP-pair carrier to a slot and mark it as a
+    /// full-precision F128 source (sign-bit intrinsics results).
+    pub(super) fn emit_f128_store_a0_a1_tracked(&mut self, dest_id: u32) {
+        if let Some(slot) = self.state.get_slot(dest_id) {
+            // Value slots are frame-pointer relative (s0); emit_store_to_sp
+            // addresses sp, which is only valid under a call-staging sp
+            // adjustment — an intrinsic runs with the unadjusted frame.
+            self.emit_store_to_s0("a0", slot.0, "sd");
+            self.emit_store_to_s0("a1", slot.0 + 8, "sd");
+            self.state.track_f128_self(dest_id);
+        } else {
+            unimplemented!("f128 sign-bit intrinsic: dest is not slot-homed");
+        }
+    }
+
     /// Negate an F128 value with full precision.
     pub(super) fn emit_f128_neg_full(&mut self, dest: &Value, src: &Operand) {
         crate::backend::f128_softfloat::f128_neg(self, dest, src);

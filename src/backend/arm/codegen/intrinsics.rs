@@ -399,6 +399,80 @@ impl ArmCodegen {
             IntrinsicOp::SqrtF32 => self.emit_f32_unary_neon(dest, args, "fsqrt"),
             IntrinsicOp::FabsF64 => self.emit_f64_unary_neon(dest, args, "fabs"),
             IntrinsicOp::FabsF32 => self.emit_f32_unary_neon(dest, args, "fabs"),
+            // ── Scalar FP round/FMA/copysign ────────────────────────────────
+            // x86 lowered these to SSE ROUNDSD/VFMA/VANDPD; without arms here
+            // they hit the silent catch-all and produced uninitialized
+            // registers (observed: rint/floor/ceil/trunc/copysign/fma all
+            // returned 0.0 on aarch64, vex_move_false_dep outputs DIFFER).
+            IntrinsicOp::RoundScalarF64(imm) => {
+                // x86 ROUNDSD imm8 rounding modes map 1:1 onto AArch64
+                // FRINT* variants; bit 3 (precision mask) is not emitted.
+                let frint = match imm & 3 {
+                    0 => "frintn", // round to nearest, ties to even
+                    1 => "frintm", // toward -inf (floor)
+                    2 => "frintp", // toward +inf (ceil)
+                    3 => "frintz", // toward zero (trunc)
+                    _ => unreachable!("ROUND imm8 mode bits are 2 bits wide"),
+                };
+                self.emit_f64_unary_neon(dest, args, frint);
+            }
+            IntrinsicOp::RoundScalarF32(imm) => {
+                let frint = match imm & 3 {
+                    0 => "frintn",
+                    1 => "frintm",
+                    2 => "frintp",
+                    3 => "frintz",
+                    _ => unreachable!("ROUND imm8 mode bits are 2 bits wide"),
+                };
+                self.emit_f32_unary_neon(dest, args, frint);
+            }
+            IntrinsicOp::FmaScalarF64 => {
+                // dest = a*b + c, single rounding: native fmadd.
+                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
+                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
+                self.float_operand_to_reg(&args[2], IrType::F64, "d2");
+                self.state.emit("    fmadd d0, d0, d1, d2");
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F64, "d0");
+                }
+            }
+            IntrinsicOp::FmaScalarF32 => {
+                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
+                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
+                self.float_operand_to_reg(&args[2], IrType::F32, "s2");
+                self.state.emit("    fmadd s0, s0, s1, s2");
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F32, "s0");
+                }
+            }
+            IntrinsicOp::CopysignF64 => {
+                // result = |x| with y's sign bit: pure integer bit ops on
+                // the F64 bit patterns (no branch, no libm call).
+                self.float_operand_to_reg(&args[0], IrType::F64, "d0");
+                self.float_operand_to_reg(&args[1], IrType::F64, "d1");
+                self.state.emit("    fmov x0, d0");
+                self.state.emit("    fmov x1, d1");
+                self.state.emit("    and x0, x0, #0x7fffffffffffffff");
+                self.state.emit("    and x1, x1, #0x8000000000000000");
+                self.state.emit("    orr x0, x0, x1");
+                self.state.emit("    fmov d0, x0");
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F64, "d0");
+                }
+            }
+            IntrinsicOp::CopysignF32 => {
+                self.float_operand_to_reg(&args[0], IrType::F32, "s0");
+                self.float_operand_to_reg(&args[1], IrType::F32, "s1");
+                self.state.emit("    fmov w0, s0");
+                self.state.emit("    fmov w1, s1");
+                self.state.emit("    and w0, w0, #0x7fffffff");
+                self.state.emit("    and w1, w1, #0x80000000");
+                self.state.emit("    orr w0, w0, w1");
+                self.state.emit("    fmov s0, w0");
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F32, "s0");
+                }
+            }
             // x86-specific SSE/AES-NI/CLMUL intrinsics - these are x86-only and should
             // not appear in ARM codegen in practice. Cross-compiled code that conditionally
             // uses these behind #ifdef __x86_64__ will have the calls dead-code eliminated.

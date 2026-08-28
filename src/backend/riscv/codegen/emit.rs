@@ -426,6 +426,17 @@ impl RiscvCodegen {
                     self.state.emit("    li t0, 0");
                     self.state.emit("    li t1, 0");
                 }
+                IrConst::LongDouble(_, f128_bytes) => {
+                    // _Float128 carrier constant: the 16 bytes ARE the
+                    // value — stage bit-exactly (an f64 conversion here
+                    // would integer-reinterpret the binary128 pattern).
+                    let lo = u64::from_le_bytes(f128_bytes[0..8].try_into().unwrap());
+                    let hi = u64::from_le_bytes(f128_bytes[8..16].try_into().unwrap());
+                    self.state
+                        .emit_fmt(format_args!("    li t0, {}", lo as i64));
+                    self.state
+                        .emit_fmt(format_args!("    li t1, {}", hi as i64));
+                }
                 _ => {
                     self.operand_to_t0(op);
                     self.state.emit("    li t1, 0");
@@ -439,6 +450,29 @@ impl RiscvCodegen {
                     } else if self.state.is_i128_value(v.0) {
                         self.emit_load_from_s0("t0", slot.0, "ld");
                         self.emit_load_from_s0("t1", slot.0 + 8, "ld");
+                    } else if let Some((src_id, offset, is_indirect)) =
+                        self.state.get_f128_source(v.0)
+                    {
+                        // Tracked full-precision F128 value consumed in a
+                        // 128-bit context (intrinsic results are typed F128
+                        // but their U128-carrier consumers need all 16
+                        // bytes); a typed load would zero the high half.
+                        if is_indirect {
+                            if let Some(ptr_slot) = self.state.get_slot(src_id) {
+                                self.emit_load_from_s0("t5", ptr_slot.0, "ld");
+                                if offset != 0 {
+                                    self.emit_add_offset_to_addr_reg_impl(offset);
+                                }
+                                self.emit_load_pair_indirect_impl();
+                                return;
+                            }
+                        } else if let Some(src_slot) = self.state.get_slot(src_id) {
+                            let base = src_slot.0 + offset;
+                            self.emit_load_from_s0("t0", base, "ld");
+                            self.emit_load_from_s0("t1", base + 8, "ld");
+                            return;
+                        }
+                        let _ = slot;
                     } else {
                         if let Some(&reg) = self.reg_assignments.get(&v.0) {
                             let reg_name = callee_saved_name(reg);
@@ -661,7 +695,12 @@ impl ArchCodegen for RiscvCodegen {
         self.state.emit("    mv t3, t0");
     }
     fn emit_typed_store_indirect(&mut self, instr: &'static str, _ty: IrType) {
-        self.state.emit_fmt(format_args!("    {} t3, 0(t5)", instr));
+        // The value rides the accumulator (t0) per the emit_store_default
+        // contract (emit_load_operand -> operand_to_t0); t3 is the SAVED-acc
+        // scratch and holds an unrelated value here. Storing t3 wrote
+        // garbage for every indirect store whose value wasn't explicitly
+        // saved first (observed: F64 array element stores on riscv64).
+        self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr));
     }
     fn emit_typed_load_indirect(&mut self, instr: &'static str) {
         self.state.emit_fmt(format_args!("    {} t0, 0(t5)", instr));

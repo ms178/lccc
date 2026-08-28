@@ -252,6 +252,38 @@ impl ArmCodegen {
                 }
             }
         }
+        if crate::backend::generation::is_i128_type(ty) {
+            // U128-carrier store. When the stored value is a tracked
+            // full-precision F128 source (e.g. an F128Neg/F128Fabs result
+            // consumed by a U128-typed store), the destination slot ends up
+            // holding the full 16 bytes — record it so later F128 paths can
+            // read them instead of degrading to the f64-extend fallback.
+            crate::backend::traits::emit_store_default(self, val, ptr, ty);
+            // Tracking is sound only when the destination slot anchors
+            // the bytes themselves (Direct alloca/value slot or an
+            // over-aligned alloca): an Indirect/Reg home stores THROUGH a
+            // pointer, so its own slot does not hold the data.
+            let slot_anchored = matches!(
+                self.state.resolve_slot_addr(ptr.0),
+                Some(SlotAddr::Direct(_) | SlotAddr::OverAligned(_, _))
+            );
+            let tracked_val = match val {
+                Operand::Value(v) => self.state.get_f128_source(v.0).is_some(),
+                // A constant stored through a U128-typed store IS the
+                // full-precision bit pattern by construction (LongDouble
+                // bytes, or the I128 carrier bits): the destination slot is
+                // a full-precision F128 source. Without this, a
+                // const-initialized local _Float128 forced every later
+                // intrinsic/argument staging into the lossy f64-extend
+                // fallback (observed: -1.5F128 negated to -0.0 on RISC-V).
+                Operand::Const(c) => matches!(c, IrConst::LongDouble(_, _) | IrConst::I128(_)),
+                _ => false,
+            };
+            if tracked_val && slot_anchored {
+                self.state.track_f128_self(ptr.0);
+            }
+            return;
+        }
         crate::backend::traits::emit_store_default(self, val, ptr, ty);
     }
 
@@ -285,6 +317,33 @@ impl ArmCodegen {
                     }
                 }
             }
+        }
+        if crate::backend::generation::is_i128_type(ty) {
+            // U128-carrier load: the 16 raw bytes land in dest's own slot,
+            // so dest is a full-precision F128 source. Without this, an
+            // F128Neg/F128Fabs/F128Copysign operand staging on a freshly
+            // loaded _Float128 value degraded to the f64-extend fallback
+            // and produced -0.0 for -(-1.5F128)-shaped code.
+            if let Some(addr) = self.state.resolve_slot_addr(ptr.0) {
+                match addr {
+                    SlotAddr::OverAligned(slot, id) => {
+                        self.emit_alloca_aligned_addr_impl(slot, id);
+                        self.emit_load_pair_indirect_impl();
+                    }
+                    SlotAddr::Direct(slot) => self.emit_load_pair_from_slot_impl(slot),
+                    SlotAddr::Indirect(slot) => {
+                        self.emit_load_ptr_from_slot_impl(slot, ptr.0);
+                        self.emit_load_pair_indirect_impl();
+                    }
+                    SlotAddr::Reg(reg) => {
+                        self.emit_reg_to_addr(reg);
+                        self.emit_load_pair_indirect_impl();
+                    }
+                }
+                self.emit_store_acc_pair_impl(dest);
+                self.state.track_f128_self(dest.0);
+            }
+            return;
         }
         crate::backend::traits::emit_load_default(self, dest, ptr, ty);
     }

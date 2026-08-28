@@ -660,6 +660,26 @@ fn classify_args_core(
                 continue;
             }
 
+            // RISC-V (soft-float-pair targets): a _Float128 carrier goes in
+            // an even-aligned GP register pair exactly like long double
+            // (f128_in_gp_pairs); overflow takes the F128Stack slot. The x86
+            // F128SseReg branch below must not fire — RISC-V has no XMM.
+            if info.is_f128_sse && size == 16 && config.f128_in_gp_pairs {
+                if config.align_i128_pairs && int_idx % 2 != 0 {
+                    int_idx += 1;
+                }
+                if int_idx + 1 < config.max_int_regs {
+                    result.push(CoreArgClass::F128GpPair {
+                        base_reg_idx: int_idx,
+                    });
+                    int_idx += 2;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                    int_idx = config.max_int_regs;
+                }
+                continue;
+            }
+
             // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
             // register per the psABI (not a two-eightbyte SSE struct).
             // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
