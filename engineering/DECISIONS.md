@@ -655,6 +655,18 @@ anyway (the bullet carries the *why*).
   the environment (`--config rustflags=[]` does NOT override the file).
   Prebuilt static mold 2.42.0 user-local + `RUSTFLAGS="-C
   link-arg=-fuse-ld=mold"` brings cold builds to ~3 m 10 s.
+- **[history/session86 / agent/CARGO_CONFIG_GCC_BFD]** **Supersedes the
+  session84 recipe above.** `.cargo/config.toml` now defaults to
+  `linker = "gcc"` (GNU ld/bfd) for both x86_64-unknown-linux-gnu and
+  i686-unknown-linux-gnu (the latter keeps `-m32`). Rationale: neither
+  clang nor mold is installed on the current research VM, so the old pin
+  forced every build either to fail or to rely on per-invocation
+  environment overrides — a standing footgun. The reference recipe is now
+  simply `scripts/build_lccc_o1_j2.sh` (fastbuild, `-O1`, `-j 2`,
+  foreground, gcc/bfd) with no environment overrides needed. mold/wild
+  remain available as **differential test oracles only**
+  (`tests/linker/setup_oracles.sh`, git-HEAD builds) — they are build
+  linkers nowhere.
 - **[history/session84/10]** Snapshot discipline: commit + regenerate the
   `ms178-N.patch` + artifact + bundle immediately after every validated
   fix (session 84 lost a fix to a mid-session wipe and re-implemented it);

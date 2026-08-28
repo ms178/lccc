@@ -1,15 +1,16 @@
-# Use mold for fastest possible links on the constrained 2-vCPU research box.
-# Mold's i686 preset ("-m elf_i386") is enabled automatically when the target
-# is i686-unknown-linux-gnu; for the default x86_64 host target mold picks the
-# x86_64 preset.  This saves ~300-500 ms per rebuild and cuts peak RSS during
-# LTO/fastbuild links enough to stay out of OOM on the 2 GB VM.
+# Default toolchain: gcc + GNU ld (bfd).
 #
-# scripts/build_lccc_fast.sh keeps this clang+mold pairing when both tools
-# are installed and falls back to gcc + GNU ld otherwise.
+# gcc/bfd is the proven default pairing on this box. The previous
+# clang+mold pin caused repeated build friction (and neither tool is
+# even installed on the current research VM), so it is no longer
+# pinned here. Explicit override is still possible per-invocation via
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER if ever needed.
+#
+# Reference build recipe (foreground, constrained-memory safe):
+#   scripts/build_lccc_o1_j2.sh   # fastbuild, -O1, -j 2, gcc/bfd
 [target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+linker = "gcc"
 
 [target.i686-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "link-arg=-m32"]
+linker = "gcc"
+rustflags = ["-C", "link-arg=-m32"]

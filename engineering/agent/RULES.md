@@ -94,12 +94,14 @@ the evidence. Re-oracle and check gzip `longest_match` stack-mem after
 
 ## Environment / process
 
-26. Build: `scripts/build_lccc_fast.sh` → `target/fastbuild/lccc`. Swap:
-    `scripts/ensure_swap.sh` on 2 GiB VMs (needs CAP_SYS_ADMIN; otherwise
-    rely on `-j2`). Mold-less sandboxes: pass
-    `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=gcc` and `RUSTFLAGS` as
-    environment variables — `--config` does not override
-    `.cargo/config.toml`.
+26. Build: `scripts/build_lccc_o1_j2.sh` → `target/fastbuild/lccc`
+    (fastbuild, `-O1`, `-j 2`, foreground — lower parallelism on the
+    4 GiB no-swap VM OOM-kills less). Swap: `scripts/ensure_swap.sh` on
+    2 GiB VMs (needs CAP_SYS_ADMIN; otherwise rely on `-j2`).
+    `.cargo/config.toml` defaults to gcc/bfd — no linker environment
+    overrides are needed anymore; do not reintroduce clang/mold pins
+    (mold/wild are differential test oracles only, see
+    `tests/linker/setup_oracles.sh`).
 27. Linker oracles (mold, wild) must be **git-HEAD builds**; stale release
     binaries produced false failures. GAS/binutils pin: 2.47. Record
     resolved oracle revisions in `ORACLE_REVISIONS.txt`.
