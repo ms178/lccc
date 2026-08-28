@@ -10861,7 +10861,6 @@ mod tests {
     // Note: store forwarding tests removed - global_store_forwarding is disabled
     // due to FP computation regressions.
 
-    #[test]
     // ── P17 else-hoist: the else store hoists and the ORIGINAL condition
     // jumps to the join; the jmp disappears.  The inverted mnemonic would
     // swap the arms' values (miscompile caught auditing cpucheck).

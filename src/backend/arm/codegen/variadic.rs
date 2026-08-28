@@ -229,10 +229,16 @@ impl ArmCodegen {
         dest_ptr: &Value,
         va_list_ptr: &Value,
         size: usize,
-        _align: usize,
+        align: usize,
     ) {
         let num_slots = size.div_ceil(8);
         let total_reg_bytes = num_slots * 8;
+        // AAPCS64: a composite whose natural alignment exceeds 8 bytes is
+        // placed at an offset rounded down to that alignment (capped at 16,
+        // the byte granularity of the va_list register save area) and read
+        // from the overflow area at a matching alignment. struct { long double }
+        // is the canonical case (align 16).
+        let eff_align = if align > 8 { align.min(16) } else { 8 };
 
         let label_id = self.state.next_label_id();
         let label_stack = format!(".Lva_struct_stack_{}", label_id);
@@ -246,10 +252,14 @@ impl ArmCodegen {
 
         // Check if enough GP register slots remain for the entire struct.
         // __gr_offs is a negative i32 at [va_list + 24].
-        // We need: __gr_offs + total_reg_bytes <= 0
-        // Equivalently: __gr_offs <= -total_reg_bytes
-        // Or: __gr_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
+        // For over-aligned composites the offset is first rounded DOWN to
+        // the alignment (per AAPCS64), wasting any partial slot.
+        // We need: aligned_offs + total_reg_bytes <= 0
+        // Or: aligned_offs + total_reg_bytes is still negative (bit 63 set after sign-extend + add)
         self.state.emit("    ldrsw x2, [x1, #24]"); // x2 = sign-extended __gr_offs
+        if eff_align == 16 {
+            self.state.emit("    and x2, x2, #-16");
+        }
         if total_reg_bytes <= 4095 {
             self.state
                 .emit_fmt(format_args!("    adds x3, x2, #{}", total_reg_bytes));
@@ -302,9 +312,15 @@ impl ArmCodegen {
         // Read from __stack
         self.state.emit("    ldr x5, [x1]"); // x5 = __stack (source addr)
 
-        // Align __stack to 8 bytes (structs on stack are 8-byte aligned per AAPCS64)
-        self.state.emit("    add x5, x5, #7");
-        self.state.emit("    and x5, x5, #-8");
+        // Align __stack to the composite's effective alignment (AAPCS64:
+        // 16-byte-aligned composites are 16-byte aligned on the stack).
+        if eff_align == 16 {
+            self.state.emit("    add x5, x5, #15");
+            self.state.emit("    and x5, x5, #-16");
+        } else {
+            self.state.emit("    add x5, x5, #7");
+            self.state.emit("    and x5, x5, #-8");
+        }
 
         // Copy struct data from stack to dest
         for i in 0..num_slots {

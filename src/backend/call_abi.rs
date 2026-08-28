@@ -1163,6 +1163,22 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 ParamClass::I128Stack { offset: off }
             }
             CoreArgClass::StructByValStack { size } | CoreArgClass::LargeStructStack { size } => {
+                // psABI (RISC-V LP64D / AAPCS64 / SysV): a stack argument
+                // whose natural alignment exceeds XLEN is aligned to
+                // min(align, 2*XLEN) in the argument area — struct { long
+                // double } (align 16) is the canonical case. The va_arg /
+                // prologue readers use the same rule, so caller and callee
+                // agree. (The cap is 2*XLEN: nothing on these targets
+                // aligns stack arguments beyond that.)
+                let struct_align = func
+                    .params
+                    .get(i)
+                    .and_then(|p| p.struct_align)
+                    .unwrap_or(slot_size as usize);
+                if struct_align > slot_size as usize {
+                    let a = (struct_align as i64).min(2 * slot_size as i64);
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
+                }
                 let off = stack_offset;
                 stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
                 if matches!(*c, CoreArgClass::LargeStructStack { .. }) {
@@ -1231,20 +1247,37 @@ pub fn classify_params(func: &IrFunction, config: &CallAbiConfig) -> Vec<ParamCl
 ///
 /// This correctly accounts for alignment padding (e.g., 16-byte alignment for F128/I128).
 pub fn named_params_stack_bytes(param_classes: &[ParamClass]) -> usize {
-    let mut total: usize = 0;
-    for class in param_classes {
-        // Align for 16-byte types before adding their size
-        if matches!(
-            class,
-            ParamClass::F128Stack { .. }
-                | ParamClass::I128Stack { .. }
-                | ParamClass::F128AlwaysStack { .. }
-        ) {
-            total = (total + 15) & !15;
-        }
-        total += class.stack_bytes();
-    }
-    total
+    // The ParamClass offsets already embed every alignment decision
+    // (16-byte F128/I128 slots, over-aligned struct padding), so the named
+    // stack area ends at the furthest (offset + size). Deriving the total
+    // from the offsets — instead of re-summing sizes — cannot drift from
+    // the layout the caller and prologue actually use.
+    param_classes
+        .iter()
+        .filter_map(|class| match class {
+            ParamClass::StackScalar { offset } => Some(offset + 8),
+            ParamClass::I128Stack { offset } => Some(offset + 16),
+            ParamClass::F128Stack { offset } => Some(offset + 16),
+            // i686 x87 long double occupies 12 bytes; x86-64 uses 16.
+            ParamClass::F128AlwaysStack { offset } => {
+                let sz = if crate::common::types::target_ptr_size() == 4 { 12 } else { 16 };
+                Some(offset + sz)
+            }
+            ParamClass::StructStack { offset, size }
+            | ParamClass::LargeStructStack { offset, size } => {
+                Some(offset + (*size as i64 + 7) & !7)
+            }
+            ParamClass::LargeStructByRefStack { offset, .. } => Some(offset + 8),
+            ParamClass::StructSplitRegStack {
+                stack_offset, size, ..
+            } => {
+                let stack_part = (*size as i64 - 8 + 7) & !7;
+                Some(stack_offset + stack_part)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,16 +1287,17 @@ pub fn named_params_stack_bytes(param_classes: &[ParamClass]) -> usize {
 /// Compute the total stack space needed for stack-overflow arguments.
 /// Returns the total bytes needed, 16-byte aligned.
 /// Use this for ARM and RISC-V which pre-allocate stack space with a single SP adjustment.
-pub fn compute_stack_arg_space(arg_classes: &[CallArgClass]) -> usize {
+pub fn compute_stack_arg_space(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+) -> usize {
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns);
     let mut total: usize = 0;
-    for cls in arg_classes {
+    for (i, cls) in arg_classes.iter().enumerate() {
         if !cls.is_stack() {
             continue;
         }
-        if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
-            total = (total + 15) & !15;
-        }
-        total += cls.stack_bytes();
+        total += padding[i] + cls.stack_bytes();
     }
     (total + 15) & !15
 }

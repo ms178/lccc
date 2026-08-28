@@ -219,29 +219,62 @@ pub(crate) fn encode_mov_wide_imm(rd: u32, is_64: bool, imm: u64) -> Result<Enco
     }
 }
 
-/// Resolve `:abs_g0:`, `:abs_g1:`, etc. modifiers for movz/movk.
-/// If the expression is a pure constant, returns Some((imm16, hw)) where
-/// imm16 is the relevant 16-bit chunk and hw is the halfword selector.
-/// If the expression contains a symbol reference, returns None (needs relocation).
-pub(crate) fn resolve_abs_g_modifier(
-    kind: &str,
-    symbol: &str,
-) -> Result<Option<(u32, u32)>, String> {
-    let shift = match kind {
-        "abs_g0" | "abs_g0_nc" | "abs_g0_s" => 0,
-        "abs_g1" | "abs_g1_nc" | "abs_g1_s" => 16,
-        "abs_g2" | "abs_g2_nc" | "abs_g2_s" => 32,
-        "abs_g3" => 48,
-        _ => return Ok(None), // Not an abs_g modifier
+/// Classification of an `:abs_g*:` modifier for movz/movk (GAS parity).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AbsGSpec {
+    /// Right-shift applied to the 64-bit value before masking: 0/16/32/48.
+    pub shift: u32,
+    /// Signed variant (`:abs_g*_s:`) — the field is the sign-extended
+    /// bit pattern; the ABI has no `abs_g3_s` form.
+    pub signed: bool,
+    /// No-check variant (`_nc`): the value is truncated, never
+    /// overflow-checked. Used for the later movk chunks of a sequence.
+    /// The ABI defines no `abs_g3_nc`.
+    pub nc: bool,
+}
+
+/// Classify an `:abs_g*:` modifier kind.
+///
+/// * `Ok(None)`  — the kind is not an abs_g modifier at all (caller falls
+///   back to immediate handling).
+/// * `Err`       — the kind looks like abs_g but is not a valid ABI form;
+///   a precise error beats a misleading "expected immediate" later.
+pub(crate) fn abs_g_spec(kind: &str) -> Result<Option<AbsGSpec>, String> {
+    let spec = match kind {
+        "abs_g0" => (0, false, false),
+        "abs_g1" => (16, false, false),
+        "abs_g2" => (32, false, false),
+        "abs_g3" => (48, false, false),
+        "abs_g0_nc" => (0, false, true),
+        "abs_g1_nc" => (16, false, true),
+        "abs_g2_nc" => (32, false, true),
+        "abs_g0_s" => (0, true, false),
+        "abs_g1_s" => (16, true, false),
+        "abs_g2_s" => (32, true, false),
+        _ => {
+            if kind.starts_with("abs_g") {
+                return Err(format!(
+                    ":{}: is not a valid AArch64 abs_g modifier (valid: abs_g0..abs_g3, \
+                     abs_g0_nc..abs_g2_nc, abs_g0_s..abs_g2_s — the ABI defines no \
+                     abs_g3_nc/abs_g3_s)",
+                    kind
+                ));
+            }
+            return Ok(None);
+        }
     };
-    let hw = shift / 16;
-    // Try to evaluate the expression as a constant
-    if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(symbol) {
-        let imm16 = ((val as u64) >> shift) as u32 & 0xFFFF;
-        Ok(Some((imm16, hw)))
-    } else {
-        Ok(None) // Contains symbol reference - needs relocation
-    }
+    Ok(Some(AbsGSpec {
+        shift: spec.0,
+        signed: spec.1,
+        nc: spec.2,
+    }))
+}
+
+/// Build a MOVZ (is_movz) / MOVK word with the given halfword selector.
+pub(crate) fn movw_word(is_movz: bool, rd: u32, is_64: bool, hw: u32, imm16: u32) -> u32 {
+    let sf = sf_bit(is_64);
+    let base = if is_movz { 0b1010_0101u32 } else { 0b1110_0101 };
+    (sf << 31) | (base << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd
 }
 
 pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -250,9 +283,21 @@ pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> 
 
     // Handle :abs_g*: modifiers
     if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
-        if let Some((imm16, hw)) = resolve_abs_g_modifier(kind, symbol)? {
-            let word = (sf << 31) | (0b10100101 << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd;
-            return Ok(EncodeResult::Word(word));
+        if let Some(spec) = abs_g_spec(kind)? {
+            if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(symbol) {
+                let imm16 = ((val as u64) >> spec.shift) as u32 & 0xFFFF;
+                let hw = spec.shift / 16;
+                return Ok(EncodeResult::Word(movw_word(true, rd, is_64, hw, imm16)));
+            }
+            // Symbolic value: the ELF writer resolves these at write time
+            // (aliases/labels inline, everything else as a MOVW reloc),
+            // so reaching here means the modifier was fed to the encoder
+            // directly. Fail with a precise error instead of a misleading
+            // "expected immediate".
+            return Err(format!(
+                "{}: symbolic :{}: value '{}' must be resolved by the ELF writer",
+                "movz", kind, symbol
+            ));
         }
     }
 
@@ -279,13 +324,19 @@ pub(crate) fn encode_movz(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
-    let sf = sf_bit(is_64);
 
     // Handle :abs_g*: modifiers
     if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
-        if let Some((imm16, hw)) = resolve_abs_g_modifier(kind, symbol)? {
-            let word = (sf << 31) | (0b11100101 << 23) | (hw << 21) | ((imm16 & 0xFFFF) << 5) | rd;
-            return Ok(EncodeResult::Word(word));
+        if let Some(spec) = abs_g_spec(kind)? {
+            if let Ok(val) = crate::backend::asm_expr::parse_integer_expr(symbol) {
+                let imm16 = ((val as u64) >> spec.shift) as u32 & 0xFFFF;
+                let hw = spec.shift / 16;
+                return Ok(EncodeResult::Word(movw_word(false, rd, is_64, hw, imm16)));
+            }
+            return Err(format!(
+                "movk: symbolic :{}: value '{}' must be resolved by the ELF writer",
+                kind, symbol
+            ));
         }
     }
 
@@ -305,12 +356,27 @@ pub(crate) fn encode_movk(operands: &[Operand]) -> Result<EncodeResult, String> 
         0
     };
 
+    let sf = sf_bit(is_64);
     let word = (sf << 31) | (0b11100101 << 23) | (hw << 21) | (((imm as u32) & 0xFFFF) << 5) | rd;
     Ok(EncodeResult::Word(word))
 }
 
 pub(crate) fn encode_movn(operands: &[Operand]) -> Result<EncodeResult, String> {
     let (rd, is_64) = get_reg(operands, 0)?;
+
+    // GAS parity: MOVN supports no :abs_g*: relocations — the MOVW
+    // relocation semantics write the un-inverted value, which is wrong
+    // for MOVN's inverted immediate. Reject with a precise message.
+    if let Some(Operand::Modifier { kind, symbol }) = operands.get(1) {
+        if abs_g_spec(kind)?.is_some() {
+            return Err(format!(
+                "movn does not support :{}: modifiers (operand '{}'): \
+                 MOVW relocations cannot express MOVN's inverted immediate",
+                kind, symbol
+            ));
+        }
+    }
+
     let imm = get_imm(operands, 1)?;
     let sf = sf_bit(is_64);
 

@@ -85,6 +85,22 @@ pub enum RelocType {
     Prel64,
     /// R_AARCH64_LD_PREL_LO19 - LDR literal, 19-bit PC-relative
     Ldr19,
+    /// R_AARCH64_MOVW_UABS_G0/G1/G2/G3 - movz/movk absolute halfword
+    /// (build-time overflow check: the full value must fit)
+    MovwUabsG0,
+    MovwUabsG1,
+    MovwUabsG2,
+    MovwUabsG3,
+    /// R_AARCH64_MOVW_UABS_G0/G1/G2 _NC - no-check variants (value is
+    /// truncated; used for later movk chunks). The ABI defines no G3_NC.
+    MovwUabsG0Nc,
+    MovwUabsG1Nc,
+    MovwUabsG2Nc,
+    /// R_AARCH64_MOVW_SABS_G0/G1/G2 - signed variants. The ABI defines
+    /// no SABS_G3 (the top halfword of a signed value uses UABS_G3).
+    MovwSabsG0,
+    MovwSabsG1,
+    MovwSabsG2,
 }
 
 impl RelocType {
@@ -112,6 +128,18 @@ impl RelocType {
             RelocType::CondBr19 => 280,          // R_AARCH64_CONDBR19
             RelocType::TstBr14 => 279,           // R_AARCH64_TSTBR14
             RelocType::Ldr19 => 273,             // R_AARCH64_LD_PREL_LO19
+            // MOVW halfword relocations (IHI0056B / LLVM AArch64.def):
+            // G0=0x107=263 .. G3=0x10d=269, SABS_G0=0x10e=270 .. SABS_G2=272
+            RelocType::MovwUabsG0 => 263,
+            RelocType::MovwUabsG0Nc => 264,
+            RelocType::MovwUabsG1 => 265,
+            RelocType::MovwUabsG1Nc => 266,
+            RelocType::MovwUabsG2 => 267,
+            RelocType::MovwUabsG2Nc => 268,
+            RelocType::MovwUabsG3 => 269,
+            RelocType::MovwSabsG0 => 270,
+            RelocType::MovwSabsG1 => 271,
+            RelocType::MovwSabsG2 => 272,
         }
     }
 }
@@ -1108,6 +1136,8 @@ pub fn encode_instruction(
         // LSE atomics
         "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
         | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
+        // LSE compare-and-swap pair (kernel mm/slub.c __cmpxchg_double & co.)
+        "casp" | "caspa" | "caspal" | "caspl" => encode_casp(mnemonic, operands),
         "swp" | "swpa" | "swpal" | "swpl" | "swpb" | "swpab" | "swpalb" | "swplb" | "swph"
         | "swpah" | "swpalh" | "swplh" => encode_swp(mnemonic, operands),
         "ldadd" | "ldadda" | "ldaddal" | "ldaddl" | "ldaddb" | "ldaddab" | "ldaddalb"
@@ -1140,7 +1170,7 @@ pub fn encode_instruction(
 
 // ── Encoding helpers ──────────────────────────────────────────────────────
 
-fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
+pub(crate) fn get_reg(operands: &[Operand], idx: usize) -> Result<(u32, bool), String> {
     match operands.get(idx) {
         Some(Operand::Reg(name)) => {
             let num = parse_reg_num(name).ok_or_else(|| format!("invalid register: {}", name))?;

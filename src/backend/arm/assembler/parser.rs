@@ -182,6 +182,11 @@ pub enum AsmDirective {
     RawBytes(Vec<u8>),
     /// Literal pool dump: `.ltorg` or `.pool`
     Ltorg,
+    /// `.org new-lc [, fill]` — pad the current section to `new-lc` bytes
+    /// from its start with `fill` (default 0). Evaluated immediately by the
+    /// ELF writer (`.` and already-defined labels resolve; forward
+    /// references are an error).
+    Org { expr: String, fill: u8 },
     /// Other ignored directives (.file, .loc, .ident, etc.)
     Ignored,
 }
@@ -1863,9 +1868,30 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             AsmDirective::Ignored
         }
         ".org" => {
-            // .org expressions like ". - (X) + (Y)" are used as size assertions
-            // in kernel alternative macros. Silently ignore them.
-            AsmDirective::Ignored
+            // `.org new-lc [, fill]` — advance the location counter to
+            // `new-lc` bytes from the section start, padding with `fill`
+            // (default 0).  Evaluated immediately, matching GAS: `new-lc`
+            // may reference `.` and already-defined labels in the current
+            // section, but forward references are rejected by the ELF
+            // writer because padding shifts every following offset and
+            // cannot be deferred the way `.word` expressions can.
+            // Primary kernel user: the vectors table
+            // (`.org .Lventry_start + 128` pads each entry to 128 bytes).
+            let (lc, fill) = match args.split_once(',') {
+                Some((lc, f)) => {
+                    let fill_val = crate::backend::asm_expr::parse_integer_expr(f.trim())
+                        .map_err(|_| format!("bad .org fill: {}", f.trim()))?;
+                    if !(0..=255).contains(&fill_val) {
+                        return Err(format!(".org fill out of byte range: {}", f.trim()));
+                    }
+                    (lc.trim(), fill_val as u8)
+                }
+                None => (args, 0u8),
+            };
+            AsmDirective::Org {
+                expr: lc.to_string(),
+                fill,
+            }
         }
         ".incbin" => {
             let parts: Vec<&str> = args.splitn(3, ',').collect();

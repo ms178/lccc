@@ -1,139 +1,118 @@
-# LCCC Follow-up / Kontinuität — Session 90 (2026-08-28, Agent-Z audit + miscompile round)
+# LCCC Follow-up / Kontinuität — Session 90 (2026-08-28, cross-backend ABI round)
 
-**Scope:** audit and perfect Agent Z's `fuse_setcc_branch` (PR #274 body);
-close the audit with red-team regression tests; resolve every corpus
-failure down to root cause; keep the deliverable applies-clean on latest
-main.
+**Scope:** work through the `current_tasks/` queue across all four supported
+architectures (x86-64, i686, AArch64, RISC-V), transfer recent code-quality
+improvements between backends, and add regression tests for everything.
 
-**Base:** `origin/main @ 2b53a6ec` (PR #273 = v7 peephole `9a540781`,
-PR #274 = Agent Z `0fbf334a`)
-**Session commits:** `7569cdb0` (fuse_setcc_branch hardening + differential
-tests), `7df4089c` (two pre-existing miscompiles surfaced by the corpus)
-**Deliverable:** ms178-1.patch — APPLIES-CLEAN on fresh `2b53a6ec`.
+**Base:** `origin/main @ 2b53a6ec` (PR #274 = merged ms178-1.patch)
 
 ---
 
-## 1. Validation state (all measured this session)
+## 1. Queue disposition (8 of 9 closed)
 
-| suite | result |
-|---|---|
-| unit (`cargo test --lib`) | **1258 pass / 0 fail / 6 ignored** |
-| regression corpus (`run_regression.py`, regression + benchmark dirs) | **506 pass / 0 fail** / 10 skip-compare (GCC cannot build the oracle — lccc self-checks pass) / 0 skip-run |
-| compat_test.sh (GCC differential) | **20/20** |
-| boot gate (`build_kernel_boot.sh`) | **PASS, `_end=31168`** (headroom 1600 B), flat setup image **byte-identical** to the ld.bfd oracle |
-| mulacc/setCC differential (4 new GCC-oracle tests) | byte-exact vs GCC -O2, fusion ON and OFF (`CCC_NO_MULACC`, `CCC_NO_SETCC_BRANCH`) |
+| Task | Verdict | Evidence |
+|---|---|---|
+| fix_arm_asm_caspal_instruction | **fixed** | `encode_casp` per LLVM `AArch64InstrFormats.td`; all 4 orderings × X/W pairs + SP base byte-exact round-tripped through Capstone (0x4860FD62 et al.); `LineKind`-propagation skip extended to the whole casp/cas family |
+| fix_arm_asm_global_branch_relocs | **fixed** | `resolve_local_branches` now checks `global_symbols`/`weak_symbols` before in-place baking (GAS preemption parity); `readelf -r` shows CALL26/JUMP26 against same-section globals, locals stay baked |
+| fix_arm_asm_org_directive | **fixed** | `.org new-lc [, fill]` implemented with token-boundary-aware `.`/label substitution, immediate evaluation (GAS parity), backward-move and forward-ref errors. Vector-table shape (3×128 B entries, fill bytes) verified |
+| fix_arm_asm_quad_prel64_relocation | **already fixed** (stale file) | parser `sym+offset` decomposition, size-based PREL32/PREL64 selection, `RelocType::Prel64` (260) all present; `.quad sym+48 - .` emits `R_AARCH64_PREL64` with addend 0x30 |
+| fix_arm_movw_symbolic_relocations | **fixed** | new `AbsGSpec` classification, write-time alias/label resolution with overflow checks, MOVW relocations (ABI 263–272) for globals/externals; kernel `tramp_alias` shape encodes inline byte-exact (G2_s=0xFFFF, G1_nc=0xFF5F, G0_nc=0x5FFC) |
+| fix_i686_double_param_high_word_store | **already fixed** (stale file) | `f01` asm carries both stores; all trigger shapes pass at -O0/-O1/-O2; locked with `tests/regression/i686_double_param_high_word.{c,flags}` |
+| fix_pcre2_stack_frame_bloat | **already fixed** (stale file) | width-partitioned small slots landed earlier; A/B differential lives in the suite (`CCC_NO_SMALL_SLOTS`) |
+| fix_riscv_va_arg_long_double_struct | **fixed (end-to-end)** | see §2 |
+| fix_dash | **deferred** | needs a RISC-V execution environment (qemu-user + riscv sysroot) absent from this sandbox; compile-side attempt not meaningful without the target libc |
 
-## 2. fuse_setcc_branch — audit closed, hardening landed
+## 2. RISC-V va_arg struct{long double} — the full repair
 
-The full semantic audit of Agent Z's fusion (1,809 lines) closed with two
-code-level defects fixed and locked by tests:
+The earlier IR-lowering fix aligned the *callee's* va_arg read pointer, but
+the *caller* still placed over-aligned structs on 8-byte boundaries and the
+callee's named-parameter layout matched that old shape. Three coordinated
+fixes make both sides agree with the psABI:
 
-1. **movzwl carrier arm deleted.** setCC writes only the low BYTE of its
-   destination; `movzwl %ax` imports AH — garbage — into the bool, so ZF
-   would not reflect it. The fusion must refuse that carrier
-   (`setcc_fuse_refuses_movzwl_carrier`).
-2. **Post-jcc guard made classifier-independent.** The reader check must
-   run before the barrier check (a CondJmp is both), labels are skipped
-   (fallthrough enters the next block), AND — the new part — the reader
-   test consults `is_cond_jcc()`, the authoritative mnemonic list. The
-   classifier keys `is_conditional_jump` on the *second* character, so
-   `jc` classifies as Other while `jnc` classifies as CondJmp; a `jc`
-   after the branch escaped the guard and the fusion fired, handing the
-   reader the producer's flags (repro: je→jne rewrite in
-   `setcc_fuse_refuses_jcc_reader_after_branch`). The deadness scan now
-   also stops at any conditional-jump spelling (its target may rejoin and
-   read the carrier).
-3. Red-team suite (7 tests): dead window, je inversion, movzwl refusal,
-   post-branch jcc reader refusal (`jc` spelling), setCC reader behind
-   the fallthrough label refusal, writer-before-reader allowance,
-   live-bool window-kept shape. cmpl-headed producers make every refusal
-   *observable* (no other pass may drop a cmpl-headed setCC test, and a
-   wrong fusion's je→jne rewrite is detectable in the output text).
-4. Liveness def-point numbering re-verified end-to-end (per-instruction
-   points; mulacc `block_start + ii` defs match exactly) — Agent Z's
-   def-point gate is sound.
+1. **Caller forward layout** (`riscv/codegen/calls.rs`): per-arg alignment
+   padding from the previously-ignored `struct_arg_aligns` parameter, via
+   the shared `compute_stack_arg_padding`. `struct { long double }` after
+   an odd 8-byte overflow arg now lands 16-byte aligned.
+2. **Space accounting** (`call_abi.rs`): `compute_stack_arg_space` is now
+   padding-aware (it previously rounded the unpadded total, which can
+   under-allocate when two over-aligned structs interleave with scalars —
+   8+16+8+16 needs 64 B, the old math reserved 48).
+3. **Named-parameter layout** (`call_abi.rs` shared callee loop) and
+   **va_start base** (`named_params_stack_bytes` now derived from the
+   ParamClass offsets themselves, so it can never drift from the layout).
 
-## 3. Corpus failures — all five resolved to root cause
+`misalign(1..9, {42.0L})` assembly now shows: caller reserves 32 B, places
+a9@0 and the struct@16; callee va_list=sp0+8, align-up → sp0+16, reads
+exactly the struct. Before, the caller wrote @8 while the callee read @16.
 
-Starting corpus state on `2b53a6ec` was **501/5** (the earlier "474/0/11"
-baseline predates the benchmark dir being swept and the i386 loader being
-installed). All five:
+**Cross-backend transfer:** ARM's caller got the identical padding, and ARM
+`emit_va_arg_struct` now honors its previously-ignored `align` parameter
+(register-path `__gr_offs` rounding-down, stack-path 16-byte align-up —
+AAPCS64 parity). The shared named-layout loop benefits x86-64 too (its
+caller already padded; the callee now matches).
 
-1. **sqlite_varint — REAL MISCOMPILE, fixed (`7df4089c`).** MachInst
-   two-address lowering (`mov lhs,dst; alu rhs,dst`) reads rhs *after*
-   writing dst, but the allocator only guarantees IR read-then-write
-   semantics; rhs and dest legally shared %edx and the OR became
-   `or %edx,%edx` (sqlite3GetVarint `b |= *p`, every 9-byte varint wrong).
-   ISel now enforces the machine constraint: commutative ops swap
-   operands, Sub/both-alias falls back to the mature emitter
-   (`lower_binop` → bool). Bisection: `CCC_MI_DISABLE_KINDS=binop`,
-   `CCC_NO_MACHINST`, `CCC_NO_BLOCK_RELAYOUT`, `CCC_NO_LEAF_PARAM_GPR`
-   all masked it; the MI stream contained the OR, the final asm did not.
-2. **glibc_f128_builtins — REAL MISCOMPILE, fixed (`7df4089c`).**
-   `Intrinsic::result_type()` returned None for F128Fabs/Neg/Copysign, so
-   their destinations got 8-byte slots while codegen stores 16 (movdqu);
-   the store overflowed into the neighbouring slot and corrupted the
-   operand for later ops. `result_type()` now reports F128 for the three
-   bit-op builtins.
-3. **stmt_expr_asm_typeof — TEST defect, fixed (`7569cdb0`).** It returned
-   42 (the asserted payload) instead of 0; both lccc and GCC returned 42.
-4+5. **i686_fused_mul_add_operand_order, segment_fill_copy_alias —
-   environment, resolved.** `-m32` exes were linked without crt1.o (no
-   `libc6-dev-i386` on the host), so main's final `ret` popped argc and
-   jumped to 1 — *after* the program computed correctly. They were
-   skip-run before (no i386 loader; the 11 baseline skips); installing
-   the loader (via gdb's lib32 pull-in) unmasked them. With
-   `libc6-dev-i386` installed both exit 0 — and the whole -m32 corpus now
-   genuinely executes, which is strictly better i686 coverage.
+## 3. MOVW relocation types — a latent linker bug found and fixed
 
-## 4. New coverage
+The AArch64 linker's MOVW type numbers assumed a consecutive
+G0/G0_NC/G1_NC/G2_NC/G3 layout that matches nothing: per IHI0056B /
+LLVM `AArch64.def` the real numbers interleave the non-NC forms
+(G0=263, G0_NC=264, G1=265, G1_NC=266, G2=267, G2_NC=268, G3=269,
+SABS_G0=270, SABS_G1=271, SABS_G2=272). G1_NC was resolved with G1's
+shift, G3 with G2's — dead-wrong code that could never fire before the
+assembler gained MOVW emission. Fixed constants + handlers for all ten
+forms. There is no G3_NC / SABS_G3 in the ABI; `:abs_g3_nc:`/`:abs_g3_s:`
+are rejected with precise messages.
 
-- `mulacc_chain_u64.c`: kstrtoull-shaped chains with overflow gates,
-  wraparound, 2^32/2^63 boundaries.
-- `mulacc_sext_addend.c`: sext/negative addend feeders, negative constant
-  addends, hi-zero boundary base 0xFFFFFFFF vs rejected >=2^32 bases,
-  sign-bit-set u32 feeders.
-- `mulacc_nop_cast_sandwich.c`: multi-use no-op cast sandwiches, split
-  uses, nested chains, self-referential wraparound (the single-use canon
-  rule).
-- `setcc_bool_gate.c`: window-dead, window-kept (bool stored), sete/je
-  inverted shape, chained selects.
+## 4. Other quality items
 
-All GCC-oracle compared byte-exact at -O2, fusion on and off.
+- **Zero-warning contract repaired for the test profile**: duplicated
+  `#[test]` attribute on `else_hoist_keeps_original_polarity` (shipped in
+  ms178-1.patch; `cargo test` refused to compile with `-D warnings`).
+- `encode_cas` suffix parsing switched from `contains` probes to an exact
+  grammar shared with `encode_casp` — `casq`/`casx` now error instead of
+  silently assembling as relaxed CAS. All twelve valid CAS forms pinned
+  byte-exact (Capstone cross-check).
+- CASP even-start/consecutive/uniform-width validation is architectural,
+  not cosmetic: the encoding has no fields for Xs+1/Xt+1, so accepting
+  `caspal x0, x2, x4, x6` would silently change which registers
+  participate in the atomic operation.
 
-## 5. Lessons that cost time — do not re-learn them
+## 5. Verification state
 
-- The runner sweeps `tests/regression/` **and** `tests/benchmark/programs/`;
-  a `.flags` file (e.g. `-m32 -O0`) overrides the `-O2` default — hand
-  runs without it reproduce nothing.
-- `tests/compat_test.sh` needs plain `LCCC_BIN=./target/fastbuild/lccc`
-  (it appends `-I` itself; a raw include dir makes the driver fail).
-- gdb's install pulls `libc6-i386` (the loader appears → -m32 runs →
-  crt-less links crash at exit); install `libc6-dev-i386` in the same
-  breath or the -m32 corpus reports phantom segfaults.
-- The MI stream (`CCC_MI_STREAM=1`) proves what MachInst emitted; diff
-  *that* against the final asm before suspecting the emitter — the peephole
-  phase is innocent in this class of bug.
-- Test-expectation pitfalls in this round: another pass may normalize a
-  redundant test's operands (`testl %eax,%edx` → `%eax,%eax`) or delete a
-  branch-to-next; assert on the *observable semantics* (jne present/absent,
-  testl family present), not exact spellings.
+- Unit suite: **1262 passed / 0 failed / 6 ignored** (12 new: CASP exact
+  words ×2 + suffix rejection, CAS family drift pins, `.org` padding/
+  errors/absolute-arith, global-branch triage, MOVW tramp_alias/external/
+  overflow×2, CASP pipeline guard).
+- Regression suite: **476 PASS / 0 FAIL / 0 AB-diff** (was 474/0/0; two new
+  tests: `i686_double_param_high_word`, `ld_struct_va_arg_align`; the i686
+  test's GCC oracle comparison skips in this sandbox for lack of a static
+  32-bit libm — GCC builds it on any multilib host).
+- fastbuild build: zero warnings (`-D warnings` enforced).
+- Boot gate: SKIP (no kernel tree in this sandbox).
+- toolchain: rustup 1.98.0 per `rust-toolchain.toml`; sandbox constraints:
+  2 vCPU / 4 GB, no qemu-aarch64/riscv64, no 32-bit syscalls under seccomp
+  (i686 freestanding tests verified via int3/ud2 death-signal verdicts).
 
 ## 6. Next-session entry points (priority order)
 
-1. **CCC_PEEPHOLE_SKIP plumbing for the i686 text pipeline** (still
-   x86-64-only; peephole_ab.py cannot A/B i686 patterns).
-2. P0 levers (memset→rep stosl, video family, census-v2 callee-saves) —
-   boot gate has 1600 bytes of `_end` headroom and the gate now reports
-   PASS with room; per-function insn excess table unchanged from session 89.
-3. Unit tests still missing for P5-sym/P13/P14/threading/redundant-jCC/
-   propagate (i686 peephole).
-4. RA accumulator machine + allocatable ebx/esi/edi (the big per-function
-   excesses: set_video +169, vga_set_mode +137, vsprintf +118).
+1. **fix_dash (riscv)**: reproduce under qemu-user with a riscv64 sysroot;
+   the dash sources are downloaded/configured in the session notes — the
+   failure mode (compile vs runtime) is still unknown.
+2. **P17 second harvest** (recursive body walk, ~10 nested-diamond sites)
+   and **P18 generalisation** (session-89 §6 items 3–5 unchanged).
+3. **CCC_PEEPHOLE_SKIP plumbing for the i686 text pipeline** (A/B harness
+   parity with x86-64).
+4. **x86-64 callee-side named struct{long double} test**: the shared-loop
+   padding now aligns named over-aligned stack params on the callee to
+   match the caller; a dedicated hosted probe with GCC cross-check would
+   pin it independently of `ld_struct_va_arg_align` (which covers the
+   variadic path).
+5. Pre-existing clippy lints across `elf_writer_common.rs`,
+   `simplify.rs`, arm encoder files (cosmetic; build is warning-free).
 
 ## 7. Snapshot ledger
 
-`S04-az-audit-miscompiles` — base `2b53a6ec`, head `7df4089c`,
-deliverable ms178-1.patch APPLIES-CLEAN on fresh `2b53a6ec` (validated
-with `git apply --check`), zero garbage (no trace probes; the temporary
-`CCC_SETCC_TRACE` eprintlns were removed before commit).
+`S04-crossbackend-abi` — base `2b53a6ec`, deliverable ms178-2.patch
+APPLIES-CLEAN (validated with `git apply --check` on a pristine base
+worktree), zero garbage (no eprintln!/dbg!/TRACE/env-gated probes added;
+the pre-existing `resolve_pending_instructions` warning path untouched).
