@@ -39,7 +39,7 @@ How to gather data (mandatory):
 
 | ID | P | Item | Files | Evidence | Accept | Do not |
 |----|---|------|-------|----------|--------|--------|
-| PF-05 | P0 | Adler accumulator spills — merged into RA-06 (the arithmetic-chain copy-web work); the standalone leader-promotion variant is a measured negative | `regalloc.rs`, `live_range.rs` | **M** adler 1.63× | see RA-06 acceptance | leader promotion without the web extension |
+| PF-05 | P0 | Adler accumulator spills — merged into RA-06 (the arithmetic-chain copy-web work); the standalone leader-promotion variant is a measured negative | `regalloc.rs`, `live_range.rs` | **M** adler 1.50× | see RA-06 acceptance | leader promotion without the web extension |
 | PF-06 | P1 | isort: secondary-IV strength reduction (marching register for `j+1`) + int-index widening pairs | `iv_strength_reduce.rs`, codegen | **G** isort 43 vs Clang 23 | isort ≤25 insns | recompute chains per iteration |
 | PF-15 | P1 | scmp re-sign-extends the same byte three times: "the source is already its own extension" | peephole | **G** scmp 25 vs GCC 12 | designed shape fires | fold without dominance-correct liveness |
 | PF-16 | P2 | `movq $imm32,%reg` → `movl`; redundant `cltq` after `lzcnt` | peephole | **G** ffs1 17 vs 11, lz 8 vs 6 | fewer wide imms | change RA homes |
@@ -55,7 +55,7 @@ How to gather data (mandatory):
 | RA-01b | P0 | Marching-pointer recurrences (IVSR Ptr phis) get slot-homed: 151 of nbody's 159 stack refs are GPR address traffic. Extend GlobalAddr remat through Copy chains; prefer SIB-index forms for IVSR recurrences | `generation.rs`, `regalloc.rs` | **M/G** GCC keeps 0 stack refs via direct `bodies+N(%rip)`; lccc folds 66 where the cascade fires | nbody stack refs 159 → <20 | entry-hoist derived variable-index bases |
 | RA-02 | P0 | Keep match IVs (`scan`,`best`,`chain`) in GPR | `live_range.rs` next-use | **M** 248 B frame | stack-mem <20 on gzip `longest_match` | eviction mode 5 global |
 | RA-03 | P0 | Adler DO8: the reassoc closed form materialises all eight byte temporaries. Refuse the form above the GPR budget or emit GCC's interleaved prefix-sum tree | `reassoc_accum.rs`, `live_range.rs` | **M** 91 vs GCC 63 insns; prefix-sum = ~26 insns, 0 stack | Adler kernel ≤1.15× GCC | unify incoming/victim cost blindly; another eviction knob (modes 2/4/5 measured worse) |
-| RA-06 | P0 | **Reload-at-next-use + in-place splitting** (historically RA-06a) — the #1 perf gap (3–5× spill traffic). Gate on the `enable_splitting` stub; reuse the sweep-eviction traffic model; start with call-site splits; extend arithmetic-chain copy webs so ONE range carries a recurrence (the naive leader-promotion measured +28 % runtime — see DECISIONS.md) | `live_range.rs`, `regalloc.rs`, `split_ranges.rs` | **C** `live_range.rs:26` "no reload-at-next-use"; **M** adler 1.58× | gzip unregressed; adler ≤1.15×; spill traffic −30…−50 % | IR volatile alloca dance; Wimmer-style rewrite in one step |
+| RA-06 | P0 | **Reload-at-next-use + in-place splitting** (historically RA-06a) — the #1 perf gap (3–5× spill traffic). Gate on the `enable_splitting` stub; reuse the sweep-eviction traffic model; start with call-site splits; extend arithmetic-chain copy webs so ONE range carries a recurrence (the naive leader-promotion measured +28 % runtime — see DECISIONS.md) | `live_range.rs`, `regalloc.rs`, `split_ranges.rs` | **C** `live_range.rs:26` "no reload-at-next-use"; **M** adler 1.50× | gzip unregressed; adler ≤1.15×; spill traffic −30…−50 % | IR volatile alloca dance; Wimmer-style rewrite in one step |
 | RA-07 | P1 | Call-site caller-saved save vs always r12 | `regalloc.rs` `caller_save_spans` | **C** Phase 2b slots | use spans more; prologue stk down | promote r11 to callee-saved |
 | RA-08 | P1 | Affinity coalescing overlapping copies | `regalloc.rs` `build_coalesce_groups` | **C** disjoint-only | fewer movs, no extra spills | merge overlapping intervals |
 | RA-09 | P2 | Residual Briggs on spilled | new | **C** | fewer reloads | rename the slot colorer as a GPR allocator |
@@ -79,7 +79,7 @@ How to gather data (mandatory):
 | IS-08 | P1 | Load-cast fold remaining | `prologue.rs` load_cast | **C** 33 % gzip-9 was movzbl | leftover movzbl down | disable the fold globally without measure |
 | IS-09 | P1 | Cmp-replay only from **slots** | keep | **C** sqlite `yy_shift` | no sqlite SEGV | replay from physreg |
 | IS-10 | P1 | Flag fusion Copy/Cast chain — extend carefully | exists | **C** expat accounting SEGV if multi-use | more fused cmp | multi-use flags |
-| IS-11 | P1 | C `__ffs` if-tree → gcc **`andn`+`cmov` chain** (not tzcnt) | `bit_idioms.rs`, `alu.rs` | **G** gcc cmov×11; 1.42× gap | find_bit CE vs gcc | blindly emit tzcnt |
+| IS-11 | P1 | C `__ffs` if-tree → gcc **`andn`+`cmov` chain** (not tzcnt) | `bit_idioms.rs`, `alu.rs` | **G** gcc cmov×11; 1.51× gap | find_bit CE vs gcc | blindly emit tzcnt |
 | IS-13 | P1 | ALU+mem for spilled | peephole | ICX lookalike | fewer reloads | change RA homes |
 | IS-16 | P2 | Match inner 258 B with `pcmpeqb` | vectorize | spike | gzip gate | ship without CRC/adler oracles |
 | IS-17 | P1 | MachInst profit model ≠ 32-inst cutoff | `prologue.rs` | **C** gzip −3 % | beat gzip then raise | `CCC_MI_FORCE_LOOPS` |
@@ -156,7 +156,7 @@ How to gather data (mandatory):
 
 | ID | P | Item | Files | Evidence | Accept | Do not |
 |----|---|------|-------|----------|--------|--------|
-| AB-01 | P0 | SysV SSE-class args in XMM not rax shuttle (returns landed) | ABI + float_ops | **S** struct_copy 1.54× | XMM class | rax roundtrip |
+| AB-01 | P0 | SysV SSE-class args in XMM not rax shuttle (returns landed) | ABI + float_ops | **S** struct_copy 1.35× | XMM class | rax roundtrip |
 | AB-02 | P0 | sret + one wide copy | ABI | same | one ymm/xmm copy | field loop |
 | AB-03 | P1 | 4-byte slots without zext bug | stack_layout README | **C** | | |
 | AB-04 | P1 | Overalign param copy already special-cased; audit | prologue Alignas(32) | **C** | | |
@@ -272,24 +272,24 @@ layout must not reorder (expat 131→248 ms).
 
 Canonical screening: `-O2` paired medians vs GCC 14.2, checksums verified,
 shared 2-core VM (no PMU). Full table in root `README.md`
-(2026-08-25, geomean ≈ 0.85; conventional-code geomean ≈ 0.95).
+(2026-08-28, geomean ≈ 0.74; conventional-code geomean ≈ 1.10).
 
 | Workload | LCCC vs GCC | Root cause | Oracle (CE -O2 v3) |
 |----------|-------------|------------|---------------------|
 | gzip `longest_match` | 118 vs 0 stack-mem, 248 B frame, GOT | RA remat + RIP + IV homes (RA-01/02) | gcc `window(%r9,%rcx)`, 1× push rbx |
-| zlib-ng Adler kernel | ~1.58× | arithmetic-chain copy webs + no reload-at-use (RA-06/RA-03) | icx/clang: 0 stack |
-| gzip CRC kernel | **0.86× WIN** (hoisted PIC base + magic-const hoist) | closed for the table loop | gcc 20-line loop; **no `crc32` insn** |
-| Expat name scan | ~1.6× | hash-multiply `imul` chains; branch-prediction shaped on VM | gcc `btq` |
+| zlib-ng Adler kernel | ~1.50× | arithmetic-chain copy webs + no reload-at-use (RA-06/RA-03) | icx/clang: 0 stack |
+| gzip CRC kernel | **0.87× WIN** (hoisted PIC base + magic-const hoist) | closed for the table loop | gcc 20-line loop; **no `crc32` insn** |
+| Expat name scan | ~1.80× | hash-multiply `imul` chains; branch-prediction shaped on VM | gcc `btq` |
 | xmltok / inflate TUs | segment RA landed; re-measure | former 12×/15× stack-mem addressed by RA-05a | — |
-| `struct_copy` | ~1.54× | scalar movsd chains vs paired mulpd; SysV SSE class (AB-01/02) | gcc/icx: 2× ymm for 64 B |
-| nbody / spectral / mandelbrot | 1.26 / 1.30 / 1.23 | multi-store scatter (OP-05b) + marching pointers (RA-01b) | ICX nbody 97 ymm / 58 FMA |
-| sqlite varint | 1.27–1.36× | ISel branches, loop rotation | — |
-| linux_find_bit | 1.42× | gcc `andn`+`cmov` ffs tree, **not tzcnt** | CE corpus |
-| loop_patterns | **0.98× (beats GCC)** | LCG RA precise-span seed + fused mul-add | gcc `vpmaxsd` would beat scalar |
-| sieve | 1.26× | gcc **45 scalar**; clang **365 ymm** — **do not copy clang** | |
+| `struct_copy` | ~1.35× | scalar movsd chains vs paired mulpd; SysV SSE class (AB-01/02) | gcc/icx: 2× ymm for 64 B |
+| nbody / spectral / mandelbrot | 1.23 / 1.31 / 1.23 | multi-store scatter (OP-05b) + marching pointers (RA-01b) | ICX nbody 97 ymm / 58 FMA |
+| sqlite varint | 1.19× | ISel branches, loop rotation | — |
+| linux_find_bit | 1.51× | gcc `andn`+`cmov` ffs tree, **not tzcnt** | CE corpus |
+| loop_patterns | 1.06× (parity within CI) | LCG RA precise-span seed + fused mul-add | gcc `vpmaxsd` would beat scalar |
+| sieve | 1.20× | gcc **45 scalar**; clang **365 ymm** — **do not copy clang** | |
 | mandelbrot | 1.23× | FP branch-heavy loop; rotation | |
-| libm_round_family | **0.41× (2.43× faster)** | IS-29a landed | |
-| fib / ackermann | **0.009× / 0.022×** | TCE + rec2iter | not codec metrics |
+| libm_round_family | **0.41× (2.42× faster)** | IS-29a landed | |
+| fib / ackermann | **0.010× / 0.018×** | TCE + rec2iter | not codec metrics |
 
 ## 4. What "beat ICX" means
 

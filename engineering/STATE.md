@@ -75,19 +75,21 @@ hardening). Re-verify line numbers before editing. The item catalog is
   `-pg`/`-mfentry` mcount family emitted; objtool interop is the next hard
   gate (see `tasks/`).
 
-## What is still losing vs GCC (canonical 2026-08-25 screening)
+## What is still losing vs GCC (canonical 2026-08-28 screening)
 
 Ratio = LCCC/GCC, `-O2`, paired medians, checksums verified. Geomean
-~0.85 (27 pairs), conventional-code geomean ~0.95. Full table:
-root `README.md`. Root-caused gaps, in priority order:
+0.738 (33 pairs), conventional-code geomean 1.096 (30 pairs, recursion
+folds excluded). Full table: root `README.md`; evidence:
+`evidence/benchmarks/2026-08-28-1b3994e7/`. Root-caused gaps, by magnitude:
 
 | Gap | Kernel | Root cause | Tracked as |
 |-----|--------|-----------|------------|
-| ~1.63× | adler32 | arithmetic-chain copy webs; no reload-at-use | RA-06/PF-05 (P0) |
-| 1.26× / 1.30× | nbody / spectral | non-reduction FP loops; multi-store scatter; marching-pointer slot-homing (mandelbrot 1.23×) | OP-05b, RA-01b (P0) |
+| 2.15× | tls_seg_access | thread-pointer materialization; direct `%fs:offset` covers only link-time-constant offsets | unassigned (candidate IS) |
+| ~1.50× | adler32 | arithmetic-chain copy webs; no reload-at-use | RA-06/PF-05 (P0) |
+| 1.23× / 1.31× | nbody / spectral | non-reduction FP loops; multi-store scatter; marching-pointer slot-homing (mandelbrot 1.23×) | OP-05b, RA-01b (P0) |
 | suite-wide | every loop kernel | loop rotation default-off (double-jump preheader, ~1 branch/iter) | PF-17 hardening (P0) |
-| ~1.69× | expat | hash-multiply `imul` chains | OP-25/PF-15 (P1) |
-| ~1.44× | linux_find_bit | branchy ffs tree → andn+cmov chain | IS-11 (P1) |
+| ~1.80× | expat | hash-multiply `imul` chains | OP-25/PF-15 (P1) |
+| ~1.51× | linux_find_bit | branchy ffs tree → andn+cmov chain | IS-11 (P1) |
 | isort (CE) | instruction count | secondary-IV strength reduction (43 vs 23) | PF-06 (P1) |
 
 ## Dead code — nuanced assessment
