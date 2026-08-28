@@ -3694,8 +3694,17 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         )
     }
     /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
+    ///
+    /// The mnemonic check is authoritative, not the classifier: the
+    /// LineKind-based arm misses synonyms the classifier folds into
+    /// Other — `is_conditional_jump` keys on the second character, so
+    /// `jc` classifies as Other while `jnc` classifies as CondJmp. A
+    /// flags reader that slips through here would let the fusion hand
+    /// it the producer's flags instead of the dropped test's (caught by
+    /// setcc_fuse_refuses_jcc_reader_after_branch with a `jc`).
     fn is_flags_reader(kind: LineKind, s: &str) -> bool {
         matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
+            || is_cond_jcc(s)
             || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
     }
 
@@ -3744,21 +3753,12 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     None
                 }
             }
-        } else if let Some(rest) = mz.strip_prefix("movzwl ") {
-            let mut it = rest.split(',');
-            let src = it.next().unwrap_or("").trim();
-            let dst = it.next().unwrap_or("").trim();
-            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
-                None
-            } else {
-                let sf = register_family(src);
-                let df = register_family(dst);
-                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
-                    Some(df)
-                } else {
-                    None
-                }
-            }
+        // movzwl is deliberately NOT accepted here: setCC writes only the
+        // low BYTE of its destination, so `movzwl %ax, %r32` would import
+        // whatever the high byte of %ax held into the bool — the fused test
+        // (and the branch rewritten onto the producer CC) would then observe
+        // garbage bits, not the 0/1 bool. movzbl is the only zero-extend of
+        // a setCC result that is exact by construction.
         } else {
             None
         };
@@ -3860,8 +3860,16 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         };
         // Post-jcc guard: a flags writer must precede any flags reader on
-        // the fallthrough path (bounded scan; barriers stop it — a label
-        // ends the guaranteed-straight-line region conservatively).
+        // the fallthrough path. ORDER MATTERS: the reader check runs BEFORE
+        // the barrier check because a CondJmp is both a reader and a
+        // barrier — after the rewrite it would consume the producer's
+        // flags instead of the dropped test's. Labels are SKIPPED, not
+        // barriers: the fallthrough physically continues into the next
+        // block, so a reader there sees the changed flags too. The scan
+        // still stops at true control/analysis boundaries (call destroys
+        // the flags entirely; jmp/ret leave the path; push/pop/esp fences
+        // are handled by their own barrier classes) and at any flag-
+        // preserving instruction it keeps scanning.
         let mut ok_after = true;
         let mut m = t + 1;
         let mut cnt = 0;
@@ -3870,15 +3878,19 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 m += 1;
                 continue;
             }
-            if infos[m].is_barrier() {
-                break;
-            }
             let s2 = trimmed(store, &infos[m], m);
             if is_flags_writer(s2) {
                 break;
             }
             if is_flags_reader(infos[m].kind, s2) {
                 ok_after = false;
+                break;
+            }
+            if infos[m].kind == LineKind::Label {
+                m += 1;
+                continue;
+            }
+            if infos[m].is_barrier() {
                 break;
             }
             m += 1;
@@ -3903,6 +3915,14 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     break;
                 }
                 let s3 = trimmed(store, &infos[k2], k2);
+                // A conditional branch of ANY synonym spelling ends the
+                // provable region: its target may rejoin and read the
+                // carrier. (The classifier may fold rare spellings like
+                // `jc` into Other — is_cond_jcc is the authoritative
+                // mnemonic list.)
+                if is_cond_jcc(s3) {
+                    break;
+                }
                 let written = match infos[k2].kind {
                     LineKind::Other { dest_reg } => dest_reg == c,
                     LineKind::Move { dst, .. } => dst == c,
@@ -10887,6 +10907,111 @@ mod tests {
         let asm = "    xorl %eax, %eax\n    pushl %eax\n    xorl %eax, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert_eq!(r.matches("xorl %eax, %eax").count(), 2, "both kept: {}", r);
+    }
+
+    // ── fuse_setcc_branch red-team tests ──
+    //
+    // Canonical fused shape (the emitter's real relay chain):
+    //   orl; setne %al; movzbl %al,%eax; movl %eax,%edx; testl %eax,%edx; jne
+    // The test is redundant: setCC→movzbl→movl all preserve EFLAGS, so the
+    // jcc can read the producer's ZF (identical: bool==0 ⇔ or-result==0).
+
+    #[test]
+    fn setcc_fuse_drops_dead_window() {
+        // Both carriers rewritten before any read or label: the whole
+        // window (setCC..relay) is dead and disappears. invert_cc("ne")
+        // == "e", so the rewritten je is textually unchanged but now
+        // consumes the producer's flags.
+        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        assert!(!r.contains("testl"), "test dropped: {}", r);
+        assert!(!r.contains("setne"), "dead window NOPed: {}", r);
+        assert!(r.contains("je .L1"), "branch onto producer flags: {}", r);
+    }
+
+    #[test]
+    fn setcc_fuse_inverts_for_je() {
+        // sete's CC is "e": je (bool==0) inverts to jne (producer != 0).
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        assert!(!r.contains("testl"), "test dropped: {}", r);
+        assert!(r.contains("jne .L1"), "je(sete) -> jne(producer inverted): {}", r);
+    }
+
+    // REGRESSION (audit finding): setCC writes only the low BYTE of its
+    // destination. `movzwl %ax, %r32` imports AH — garbage — into the
+    // bool, so ZF would not reflect it. The fusion must be refused and
+    // the window left untouched.
+    #[test]
+    fn setcc_fuse_refuses_movzwl_carrier() {
+        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzwl %ax, %edx\n    testl %eax, %edx\n    je .L1\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        assert!(r.contains("testl %eax, %edx"), "test kept: {}", r);
+        assert!(r.contains("movzwl %ax, %edx"), "carrier kept: {}", r);
+    }
+
+    // REGRESSION (audit finding): a CondJmp after the fused branch is a
+    // flags READER (reader-check must precede the barrier check): after
+    // the rewrite it would consume the producer's flags instead of the
+    // dropped test's. The fusion must be refused.
+    #[test]
+    fn setcc_fuse_refuses_jcc_reader_after_branch() {
+        // Producer is a cmpl (no other pass may drop a cmpl-headed setCC
+        // test), and a WRONG fusion would rewrite je -> jne (invert of
+        // "e") — observable. The following jc is a flags reader the guard
+        // must see (reader-check before the barrier check).
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    jc .L2\n.L1:\n    xorl %ecx, %ecx\n    jmp .L3\n.L2:\n    xorl %ecx, %ecx\n.L3:\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        // The wrong-fusion signature is `jne` (invert of "e"). Other sound
+        // passes may normalize the redundant test's operands, so assert on
+        // the branch pair's semantics, not the test's exact spelling.
+        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
+        assert!(r.contains("testl"), "test kept: {}", r);
+        assert!(r.contains("je .L1"), "jcc untouched: {}", r);
+        assert!(r.contains("jc .L2"), "following reader untouched: {}", r);
+    }
+
+    // The guard skips block labels (the fallthrough physically enters the
+    // next block): a setCC there would read the producer's flags instead
+    // of the bool's. Refuse.
+    #[test]
+    fn setcc_fuse_refuses_setcc_reader_behind_label() {
+        // The guard skips the block label (fallthrough enters the next
+        // block) and must find the setCC reader there. cmpl producer: no
+        // other pass may drop this test, and a wrong fusion would show
+        // jne (invert of "e").
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        assert!(!r.contains("jne .L1"), "fusion must be refused: {}", r);
+        assert!(r.contains("testl"), "test kept: {}", r);
+        // (je .L1 may additionally be deleted by the branch-to-next rule —
+        // also sound: the target IS the fallthrough here.)
+    }
+
+    // A flags WRITER between the branch and a later reader makes the fuse
+    // safe: the reader sees the writer's flags either way.
+    #[test]
+    fn setcc_fuse_allows_writer_before_reader() {
+        let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    cmpl $2, %ecx\n    setne %cl\n    movzbl %cl, %ecx\n    movl %ecx, %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        // je targets the immediate fallthrough, so the (correct) branch
+        // elimination drops it entirely; the writer (cmpl) makes dropping
+        // the test safe for the later setCC reader.
+        assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
+        assert!(!r.contains("je .L1"), "branch to next removed: {}", r);
+        assert!(r.contains("cmpl $2, %ecx"), "flag writer present: {}", r);
+    }
+
+    // The bool is alive after the branch (stored to a slot): only the test
+    // may drop; the setCC/movzbl/relay window must survive intact.
+    #[test]
+    fn setcc_fuse_keeps_window_for_live_bool() {
+        let asm = "f:\n    orl %ebx, %eax\n    setne %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n.L1:\n    movl %edx, 8(%esp)\n    xorl %ecx, %ecx\n    movl 8(%esp), %eax\n    ret\n";
+        let r = peephole_optimize(asm.to_string());
+        assert!(!r.contains("testl %eax, %edx"), "test dropped: {}", r);
+        assert!(r.contains("setne %al"), "setCC kept (bool live): {}", r);
+        assert!(r.contains("movzbl %al, %eax"), "movzbl kept: {}", r);
+        assert!(r.contains("movl %eax, %edx"), "relay kept: {}", r);
     }
 
     // ── P16 constant staging through a register (numeric and symbol).

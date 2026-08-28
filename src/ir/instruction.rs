@@ -642,6 +642,17 @@ impl Instruction {
                 | IntrinsicOp::CopysignF64 => {
                     Some(IrType::F64)
                 }
+                // The bit-op F128 builtins produce a full _Float128. Their
+                // codegen stores 16 bytes (movdqu) to the dest's home; a
+                // None here made the slot allocator reserve only 8 bytes,
+                // so the store overflowed into the adjacent slot and
+                // corrupted the neighbouring value (glibc_f128_builtins:
+                // copysign's result temp at 0x18 overwrote the operand's
+                // slot at 0x20, mis-decoding every later operation that
+                // read the operand).
+                IntrinsicOp::F128Fabs
+                | IntrinsicOp::F128Neg
+                | IntrinsicOp::F128Copysign => Some(IrType::F128),
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),
