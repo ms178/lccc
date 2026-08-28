@@ -149,6 +149,30 @@ impl super::InstructionEncoder {
                         4 => self.bytes.extend_from_slice(&(*val as i32).to_le_bytes()),
                         _ => unreachable!(),
                     },
+                    // `movl $__inb, pio_ops` — a SYMBOL immediate stored to
+                    // an absolute label address (function-pointer tables in
+                    // linux arch/x86/boot, GCC emits this shape natively).
+                    // The 4-byte immediate field takes an R_386_32 relocation
+                    // exactly like the `movl $sym,%reg` register form above;
+                    // 8/16-bit stores keep the historical integer-only
+                    // restriction.
+                    ImmediateValue::Symbol(sym)
+                    | ImmediateValue::SymbolPlusOffset(sym, _) => {
+                        let addend =
+                            if let ImmediateValue::SymbolPlusOffset(_, a) = imm {
+                                *a
+                            } else {
+                                0
+                            };
+                        if size != 4 {
+                            return Err(
+                                "symbol immediate to label address only supported for 32-bit mov"
+                                    .to_string(),
+                            );
+                        }
+                        self.add_relocation(sym, R_386_32, addend);
+                        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+                    }
                     _ => return Err("unsupported immediate for mov to label address".to_string()),
                 }
                 Ok(())
