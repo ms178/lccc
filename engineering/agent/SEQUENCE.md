@@ -1,42 +1,51 @@
-# First tickets
+# Execution sequence
 
-Re-oracle and check gzip `longest_match` stack-mem after **each** item.
+Derived from the open items in [`BACKLOG.md`](BACKLOG.md) and the queue in
+[`../tasks/`](../tasks/README.md). Re-oracle and check gzip `longest_match`
+stack-mem after each item. Vetoes: sqlite/expat miscompiles.
 
-## Phase 0 — Hygiene & enablers (do first)
+## Phase 0 — Hygiene & enablers (parallel-safe, low risk)
 
-| Step | ID | Work |
-|------|-----|------|
-| 1 | P0-01a/b | **DONE/BLOCKED:** deleted only dead MachInst RA; retained and perfected graph coloring under research gate, pending RA-23; wired `reg_hint` and `handled`; kept splitting stub. |
-| 2 | MS-07 / P0-03 | **DONE on `50e7ac83` + patch:** pinned gzip 1.14, 30/30; longest_match LCCC 303 instructions/119 stack refs vs GCC 114/0; kill-switch control identical. |
-| 3 | RA-04 | **DONE:** `CCC_RA_EXPLAIN=fn` deterministic one-line-per-spill report. |
+| Step | ID | Work | Gate |
+|------|-----|------|------|
+| 1 | MS-08 | Consolidate the 50+ `CCC_` env knobs (regalloc 33, live_range 6, x86 prologue 11) into a `RaConfig` struct (single source of truth) | byte-identical asm on the kernel corpus |
+| 2 | MS-10 | Run `CCC_VALIDATE_SSA` over the regression corpus in the codegen gate | watermark + duplicate-def clean |
+| 3 | MS-04 | Make OnceLock env caches parameterizable so unit tests are independent | `cargo test --lib` |
+| 4 | MS-09 | Close the peephole UTF-8 audit: verify no shipped binary carries corrupted asm; write the audit report | audit doc in `evidence/` |
 
-## Phase 1 — Measured codec gaps (P0)
+## Phase 1 — P0 codegen (the big three)
 
-| Step | ID | Work |
-|------|-----|------|
-| 4 | RA-01 + IS-26 | RIP-relative `window`/`prev`/`strstart` (not GOT+stack). CE: gcc `window(%r9,%rcx)`. |
-| 5 | RA-02, RA-03 | Next-use: match IVs in GPR; Adler DO8 keep `sum2`/`n`. CE Adler ~0 stack. |
-| 6 | IS-01 | **DONE:** safe masked-index homes produce scale-4 SIB CRC loads; -12 B/-7 instructions, 1.34x faster than control, full differential clean. |
-| 7 | IS-12, IS-28 | **DONE:** BMI-gated direct-source ANDN (+4% find-bit vs control); canonical SWAR Popcount already lowers to `popcntl`, revalidated. |
-| 8 | IS-02, AB-01 | `double` stays in XMM; SysV SSE-class aggregates. |
-| 9 | IS-03 | **DONE for isolated assignment:** AVX2 64 B → 2× YMM pairs + vzeroupper, -17 bytes; broader struct SROA remains OP-02. |
-| 10 | IS-04, OP-05 | ICX-style YMM FMA on nbody/matmul/spectral/reduction. |
-| 11 | IS-06, OP-01 | **OP-01 DONE:** shared alias forms wired to LICM with checked Shl and fail-closed writes; `btq` classify remains. |
-| 11a | OP-34 | **DONE:** GlobalAddr CSE wired pre-GVN/post-inline/post-unroll with oracle-derived cold/loop/branch placement, derived indexed-root protection, and all-backend validation. |
+| Step | ID | Work | Gate |
+|------|-----|------|------|
+| 5 | RA-06 / RA-06a / PF-05 | Reload-at-use + arithmetic-chain copy webs in the scan. Reuse the sweep-eviction traffic model; start with call-site splits; extend copy webs through the arithmetic chain so ONE range carries a recurrence | adler ≤1.15× GCC kernel; gzip gate; `CCC_VERIFY_REGALLOC` clean |
+| 6 | OP-05b | Multi-store scatter vectorization (nbody `fx/fy/fz[i] ±= …`) + computed-invariant dot (spectral `A(i,j)` affine in j) | nbody/spectral A/B at -O3 v3; checksums bit-identical |
+| 7 | PF-17 | Root-cause the 15 loop-rotation miscompile shapes (list in DECISIONS.md), harden, then default-enable at -O2+ | regression corpus green; geomean improvement on the 9-kernel suite |
+| 8 | RA-01b | Marching-pointer recurrences: extend GlobalAddr remat through Copy chains; prefer SIB-index forms for IVSR pointer recurrences | nbody stack refs 159 → <20 |
 
-## Phase 2 — Structural blockers (prerequisites for all subsequent RA work)
+## Phase 2 — glibc & kernel gates
 
-| Step | ID | Work |
-|------|-----|------|
-| 12 | P0-02 / RA-05 | Switch `live_range.rs` scan from `intervals` to `segments` (infrastructure built, just wire). |
-| 13 | RA-06 | Reload-at-next-use + in-place splitting (the #1 perf gap — 3-5× spill traffic). Gate on `enable_splitting`. |
-| 14 | RA-23 | **PARTIAL:** `ExplicitLocation::{Reg,Accumulator}` unifies non-stack homes; remaining work is moving consumer legality into RA and deleting the whitelist before Tier-2 default. |
-| 15 | RA-24 | **DONE:** exact `SlotAddr::Reg(PhysReg)` migrated through all shared and target-specific address consumers; exhaustive 51-site compile gate plus all-backend tests. |
-| 16 | RA-13 | **DONE:** hard segment/final verifier plus handled eviction-history verifier. |
-| 17 | RA-26 | **DONE and extended:** scalar non-sret hints plus ordered caller homes for call-free x86 CFG leaves with ≤6 register args and leading ParamRefs; stack args/mixed/calling shapes refuse. |
-| 17a | RA-27 | **DONE:** disable one-def linear scan on non-SSA `-O0` IR across all backends; 600/600 phi CFG and 540/540 alias differential. |
-| 18 | P0-04 / OP-01 | **DONE:** shared alias engine in LICM, targeted hoist plus full differential validation. |
-| 19 | P0-05 / FE-01 | **DONE for core constraints:** sema rejects invalid assignments, prototype arity, and return-value mismatches with direct/indirect-call coverage. |
-| 20 | RA-25 / OP-31 | Unify `loop_memory_promote` alias engine with `alias.rs`. |
+| Step | ID | Work | Gate |
+|------|-----|------|------|
+| 9 | LK-19 | IFUNC end-to-end: `__attribute__((ifunc))` in sema/lowering, `R_X86_64_IRELATIVE` for data words, ld.so semantics | glibc configure accepts `--enable-multi-arch`; IRELATIVE relocs in a probe |
+| 10 | LK-24 | External-PIE startup SIGSEGV triage (LD_DEBUG, `_r_debug`/`_rtld_global`/TLS init) | staged-loader smoke exits 0 |
+| 11 | MS-11 | glibc `make check` triage harness: classify {miscompile, unsupported-feature, environment} | harness committed; first triage table |
+| 12 | KERNEL B1/B2 | objtool `.discard.annotate_insn` empty-data assembler bug; statement-expression + inline-asm typing (blocks `net/*`) | objtool passes on lccc objects; net/*.o compile |
 
-Veto: gzip match stack-mem. Stop if sqlite/expat miscompile.
+## Phase 3 — P1 measured gaps
+
+| Step | ID | Work | Gate |
+|------|-----|------|------|
+| 13 | PF-06 | isort secondary-IV strength reduction (marching register) | isort 43 → ≤25 insns |
+| 14 | IS-11 / IS-12 | C `__ffs` if-tree → `andn`+cmov chain (not tzcnt) | find_bit vs gcc CE |
+| 15 | FE-25 | Real `-march=native` for Raptor Lake (AVX2/BMI2/F16C/GFNI/VNNI where present); cost model queries the host | feature detection on the 14700KF |
+| 16 | PERF-3 | TLS base CSE + `%fs:sym@tpoff(,%r,scale)` addressing | tls_seg_access ≤1.3× GCC |
+| 17 | OP-25 / OP-26 | Inline `name_cont`; pressure-aware inline budget | expat scan; sqlite frame |
+| 18 | IS-07 / IS-08 / IS-13 | cmov limit idiom; remaining load-cast folds; ALU+mem for spilled | oracle counts |
+
+## Phase 4 — P2 / research (pull from BACKLOG)
+
+LK-20/21/22/23 linker polish · OP-03/07/08/10/11/14/16/17/19/20/21/22/23/24/26/27/29
+· FE-02/03/04/05/06/07/08/09/10/11/12/13/14/15/17/18 · AB-01/02/03/04/05/11/12/15 ·
+PG-01/02/04/05/07/08/09/10 · LK-03/07/08/09/10/11/12/13/15/16/18 ·
+MS-03/05/06/12/13/14 · RA-07/08/09/10/11/15/16/17/20/22 · EVEX/AVX-512 assembler
+(mathvec blocker) · fix_dash (needs qemu-user + riscv64 sysroot).

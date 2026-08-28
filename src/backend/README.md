@@ -464,9 +464,9 @@ single-block values.
 
 ## Linear Scan Register Allocator (regalloc.rs + live_range.rs)
 
-**Live documentation:** `lccc-improvements/register-allocation/`
-(August 2026). The paragraphs below are a sketch; they must not be used
-as a Week-2 implementation plan.
+**Live documentation:** `engineering/subsystems/register-allocation.md`
+and `engineering/agent/BACKLOG.md`. The paragraphs below are a sketch;
+they must not be used as a Week-2 implementation plan.
 
 The scan kernel is `LinearScanAllocator` (`live_range.rs`). Policy
 (eligibility, copy/phi groups, call-arg waves, i686 hazards, XMM/NEON)

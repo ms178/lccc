@@ -10,7 +10,7 @@ change plausibly adopted.
 
 Usage:
   git fetch levkropp main --shallow-since=2026-08-19T00:00:00Z
-  scripts/audit_levkropp_since.py --since 2026-08-19 --out docs/history/levkropp-audit.md
+  scripts/audit_levkropp_since.py --since 2026-08-19 --out engineering/evidence/levkropp-audit.md
 """
 from __future__ import annotations
 

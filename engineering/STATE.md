@@ -1,64 +1,118 @@
 # Current compiler state
 
-SHA at last doc refresh: **`2f81cdce`** (`ms178/lccc` main, PR #165; explicit-accumulator/AB-14 patch based here). Re-verify line numbers before editing. The 150-item catalog is [`agent/BACKLOG.md`](agent/BACKLOG.md) (P0-01…MS-09).
+SHA at last doc refresh: **`f657de55`** (`ms178/lccc` main, PR #276; the
+cross-backend ABI round = merged `ms178-2.patch`, plus PR #275 setcc
+hardening). Re-verify line numbers before editing. The item catalog is
+[`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is
+[`tasks/`](tasks/README.md); the negative-results ledger is
+[`DECISIONS.md`](DECISIONS.md).
 
 ## What is production
 
-- **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full / `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md`).
-- **Linear-scan RA** in `src/backend/live_range.rs` + policy in `regalloc.rs` (waves, coalescing, XMM/NEON, i686). ABI physical hints retain leading ParamRefs across safe call-free x86 CFG leaves. `-O0` deliberately uses canonical stack homes because phi elimination leaves non-SSA multi-def webs; this fixes the 600-case CFG differential while O1+ keeps production RA. `CCC_TRACE_ALLOCSTATS` reports aggregate pressure. No `linear_scan.rs`.
-- **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no `MAX_ITERATIONS` cap). Produces both fat `intervals` and hole-aware `segments`. `segments` is consumed by `regalloc.rs` for call-spanning detection and interval extension (lines 571, 785); the linear scan itself still runs on fat `intervals`.
-- **SROA** `aggregate_sroa.rs` load-forward + chain collapse **on**. Copy-out **off** (`CCC_SROA_COPYOUT` hangs tests).
-- **Alias** `alias.rs` — `LoopFrames`, `resolve_in_frame`, `forms_disjoint` (SCEV-lite). Consumed by `redundant_loads` and LICM; the shared resolver supports checked Shl scaling.
-- **GlobalAddr CSE/GVN** uses dominance- and loop-aware placement: cold singletons and mutually-exclusive branches stay local, loop addresses move to the innermost preheader, and existing dominating definitions are reused. Derived variable-index bases stay site-local for symbol+index selection. Intrinsic-bearing loops forbid new preheader homes until RA-23 exposes hidden accumulator/XMM locations; safe same-block and non-loop CSE remains active.
-- **FMA** scalar `vfmadd231sd` and vector `vfmadd231pd` **emitters exist**. Auto-vectorize of non-reduction loops and FMA-in-vector-body are the remaining gaps.
-- **YMM memcpy**: AVX2 64-byte assignments use two YMM pairs plus `vzeroupper`; proven-safe 64-bit leaf DCE removes dead parameter homes, yielding the six-instruction GCC/Clang/ICX shape. 32/48-byte copies deliberately stay XMM after a measured YMM slowdown. Whole `struct_copy` remains 3.58x behind GCC due aggregate scalar replacement.
-- **BMI1 ANDN**: adjacent single-use `not`+`and` fuses only under a target BMI contract and reads assigned source registers directly; Linux find-bit improves ~4% vs treatment control. Baseline x86 remains instruction-set safe.
-- **MachInst** ISel/emit path exists; **disabled** when loop insts > 32 (`CCC_MI_MAX_LOOP_INSTS`) because the local scheduler **regressed gzip ~3%**. The `machinst_regalloc.rs` module (635 LOC) is **dead code** (zero callers, soundness bug in `rewrite_machinsts` RAX-clobber) — delete only this file (P0-01).
-- **PGO** generate/use; layout must not reorder hot loops (expat 131→248 ms). The active vectorizer now applies exact profile profitability per natural loop: trip <8 is rejected, and >80-instruction bodies require at least 32 trips; absent profile data leaves static policy unchanged.
-- **Sema constraints**: named aggregate/pointer assignments, fixed-prototype direct and indirect call arity, and return-value mismatches are rejected before lowering. Legacy unspecified prototypes and anonymous SIMD identities remain conservative.
-- **`enable_splitting`** in the scan is a stub (`false`, never read) — keep as the gate for RA-06 (reload-at-next-use), do not delete.
-- **`outline_switch`** min cases = **40** (was 999999; fixed).
-- UnaryOp already emits `lzcnt`/`tzcnt`/`popcnt`. C if-trees (`__ffs`, hand-rolled popcount) do not become those insns until recognized.
-- **`__builtin_cpu_supports`** folds against an exact Raptor Lake allowlist (`expr_builtins.rs:436`, `PRESENT` const). FIXED — the old "return 1 for everything" SIGILL bug is gone. Still compile-time, not runtime CPUID.
-- **`usual_arithmetic_conversion`** else-arm is correct C11 6.3.1.8 (`types.rs:1586`: `signed_ty.size() > unsigned_ty.size() ? signed : signed.to_unsigned_version()`). FIXED.
-- **`split_ranges.rs`** call-split now actually rewrites uses (FIXED — old version was a no-op that ran mem2reg on a non-volatile alloca). Loop-split now scans all body blocks, inserts after Phis, rewrites terminators.
+- **C frontend** → SSA IR → `-O0` skip / `-O1` light / `-O2` full /
+  `-O3` +unroll / `-Os`/`-Oz` size (`src/passes/README.md` is the
+  authoritative tier list).
+- **Linear-scan RA** in `src/backend/live_range.rs` (scan) +
+  `src/backend/regalloc.rs` (policy). **Segment-aware interference is the
+  scan's primary model** (RA-05a landed): `LiveRange::segs` +
+  `segments_conflict`, coalesce-leader piece/use union, Phase-2f residual
+  fill generalized to all targets and default-ON (multi-piece values
+  ranked first, pressure-gated). Kill switches: `CCC_NO_SEGMENT_FILL`.
+  Tier-2 hole-aware graph coloring is **production default** for the
+  eligible subset (`CCC_NO_TIER2_GRAPH` restores the scan-only path).
+- **ABI physical hints** (RA-26) retain leading ParamRefs across safe
+  call-free x86 CFG leaves; ordered caller homes; stack-arg/mixed/calling
+  shapes fail closed (`CCC_NO_LEAF_PARAM_GPR`,
+  `CCC_NO_EMPTY_LOCAL_FRAME_ELISION`).
+- **RA verifier**: `CCC_VERIFY_REGALLOC=1` hard-verifies segment interference,
+  final assignments, and the eviction occupancy history (half-open
+  `[start, cut)` for evicted ranges).
+- **-O0** deliberately uses canonical stack homes on all four backends
+  because phi elimination leaves non-SSA multi-def webs (RA-27).
+- **Liveness** `src/backend/liveness.rs` — worklist backward dataflow (no
+  `MAX_ITERATIONS` cap), fat `intervals` plus hole-aware `segments`.
+- **FMA / FP contract**: `FpContract { Off, OnExpr, Fast }` threaded
+  cli→pipeline→passes→backend. Default **Off** (GCC `gnu*` parity);
+  `-ffp-contract=fast`/`-ffast-math` enable Fast; `-ffp-contract=on`
+  contracts only within a tagged statement root. FMA emission requires the
+  FMA3 ISA feature (SIGILL guard). Scalar and packed `vfmadd231*` emitters
+  are production.
+- **Vectorizers**: reduction (single/multi/secondary accumulator),
+  widening I32→I64 + masked conditional-sum, stencil (constant-tap affine),
+  elementwise map expression trees, plain-copy; per-natural-loop PGO
+  profitability gate (exact trips; trip <8 rejected, >80-inst bodies need
+  ≥32 trips). Kill switches: `CCC_NO_STENCIL_VEC`, `CCC_NO_MAP_VEC`,
+  `CCC_NO_VECREG`.
+- **Loop rotation** `src/passes/loop_rotate.rs` is **opt-in**
+  (`CCC_LOOP_ROTATE=1`): correctness-clean for the canonical counted-loop
+  shape (v14 exit-merge-phi fix, v17 cross-phi latch-incoming rewrite), but
+  15 shapes still miscompile under default-enable (DECISIONS.md). Runs
+  after vectorize.
+- **DSE** `src/passes/dse.rs` (same-block, closed-alloca escape analysis,
+  byte-range kills; `CCC_NO_DSE`); backedge PRE (integer recurrences
+  default-on; FP variants gated); GVN per-object epochs for disjoint
+  non-escaping allocas + `restrict` params; GlobalAddr CSE with
+  oracle-derived placement (cold branch-local, loop preheader, reuse of
+  dominating defs; derived variable-index bases site-local).
+- **Aggregates**: AVX2 64-byte assignment = 2 YMM pairs + `vzeroupper`;
+  32/48-byte copies stay XMM (measured). SysV all-SSE 16-byte struct
+  returns use xmm0/xmm1.
+- **MachInst** ISel/emit path exists, gated off when loop body > 32 insts
+  (`CCC_MI_MAX_LOOP_INSTS`; the local scheduler regressed gzip ~3 %). The
+  dead `machinst_regalloc.rs` module was deleted (P0-01a).
+- **PGO** generate/use; layout must not reorder hot loops (expat
+  131→248 ms). Per-loop trip/body profitability only.
+- **Sema** enforces assignment/prototype-arity/return constraints,
+  `__seg_fs`/`__seg_gs` declarator/local threading, GNU char-pointee
+  pointer-sign warning parity; C2x `__VA_OPT__`, `_Pragma` operator,
+  address-space-qualified lvalue stores (LK-26 fix, `afa22485`).
+- **Multi-arch**: x86-64, i686 (natural 4-byte slots, m16 boot pipeline,
+  32 KiB boot gate PASS at `.text` 23,378 / cliff 23,384), AArch64
+  (CASP, MOVW `:abs_g*:`, `.org`, PREL64, G1/G2/SABS reloc repair),
+  RISC-V (va_arg struct{long double} end-to-end padding). Assembler +
+  ELF linker in-tree for all four.
+- **Kernel bring-up**: linux-cachymod 6.18.46 boot code compiles + links;
+  `-pg`/`-mfentry` mcount family emitted; objtool interop is the next hard
+  gate (see `tasks/`).
 
-## What is still losing vs GCC 14 / gcc16.2 / ICX
+## What is still losing vs GCC (canonical 2026-08-25 screening)
 
-| Gap | LCCC | Oracle |
-|-----|------|--------|
-| gzip `longest_match` | 118 stack-mem, GOT, 248 B frame | gcc RIP `window(%r9,%rcx)`, 1 push |
-| Adler-32 kernel | 1.49×; `sum2`/`n` on stack in DO8 | CE whole-file ~0–3 stack refs |
-| CRC-32 kernel | 1.49×; 2 vs 0 spills | gcc `xorl table(,%reg,4)` — **no `crc32` insn** at `-O2` |
-| Expat name scan | 1.69× (v12) | FNV-prime IS register-homed (%r14); gap is loop rotation + byte-classify verbose vs GCC case-fold |
-| xmltok / inflate TUs | 12× / 15× stack-mem | segment RA (scan still on fat `intervals`) |
-| struct_copy | 1.54× | SysV SSE class + no xmm↔rax field copies |
-| nbody / spectral / mandelbrot | **1.26 / 1.30 / 1.23** (v12; FP staging-copy elimination + cmp-branch fusion) | ICX FMA+YMM (copy **ICX**, not gcc16 horiz-per-iter); remaining: loop rotation |
-| find_bit | 1.42× (v11) | gcc `andn`+`cmov` on ffs tree (**not** tzcnt) |
-| loop_patterns | **0.98× (beats GCC)** (v12; LCG RA precise-span seed + fused mul-add + widening accumulator coalescing) | find_max AVX2 transform wired + correct but detection gated pending cost-model; int dot_product scalar (vpmuldq v13) |
-| bitops | — | gcc/clang `popcntl` if IR is Popcount |
-| sieve | 1.3× | gcc 45-insn **scalar**; clang ymm explosion — **do not copy clang** |
-| fib/TCE geomean | LCCC can beat gcc | **not** a codec metric |
+Ratio = LCCC/GCC, `-O2`, paired medians, checksums verified. Geomean
+~0.85 (27 pairs), conventional-code geomean ~0.95. Full table:
+root `README.md`. Root-caused gaps, in priority order:
+
+| Gap | Kernel | Root cause | Tracked as |
+|-----|--------|-----------|------------|
+| ~1.63× | adler32 | arithmetic-chain copy webs; no reload-at-use | RA-06/PF-05 (P0) |
+| 1.26× / 1.30× | nbody / spectral | non-reduction FP loops; multi-store scatter; marching-pointer slot-homing (mandelbrot 1.23×) | OP-05b, RA-01b (P0) |
+| suite-wide | every loop kernel | loop rotation default-off (double-jump preheader, ~1 branch/iter) | PF-17 hardening (P0) |
+| ~1.69× | expat | hash-multiply `imul` chains | OP-25/PF-15 (P1) |
+| ~1.44× | linux_find_bit | branchy ffs tree → andn+cmov chain | IS-11 (P1) |
+| isort (CE) | instruction count | secondary-IV strength reduction (43 vs 23) | PF-06 (P1) |
 
 ## Dead code — nuanced assessment
 
-Not all dead code should be deleted. Some is sound infrastructure blocked by a hard blocker, or a stub for an unimplemented feature.
+Not all dead code should be deleted:
 
-| Item | LOC | Verdict | Rationale |
-|---|---|---|---|
-| `machinst_regalloc.rs` | 635 | **DELETED (P0-01a DONE)** | Zero callers and unsound RAX-only spill rewrite; live MachInst ISel/emit remains on main RA |
-| `graph_coloring.rs` | rewritten | **KEPT/PERFECTED, BLOCKED** | Exact-size hole-aware segment coloring with conservative closed boundaries, wired under `CCC_ENABLE_TIER2_GRAPH`; broad fuzz proves RA-23 must land before default enable |
-| `reg_hint: Option<PhysReg>` | field | **WIRED (RA-26 DONE)** | Conservative scalar non-sret SysV/AArch64 ParamRef hints; mixed ABI signatures fail closed and `follow_value` wins |
-| `enable_splitting: bool` | field | **KEPT (RA-06 stub)** | Gate remains for reload-at-next-use implementation |
-| `handled: Vec<ActiveInterval>` | field | **WIRED (RA-13 DONE)** | Records physical register and eviction cut point; full occupancy history hard-verifies under `CCC_VERIFY_REGALLOC` |
+| Item | Verdict |
+|---|---|
+| `machinst_regalloc.rs` | DELETED (P0-01a) |
+| `graph_coloring.rs` (slot colorer) | KEPT/PERFECTED — Tier-2 production default, `CCC_NO_TIER2_GRAPH` |
+| `reg_hint: Option<PhysReg>` | WIRED (RA-26) |
+| `enable_splitting: bool` | KEPT — the RA-06 stub gate (do not delete) |
+| `handled: Vec<ActiveInterval>` | WIRED (RA-13 verifier) |
 
-## Hard blockers for RA improvements
+## Hard constraints (short form; full list in `agent/RULES.md`)
 
-1. **RA-23 PARTIAL:** register and accumulator homes share `ExplicitLocation`; parallel state sets are gone. The remaining blocker is `compute_immediately_consumed`/`is_safe_sole_consumer`, which still derives accumulator legality from backend load order. Move that decision into RA before enabling Tier-2 graph coloring.
-2. **RA-24 DONE:** register-homed pointers resolve as `SlotAddr::Reg(PhysReg)`. Shared codegen, soft-F128, x86/x87, i686, AArch64, and RISC-V consume the exact home; the fake offset-zero convention is deleted and future missing consumers fail exhaustiveness checking.
-3. **Lifetime demotion** (`live_range.rs:26-27`): "There is no reload-at-next-use in this module." 3-5× spill traffic vs LLVM. `segments` infrastructure is built but the scan doesn't use it for splitting (RA-05/RA-06).
-4. **RA-13 DONE:** final assignments are verified with coalesce/phi equivalence classes and hole-aware O(n log n) sweeps; `handled` additionally verifies actual register occupancy through expiration/eviction cut points. `CCC_VERIFY_REGALLOC` hard-aborts.
-
-## Dual pipelines (do not "just enable")
-
-Text ISel + string peephole **and** MachInst ISel/emit (the MachInst RA module is dead code — delete it; keep the ISel/emit path). Homes are many HashSets, not a `ValueLocation` enum. PhysReg **(11) = `%r10`**, (10) = `%r11`.
+1. gzip `longest_match` stack-mem must not rise; adler/gzip/expat oracles
+   gate RA work.
+2. Do not enable MachInst on large loops; do not enable `CCC_SROA_COPYOUT`
+   without a dominance proof; do not set `CCC_EVICT_MODE=5` or
+   `CCC_PGO_WEIGHT_MAX>1` as defaults.
+3. PhysReg(11)=`%r10` (static chain), PhysReg(10)=`%r11`; `cmp` never in
+   `CCC_X64_NOHOME_CLASSES`.
+4. `FpContract::Off` is the default; FMA needs the FMA3 feature gate.
+5. Loop rotation stays opt-in until the 15 known miscompiles are
+   root-caused.
+6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
+   `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.

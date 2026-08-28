@@ -54,14 +54,12 @@ Flags: `-O0`–`-O3`, `-Os`, `-Oz`, `-S`, `-c`, `-E`, `-g`, `-D`, `-I`, `-fprofi
 
 ## Benchmarks (canonical)
 
-**Not** `lccc-improvements/benchmarks/bench.py` (archive).
-
 ```bash
 python3 tests/benchmark/run_benchmarks.py
 python3 tests/benchmark/run_benchmarks.py --only gzip_crc32,zlib_ng_adler32,expat_xml_scan
 ```
 
-RA validation notes: `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`.
+RA validation notes: `engineering/evidence/workloads/gzip-zlib-expat.md`.
 
 ## Tests
 

@@ -5,7 +5,7 @@
 > split_ranges) or of `-O` tiers. Authoritative:
 > `docs/architecture.md`, `docs/register-allocator.md`,
 > `src/passes/README.md`, `src/backend/README.md` (RA subsection lags;
-> prefer `lccc-improvements/register-allocation/`).
+> prefer `engineering/subsystems/register-allocation.md`).
 
 This document describes the architecture and implementation of CCC
 (Claude's C Compiler). For building, usage, and status information, see

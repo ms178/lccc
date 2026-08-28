@@ -1138,7 +1138,7 @@ mod org_and_branch_tests {
         assert!(back.is_err(), "backwards move must be rejected");
     }
 
-    // Regression for current_tasks/fix_arm_asm_global_branch_relocs:
+    // Regression for the arm global-branch-reloc fix (2026-08-28 round):
     // branches to GLOBAL/WEAK symbols must keep their relocations even when
     // the target lives in the same section (the linker may preempt them);
     // only genuinely local symbols may be resolved in place.
@@ -1219,7 +1219,7 @@ mod movw_tests {
         u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
     }
 
-    /// Regression for current_tasks/fix_arm_movw_symbolic_relocations: the
+    /// Regression for the arm MOVW symbolic-relocation fix (2026-08-28 round):
     /// kernel `tramp_alias` macro shape. A local `.set` alias of a label
     /// difference plus constant must resolve INLINE with the documented
     /// chunk values (no relocation, no "expected immediate" error).
