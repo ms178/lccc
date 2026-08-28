@@ -20,7 +20,12 @@ impl ArmCodegen {
             use_sysv_struct_classification: false,
             use_riscv_float_struct_classification: false,
             allow_struct_split_reg_stack: false,
-            align_struct_pairs: false,
+            // Composites with 16-byte natural alignment are allocated at an
+            // even-aligned register pair (or a 16-aligned stack slot), for
+            // named AND variadic arguments — GCC's aarch64 layout places
+            // struct{int} align(16) at w0/w2/w4/w6, skipping odd registers
+            // (verified against the GCC oracle on named args).
+            align_struct_pairs: true,
             sret_uses_dedicated_reg: true,
             gcc_regparm_mode: false,
         }

@@ -195,6 +195,15 @@ impl Driver {
         } else {
             Target::X86_64
         };
+        // Plain `char` signedness is target-defined (C11 6.7.2p5): unsigned
+        // on AArch64/RISC-V SysV, signed on x86. Recorded process-globally
+        // BEFORE any parsing/sema/lowering so every type resolution, cast,
+        // and character constant sees the target's answer. -funsigned-char /
+        // -fsigned-char override the default in the argument loop.
+        crate::common::types::set_char_unsigned(matches!(
+            self.target,
+            Target::Aarch64 | Target::Riscv64
+        ));
 
         // Handle GCC query flags that exit immediately (before requiring input files).
         // These are used by configure scripts to detect the compiler and target.
@@ -832,6 +841,15 @@ impl Driver {
                 }
                 arg if arg == "-fno-exceptions" => {
                     self.exceptions = false;
+                }
+                // Plain-char signedness overrides (GCC-compatible): these
+                // re-record the process-global AFTER the target default was
+                // installed, so they win regardless of order relative to it.
+                arg if arg == "-funsigned-char" => {
+                    crate::common::types::set_char_unsigned(true);
+                }
+                arg if arg == "-fsigned-char" => {
+                    crate::common::types::set_char_unsigned(false);
                 }
                 arg if arg.starts_with("-std=") => {
                     let std_value = &arg[5..];

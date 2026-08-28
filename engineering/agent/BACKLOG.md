@@ -322,7 +322,11 @@ the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
 soundness; f128_softfloat + f128_global_carrier green, 2026-08-28). · riscv f128-carrier
 end-to-end (f128_in_gp_pairs classify arm, tracker-fed U128 load/store,
 sign-bit intrinsic arms — F128Neg previously hit the silent SIMD no-op;
-f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28).
+f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28). ·
+AAPCS64/RISC-V wide va_arg: __int128 va_arg arms both backends, long double
+varargs full precision on riscv, align-16 composites at even pairs (named +
+variadic, both arches — old "AAPCS64 needs no even pairs" note was wrong),
+va_arg_wide_struct green on aarch64 AND riscv64 (2026-08-28).
 
 Rejected-with-evidence (never resubmit without new data): Agent B's
 MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;

@@ -1437,6 +1437,24 @@ impl std::fmt::Display for CType {
     }
 }
 
+/// Whether the target's plain `char` is unsigned (AArch64 and RISC-V SysV
+/// ABIs specify unsigned char; x86-64/i686 use signed char). One target per
+/// driver process, so a process-global set by the driver before parsing is
+/// the single source of truth — the front end is otherwise target-blind.
+static CHAR_UNSIGNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Record the target's plain-char signedness. Called once by the driver
+/// after the target is known, before any parsing/sema/lowering runs.
+pub fn set_char_unsigned(unsigned: bool) {
+    CHAR_UNSIGNED.store(unsigned, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
+pub fn char_is_unsigned() -> bool {
+    CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl CType {
     /// Size in bytes, with struct/union layout lookup via context.
     /// Uses the thread-local target pointer size for target-dependent types

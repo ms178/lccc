@@ -244,9 +244,16 @@ impl Lowerer {
                 Operand::Const(IrConst::I128(v as i128))
             }
             Expr::CharLiteral(ch, _) => {
-                // Sign-extend from signed char to int, matching GCC behavior.
-                // '\xEF' should be -17, not 239, when char is signed.
-                let val = *ch as u8 as i8 as i32;
+                // A character constant has type int and the value the target's
+                // plain char would hold (C11 6.4.4.4p10): sign-extended when
+                // char is signed (x86), zero-extended when unsigned
+                // (AArch64/RISC-V SysV). '\xEF' is -17 with signed char,
+                // 239 with unsigned char.
+                let val = if crate::common::types::char_is_unsigned() {
+                    *ch as u8 as i32
+                } else {
+                    *ch as u8 as i8 as i32
+                };
                 Operand::Const(IrConst::I32(val))
             }
 

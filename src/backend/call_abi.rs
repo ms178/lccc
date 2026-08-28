@@ -813,12 +813,21 @@ fn classify_args_core(
                     } else {
                         size.div_ceil(slot_size)
                     };
-                    // RISC-V psABI: 2×XLEN-aligned structs must start at even register.
-                    // Note: ARM AAPCS64 does NOT require even-aligned pairs for composites.
-                    if regs_needed == 2 && config.align_struct_pairs {
+                    // Composites whose natural alignment exceeds XLEN are
+                    // allocated at an even-aligned register (pair) — the
+                    // RISC-V psABI requires it for 2×XLEN-aligned structs,
+                    // and AAPCS64 does the same for ANY 16-byte-aligned
+                    // composite, including single-register struct{int}
+                    // align(16) (GCC oracle: w0/w2/w4/w6 with odd registers
+                    // skipped). The rounding also applies on the va_arg side
+                    // (emit_va_arg_struct rounds __gr_offs the same way), so
+                    // caller and callee agree.
+                    let mut align_applied = false;
+                    if config.align_struct_pairs {
                         let struct_align = info.struct_align.unwrap_or(slot_size);
                         if struct_align > slot_size && int_idx % 2 != 0 {
                             int_idx += 1; // skip to even register
+                            align_applied = true;
                         }
                     }
                     if int_idx + regs_needed <= config.max_int_regs {
@@ -827,7 +836,8 @@ fn classify_args_core(
                             size,
                         });
                         int_idx += regs_needed;
-                    } else if regs_needed == 2
+                    } else if !align_applied
+                        && regs_needed == 2
                         && int_idx < config.max_int_regs
                         && config.allow_struct_split_reg_stack
                     {

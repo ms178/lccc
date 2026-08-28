@@ -1,8 +1,8 @@
 # Current compiler state
 
-SHA at last doc refresh: **`f657de55`** (`ms178/lccc` main, PR #276; the
-cross-backend ABI round = merged `ms178-2.patch`, plus PR #275 setcc
-hardening). Re-verify line numbers before editing. The item catalog is
+State refreshed against **`2f5e9af3`** (`ms178/lccc` main, PR #281) with
+16-byte-granular `va_arg` support on AArch64/RISC-V64 and target-aware
+plain-char signedness. Re-verify line numbers before editing. The item catalog is
 [`agent/BACKLOG.md`](agent/BACKLOG.md); the active queue is
 [`tasks/`](tasks/README.md); the negative-results ledger is
 [`DECISIONS.md`](DECISIONS.md).
@@ -118,3 +118,26 @@ Not all dead code should be deleted:
    root-caused.
 6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
    `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.
+
+## S08: wide va_arg + target char signedness (2026-08-28)
+
+- **16-byte-granular va_arg, AArch64 + RISC-V64**: `va_arg(ap, __int128)`
+  has dedicated 16-byte-aligned arms on both backends (AArch64 rounds
+  `__gr_offs` UP like glibc; RISC-V rounds the overflow-area POINTER);
+  `va_arg(ap, long double)` on RISC-V stores the full binary128 value
+  (was silently `__trunctfdf2`-truncated). The riscv arms stage values
+  through t3/t4 — t0/t1 clobbered the `&va_list` pointer needed for the
+  write-back (SIGSEGV). Align-16 composites now take even-aligned GP
+  pairs on BOTH arches, named and variadic (GCC oracles verified;
+  the old "AAPCS64 needs no even pairs" call_abi note was wrong and is
+  gone). `tests/regression/va_arg_wide_struct.c` green on aarch64 AND
+  riscv64; lib 1273/0/6; ARM 378/30/75; x86 536/5 (same 5 pre-existing).
+- **Target plain-char signedness**: plain `char` was compiled signed on
+  every target (x86 default leaking into AArch64/RISC-V SysV where char
+  is unsigned). Resolved at the parse boundary — the parser rewrites
+  plain char to UnsignedChar on unsigned-char targets, so downstream
+  CType/IR mappings stay unconditional; `-fsigned-char` /
+  `-funsigned-char` override (both directions GCC-verified). Caught by
+  cast_chain_fold.c GCC differential; new
+  `tests/regression/char_signedness_target.c` pins the
+  declaration-vs-constant agreement invariant on all targets.
