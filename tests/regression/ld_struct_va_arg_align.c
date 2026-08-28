@@ -6,7 +6,7 @@
  * classification previously rounded struct stack slots to 8 bytes only,
  * so a struct { long double } (align 16) placed after an odd 8-byte slot
  * was read from a different offset than the caller wrote it — va_arg
- * returned garbage (current_tasks/fix_riscv_va_arg_long_double_struct,
+ * returned garbage (riscv va_arg struct{long double} alignment fix,
  * test_misalign_r10 shape).
  *
  * This host test locks the shared compute_stack_arg_padding logic on

@@ -9,7 +9,7 @@ LCCC="${1:-target/release/lccc}"
 REPS="${2:-5}"
 GCC_INC="$(gcc -print-file-name=include)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/../lccc-improvements/benchmarks/bench/02_fib.c"
+SRC="$SCRIPT_DIR/benchmark/programs/fib.c"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 

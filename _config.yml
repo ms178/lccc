@@ -19,7 +19,7 @@ exclude:
   - Cargo.lock
   - target/
   - ccc/
-  - lccc-improvements/
+  - engineering/
   - "*.sh"
   - "*.rs"
   - "*.c"
@@ -33,16 +33,13 @@ exclude:
   - a.out
   - DESIGN_DOC.md
   - LICENSING.md
-  - docs/history/
+  - ideas/
+  - tests/
+  - scripts/
 
 defaults:
   - scope:
       path: "docs"
-      type: "pages"
-    values:
-      layout: doc
-  - scope:
-      path: "updates"
       type: "pages"
     values:
       layout: doc

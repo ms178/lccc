@@ -47,7 +47,6 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 PROGRAMS = HERE / "programs"
 REPO_ROOT = HERE.parents[1]
-LEGACY_PROGRAMS = REPO_ROOT / "lccc-improvements" / "benchmarks" / "bench"
 DEFAULT_LCCC = REPO_ROOT / "target" / "fastbuild" / "lccc"
 
 
@@ -233,10 +232,9 @@ def invoke(command: list[str], *, timeout_s: int, cwd: Path | None = None,
 
 def source_for(benchmark: Benchmark) -> Path | None:
     for candidate in benchmark.sources:
-        for directory in (PROGRAMS, LEGACY_PROGRAMS):
-            path = directory / candidate
-            if path.is_file():
-                return path
+        path = PROGRAMS / candidate
+        if path.is_file():
+            return path
     return None
 
 

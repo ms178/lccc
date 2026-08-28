@@ -24,6 +24,30 @@ Older text that claimed “all `-O` levels run the same pipeline” is **obsolet
 
 The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `#ifdef`s.
 
+## Passes added since this page was written (August 2026)
+
+This page predates several production passes; `src/passes/README.md` and
+`src/passes/mod.rs` are authoritative. Landed since:
+
+- **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
+  escape analysis and byte-range kills (`CCC_NO_DSE`).
+- **Backedge PRE** — integer recurrences default-on (1.14× measured);
+  FP variants gated (`CCC_BEPRE_FP=1` research).
+- **GlobalAddr CSE** (`global_addr_cse.rs`) — oracle-derived placement:
+  cold singletons branch-local, loop addresses to the innermost preheader,
+  dominating defs reused, derived variable-index bases site-local.
+- **Stencil vectorizer** — constant-tap affine loops, bit-exact vs scalar
+  (`CCC_NO_STENCIL_VEC`).
+- **Map expression trees** — elementwise FP/int map loops (`CCC_NO_MAP_VEC`).
+- **Widening + masked conditional-sum reductions** — I32→I64 `paddq`
+  pipelines, VEX-only bodies (9× AVX-SSE transition penalty avoided).
+- **Loop rotation** (`loop_rotate.rs`) — opt-in (`CCC_LOOP_ROTATE=1`),
+  runs after vectorize; default-enable pending hardening.
+- **General complete unrolling** — nested/multi-block constant-trip loops
+  with FP-aware expansion budget.
+- **Tri-state FP contraction** — `FpContract { Off, OnExpr, Fast }`,
+  default Off (GCC `gnu*` parity); FMA emission requires the FMA3 feature.
+
 ## Pass Order
 
 The optimizer runs up to three full iterations. Each iteration runs this pipeline:

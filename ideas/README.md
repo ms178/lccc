@@ -1,55 +1,60 @@
 # ideas/
 
-Ranked notes. **Authoritative backlog:** [`../engineering/agent/BACKLOG.md`](../engineering/agent/BACKLOG.md).
+Ranked raw notes. **Authoritative backlog:**
+[`../engineering/agent/BACKLOG.md`](../engineering/agent/BACKLOG.md) — ideas
+graduate into the backlog (and then into
+[`../engineering/tasks/`](../engineering/tasks/) as actionable queue files)
+only when they have evidence and acceptance gates.
 
 # Improvement backlog (not yet scheduled)
 
 Ranked ideas with evidence. Naming: `<priority>_<topic>.txt` for
 enhancements, `fix_<area>_<symptom>.txt` for latent defects that need
-investigation before they can enter `current_tasks/`.
+investigation before they can enter the engineering queue.
 
 Priority reflects (expected impact × workload breadth × confidence) /
-implementation cost — see `hotspots/RESEARCH_BACKLOG.md` for the scored
-performance queue; this directory holds everything else.
+implementation cost — see
+[`../engineering/agent/SEQUENCE.md`](../engineering/agent/SEQUENCE.md) for
+the scored performance order; this directory holds everything else.
 
-## High-value engineering (from 2026-08 audits)
+## Status of the 2026-08 structural list (re-checked 2026-08-28, v3 doc audit)
 
-The following items were validated against the codebase during the
-GLM-audit review (2026-08-15) and remain the top structural work:
+Several items from the original high-value list have since landed; do not
+redo them:
 
-1. **Typed AST / sema expansion** (`high_sema_expansion_typed_ast.txt`)
-   — sema still emits ~1 type diagnostic; the lowerer carries ~382.
-2. **Vector register retention across intrinsic boundaries** — the
-   5.3× zlib-ng SIMD gap documented in `docs/simd-audit.md`; re-measure
-   before starting (backend value-tracking, not a new pass).
-3. **Dead-store elimination** — `dce.rs` treats every Store as
-   side-effecting; pair with pure/const call-attribute propagation.
-4. **Vectorizer cost model** — `vectorize_gate` returns `true`
-   unconditionally (pgo/unroll_pgo.rs:122); 4-iteration loops get
-   vectorized for zero win.
-5. **Reload-at-next-use + remat** (`register_allocator.txt`) —
-   `future_uses` exists; 2026-08-20 gzip `longest_match` is 118 vs 0 stack-mem.
-6. **SCEV** (`optimization_passes_future.txt`) — would subsume both
-   IVSR pattern matchers (~2k LOC) and unblock LICM GEP aliasing.
-7. **Parser panic-mode recovery** — one missing `;` still cascades.
-8. **outline_switch**: either lower `MIN_CASES_FOR_OUTLINING` from
-   999999 to a real threshold with a size-mode gate, or delete the pass.
-9. **CI wiring** — the harnesses under `tests/` are not run by
-   `.github/workflows/ci.yml` (build + `cargo test --lib` only). All
-   five suites are verified green locally; wiring them requires
-   workflow-file permissions that repo automation currently lacks, so
-   this needs a manual PR by the maintainer:
-   correctness, regression, intrinsics, linker (bfd+mold oracles),
-   differential-fuzz smoke (120 seeds, O0/O2).
+1. **Dead-store elimination** — same-block DSE is landed (`dse.rs`,
+   `CCC_NO_DSE`); cross-block extension is BACKLOG OP-13b.
+2. **Vectorizer cost model** — the per-natural-loop PGO profitability gate
+   is landed (exact trips; trip <8 rejected, >80-inst bodies need ≥32).
+3. **Reload-at-next-use + remat** — interference half landed (RA-05a,
+   segment-aware scan + Tier-2 graph coloring); the splitting half is
+   RA-06, the top P0 item.
+4. **outline_switch** — threshold is 40 (was 999999), landed.
+5. **CI wiring** — the structural codegen gate (`ci-codegen-gate.py`) is
+   now wired into the benchmark workflow; extending CI to the full test
+   suites remains MS-03.
+6. **Vector register retention across intrinsic boundaries** — the 5.3×
+   zlib-ng SIMD gap from the deleted `docs/simd-audit.md` was addressed by
+   the vector-temp-promotion rewrites (sessions 42–45) and the
+   segment-aware vector allocator; re-measure before reopening.
 
-## Linker follow-up (from 2026-08-14/15 sessions)
+Still open (see the .txt files):
 
-Remaining items from the linker work (kernel links & boots; -r, PIE,
-build-id, RELRO, .eh_frame_hdr, strmerge all landed):
+1. **Typed AST / sema expansion** (`high_sema_expansion_typed_ast.txt`).
+2. **SCEV** (`optimization_passes_future.txt`) — would subsume both IVSR
+   pattern matchers and unblock deeper aliasing (OP-28).
+3. **Parser panic-mode recovery** (`ideas`, FE-07) — one missing `;`
+   still cascades.
+4. **Use-def-chain shared optimizer context** (`high_use_def_chains.txt`,
+   FE-13).
 
-- mmap-based input/output I/O (biggest remaining speed lever vs wild)
-- parallel relocation application (rayon-style, per output section)
-- ELF32 script path for setup.elf (`-m elf_i386` currently GNU ld)
-- `--emit-relocs` for CONFIG_RELOCATABLE kernels
-- positional `--start-group` semantics in the userspace driver path
-- `--icf=safe/all`, `--exclude-libs`, `-Map=` real output
+## Linker follow-up (post 2026-08-15 sessions)
+
+Landed since: congruent segment packing, `parallel_reloc.rs` (UB-fixed,
+opt-in `LCCC_LD_PARALLEL`), ICF analysis (`LCCC_LD_ICF`), `--icf=safe`
+rules, exclude-libs/PLT fix, `SIZEOF_HEADERS` single-source fix, COMDAT
+exe-path dedup, `--as-needed` GROUP-script fix, `-D warnings` build gate.
+Still open (BACKLOG LK-*): mmap I/O (LK-01 — note: `Vec→Arc` measured
+always-copy; needs real mmap), `SymbolId(u32)` interning (~7 %, 149 call
+sites, on top of SymStr), thin-archive shared buffers, `--emit-relocs`
+(LK-16), ELF32 script setup.elf (LK-15), grammar-fuzzer depth.

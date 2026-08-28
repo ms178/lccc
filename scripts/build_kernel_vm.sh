@@ -41,7 +41,7 @@ if [[ ! -f .lccc-vm-config ]]; then
 
   # Every CachyMod patch must stay FUNCTIONAL, not merely applied.
   # (SCHED_CLASS_EXT needs DEBUG_INFO_BTF on 6.18 — deferred to milestone 2,
-  #  see docs/current_tasks/*; the ms178-custom patches are all covered here.)
+  #  see engineering/tasks/; the ms178-custom patches are all covered here.)
   REQUIRED=(CACHY SCHED_BORE SCHED_CACHE HZ_800 PREEMPT
             TCP_CONG_BBR SMP SERIAL_8250_CONSOLE IKCONFIG_PROC BLK_DEV_INITRD
             DEVTMPFS KERNEL_ZSTD)

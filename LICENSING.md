@@ -37,7 +37,7 @@ All code authored as part of LCCC optimization efforts:
 - `src/backend/live_range.rs`, RA policy in `src/backend/regalloc.rs`
 - Optimizer / PGO / SIMD / linker work under `src/`
 - `tests/benchmark/` runners (not third-party kernel *bodies*)
-- Documentation under `docs/` and `lccc-improvements/`
+- Documentation under `docs/`, `engineering/`, and `ideas/`
 - Any new modules or major rewrites
 
 Paths are `src/…`. There is no `ccc/` submodule and no `linear_scan.rs`.

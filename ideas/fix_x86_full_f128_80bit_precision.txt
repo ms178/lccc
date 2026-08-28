@@ -1,3 +1,5 @@
+> Status 2026-08-28: partially superseded — F128 copy fusion + soft-F128 SlotAddr consumption landed (AB-14); the full x87 80-bit precision audit remains open (see BACKLOG FE/AB sections).
+
 Full 80-bit precision for x86 long double (F128)
 
 Status: Partially done. Casts and binops now use x87 FPU, but the f64 register

@@ -17,7 +17,7 @@ Remaining bottlenecks:
    and RISC-V, eliminating fork/exec per compilation unit and enabling
    standalone linking (QEMU, FFmpeg, and kernel builds use it). Remaining
    work is breadth (i686 vector-table `.org`, MOVW relocs, .ifnb/.ifb, etc.)
-   tracked in `current_tasks/`.
+   tracked in `engineering/tasks/`.
 
 2. ALLOCATION OVERHEAD (~17.5% of total)
    malloc/free/realloc/memcpy dominate the profile (5.5% _int_malloc,

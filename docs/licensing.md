@@ -23,7 +23,7 @@ All code authored as part of LCCC — new files, substantial rewrites, benchmark
 This includes:
 - `src/backend/live_range.rs` — `LinearScanAllocator` / `LiveRange`
 - Changes to `src/backend/regalloc.rs` — waves, coalescing, XMM, i686
-- `tests/benchmark/` kernels and `lccc-improvements/register-allocation/` docs
+- `tests/benchmark/` kernels and `engineering/` documentation
 - All documentation (`docs/`, `index.html`, `_layouts/`, etc.)
 
 ## CCC-Derived Code

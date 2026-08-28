@@ -22,14 +22,16 @@ from statistics import mean, median, stdev
 
 HERE = Path(__file__).parent.resolve()
 REPO = HERE.parent.parent
-BENCH_DIR = REPO / "lccc-improvements" / "benchmarks" / "bench"
+BENCH_DIR = REPO / "tests" / "benchmark" / "programs"
 
+# Canonical sources live in tests/benchmark/programs/ (the 2026-03
+# lccc-improvements/benchmarks/bench/ copies were removed).
 BENCHMARKS = [
-    ("01_arith_loop", "Arith Loop"),
-    ("02_fib",        "Fibonacci"),
-    ("03_matmul",     "MatMul 256²"),
-    ("04_qsort",      "Quicksort 1M"),
-    ("05_sieve",      "Sieve 10M"),
+    ("arith_loop", "Arith Loop"),
+    ("fib",        "Fibonacci"),
+    ("matmul",     "MatMul 256²"),
+    ("qsort",      "Quicksort 1M"),
+    ("sieve",      "Sieve 10M"),
 ]
 
 

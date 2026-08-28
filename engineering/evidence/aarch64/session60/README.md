@@ -7,5 +7,5 @@
   built by fastbuild LCCC/integrated lccc-ld and GCC. This is host-VM evidence,
   not ARM PMU evidence.
 
-See `docs/history/2026-08-22-session60-aarch64-optimal-leaf.md` for legality,
+See git history (commit range of 2026-08-22, session 60) for legality,
 validation, and remaining gaps.

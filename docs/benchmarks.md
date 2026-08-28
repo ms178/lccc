@@ -83,8 +83,9 @@ Each file names its source license and links to
 [`WORKLOAD_PROVENANCE.md`](../tests/benchmark/WORKLOAD_PROVENANCE.md), which
 records the package selector, exact source-file digest, adaptation boundary,
 and archive-integrity observations.  The first evidence-backed candidate is
-recorded in [`hotspots/`](../hotspots/README.md), rather than being mistaken
-for a proven optimization.
+recorded as a screening artifact in
+[`engineering/evidence/`](https://github.com/ms178/lccc/tree/main/engineering/evidence),
+rather than being mistaken for a proven optimization.
 
 ### Reproducible screening run
 
@@ -157,7 +158,7 @@ and parsers are not won.
 
 ### 2026-08-20 RA compile of real TUs + kernels
 
-See `lccc-improvements/register-allocation/VALIDATION_ZLIB_GZIP_EXPAT.md`.
+See `engineering/evidence/workloads/gzip-zlib-expat.md`.
 LCCC `-O2` vs GCC 14, checksums matched, median of 7 on a 2-core VM:
 
 | Kernel | LCCC/GCC |
@@ -401,10 +402,9 @@ static long sum(int n, long acc) {
 
 ### Historical commands
 
-The former `lccc-improvements/benchmarks/bench.py` script is retained as an
-archive, but it is not the canonical measurement path.  Use the current runner
-and keep its JSON plus assembly artifact directory with every performance
-claim.  To manually inspect a single generated binary:
+A retired 2026-03 `bench.py` script once lived in `lccc-improvements/`; it
+is not the canonical measurement path. Use the current runner and keep its
+JSON plus assembly artifact directory with every performance claim.  To manually inspect a single generated binary:
 
 ```bash
 ./scripts/build_lccc_o1_j2.sh
