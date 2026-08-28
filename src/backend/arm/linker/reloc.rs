@@ -364,15 +364,18 @@ pub fn apply_one_reloc(
         }
 
         // ── MOVW relocations ──
-        R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC => {
+        // All forms take the field bits ((S + A) >> shift) & 0xffff. For the
+        // signed variants the bit pattern of the two's-complement value is
+        // used, so the same extraction serves them.
+        R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC | R_AARCH64_MOVW_SABS_G0 => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, (sa & 0xffff) as u32);
         }
-        R_AARCH64_MOVW_UABS_G1_NC => {
+        R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC | R_AARCH64_MOVW_SABS_G1 => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, ((sa >> 16) & 0xffff) as u32);
         }
-        R_AARCH64_MOVW_UABS_G2_NC => {
+        R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC | R_AARCH64_MOVW_SABS_G2 => {
             let sa = (s as i64).wrapping_add(a) as u64;
             encode_movw(out, fp, ((sa >> 32) & 0xffff) as u32);
         }

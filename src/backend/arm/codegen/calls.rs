@@ -28,9 +28,9 @@ impl ArmCodegen {
         &self,
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
     ) -> usize {
-        compute_stack_arg_space(arg_classes)
+        compute_stack_arg_space(arg_classes, struct_arg_aligns)
     }
 
     pub(super) fn emit_call_f128_pre_convert_impl(
@@ -52,7 +52,7 @@ impl ArmCodegen {
         stack_arg_space: usize,
         fptr_spill: usize,
         _f128_temp_space: usize,
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
     ) -> i64 {
         if stack_arg_space > 0 {
             self.emit_sub_sp(stack_arg_space as i64);
@@ -61,15 +61,19 @@ impl ArmCodegen {
             } else {
                 stack_arg_space as i64 + fptr_spill as i64
             };
+            // Per-arg alignment padding (AAPCS64: a composite whose natural
+            // alignment is 16 is placed 16-byte aligned in the overflow
+            // area; F128/I128 are always 16-byte aligned). Must match
+            // compute_stack_arg_space.
+            let arg_padding =
+                crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
             let mut stack_offset = 0i64;
             for (arg_idx, arg) in args.iter().enumerate() {
                 if !arg_classes[arg_idx].is_stack() {
                     continue;
                 }
+                stack_offset += arg_padding[arg_idx] as i64;
                 let cls = arg_classes[arg_idx];
-                if matches!(cls, CallArgClass::F128Stack | CallArgClass::I128Stack) {
-                    stack_offset = (stack_offset + 15) & !15;
-                }
                 match cls {
                     CallArgClass::StructByValStack { size }
                     | CallArgClass::LargeStructStack { size } => {

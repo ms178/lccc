@@ -1167,8 +1167,44 @@ pub(crate) fn encode_prfop(name: &str) -> Result<u32, String> {
 
 // ── LSE Atomics ──────────────────────────────────────────────────────────
 
+/// Parse the order/size suffix shared by the CAS and CASP families
+/// (everything after the `cas` / `casp` stem).
+///
+/// Valid suffixes:
+///   ""    relaxed          "b"  byte   (CAS family only)
+///   "a"   acquire          "h"  half   (CAS family only)
+///   "l"   release
+///   "al"  acquire+release
+/// Byte/half letters always trail the order letters (`casalb`, `caslb`, ...).
+///
+/// The parse is exact rather than a `contains` probe: a lenient contains
+/// check silently encodes a mistyped mnemonic such as `casq` as relaxed
+/// CAS, i.e. the assembler would accept and mis-assemble garbage.
+/// Returns `(acquire, release, size_letter)`.
+fn parse_atomic_order_suffix(
+    stem: &str,
+    suffix: &str,
+) -> Result<(bool, bool, Option<char>), String> {
+    let (order, size) = if let Some(rest) = suffix.strip_suffix('b') {
+        (rest, Some('b'))
+    } else if let Some(rest) = suffix.strip_suffix('h') {
+        (rest, Some('h'))
+    } else {
+        (suffix, None)
+    };
+    let (a, l) = match order {
+        "" => (false, false),
+        "a" => (true, false),
+        "l" => (false, true),
+        "al" => (true, true),
+        _ => return Err(format!("{}: invalid order/size suffix '{}'", stem, suffix)),
+    };
+    Ok((a, l, size))
+}
+
 /// Encode CAS/CASA/CASAL/CASL and byte/halfword variants (Compare and Swap).
-/// CAS Xs, Xt, [Xn]: size 001000 1 L 1 Rs o0 11111 Rn Rt
+/// CAS  SZ  |001000|1|A|1|Rs|R|11111|Rn|Rt   (LLVM AArch64InstrFormats.td;
+/// round-trip verified against Capstone for all twelve order/size forms)
 pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
     if operands.len() < 3 {
         return Err(format!("{} requires 3 operands", mnemonic));
@@ -1181,28 +1217,137 @@ pub(crate) fn encode_cas(mnemonic: &str, operands: &[Operand]) -> Result<EncodeR
     };
     let mn = mnemonic.to_lowercase();
     let suffix = mn.strip_prefix("cas").unwrap_or("");
+    let (a, l, size_letter) = parse_atomic_order_suffix("cas", suffix)?;
     // Determine size: 'b' suffix = byte (00), 'h' suffix = half (01), else register-based
-    let size = if suffix.contains('b') {
-        0b00u32
-    } else if suffix.contains('h') {
-        0b01u32
-    } else if is_64 {
-        0b11u32
-    } else {
-        0b10u32
+    let size = match size_letter {
+        Some('b') => 0b00u32,
+        Some('h') => 0b01u32,
+        _ if is_64 => 0b11u32,
+        _ => 0b10u32,
     };
-    // L bit (acquire): set for casa, casal
-    let l = if suffix.contains('a') { 1u32 } else { 0u32 };
-    // o0 bit (release): set for casl, casal
-    let o0 = if suffix.contains('l') { 1u32 } else { 0u32 };
-    // size 001000 1 L 1 Rs o0 11111 Rn Rt
+    // size 001000 1 A 1 Rs R 11111 Rn Rt
     let word = (size << 30)
         | (0b001000 << 24)
         | (1 << 23)
-        | (l << 22)
+        | ((a as u32) << 22)
         | (1 << 21)
         | (rs << 16)
-        | (o0 << 15)
+        | ((l as u32) << 15)
+        | (0b11111 << 10)
+        | (rn << 5)
+        | rt;
+    Ok(EncodeResult::Word(word))
+}
+
+/// Encode CASP/CASPA/CASPAL/CASPL (Compare and Swap **Pair**, LSE).
+///
+/// CASP  0|SZ|001000|0|A|1|Rs|R|11111|Rn|Rt
+///
+/// Layout per LLVM AArch64InstrFormats.td (Capstone round-trip verified):
+/// - bit 31 is always 0 and SZ (bit 30) selects X pairs (1) vs W pairs (0);
+///   this is why CASP does NOT live at the same size-field position as CAS.
+/// - bit 23 (NP) is 0 here and 1 for CAS — the architectural CAS/CASP split.
+/// - A (bit 22) / R (bit 15) are the acquire/release order bits.
+///
+/// Operand order: `casp<order> Xs, Xs+1, Xt, Xt+1, [Xn]` — the first pair
+/// holds the expected (compare) value and receives the loaded old value
+/// (both members are in-out), the second pair holds the new value.
+/// Only Xs and Xt occupy encoding fields; Xs+1 / Xt+1 are architecturally
+/// implied, so the text operands are validated to match exactly (GAS
+/// parity: even-numbered start register, consecutive pairs, uniform width).
+pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+    if operands.len() != 5 {
+        return Err(format!(
+            "{} requires exactly 5 operands (Xs, Xs+1, Xt, Xt+1, [Xn])",
+            mnemonic
+        ));
+    }
+    let (rs, rs_64) = get_reg(operands, 0)?;
+    let (rs1, rs1_64) = get_reg(operands, 1)?;
+    let (rt, rt_64) = get_reg(operands, 2)?;
+    let (rt1, rt1_64) = get_reg(operands, 3)?;
+
+    // SP/xzr (register 31) can never be a pair member: the pair registers
+    // are architectural GPRs, and 31 would alias the stack pointer / zero
+    // register depending on context.
+    if rs == 31 || rs1 == 31 || rt == 31 || rt1 == 31 {
+        return Err(format!(
+            "{}: SP/xzr/wsp/wzr cannot be a CASP pair register",
+            mnemonic
+        ));
+    }
+    // Uniform width across the whole instruction (both pairs).
+    if rs_64 != rs1_64 || rt_64 != rt1_64 || rs_64 != rt_64 {
+        return Err(format!(
+            "{}: CASP pair registers must all be X or all be W",
+            mnemonic
+        ));
+    }
+    // Even start register + exact consecutive pairing. Both are architectural
+    // requirements (Xs+1/Xt+1 have no encoding field), not just GAS policy:
+    // accepting `caspal x0, x2, x4, x6, [x11]` would silently change which
+    // registers participate in the atomic operation.
+    if rs % 2 != 0 || rt % 2 != 0 {
+        return Err(format!(
+            "{}: CASP pair start registers must be even (got {}, {})",
+            mnemonic, rs, rt
+        ));
+    }
+    if rs1 != rs + 1 || rt1 != rt + 1 {
+        return Err(format!(
+            "{}: CASP pair registers must be consecutive (got {}, {} and {}, {})",
+            mnemonic, rs, rs1, rt, rt1
+        ));
+    }
+
+    // Base register: plain GPR64sp — no offset/writeback forms exist for
+    // CASP, and XZR-as-base is not encodable (31 here means SP).
+    let rn = match operands.get(4) {
+        Some(Operand::Mem { base, offset: 0 }) => {
+            let b = base.to_lowercase();
+            if b == "xzr" || b == "wzr" {
+                return Err(format!("{}: xzr/wzr is not a valid CASP base register", mnemonic));
+            }
+            if !is_64bit_reg(base) {
+                return Err(format!(
+                    "{}: CASP base register must be an X register or SP",
+                    mnemonic
+                ));
+            }
+            parse_reg_num(base).ok_or_else(|| format!("{}: invalid base register", mnemonic))?
+        }
+        Some(Operand::Mem { .. }) => {
+            return Err(format!(
+                "{}: memory operand must be a plain base register [Xn] (no offset/writeback)",
+                mnemonic
+            ))
+        }
+        other => {
+            return Err(format!(
+                "{}: expected memory operand [Xn], got {:?}",
+                mnemonic, other
+            ))
+        }
+    };
+
+    let mn = mnemonic.to_lowercase();
+    let suffix = mn.strip_prefix("casp").unwrap_or("");
+    let (a, l, size_letter) = parse_atomic_order_suffix("casp", suffix)?;
+    if size_letter.is_some() {
+        return Err(format!(
+            "{}: CASP has no byte/halfword variants",
+            mnemonic
+        ));
+    }
+
+    let size_bit = if rs_64 { 1u32 } else { 0 };
+    // 0|SZ 001000 0 A 1 Rs R 11111 Rn Rt
+    let word = (size_bit << 30)
+        | (0b001000 << 24)
+        | ((a as u32) << 22)
+        | (1 << 21)
+        | (rs << 16)
+        | ((l as u32) << 15)
         | (0b11111 << 10)
         | (rn << 5)
         | rt;
@@ -1351,4 +1496,134 @@ pub(crate) fn encode_stop(mnemonic: &str, operands: &[Operand]) -> Result<Encode
         | (rn << 5)
         | rt;
     Ok(EncodeResult::Word(word))
+}
+
+// ── Tests: LSE atomics (CAS family + CASP pair) ──────────────────────────
+//
+// Every expected word below was cross-verified by round-tripping the
+// encoder output through Capstone (aarch64 little-endian), which decodes
+// it back to the exact source mnemonic and operands. The CASP layout
+// (0|SZ in bits 31-30, NP=0 in bit 23) follows LLVM's
+// AArch64InstrFormats.td; note that a naive "same size field as CAS,
+// flip bit 23" reading decodes as LDXP/STXP instead.
+#[cfg(test)]
+mod lse_atomic_tests {
+    use super::*;
+    use crate::backend::arm::assembler::parser::Operand;
+
+    fn enc(mnemonic: &str, operands: &[Operand]) -> u32 {
+        match encode_any(mnemonic, operands).expect(mnemonic) {
+            EncodeResult::Word(w) => w,
+            other => panic!("{}: expected single word, got {:?}", mnemonic, other),
+        }
+    }
+
+    // Route through the same mnemonic sets as the dispatch table so the
+    // test also pins the mnemonic -> encoder wiring, not just internals.
+    fn encode_any(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
+        match mnemonic {
+            "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb"
+            | "cash" | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
+            "casp" | "caspa" | "caspal" | "caspl" => encode_casp(mnemonic, operands),
+            other => Err(format!("test harness: unknown mnemonic {}", other)),
+        }
+    }
+
+    fn reg(r: &str) -> Operand {
+        Operand::Reg(r.to_string())
+    }
+    fn mem(base: &str) -> Operand {
+        Operand::Mem {
+            base: base.to_string(),
+            offset: 0,
+        }
+    }
+    fn casp_ops(xs: &str, xs1: &str, xt: &str, xt1: &str, base: &str) -> Vec<Operand> {
+        vec![reg(xs), reg(xs1), reg(xt), reg(xt1), mem(base)]
+    }
+
+    // ── CAS family (pre-existing encoder, now pinned against drift) ──
+
+    #[test]
+    fn cas_family_exact_words() {
+        let m = mem("x2");
+        let x_ops = [reg("x0"), reg("x1"), m.clone()];
+        assert_eq!(enc("cas", &x_ops), 0xC8A0_7C41);
+        assert_eq!(enc("casa", &x_ops), 0xC8E0_7C41);
+        assert_eq!(enc("casl", &x_ops), 0xC8A0_FC41);
+        assert_eq!(enc("casal", &x_ops), 0xC8E0_FC41);
+        // Size comes from the W register when there is no b/h suffix.
+        let w_ops = [reg("w0"), reg("w1"), m.clone()];
+        assert_eq!(enc("cas", &w_ops), 0x88A0_7C41);
+        assert_eq!(enc("casb", &w_ops), 0x08A0_7C41);
+        assert_eq!(enc("casab", &w_ops), 0x08E0_7C41);
+        assert_eq!(enc("caslb", &w_ops), 0x08A0_FC41);
+        assert_eq!(enc("casalb", &w_ops), 0x08E0_FC41);
+        assert_eq!(enc("cash", &w_ops), 0x48A0_7C41);
+        assert_eq!(enc("casah", &w_ops), 0x48E0_7C41);
+        assert_eq!(enc("casalh", &w_ops), 0x48E0_FC41);
+    }
+
+    #[test]
+    fn cas_rejects_mistyped_suffixes() {
+        let ops = [reg("x0"), reg("x1"), mem("x2")];
+        // A lenient contains-based parser would silently encode these as
+        // relaxed CAS instead of rejecting them.
+        for bad in ["casq", "casx", "caszr", "caslbq"] {
+            assert!(encode_any(bad, &ops).is_err(), "{} must be rejected", bad);
+        }
+    }
+
+    // ── CASP pair family ─────────────────────────────────────────────
+
+    #[test]
+    fn casp_family_exact_words() {
+        assert_eq!(enc("casp", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4820_7D62);
+        assert_eq!(enc("caspa", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4860_7D62);
+        assert_eq!(enc("caspl", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4820_FD62);
+        assert_eq!(enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4860_FD62);
+        // W pairs: SZ=0 (bit 30 clear).
+        assert_eq!(enc("caspal", &casp_ops("w0", "w1", "w2", "w3", "x11")), 0x0860_FD62);
+        // SP base is GPR64sp-legal.
+        assert_eq!(enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "sp")), 0x4860_FFE2);
+        // High register pair: Rs=2, Rt=4.
+        assert_eq!(enc("caspal", &casp_ops("x2", "x3", "x4", "x5", "sp")), 0x4862_FFE4);
+    }
+
+    #[test]
+    fn casp_rejects_invalid_pairs() {
+        // Odd pair-start registers: architecturally unallocated encoding.
+        assert!(encode_any("caspal", &casp_ops("x1", "x2", "x2", "x3", "x11")).is_err());
+        // Non-consecutive second registers: the encoding field only stores
+        // Xs/Xt, so accepting these would silently swap which registers
+        // participate in the atomic operation.
+        assert!(encode_any("caspal", &casp_ops("x0", "x2", "x4", "x5", "x11")).is_err());
+        // Mixed widths across or within pairs.
+        assert!(encode_any("caspal", &casp_ops("x0", "x1", "w2", "w3", "x11")).is_err());
+        assert!(encode_any("caspal", &casp_ops("w0", "x1", "x2", "x3", "x11")).is_err());
+        // SP/xzr as pair member (lr = x30 is fine, sp = 31 is not).
+        assert!(encode_any("caspal", &casp_ops("x30", "sp", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspal", &casp_ops("xzr", "x1", "x2", "x3", "x11")).is_err());
+        // xzr as base register.
+        assert!(encode_any("caspal", &casp_ops("x0", "x1", "x2", "x3", "xzr")).is_err());
+        // Offset/writeback memory forms do not exist for CASP.
+        let off = vec![
+            reg("x0"),
+            reg("x1"),
+            reg("x2"),
+            reg("x3"),
+            Operand::Mem {
+                base: "x11".to_string(),
+                offset: 8,
+            },
+        ];
+        assert!(encode_any("caspal", &off).is_err());
+        // Wrong operand count.
+        let short = vec![reg("x0"), reg("x1"), reg("x2"), mem("x11")];
+        assert!(encode_any("caspal", &short).is_err());
+        // No byte/halfword pair forms; no mistyped order letters.
+        assert!(encode_any("caspalb", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspaq", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+        assert!(encode_any("caspx", &casp_ops("x0", "x1", "x2", "x3", "x11")).is_err());
+    }
 }

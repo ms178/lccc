@@ -39,11 +39,24 @@ pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 pub const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
 pub const R_AARCH64_JUMP26: u32 = 282; // S + A - P (26-bit B)
 pub const R_AARCH64_CALL26: u32 = 283; // S + A - P (26-bit BL)
-pub const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
-pub const R_AARCH64_MOVW_UABS_G1_NC: u32 = 265;
-pub const R_AARCH64_MOVW_UABS_G2_NC: u32 = 266;
-pub const R_AARCH64_MOVW_UABS_G3: u32 = 267;
-pub const R_AARCH64_MOVW_UABS_G0: u32 = 263;
+// MOVW (movz/movk) absolute halfword relocations, ABI numbers per
+// IHI0056B / llvm/include/llvm/BinaryFormat/ELFRelocs/AArch64.def:
+// G0=0x107 G0_NC=0x108 G1=0x109 G1_NC=0x10a G2=0x10b G2_NC=0x10c
+// G3=0x10d SABS_G0=0x10e SABS_G1=0x10f SABS_G2=0x110.
+// (There is deliberately no G3_NC and no SABS_G3 in the ABI. The
+// previous table here assumed a consecutive G0/G0_NC/G1_NC/G2_NC/G3
+// numbering that matched nothing — any object carrying real ABI MOVW
+// relocs would have been resolved with the wrong shift.)
+pub const R_AARCH64_MOVW_UABS_G0: u32 = 263; // 0x107
+pub const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264; // 0x108
+pub const R_AARCH64_MOVW_UABS_G1: u32 = 265; // 0x109
+pub const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266; // 0x10a
+pub const R_AARCH64_MOVW_UABS_G2: u32 = 267; // 0x10b
+pub const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268; // 0x10c
+pub const R_AARCH64_MOVW_UABS_G3: u32 = 269; // 0x10d
+pub const R_AARCH64_MOVW_SABS_G0: u32 = 270; // 0x10e
+pub const R_AARCH64_MOVW_SABS_G1: u32 = 271; // 0x10f
+pub const R_AARCH64_MOVW_SABS_G2: u32 = 272; // 0x110
 pub const R_AARCH64_ADR_GOT_PAGE: u32 = 311;
 pub const R_AARCH64_LD64_GOT_LO12_NC: u32 = 312;
 pub const R_AARCH64_CONDBR19: u32 = 280;

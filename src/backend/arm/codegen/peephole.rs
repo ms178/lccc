@@ -2493,8 +2493,13 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             | LineKind::Call => continue,
             _ => {}
         }
-        // Also skip ldp/ldaxr/ldxr/stxr by checking instruction text,
-        // since these have multiple dest registers or complex operand semantics
+        // Also skip ldp/ldaxr/ldxr/stxr/cas-family by checking instruction
+        // text, since these have multiple destination registers or complex
+        // operand semantics. `cas` covers the whole CAS/CASP family: for
+        // CAS, operand 0 (Rs) receives the loaded old value (in-out), and
+        // for CASP BOTH pair members of the compare pair (Xs, Xs+1) are
+        // in-out — Xs+1 sits after the first comma, exactly where
+        // replace_source_reg_in_instruction rewrites "source" operands.
         let trimmed_j = lines[j].trim();
         if trimmed_j.starts_with("ldp ")
             || trimmed_j.starts_with("ldaxr ")
@@ -2502,7 +2507,7 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             || trimmed_j.starts_with("stxr ")
             || trimmed_j.starts_with("ldaxp ")
             || trimmed_j.starts_with("ldxp ")
-            || trimmed_j.starts_with("cas ")
+            || trimmed_j.starts_with("cas")
         {
             continue;
         }

@@ -29,9 +29,9 @@ impl RiscvCodegen {
         &self,
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
     ) -> usize {
-        compute_stack_arg_space(arg_classes)
+        compute_stack_arg_space(arg_classes, struct_arg_aligns)
     }
 
     pub(super) fn emit_call_f128_pre_convert_impl(
@@ -75,15 +75,22 @@ impl RiscvCodegen {
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
     ) -> i64 {
         if stack_arg_space > 0 {
+            // Per-arg alignment padding (RISC-V psABI: stack arguments whose
+            // natural alignment exceeds XLEN — e.g. struct { long double } —
+            // are aligned to 2*XLEN in the argument area; F128/I128 are
+            // always 16-byte aligned). Must match compute_stack_arg_space.
+            let arg_padding =
+                crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
             self.emit_addi_sp(-(stack_arg_space as i64));
             let mut offset: usize = 0;
             for (arg_i, arg) in args.iter().enumerate() {
                 if !arg_classes[arg_i].is_stack() {
                     continue;
                 }
+                offset += arg_padding[arg_i];
                 match arg_classes[arg_i] {
                     CallArgClass::StructByValStack { size }
                     | CallArgClass::LargeStructStack { size } => {
@@ -115,7 +122,6 @@ impl RiscvCodegen {
                         offset += n_dwords * 8;
                     }
                     CallArgClass::I128Stack => {
-                        offset = (offset + 15) & !15;
                         match arg {
                             Operand::Const(c) => {
                                 if let IrConst::I128(v) = c {
@@ -151,7 +157,6 @@ impl RiscvCodegen {
                         offset += 16;
                     }
                     CallArgClass::F128Stack => {
-                        offset = (offset + 15) & !15;
                         match arg {
                             Operand::Const(ref c) => {
                                 let bytes = match c {
