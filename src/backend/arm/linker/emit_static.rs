@@ -816,8 +816,27 @@ pub(super) fn emit_executable(
         ph += 56;
     }
 
-    // GNU_STACK
-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+    // GNU_STACK — executable when any input's .note.GNU-stack marks
+    // SHF_EXECINSTR (binutils ORs all input notes into the final flags).
+    // The compiler emits the executable note whenever a unit initialises
+    // nested-function trampolines; a non-executable stack segfaults on the
+    // first indirect nested call. (Mirrors i686/linker/emit.rs.)
+    let exec_stack = objects.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
+    });
+    wphdr(
+        &mut out,
+        ph,
+        PT_GNU_STACK,
+        PF_R | PF_W | if exec_stack { PF_X } else { 0 },
+        0,
+        0,
+        0,
+        0,
+        0x10,
+    );
     ph += 56;
 
     // PT_GNU_EH_FRAME: points to .eh_frame_hdr for stack unwinding

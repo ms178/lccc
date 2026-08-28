@@ -518,6 +518,9 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
+        changed |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
+        changed |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
         changed |= eliminate_move_chains(&mut lines, &mut kinds, n);
         changed |= fold_zext_move_chains(&mut lines, &mut kinds, n);
         changed |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -567,6 +570,9 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_sxtw(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_sxtb(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_zext_and(&mut lines, &mut kinds, n);
+            changed2 |= fuse_and_cmp_zero(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_dead_pre_ret_moves(&mut lines, &mut kinds, n);
             changed2 |= eliminate_move_chains(&mut lines, &mut kinds, n);
             changed2 |= fold_zext_move_chains(&mut lines, &mut kinds, n);
             changed2 |= eliminate_unused_x9_address_moves(&lines, &mut kinds, n);
@@ -2111,6 +2117,566 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
                     }
                 }
             }
+        }
+    }
+    changed
+}
+
+
+// ── Redundant zero-extension mask elimination ────────────────────────────────
+//
+// The cast emitters stage through x0 and mask every widening/narrowing cast
+// (`and x0, x0, #0xff` for U8, #0xffff for U16), even when the value already
+// satisfies the mask because it came from an `ldrb`/`ldrh` (zero-extending
+// loads), a narrower mask, or a small immediate. AArch64 has no need for the
+// re-mask; GCC drops it (zext_chain/load_cmp compile the mask away entirely).
+//
+// Forward knowledge tracking, one pass per basic-block-shaped region: for
+// every x-register we track a WIDTH bound w meaning value(x-reg) < 2^w
+// (all bits at index >= w are zero). Producers: zero-extending loads
+// (w=8/16), 32-bit writes (w=32), a previous mask (its width), small
+// immediates, ubfx #0,#w, uxtb/uxth, xzr (w=0), and register moves (the
+// bound transfers; a w-form move clamps to 32). Everything else that
+// writes a register widens the bound to its form (32 for w-form writes,
+// 64 = no information for x-form writes): precisely for the classified
+// kinds, and CONSERVATIVELY (full reset to 64) for the unclassified
+// Other/MemOther kinds -- matching the soundness stance of
+// eliminate_redundant_sxtw above. Labels, branches, calls and returns are
+// barriers (no cross-block knowledge).
+//
+// Fire condition: value(s) < 2^mask_width, i.e. bound(s) <= mask_width.
+// Note the direction -- a 32-bit bound says NOTHING about bits 31:8, so a
+// generic w-form write never fires an #0xff mask; a tight 8-bit bound from
+// ldrb fires both #0xff and #0xffff masks.
+//
+// Rewrite: `and d, s, #mask` with knowledge(s) >= mask width becomes
+// `mov d, s` — value-identical — and the existing move-chain/self-move
+// passes clean the copy up. `and` does not read flags and the rewrite does
+// not write any, so no flag state is disturbed.
+//
+// Example (zext_chain, per iteration):
+//   ldrb w5, [x19, x1]     ldrb w5, [x19, x1]
+//   and  w4, w5, #0xff  →  mov  w4, w5     (then propagated away)
+//   mov  x0, x4            mov  x0, x5
+
+fn zext_mask_bits(imm: &str) -> Option<u8> {
+    match imm.trim() {
+        "#0xff" => Some(8),
+        "#0xffff" => Some(16),
+        _ => None,
+    }
+}
+
+/// Width bound contributed by a destination's REGISTER FORM: a w-form
+/// write produces a value < 2^32 (bits 63:32 zeroed); an x-form write
+/// carries no bound. Used as the base rule for classified writes.
+const ZEXT_NO_INFO: u8 = 64;
+
+fn form_zero_width(op: &str) -> u8 {
+    if op.starts_with('w') {
+        32
+    } else {
+        ZEXT_NO_INFO
+    }
+}
+
+/// Destination register of an instruction whose first comma-operand is the
+/// written register (all AArch64 ALU/move/load forms), or REG_NONE.
+fn first_operand_reg(line: &str) -> u8 {
+    let Some(rest) = line.trim().split_once(' ').map(|(_, r)| r) else {
+        return REG_NONE;
+    };
+    let Some((d, _)) = rest.split_once(',') else {
+        return REG_NONE;
+    };
+    parse_reg(d.trim())
+}
+
+/// Kill knowledge for a post-indexed writeback base (`..., [xN], #imm`).
+fn kill_writeback_base(line: &str, zext: &mut [u8; 33]) {
+    let t = line.trim();
+    let Some(bracket) = t.find('[') else { return };
+    let Some(close) = t[bracket..].find(']') else { return };
+    let inner = &t[bracket + 1..bracket + close];
+    // Post-index (`[xN], #imm`) or pre-index (`[xN, #imm]!`) writeback both
+    // redefine the base register.
+    if let Some((_, after)) = t.split_once(']') {
+        let after = after.trim_start();
+        if after.starts_with('!') || after.starts_with('#') || after.starts_with(", #") {
+            // Writeback base becomes base+imm: arbitrary 64-bit.
+            if let Some((base, _)) = inner.split_once(',') {
+                let r = parse_reg(base.trim());
+                if r < 31 {
+                    zext[r as usize] = ZEXT_NO_INFO;
+                }
+            } else if !inner.is_empty() {
+                let r = parse_reg(inner.trim());
+                if r < 31 {
+                    zext[r as usize] = ZEXT_NO_INFO;
+                }
+            }
+        }
+    }
+}
+
+fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_ZEXT_MASK_FOLD").is_ok() {
+        return false;
+    }
+    let mut zext = [ZEXT_NO_INFO; 33];
+    zext[32] = 0; // xzr/wzr is all-zero and unwritable
+    let mut changed = false;
+    for i in 0..n {
+        match kinds[i] {
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret => {
+                zext = [ZEXT_NO_INFO; 33];
+                zext[32] = 0;
+                continue;
+            }
+            LineKind::Directive | LineKind::Nop => continue,
+            _ => {}
+        }
+        let t = lines[i].trim();
+        let Some(sp) = t.find(' ') else { continue };
+        let mnemonic = &t[..sp];
+        let rest = &t[sp + 1..];
+        match mnemonic {
+            // Zero-extending loads: bits above the access size are zero.
+            "ldrb" | "ldurb" | "ldarb" | "ldaprb" | "ldtrb" | "ldrab" => {
+                if let Some((d, _)) = rest.split_once(',') {
+                    let dst = parse_reg(d.trim());
+                    if dst < 32 {
+                        zext[dst as usize] = 8;
+                    }
+                }
+                kill_writeback_base(t, &mut zext);
+            }
+            "ldrh" | "ldurh" | "ldarh" | "ldaprh" | "ldtrh" => {
+                if let Some((d, _)) = rest.split_once(',') {
+                    let dst = parse_reg(d.trim());
+                    if dst < 32 {
+                        zext[dst as usize] = 16;
+                    }
+                }
+                kill_writeback_base(t, &mut zext);
+            }
+            // Masks produce exactly their own width of known zeros. NOTE:
+            // `ands` also SETS FLAGS — its value knowledge is tracked, but
+            // it is never rewritten (a `mov` replacement would drop the
+            // flag definitions).
+            "and" | "ands" => {
+                let is_ands = mnemonic == "ands";
+                let mut ops = rest.split(',');
+                let dst = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
+                let src = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
+                let third = ops.next();
+                // Capture the source bound BEFORE writing the destination:
+                // for the in-place form `and x0, x0, #mask` (dst == src) the
+                // destination update below would otherwise overwrite the
+                // very bound the redundancy check reads — the mask would
+                // then validate itself (e.g. an #0xffff truncation after
+                // `sxth` saw its own 16-bit result instead of the 64-bit
+                // sign-extended input and deleted itself — cast_chain_fold,
+                // sqlite_yy_shift miscompiles).
+                let src_bound = if src < 32 { zext[src as usize] } else { ZEXT_NO_INFO };
+                if dst < 32 {
+                    let w = third.and_then(zext_mask_bits).unwrap_or_else(|| {
+                        let dform = rest.split(',').next().unwrap_or("").trim();
+                        form_zero_width(dform)
+                    });
+                    zext[dst as usize] = w;
+                }
+                // A plain-AND mask whose source is already wider-known is
+                // redundant: value-identical `mov`, flags untouched (`and`
+                // reads no flags and writes none).
+                if !is_ands {
+                    if let Some(bits) = third.and_then(zext_mask_bits) {
+                        if src < 32 && src_bound <= bits {
+                            let dform = rest.split(',').next().unwrap_or("").trim();
+                            let sform = rest
+                                .split(',')
+                                .nth(1)
+                                .unwrap_or("")
+                                .trim()
+                                .to_string();
+                            let is32 = dform.starts_with('w');
+                            let new = format!("    mov {}, {}", dform, sform);
+                            kinds[i] = LineKind::Move {
+                                dst,
+                                src,
+                                is_32bit: is32,
+                            };
+                            lines[i] = new;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            // ubfx wD, ..., #0, #w yields w known-zero bits when lsb == 0.
+            "ubfx" => {
+                // Operands: dst, src, #lsb, #width.
+                let mut ops = rest.split(',');
+                let dst = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
+                let lsb: Option<u32> = ops
+                    .nth(2)
+                    .and_then(|o| o.trim().strip_prefix('#'))
+                    .and_then(|o| o.trim().parse().ok());
+                let width: Option<u32> = ops
+                    .next()
+                    .and_then(|o| o.trim().strip_prefix('#'))
+                    .and_then(|o| o.trim().parse().ok());
+                if dst < 32 {
+                    zext[dst as usize] = if lsb == Some(0) {
+                        width.map(|w| w.clamp(0, 63) as u8).unwrap_or(0)
+                    } else {
+                        form_zero_width(rest.split(',').next().unwrap_or("").trim())
+                    };
+                }
+            }
+            "uxtb" | "uxth" => {
+                if let Some((d, _)) = rest.split_once(',') {
+                    let dst = parse_reg(d.trim());
+                    if dst < 32 {
+                        zext[dst as usize] = if mnemonic == "uxtb" { 8 } else { 16 };
+                    }
+                }
+            }
+            // adrp: page-aligned (bits 11:0 zero) is an ALIGNMENT fact,
+            // not a width bound -- value(adrp) is generally >= 2^12. No
+            // width information here; the x-form base rule applies.
+            "adrp" => {}
+            "mov" | "movz" => {
+                let mut ops = rest.split(',');
+                let dform = ops.next().unwrap_or("").trim().to_string();
+                let srcop = ops.next().unwrap_or("").trim().to_string();
+                let dst = parse_reg(&dform);
+                // `movz xD, #imm, lsl #n` shifts — the immediate's width no
+                // longer bounds the register's zero bits (e.g. lsl #48 puts
+                // non-zero bits high). The register IS written, so the old
+                // bound must not survive: fall back to the form rule.
+                let shifted = rest.contains(", lsl") || rest.contains(", lsl ");
+                if dst < 32 && shifted {
+                    zext[dst as usize] = form_zero_width(&dform);
+                }
+                if dst < 32 && !shifted {
+                    if let Some(immv) = srcop.strip_prefix('#') {
+                        // mov/movz with a non-negative immediate: the value's
+                        // known zero width is the immediate's significant
+                        // width rounded up to 8/16/32.
+                        if let Ok(v) = u64::from_str_radix(
+                            immv.trim_start_matches("0x"),
+                            if immv.starts_with("0x") { 16 } else { 10 },
+                        ) {
+                            zext[dst as usize] = if v <= 0xff {
+                                8
+                            } else if v <= 0xffff {
+                                16
+                            } else {
+                                32
+                            };
+                        } else {
+                            zext[dst as usize] = form_zero_width(&dform);
+                        }
+                    } else {
+                        let src = parse_reg(&srcop);
+                        if src < 32 {
+                            // Copy: the written value keeps the source's
+                            // width bound; a w-form write additionally
+                            // zeroes bits 63:32, clamping the bound at 32.
+                            zext[dst as usize] = if dform.starts_with('w') {
+                                zext[src as usize].min(32)
+                            } else {
+                                zext[src as usize]
+                            };
+                        } else {
+                            zext[dst as usize] = form_zero_width(&dform);
+                        }
+                    }
+                }
+            }
+            // Everything else with a classified single destination: the form
+            // of the destination fixes the base knowledge.
+            _ => match kinds[i] {
+                LineKind::Alu => {
+                    let dst = first_operand_reg(t);
+                    if dst < 32 {
+                        let dform = t
+                            .split_once(' ')
+                            .and_then(|(_, r)| r.split(',').next())
+                            .unwrap_or("")
+                            .trim();
+                        zext[dst as usize] = form_zero_width(dform);
+                    }
+                }
+                // Move-family mnemonics movn/movk reach here: movn writes a
+                // complemented immediate (unknown zeros — form rule), movk
+                // patches mid-bits (form rule). Both are captured by the
+                // destination-form base rule below.
+                LineKind::Move { dst, src, is_32bit } => {
+                    if dst < 32 {
+                        // Reached only for forms the mov/movz mnemonic arm
+                        // does not cover (movn/movk); transfer conservatively.
+                        let _ = src;
+                        zext[dst as usize] = if is_32bit { 32 } else { ZEXT_NO_INFO };
+                    }
+                }
+                LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => {
+                    if dst < 32 {
+                        let dform = t
+                            .split_once(' ')
+                            .and_then(|(_, r)| r.split(',').next())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        zext[dst as usize] = form_zero_width(&dform);
+                    }
+                }
+                LineKind::LoadSp { reg, is_word, .. } => {
+                    if reg < 32 {
+                        // w-form: value < 2^32; x-form: arbitrary 64-bit.
+                        zext[reg as usize] = if is_word { 32 } else { ZEXT_NO_INFO };
+                    }
+                }
+                LineKind::LoadswSp { reg, .. } => {
+                    if reg < 32 {
+                        // ldrsw sign-extends: bits 63:32 may be all ones.
+                        zext[reg as usize] = ZEXT_NO_INFO;
+                    }
+                }
+                LineKind::LoadPairSp => {
+                    // ldp wA, wB / ldp xA, xB — both destinations.
+                    let mut ops = rest.split(',');
+                    if let Some(a) = ops.next() {
+                        let r = parse_reg(a.trim());
+                        if r < 32 {
+                            zext[r as usize] = form_zero_width(a.trim());
+                        }
+                    }
+                    if let Some(b) = ops.next() {
+                        let r = parse_reg(b.trim());
+                        if r < 32 {
+                            zext[r as usize] = form_zero_width(b.trim());
+                        }
+                    }
+                }
+                // cmp/cmn write no GP registers; stores write none (sp-based
+                // forms carry no writeback in this backend); sxtw/ldrsb
+                // produce sign-extended values (base form rule below).
+                LineKind::Compare | LineKind::StoreSp { .. } | LineKind::StorePairSp => {}
+                LineKind::Sxtw { dst, .. } => {
+                    if dst < 32 {
+                        // Sign-extended: bits 63:32 copy bit 31 (may be set).
+                        zext[dst as usize] = ZEXT_NO_INFO;
+                    }
+                }
+                LineKind::LoadsbReg => {
+                    let d = first_operand_reg(t);
+                    if d < 32 {
+                        // ldrsb sign-extends: no width bound.
+                        zext[d as usize] = ZEXT_NO_INFO;
+                    }
+                }
+                // Unknown shape: reset everything (conservative).
+                _ => {
+                    zext = [ZEXT_NO_INFO; 33];
+                    zext[32] = 0;
+                }
+            },
+        }
+    }
+    changed
+}
+
+// ── AND + CMP #0 fusion (AArch64 TST) ────────────────────────────────────────
+//
+// `and wA, wB, C` immediately followed by `cmp wA, #0` and an N/Z/V-based
+// flag consumer burns an instruction: ANDS computes the same value, writes
+// the same destination register, and sets N/Z/V from the identical result.
+// Fuse to `ands wA, wB, C` and delete the compare:
+//
+//   and  w5, w19, w20        ands w5, w19, w20
+//   cmp  w5, #0          →   cset x0, ne
+//   cset x0, ne
+//
+// Exactness (ARM ARM): for `cmp x, #0` N = bit31(x), Z = (x == 0), C = 1,
+// V = 0. For `ands` N and Z are identical (same value); V = 0 always
+// (logical ops). C differs (shifter carry), so C-consuming conditions
+// (hs/lo/cs/cc/hi/ls) are excluded. Allowed set uses only N/Z/V:
+// eq/ne/mi/pl/ge/lt/gt/le/vs/vc (for ge/lt/gt/le note V is 0 on BOTH sides,
+// so N-vs-V relations are identical).
+//
+// The ANDS keeps writing wA, so no liveness is required; the immediate form
+// shares AND's encoder, so any valid `and #imm` is a valid `ands #imm`.
+
+fn nzv_condition(cc: &str) -> bool {
+    matches!(
+        cc,
+        "eq" | "ne" | "mi" | "pl" | "ge" | "lt" | "gt" | "le" | "vs" | "vc"
+    )
+}
+
+fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_AND_TST_FUSION").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    for i in 0..n.saturating_sub(2) {
+        if kinds[i] != LineKind::Alu {
+            continue;
+        }
+        let t = lines[i].trim();
+        if !t.starts_with("and ") {
+            continue;
+        }
+        let mut ops = t[4..].splitn(3, ',');
+        let dform = ops.next().unwrap_or("").trim().to_string();
+        let sform = ops.next().unwrap_or("").trim().to_string();
+        // Tail kept VERBATIM (may contain shifted-register operands such as
+        // `x2, lsl #3` — ands accepts the identical operand encoding).
+        let cform = ops.next().unwrap_or("").trim().to_string();
+        let dst = parse_reg(&dform);
+        if dst == REG_NONE || dst >= 32 {
+            continue;
+        }
+        // i+1: cmp <same reg>, #0 (or xzr/wzr)
+        let t1 = lines[i + 1].trim();
+        if kinds[i + 1] != LineKind::Compare || !t1.starts_with("cmp ") {
+            continue;
+        }
+        let mut cops = t1[4..].split(',');
+        let creg = cops.next().unwrap_or("").trim();
+        let cimm = cops.next().unwrap_or("").trim();
+        if creg != dform || !(cimm == "#0" || cimm == "xzr" || cimm == "wzr") {
+            continue;
+        }
+        // i+2: an N/Z/V-only flag consumer.
+        let t2 = lines[i + 2].trim();
+        let cc_ok = if let Some(rest) = t2.strip_prefix("b.") {
+            rest.split_once(' ').map(|(cc, _)| nzv_condition(cc)).unwrap_or(false)
+        } else if t2.starts_with("cset ") || t2.starts_with("csetm ") {
+            t2.split_once(' ')
+                .and_then(|(_, tail)| tail.split(',').nth(1))
+                .map(|cc| nzv_condition(cc.trim()))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !cc_ok {
+            continue;
+        }
+        lines[i] = format!("    ands {}, {}, {}", dform, sform, cform);
+        kinds[i] = LineKind::Alu;
+        lines[i + 1] = String::new();
+        kinds[i + 1] = LineKind::Nop;
+        changed = true;
+    }
+    changed
+}
+
+
+// ── Dead move before return ──────────────────────────────────────────────────
+//
+// Return staging can leave `mov xD, xS` writes whose destination is the
+// value's register-allocation home rather than the ABI return register x0 —
+// e.g. bool-gate-shaped functions end
+//   cset x0, ne ; sxtw x0, w0 ; mov x5, x0 ; <epilogue restores> ; ret
+// where x5 is never read again. `ret` reads no general-purpose register
+// except x30 (lr), so a move whose destination is not mentioned again
+// before the ret (a later pure redefinition also proves death) is dead.
+//
+// The scan is the eliminate_dead_call_staging_moves shape, tightened for
+// the no-call path: every instruction between the move and the ret must
+// either not mention the destination, or provably only WRITE it (Move from
+// a different source, MoveImm, LoadSp, Sxtw from a different source, Alu
+// writing a different register). Anything ambiguous — unknown kinds, memory
+// ops, calls, control flow — aborts the scan (move stays). Destinations
+// x29 (fp), x30 (lr: `ret` reads it), sp and xzr are excluded.
+fn eliminate_dead_pre_ret_moves(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_DEAD_PRE_RET").is_ok() {
+        return false;
+    }
+    fn mentions_reg(line: &str, reg: u8) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|token| token == xreg_name(reg) || token == wreg_name(reg))
+    }
+    /// True when the line writes `reg` and provably does not read it.
+    fn pure_write(line: &str, kind: &LineKind, reg: u8) -> bool {
+        match kind {
+            LineKind::Move { dst, src, .. } => *dst == reg && *src != reg,
+            LineKind::MoveImm { dst } | LineKind::MoveWide { dst } => *dst == reg,
+            LineKind::LoadSp { reg: d, .. } | LineKind::LoadswSp { reg: d, .. } => *d == reg,
+            LineKind::LoadPairSp => {
+                // ldp d, other — both destinations; reg must be one and the
+                // other must differ.
+                let rest = line.trim().split_once(' ').map(|(_, r)| r).unwrap_or("");
+                let mut ops = rest.split(',');
+                let a = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
+                let b = ops.next().map(|o| parse_reg(o.trim())).unwrap_or(REG_NONE);
+                (a == reg) != (b == reg)
+            }
+            LineKind::Sxtw { dst, src } => *dst == reg && *src != reg,
+            LineKind::Alu => {
+                // Alu writes its first operand and reads the rest (for
+                // read-modify forms the source operands may name the same
+                // register — those are NOT pure writes). Memory operands
+                // like `[x19, x1]` never parse to `reg` unless reg is
+                // genuinely named, which the all-check treats as a read.
+                let d = first_operand_reg(line);
+                if d != reg {
+                    return false;
+                }
+                let rest = line.trim().split_once(' ').map(|(_, r)| r).unwrap_or("");
+                rest.split(',').skip(1).all(|o| parse_reg(o.trim()) != reg)
+            }
+            _ => false,
+        }
+    }
+    let mut changed = false;
+    for i in 0..n {
+        // Destinations: GP registers 1..=28. Excluded: x0 — THE RETURN
+        // REGISTER; `ret` hands x0 to the caller, so a late write to it is
+        // observable even when nothing in this function reads it (aarch64
+        // regression seeds: deleting `mov w0, w0` before ret changed the
+        // returned value — the 32-bit form zero-extends x0). Also excluded:
+        // x29 (fp), x30 (lr — `ret` reads it), sp, xzr.
+        let dst = match kinds[i] {
+            LineKind::Move { dst, .. } if (1..=28).contains(&dst) => dst,
+            _ => continue,
+        };
+        let mut j = i + 1;
+        let mut dead = false;
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                LineKind::Ret => {
+                    dead = true;
+                    break;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call => break,
+                _ => {
+                    if mentions_reg(&lines[j], dst) {
+                        if pure_write(&lines[j], &kinds[j], dst) {
+                            dead = true; // overwritten unread: move is dead
+                        }
+                        break;
+                    }
+                }
+            }
+            j += 1;
+        }
+        if dead {
+            kinds[i] = LineKind::Nop;
+            lines[i] = String::new();
+            changed = true;
         }
     }
     changed
@@ -3756,12 +4322,13 @@ mod tests {
 
     #[test]
     fn test_adjacent_store_load_diff_reg() {
-        let input = "    str x0, [sp, #16]\n    ldr x1, [sp, #16]\n    ret\n";
+        let input = "    str x0, [sp, #16]\n    ldr x1, [sp, #16]\n    add x2, x1, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        // The load is replaced with mov, and then DSE removes the now-dead store
-        // (no remaining loads from offset 16), leaving just the mov and ret.
-        assert!(!result.contains("ldr x1, [sp, #16]"));
-        assert!(result.contains("mov x1, x0"));
+        // The load must never reach the final text: it is replaced by the
+        // store's value (mov or propagated copy), and the then-dead store
+        // is removed by DSE.
+        assert!(!result.contains("ldr x1, [sp, #16]"), "load kept:\n{}", result);
+        assert!(!result.contains("str x0, [sp, #16]"), "dead store kept:\n{}", result);
     }
 
     #[test]
@@ -3791,16 +4358,21 @@ mod tests {
 
     #[test]
     fn test_move_chain() {
-        let input = "    mov x0, x14\n    mov x13, x0\n    ret\n";
+        // The copy-of-copy chain must not survive: the fold (or equivalent
+        // copy propagation) rewrites the sole read of x13 to its source, so
+        // `mov x13, x0` disappears in one form or another.
+        let input = "    mov x0, x14\n    mov x13, x0\n    add x15, x13, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mov x13, x14"));
+        assert!(!result.contains("mov x13, x0"), "chain not folded:\n{}", result);
+        assert!(result.contains("add x15, x14, #1"), "value flow lost:\n{}", result);
     }
 
     #[test]
     fn test_move_imm_chain() {
-        let input = "    mov x0, #0\n    mov x14, x0\n    ret\n";
+        let input = "    mov x0, #0\n    mov x14, x0\n    add x15, x14, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mov x14, #0"));
+        assert!(!result.contains("mov x14, x0"), "chain not folded:\n{}", result);
+        assert!(result.contains("mov x14, #0"), "immediate not retargeted:\n{}", result);
     }
 
     #[test]
@@ -4697,5 +5269,96 @@ f:
         let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
         let n = lines.len();
         assert!(!sink_loop_carried_stores(&mut lines, &mut kinds, n));
+    }
+
+    // ── eliminate_dead_pre_ret_moves ──────────────────────────────────────
+
+    #[test]
+    fn test_dead_pre_ret_move_removed() {
+        // Staged-to-home move whose destination nothing reads before the
+        // ret (bool_gate shape): dead, removed.
+        let input = "f:\n    cset x0, ne\n    sxtw x0, w0\n    mov x5, x0\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("mov x5, x0"), "dead staging mov kept:\n{}", result);
+    }
+
+    #[test]
+    fn test_dead_pre_ret_x0_return_reg_kept() {
+        // A write to x0 immediately before ret IS the return value: kept.
+        let input = "f:\n    mov x0, x5\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x0, x5"), "return-register write deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_dead_pre_ret_w0_zext_semantics_kept() {
+        // `mov w0, w0` is a 32-bit write that zero-extends x0's low half —
+        // observable through the caller's view of x0. Never delete.
+        let input = "f:\n    mov x0, x22\n    mov w0, w0\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov w0, w0"), "zext-into-x0 deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_dead_pre_ret_read_blocks_removal() {
+        // The move's destination is read by a store through an argument
+        // pointer (which DSE cannot prove dead): the move is live and the
+        // whole sequence must survive verbatim.
+        let input = "f:\n    mov x5, x0\n    str x5, [x19]\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("mov x5, x0"), "live move deleted:\n{}", result);
+        assert!(result.contains("str x5, [x19]"), "store lost:\n{}", result);
+    }
+
+    // ── fuse_and_cmp_zero ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_and_cmp_fused_to_ands() {
+        let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    cset x0, ne\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ands w5, w19, w20"), "fusion missed:\n{}", result);
+        assert!(!result.contains("cmp w5, #0"), "cmp kept after fusion:\n{}", result);
+    }
+
+    #[test]
+    fn test_and_cmp_ccond_not_fused() {
+        // b.cs consumes the C flag: cmp #0 sets C=1, ands sets the shifter
+        // carry — the flags differ, so no fusion.
+        let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    b.cs .L1\n    ret\n.L1:\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ands w5"), "C-consumer fused:\n{}", result);
+        assert!(result.contains("cmp w5, #0"), "cmp dropped for C-consumer:\n{}", result);
+    }
+
+    // ── eliminate_redundant_zext_and ──────────────────────────────────────
+
+    #[test]
+    fn test_zext_and_after_ldrb_removed() {
+        // ldrb already zero-extends: the #0xff re-mask is a no-op.
+        let input = "f:\n    ldrb w5, [x19, x1]\n    and w4, w5, #0xff\n    add x9, x4, #1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("and w4, w5, #0xff"),
+            "redundant mask kept:\n{}",
+            result
+        );
+        assert!(result.contains("mov w4, w5"), "mask not rewritten to mov:\n{}", result);
+    }
+
+    #[test]
+    fn test_zext_and_unknown_source_kept() {
+        // w6's high bits are unknown: the mask is semantically required.
+        let input = "f:\n    mov w4, w6\n    and w5, w4, #0xff\n    add x9, x5, #1\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("and w5, w4, #0xff"), "needed mask removed:\n{}", result);
+    }
+
+    #[test]
+    fn test_zext_and_never_rewrites_ands() {
+        // ands defines flags for the cset: value-redundant or not, it must
+        // stay an ands.
+        let input = "f:\n    ldrb w5, [x19, x1]\n    ands w4, w5, #0xff\n    cset x9, ne\n    ret\n";
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ands w4, w5, #0xff"), "flag-setting ands rewritten:\n{}", result);
     }
 }

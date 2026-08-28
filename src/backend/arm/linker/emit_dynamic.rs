@@ -648,7 +648,25 @@ pub(super) fn emit_dynamic_executable(
         8,
     );
     ph += 56;
-    wphdr(&mut out, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0x10);
+    // GNU_STACK — OR of all input notes (trampoline units mark the note
+    // SHF_EXECINSTR); without PF_X an address-taken nested function
+    // segfaults on its first indirect call. (Mirrors i686/linker/emit.rs.)
+    let exec_stack = objects.iter().any(|obj| {
+        obj.sections
+            .iter()
+            .any(|s| s.name == ".note.GNU-stack" && (s.flags & SHF_EXECINSTR) != 0)
+    });
+    wphdr(
+        &mut out,
+        ph,
+        PT_GNU_STACK,
+        PF_R | PF_W | if exec_stack { PF_X } else { 0 },
+        0,
+        0,
+        0,
+        0,
+        0x10,
+    );
     ph += 56;
     if has_tls {
         wphdr(
