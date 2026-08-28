@@ -733,45 +733,88 @@ impl Lowerer {
             }
             UnaryOp::LogicalNot => {
                 let int_ty = crate::common::types::target_int_ir_type();
-                let zero = if int_ty == IrType::I32 {
-                    IrConst::I32(0)
-                } else {
-                    IrConst::I64(0)
-                };
                 let inner_ct = self.expr_ctype(inner);
                 if inner_ct.is_complex() {
                     // !complex_val => (real == 0) && (imag == 0)
                     let val = self.lower_expr(inner);
                     let ptr = self.operand_to_value(val);
                     let bool_val = self.lower_complex_to_bool(ptr, &inner_ct);
-                    // Negate: bool_val is 1 if nonzero, so !complex is (bool_val == 0)
-                    let dest =
-                        self.emit_cmp_val(IrCmpOp::Eq, bool_val, Operand::Const(zero), int_ty);
+                    // Negate: bool_val is 1 if nonzero, so !complex is
+                    // (bool_val == 0). Compare at the boolean's own width
+                    // (I32): comparing an I32 value at the target int width
+                    // (I64 on x86-64) is a width lie — if the boolean ever
+                    // spills to a 4-byte stack slot, the backend's
+                    // memory-operand forms would read 8 bytes, pulling
+                    // adjacent-slot garbage into the high 32 bits.
+                    let dest = self.emit_cmp_val(
+                        IrCmpOp::Eq,
+                        bool_val,
+                        Operand::Const(IrConst::I32(0)),
+                        IrType::I32,
+                    );
                     Operand::Value(dest)
                 } else {
                     let inner_ty = self.infer_expr_type(inner);
                     let val = self.lower_expr(inner);
-                    let cmp_val = self.mask_float_sign_for_truthiness(val, inner_ty);
-                    // Use the inner expression's type for comparison when it is
-                    // a wide integer (I64/U64) on a 32-bit target. Otherwise a
-                    // 64-bit value like 0x1_0000_0000 would be truncated to 32
-                    // bits and incorrectly compare equal to zero. Float types
-                    // are excluded because mask_float_sign_for_truthiness already
-                    // reduces them to an I32 boolean on 32-bit targets.
-                    let cmp_ty = if !inner_ty.is_float() && inner_ty.size() > int_ty.size() {
-                        inner_ty
+                    // `!x` is (x == 0) at x's own (promoted) width. Every
+                    // Cmp operand must be defined at exactly the width the
+                    // compare declares: comparing a 32-bit value at 64-bit
+                    // width is only accidentally correct while the value
+                    // stays register-resident (x86-64 32-bit ops
+                    // zero-extend) and miscompiles once it spills — the
+                    // backend substitutes the 4-byte slot into a `cmpq`,
+                    // which reads 8 bytes (adjacent-slot garbage). Width
+                    // selection:
+                    // * sub-int: widen FIRST (narrow ops leave the high
+                    //   bits stale; the test must not observe them), then
+                    //   test at the widened (I32) width;
+                    // * 32-bit ints: test at 32 bits — the low 32 bits
+                    //   decide zero-ness, so this is identical to the
+                    //   zero-extended 64-bit test, one byte shorter, and
+                    //   reads exactly the 4 stored bytes of a small slot;
+                    // * 64-bit ints: test at 64 bits — REQUIRED on i686,
+                    //   where a 32-bit test would truncate e.g.
+                    //   0x1_0000_0000 to zero;
+                    // * floats: mask_float_sign_for_truthiness already
+                    //   produced a well-typed value (I64 on 64-bit
+                    //   targets, I32 boolean on i686 / for F128) — test
+                    //   at that type.
+                    let (cmp_val, cmp_ty) = if inner_ty.is_float() {
+                        let masked = self.mask_float_sign_for_truthiness(val, inner_ty);
+                        let t = if crate::common::types::target_is_32bit()
+                            || inner_ty == IrType::F128
+                        {
+                            IrType::I32
+                        } else {
+                            IrType::I64
+                        };
+                        (masked, t)
                     } else {
-                        int_ty
+                        match inner_ty {
+                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => {
+                                let w = crate::common::types::widened_op_type(inner_ty);
+                                let widened = self.emit_cast_val(val, inner_ty, w);
+                                (Operand::Value(widened), w)
+                            }
+                            IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64 => {
+                                (val, inner_ty)
+                            }
+                            // Pointers and anything else: test at the target
+                            // int width when the value is int-sized; preserve
+                            // the value's own width when it is genuinely
+                            // wider (I128/U128).
+                            _ => {
+                                if inner_ty.size() > int_ty.size() {
+                                    (val, inner_ty)
+                                } else {
+                                    (val, int_ty)
+                                }
+                            }
+                        }
                     };
                     let cmp_zero = match cmp_ty {
                         IrType::I64 | IrType::U64 => IrConst::I64(0),
-                        _ => {
-                            if int_ty == IrType::I32 {
-                                IrConst::I32(0)
-                            } else {
-                                IrConst::I64(0)
-                            }
-                        }
+                        _ => IrConst::I32(0),
                     };
                     let dest =
                         self.emit_cmp_val(IrCmpOp::Eq, cmp_val, Operand::Const(cmp_zero), cmp_ty);
