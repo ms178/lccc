@@ -38,7 +38,7 @@ impl RiscvCodegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         _stack_arg_space: usize,
     ) -> usize {
         let mut f128_temp_space: i64 = 0;
@@ -56,8 +56,24 @@ impl RiscvCodegen {
                 if !matches!(arg_classes[i], CallArgClass::F128Reg { .. }) {
                     continue;
                 }
-                if let Operand::Value(_) = arg {
-                    self.emit_f128_operand_to_a0_a1(arg);
+                if let Operand::Value(v) = arg {
+                    // _Float128 lowered to the IrType::U128 carrier carries
+                    // 16 REAL bytes in its own slot even when no f128 source
+                    // tracking vouches for it. Load directly — the
+                    // __extenddftf2-style fallback inside
+                    // emit_f128_operand_to_a0_a1 would fabricate the value
+                    // from the low qword reinterpreted as a double.
+                    let mut staged = false;
+                    if i < arg_types.len() && arg_types[i] == IrType::U128 {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            self.emit_load_from_s0("a0", slot.0, "ld");
+                            self.emit_load_from_s0("a1", slot.0 + 8, "ld");
+                            staged = true;
+                        }
+                    }
+                    if !staged {
+                        self.emit_f128_operand_to_a0_a1(arg);
+                    }
                     self.emit_store_to_sp("a0", temp_offset, "sd");
                     self.emit_store_to_sp("a1", temp_offset + 8, "sd");
                     temp_offset += 16;
@@ -312,6 +328,12 @@ impl RiscvCodegen {
                     Operand::Const(ref c) => {
                         let bytes = match c {
                             IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
+                            // _Float128 lowered to the IrType::U128 carrier:
+                            // the I128 constant IS the IEEE binary128 bit
+                            // pattern. Stage it bit-exactly — a to_f64()
+                            // here would integer-convert the pattern and
+                            // fabricate a huge value out of 1.5L's bits.
+                            IrConst::I128(bits) => bits.to_le_bytes(),
                             _ => {
                                 let f64_val = c.to_f64().unwrap_or(0.0);
                                 crate::ir::reexports::f64_to_f128_bytes(f64_val)

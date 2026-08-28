@@ -607,6 +607,14 @@ pub fn peephole_optimize(asm: String) -> String {
 /// overwrite of `dst` by an instruction that does not read it, or the end of
 /// the function's text. Anything unrecognized (other memory ops, unknown
 /// instruction kinds, calls) blocks the transform.
+/// Column-0 identifier label: the next function or data object, i.e. the
+/// end of the current function's text. Block labels start with '.', and
+/// inline-asm numeric local labels (`1:`) start with a digit — neither
+/// terminates the function's text.
+fn is_function_boundary(line: &str) -> bool {
+    line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+}
+
 fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -616,13 +624,6 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .filter(|tok| *tok == xreg_name(reg) || *tok == wreg_name(reg))
             .count()
-    }
-    // Column-0 identifier label: the next function or data object, i.e. the
-    // end of the current function's text. Block labels start with '.', and
-    // inline-asm numeric local labels (`1:`) start with a digit — neither
-    // terminates the function's text.
-    fn is_function_boundary(line: &str) -> bool {
-        line.ends_with(':') && line.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
     }
     let mut changed = false;
     for i in 0..n {
@@ -1033,28 +1034,70 @@ fn written_gp_register(line: &str, kind: LineKind) -> Option<u8> {
     }
 }
 
-/// Remove `mov x9, xN` immediately followed by a memory operation that already
-/// addresses through xN. Regalloc-aware loads can make the legacy x9 setup dead.
+/// Remove `mov x9, xN` when x9's staged address is provably dead after the
+/// mov. Regalloc-aware loads and copy propagation can make the legacy x9
+/// setup dead.
+///
+/// Soundness requires a FULL dead-value scan, not a single-instruction
+/// lookahead: `propagate_register_copies` rewrites only the FIRST use of the
+/// copy (`ldr x0, [x9]` -> `ldr x0, [x0]`), so the instruction after the mov
+/// can look clean while a later instruction (`ldr x1, [x9, #8]` — the high
+/// half of a 16-byte _Float128-carrier global load) still reads x9. Deleting
+/// the mov on the one-line view left a stale-x9 SIGSEGV (f128_softfloat).
+/// The scan stops at the first x9 read (mov stays), the first pure x9
+/// redefinition (mov is dead past it), a control-flow boundary, a call (x9
+/// is caller-saved: a later read would need a fresh definition), or the
+/// end of the function.
 fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    fn mentions_x9(line: &str) -> bool {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|tok| tok == "x9" || tok == "w9")
+    }
+    fn mentions_x9_count(line: &str) -> usize {
+        line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|&tok| tok == "x9" || tok == "w9")
+            .count()
+    }
     let mut changed = false;
-    for i in 0..n.saturating_sub(1) {
+    for i in 0..n {
         let LineKind::Move {
             dst: 9,
-            src,
             is_32bit: false,
+            ..
         } = kinds[i]
         else {
             continue;
         };
+        let mut dead = true;
         let mut j = i + 1;
-        while j < n && kinds[j] == LineKind::Nop {
+        while j < n {
+            if is_function_boundary(&lines[j]) {
+                break;
+            }
+            match kinds[j] {
+                LineKind::Nop | LineKind::Directive => {}
+                // Path ends: textually later lines belong to other paths, and
+                // a label can only be joined from before the mov (skipping it).
+                LineKind::Label | LineKind::Branch | LineKind::CondBranch
+                | LineKind::CmpBranch | LineKind::Ret | LineKind::Call => break,
+                _ => {
+                    if written_gp_register(&lines[j], kinds[j]) == Some(9)
+                        && mentions_x9_count(&lines[j]) == 1
+                    {
+                        // Pure redefinition of x9: the staged value is dead
+                        // past this instruction.
+                        break;
+                    }
+                    if mentions_x9(&lines[j]) {
+                        // A read (or read-modify-write) of x9: the mov is live.
+                        dead = false;
+                        break;
+                    }
+                }
+            }
             j += 1;
         }
-        if j >= n || !matches!(kinds[j], LineKind::MemOther | LineKind::LoadsbReg) {
-            continue;
-        }
-        let needle = format!("[{}", xreg_name(src));
-        if lines[j].contains(&needle) && !lines[j].contains("[x9") {
+        if dead {
             kinds[i] = LineKind::Nop;
             changed = true;
         }
@@ -3983,6 +4026,98 @@ g:
         assert!(
             result.contains("str d28"),
             "store kept under conservative GDSE:\n{}",
+            result
+        );
+    }
+
+    // ── x9 address-mov dead-value soundness ─────────────────────────────
+    //
+    // Regression: a 16-byte carrier load stages its address with
+    // `mov x9, xN` and issues TWO loads (`ldr x0,[x9]`, `ldr x1,[x9,#8]`).
+    // Copy propagation rewrites only the FIRST use to `[xN]`; the old
+    // single-instruction lookahead in eliminate_unused_x9_address_moves
+    // then believed x9 dead and deleted the mov, leaving the second load
+    // reading a stale x9 (SIGSEGV on _Float128 globals).
+
+    #[test]
+    fn test_x9_address_mov_survives_second_use() {
+        let input = "\
+main:
+    adrp x0, :got:g
+    ldr x0, [x0, :got_lo12:g]
+    mov x20, x0
+    mov x9, x0
+    ldr x0, [x9]
+    ldr x1, [x9, #8]
+    str x0, [sp, #32]
+    str x1, [sp, #40]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        // Invariant: a surviving read of x9 must have a live definition.
+        // The broken pipeline produced `ldr x0, [x0]; ldr x1, [x9, #8]`
+        // with the defining mov deleted — the second half read a stale x9.
+        let stale_x9_read = result.contains("[x9") && !result.contains("mov x9,");
+        // Both halves must load the global's 16 bytes: half one from the
+        // GOT-resolved base (x0), half two from either a live x9 or the
+        // propagated base.
+        let second_half_ok = result.contains("ldr x1, [x9, #8]")
+            || result.contains("ldr x1, [x0, #8]")
+            || result.contains("mov x9,");
+        assert!(!stale_x9_read, "x9 read without a live definition:\n{}", result);
+        assert!(second_half_ok, "second carrier-load half lost:\n{}", result);
+    }
+
+    #[test]
+    fn test_x9_address_mov_deleted_when_fully_dead() {
+        // Positive case: ALL uses rewritten to the source register -> the
+        // mov is provably dead and must still be removed.
+        let input = "\
+f:
+    mov x9, x24
+    ldr q0, [x24]
+    ldr q1, [x24, #16]
+    str q0, [sp, #16]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("mov x9, x24"),
+            "dead address mov must be removed:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_x9_address_mov_kept_across_redef_and_use() {
+        // x9 redefined (`mov x9, x5`) before its next read: the FIRST mov
+        // is dead past the redefinition and may go; the redefining mov must
+        // stay because `ldr x2, [x9]` reads it.
+        let input = "\
+f:
+    mov x9, x24
+    ldr x0, [x24]
+    mov x9, x5
+    ldr x2, [x9]
+    ret
+g:
+    ret
+";
+        let result = peephole_optimize(input.to_string());
+        assert!(
+            !result.contains("mov x9, x24"),
+            "mov dead before redefinition must be removed:\n{}",
+            result
+        );
+        // Either the redefining mov survives for the read, or the read was
+        // propagated straight to x5 — both keep x2 loading x5's value.
+        assert!(
+            result.contains("mov x9, x5") || result.contains("ldr x2, [x5]"),
+            "x2 must still load x5's value:\n{}",
             result
         );
     }

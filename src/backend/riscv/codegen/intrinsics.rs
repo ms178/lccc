@@ -244,6 +244,95 @@ impl RiscvCodegen {
                     self.store_t0_to(d);
                 }
             }
+            // ── Scalar FP round/FMA/copysign ────────────────────────────────
+            // x86 lowered these to SSE ops; without arms they hit the silent
+            // catch-all and produced uninitialized registers.
+            IntrinsicOp::RoundScalarF64(imm) => {
+                // RV64D has no mode-selecting round instruction; route
+                // through libm (fa0 is the F64 ABI argument register).
+                let sym = match imm & 3 {
+                    0 => "rint",  // nearest, ties to even
+                    1 => "floor", // toward -inf
+                    2 => "ceil",  // toward +inf
+                    _ => "trunc", // toward zero
+                };
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.d.x fa0, t0");
+                self.state
+                    .emit_fmt(format_args!("    call {}", sym));
+                self.state.emit("    fmv.x.d t0, fa0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::RoundScalarF32(imm) => {
+                let sym = match imm & 3 {
+                    0 => "rintf",
+                    1 => "floorf",
+                    2 => "ceilf",
+                    _ => "truncf",
+                };
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.s.x fa0, t0");
+                self.state
+                    .emit_fmt(format_args!("    call {}", sym));
+                self.state.emit("    fmv.x.s t0, fa0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::FmaScalarF64 => {
+                // dest = a*b + c, single rounding: native fmadd.d.
+                // operand_to_t0 always targets t0, so each bridge must run
+                // immediately after its own load.
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.d.x ft0, t0");
+                self.operand_to_t0(&args[1]);
+                self.state.emit("    fmv.d.x ft1, t0");
+                self.operand_to_t0(&args[2]);
+                self.state.emit("    fmv.d.x ft2, t0");
+                self.state.emit("    fmadd.d ft0, ft0, ft1, ft2");
+                self.state.emit("    fmv.x.d t0, ft0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::FmaScalarF32 => {
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.s.x ft0, t0");
+                self.operand_to_t0(&args[1]);
+                self.state.emit("    fmv.s.x ft1, t0");
+                self.operand_to_t0(&args[2]);
+                self.state.emit("    fmv.s.x ft2, t0");
+                self.state.emit("    fmadd.s ft0, ft0, ft1, ft2");
+                self.state.emit("    fmv.x.s t0, ft0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::CopysignF64 => {
+                // native fsgnj.d: |rs1| with rs2's sign bit.
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.d.x ft0, t0");
+                self.operand_to_t0(&args[1]);
+                self.state.emit("    fmv.d.x ft1, t0");
+                self.state.emit("    fsgnj.d ft0, ft0, ft1");
+                self.state.emit("    fmv.x.d t0, ft0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
+            IntrinsicOp::CopysignF32 => {
+                self.operand_to_t0(&args[0]);
+                self.state.emit("    fmv.s.x ft0, t0");
+                self.operand_to_t0(&args[1]);
+                self.state.emit("    fmv.s.x ft1, t0");
+                self.state.emit("    fsgnj.s ft0, ft0, ft1");
+                self.state.emit("    fmv.x.s t0, ft0");
+                if let Some(d) = dest {
+                    self.store_t0_to(d);
+                }
+            }
             IntrinsicOp::FabsF64 => {
                 self.operand_to_t0(&args[0]);
                 self.state.emit("    fmv.d.x ft0, t0");
@@ -377,6 +466,52 @@ impl RiscvCodegen {
                 // These are x86-64/AArch64-specific register-based vector operations
                 // RISC-V would use RVV (RISC-V Vector extension) differently
                 unimplemented!("Register-based vector intrinsics not implemented for RISC-V");
+            }
+            // ── _Float128 / long double sign-bit intrinsics ─────────────
+            //
+            // The carrier (IrType::U128) holds the IEEE binary128 pattern in
+            // a0:a1 (GP pair, f128_in_gp_pairs). All three ops are pure
+            // sign-bit edits on the high qword — no soft-float call needed.
+            IntrinsicOp::F128Neg => {
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_a0_a1(&args[0]);
+                    // hi ^= SIGN
+                    self.state.emit("    li t2, 1");
+                    self.state.emit("    slli t2, t2, 63");
+                    self.state.emit("    xor a1, a1, t2");
+                    self.emit_f128_store_a0_a1_tracked(d.0);
+                }
+            }
+            IntrinsicOp::LDFabs | IntrinsicOp::F128Fabs => {
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_a0_a1(&args[0]);
+                    // hi &= ~SIGN (clear sign bit, preserve everything else)
+                    self.state.emit("    li t2, 1");
+                    self.state.emit("    slli t2, t2, 63");
+                    self.state.emit("    not t2, t2");
+                    self.state.emit("    and a1, a1, t2");
+                    self.emit_f128_store_a0_a1_tracked(d.0);
+                }
+            }
+            IntrinsicOp::LDCopysign | IntrinsicOp::F128Copysign => {
+                // copysign(x, y): result = {x.lo, (x.hi & ~SIGN) | (y.hi & SIGN)}
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_a0_a1(&args[1]);
+                    self.state.emit("    mv t3, a0");
+                    self.state.emit("    mv t4, a1");
+                    self.emit_f128_operand_to_a0_a1(&args[0]);
+                    self.state.emit("    li t2, 1");
+                    self.state.emit("    slli t2, t2, 63");
+                    self.state.emit("    and t4, t4, t2");
+                    self.state.emit("    not t2, t2");
+                    self.state.emit("    and a1, a1, t2");
+                    self.state.emit("    or a1, a1, t4");
+                    // NOTE: if args[0] staging took the lossy __extenddftf2
+                    // fallback it would clobber t3/t4 across the call — the
+                    // same accepted limitation as the AArch64 arm; tracked
+                    // carriers and constants never take that path.
+                    self.emit_f128_store_a0_a1_tracked(d.0);
+                }
             }
             _ => { /* x86-only SIMD op on riscv: no-op */ }
         }

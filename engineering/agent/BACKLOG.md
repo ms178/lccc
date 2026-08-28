@@ -317,7 +317,12 @@ LK-04 (CASP/MOVW/.org/PREL64), LK-17 (pcre2), LK-26 (seg_fs lvalue stores,
 same-block · backedge PRE · GVN disjoint epochs · FpContract tri-state ·
 mcount/`-pg` family · 32 KiB boot gate PASS · i686 natural slots ·
 width-partitioned slots · RISC-V va_arg struct{long double} · ci-codegen
-gate.
+gate. · aarch64 f128-carrier full-precision plumbing (U128 loads/stores feed
+the f128 tracker; pair loads prefer it; x9 dead-address-mov full-scan
+soundness; f128_softfloat + f128_global_carrier green, 2026-08-28). · riscv f128-carrier
+end-to-end (f128_in_gp_pairs classify arm, tracker-fed U128 load/store,
+sign-bit intrinsic arms — F128Neg previously hit the silent SIMD no-op;
+f128_softfloat + f128_global_carrier green on qemu-riscv64, 2026-08-28).
 
 Rejected-with-evidence (never resubmit without new data): Agent B's
 MAX_SMALL_INLINE_BLOCKS 12 / -Os cap removal / split-call-everywhere;
