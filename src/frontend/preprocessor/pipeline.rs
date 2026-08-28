@@ -8,11 +8,15 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::fmt::Write;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::builtin_macros::define_builtin_macros;
 use super::conditionals::{evaluate_condition, ConditionalStack};
 use super::macro_defs::{parse_define, MacroDef, MacroTable};
-use super::text_processing::{split_first_word, strip_line_comment};
+use super::text_processing::{
+    split_first_word, strip_line_comment, CommentSegments, LineResolver, LineResolverData,
+    LineSegments,
+};
 use super::utils::{is_ident_cont, is_ident_start};
 
 /// Deduplicate a list of macro names, preserving order (first occurrence wins).
@@ -208,9 +212,33 @@ impl Preprocessor {
         // Phase 2: Line splicing (backslash-newline removal)
         // Phase 3: Comment replacement
         // So we must join continued lines BEFORE stripping comments.
-        let source = self.join_continued_lines(source);
-        let (source, line_map) = Self::strip_block_comments(&source);
+        //
+        // Both transforms return per-line source-position maps so __LINE__
+        // can resolve the PHYSICAL line of each token: splicing and comment
+        // collapse shift line numbers, and one output line may even contain
+        // bytes from several physical lines (tokens after a comment's
+        // closing `*/` or after a continuation splice).
+        let (joined, join_map) = self.join_continued_lines(source);
+        let (source, comment_map) = Self::strip_block_comments(&joined);
         let mut output = String::with_capacity(source.len() + source.len() / 4);
+        // Absolute offset of the current line's first byte within the
+        // comment-stripped text: the base that translates the macro
+        // expander's line-relative offsets into the resolver's absolute
+        // coordinate space.
+        let mut stripped_line_start: usize = 0;
+        // Absolute offset of each JOINED-text line start. The join map's
+        // breakpoints live in joined-text coordinates; the macro expander
+        // queries in stripped-text coordinates (comments collapsed lines /
+        // removed bytes). Per-line delta = stripped_start - joined_start.
+        let joined_starts: Vec<usize> = {
+            let mut v = Vec::with_capacity(64);
+            let mut off = 0usize;
+            for jl in joined.lines() {
+                v.push(off);
+                off += jl.len() + 1;
+            }
+            v
+        };
 
         // For included files, save and reset the conditional stack and line override
         let saved_conditionals = if is_include {
@@ -228,6 +256,11 @@ impl Preprocessor {
         let mut pending_line = String::with_capacity(256);
         let mut pending_newlines: usize = 0;
 
+        // Physical start line of the most recently processed line; used for
+        // the flat __LINE__ resolver when flushing accumulated multi-line
+        // macro invocations (their text spans lines, so per-line offsets do
+        // not apply).
+        let mut last_source_line_num: usize = 0;
         // Track current line number in the preprocessed output for macro expansion metadata.
         // Incremented whenever a newline is appended to the output string.
         let mut pp_output_line: u32 = 0;
@@ -251,21 +284,24 @@ impl Preprocessor {
             self.drain_expansion_pragmas();
             let trimmed = line.trim();
 
-            // Map output line number to original source line number using the
-            // line_map from comment stripping (accounts for removed newlines in
-            // block comments).
-            let source_line_num = line_map.get(line_num);
-
-            // Update __LINE__, accounting for any #line directive override
-            let effective_line =
-                if let Some((target_line, source_line_at_directive)) = self.line_override {
-                    // After #line N, __LINE__ = N + (current_source_line - source_line_of_directive)
-                    let offset = source_line_num.saturating_sub(source_line_at_directive);
-                    target_line + offset
-                } else {
-                    source_line_num + 1
-                };
-            self.macros.set_line(effective_line);
+            // Build this output line's source-position resolver: comment
+            // breakpoints (if any) composed with the join map give the
+            // physical source line of every byte of the line.
+            let line_resolver = self.build_line_resolver(
+                line_num,
+                stripped_line_start,
+                &joined_starts,
+                &comment_map,
+                &join_map,
+            );
+            let source_line_num = line_resolver.line_at(stripped_line_start);
+            last_source_line_num = source_line_num;
+            self.macros.set_line_resolver(
+                line_resolver,
+                self.line_override,
+                stripped_line_start,
+            );
+            stripped_line_start += line.len() + 1;
 
             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always
             // be processed regardless of pending multi-line accumulation. Other
@@ -361,6 +397,17 @@ impl Preprocessor {
                 if !pending_line.is_empty() && !is_include {
                     let after_hash = trimmed[1..].trim_start();
                     if after_hash.starts_with("define") || after_hash.starts_with("undef") {
+                        // The accumulated text spans several physical lines;
+                        // expand it against a flat resolver (the current
+                        // line) rather than per-line offsets.
+                        // Flat resolver: the accumulated text spans several
+                        // physical lines, so per-offset resolution does not
+                        // apply; the offset base is irrelevant.
+                        self.macros.set_line_resolver(
+                            LineResolver::Flat(source_line_num),
+                            self.line_override,
+                            0,
+                        );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
                         self.drain_expansion_pragmas();
                         pending_line.clear();
@@ -370,6 +417,14 @@ impl Preprocessor {
                         // (e.g. a function call with args spanning lines), flush the
                         // pending tokens to output first. The included content must appear
                         // after the preceding tokens, not before them.
+                        // Flat resolver: the accumulated text spans several
+                        // physical lines, so per-offset resolution does not
+                        // apply; the offset base is irrelevant.
+                        self.macros.set_line_resolver(
+                            LineResolver::Flat(source_line_num),
+                            self.line_override,
+                            0,
+                        );
                         let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
                         self.drain_expansion_pragmas();
                         let expanded = self.resolve_has_macros_in_code(&expanded);
@@ -426,6 +481,8 @@ impl Preprocessor {
                 let output_len_before = output.len();
                 self.accumulate_and_expand(
                     line,
+                    source_line_num,
+                    stripped_line_start - line.len() - 1,
                     &mut pending_line,
                     &mut pending_newlines,
                     &mut output,
@@ -467,6 +524,11 @@ impl Preprocessor {
 
         // Flush any remaining pending line
         if !pending_line.is_empty() {
+            self.macros.set_line_resolver(
+                LineResolver::Flat(last_source_line_num),
+                self.line_override,
+                0,
+            );
             let expanded = self.macros.expand_line_reuse(&pending_line, &mut expanding);
             self.drain_expansion_pragmas();
             let expanded = self.resolve_has_macros_in_code(&expanded);
@@ -508,9 +570,111 @@ impl Preprocessor {
     ///
     /// The `expanding` parameter is a reusable FxHashSet that avoids per-line
     /// allocation for macro expansion tracking.
+    /// Build the `__LINE__` resolver for one output line: comment-strip
+    /// breakpoints composed with the join map, or the flat fast path.
+    ///
+    /// `line_num` is the output (comment-stripped) line index; `comment_map`
+    /// is indexed by output line and carries `(stripped_offset,
+    /// joined_offset, joined_line)` breakpoints (absolute text coordinates);
+    /// `join_map` is indexed by joined line and carries
+    /// `(joined_offset, physical_line)` splice breakpoints in ABSOLUTE
+    /// joined-text coordinates. `stripped_line_start` is the output line's
+    /// absolute start in the stripped text and `joined_starts` holds every
+    /// joined line's absolute start; their difference is the coordinate
+    /// delta that translates splice breakpoints into the expander's
+    /// stripped-text coordinate space. Composition gives the physical line
+    /// of any byte.
+    fn build_line_resolver(
+        &self,
+        line_num: usize,
+        stripped_line_start: usize,
+        joined_starts: &[usize],
+        comment_map: &Option<Vec<CommentSegments>>,
+        join_map: &Option<Vec<LineSegments>>,
+    ) -> LineResolver {
+        let jm = join_map.as_deref();
+        // The joined line this output line starts at, and its absolute
+        // joined-text offset.
+        let (jl0, j_start): (usize, usize) =
+            match comment_map.as_deref().and_then(|c| c.get(line_num)) {
+                Some(CommentSegments::Mapped(pts)) => match pts.first() {
+                    Some(&(_, jo, jl)) => (jl, jo),
+                    None => (
+                        line_num,
+                        joined_starts.get(line_num).copied().unwrap_or(0),
+                    ),
+                },
+                Some(CommentSegments::Flat(jl)) => (
+                    *jl,
+                    joined_starts.get(*jl).copied().unwrap_or(0),
+                ),
+                None => (
+                    line_num,
+                    joined_starts.get(line_num).copied().unwrap_or(0),
+                ),
+            };
+        // Stripped start - joined start: comment stripping only removes
+        // bytes, so the stripped text never runs AHEAD of the joined text
+        // and the splice breakpoints shift LEFT by |delta|.
+        let delta = stripped_line_start as isize - j_start as isize;
+        // Build splice breakpoints in stripped coordinates: (o + delta, o,
+        // joined_line). Between breakpoints on this line the stripped and
+        // joined offsets advance in lockstep, so line_at()'s
+        // joined = jo + (abs - so) lands inside the same splice segment.
+        let splice_points = |pts: &[(usize, usize)], jl: usize| -> LineResolver {
+            LineResolver::Mapped(Rc::new(LineResolverData {
+                points: pts
+                    .iter()
+                    .map(|&(o, _)| {
+                        let so = (o as isize + delta).max(0) as usize;
+                        (so, o, jl)
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
+                join_map: jm.map(Rc::from).unwrap_or_else(|| Rc::from([])),
+            }))
+        };
+        match comment_map.as_deref() {
+            // No multi-line comments anywhere: the join map is the only
+            // possible source of line shifts (single-line comment removal
+            // shifts offsets, which the delta absorbs).
+            None => match jm.and_then(|j| j.get(line_num)) {
+                Some(LineSegments::Mapped(pts)) => splice_points(pts, line_num),
+                // Flat(phys): a standalone joined line. When earlier lines
+                // were spliced, phys is the PHYSICAL line and generally
+                // differs from the joined/output line number line_num.
+                Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
+                None => LineResolver::Flat(line_num),
+            },
+            Some(c) => {
+                let jm_rc: Rc<[LineSegments]> = jm.map(Rc::from).unwrap_or_else(|| Rc::from([]));
+                match c.get(line_num) {
+                    // Comment breakpoints on this line: they already carry
+                    // (stripped, joined) absolute pairs.
+                    Some(CommentSegments::Mapped(pts)) => {
+                        LineResolver::Mapped(Rc::new(LineResolverData {
+                            points: pts.clone(),
+                            join_map: jm_rc,
+                        }))
+                    }
+                    // No comment breakpoints on this line; the joined line it
+                    // came from decides via the join map's splice breakpoints.
+                    Some(CommentSegments::Flat(jl)) => match jm.and_then(|j| j.get(*jl)) {
+                        Some(LineSegments::Mapped(pts)) => splice_points(pts, *jl),
+                        Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
+                        None => LineResolver::Flat(*jl),
+                    },
+                    None => LineResolver::Flat(line_num),
+                }
+            }
+        }
+    }
+
     fn accumulate_and_expand(
         &self,
         line: &str,
+        source_line_num: usize,
+        _line_start_abs: usize,
         pending_line: &mut String,
         pending_newlines: &mut usize,
         output: &mut String,
@@ -562,6 +726,16 @@ impl Preprocessor {
                 if !Self::has_unbalanced_parens(pending_line)
                     || *pending_newlines > MAX_PENDING_NEWLINES
                 {
+                    // Accumulated text spans several physical lines: expand
+                    // against a flat resolver (the current line).
+                    // Flat resolver: per-offset resolution does not apply
+                    // to the multi-line accumulated buffer; the offset base
+                    // is irrelevant.
+                    self.macros.set_line_resolver(
+                        LineResolver::Flat(source_line_num),
+                        self.line_override,
+                        0,
+                    );
                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
                     // Check if the expanded result ends with a function-like macro
                     // that needs args from the next line (chained macros).
@@ -590,6 +764,16 @@ impl Preprocessor {
                     // Keep accumulating.
                 } else {
                     // Parens balanced or next line didn't start with '(' - expand now.
+                    // Accumulated text spans several physical lines: expand
+                    // against a flat resolver (the current line).
+                    // Flat resolver: per-offset resolution does not apply
+                    // to the multi-line accumulated buffer; the offset base
+                    // is irrelevant.
+                    self.macros.set_line_resolver(
+                        LineResolver::Flat(source_line_num),
+                        self.line_override,
+                        0,
+                    );
                     let expanded = self.macros.expand_line_reuse(pending_line, expanding);
                     // Check if the expanded result itself ends with a function-like
                     // macro name that needs args from the next line (chained macros).

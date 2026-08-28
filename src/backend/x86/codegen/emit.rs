@@ -3298,12 +3298,39 @@ fn resolve_stack_vregs(
     // (the has_unresolvable_vreg check will catch it and abandon the buffer).
     let resolve_reg = |r: &MachReg| -> MachReg { *r };
 
-    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible
-    let resolve_op = |op: &MachOperand| -> MachOperand {
+    // WIDTH SOUNDNESS: a spilled vreg's slot is 4 bytes (small slot) or 8
+    // bytes. Substituting it into an instruction whose size is WIDER than
+    // the slot makes the emitter read bytes past the slot — e.g.
+    // `cmpq $0, 28(%rsp)` on a 4-byte slot pulls the adjacent slot's
+    // garbage into the high 32 bits (kernel lib/zstd
+    // ZSTD_decodeLiteralsBlock: the 64-bit `!lhlCode` predicate read
+    // `flags` from the neighboring slot and took the wrong HUF dispatch).
+    // A register-form consumer is safe — a `movl` reload zero-extends —
+    // but memory-operand substitution silently loses that extension.
+    // Refuse the substitution when the instruction size exceeds the slot
+    // width: the leftover Vreg trips has_unresolvable_vreg and the
+    // buffered window falls back to the default (accumulator) path, which
+    // loads every value at its true width.
+    let slot_fits = |id: &u32, inst_size: OpSize| -> bool {
+        if state.is_small_slot(*id) {
+            // 4-byte slot: only 8/16/32-bit reads are in-bounds.
+            matches!(inst_size, OpSize::S8 | OpSize::S16 | OpSize::S32)
+        } else {
+            // 8-byte slot: every instruction width reads in-bounds.
+            true
+        }
+    };
+
+    // Helper: resolve a MachOperand — replace Vreg with StackSlot if possible.
+    let resolve_op = |op: &MachOperand, inst_size: OpSize| -> MachOperand {
         match op {
             MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
                 if let Some(slot) = state.get_slot(*id) {
-                    MachOperand::StackSlot(slot.0)
+                    if slot_fits(id, inst_size) {
+                        MachOperand::StackSlot(slot.0)
+                    } else {
+                        op.clone()
+                    }
                 } else {
                     op.clone()
                 }
@@ -3344,7 +3371,7 @@ fn resolve_stack_vregs(
                 }
                 MachInst::Mov {
                     src: MachOperand::StackSlot(slot.0),
-                    dst: resolve_op(dst),
+                    dst: resolve_op(dst, *size),
                     size: *size,
                 }
             } else {
@@ -3352,8 +3379,8 @@ fn resolve_stack_vregs(
             }
         }
         MachInst::Mov { src, dst, size } => MachInst::Mov {
-            src: resolve_op(src),
-            dst: resolve_op(dst),
+            src: resolve_op(src, *size),
+            dst: resolve_op(dst, *size),
             size: *size,
         },
         MachInst::Alu { op, src, dst, size } => {
@@ -3367,7 +3394,7 @@ fn resolve_stack_vregs(
             }
             MachInst::Alu {
                 op: *op,
-                src: resolve_op(src),
+                src: resolve_op(src, *size),
                 dst: *dst,
                 size: *size,
             }
@@ -3381,12 +3408,19 @@ fn resolve_stack_vregs(
             // movzx/movsx accept a memory source: a slot-backed (spilled) src
             // vreg can be resolved to StackSlot directly. The emitter formats
             // the src through fmt_operand, so `movzbl slot, %eax` is emitted.
-            // A slot-backed dst stays a vreg and is caught by
+            // The memory read is `from_size` bytes wide, which never exceeds
+            // the slot (S8/S16/S32 reads of a 4-byte small slot read the
+            // stored low bytes, exactly the value's bits). A slot-backed dst
+            // stays a vreg and is caught by
             // has_unresolvable_vreg -> default-path fallback.
             let src_resolved = match src {
                 MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
                     if let Some(slot) = state.get_slot(*id) {
-                        MachOperand::StackSlot(slot.0)
+                        if slot_fits(id, *from_size) {
+                            MachOperand::StackSlot(slot.0)
+                        } else {
+                            src.clone()
+                        }
                     } else {
                         src.clone()
                     }
@@ -3409,7 +3443,11 @@ fn resolve_stack_vregs(
             let src_resolved = match src {
                 MachOperand::Reg(MachReg::Vreg(id)) if !ra.contains_key(id) => {
                     if let Some(slot) = state.get_slot(*id) {
-                        MachOperand::StackSlot(slot.0)
+                        if slot_fits(id, *from_size) {
+                            MachOperand::StackSlot(slot.0)
+                        } else {
+                            src.clone()
+                        }
                     } else {
                         src.clone()
                     }
@@ -3424,18 +3462,18 @@ fn resolve_stack_vregs(
             }
         }
         MachInst::Cmp { lhs, rhs, size } => MachInst::Cmp {
-            lhs: resolve_op(lhs),
-            rhs: resolve_op(rhs),
+            lhs: resolve_op(lhs, *size),
+            rhs: resolve_op(rhs, *size),
             size: *size,
         },
         MachInst::Test { lhs, rhs, size } => MachInst::Test {
-            lhs: resolve_op(lhs),
-            rhs: resolve_op(rhs),
+            lhs: resolve_op(lhs, *size),
+            rhs: resolve_op(rhs, *size),
             size: *size,
         },
         MachInst::Cmov { cc, src, dst, size } => MachInst::Cmov {
             cc: *cc,
-            src: resolve_op(src),
+            src: resolve_op(src, *size),
             dst: *dst,
             size: *size,
         },
@@ -3446,7 +3484,7 @@ fn resolve_stack_vregs(
             size,
         } => MachInst::Shift {
             op: *op,
-            amount: resolve_op(amount),
+            amount: resolve_op(amount, *size),
             dst: *dst,
             size: *size,
         },
@@ -3455,7 +3493,7 @@ fn resolve_stack_vregs(
             signed,
             size,
         } => MachInst::Div {
-            divisor: resolve_op(divisor),
+            divisor: resolve_op(divisor, *size),
             signed: *signed,
             size: *size,
         },

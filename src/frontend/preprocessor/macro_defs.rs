@@ -113,8 +113,22 @@ pub struct MacroTable {
     macros: FxHashMap<String, MacroDef>,
     /// Counter for the __COUNTER__ built-in macro. Increments on each expansion.
     counter: Cell<usize>,
-    /// Cached __LINE__ value. Updated by set_line(), expanded specially in expand_text.
-    line_value: Cell<usize>,
+    /// Per-line __LINE__ resolver: maps a byte offset within the line being
+    /// expanded to its physical source line. Set once per processed line by
+    /// set_line_resolver().
+    line_resolver: std::cell::RefCell<super::text_processing::LineResolver>,
+    /// Absolute offset of the line being expanded within the comment-stripped
+    /// text. Macro expansion sees byte offsets relative to the line buffer;
+    /// resolve_line() adds this base to translate them into the resolver's
+    /// absolute coordinate space.
+    line_offset_base: Cell<usize>,
+    /// #line override: (target_line, source_line_at_directive). The stored
+    /// base is 1-based (as passed by process_directive); see resolve_line().
+    line_override: Cell<Option<(usize, usize)>>,
+    /// __LINE__ value pinned while a macro body is being expanded: per C11
+    /// §6.10.8, __LINE__ inside a macro body expands to the line of the
+    /// INVOCATION, not of the body text.
+    line_pinned: Cell<Option<usize>>,
     /// Collects names of macros expanded during the current expand_line_reuse() call.
     /// Used by the preprocessor to build macro expansion metadata for diagnostics
     /// ("in expansion of macro 'X'" notes). Wrapped in RefCell because expansion
@@ -141,7 +155,12 @@ impl MacroTable {
         Self {
             macros: FxHashMap::default(),
             counter: Cell::new(0),
-            line_value: Cell::new(1),
+            line_resolver: std::cell::RefCell::new(
+                super::text_processing::LineResolver::Flat(1),
+            ),
+            line_offset_base: Cell::new(0),
+            line_override: Cell::new(None),
+            line_pinned: Cell::new(None),
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
@@ -189,10 +208,37 @@ impl MacroTable {
         self.macros.get(name)
     }
 
-    /// Set the current __LINE__ value without allocating a MacroDef.
-    /// This avoids per-line allocation of MacroDef { name: "__LINE__", ... }.
-    pub fn set_line(&self, line: usize) {
-        self.line_value.set(line);
+    /// Set the line resolver for the line about to be expanded.
+    ///
+    /// `resolver` maps byte offsets within the line to 0-based physical
+    /// source lines (multi-line comment tails and spliced continuations put
+    /// several physical lines' bytes into one output line). `override_` is
+    /// the active `#line` directive state.
+    pub(super) fn set_line_resolver(
+        &self,
+        resolver: super::text_processing::LineResolver,
+        override_: Option<(usize, usize)>,
+        offset_base: usize,
+    ) {
+        *self.line_resolver.borrow_mut() = resolver;
+        self.line_override.set(override_);
+        self.line_offset_base.set(offset_base);
+    }
+
+    /// Physical source line (0-based) of the byte at `offset` within the
+    /// current line, with the `#line` override applied.
+    #[inline]
+    fn resolve_line(&self, offset: usize) -> usize {
+        let phys = self
+            .line_resolver
+            .borrow()
+            .line_at(self.line_offset_base.get() + offset);
+        match self.line_override.get() {
+            // The stored base is 1-based (process_directive convention); the
+            // line right after `#line N` must be N.
+            Some((target, base)) => target + phys.saturating_sub(base),
+            None => phys + 1,
+        }
     }
 
     /// Set the __FILE__ macro body without allocating a full MacroDef.
@@ -544,9 +590,14 @@ impl MacroTable {
             return i;
         }
 
-        // Handle __LINE__ built-in
+        // Handle __LINE__ built-in: inside a macro expansion the value is
+        // pinned to the invocation line; at top level it is the physical
+        // line of this very token (per-offset resolution).
         if ident == "__LINE__" {
-            let val = self.line_value.get();
+            let val = match self.line_pinned.get() {
+                Some(v) => v,
+                None => self.resolve_line(start),
+            };
             let mut buf = itoa::Buffer::new();
             result.push_str(buf.format(val));
             return i;
@@ -751,6 +802,16 @@ impl MacroTable {
                 j += 1;
             }
             if j < len && bytes[j] == b'(' {
+                // Pin __LINE__ to the invocation site for the whole expansion
+                // (body AND argument prescan): C11 §6.10.8 requires __LINE__
+                // in a macro body to expand to the line of the invocation.
+                // Body/argument offsets are not source-line offsets, so the
+                // per-offset resolver must not be consulted inside.
+                let ident_start = i.saturating_sub(ident.len());
+                let prev_pinned = self.line_pinned.get();
+                if prev_pinned.is_none() {
+                    self.line_pinned.set(Some(self.resolve_line(ident_start)));
+                }
                 let (args, end_pos) = self.parse_macro_args(bytes, j);
                 let mut i = end_pos;
                 let (expanded, body_ended_with_func_ident) =
@@ -770,6 +831,7 @@ impl MacroTable {
                 i = new_i;
                 let next = if i < len { Some(bytes[i]) } else { None };
                 Self::append_with_paste_guard(result, &expanded, next);
+                self.line_pinned.set(prev_pinned);
                 return i;
             }
             result.push_str(ident);
@@ -778,12 +840,19 @@ impl MacroTable {
 
         // Object-like macro
         expanding.insert(ident.to_string());
+        // Pin __LINE__ to the invocation site (see function-like path above).
+        let ident_start = i.saturating_sub(ident.len());
+        let prev_pinned = self.line_pinned.get();
+        if prev_pinned.is_none() {
+            self.line_pinned.set(Some(self.resolve_line(ident_start)));
+        }
         let expanded = self.expand_text(&mac.body, expanding);
         expanding.remove(ident);
 
         if let Some((func_expanded, end_pos)) =
             self.try_resolve_objlike_to_funclike(&expanded, bytes, i, expanding)
         {
+            self.line_pinned.set(prev_pinned);
             result.push_str(&func_expanded);
             return end_pos;
         }
@@ -796,6 +865,7 @@ impl MacroTable {
 
         let next = if i < len { Some(bytes[i]) } else { None };
         Self::append_with_paste_guard(result, &expanded, next);
+        self.line_pinned.set(prev_pinned);
         i
     }
 
