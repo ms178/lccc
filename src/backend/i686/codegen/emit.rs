@@ -15,6 +15,7 @@ use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::FxHashSet;
 use crate::common::types::{AddressSpace, IrType};
 use crate::delegate_to_impl;
 use crate::emit;
@@ -74,6 +75,21 @@ pub struct I686Codegen {
     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
     /// (magic-number division, multi-instruction LEA multiply chains).
     pub(super) optimize_for_size: bool,
+    /// Same-block div/rem pair analysis (see backend::regalloc::
+    /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
+    /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
+    pub(super) divrem_tail_dests: FxHashSet<u32>,
+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
+    /// Pairs broken at emission time (pathological home combination — see
+    /// emit_divrem_pair_head): the tail must emit its own standalone
+    /// division even though the table lists it as a tail.
+    pub(super) divrem_broken_tails: FxHashSet<u32>,
+    /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
+    /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
+    /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
+    /// cross term and carries with an immediate 0 — the parser hot shape
+    /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
+    pub(super) zext_wide_values: FxHashSet<u32>,
 }
 
 // Callee-saved physical register indices for i686
@@ -141,6 +157,10 @@ impl I686Codegen {
             current_return_type: IrType::I32,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
+            divrem_tail_dests: FxHashSet::default(),
+            divrem_head_partners: FxHashMap::default(),
+            divrem_broken_tails: FxHashSet::default(),
+            zext_wide_values: FxHashSet::default(),
             used_callee_saved: Vec::new(),
             va_named_stack_bytes: 0,
             asm_scratch_idx: 0,
@@ -252,6 +272,30 @@ impl I686Codegen {
             return None;
         }
         if let Some(&phys) = self.reg_assignments.get(&v.0) {
+            return Some(format!("%{}", phys_reg_name(phys)));
+        }
+        None
+    }
+
+    /// Direct divisor source for div/idiv. Unlike `direct_reg_src_ref`,
+    /// register-homed ALLOCAS qualify: the divisor emission path stages a
+    /// register-homed operand with exactly `movl %home,%ecx` (see
+    /// operand_to_ecx's reg_assignments branch, which runs before the slot
+    /// path), so the home register holds the value and `divl %home` performs
+    /// the identical read without the %ecx relay. `%edx` (dividend high
+    /// half — divl would divide by edx:edx:eax) and `%eax` (clobbered by
+    /// operand_to_eax(lhs) moments before) are excluded; those home shapes
+    /// stage through %ecx exactly as before.
+    pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
+        if self.state.wide_values.contains(&v.0)
+            || self.state.f128_direct_slots.contains(&v.0)
+        {
+            return None;
+        }
+        if let Some(&phys) = self.reg_assignments.get(&v.0) {
+            if phys.0 == 5 || phys.0 == 6 {
+                return None; // %edx / %eax: stage through %ecx instead
+            }
             return Some(format!("%{}", phys_reg_name(phys)));
         }
         None
@@ -502,6 +546,23 @@ impl I686Codegen {
                 emit!(self.state, "    movl $0, {}", sr4);
             }
             self.state.reg_cache.set_acc(dest.0, false);
+        }
+    }
+
+    /// Store %edx to a value's destination (register home or stack slot).
+    /// Mirror of `store_eax_to` for the remainder output of divl/idivl.
+    /// A dest homed in %edx needs no code — the value is born there.
+    pub(super) fn store_edx_to(&mut self, dest: &Value) {
+        if let Some(phys) = self.dest_reg(dest) {
+            if phys.0 == 5 {
+                // Destination homed in %edx: the remainder is already home.
+                return;
+            }
+            let reg = phys_reg_name(phys);
+            emit!(self.state, "    movl %edx, %{}", reg);
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            let sr = self.slot_ref(slot);
+            emit!(self.state, "    movl %edx, {}", sr);
         }
     }
 

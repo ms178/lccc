@@ -30,6 +30,7 @@
 
 use super::emit::{alu_mnemonic, shift_mnemonic, I686Codegen};
 use super::magic_div::{magic_s32, magic_u32};
+use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{IrBinOp, Operand, Value};
@@ -570,6 +571,50 @@ impl I686Codegen {
         rhs: &Operand,
         _ty: IrType,
     ) {
+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs). The
+        // TAIL of a pair emits nothing — its result was stored by the HEAD's
+        // dual-store emission further up in this block. The HEAD emits one
+        // divl/idivl and stores its own result AND the partner's.
+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+            if self.divrem_tail_dests.contains(&dest.0)
+                && !self.divrem_broken_tails.contains(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
+                }
+                // Tail: nothing to emit. The accumulator cache makes no
+                // claim about this dest (it was never staged through %eax),
+                // and its home/slot was written at the head.
+                return;
+            }
+            if self.divrem_broken_tails.contains(&dest.0) {
+                // Pair was broken at head-emission time (pathological home
+                // combination): both sides emit standalone divisions.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
+                }
+            } else if let Some(&(partner_dest, partner_from_eax)) =
+                self.divrem_head_partners.get(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!(
+                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
+                        dest.0, op, partner_dest, partner_from_eax
+                    );
+                }
+                let fused = self.emit_divrem_pair_head(
+                    dest, op, lhs, rhs, partner_dest, partner_from_eax,
+                );
+                if fused {
+                    return;
+                }
+                // Broken pair: fall through to the standalone path; the
+                // partner (tail) was marked broken above.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
+                }
+            }
+        }
         // Direct-to-dest path: skip the accumulator entirely when the dest
         // has a register and both operands are register/slot/imm-resident.
         if self.try_emit_int_binop_direct(dest, op, lhs, rhs) {
@@ -683,7 +728,18 @@ impl I686Codegen {
             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
         );
         let rhs_ref: String = if let Operand::Value(rv) = rhs {
-            let direct = self.direct_reg_src_ref(rv);
+            // div/idiv: register-homed ALLOCAS also qualify as direct
+            // divisors. operand_to_ecx reads exactly `movl %home,%ecx` for
+            // them (the register holds the value), so `divl %home` is the
+            // identical read without the %ecx relay — which in turn keeps
+            // %ecx clean across the div for the register allocator's hazard
+            // model. %edx (dividend high half) and %eax (just clobbered by
+            // operand_to_eax(lhs)) stay excluded and stage through %ecx.
+            let direct = if div_like {
+                self.div_rhs_direct_ref(rv)
+            } else {
+                self.direct_reg_src_ref(rv)
+            };
             if var_shift || (div_like && matches!(&direct, Some(r) if r == "%edx")) {
                 self.operand_to_ecx(rhs);
                 "%ecx".to_string()
@@ -742,15 +798,148 @@ impl I686Codegen {
             IrBinOp::SRem => {
                 self.state.emit("    cltd");
                 emit!(self.state, "    idivl {}", rhs_ref);
+                // Remainder born in %edx: when the dest is HOMED in %edx the
+                // relay through %eax (movl %edx,%eax; movl %eax,%edx) is a
+                // pure no-op pair — the result is already home.
+                if self.dest_reg(dest) == Some(PhysReg(5)) {
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
                 self.state.emit("    movl %edx, %eax");
             }
             IrBinOp::URem => {
                 self.state.emit("    xorl %edx, %edx");
                 emit!(self.state, "    divl {}", rhs_ref);
+                if self.dest_reg(dest) == Some(PhysReg(5)) {
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
                 self.state.emit("    movl %edx, %eax");
             }
         }
         self.state.reg_cache.invalidate_acc();
         self.store_eax_to(dest);
+    }
+
+    /// Emit the HEAD of a fused same-block div/rem pair: one divl/idivl
+    /// computes both results; store the head's own result from its natural
+    /// output register (%edx for rem, %eax for div) and the partner's from
+    /// the register its flavour demands. Mirrors the general-path staging
+    /// (direct register-homed divisor incl. register-homed allocas, %ecx
+    /// staging otherwise).
+    ///
+    /// STORE ORDER IS LOAD-BEARING. The two results live in %eax (quotient)
+    /// and %edx (remainder) until stored. Storing the %eax side into a home
+    /// of %edx (`movl %eax,%edx`) destroys the remainder before it is
+    /// stored; symmetrically, storing the %edx side into an %eax home
+    /// destroys the quotient. The order below stores the %edx side first
+    /// unless that side's store writes %eax — and when BOTH conflict
+    /// (quotient homed %edx AND remainder homed %eax) no order works, so
+    /// the pair is BROKEN: this returns false, the caller falls through to
+    /// the standalone path, and the tail (marked in divrem_broken_tails)
+    /// emits its own division. The head is always emitted before the tail
+    /// (same block, earlier position), so the marker is set in time.
+    ///
+    /// Returns true when the fused emission completed.
+    fn emit_divrem_pair_head(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        partner_dest: u32,
+        partner_from_eax: bool,
+    ) -> bool {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        self.operand_to_eax(lhs);
+        let rhs_ref: String = if let Operand::Value(rv) = rhs {
+            match self.div_rhs_direct_ref(rv) {
+                Some(r) => r,
+                None => {
+                    self.operand_to_ecx(rhs);
+                    "%ecx".to_string()
+                }
+            }
+        } else {
+            self.operand_to_ecx(rhs);
+            "%ecx".to_string()
+        };
+        if signed {
+            self.state.emit("    cltd");
+            emit!(self.state, "    idivl {}", rhs_ref);
+        } else {
+            self.state.emit("    xorl %edx, %edx");
+            emit!(self.state, "    divl {}", rhs_ref);
+        }
+        self.state.reg_cache.invalidate_acc();
+
+        // Which value takes which output register:
+        //   div-flavoured dest -> %eax, rem-flavoured dest -> %edx.
+        let div_dest = if self_is_div {
+            *dest
+        } else {
+            Value(partner_dest)
+        };
+        let rem_dest = if self_is_div {
+            Value(partner_dest)
+        } else {
+            *dest
+        };
+        let _ = partner_from_eax; // flavour already encoded in the dest split above
+
+        let rem_home = self.dest_reg(&rem_dest).map(|p| p.0);
+        let div_home = self.dest_reg(&div_dest).map(|p| p.0);
+        // Immediately-consumed (accumulator-flow) values have neither a home
+        // nor a slot: their consumer reads %eax directly (see operand_to_eax's
+        // no-home fallback). The pair tail can never be one (the accumulator
+        // analysis excludes tails), so at most the HEAD's own dest is
+        // slotless — it must be materialised into %eax with a cache entry.
+        let rem_slotless =
+            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
+        let div_slotless =
+            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
+        // store_edx(rem) writes %eax iff rem is HOMED in %eax (PhysReg 6);
+        // store_eax(div) writes %edx iff div is HOMED in %edx (PhysReg 5).
+        let edx_side_writes_eax = rem_home == Some(6);
+        let eax_side_writes_edx = div_home == Some(5);
+
+        // Deadlock screening: combinations where NO store order preserves
+        // both results (each side's only copy sits in the register the other
+        // side's store must overwrite). Break the pair — both sides then
+        // emit standalone divisions, which is always correct.
+        if (edx_side_writes_eax && eax_side_writes_edx)
+            || (rem_slotless && eax_side_writes_edx)
+            || (div_slotless && edx_side_writes_eax)
+        {
+            self.divrem_broken_tails.insert(partner_dest);
+            return false;
+        }
+        if rem_slotless {
+            // Quotient out first (its store cannot touch %edx here); then
+            // move the remainder into %eax for its acc-flow consumer.
+            self.store_eax_to(&div_dest);
+            self.state.emit("    movl %edx, %eax");
+            self.state.reg_cache.set_acc(rem_dest.0, false);
+        } else if div_slotless {
+            // Remainder out first (its store cannot touch %eax here); the
+            // quotient is already in %eax — just claim the cache entry its
+            // consumer will read.
+            self.store_edx_to(&rem_dest);
+            self.state.reg_cache.set_acc(div_dest.0, false);
+        } else if edx_side_writes_eax {
+            // Quotient first (its store cannot touch %edx here); then the
+            // remainder store rewrites %eax — invalidate the acc claim the
+            // quotient store just made.
+            self.store_eax_to(&div_dest);
+            self.store_edx_to(&rem_dest);
+            self.state.reg_cache.invalidate_acc();
+        } else {
+            // Canonical order: remainder out of %edx first (homed there it
+            // is a no-op, leaving %edx free for the quotient's store).
+            self.store_edx_to(&rem_dest);
+            self.store_eax_to(&div_dest);
+        }
+        true
     }
 }

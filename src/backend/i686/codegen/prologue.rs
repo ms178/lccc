@@ -92,6 +92,49 @@ impl I686Codegen {
         self.is_fastcall = func.is_fastcall;
         self.current_return_type = func.return_type;
 
+        // Same-block div/rem pair fusion table (one divl serves a
+        // URem+UDiv couple with identical operands). Constant divisors pair
+        // only at -Os, where the magic-number strength reduction is off and
+        // the general divl path is guaranteed for both sides.
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+            func,
+            self.optimize_for_size,
+        );
+        self.divrem_tail_dests = pairs.tail_dests;
+        self.divrem_head_partners = pairs.head_partners;
+        self.divrem_broken_tails.clear();
+
+        // Zero-extending wide casts (u8/u16/u32/ptr -> i64/u64): their high
+        // half is provably zero — the 64-bit ALU fast paths use this to drop
+        // the alo*bhi cross product and to carry with an immediate 0.
+        self.zext_wide_values.clear();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let crate::ir::reexports::Instruction::Cast {
+                    dest,
+                    src: crate::ir::reexports::Operand::Value(_),
+                    from_ty,
+                    to_ty,
+                } = inst
+                {
+                    let zext = matches!(
+                        (from_ty, to_ty),
+                        (
+                            crate::common::types::IrType::U8
+                                | crate::common::types::IrType::U16
+                                | crate::common::types::IrType::U32
+                                | crate::common::types::IrType::Ptr,
+                            crate::common::types::IrType::I64
+                                | crate::common::types::IrType::U64
+                        )
+                    );
+                    if zext {
+                        self.zext_wide_values.insert(dest.0);
+                    }
+                }
+            }
+        }
+
         // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
         // since ESP changes by runtime-computed amounts.
         if self.state.has_dyn_alloca {

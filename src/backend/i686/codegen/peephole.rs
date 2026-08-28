@@ -2357,9 +2357,28 @@ fn replace_att_source_reg(line: &str, old_reg: &str, new_reg: &str) -> Option<St
     }
     parts.push(cur);
 
-    // A single operand is read-modify-write or a branch target: not a source.
+    // A single operand is read-modify-write (incl/neg/not/bswap…), a branch
+    // target, or a stack slot — EXCEPT for the single-operand forms whose one
+    // register operand is a pure SOURCE: `divl %reg` / `idivl %reg` (the
+    // divisor is read; the implicit results land in eax/edx), `push %reg`,
+    // and `jmp/call *%reg`. Rewriting the source of those is exactly as safe
+    // as rewriting a two-operand source. Everything else keeps refusing.
     if parts.len() < 2 {
-        return None;
+        let p0 = parts[0].trim();
+        if !(p0.starts_with('%')
+            && !p0.contains('(')
+            && (mnemonic.starts_with("div")
+                || mnemonic.starts_with("idiv")
+                || mnemonic.starts_with("push")
+                || ((mnemonic == "jmp" || mnemonic == "call") && p0.starts_with('*'))))
+        {
+            return None;
+        }
+        if !has_whole_word(p0, old_reg) {
+            return None;
+        }
+        let replaced = replace_whole_word(p0, old_reg, new_reg);
+        return Some(format!("{}{}{}{}", ws, mnemonic, " ", replaced));
     }
 
     let last = parts.len() - 1;
