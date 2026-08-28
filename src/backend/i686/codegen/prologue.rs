@@ -96,10 +96,8 @@ impl I686Codegen {
         // URem+UDiv couple with identical operands). Constant divisors pair
         // only at -Os, where the magic-number strength reduction is off and
         // the general divl path is guaranteed for both sides.
-        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
-            func,
-            self.optimize_for_size,
-        );
+        let pairs =
+            crate::backend::regalloc::compute_i686_divrem_pairs(func, self.optimize_for_size);
         self.divrem_tail_dests = pairs.tail_dests;
         self.divrem_head_partners = pairs.head_partners;
         self.divrem_broken_tails.clear();
@@ -124,8 +122,7 @@ impl I686Codegen {
                                 | crate::common::types::IrType::U16
                                 | crate::common::types::IrType::U32
                                 | crate::common::types::IrType::Ptr,
-                            crate::common::types::IrType::I64
-                                | crate::common::types::IrType::U64
+                            crate::common::types::IrType::I64 | crate::common::types::IrType::U64
                         )
                     );
                     if zext {
@@ -352,7 +349,7 @@ impl I686Codegen {
 
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
-        calculate_stack_space_common(
+        let space = calculate_stack_space_common(
             &mut self.state,
             func,
             callee_saved_bytes,
@@ -378,7 +375,12 @@ impl I686Codegen {
             &reg_assigned,
             callee_saved_set,
             cached_liveness,
-        )
+        );
+        // Mul-acc chain plans resolve AFTER the RA and slot assignment:
+        // fusibility depends on the final register homes and stack slots
+        // (see compute_i686_mulacc_chains / resolve_mulacc_plans).
+        self.resolve_mulacc_plans(func);
+        space
     }
 
     // ---- aligned_frame_size ----

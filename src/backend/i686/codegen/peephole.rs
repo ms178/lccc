@@ -3640,6 +3640,324 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
     changed
 }
 
+// ── Pass: setCC-bool test/branch fusion ──────────────────────────────────────
+
+/// Fuse `setCC %r8; movzbl %r8, %r32; [movl relays]; testl A, B; {je|jne}`:
+/// the test is REDUNDANT — `movzbl` and `movl` preserve EFLAGS, so the
+/// original producer's flags (the ones the setCC consumed) are still live at
+/// the conditional jump, and `je`-after-test ⇔ (bool == 0) ⇔ CC false.
+///
+/// The i64 `res & mask != 0` gates (kstrtoull's overflow check) lower to
+/// exactly this shape with a register relay: `orl; setne %al; movzbl;
+/// movl %eax,%edx; testl %eax,%edx; je` — none of which the Cmp-headed
+/// fuse_compare_and_branch or the and/or/xor-headed
+/// eliminate_redundant_test_i686 can match (cross-register test + relay).
+///
+/// When the bool is dead after the branch (bounded written-before-read scan
+/// for every carrier register, no unmatched slot stores — the window admits
+/// none), the whole setCC..relay window is NOPed; otherwise only the test
+/// is dropped. In both cases the jcc is rewritten: `je`→`j<inv(CC)>`,
+/// `jne`→`j<CC>` on the surviving producer flags.
+///
+/// Soundness gates:
+///  * the window (setCC..test) contains ONLY flag-preserving carrier moves
+///    (movzbl same-family, movl reg-reg from a carrier) — any other line,
+///    label, or branch bails;
+///  * the tested operands are both carriers of the bool;
+///  * after the jcc, a bounded scan requires a flags WRITER before any
+///    flags READER — otherwise a later reader could observe the producer's
+///    flags where the test's were intended (strictly stricter than the
+///    existing fuse_compare_and_branch, which relies on the emitter's
+///    always-produce-before-consume discipline alone).
+fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_SETCC_BRANCH").is_some() {
+        return false;
+    }
+    /// Instruction mnemonics that WRITE the flags register.
+    fn is_flags_writer(s: &str) -> bool {
+        let m = s.split_whitespace().next().unwrap_or("");
+        matches!(
+            m,
+            "addl" | "addw" | "addb"
+                | "subl" | "subw" | "subb"
+                | "adcl" | "sbbl"
+                | "andl" | "andw" | "andb"
+                | "orl" | "orw" | "orb"
+                | "xorl" | "xorw" | "xorb"
+                | "cmpl" | "cmpw" | "cmpb"
+                | "testl" | "testw" | "testb"
+                | "shll" | "shrl" | "sarl"
+                | "roll" | "rorl" | "rcll" | "rcrl"
+                | "imull" | "mull" | "idivl" | "divl"
+                | "incl" | "decl" | "negl"
+                | "negw" | "negb"
+        )
+    }
+    /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
+    fn is_flags_reader(kind: LineKind, s: &str) -> bool {
+        matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
+            || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
+    }
+
+    let len = infos.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        let (cc, byte_reg) = match infos[i].kind {
+            LineKind::SetCC { reg } => {
+                let s = trimmed(store, &infos[i], i);
+                match parse_setcc(s) {
+                    Some(cc) if reg <= REG_GP_MAX => (cc, reg),
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        // Next non-nop: movz{b,w}l %r8, %r32 (same family) — the bool lands
+        // in the full register.
+        let mut j = i + 1;
+        while j < len && (infos[j].is_nop() || is_debug_location(store, infos, j)) {
+            j += 1;
+        }
+        if j >= len {
+            break;
+        }
+        let mz = trimmed(store, &infos[j], j);
+        let carrier = if let Some(rest) = mz.strip_prefix("movzbl ") {
+            let mut it = rest.split(',');
+            let src = it.next().unwrap_or("").trim();
+            let dst = it.next().unwrap_or("").trim();
+            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
+                None
+            } else {
+                let sf = register_family(src);
+                let df = register_family(dst);
+                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
+                    Some(df)
+                } else {
+                    None
+                }
+            }
+        } else if let Some(rest) = mz.strip_prefix("movzwl ") {
+            let mut it = rest.split(',');
+            let src = it.next().unwrap_or("").trim();
+            let dst = it.next().unwrap_or("").trim();
+            if it.next().is_some() || !src.starts_with('%') || !dst.starts_with('%') {
+                None
+            } else {
+                let sf = register_family(src);
+                let df = register_family(dst);
+                if sf == byte_reg && sf == df && df <= REG_GP_MAX {
+                    Some(df)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let Some(carrier) = carrier else {
+            i += 1;
+            continue;
+        };
+        // Window: movl relays then the test. No stores, labels, branches.
+        let mut carriers = [REG_NONE; 4];
+        carriers[0] = carrier;
+        let mut carrier_count = 1usize;
+        let mut window: Vec<usize> = Vec::new();
+        let mut test_idx = None;
+        let mut k = j + 1;
+        let mut scanned = 0;
+        while k < len && scanned < 6 {
+            if infos[k].is_nop() || is_debug_location(store, infos, k) {
+                k += 1;
+                continue;
+            }
+            if infos[k].is_barrier() {
+                break;
+            }
+            let s = trimmed(store, &infos[k], k);
+            if let Some(rest) = s.strip_prefix("movl ") {
+                let mut it = rest.split(',');
+                let src = it.next().unwrap_or("").trim();
+                let dst = it.next().unwrap_or("").trim();
+                let sf = register_family(src);
+                let df = register_family(dst);
+                if it.next().is_some()
+                    || !src.starts_with('%')
+                    || !dst.starts_with('%')
+                    || sf == REG_NONE
+                    || sf > REG_GP_MAX
+                    || df > REG_GP_MAX
+                    || dst.contains('(')
+                {
+                    break; // slot store or odd form: bail (strict window)
+                }
+                if (0..carrier_count).any(|c| carriers[c] == sf) {
+                    if df != sf && (0..carrier_count).all(|c| carriers[c] != df) {
+                        if carrier_count < carriers.len() {
+                            carriers[carrier_count] = df;
+                            carrier_count += 1;
+                            window.push(k);
+                            k += 1;
+                            scanned += 1;
+                            continue;
+                        }
+                    } else if df == sf {
+                        // movl %eax, %eax: no-op relay, skip
+                        k += 1;
+                        scanned += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if let Some(rest) = s.strip_prefix("testl ") {
+                let mut it = rest.split(',');
+                let a = it.next().unwrap_or("").trim();
+                let b = it.next().unwrap_or("").trim();
+                if it.next().is_some() || !a.starts_with('%') || !b.starts_with('%') {
+                    break;
+                }
+                let af = register_family(a);
+                let bf = register_family(b);
+                let a_c = (0..carrier_count).any(|c| carriers[c] == af);
+                let b_c = (0..carrier_count).any(|c| carriers[c] == bf);
+                if a_c && b_c {
+                    test_idx = Some(k);
+                    k += 1;
+                    break;
+                }
+            }
+            break;
+        }
+        let Some(test_idx) = test_idx else {
+            i += 1;
+            continue;
+        };
+        // Next non-nop after the test: je/jne.
+        let mut t = test_idx + 1;
+        while t < len && (infos[t].is_nop() || is_debug_location(store, infos, t)) {
+            t += 1;
+        }
+        if t >= len {
+            i += 1;
+            continue;
+        }
+        let jl = trimmed(store, &infos[t], t);
+        let (is_jne, target) = if let Some(x) = jl.strip_prefix("jne ") {
+            (true, x.trim())
+        } else if let Some(x) = jl.strip_prefix("je ") {
+            (false, x.trim())
+        } else {
+            i += 1;
+            continue;
+        };
+        // Post-jcc guard: a flags writer must precede any flags reader on
+        // the fallthrough path (bounded scan; barriers stop it — a label
+        // ends the guaranteed-straight-line region conservatively).
+        let mut ok_after = true;
+        let mut m = t + 1;
+        let mut cnt = 0;
+        while m < len && cnt < 16 {
+            if infos[m].is_nop() || is_debug_location(store, infos, m) {
+                m += 1;
+                continue;
+            }
+            if infos[m].is_barrier() {
+                break;
+            }
+            let s2 = trimmed(store, &infos[m], m);
+            if is_flags_writer(s2) {
+                break;
+            }
+            if is_flags_reader(infos[m].kind, s2) {
+                ok_after = false;
+                break;
+            }
+            m += 1;
+            cnt += 1;
+        }
+        if !ok_after {
+            i += 1;
+            continue;
+        }
+        // Bool deadness: every carrier written-before-read after the jcc.
+        let mut bool_dead = true;
+        for c in (0..carrier_count).map(|c| carriers[c]) {
+            let mut k2 = t + 1;
+            let mut cnt2 = 0;
+            let mut dead = false;
+            while k2 < len && cnt2 < 24 {
+                if infos[k2].is_nop() || is_debug_location(store, infos, k2) {
+                    k2 += 1;
+                    continue;
+                }
+                if infos[k2].is_barrier() {
+                    break;
+                }
+                let s3 = trimmed(store, &infos[k2], k2);
+                let written = match infos[k2].kind {
+                    LineKind::Other { dest_reg } => dest_reg == c,
+                    LineKind::Move { dst, .. } => dst == c,
+                    LineKind::LoadEbp { reg, .. } => reg == c,
+                    LineKind::SetCC { reg } => reg == c,
+                    _ => false,
+                };
+                if written && !line_reads_dest_source(s3, c) {
+                    dead = true;
+                    break;
+                }
+                if line_references_reg(s3, c) || line_writes_reg_implicitly(s3, c) {
+                    break;
+                }
+                k2 += 1;
+                cnt2 += 1;
+            }
+            if !dead {
+                bool_dead = false;
+                break;
+            }
+        }
+        // Rewrite: drop the test; rewrite the jcc onto the producer flags.
+        let fused_cc = if is_jne {
+            cc.to_string()
+        } else {
+            match invert_cc(cc) {
+                Some(inv) => inv.to_string(),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        };
+        infos[test_idx].kind = LineKind::Nop;
+        if bool_dead {
+            infos[i].kind = LineKind::Nop; // setCC
+            infos[j].kind = LineKind::Nop; // movzbl
+            for w in &window {
+                infos[*w].kind = LineKind::Nop; // relays
+            }
+        }
+        store.replace(t, format!("    j{} {}", fused_cc, target));
+        infos[t] = LineInfo {
+            kind: LineKind::CondJmp,
+            trim_start: 4,
+            has_indirect_mem: false,
+            ebp_offset: EBP_OFFSET_NONE,
+        };
+        changed = true;
+        i = t + 1;
+    }
+    changed
+}
+
 // ── Pass: redundant testl-after-logical elimination ─────────────────────────
 
 /// `andl`/`orl` (any operand form) and the `xorl %R,%R` zero idiom set
@@ -7438,6 +7756,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
+    let global_changed = global_changed | fuse_setcc_branch(&mut store, &mut infos);
     let global_changed = global_changed | fold_memory_operands(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
@@ -7454,6 +7773,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= forward_slot_loads(&mut store, &mut infos);
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
+            changed2 |= fuse_setcc_branch(&mut store, &mut infos);
             changed2 |= fold_memory_operands(&mut store, &mut infos);
             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
             changed2 |= fuse_sext_testb(&mut store, &mut infos);

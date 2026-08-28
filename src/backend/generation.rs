@@ -777,6 +777,87 @@ pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, V
     out
 }
 
+/// Dest values of INDEXED-fold GEPs (the `base + index*scale` SIB shape),
+/// plus their GlobalAddr BASES. The GEP dests are single-use address
+/// temporaries: when the fold fires (the index holds a register), the GEP
+/// emits NOTHING; when it does not, the fallback materialises through
+/// %eax/%ecx staging and a slot is exactly as good as a register. The
+/// GlobalAddr bases are the same steal-risk class with a sharper failure
+/// mode: vsprintf number()'s digit table homed `digits` in %edx
+/// [def..access] — that 2-point holder blocked the loop-carried remainder
+/// (born in %edx at the fused div, [div..access]) from the register, the
+/// load then unfolded to the 4-instruction `digits+r` materialisation, and
+/// the fold's sym form never fired. Denied %edx/%ecx, the base either
+/// takes a callee-saved home (reg-base SIB, still a single-instruction
+/// load) or none at all (sym form `sym(,%idx,scale)`, base skipped as a
+/// dead GlobalAddr) — both leave the caller-saved pool to the index.
+pub(crate) fn collect_i686_scratch_denials(func: &IrFunction) -> FxHashSet<u32> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let m = build_indexed_gep_map(func, &use_counts, &stab);
+    let mut out: FxHashSet<u32> = m.keys().copied().collect();
+    let mut global_addrs: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GlobalAddr { dest, .. } = inst {
+                global_addrs.insert(dest.0);
+            }
+        }
+    }
+    for info in m.values() {
+        if global_addrs.contains(&info.base.0) {
+            out.insert(info.base.0);
+        }
+    }
+    // LOAD dests consuming indexed GEPs: their %edx/%ecx homes are worthless
+    // (the access is a single instruction and the value flows through the
+    // accumulator either way), while an %edx home at the access point is a
+    // PRIORITY INVERSION — it both creates an edx hazard at the load (the
+    // store-to-home write) and occupies the register the SIB INDEX needs.
+    // vsprintf number()'s digit loop measured exactly this: the digit-char
+    // dest took %edx in Phase 2 (loads were never edx hazards there), which
+    // blocked the loop-carried remainder (born at the fused div, the load's
+    // natural SIB index) from %edx in every later phase — the load unfolded
+    // to base+addl staging and the digits GlobalAddr rematerialised inside
+    // the loop. Store VALUES are deliberately NOT denied: a register home is
+    // read directly by direct_store_src (`movl %edx, mem`), which is a win.
+    // Denied values keep every other home path (callee-saved Phases 1/2c/2f,
+    // %eax Phase 2e).
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { ptr, dest, .. } = inst {
+                if m.contains_key(&ptr.0) {
+                    out.insert(dest.0);
+                }
+            }
+        }
+    }
+    // DIV QUOTIENT dests: a quotient is BORN in %eax (divl/idivl write the
+    // quotient to eax, the remainder to edx) — an %edx home is a
+    // wrong-birth-register home requiring a pointless `movl %eax,%edx`, and
+    // it occupies %edx across the div point exactly where the REMAINDER (the
+    // value actually born in %edx) and the div-adjacent index chains need it.
+    // number()'s digit loop: the quotient's [div..cast] %edx interval
+    // fragmented the register across the remainder->GEP-index chain
+    // [div..load], blocking the SIB fold. The quotient keeps %eax (Phase 2e,
+    // its birth register) and callee-saved homes — GCC's shape (`movl %eax,
+    // %ebp` after the div). Remainder dests are deliberately NOT denied:
+    // %edx is THEIR birth register.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::UDiv | IrBinOp::SDiv,
+                ..
+            } = inst
+            {
+                out.insert(dest.0);
+            }
+        }
+    }
+    out
+}
+
 /// Union of the per-kind folded-GEP consumption links (index + base) for
 /// backends that fold BOTH forms. Each backend must pass exactly the links
 /// for the forms its emitter actually consumes at the access position;
@@ -2496,7 +2577,8 @@ fn detect_mul_add_fusions(
         };
         if (mul_ty.is_float() && !fuse_float)
             || matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128)
-            || (crate::common::types::target_is_32bit() && matches!(mul_ty, IrType::I64 | IrType::U64))
+            || (crate::common::types::target_is_32bit()
+                && matches!(mul_ty, IrType::I64 | IrType::U64))
         {
             continue;
         }
@@ -3132,10 +3214,8 @@ fn emit_functions_and_sections(
             emit_switch_to_section(cg, &sect);
             if let Some(&alignment) = module.function_alignments.get(&func.name) {
                 if alignment > 1 && alignment.is_power_of_two() {
-                    cg.state().emit_fmt(format_args!(
-                        ".p2align {}",
-                        alignment.trailing_zeros()
-                    ));
+                    cg.state()
+                        .emit_fmt(format_args!(".p2align {}", alignment.trailing_zeros()));
                 }
             }
             generate_function(cg, func, source_mgr, file_table);
@@ -3424,7 +3504,8 @@ fn generate_function(
                     let ptr_align = crate::common::types::target_ptr_size();
                     let ptr_dir = cg.ptr_directive();
                     cg.state().emit_fmt(format_args!(".align {}", ptr_align));
-                    cg.state().emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
+                    cg.state()
+                        .emit_fmt(format_args!("{} {}", ptr_dir.as_str(), lbl));
                     emit_switch_to_section(cg, &func_sect);
                 }
                 if mc.nop {
@@ -3451,8 +3532,8 @@ fn generate_function(
                     // the parent PC through the frame; GCC measures to the
                     // same shape and rejects -pg with -fomit-frame-pointer.
                     // The label is emitted at the site only when recording.
-                    cg.state().pending_classic_mcount_label =
-                        mcount_label.or_else(|| Some(format!(".LMC{}", cg.state().next_label_id())));
+                    cg.state().pending_classic_mcount_label = mcount_label
+                        .or_else(|| Some(format!(".LMC{}", cg.state().next_label_id())));
                 }
             } else if !cg.state().mcount_unsupported_warned {
                 cg.state().mcount_unsupported_warned = true;
@@ -3737,6 +3818,63 @@ fn generate_function(
             }
             if can_indexed_addr_fold(cg, info, &global_addr_map) {
                 foldable_folds.insert(*dest);
+            }
+        }
+        // Indexed-fold GlobalAddr BASES: a symbol whose EVERY use is the
+        // base of a guaranteed-folded indexed GEP never materializes — the
+        // SIB memory operand embeds the symbol directly (sym(,%idx,scale)).
+        // Without this, vsprintf number()'s digit table kept a dead
+        // `movl $digits, slot` inside the loop after the load folded.
+        // Guard: ALL of the base's uses must be bases of foldable folds
+        // (use-count equality; a base shared with any other consumer — a
+        // direct Load, an unfolded GEP, a Store value — still materializes).
+        // Store-fed folds keep their base: the value-staging fallback
+        // (`rematerialize_skipped_indexed`) may re-emit the GEP and read it.
+        {
+            let mut folded_base_uses: FxHashMap<u32, u32> = FxHashMap::default();
+            for dest in &foldable_folds {
+                if let Some(info) = indexed_gep_map.get(dest) {
+                    if global_addr_map.contains_key(&info.base.0) {
+                        *folded_base_uses.entry(info.base.0).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut has_store_consumer0: FxHashSet<u32> = FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Store { ptr, .. } = inst {
+                        if foldable_folds.contains(&ptr.0) {
+                            if let Some(info) = indexed_gep_map.get(&ptr.0) {
+                                has_store_consumer0.insert(info.base.0);
+                            }
+                        }
+                    }
+                }
+            }
+            for (base, folded_uses) in folded_base_uses {
+                let total = value_use_counts[base as usize];
+                if total != folded_uses || has_store_consumer0.contains(&base) {
+                    continue;
+                }
+                // SYM-FORM GUARANTEE: the materialisation may be skipped
+                // only when the base value has NO register home. A homed
+                // base makes `can_indexed_addr_fold` fold via the
+                // REGISTER-base arm, and the emitter's first dispatch
+                // (`emit_load_indexed`) then consumes the base register in
+                // the SIB operand — a register the skipped `leaq/movl`
+                // would have written (narrow_compare_constant_semantics:
+                // `movzwl (%rbx,%r14,2)` read a never-written %rbx). An
+                // UNHOMED base cannot take the register form (GlobalAddrs
+                // are not allocas, so the frame-SIB arm refuses too), and
+                // the fold only became foldable through the symbol arm —
+                // which had already verified `supports_indexed_sym_base`,
+                // `rip_rel_blocked` (the emitter's GOT verdict agrees, see
+                // emit_load_indexed_sym_impl) and a register-resident
+                // index. The symbol form therefore cannot refuse, and it
+                // never reads the base's (now never-written) slot.
+                if cg.get_phys_reg_for_value(base).is_none() {
+                    dead_global_addrs.insert(base);
+                }
             }
         }
         let mut has_store_consumer: FxHashSet<u32> = FxHashSet::default();

@@ -24,6 +24,8 @@ use crate::ir::reexports::{
     IrUnaryOp, Operand, Value,
 };
 
+use super::i128_ops::MulAccPlan;
+
 /// i686 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses cdecl calling convention with no register allocation (accumulator-based).
 pub struct I686Codegen {
@@ -84,6 +86,18 @@ pub struct I686Codegen {
     /// emit_divrem_pair_head): the tail must emit its own standalone
     /// division even though the table lists it as a tail.
     pub(super) divrem_broken_tails: FxHashSet<u32>,
+    /// Resolved mul-accumulate chain plans (see backend::regalloc::
+    /// compute_i686_mulacc_chains). Only FUSED chains are listed; each plan
+    /// carries the resolved operand references for the fused head emission.
+    pub(super) mulacc_plans: Vec<MulAccPlan>,
+    /// head (Mul) dest value-id -> index into mulacc_plans.
+    pub(super) mulacc_head_of: FxHashMap<u32, usize>,
+    /// FUSED tail (Add) dest value-ids — emit nothing (the head stored the
+    /// fused result).
+    pub(super) mulacc_fused_tails: FxHashSet<u32>,
+    /// ZExt cast dests that are VIRTUAL feeders of a fused chain: the cast
+    /// emits nothing; the fused head references the 32-bit source directly.
+    pub(super) mulacc_virtual_casts: FxHashSet<u32>,
     /// Wide values whose IR definition is a ZERO-EXTENDING cast from a
     /// 32-bit-or-smaller unsigned type (u32→u64, u8→u64, …): the high half
     /// is provably zero, so 64-bit multiply/add with them drops the alo×bhi
@@ -160,6 +174,10 @@ impl I686Codegen {
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             divrem_broken_tails: FxHashSet::default(),
+            mulacc_plans: Vec::new(),
+            mulacc_head_of: FxHashMap::default(),
+            mulacc_fused_tails: FxHashSet::default(),
+            mulacc_virtual_casts: FxHashSet::default(),
             zext_wide_values: FxHashSet::default(),
             used_callee_saved: Vec::new(),
             va_named_stack_bytes: 0,
@@ -287,9 +305,7 @@ impl I686Codegen {
     /// operand_to_eax(lhs) moments before) are excluded; those home shapes
     /// stage through %ecx exactly as before.
     pub(super) fn div_rhs_direct_ref(&self, v: &Value) -> Option<String> {
-        if self.state.wide_values.contains(&v.0)
-            || self.state.f128_direct_slots.contains(&v.0)
-        {
+        if self.state.wide_values.contains(&v.0) || self.state.f128_direct_slots.contains(&v.0) {
             return None;
         }
         if let Some(&phys) = self.reg_assignments.get(&v.0) {
@@ -1724,6 +1740,26 @@ impl ArchCodegen for I686Codegen {
     /// Override emit_binop to route I64/U64 through register-pair (eax:edx) arithmetic.
     fn emit_binop(&mut self, dest: &Value, op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) {
         if matches!(ty, IrType::I64 | IrType::U64) {
+            // Fused mul-acc chain HEAD (the Mul): the whole res*base+val
+            // expression emits here; the tail Add and the virtual feeder
+            // zexts emit nothing (compute_i686_mulacc_chains soundness model).
+            if op == IrBinOp::Mul {
+                if let Some(&pi) = self.mulacc_head_of.get(&dest.0) {
+                    if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                        eprintln!("[MULACC] head-emit dest={} plan={}", dest.0, pi);
+                    }
+                    self.emit_mulacc_chain_head(pi);
+                    return;
+                }
+            }
+            // Fused mul-acc chain TAIL (the Add): nothing to emit — the
+            // fused head stored the result at the Mul's program point.
+            if op == IrBinOp::Add && self.mulacc_fused_tails.contains(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
+                    eprintln!("[MULACC] tail-skip dest={}", dest.0);
+                }
+                return;
+            }
             if self.try_emit_i64_binop_fast(dest, op, lhs, rhs) {
                 return;
             }
@@ -1993,7 +2029,11 @@ impl ArchCodegen for I686Codegen {
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
         // Under -mregparm>=1 the sret pointer is passed in %eax, not pushed,
         // so the callee's plain `ret` pops nothing (mirrors emit_epilogue).
-        if is_sret && self.regparm == 0 { 4 } else { 0 }
+        if is_sret && self.regparm == 0 {
+            4
+        } else {
+            0
+        }
     }
 
     // ---- Control flow ----
@@ -2321,9 +2361,7 @@ impl ArchCodegen for I686Codegen {
             // destination; the range fallback preserves standalone constants
             // that genuinely cannot fit one 32-bit word.
             Operand::Const(IrConst::I64(v)) => {
-                self.state.is_wide_value(dest.0)
-                    || *v < i32::MIN as i64
-                    || *v > u32::MAX as i64
+                self.state.is_wide_value(dest.0) || *v < i32::MIN as i64 || *v > u32::MAX as i64
             }
             _ => false,
         };
@@ -2376,9 +2414,7 @@ impl ArchCodegen for I686Codegen {
         // Wide dests are excluded: store_eax_to zero-fills their upper word,
         // which this single 4-byte store must not skip.
         if let Operand::Const(_) = src {
-            if !self.reg_assignments.contains_key(&dest.0)
-                && !self.state.is_wide_value(dest.0)
-            {
+            if !self.reg_assignments.contains_key(&dest.0) && !self.state.is_wide_value(dest.0) {
                 if let Some(slot) = self.state.get_slot(dest.0) {
                     // Reuse the store path's immediate formatter so accepted
                     // constant kinds and width masking stay in one place.
@@ -2780,7 +2816,7 @@ impl I686Codegen {
         s.emit("    shrl %eax");
         s.emit("    shrl %cl, %eax"); // q = qs >> (1+i)
         s.emit("    movl %eax, %edi"); // edi = q
-        // Verify: compute a - q*b, adjust if negative
+                                       // Verify: compute a - q*b, adjust if negative
         s.emit("    mull 20(%esp)"); // edx:eax = q * B_lo
         s.emit("    movl 12(%esp), %ebx");
         s.emit("    movl 16(%esp), %ecx"); // ecx:ebx = a
@@ -2909,7 +2945,7 @@ impl I686Codegen {
         s.emit("    xorl %ecx, %edi"); // edi = sign of result (bit 31)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-        // Negate A if negative
+                                           // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Ldiv_a_pos");
         s.emit("    negl %eax");
@@ -2963,7 +2999,7 @@ impl I686Codegen {
         s.emit("    movl %edx, %edi"); // save A_hi sign (remainder sign = dividend sign)
         s.emit("    movl 16(%esp), %eax"); // A_lo
         s.emit("    movl 24(%esp), %ebx"); // B_lo
-        // Negate A if negative
+                                           // Negate A if negative
         s.emit("    testl %edx, %edx");
         s.emit("    jns .Lmod_a_pos");
         s.emit("    negl %eax");

@@ -10,8 +10,8 @@
 
 use super::live_range::{self, LinearScanAllocator};
 use super::liveness::{
-    LiveInterval, LivenessResult, compute_live_intervals, for_each_operand_in_instruction,
-    for_each_operand_in_terminator, for_each_value_use_in_instruction,
+    compute_live_intervals, for_each_operand_in_instruction, for_each_operand_in_terminator,
+    for_each_value_use_in_instruction, LiveInterval, LivenessResult,
 };
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
@@ -71,7 +71,11 @@ pub fn analyze_accumulator_assignments(
         }
         return analyze_accumulator_assignments_impl(func, policy, &filtered);
     }
-    analyze_accumulator_assignments_impl(func, policy, &candidates.into_iter().collect::<Vec<u32>>())
+    analyze_accumulator_assignments_impl(
+        func,
+        policy,
+        &candidates.into_iter().collect::<Vec<u32>>(),
+    )
 }
 
 fn analyze_accumulator_assignments_impl(
@@ -561,7 +565,9 @@ pub(crate) fn compute_i686_divrem_pairs(
             // Head = i (earlier), tail = j. The partner's result register:
             // quotient ops read %eax, remainder ops read %edx.
             let partner_from_eax = div_flavor(*op_j) == Some(true);
-            pairs.head_partners.insert(*dest_i, (*dest_j, partner_from_eax));
+            pairs
+                .head_partners
+                .insert(*dest_i, (*dest_j, partner_from_eax));
             pairs.tail_dests.insert(*dest_j);
             pairs.tail_points.insert((bi, cands[j].0));
             pairs
@@ -596,6 +602,492 @@ fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult)
         if let Some(&hp) = head_of.get(&seg.value_id) {
             if hp < seg.start {
                 seg.start = hp;
+            }
+        }
+    }
+    liveness
+        .segments
+        .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
+}
+
+/// One detected `t2 = t + v` tail of a mul-accumulate chain, where `t` is a
+/// same-block i64 Mul whose ONLY use is this Add. The emitter fuses the whole
+/// `res*base + val` expression at the Mul (the head): it computes the product
+/// in %eax:%edx with the zero-high-half short shape, adds the (provably
+/// zero-extended) addend in place, and stores ONLY the tail dest. The tail
+/// emits nothing. The product `t` is dead-by-construction (single use) and is
+/// never stored, eliminating the slot round-trip.
+#[derive(Debug, Clone)]
+pub(crate) struct MulAccChain {
+    /// Dest of the head (Mul) instruction `t`.
+    pub head_dest: u32,
+    /// Dest of the tail (Add) instruction `t2`.
+    pub tail_dest: u32,
+    /// Program point of the head (Mul) instruction.
+    pub head_point: u32,
+    /// The Mul's lhs (res).
+    pub lhs: Operand,
+    /// The Mul's rhs (base): i64 constant with zero high half, or a Value.
+    pub rhs: Operand,
+    /// If the rhs is a single-use zext cast whose 32-bit source is defined
+    /// before the head, its dest value-id (a VIRTUAL feeder candidate: the
+    /// cast may emit nothing and the head references the source directly).
+    pub rhs_feeder: Option<u32>,
+    /// The Add's rhs (addend val): i64 constant with zero high half, or a
+    /// Value that is a zext-widening cast dest (or a feeder).
+    pub addend: Operand,
+    /// Feeder candidate for the addend (same rules as `rhs_feeder`).
+    pub addend_feeder: Option<u32>,
+    /// True when the addend's defining zext cast sits BETWEEN head and tail:
+    /// the addend is then only readable through its feeder source (the cast
+    /// dest's slot is not yet written at the head point).
+    pub addend_cast_after_head: bool,
+    /// Single-use I64<->U64 no-op cast dests crossed by the operand
+    /// canonicalization (rhs and/or addend). Their ONLY reader is the chain
+    /// (the tail or the head operand position); when the chain fuses, that
+    /// reader emits nothing, so these casts are DEAD and the emitter
+    /// suppresses their slot-pair copies.
+    pub dead_nop_casts: Vec<u32>,
+}
+
+impl MulAccChain {
+    /// Feeder candidates (zext cast dests) feeding this chain.
+    pub fn feeders(&self) -> impl Iterator<Item = u32> + '_ {
+        self.rhs_feeder.into_iter().chain(self.addend_feeder)
+    }
+}
+
+pub(crate) struct I686MulAccChains {
+    /// All detected chains (the emitter resolves fusibility per chain AFTER
+    /// register allocation, when homes/slots are final).
+    pub chains: Vec<MulAccChain>,
+    /// head (Mul) dest -> index into `chains`.
+    pub head_of: FxHashMap<u32, usize>,
+    /// tail (Add) dest -> index into `chains`.
+    pub tail_of: FxHashMap<u32, usize>,
+}
+
+/// Same-block i64 mul-accumulate chain analysis — the parser hot shape
+/// `res = res*base + val` (kstrtoull/simple_strtoull). Deterministic,
+/// derived from the same IR by emitter and RA (mirrors the divrem-pair
+/// contract). Conditions:
+///
+/// - Head: an `I64/U64 Mul` whose result `t` has exactly ONE use in the
+///   whole function: the tail Add. (Otherwise the product must exist
+///   independently and cannot be folded into the fused store.)
+/// - Tail: an `I64/U64 Add(t, v)` in the same block, after the head.
+/// - The rhs (base) and the addend (val) must each be either an i64 constant
+///   with a provably zero high half (< 2^32), or the dest of a
+///   ZERO-extending cast (u8/u16/u32/ptr -> i64/u64) — the high half is then
+///   provably zero, so the fused `adcl $0` and the 3-term product shape are
+///   sound. Sign-extending casts and general 64-bit values reject the chain.
+/// - A zext operand with a single function-wide use becomes a VIRTUAL
+///   feeder candidate: its cast may emit nothing, and the head reads the
+///   32-bit SOURCE directly. The source must be defined before the head
+///   (SSA gives this for free for the rhs; for the addend the cast may sit
+///   between head and tail, so the source's def point is checked).
+///
+/// Kill switch: `CCC_NO_MULACC` (both the RA patch and the emitter respect it).
+pub(crate) fn compute_i686_mulacc_chains(func: &IrFunction) -> I686MulAccChains {
+    let mut out = I686MulAccChains {
+        chains: Vec::new(),
+        head_of: FxHashMap::default(),
+        tail_of: FxHashMap::default(),
+    };
+    if std::env::var_os("CCC_NO_MULACC").is_some() {
+        return out;
+    }
+
+    // Program-point numbering identical to liveness/the hazard scan.
+    let mut block_start: Vec<u32> = Vec::with_capacity(func.blocks.len());
+    let mut pt = 0u32;
+    for block in &func.blocks {
+        block_start.push(pt);
+        pt += block.instructions.len() as u32 + 1;
+    }
+
+    // Function-wide use counts (instructions + terminators).
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_count.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    let is_wide_ty = |ty: &IrType| matches!(ty, IrType::I64 | IrType::U64);
+    let zext_from = |from_ty: &IrType, to_ty: &IrType| {
+        matches!(
+            (from_ty, to_ty),
+            (
+                IrType::U8 | IrType::U16 | IrType::U32 | IrType::Ptr,
+                IrType::I64 | IrType::U64
+            )
+        )
+    };
+    // Constant with provably zero high half.
+    let const_hi_zero = |op: &Operand| match op {
+        Operand::Const(IrConst::Zero) => true,
+        Operand::Const(c) => c.to_i64().is_some_and(|v| {
+            let v = v as u128 & 0xFFFF_FFFF_FFFF_FFFF;
+            v >> 32 == 0
+        }),
+        _ => false,
+    };
+
+    // Same-size wide reinterpretation casts (I64<->U64): bit-identical
+    // values; their emitter materialisation is a slot-pair copy. The chain
+    // analysis canonicalizes operands THROUGH them so a C sandwich like
+    // `res*base + (u64)(s64)val` still exposes its real widening feeder.
+    // SOUNDNESS: the lookthrough only crosses a no-op cast whose dest has a
+    // SINGLE use — the chain consuming it. A multi-use no-op dest keeps
+    // other readers, its copy must materialise, and that copy reads the
+    // feeder's slot: crossing it would leave the copy reading the
+    // never-written slot of a VIRTUALIZED feeder (use-after-death).
+    // Crossed single-use no-op dests are recorded: they are dead when the
+    // chain fuses (their one reader, the tail, emits nothing) and the
+    // emitter then suppresses the copy. Depth-capped against pathological
+    // chains; beyond the cap the operand resolves as-is.
+    let mut wide_nop_casts: FxHashMap<u32, Operand> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                if is_wide_ty(from_ty) && is_wide_ty(to_ty) {
+                    wide_nop_casts.insert(dest.0, src.clone());
+                }
+            }
+        }
+    }
+    // (canonical operand, single-use no-op cast dests crossed on the way)
+    let canon = |op: &Operand| -> (Operand, Vec<u32>) {
+        let mut crossed = Vec::new();
+        let mut cur = op.clone();
+        for _ in 0..8 {
+            match &cur {
+                Operand::Value(v) => {
+                    let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
+                    match wide_nop_casts.get(&v.0) {
+                        Some(next) if single_use => {
+                            crossed.push(v.0);
+                            cur = next.clone();
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        (cur, crossed)
+    };
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        // Widening (to i64/u64) cast dests in this block:
+        // dest -> (src operand, inst idx, is_zext). Sext casts qualify as
+        // ADDEND feeders only (their high half is the sign replication).
+        let mut widening_casts: FxHashMap<u32, (Operand, usize, bool)> = FxHashMap::default();
+        // Def points of every value defined in this block (params are
+        // entry-defined: point 0 dominates everything).
+        let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
+        // i64 Muls: (inst idx, dest, lhs, rhs).
+        let mut muls: Vec<(usize, u32, Operand, Operand, Vec<u32>)> = Vec::new();
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            match inst {
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    if is_wide_ty(to_ty)
+                        && !is_wide_ty(from_ty)
+                        && matches!(
+                            from_ty,
+                            IrType::U8
+                                | IrType::U16
+                                | IrType::U32
+                                | IrType::Ptr
+                                | IrType::I8
+                                | IrType::I16
+                                | IrType::I32
+                        )
+                    {
+                        let z = zext_from(from_ty, to_ty);
+                        widening_casts.insert(dest.0, (src.clone(), ii, z));
+                    }
+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
+                }
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Mul,
+                    ty,
+                    lhs,
+                    rhs,
+                    ..
+                } if is_wide_ty(ty) => {
+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
+                    // Canonicalize the rhs through single-use I64<->U64
+                    // no-op casts; the crossed dests die with the chain.
+                    let (rhs_canon, rhs_dead_nops) = canon(rhs);
+                    muls.push((ii, dest.0, lhs.clone(), rhs_canon, rhs_dead_nops));
+                }
+                Instruction::BinOp { dest, .. } => {
+                    def_point.insert(dest.0, block_start[bi] + ii as u32);
+                }
+                _ => {
+                    // Other defining instructions (Load, UnaryOp, Cmp, ...).
+                    if let Some(dest) = inst.dest() {
+                        def_point.insert(dest.0, block_start[bi] + ii as u32);
+                    }
+                }
+            }
+        }
+
+        // Source of `op` defined (strictly) before `limit` in this block, or
+        // defined elsewhere (params / other blocks) — always available.
+        let src_available_before = |op: &Operand, limit: u32| -> bool {
+            match op {
+                Operand::Const(_) => true,
+                Operand::Value(v) => match def_point.get(&v.0) {
+                    Some(&dp) => dp < limit,
+                    None => true, // defined in another block / param
+                },
+            }
+        };
+
+        // Resolve the MUL's RHS (base): zext-provable or zero-high constant
+        // only — the fused 3-term product shape needs bhi = 0. `op` is
+        // ALREADY canonicalized (I64<->U64 no-op casts stripped) by the
+        // muls-table builder.
+        let resolve_rhs = |op: &Operand, use_point: u32| -> Option<(Operand, Option<u32>)> {
+            match op {
+                Operand::Const(_) if const_hi_zero(op) => Some((op.clone(), None)),
+                Operand::Value(v) => {
+                    let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
+                    if let Some((src, _cast_idx, is_zext)) = widening_casts.get(&v.0) {
+                        if !is_zext {
+                            return None; // sext base: bhi unprovable
+                        }
+                        // SSA guarantees the cast precedes the head (the
+                        // Mul uses v), so the source is available there.
+                        if single_use && src_available_before(src, use_point) {
+                            Some((op.clone(), Some(v.0)))
+                        } else {
+                            // Materialized zext before the head: readable
+                            // from the slot low half.
+                            Some((op.clone(), None))
+                        }
+                    } else {
+                        // Cross-block zext dest: the emitter's zext proof
+                        // (zext_wide_values) gates it. Same-block non-cast
+                        // defs are not provably zero-high.
+                        match def_point.get(&v.0) {
+                            Some(_) => None,
+                            None => Some((op.clone(), None)),
+                        }
+                    }
+                }
+                _ => None,
+            }
+        };
+
+        // Resolve the ADDEND (val): far more permissive — both halves are
+        // readable from a materialized slot pair, so ANY wide value defined
+        // (or materialized) before the head works; constants carry lo+hi;
+        // single-use widening casts (zext OR sext) become feeder candidates.
+        // `op` is ALREADY canonicalized by the tail-loop caller.
+        let resolve_addend =
+            |op: &Operand, use_point: u32, after_head: bool| -> Option<(Operand, Option<u32>)> {
+                match op {
+                    Operand::Const(c) if c.to_i64().is_some() => Some((op.clone(), None)),
+                    Operand::Value(v) => {
+                        let single_use = use_count.get(&v.0).copied().unwrap_or(0) == 1;
+                        if let Some((src, cast_idx, _is_zext)) = widening_casts.get(&v.0) {
+                            if single_use && src_available_before(src, use_point) {
+                                Some((op.clone(), Some(v.0)))
+                            } else if (block_start[bi] + *cast_idx as u32) < use_point {
+                                // Multi-use widening cast before the head:
+                                // materialized, both halves in its slot pair.
+                                Some((op.clone(), None))
+                            } else {
+                                // Cast between head and tail, not a feeder: its
+                                // slot is not yet written at the head point.
+                                None
+                            }
+                        } else {
+                            // Non-cast Value: sound iff defined before the head
+                            // (materialized with a slot) or cross-block.
+                            match def_point.get(&v.0) {
+                                Some(&dp) if dp < use_point => Some((op.clone(), None)),
+                                Some(_) => None,
+                                None => Some((op.clone(), None)),
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+        // Tail Adds: t2 = Add(t, v).
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            if !is_wide_ty(ty) {
+                continue;
+            }
+            let Operand::Value(t) = lhs else { continue };
+            // Head: a same-block i64 Mul defining t, before this Add.
+            let Some(&(mul_idx, head_dest, ref head_lhs, ref head_rhs, ref rhs_dead_nops)) =
+                muls.iter().find(|(mi, md, ..)| *md == t.0 && *mi < ii)
+            else {
+                continue;
+            };
+            // t's single use must be this Add.
+            if use_count.get(&t.0).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let head_point = block_start[bi] + mul_idx as u32;
+            // Addend: value use point is the head (the fused add reads it at
+            // the head); after_head marks materializations sitting between
+            // head and tail (unreadable at the head point). Computed on the
+            // CANONICAL addend operand (through single-use I64<->U64 no-op
+            // casts; the crossed dests die with the chain).
+            let (addend_canon, addend_dead_nops) = canon(rhs);
+            let after_head = match &addend_canon {
+                Operand::Value(v) => widening_casts
+                    .get(&v.0)
+                    .is_some_and(|(_, ci, _)| *ci > mul_idx),
+                _ => false,
+            };
+            let Some((addend, addend_feeder)) =
+                resolve_addend(&addend_canon, head_point, after_head)
+            else {
+                continue;
+            };
+            // RHS: SSA guarantees the cast (if any) is before the head.
+            let Some((rhs_op, rhs_feeder)) = resolve_rhs(head_rhs, head_point) else {
+                continue;
+            };
+            let mut dead_nop_casts = rhs_dead_nops.clone();
+            dead_nop_casts.extend(addend_dead_nops.iter().copied());
+            let chain = MulAccChain {
+                head_dest,
+                tail_dest: dest.0,
+                head_point,
+                lhs: head_lhs.clone(),
+                rhs: rhs_op,
+                rhs_feeder,
+                addend,
+                addend_feeder,
+                addend_cast_after_head: after_head,
+                dead_nop_casts,
+            };
+            out.head_of.insert(head_dest, out.chains.len());
+            out.tail_of.insert(dest.0, out.chains.len());
+            out.chains.push(chain);
+        }
+    }
+    out
+}
+
+/// Mul-acc chain tails are physically born at their HEAD's fused store; the
+/// fused head also reads the feeder SOURCES (whose natural death is their
+//  zext cast, potentially before the head). Patch both interval families
+/// before any interval map is derived — the divrem-tail contract.
+fn patch_mulacc_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
+    let chains = compute_i686_mulacc_chains(func);
+    if chains.chains.is_empty() {
+        return;
+    }
+    // Feeder cast dest -> source operand (re-walked here; the table keeps
+    // only value-ids so the emitter can re-resolve against final homes).
+    let mut feeder_cast_src: FxHashMap<u32, Operand> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } = inst
+            {
+                // ALL widening feeders (zext AND sext): the fused head reads
+                // the 32-bit SOURCE directly in both cases — zext for the
+                // rhs (bhi=0 proof), sext for the addend (AddendHi::Sext,
+                // sarl replication). Restricting the source-liveness
+                // extension to zext feeders left a use-after-death window
+                // for SEXT addend feeders whose cast precedes the head:
+                // the source's interval ended at the cast, the RA reused
+                // its home between cast and head, and the fused head read
+                // the clobbered register.
+                let widening = matches!(
+                    (from_ty, to_ty),
+                    (
+                        IrType::U8
+                            | IrType::U16
+                            | IrType::U32
+                            | IrType::Ptr
+                            | IrType::I8
+                            | IrType::I16
+                            | IrType::I32,
+                        IrType::I64 | IrType::U64
+                    )
+                );
+                if widening {
+                    feeder_cast_src.insert(dest.0, src.clone());
+                }
+            }
+        }
+    }
+    for chain in &chains.chains {
+        // Tail dest born at the head point.
+        for iv in &mut liveness.intervals {
+            if iv.value_id == chain.tail_dest && chain.head_point < iv.start {
+                iv.start = chain.head_point;
+            }
+        }
+        for seg in &mut liveness.segments {
+            if seg.value_id == chain.tail_dest && chain.head_point < seg.start {
+                seg.start = chain.head_point;
+            }
+        }
+        // Feeder sources live until the head point.
+        for f in chain.feeders() {
+            let Some(src) = feeder_cast_src.get(&f) else {
+                continue;
+            };
+            let Operand::Value(sv) = src else { continue };
+            for iv in &mut liveness.intervals {
+                if iv.value_id == sv.0 && iv.end < chain.head_point {
+                    iv.end = chain.head_point;
+                }
+            }
+            for seg in &mut liveness.segments {
+                if seg.value_id == sv.0 && seg.end < chain.head_point {
+                    seg.end = chain.head_point;
+                }
             }
         }
     }
@@ -739,6 +1231,44 @@ fn collect_safe_folded_index_homes(
             // homes remain blocked on RA-23 (phi_cfg_fuzz catches them).
             if mask.is_some_and(|value| (0..=255).contains(&value)) {
                 result.insert(dest.0);
+            }
+        }
+    }
+    // RA-23 follow-up: fresh-arithmetic hidden indexes. A value whose def is
+    // a pure BinOp (URem/Shl/Add/... — born fresh each iteration, never a
+    // Copy/Phi web member) and whose SINGLE function-wide use feeds a folded
+    // GEP's offset chain. vsprintf number()'s digit loop: the URem remainder
+    // is the natural index of the digits load; keeping it eligible lets the
+    // caller-saved phases home it in %edx (born there at the fused div) and
+    // the load folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5
+    // instructions per iteration. Single-use ⇒ the value is the source of
+    // no Copy and the dest of no Phi ⇒ no coalescing web ⇒ none of the RA-23
+    // materialization ambiguity the narrow And-mask exception guards against;
+    // the emitter still folds only when a physical home was actually
+    // assigned, and an unhomed value keeps its accumulator-flow shape.
+    let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *use_counts.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *use_counts.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::BinOp { dest, .. } = inst {
+                if folded_index_uses.contains_key(&dest.0)
+                    && use_counts.get(&dest.0).copied() == Some(1)
+                {
+                    result.insert(dest.0);
+                }
             }
         }
     }
@@ -954,10 +1484,13 @@ fn build_coalesce_groups(
     if !latch_dests.is_empty() {
         for block in &func.blocks {
             for w in block.instructions.windows(2) {
-                if let (prev, Instruction::Copy {
-                    dest: d,
-                    src: Operand::Value(s),
-                }) = (&w[0], &w[1])
+                if let (
+                    prev,
+                    Instruction::Copy {
+                        dest: d,
+                        src: Operand::Value(s),
+                    },
+                ) = (&w[0], &w[1])
                 {
                     if latch_dests.contains(&d.0) {
                         if let Some(pd) = prev.dest() {
@@ -1193,7 +1726,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             )
         })
     });
-    if has_builtin_setjmp || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty()) {
+    if has_builtin_setjmp
+        || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
+    {
         return RegAllocResult {
             assignments: FxHashMap::default(),
             accumulator_assignments: if has_builtin_setjmp {
@@ -1213,6 +1748,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // extend their intervals before ANY interval map is derived. Without
     // this, homes/slots in the head..tail window get double-assigned.
     patch_divrem_tail_intervals(func, &mut liveness);
+    // Mul-acc chain tails are born at their head's fused store, and the
+    // virtual feeder sources live until the head reads them — same contract.
+    patch_mulacc_intervals(func, &mut liveness);
     // Extend live intervals for backend-folded index consumers BEFORE any
     // interval map is derived (see RegAllocConfig::folded_index_uses).
     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
@@ -1264,6 +1802,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .first()
         .is_some_and(|r| (20..=33).contains(&r.0));
     let non_gpr_values = collect_non_gpr_values(func, is_32bit);
+    // Dest values of indexed-fold GEPs: single-use address temporaries whose
+    // register home is worthless when the SIB fold fires (they emit nothing)
+    // and no better than a slot when it does not. Denied %ecx/%edx homes on
+    // the i686 caller-saved pool so the loop-carried INDEX can claim the
+    // register instead (Phase 2/2d/2h filters; see
+    // collect_i686_scratch_denials for the full denial policy: indexed-GEP
+    // dests, their GlobalAddr bases and load dests, and div quotients).
+    let scratch_denied = if is_32bit {
+        crate::backend::generation::collect_i686_scratch_denials(func)
+    } else {
+        FxHashSet::default()
+    };
     // Values consumed as call arguments: their last read happens in the call's
     // argument staging, which writes the ABI arg registers in order. A home in
     // one of those registers (rdi/rsi/rdx/r8/r9 on x86-64) is clobbered by an
@@ -1673,6 +2223,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .iter()
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
+                    .filter(|iv| !scratch_denied.contains(&iv.value_id))
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .collect();
                 if env_on("CCC_DEBUG_RA_INTERVALS") {
@@ -1960,8 +2511,12 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
         if !ecx_clean_ptrs.is_empty() {
-            let (ecx_hazards2, edx_hazards2) =
-                collect_i686_scratch_hazard_points(func, &non_gpr_values, &ecx_clean_ptrs);
+            let (ecx_hazards2, edx_hazards2) = collect_i686_scratch_hazard_points_refined(
+                func,
+                &non_gpr_values,
+                &ecx_clean_ptrs,
+                Some(&assignments),
+            );
             for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards2), (PhysReg(4), &ecx_hazards2)] {
                 if !config.caller_saved_regs.contains(&reg) {
                     continue;
@@ -1984,6 +2539,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .filter(|iv| {
                         !assignments.contains_key(&iv.value_id)
                             && !call_spanning.contains(&iv.value_id)
+                            && !scratch_denied.contains(&iv.value_id)
                             && (x86_ordered_param_copies
                                 || !param_restricted.contains(&iv.value_id))
                     })
@@ -2249,10 +2805,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .iter()
         .any(|r| matches!(r.0, 4 | 5))
         && config.available_regs.iter().all(|r| r.0 <= 3);
-    if !env_on("CCC_NO_HOT_WEB_STEAL")
-        && i686_narrow_pool
-        && !all_phi_pairs.is_empty()
-    {
+    if !env_on("CCC_NO_HOT_WEB_STEAL") && i686_narrow_pool && !all_phi_pairs.is_empty() {
         let k: usize = std::env::var("CCC_HOT_WEB_STEAL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -2307,9 +2860,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 if !config.available_regs.iter().any(|r| r.0 == reg_id) {
                     continue;
                 }
-                if holders.iter().any(|h| {
-                    phi_pair_values.contains(h) || config.reg_hints.contains_key(h)
-                }) {
+                if holders
+                    .iter()
+                    .any(|h| phi_pair_values.contains(h) || config.reg_hints.contains_key(h))
+                {
                     continue;
                 }
                 let evict: Vec<u32> = holders
@@ -2348,6 +2902,173 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
     }
+
+    // Phase 2h (i686): iterated hazard refinement.  Phase 2/2d treated every
+    // Div/Rem as an %ecx hazard (divisor staging) and every gpr32 Load as an
+    // %edx hazard.  With the final Phase-1..2g assignments in hand, two
+    // hazard classes refine (see collect_i686_scratch_hazard_points_refined):
+    // div/rem with a register-homed divisor ∉ {edx,eax} is %ecx-clean, and
+    // GEP-pointer loads are %edx-clean.  Each round hands the newly-free
+    // caller-saved registers to still-unassigned values — which can unlock
+    // the next round's refinements (a value homed by round 1 can be the
+    // direct divisor that cleans round 2's div points).  Two rounds capture
+    // the practical fixpoint; each round is the Phase-2d model: no overlap
+    // with refined hazards NOR with existing holders of the register.
+    //
+    // Boot-corpus payoff: vsprintf number()'s digit loop — the remainder is
+    // born in %edx at the fused div, survives the digits GEP (edx-clean) and
+    // the indexed load (refined edx-clean), so it keeps %edx and the load
+    // folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5 insns/iter.
+    if !env_on("CCC_NO_ITERATED_HAZARD")
+        && config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5))
+    {
+        // Phase 2d's pointer-cleanliness set (loads whose pointers stage no
+        // %ecx) — recomputed here for the refined hazard collection.
+        let ecx_clean_ptrs_2h: FxHashSet<u32> = {
+            let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Alloca { dest, .. } = inst {
+                        alloca_dests.insert(dest.0);
+                    }
+                }
+            }
+            let mut ptr_all_clean: FxHashMap<u32, bool> = FxHashMap::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Load { ptr, dest, ty, .. } = inst {
+                        let gpr32 = matches!(
+                            ty,
+                            IrType::I8
+                                | IrType::U8
+                                | IrType::I16
+                                | IrType::U16
+                                | IrType::I32
+                                | IrType::U32
+                                | IrType::Ptr
+                        );
+                        if !gpr32 {
+                            continue;
+                        }
+                        let clean_here = assignments.contains_key(&ptr.0)
+                            && !alloca_dests.contains(&ptr.0)
+                            && assignments.contains_key(&dest.0);
+                        *ptr_all_clean.entry(ptr.0).or_insert(true) &= clean_here;
+                    }
+                }
+            }
+            let mut set: FxHashSet<u32> = ptr_all_clean
+                .into_iter()
+                .filter(|(_, c)| *c)
+                .map(|(v, _)| v)
+                .collect();
+            for &v in &config.never_materialized {
+                set.insert(v);
+            }
+            set
+        };
+        for round in 0..2 {
+            let (ecx_hazards_h, edx_hazards_h) = collect_i686_scratch_hazard_points_refined(
+                func,
+                &non_gpr_values,
+                &ecx_clean_ptrs_2h,
+                Some(&assignments),
+            );
+            if env_on("CCC_DEBUG_RA_INTERVALS") {
+                eprintln!(
+                    "[RA-P2h] fn={} round={} refined edx_hazards={:?}",
+                    func.name, round, edx_hazards_h
+                );
+            }
+            let mut assigned_this_round = 0usize;
+            for (reg, reg_hazards) in [(PhysReg(5), &edx_hazards_h), (PhysReg(4), &ecx_hazards_h)] {
+                if !config.caller_saved_regs.contains(&reg) {
+                    continue;
+                }
+                let holders: Vec<(u32, u32)> = assignments
+                    .iter()
+                    .filter(|(_, &r)| r == reg)
+                    .filter_map(|(&v, _)| iv_map.get(&v).copied())
+                    .collect();
+                if round == 0 && env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let holders_dbg: Vec<String> = assignments
+                        .iter()
+                        .filter(|(_, &r)| r == reg)
+                        .filter_map(|(&v, _)| {
+                            iv_map
+                                .get(&v)
+                                .map(|iv| format!("v{}[{}..{}]", v, iv.0, iv.1))
+                        })
+                        .collect();
+                    eprintln!(
+                        "[RA-P2h] fn={} reg={:?} holders={:?}",
+                        func.name, reg, holders_dbg
+                    );
+                }
+                let intervals: Vec<LiveInterval> = scan_ivs
+                    .iter()
+                    .copied()
+                    .filter(|iv| {
+                        !assignments.contains_key(&iv.value_id)
+                            && !call_spanning.contains(&iv.value_id)
+                            && !scratch_denied.contains(&iv.value_id)
+                            && (x86_ordered_param_copies
+                                || !param_restricted.contains(&iv.value_id))
+                    })
+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
+                    .filter(|iv| {
+                        !holders
+                            .iter()
+                            .any(|&h| intervals_overlap((iv.start, iv.end), h))
+                    })
+                    .collect();
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    #[allow(unused_mut)]
+                    let mut unassigned: Vec<String> = scan_ivs
+                        .iter()
+                        .filter(|iv| {
+                            !assignments.contains_key(&iv.value_id)
+                                && !call_spanning.contains(&iv.value_id)
+                                && !scratch_denied.contains(&iv.value_id)
+                                && (x86_ordered_param_copies
+                                    || !param_restricted.contains(&iv.value_id))
+                        })
+                        .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
+                        .collect();
+                    let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+                    eprintln!(
+                        "[RA-P2h] fn={} round={} reg={:?} unassigned={:?} candidates={:?}",
+                        func.name, round, reg, unassigned, cands
+                    );
+                }
+                if intervals.is_empty() {
+                    continue;
+                }
+                let ranges = build_gpr_ranges(&intervals);
+                let mut alloc = LinearScanAllocator::new(ranges, vec![reg]);
+                alloc.run();
+                for (vid, r) in alloc.assignments {
+                    assignments.insert(vid, r);
+                    caller_used_regs_set.insert(r.0);
+                    assigned_this_round += 1;
+                }
+            }
+            propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+            if assigned_this_round == 0 {
+                break;
+            }
+            if env_on("CCC_DEBUG_RA_INTERVALS") {
+                eprintln!(
+                    "[RA-P2h] fn={} round={} assigned={}",
+                    func.name, round, assigned_this_round
+                );
+            }
+        }
+    }
+
     // Phase 2f (all targets): fill holes in ALREADY-SAVED callee registers
     // using the CFG-aware liveness segments. The primary scan deliberately
     // retains one fat [def,last_use] interval per value, which is simple but
@@ -2504,7 +3225,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             eprintln!("[RA-SEGMENT-FILL] fn={} added={}", func.name, added);
         }
     }
-
 
     if env_on("CCC_DEBUG_RA") {
         let mut v: Vec<(u32, u8)> = assignments.iter().map(|(k, r)| (*k, r.0)).collect();
@@ -4156,7 +4876,8 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::RoundScalarF32(_)
                         | O::CopysignF64
                         | O::CopysignF32
-                ) => {
+                ) =>
+                {
                     f64_values.insert(d.0);
                 }
                 _ => {}
@@ -4308,6 +5029,27 @@ fn collect_i686_scratch_hazard_points(
     wide: &FxHashSet<u32>,
     ecx_clean_load_ptrs: &FxHashSet<u32>,
 ) -> (Vec<u32>, Vec<u32>) {
+    collect_i686_scratch_hazard_points_refined(func, wide, ecx_clean_load_ptrs, None)
+}
+
+/// Assignment-aware hazard refinement (Phase 2h). `assignments` carries the
+/// CURRENT register homes; when present, two conservative-hazard classes are
+/// refined:
+///
+/// (a) Div/Rem with a register-homed divisor (∉ {edx,eax} — div_rhs_direct_ref's
+///     contract): the emitter reads the divisor directly (`divl %reg`), so the
+///     point is %ecx-clean. Constant divisors always stage through %ecx
+///     (-Os) or take the magic-number path (-O2+) — never clean.
+/// (b) gpr32 Loads whose pointer is a GetElementPtr: %edx-clean. Both the
+///     folded indexed form (a single instruction) and the GEP-materialising
+///     fallback (staging through %eax/%ecx) leave %edx untouched — unless
+///     the load's DEST is homed in %edx (the store-to-home writes it).
+fn collect_i686_scratch_hazard_points_refined(
+    func: &IrFunction,
+    wide: &FxHashSet<u32>,
+    ecx_clean_load_ptrs: &FxHashSet<u32>,
+    assignments: Option<&FxHashMap<u32, PhysReg>>,
+) -> (Vec<u32>, Vec<u32>) {
     use crate::ir::reexports::{IrBinOp, IrUnaryOp};
     let mut ecx: Vec<u32> = Vec::new();
     let mut edx: Vec<u32> = Vec::new();
@@ -4318,6 +5060,16 @@ fn collect_i686_scratch_hazard_points(
     // Conservative constant-RHS rule keeps the RA model a subset of what the
     // emitter will actually fuse.
     let divrem_pairs = compute_i686_divrem_pairs(func, false);
+
+    // Values defined by a GetElementPtr (refinement (b)).
+    let mut gep_defined: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::GetElementPtr { dest, .. } = inst {
+                gep_defined.insert(dest.0);
+            }
+        }
+    }
 
     // Allocas with alignment ≤ 16 resolve to SlotAddr::Direct.
     // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
@@ -4365,7 +5117,8 @@ fn collect_i686_scratch_hazard_points(
             let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
             let (ecx_clean, edx_clean) = match inst {
                 Instruction::BinOp { op, ty, rhs, .. }
-                    if is_gpr32(ty) && divrem_tail
+                    if is_gpr32(ty)
+                        && divrem_tail
                         && matches!(
                             op,
                             IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
@@ -4383,9 +5136,38 @@ fn collect_i686_scratch_hazard_points(
                     | IrBinOp::Shl
                     | IrBinOp::AShr
                     | IrBinOp::LShr => (const_imm(rhs), true),
+                    IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                        // Refinement (a): a register-homed divisor (∉
+                        // {edx,eax}) is read directly (`divl %reg`) — the
+                        // point is %ecx-clean. %edx always receives the
+                        // remainder/quotient write. Constant divisors stage
+                        // through %ecx (or go magic) — never clean.
+                        let direct_divisor = match (rhs, assignments) {
+                            (Operand::Value(rv), Some(asg)) => {
+                                asg.get(&rv.0).is_some_and(|&p| p.0 != 5 && p.0 != 6)
+                            }
+                            _ => false,
+                        };
+                        (direct_divisor, false)
+                    }
                     _ => (false, false),
                 },
                 Instruction::Cmp { ty, rhs, .. } if is_gpr32(ty) => (const_imm(rhs), true),
+                // gpr32↔gpr32 casts stage only through %eax: the same-size
+                // kinds are pure no-ops (Noop / UnsignedToSignedSameSize emit
+                // nothing; coalesced members never even reach here) and the
+                // narrowing kinds are sub-register movs{x}l/movz{x}l on %eax,
+                // all wrapped in operand_to_eax/store_eax_to. The old
+                // catch-all (false, false) marked vsprintf number()'s two
+                // U32→I32 casts as %edx hazards inside the digit loop and
+                // kept the URem remainder (the folded load's natural index,
+                // born in %edx at the fused div) out of its own birth
+                // register.
+                Instruction::Cast { from_ty, to_ty, .. }
+                    if is_gpr32(from_ty) && is_gpr32(to_ty) =>
+                {
+                    (true, true)
+                }
                 Instruction::Copy { dest, src } => match src {
                     Operand::Value(v) => {
                         let c = !wide.contains(&v.0) && !wide.contains(&dest.0);
@@ -4413,6 +5195,7 @@ fn collect_i686_scratch_hazard_points(
                 Instruction::Load {
                     ty,
                     ptr,
+                    dest,
                     seg_override,
                     ..
                 } if is_gpr32(ty) => {
@@ -4428,7 +5211,20 @@ fn collect_i686_scratch_hazard_points(
                     let clean = (direct_allocas.contains(&ptr.0)
                         || ecx_clean_load_ptrs.contains(&ptr.0))
                         && *seg_override == crate::common::types::AddressSpace::Default;
-                    (clean, true)
+                    // Refinement (b): a GEP-pointer load leaves %edx
+                    // untouched — the folded indexed form is a single
+                    // instruction and the GEP-materialising fallback stages
+                    // through %eax/%ecx — unless the load's DEST is homed in
+                    // %edx (the store-to-home writes it).
+                    let edx_clean = if gep_defined.contains(&ptr.0) {
+                        match assignments {
+                            Some(asg) => asg.get(&dest.0) != Some(&PhysReg(5)),
+                            None => false, // dest homes unknown: conservative
+                        }
+                    } else {
+                        true
+                    };
+                    (clean, edx_clean)
                 }
                 Instruction::Store {
                     ty,
@@ -5259,7 +6055,8 @@ mod phi_coalesce_tests {
         // Reduced from gcc.c-torture/execute/pr51933.c after GVN merged two
         // `i + 1` values.  The backend may fold the GEP into Store, so the
         // address dependency on old `i` remains live past the next-IV def.
-        let mut func = IrFunction::new("deferred_gep_index".to_string(), IrType::I32, vec![], false);
+        let mut func =
+            IrFunction::new("deferred_gep_index".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
                 0,
