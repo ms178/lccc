@@ -118,4 +118,40 @@ echo "================================================================"
 echo "regression suite: PASS=$pass FAIL=$fail SKIP=$skip (AB-diff failures: $ab_fail)"
 if [[ ${#FAILED[@]} -gt 0 ]]; then printf 'failed: %s\n' "${FAILED[@]}"; fi
 echo "================================================================"
+
+# ── 32 KiB boot-code size gate (the e12597c7 lesson: a size regression in
+# the boot path went unnoticed for sessions because nothing measured it).
+# Metric: pre-pecompat content end ≤ 24,576 (the alignment-cliff boundary;
+# `.pecompat` forces 4096 alignment, so `_end` jumps in 4 KiB steps and
+# hides progress inside a step). Skipped entirely when the prepared kernel
+# tree is absent (bare CI containers) — a skip is reported, not a pass.
+if [[ -n "${KERNEL_DIR:-}" && -f "$KERNEL_DIR/arch/x86/boot/printf.c" ]]; then
+    boot_out="$WORK/bootgate"
+    # build_kernel_boot.sh exits non-zero when the 32 KiB gate itself fails —
+    # that is a MEASUREMENT, not a build error; parse the log either way.
+    boot_log=$(KERNEL_DIR="$KERNEL_DIR" \
+               LCCC="$REPO/target/fastbuild/lccc" \
+               LCCC_LD="$REPO/target/fastbuild/lccc-ld" \
+               OUT="$boot_out" \
+               timeout 600 bash "$REPO/scripts/build_kernel_boot.sh" 2>&1 || true)
+    text_size=$(echo "$boot_log" | awk '$1 == ".text" && $2 ~ /^[0-9]+$/ {s=$2} END {print s}')
+    if [[ -z "$text_size" ]]; then
+        echo "boot gate: FAIL (no .text measurement — build errored)"
+        echo "$boot_log" | tail -5
+        fail=$((fail+1))
+    else
+        # content_end = 1,166 (bstext..initdata) + .text + 30 (.text32)
+        content_end=$(( 1166 + text_size + 30 ))
+        if (( content_end <= 24576 )); then
+            echo "boot gate: PASS (pre-pecompat end $content_end ≤ 24,576; .text $text_size)"
+        else
+            echo "boot gate: FAIL (pre-pecompat end $content_end > 24,576; .text $text_size)"
+            echo "          .text budget: ≤ 23,380 — see updates/followup_2026-08-27_session06.md §3"
+            fail=$((fail+1))
+        fi
+    fi
+else
+    echo "boot gate: SKIP (KERNEL_DIR not set or tree not prepared)"
+fi
+
 [[ $fail -eq 0 ]]

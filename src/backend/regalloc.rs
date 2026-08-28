@@ -56,6 +56,31 @@ pub fn analyze_accumulator_assignments(
         return Vec::new();
     }
 
+    // Fused div/rem pair tails emit no code — their dest is NOT staged into
+    // the accumulator at its IR def point (it was stored by the head). An
+    // accumulator chain starting from a tail dest would let the consumer
+    // read a stale %eax.
+    let divrem = compute_i686_divrem_pairs(func, false);
+    if !divrem.tail_dests.is_empty() {
+        let filtered: Vec<u32> = candidates
+            .into_iter()
+            .filter(|c| !divrem.tail_dests.contains(c))
+            .collect();
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+        return analyze_accumulator_assignments_impl(func, policy, &filtered);
+    }
+    analyze_accumulator_assignments_impl(func, policy, &candidates.into_iter().collect::<Vec<u32>>())
+}
+
+fn analyze_accumulator_assignments_impl(
+    func: &IrFunction,
+    policy: AccumulatorPolicy,
+    candidates: &[u32],
+) -> Vec<AccumulatorAssignment> {
+    let candidates: Vec<u32> = candidates.to_vec();
+
     let mut defs: FxHashMap<u32, u32> = FxHashMap::default();
     let mut uses: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut pp = 0u32;
@@ -375,6 +400,208 @@ fn spans_any_call(iv: &LiveInterval, call_points: &[u32]) -> bool {
 fn overlaps_inclusive(iv: &LiveInterval, points: &[u32]) -> bool {
     let idx = points.partition_point(|&p| p < iv.start);
     idx < points.len() && points[idx] <= iv.end
+}
+
+/// Like `overlaps_inclusive`, but hazards at the interval's OWN definition
+/// point are birth, not clobber: every emitter shape stages its early writes
+/// (scratch relays, `%ecx` pointer materialisation) BEFORE the final
+/// destination write that constitutes the value's birth, so a hazard exactly
+/// at `iv.start` can never destroy a value that does not exist yet. This is
+/// what lets a `divl`-born remainder claim `%edx` and a GEP-born pointer
+/// claim `%ecx` across their own defining instruction.
+#[inline]
+fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
+    let idx = points.partition_point(|&p| p < iv.start);
+    // Skip a hazard exactly at the def point (birth), then require any
+    // remaining hazard to fall within (start, end].
+    let mut idx = idx;
+    if idx < points.len() && points[idx] == iv.start {
+        idx += 1;
+    }
+    idx < points.len() && points[idx] <= iv.end
+}
+
+// ── i686 div/rem same-block pair analysis ────────────────────────────────────
+
+/// Deterministic div/rem pair analysis shared by the i686 emitter and the
+/// register allocator's hazard scan. Both derive it from the same IR, so the
+/// two views can never disagree.
+///
+/// A pair is a `URem`/`UDiv` (or `SRem`/`SDiv`) couple in the SAME block with
+/// IDENTICAL operands. One `divl`/`idivl` computes both results: the head
+/// (first in emission order) emits the division and stores BOTH results
+/// immediately — its own from its natural output register (`%edx` for rem,
+/// `%eax` for div) and the partner's from the other output — while the tail
+/// emits NOTHING (its result was already stored at the head). Soundness does
+/// not depend on what lies between the two instructions: SSA operands cannot
+/// change, and both stores happen at the head, before anything else runs.
+///
+/// `allow_const_rhs` covers the constant-divisor strength-reduction path: at
+/// -O2 the emitter replaces constant divisions with magic-number sequences
+/// that never execute `divl`, so those pairs must not fuse. At -Os the magic
+/// path is disabled and constant pairs are legal. The register allocator
+/// always passes `false` — a tail it models as "emits nothing" must be one
+/// whose head provably emits the real division (non-constant RHS pairs never
+/// take the magic path, so they can never break).
+///
+/// The greedy pairing is order-stable: scanning forward, each still-unpaired
+/// division pairs with the next unpaired compatible division in the same
+/// block. Compatibility requires identical `lhs`/`rhs` operands and matching
+/// signedness (`URem` with `UDiv`/`URem`, `SRem` with `SDiv`/`SRem`); mixing
+/// flavours would change the executed instruction.
+pub(crate) struct I686DivRemPairs {
+    /// Dest value-ids of tail instructions — the emitter skips them entirely.
+    pub tail_dests: FxHashSet<u32>,
+    /// Head dest value-id -> (partner dest, partner result is the quotient in
+    /// `%eax`). `false` means the partner wants the remainder in `%edx`.
+    pub head_partners: FxHashMap<u32, (u32, bool)>,
+    /// `(block_idx, inst_idx)` of tail instructions, for the hazard scan
+    /// (which numbers program points with the same walk).
+    pub tail_points: FxHashSet<(usize, usize)>,
+    /// Tail dest value-id -> the head's PROGRAM POINT. The tail's result is
+    /// physically born at the head (dual-store); liveness intervals for tail
+    /// dests must start there, or register homes / stack slots could be
+    /// shared with values living between head and tail.
+    pub head_point_of_tail: FxHashMap<u32, u32>,
+}
+
+pub(crate) fn compute_i686_divrem_pairs(
+    func: &IrFunction,
+    allow_const_rhs: bool,
+) -> I686DivRemPairs {
+    let mut pairs = I686DivRemPairs {
+        tail_dests: FxHashSet::default(),
+        head_partners: FxHashMap::default(),
+        tail_points: FxHashSet::default(),
+        head_point_of_tail: FxHashMap::default(),
+    };
+    if std::env::var_os("CCC_NO_IR_DIVREM").is_some() {
+        return pairs;
+    }
+
+    // Program-point numbering identical to liveness/the hazard scan:
+    // one point per instruction, one per terminator.
+    let mut block_start: Vec<u32> = Vec::with_capacity(func.blocks.len());
+    let mut pt = 0u32;
+    for block in &func.blocks {
+        block_start.push(pt);
+        pt += block.instructions.len() as u32 + 1;
+    }
+
+    let is_gpr32_ty = |ty: &IrType| {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    };
+    let div_flavor = |op: IrBinOp| -> Option<bool> {
+        // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
+        match op {
+            IrBinOp::UDiv | IrBinOp::SDiv => Some(true),
+            IrBinOp::URem | IrBinOp::SRem => Some(false),
+            _ => None,
+        }
+    };
+    let is_signed = |op: IrBinOp| matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        // Collect this block's div-like instructions.
+        let mut cands: Vec<(usize, IrBinOp, &Operand, &Operand, bool, u32)> = Vec::new();
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::BinOp {
+                dest,
+                op,
+                ty,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            {
+                if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
+                    // Constant-RHS divisions only pair when the caller has
+                    // established the magic path is off (see doc comment).
+                    let rhs_ok = allow_const_rhs || !matches!(rhs, Operand::Const(_));
+                    if rhs_ok {
+                        cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
+                    }
+                }
+            }
+        }
+        if cands.len() < 2 {
+            continue;
+        }
+        let mut used = vec![false; cands.len()];
+        for i in 0..cands.len() {
+            if used[i] {
+                continue;
+            }
+            let (_, _, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
+            // Nearest unused compatible partner ahead in this block.
+            let mut mate: Option<usize> = None;
+            for j in (i + 1)..cands.len() {
+                if used[j] {
+                    continue;
+                }
+                let (_, _, lhs_j, rhs_j, signed_j, _) = &cands[j];
+                if signed_i == signed_j && lhs_i == lhs_j && rhs_i == rhs_j {
+                    mate = Some(j);
+                    break;
+                }
+            }
+            let Some(j) = mate else { continue };
+            used[i] = true;
+            used[j] = true;
+            let (_, op_j, _, _, _, dest_j) = &cands[j];
+            // Head = i (earlier), tail = j. The partner's result register:
+            // quotient ops read %eax, remainder ops read %edx.
+            let partner_from_eax = div_flavor(*op_j) == Some(true);
+            pairs.head_partners.insert(*dest_i, (*dest_j, partner_from_eax));
+            pairs.tail_dests.insert(*dest_j);
+            pairs.tail_points.insert((bi, cands[j].0));
+            pairs
+                .head_point_of_tail
+                .insert(*dest_j, block_start[bi] + cands[i].0 as u32);
+        }
+    }
+    pairs
+}
+
+/// DivRem pair tails are physically born at their HEAD's program point (the
+/// head's dual-store writes the tail's dest register/slot). Every consumer
+/// of liveness — register homes, stack-slot sharing, coalescing — must see
+/// the tail dest live from the head onward, otherwise the home/slot can be
+/// handed to another value in the head..tail window and silently clobbered.
+/// This patches both the fat intervals and the hole-aware segments, then
+/// restores the segments' `(start, value_id)` sort order.
+fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
+    let pairs = compute_i686_divrem_pairs(func, false);
+    if pairs.head_point_of_tail.is_empty() {
+        return;
+    }
+    let head_of = &pairs.head_point_of_tail;
+    for iv in &mut liveness.intervals {
+        if let Some(&hp) = head_of.get(&iv.value_id) {
+            if hp < iv.start {
+                iv.start = hp;
+            }
+        }
+    }
+    for seg in &mut liveness.segments {
+        if let Some(&hp) = head_of.get(&seg.value_id) {
+            if hp < seg.start {
+                seg.start = hp;
+            }
+        }
+    }
+    liveness
+        .segments
+        .sort_by(|a, b| (a.start, a.value_id).cmp(&(b.start, b.value_id)));
 }
 
 fn loop_weight(depth: u32) -> u64 {
@@ -699,6 +926,51 @@ fn build_coalesce_groups(
         root
     }
 
+    // Copy-latch webs (phi-elim form): a Copy destination with 2+
+    // definitions is a phi-elim latch. When the latch Copy{V <- s} sits
+    // IMMEDIATELY after s's defining instruction, s's def consumed V's old
+    // incarnation (it reads V) and s dies at the copy — s may share V's
+    // home, so `flags |= X` lowers to `orl $X, %reg` instead of a
+    // 3-instruction relay through a second register. Adjacency is the
+    // soundness anchor: with anything between s's def and the copy, a use
+    // of V's OLD incarnation could sit inside s's live range.
+    let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                *def_count.entry(dest.0).or_insert(0) += 1;
+            }
+            if let Instruction::Copy { dest, .. } = inst {
+                copy_dests.insert(dest.0);
+            }
+        }
+    }
+    let latch_dests: FxHashSet<u32> = copy_dests
+        .into_iter()
+        .filter(|v| def_count.get(v).copied().unwrap_or(0) > 1)
+        .collect();
+    let mut latch_same_value: FxHashSet<(u32, u32)> = FxHashSet::default();
+    if !latch_dests.is_empty() {
+        for block in &func.blocks {
+            for w in block.instructions.windows(2) {
+                if let (prev, Instruction::Copy {
+                    dest: d,
+                    src: Operand::Value(s),
+                }) = (&w[0], &w[1])
+                {
+                    if latch_dests.contains(&d.0) {
+                        if let Some(pd) = prev.dest() {
+                            if pd.0 == s.0 {
+                                latch_same_value.insert((d.0, s.0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Copy {
@@ -731,7 +1003,12 @@ fn build_coalesce_groups(
                     // edge may overlap and still share one home — exactly the
                     // no-op-cast relaxation. This collapses switch-state and
                     // loop-carried webs onto a single register/slot.
-                    if phi_operands.contains(&d) || phi_dests.contains(&s) {
+                    // Adjacent copy-latch edges are the same story in the
+                    // phi-elim form (see latch_same_value above).
+                    if phi_operands.contains(&d)
+                        || phi_dests.contains(&s)
+                        || latch_same_value.contains(&(d, s))
+                    {
                         same_value_edges.insert((d, s));
                     }
                 }
@@ -780,11 +1057,25 @@ fn build_coalesce_groups(
                     && load_def_types.get(&v.0).map(|&(ty, _)| ty) == Some(*from_ty)
                     && load_uses >= 2;
                 let (d, s) = (dest.0, v.0);
+                // ParamRef sources: the loop-carried-Copy rationale (the
+                // param's ABI home dies at a redefining Copy while the loop
+                // copy wants its own register) does NOT apply to a no-op
+                // same-width cast — the cast is a pure value-preserving view
+                // of an UNCHANGED parameter, so sharing the param's home is
+                // exactly the intended shape (number()'s `(u32)base` reading
+                // %edi directly at both div sites). Keep the exclusion for
+                // the sub-word widen case: there the source is a load whose
+                // register economics the ParamRef guard was protecting.
+                let src_ok = if noop32 {
+                    true
+                } else {
+                    !param_ref_values.contains(&s)
+                };
                 if (noop32 || widen_from_load)
                     && d != s
                     && eligible.contains(&d)
                     && eligible.contains(&s)
-                    && !param_ref_values.contains(&s)
+                    && src_ok
                 {
                     parent.entry(d).or_insert(d);
                     parent.entry(s).or_insert(s);
@@ -918,6 +1209,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let is_32bit = crate::common::types::target_is_32bit();
     let mut liveness = compute_live_intervals(func);
+    // DivRem pair tails are physically born at their head's dual-store;
+    // extend their intervals before ANY interval map is derived. Without
+    // this, homes/slots in the head..tail window get double-assigned.
+    patch_divrem_tail_intervals(func, &mut liveness);
     // Extend live intervals for backend-folded index consumers BEFORE any
     // interval map is derived (see RegAllocConfig::folded_index_uses).
     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
@@ -1378,7 +1673,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     .iter()
                     .copied()
                     .filter(|iv| base_ok(&assignments, iv))
-                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .collect();
                 if env_on("CCC_DEBUG_RA_INTERVALS") {
                     let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
@@ -1692,7 +1987,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             && (x86_ordered_param_copies
                                 || !param_restricted.contains(&iv.value_id))
                     })
-                    .filter(|iv| !overlaps_inclusive(iv, reg_hazards))
+                    .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .filter(|iv| {
                         !holders
                             .iter()
@@ -4018,6 +4313,12 @@ fn collect_i686_scratch_hazard_points(
     let mut edx: Vec<u32> = Vec::new();
     let mut point: u32 = 0;
 
+    // Same-block div/rem pair tails emit no code (the head stored both
+    // results); see compute_i686_divrem_pairs for the soundness model.
+    // Conservative constant-RHS rule keeps the RA model a subset of what the
+    // emitter will actually fuse.
+    let divrem_pairs = compute_i686_divrem_pairs(func, false);
+
     // Allocas with alignment ≤ 16 resolve to SlotAddr::Direct.
     // Mirrors slot_assignment.rs: alloca_alignments only records > 16.
     let mut direct_allocas: FxHashSet<u32> = FxHashSet::default();
@@ -4053,9 +4354,25 @@ fn collect_i686_scratch_hazard_points(
         ) || matches!(op, Operand::Const(IrConst::I64(v)) if *v >= i32::MIN as i64 && *v <= i32::MAX as i64)
     };
 
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            // Fused same-block div/rem pairs: the TAIL instruction emits
+            // nothing (its result was stored by the head's dual-store
+            // emission earlier in the block), so it is a hazard for neither
+            // %ecx nor %edx. Conservative constant rule: only non-constant
+            // RHS pairs — those can never fall back to the magic-number
+            // path that would break the fusion.
+            let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
             let (ecx_clean, edx_clean) = match inst {
+                Instruction::BinOp { op, ty, rhs, .. }
+                    if is_gpr32(ty) && divrem_tail
+                        && matches!(
+                            op,
+                            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                        ) =>
+                {
+                    (true, true)
+                }
                 Instruction::BinOp { op, ty, rhs, .. } if is_gpr32(ty) => match op {
                     IrBinOp::Add
                     | IrBinOp::Sub

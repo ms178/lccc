@@ -69,11 +69,34 @@ impl I686Codegen {
         };
         let rlo_imm = rlo.starts_with('$');
         let rhi_imm = rhi.starts_with('$');
+        // Zero-extended RHS (a u8/u16/u32/ptr value widened to 64 bits): the
+        // high half is provably zero at the IR level, regardless of what the
+        // widening cast's slot machinery wrote there. This is the parser hot
+        // shape `res = res * base + val`: the alo*bhi cross product vanishes
+        // and the carry becomes an immediate 0 (GCC's imull/mull/addl/adcl
+        // $0 chain).
+        let rhs_zero_hi = rhi_imm && rhi == "$0"
+            || matches!(rhs, Operand::Value(v) if self.zext_wide_values.contains(&v.0));
 
         match op {
             IrBinOp::Mul => {
                 self.emit_load_acc_pair(lhs);
-                if !rlo_imm {
+                if rhs_zero_hi {
+                    // bhi = 0: alo*bhi and its accumulation vanish.
+                    if !rlo_imm {
+                        self.state.emit("    movl %edx, %ecx");
+                        emit!(self.state, "    imull {}, %ecx", rlo); // ahi*blo
+                        emit!(self.state, "    mull {}", rlo); // eax:edx = alo*blo
+                        self.state.emit("    addl %ecx, %edx");
+                    } else {
+                        let blo = rlo.trim_start_matches('$');
+                        self.state.emit("    movl %edx, %ecx");
+                        emit!(self.state, "    imull ${}, %ecx", blo); // ahi*blo
+                        emit!(self.state, "    movl ${}, %edx", blo);
+                        self.state.emit("    mull %edx"); // eax:edx = alo*blo
+                        self.state.emit("    addl %ecx, %edx");
+                    }
+                } else if !rlo_imm {
                     // Memory RHS: every product reads its operand directly —
                     // no stack staging at all.
                     self.state.emit("    movl %edx, %ecx");
@@ -106,7 +129,13 @@ impl I686Codegen {
                     ("subl", "sbbl")
                 };
                 emit!(self.state, "    {} {}, %eax", mn, rlo);
-                emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
+                if rhs_zero_hi {
+                    // High half of the RHS is provably 0: carry with the
+                    // 3-byte immediate form instead of a memory operand.
+                    emit!(self.state, "    {} $0, %edx", mn_carry);
+                } else {
+                    emit!(self.state, "    {} {}, %edx", mn_carry, rhi);
+                }
             }
             IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
                 self.emit_load_acc_pair(lhs);
@@ -117,9 +146,10 @@ impl I686Codegen {
                 };
                 // Identity folding: x&0 / x|0 / x^0 = skip (zero-AND writes
                 // zero, so emit `xorl reg,reg` for the 2-byte form); x&-1 /
-                // x|-1 / x^-1 likewise reduce.
+                // x|-1 / x^-1 likewise reduce. A zero-extended VALUE RHS has
+                // the same $0 high half by construction.
                 let zero_lo = rlo_imm && rlo == "$0";
-                let zero_hi = rhi_imm && rhi == "$0";
+                let zero_hi = (rhi_imm && rhi == "$0") || rhs_zero_hi;
                 let m1_lo = rlo_imm && rlo == "$-1";
                 let m1_hi = rhi_imm && rhi == "$-1";
                 if op == IrBinOp::And {
