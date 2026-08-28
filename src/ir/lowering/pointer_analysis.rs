@@ -482,16 +482,30 @@ impl Lowerer {
     /// Get the address space of a pointer expression (e.g., `__seg_gs` from a
     /// `typeof(x) __seg_gs *` cast). Returns `AddressSpace::Default` if unknown
     /// or the expression is not a pointer with a named address space.
+    ///
+    /// Named address spaces live on the *object*, not only on pointer types.
+    /// Linux `this_cpu_read_const(pcp)` expands to `*(typeof(pcp) *)&(pcp)`:
+    /// `typeof` currently drops `__seg_gs` so the cast type is a generic
+    /// pointer, but the operand is still `&pcp` of a GS/FS variable. Walk
+    /// through Default-space casts to the address-of operand so the load
+    /// keeps the `%gs:`/`%fs:` prefix (direct `return pcp` already does).
     pub(super) fn get_addr_space_of_ptr_expr(&self, expr: &Expr) -> AddressSpace {
-        // Try CType-based resolution first
         if let Some(CType::Pointer(_, addr_space)) = self.get_expr_ctype(expr) {
-            return addr_space;
+            if addr_space != AddressSpace::Default {
+                return addr_space;
+            }
         }
-        // For cast expressions, check the target type directly
-        if let Expr::Cast(TypeSpecifier::Pointer(_, addr_space), _, _) = expr {
-            return *addr_space;
+        match expr {
+            Expr::Cast(TypeSpecifier::Pointer(_, addr_space), inner, _) => {
+                if *addr_space != AddressSpace::Default {
+                    return *addr_space;
+                }
+                self.get_addr_space_of_ptr_expr(inner)
+            }
+            Expr::Cast(_, inner, _) => self.get_addr_space_of_ptr_expr(inner),
+            Expr::AddressOf(inner, _) => self.get_addr_space_of_struct_expr(inner),
+            _ => AddressSpace::Default,
         }
-        AddressSpace::Default
     }
 
     /// Get the address space of a struct/union variable expression (for `.` member access).

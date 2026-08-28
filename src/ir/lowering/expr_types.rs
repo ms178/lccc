@@ -1495,9 +1495,12 @@ impl Lowerer {
                 None
             }
             Expr::AddressOf(inner, _) => {
-                // Address-of wraps in Pointer
+                // Address-of wraps in Pointer. Named address spaces (`__seg_gs`
+                // / `__seg_fs`) qualify the object, so `&gs_var` is
+                // `T __seg_gs *`, not a generic pointer.
                 if let Some(inner_ct) = self.get_expr_ctype(inner) {
-                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
+                    let space = self.get_addr_space_of_struct_expr(inner);
+                    return Some(CType::Pointer(Box::new(inner_ct), space));
                 }
                 None
             }
@@ -1883,7 +1886,8 @@ impl Lowerer {
                     .get_expr_ctype(inner)
                     .or_else(|| self.get_expr_ctype_with_scope(inner, scope))
                 {
-                    return Some(CType::Pointer(Box::new(inner_ct), AddressSpace::Default));
+                    let space = self.get_addr_space_of_struct_expr(inner);
+                    return Some(CType::Pointer(Box::new(inner_ct), space));
                 }
                 None
             }
