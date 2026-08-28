@@ -11,13 +11,22 @@
 //! `state.requires_executable_stack`):
 //!
 //! ```text
-//! +0:  58000072   ldr x18, [pc, #12]   ; chain from literal at +16
-//! +4:  58000091   ldr x17, [pc, #16]   ; func  from literal at +24
+//! +0:  58000092   ldr x18, [pc, #16]   ; chain from literal at +16
+//! +4:  580000b1   ldr x17, [pc, #20]   ; func  from literal at +24
 //! +8:  d61f0220   br  x17
 //! +12: d503201f   nop                  (keeps the literals 8-byte aligned)
 //! +16: <chain value, 8 bytes>
 //! +24: <function address, 8 bytes>
 //! ```
+//!
+//! (The original words encoded imm19 = 3/4 — byte offsets 12/20 from the
+//! instruction — so both loads read four bytes short of their literals and
+//! every address-taken chain-using nested call jumped through garbage.
+//! Found by diffing qemu's trampoline disassembly against the stored
+//! words; the x17 encoding now matches GCC 14.2's emitted trampoline
+//! byte-for-byte. GCC additionally prefixes `bti c` because GCC binaries
+//! are BTI-marked; lccc does not yet emit .note.gnu.property BTI, so the
+//! landing pad is unnecessary here — revisit together with BTI support.)
 //!
 //! The `ldr (literal)` forms make the trampoline position-independent:
 //! pc-relative data requires no relocation patching at runtime, and no
@@ -79,8 +88,8 @@ impl ArmCodegen {
         }
         // 4. Code words (encodings derived in the module docs).
         const CODE: [(i64, u32); 4] = [
-            (0, 0x5800_0072), // ldr x18, [pc, #12]
-            (4, 0x5800_0091), // ldr x17, [pc, #16]
+            (0, 0x5800_0092), // ldr x18, [pc, #16] -> chain literal at +16
+            (4, 0x5800_00B1), // ldr x17, [pc, #20] -> func literal at +24
             (8, 0xD61F_0220), // br x17
             (12, 0xD503_201F), // nop
         ];

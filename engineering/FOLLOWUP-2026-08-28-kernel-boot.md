@@ -200,3 +200,32 @@ real-mode setup.
   `/home/user/build-lccc5.log`.
 * Boot logs: `/tmp/boot-gcc.log` (working GCC boot, 157 lines), `/tmp/bisect/o.*.log`.
 * Auto-saved patch: `/home/user/ms178-1.patch` (snapshot S05).
+
+## Session S10 (c5623a76) — trampoline + unroll defects fixed, two pre-existing ARM fails retired
+
+- **nested_functions (rc=139) FIXED** (fd4bfd9b, 2 defects): (1) AArch64 trampoline
+  `ldr (literal)` imm19 values were word-offsets, not byte/4 — x18 read the nop pad
+  at +12, x17 read half the chain at +20; correct words 0x5800_0092/0x5800_00B1
+  (data at +16/+24; x17 word byte-identical to GCC 14.2). (2) The builtin AArch64
+  linker hardcoded RW PT_GNU_STACK; trampoline units emit `.note.GNU-stack,"x"` and
+  the emitters must OR input notes into PF_X (i686 already did). All three emitters
+  fixed; `bti c` still omitted until lccc emits .note.gnu.property (revisit with BTI).
+- **lea_sib_fold (45 18 vs 45 25) FIXED** (c5623a76): mid-end, in
+  `loop_unroll::do_unroll` — only the IV phi was threaded through the clone chain,
+  so other loop-carried phis (accumulators) read stale values in every clone, their
+  updates died, and k-1 of every k elements were dropped; the early-exit edges also
+  carried the preheader phi value. Fixes: carried-phi threading (clone j reads
+  clone j-1's renamed latch operand; header latch-incoming = last clone's copy),
+  correct per-edge values for header-fed exit phis, and step 5b inserting real exit
+  phis + post-exit reader rewrites when phis were already lowered (unique-def
+  invariant preserved — an explicit-copy variant was caught by
+  test_value_ids_unique_after_unroll and replaced).
+- Gates: lib 1282/0 (-D warnings); ARM 379/93 A/B vs 377/95 (fail set otherwise
+  identical); x86 corpus 508/0; check_* suite at its 5 documented pre-existing
+  fails; 4-backend differential (remainder shapes, IV-after-loop, multi-carried)
+  ALL OK; benchmark corpus instruction counts identical (6036→6036).
+- Oracle (artifacts/evidence/oracle-S10.md): peep probe lccc 34 insns vs GCC 16.1
+  48 (1.41x smaller); tramp probe words match GCC.
+- Open: i686 trampoline emitter audit (emit_init_trampoline_impl) for the same
+  hand-encoding bug class; ARM byte-loop shape thread; the 93-fail ARM corpus is
+  dominated by x86-artifact tests (harness may need arch filtering).

@@ -1852,6 +1852,32 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
     func.next_value_id = next_val;
 
     // ── Build new blocks (read-only access to func.blocks) ───────────────────
+    //
+    // Loop-carried phi threading: the IV phi is rethreaded through the
+    // exit-check chain by construction (iv_vals), but ANY OTHER header phi
+    // — a reduction accumulator, a marching pointer — must also advance one
+    // step per unrolled iteration. Without threading, every clone reads the
+    // phi's CURRENT value (the pre-iteration one), the clone's update
+    // becomes dead, DCE deletes it, and the loop silently skips k-1 of
+    // every k elements (lea_sib_fold: 45 18 instead of 45 25). Thread:
+    //   clone j reads prev_j(H), where prev_0(H) = H's latch-incoming
+    //   operand L0 (defined by the original body — the original body's
+    //   update), and prev_{j+1}(H) = clone_j's renamed copy of L0; and the
+    //   header phi's latch incoming becomes the last clone's copy.
+    let mut carried: Vec<(u32, Operand, IrType)> = Vec::new(); // (phi id, L0, ty)
+    for inst in &func.blocks[c.header].instructions {
+        if let Instruction::Phi { dest, incoming, ty } = inst {
+            if dest.0 == c.iv_phi.0 {
+                continue;
+            }
+            if let Some((op, lbl)) = incoming.iter().find(|(_, l)| *l == latch_label) {
+                if let Operand::Value(_) = op {
+                    carried.push((dest.0, op.clone(), ty.clone()));
+                }
+            }
+        }
+    }
+
     let mut new_blocks: Vec<BasicBlock> = Vec::new();
 
     for j in 0..num_new {
@@ -1933,12 +1959,45 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         for (i, &bi) in c.body_work.iter().enumerate() {
             let orig = &func.blocks[bi];
 
+            // Reads of carried phis in this clone see the previous
+            // iteration's update: L0 for clone 0 (the original body's
+            // result), clone j-1's renamed copy of L0 for clone j > 0.
+            let prev_carried: FxHashMap<u32, Operand> = carried
+                .iter()
+                .map(|(hid, l0, _ty)| {
+                    let prev = if j == 0 {
+                        l0.clone()
+                    } else {
+                        match l0 {
+                            Operand::Value(lv) => {
+                                match clone_vmaps[j - 1].get(&lv.0) {
+                                    Some(nv) => Operand::Value(Value(*nv)),
+                                    None => l0.clone(),
+                                }
+                            }
+                            other => other.clone(),
+                        }
+                    };
+                    (*hid, prev)
+                })
+                .collect();
+
+            // Rename order matters: the clone's own vmap first (it maps
+            // ORIGINAL body values, including L0, to this clone's copies —
+            // substituting the threaded prev value before that would let
+            // the vmap re-rename the injected value onto this clone's own
+            // id, producing self-referencing adds and killing the original
+            // body). The threaded prev values are final names from other
+            // blocks; substitute them after, untouched by this clone's map.
             let new_insts: Vec<Instruction> = orig
                 .instructions
                 .iter()
                 .map(|inst| {
                     let mut cloned = inst.clone();
                     replace_values_in_inst(&mut cloned, vmap);
+                    for (hid, prev) in &prev_carried {
+                        subst_value_with_operand(&mut cloned, *hid, prev);
+                    }
                     rename_inst_dest(&mut cloned, vmap);
                     cloned
                 })
@@ -1990,10 +2049,62 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
         }
     }
 
-    // Step 5: For any phi in the exit block that has an incoming from header,
-    // add the same value as incoming from each new exit-check block.
+    // Step 4b: retarget every carried header phi's latch incoming to the
+    // last clone's copy of the original body's update (the latch now runs
+    // after clone num_new-1, not after the original body).
+    for (hid, l0, _ty) in &carried {
+        if let Operand::Value(lv) = l0 {
+            if let Some(nv) = clone_vmaps[num_new - 1].get(&lv.0) {
+                for inst in &mut func.blocks[c.header].instructions {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        if dest.0 == *hid {
+                            for (op, lbl) in incoming.iter_mut() {
+                                if *lbl == latch_label {
+                                    *op = Operand::Value(Value(*nv));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 5: For any phi in the exit block that has an incoming from
+    // header, add the value that phi would hold on each new exit-check
+    // edge. Classification (this is NOT simply the header edge's operand —
+    // on the path preheader→header→body→exit_check→exit the header phi took
+    // its PREHEADER value, because its update rides the latch edge, which
+    // the early exit never takes; using the header operand here silently
+    // dropped the last executed body's contribution — lea_sib_fold printed
+    // 18 instead of 25 for the final remainder element):
+    //   * `Value(c.iv_phi)`: the check block itself computes iv_vals[j]
+    //     (prev + step) BEFORE the exit compare, so that value is live.
+    //   * `Value(v)` naming another header phi H (loop-carried
+    //     accumulator): the would-be update is H's latch-incoming operand;
+    //     on exit_check_j's edge the original body and clones 1..=j-1 have
+    //     executed, so the live copy is that operand renamed by clone
+    //     j-1's value map (unrenamed for j = 0 — the original body).
+    //   * anything else (constants, loop-invariant values): identical on
+    //     every path; reused as-is.
     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == c.exit_target) {
-        // Collect (phi_index, value) pairs where value came from the header.
+        // The header phis' latch-incoming operands, by value id.
+        let latch_incoming: FxHashMap<u32, Operand> = func.blocks[c.header]
+            .instructions
+            .iter()
+            .filter_map(|inst| {
+                if let Instruction::Phi { dest, incoming, .. } = inst {
+                    incoming
+                        .iter()
+                        .find(|(_, lbl)| *lbl == latch_label)
+                        .map(|(op, _)| (dest.0, op.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Collect (phi_index, header-incoming value) pairs.
         let phi_header_vals: Vec<(usize, Operand)> = func.blocks[exit_bi]
             .instructions
             .iter()
@@ -2011,14 +2122,168 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             .collect();
 
         for (phi_idx, op) in phi_header_vals {
+            // Per-edge incoming for this exit phi.
+            let edge_val = |j: usize| -> Operand {
+                match op {
+                    Operand::Value(v) if v == c.iv_phi => Operand::Value(iv_vals[j]),
+                    Operand::Value(v) => {
+                        match latch_incoming.get(&v.0) {
+                            Some(l) if j == 0 => l.clone(),
+                            Some(l) => {
+                                // Rename through the last executed clone's map.
+                                let mut renamed = l.clone();
+                                if let Operand::Value(lv) = renamed {
+                                    if let Some(nv) = clone_vmaps[j - 1].get(&lv.0) {
+                                        renamed = Operand::Value(Value(*nv));
+                                    }
+                                }
+                                renamed
+                            }
+                            // Not a header phi: loop-invariant on this path.
+                            None => op.clone(),
+                        }
+                    }
+                    other => other,
+                }
+            };
             for j in 0..num_new {
+                let val = edge_val(j);
                 if let Instruction::Phi { incoming, .. } =
                     &mut func.blocks[exit_bi].instructions[phi_idx]
                 {
-                    incoming.push((op, ec_labels[j]));
+                    incoming.push((val, ec_labels[j]));
                 }
             }
         }
+    }
+
+    // Step 5b: If the exit block has NO phi fed by the header for a
+    // carried value (or the IV), readers after the loop still use the
+    // header phi's dest SSA name directly. On the NEW exit-check edges
+    // that name holds its PREHEADER value (the phi's update rides the
+    // latch edge, which an early exit never takes), so every contribution
+    // of the last executed body was silently dropped (lea_sib_fold printed
+    // 45 18 instead of 45 25). Insert a proper exit phi — dest fresh, with
+    // the header phi itself on the header edge and the threaded edge values
+    // on the new check edges — and rewrite the post-exit readers to it.
+    // (Earlier passes in the pipeline may already have lowered loop phis to
+    // explicit edge copies, which is exactly the case this step heals.)
+    {
+        let loop_labels: FxHashSet<BlockId> = c
+            .body_work
+            .iter()
+            .map(|&bi| func.blocks[bi].label)
+            .chain(std::iter::once(header_label))
+            .chain(std::iter::once(latch_label))
+            .collect();
+        let exit_idx = match func.blocks.iter().position(|b| b.label == c.exit_target) {
+            Some(i) => i,
+            None => {
+                func.blocks.extend(new_blocks);
+                return true;
+            }
+        };
+
+        // Values needing an exit phi: the IV (edge value = the check
+        // block's prev+step result) and every carried phi (edge value = the
+        // latch incoming renamed by the last executed clone's map).
+        let mut need: Vec<(Value, Vec<Operand>, IrType)> = Vec::new();
+        {
+            let mut iv_edges = Vec::with_capacity(num_new);
+            for j in 0..num_new {
+                iv_edges.push(Operand::Value(iv_vals[j]));
+            }
+            let iv_ty = func.blocks[c.header]
+                .instructions
+                .iter()
+                .find_map(|inst| match inst {
+                    Instruction::Phi { dest, ty, .. } if dest.0 == c.iv_phi.0 => Some(ty.clone()),
+                    _ => None,
+                })
+                .unwrap_or(c.iv_ty.clone());
+            need.push((c.iv_phi, iv_edges, iv_ty));
+        }
+        for (hid, l0, hty) in &carried {
+            let mut edges = Vec::with_capacity(num_new);
+            for j in 0..num_new {
+                let ev = match l0 {
+                    Operand::Value(lv) if j > 0 => {
+                        match clone_vmaps[j - 1].get(&lv.0) {
+                            Some(nv) => Operand::Value(Value(*nv)),
+                            None => l0.clone(),
+                        }
+                    }
+                    _ => l0.clone(),
+                };
+                edges.push(ev);
+            }
+            need.push((Value(*hid), edges, hty.clone()));
+        }
+
+        // Existing phis in the exit block that already take the header as a
+        // predecessor, keyed by the header-edge operand's value id.
+        let mut existing: FxHashMap<u32, ()> = FxHashMap::default();
+        for inst in &func.blocks[exit_idx].instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                if let Some((Operand::Value(v), lbl)) =
+                    incoming.iter().find(|(_, l)| *l == header_label)
+                {
+                    existing.insert(v.0, ());
+                }
+            }
+        }
+
+        for (dest, edges, pty) in &need {
+            if existing.contains_key(&dest.0) {
+                continue; // Step 5 already threaded this phi's edges
+            }
+            let new_phi = Value(next_val);
+            next_val += 1;
+            let mut incoming: Vec<(Operand, BlockId)> = Vec::with_capacity(num_new + 1);
+            incoming.push((Operand::Value(*dest), header_label));
+            for (j, ev) in edges.iter().enumerate() {
+                incoming.push((ev.clone(), ec_labels[j]));
+            }
+            func.blocks[exit_idx]
+                .instructions
+                .insert(0, Instruction::Phi { dest: new_phi, incoming, ty: pty.clone() });
+
+            // Rewrite readers of `dest` in the post-exit region: every block
+            // reachable from the exit block without re-entering the loop.
+            let mut stack: Vec<usize> = vec![exit_idx];
+            let mut visited: FxHashSet<usize> = FxHashSet::from_iter([exit_idx]);
+            while let Some(bi) = stack.pop() {
+                let in_loop = loop_labels.contains(&func.blocks[bi].label);
+                if !in_loop {
+                    for inst in &mut func.blocks[bi].instructions {
+                        if matches!(inst, Instruction::Phi { .. }) {
+                            continue; // other blocks' phis select per-edge
+                        }
+                        subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
+                    }
+                }
+                let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
+                    Terminator::Branch(l) => vec![*l],
+                    Terminator::CondBranch { true_label, false_label, .. } => {
+                        vec![*true_label, *false_label]
+                    }
+                    _ => vec![],
+                };
+                for l in succs {
+                    if loop_labels.contains(&l) {
+                        continue;
+                    }
+                    if let Some(si) =
+                        func.blocks.iter().position(|b| b.label == l)
+                    {
+                        if visited.insert(si) {
+                            stack.push(si);
+                        }
+                    }
+                }
+            }
+        }
+        func.next_value_id = next_val;
     }
 
     // Step 6: Append all new blocks.
