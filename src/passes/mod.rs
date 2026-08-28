@@ -25,6 +25,7 @@ pub(crate) mod dse;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod fp_const_hoist;
+pub(crate) mod fortify_fold;
 pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -793,6 +794,9 @@ pub(crate) fn run_passes(
             eprintln!("[PASS] o1 mem2reg");
         }
         ip_purity::run(module);
+        if !pass_disabled(&disabled, "fortifyfold") {
+            fortify_fold::run(module, target.is_32bit());
+        }
         constant_fold::run(module);
         copy_prop::run(module);
         // Same f128-builtin fold as -O0 (see above).
@@ -834,6 +838,10 @@ pub(crate) fn run_passes(
     preloop_dump!("lowering(pre-O2)");
     run_inline_phase(module, &disabled, allow_inline, optimize_for_size);
     preloop_dump!("inline_phase");
+    if !pass_disabled(&disabled, "fortifyfold") {
+        fortify_fold::run(module, target.is_32bit());
+        preloop_dump!("fortify_fold");
+    }
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
     // disappears.

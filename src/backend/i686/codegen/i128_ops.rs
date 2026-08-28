@@ -38,7 +38,6 @@ impl I686Codegen {
                 let slot = self.state.get_slot(v.0)?;
                 Some((self.slot_ref(slot), self.slot_ref_offset(slot, 4)))
             }
-            _ => None,
         }
     }
 
@@ -280,7 +279,6 @@ impl I686Codegen {
                 self.store_eax_to(dest);
                 true
             }
-            _ => false,
         }
     }
 
