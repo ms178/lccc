@@ -569,21 +569,55 @@ impl ArmCodegen {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
                     let b = self.load_vector_value_128(&args[1], "q1");
-                    let mnemonic = if *op == IntrinsicOp::VecAddI64x2 {
-                        "add"
+                    if *op == IntrinsicOp::VecAddI64x2 {
+                        if let Some(name) = self.assigned_vector_reg(d.0) {
+                            self.state.vector_values.insert(d.0);
+                            self.state.emit_fmt(format_args!(
+                                "    add {}.2d, {}.2d, {}.2d",
+                                name, a, b
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    add v0.2d, {}.2d, {}.2d", a, b));
+                            self.store_vector_value_128(d, "q0");
+                        }
                     } else {
-                        "mul"
-                    };
-                    if let Some(name) = self.assigned_vector_reg(d.0) {
-                        self.state.vector_values.insert(d.0);
-                        self.state.emit_fmt(format_args!(
-                            "    {} {}.2d, {}.2d, {}.2d",
-                            mnemonic, name, a, b
-                        ));
-                    } else {
-                        self.state
-                            .emit_fmt(format_args!("    {} v0.2d, {}.2d, {}.2d", mnemonic, a, b));
-                        self.store_vector_value_128(d, "q0");
+                        // NEON has no 64-bit integer MUL (armasm rejects
+                        // `mul v.2d`). Expand per 64-bit lane into GPRs:
+                        // wrapping i64 multiply is exactly `mul x, x, x`.
+                        // Scratch is confined to x0/x9; q0 (a) and q1 (b)
+                        // stay intact until each lane's product is written.
+                        let lane = |rd: &str, idx: u32| -> String {
+                            format!("    mov {}.d[{}], x0", rd, idx)
+                        };
+                        let compute = |idx: u32| -> [String; 3] {
+                            [
+                                format!("    umov x0, {}.d[{}]", a, idx),
+                                format!("    umov x9, {}.d[{}]", b, idx),
+                                "    mul x0, x0, x9".to_string(),
+                            ]
+                        };
+                        if let Some(name) = self.assigned_vector_reg(d.0) {
+                            self.state.vector_values.insert(d.0);
+                            for ins in compute(0) {
+                                self.state.emit(&ins);
+                            }
+                            self.state.emit(lane(&name, 0).as_str());
+                            for ins in compute(1) {
+                                self.state.emit(&ins);
+                            }
+                            self.state.emit(lane(&name, 1).as_str());
+                        } else {
+                            for ins in compute(0) {
+                                self.state.emit(&ins);
+                            }
+                            self.state.emit(lane("v0", 0).as_str());
+                            for ins in compute(1) {
+                                self.state.emit(&ins);
+                            }
+                            self.state.emit(lane("v0", 1).as_str());
+                            self.store_vector_value_128(d, "q0");
+                        }
                     }
                 }
             }
@@ -673,7 +707,10 @@ impl ArmCodegen {
 
             // Register-based vector operations (NEON 128-bit).
             // Two-wide F64 (2×.2d) and four-wide I32 (4×.4s) for reductions.
-            IntrinsicOp::VecLoadF64x2 | IntrinsicOp::VecLoadF32x4 | IntrinsicOp::VecLoadI32x4 => {
+            IntrinsicOp::VecLoadF64x2
+            | IntrinsicOp::VecLoadF32x4
+            | IntrinsicOp::VecLoadI32x4
+            | IntrinsicOp::VecLoadI64x2 => {
                 if let Some(d) = dest {
                     let addr = self.vec_addr_from_args(&args[0], args.get(1));
                     if let Some(name) = self.assigned_vector_reg(d.0) {
@@ -689,7 +726,9 @@ impl ArmCodegen {
                 }
             }
 
-            IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroI32x4 => {
+            IntrinsicOp::VecZeroF64x2
+            | IntrinsicOp::VecZeroF32x4
+            | IntrinsicOp::VecZeroI32x4 => {
                 if let Some(d) = dest {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
@@ -708,6 +747,10 @@ impl ArmCodegen {
             | IntrinsicOp::VecMulF32x4
             | IntrinsicOp::VecAddI32x4
             | IntrinsicOp::VecSmaxI32x4
+            | IntrinsicOp::VecSubF64x2
+            | IntrinsicOp::VecDivF64x2
+            | IntrinsicOp::VecSubF32x4
+            | IntrinsicOp::VecDivF32x4
             | IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
                     let a = self.load_vector_value_128(&args[0], "q0");
@@ -715,8 +758,12 @@ impl ArmCodegen {
                     let (mnemonic, suffix) = match op {
                         IntrinsicOp::VecAddF64x2 => ("fadd", "2d"),
                         IntrinsicOp::VecMulF64x2 => ("fmul", "2d"),
+                        IntrinsicOp::VecSubF64x2 => ("fsub", "2d"),
+                        IntrinsicOp::VecDivF64x2 => ("fdiv", "2d"),
                         IntrinsicOp::VecAddF32x4 => ("fadd", "4s"),
                         IntrinsicOp::VecMulF32x4 => ("fmul", "4s"),
+                        IntrinsicOp::VecSubF32x4 => ("fsub", "4s"),
+                        IntrinsicOp::VecDivF32x4 => ("fdiv", "4s"),
                         IntrinsicOp::VecAddI32x4 => ("add", "4s"),
                         IntrinsicOp::VecSmaxI32x4 => ("smax", "4s"),
                         _ => ("mul", "4s"),
@@ -774,9 +821,45 @@ impl ArmCodegen {
                 }
             }
 
+            IntrinsicOp::VecBroadcastI64x2 => {
+                if let Some(d) = dest {
+                    self.operand_to_x0(&args[0]);
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!("    dup {}.2d, x0", name));
+                    } else {
+                        self.state.emit("    dup v0.2d, x0");
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
+            IntrinsicOp::VecSqrtF64x2 | IntrinsicOp::VecSqrtF32x4 => {
+                if let Some(d) = dest {
+                    let a = self.load_vector_value_128(&args[0], "q0");
+                    let suffix = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
+                        "2d"
+                    } else {
+                        "4s"
+                    };
+                    if let Some(name) = self.assigned_vector_reg(d.0) {
+                        self.state.vector_values.insert(d.0);
+                        self.state.emit_fmt(format_args!(
+                            "    fsqrt {}.{}, {}.{}",
+                            name, suffix, a, suffix
+                        ));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    fsqrt v0.{}, {}.{}", suffix, a, suffix));
+                        self.store_vector_value_128(d, "q0");
+                    }
+                }
+            }
+
             IntrinsicOp::VecStoreF64x2
             | IntrinsicOp::VecStoreF32x4
-            | IntrinsicOp::VecStoreI32x4 => {
+            | IntrinsicOp::VecStoreI32x4
+            | IntrinsicOp::VecStoreI64x2 => {
                 // Store one 128-bit vector to dest_ptr.
                 if dest_ptr.is_some() {
                     let src = self.load_vector_value_128(&args[0], "q0");
@@ -818,6 +901,13 @@ impl ArmCodegen {
                     self.store_x0_to(d);
                 }
             }
+            IntrinsicOp::VecHorizontalAddF32x4 => {
+                let a = self.load_vector_value_128(&args[0], "q0");
+                self.state.emit_fmt(format_args!("    addv s0, {}.4s", a));
+                if let Some(d) = dest {
+                    self.store_float_reg(d, IrType::F32, "s0");
+                }
+            }
 
             // Not-yet-implemented register-based vector intrinsics for ARM.
             IntrinsicOp::VecLoadF64x4
@@ -831,7 +921,105 @@ impl ArmCodegen {
             | IntrinsicOp::VecZeroI32x8 => {
                 unimplemented!("4-wide/AVX vector intrinsics not implemented for ARM");
             }
-            _ => { /* x86-only SIMD op on arm: no-op */ }
+            // Long-double / _Float128 sign-bit intrinsics. AArch64 long
+            // double is IEEE binary128: sign bit 127 = bit 63 of the HIGH
+            // qword (unlike x87 80-bit, where x86 patches byte 9). Pure GPR
+            // bit ops on the slot-homed 16 bytes — no soft-float call, no
+            // rounding of the quiet-bit payload, NaN sign preserved.
+            IntrinsicOp::LDFabs | IntrinsicOp::F128Fabs => {
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_q0_full(&args[0]);
+                    self.state.emit("    mov x0, v0.d[0]");
+                    self.state.emit("    mov x9, v0.d[1]");
+                    self.state.emit("    movz x10, #0x8000, lsl #48");
+                    self.state.emit("    bic x9, x9, x10");
+                    self.state.emit("    fmov d0, x0");
+                    self.state.emit("    mov v0.d[1], x9");
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.emit_f128_store_q0_to_slot(slot);
+                        // The dest slot now holds full-precision f128; mark
+                        // it so later loads take the 16-byte path instead of
+                        // the f64-extend fallback (wrong for copysign/fabs).
+                        self.state.track_f128_self(d.0);
+                    } else {
+                        unimplemented!("LDFabs: dest is not slot-homed");
+                    }
+                }
+            }
+            IntrinsicOp::F128Neg => {
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_q0_full(&args[0]);
+                    self.state.emit("    mov x0, v0.d[0]");
+                    self.state.emit("    mov x9, v0.d[1]");
+                    self.state.emit("    movz x10, #0x8000, lsl #48");
+                    self.state.emit("    eor x9, x9, x10");
+                    self.state.emit("    fmov d0, x0");
+                    self.state.emit("    mov v0.d[1], x9");
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.emit_f128_store_q0_to_slot(slot);
+                        self.state.track_f128_self(d.0);
+                    } else {
+                        unimplemented!("F128Neg: dest is not slot-homed");
+                    }
+                }
+            }
+            IntrinsicOp::LDCopysign | IntrinsicOp::F128Copysign => {
+                // copysign(x, y): result = {x.lo, (x.hi & ~SIGN) | (y.hi & SIGN)}.
+                if let Some(d) = dest {
+                    self.emit_f128_operand_to_q0_full(&args[0]);
+                    self.state.emit("    mov x0, v0.d[0]");
+                    self.state.emit("    mov x1, v0.d[1]");
+                    self.emit_f128_operand_to_q0_full(&args[1]);
+                    self.state.emit("    mov x9, v0.d[1]");
+                    self.state.emit("    movz x10, #0x8000, lsl #48");
+                    self.state.emit("    and x9, x9, x10");
+                    self.state.emit("    mvn x10, x10");
+                    self.state.emit("    and x1, x1, x10");
+                    self.state.emit("    orr x1, x1, x9");
+                    self.state.emit("    fmov d0, x0");
+                    self.state.emit("    mov v0.d[1], x1");
+                    if let Some(slot) = self.state.get_slot(d.0) {
+                        self.emit_f128_store_q0_to_slot(slot);
+                        self.state.track_f128_self(d.0);
+                    } else {
+                        unimplemented!("LDCopysign: dest is not slot-homed");
+                    }
+                }
+            }
+
+            // Any vector intrinsic that reaches here has no NEON lowering.
+            // Dropping it silently would emit a read of an uninitialized
+            // vector register (observed: VecLoadI64x2 lowered to nothing and
+            // the reduction accumulated garbage). Fail the compilation loudly
+            // instead — a frontend gate that leaks an x86-shaped op to ARM is
+            // a bug we want to see, not paper over.
+            IntrinsicOp::VecAddF32x8
+            | IntrinsicOp::VecBroadcastF32x8
+            | IntrinsicOp::VecBroadcastF64x4
+            | IntrinsicOp::VecBroadcastI32x8
+            | IntrinsicOp::VecDivF32x8
+            | IntrinsicOp::VecFmaF32x8
+            | IntrinsicOp::VecFmaF64x4
+            | IntrinsicOp::VecHorizontalAddF32x8
+            | IntrinsicOp::VecHorizontalMaxI32x8
+            | IntrinsicOp::VecLoadF32x8
+            | IntrinsicOp::VecMaddF32x8
+            | IntrinsicOp::VecMaddF64x4
+            | IntrinsicOp::VecMaxI32x8
+            | IntrinsicOp::VecMulF32x8
+            | IntrinsicOp::VecMulI32x8
+            | IntrinsicOp::VecSqrtF32x8
+            | IntrinsicOp::VecStoreF32x8
+            | IntrinsicOp::VecStoreF64x4
+            | IntrinsicOp::VecStoreI32x8
+            | IntrinsicOp::VecWidenAddI32x4ToI64x2
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 => {
+                unimplemented!(
+                    "AArch64: no NEON lowering for vector intrinsic {:?} (x86-only shape leaked past the vectorizer target gate)",
+                    op
+                );
+            }
+            _ => { /* x86-only scalar/SSE-builtin op on arm: no-op */ }
         }
     }
 

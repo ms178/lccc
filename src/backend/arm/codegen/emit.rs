@@ -221,6 +221,15 @@ pub struct ArmCodegen {
     /// Frame size for the current function (needed for epilogue in terminators).
     pub(super) current_frame_size: i64,
     pub(super) current_return_type: IrType,
+    /// Current function returns a _Float128 carried in IrType::U128 (the
+    /// lowering's integer carrier). AAPCS64 puts it in Q0 exactly like
+    /// long double; without this flag the return falls to the x0:x1
+    /// integer-pair path.
+    pub(super) func_ret_is_f128_sse: bool,
+    /// The call just emitted returns a _Float128 carrier (ret_is_f128_sse
+    /// from the CallInfo). The result arrives in Q0; the result store must
+    /// take the 16-byte path instead of the x0:x1 pair.
+    pub(super) call_ret_is_f128_sse: bool,
     /// For variadic functions: offset from SP where the GP register save area starts (x0-x7).
     pub(super) va_gp_save_offset: i64,
     /// For variadic functions: offset from SP where the FP register save area starts (q0-q7).
@@ -269,6 +278,8 @@ impl ArmCodegen {
             fp_contract: crate::common::fp_contract::FpContract::default(),
             current_frame_size: 0,
             current_return_type: IrType::I64,
+            func_ret_is_f128_sse: false,
+            call_ret_is_f128_sse: false,
             va_gp_save_offset: 0,
             va_fp_save_offset: 0,
             va_named_gp_count: 0,
@@ -1841,6 +1852,7 @@ impl ArmCodegen {
         let f128_temp_slots = self.emit_call_f128_var_args(
             args,
             arg_classes,
+            arg_types,
             &fp_reg_assignments,
             slot_adjust,
             extra_sp_adj,
@@ -1880,6 +1892,7 @@ impl ArmCodegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
+        arg_types: &[IrType],
         fp_reg_assignments: &[(usize, usize)],
         slot_adjust: i64,
         extra_sp_adj: i64,
@@ -1893,8 +1906,27 @@ impl ArmCodegen {
             }
             if let Operand::Value(v) = &args[arg_i] {
                 let temp_off = f128_temp_idx * 16;
-                let loaded_full =
+                let mut loaded_full =
                     self.try_load_f128_full_precision(v.0, slot_adjust + extra_sp_adj, temp_off);
+
+                // _Float128 lowered to the IrType::U128 carrier carries 16
+                // REAL bytes in its own slot even though no f128 source
+                // tracking vouches for it (U128 loads/stores do not feed
+                // the tracker). Load directly instead of taking the
+                // __extenddftf2 fallback, which would fabricate the value
+                // from the low qword reinterpreted as a double.
+                if !loaded_full
+                    && arg_i < arg_types.len()
+                    && arg_types[arg_i] == IrType::U128
+                {
+                    if let Some(slot) = self.state.get_slot(v.0) {
+                        let adj = slot.0 + slot_adjust + extra_sp_adj;
+                        self.emit_load_from_sp("q0", adj, "ldr");
+                        self.state
+                            .emit_fmt(format_args!("    str q0, [sp, #{}]", temp_off));
+                        loaded_full = true;
+                    }
+                }
 
                 if !loaded_full {
                     self.emit_load_arg_to_reg(
@@ -1970,6 +2002,12 @@ impl ArmCodegen {
             if let Operand::Const(c) = &args[arg_i] {
                 let bytes = match c {
                     IrConst::LongDouble(_, f128_bytes) => *f128_bytes,
+                    // _Float128 lowered to the IrType::U128 carrier: the
+                    // I128 constant IS the IEEE binary128 bit pattern.
+                    // Stage it bit-exactly — a to_f64() here would
+                    // integer-convert the pattern and fabricate a huge
+                    // value out of 1.5L's bits (observed: ident(1.5F128)).
+                    IrConst::I128(bits) => bits.to_le_bytes(),
                     _ => {
                         let f64_val = c.to_f64().unwrap_or(0.0);
                         crate::ir::reexports::f64_to_f128_bytes(f64_val)
@@ -2832,6 +2870,16 @@ impl ArchCodegen for ArmCodegen {
                 self.emit_store_result(dest);
             }
         }
+
+        // F128 copies must propagate full-precision source tracking — the
+        // f128 operand loaders choose between a 16-byte slot load and the
+        // lossy f64-extend fallback based on this entry (see the same
+        // propagation in the shared default impl). Without it, a Copy
+        // through an untracked temporary downgrades every later compare or
+        // store of the copy to extend(f64(low qword)).
+        if let Operand::Value(sv) = src {
+            self.state.track_f128_copy(dest.0, sv.0);
+        }
     }
     fn emit_save_acc(&mut self) {
         self.state.emit("    mov x1, x0");
@@ -3047,6 +3095,8 @@ impl ArchCodegen for ArmCodegen {
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_store_f128_result(&mut self, dest: &Value) => emit_call_store_f128_result_impl;
+        fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         // globals
         fn emit_global_addr(&mut self, dest: &Value, name: &str) => emit_global_addr_impl;
         fn emit_label_addr(&mut self, dest: &Value, label: &str) => emit_label_addr_impl;

@@ -15,6 +15,10 @@ thread_local! {
     /// Whether long double is IEEE binary128 (f128). True for AArch64/RISC-V,
     /// false for x86/i686 where long double is x87 80-bit.
     static TARGET_LONG_DOUBLE_IS_F128: Cell<bool> = const { Cell::new(false) };
+
+    /// ELF e_machine of the current target (EM_X86_64 default). Relocation
+    /// number spaces are per ISA; see `target_elf_machine`.
+    static TARGET_ELF_MACHINE: Cell<u16> = const { Cell::new(62) };
     /// Whether the current backend supports width-partitioned 4-byte spill
     /// slots. Only the x86-64 backend's store/load paths are fully
     /// width-consistent for small types (see state::is_small_slot); every
@@ -47,6 +51,18 @@ pub fn target_ptr_size() -> usize {
 /// Whether the current target is 32-bit (ILP32).
 pub fn target_is_32bit() -> bool {
     target_ptr_size() == 4
+}
+
+/// Set the ELF e_machine for the current target. Relocation-type numbers are
+/// per-ISA namespaces (R_RISCV_CALL_PLT=19 vs R_X86_64_TLSGD=19), so any
+/// classification of a raw relocation number must consult this.
+pub fn set_target_elf_machine(machine: u16) {
+    TARGET_ELF_MACHINE.with(|c| c.set(machine));
+}
+
+/// ELF e_machine of the current target.
+pub fn target_elf_machine() -> u16 {
+    TARGET_ELF_MACHINE.with(|c| c.get())
 }
 
 /// Set whether the target uses IEEE binary128 for long double (AArch64/RISC-V).

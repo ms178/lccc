@@ -1,6 +1,8 @@
 //! ArmCodegen: return operations.
 
-use super::emit::ArmCodegen;
+use super::emit::{callee_saved_name, ArmCodegen};
+use crate::backend::state::SlotAddr;
+use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Operand, Value};
 
@@ -13,8 +15,45 @@ impl ArmCodegen {
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
+            // _Float128 lowered to the IrType::U128 carrier: AAPCS64 still
+            // returns it in Q0. The value is 16 slot bytes; load them whole.
+            // (The full loader's f64-extend fallback would be wrong here:
+            // U128-carrier loads/stores do not feed the f128 source
+            // tracker, so the tracker cannot vouch for the slot contents —
+            // but the slot IS the value, 16 bytes, by construction.)
+            if self.func_ret_is_f128_sse {
+                self.emit_f128_carrier_operand_to_q0(val);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
         }
         crate::backend::traits::emit_return_default(self, val, frame_size);
+    }
+
+    /// Load a _Float128-carrier operand into Q0: direct 16-byte slot load
+    /// when the value is slot-homed (the normal carrier case), constants
+    /// and tracked values through the full loader.
+    pub(super) fn emit_f128_carrier_operand_to_q0(&mut self, op: &Operand) {
+        if let Operand::Value(v) = op {
+            match self.state.resolve_slot_addr(v.0) {
+                Some(SlotAddr::Direct(slot)) => {
+                    self.emit_load_from_sp("q0", slot.0, "ldr");
+                    return;
+                }
+                Some(SlotAddr::Reg(reg)) => {
+                    self.state
+                        .emit_fmt(format_args!("    ldr q0, [{}]", callee_saved_name(reg)));
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    self.emit_alloca_aligned_addr(slot, id);
+                    self.state.emit("    ldr q0, [x9]");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.emit_f128_operand_to_q0_full(op);
     }
 
     pub(super) fn emit_return_i128_to_regs_impl(&mut self) {

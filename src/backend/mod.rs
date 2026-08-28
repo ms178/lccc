@@ -322,6 +322,19 @@ impl Target {
         }
     }
 
+    /// ELF e_machine value for this target. Relocation-type number spaces are
+    /// per ISA — classification of a reloc (e.g. TLS vs PLT call) must key off
+    /// the machine, never off the pointer size (R_RISCV_CALL_PLT=19 collides
+    /// with x86-64 R_X86_64_TLSGD=19).
+    pub(crate) fn elf_machine(&self) -> u16 {
+        match self {
+            Target::I686 => elf::EM_386,
+            Target::X86_64 => elf::EM_X86_64,
+            Target::Aarch64 => elf::EM_AARCH64,
+            Target::Riscv64 => elf::EM_RISCV,
+        }
+    }
+
     /// Get the assembler config for this target.
     /// Only used when the `gcc_assembler` feature is enabled for GCC fallback.
     #[cfg_attr(not(feature = "gcc_assembler"), allow(dead_code))]

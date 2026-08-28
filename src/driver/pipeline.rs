@@ -531,6 +531,8 @@ impl Driver {
             self.target,
             Target::Aarch64 | Target::Riscv64
         ));
+        // Per-ISA relocation number space (see Target::elf_machine).
+        crate::common::types::set_target_elf_machine(self.target.elf_machine());
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide

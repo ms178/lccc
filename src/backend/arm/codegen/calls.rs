@@ -2,6 +2,8 @@
 
 use super::emit::{callee_saved_name, ArmCodegen};
 use crate::backend::call_abi::{compute_stack_arg_space, CallAbiConfig, CallArgClass};
+use crate::backend::generation::is_i128_type;
+use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
@@ -319,17 +321,44 @@ impl ArmCodegen {
         self.store_x0_x1_to(dest);
     }
 
+    pub(super) fn set_call_ret_is_f128_sse_impl(&mut self, is_f128: bool) {
+        self.call_ret_is_f128_sse = is_f128;
+    }
+
+    /// Result-store dispatch: a _Float128 carrier (ret_is_f128_sse) arrives
+    /// in Q0 per AAPCS64 — store all 16 bytes and mark the dest slot as a
+    /// full-precision f128 source. Everything else keeps the shared
+    /// dispatch (I128 pair / long double / FP / integer).
+    pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        if self.call_ret_is_f128_sse {
+            self.emit_call_store_f128_result_impl(dest);
+            return;
+        }
+        if is_i128_type(return_type) {
+            self.emit_call_store_i128_result_impl(dest);
+        } else if return_type.is_long_double() {
+            self.emit_call_store_f128_result_impl(dest);
+        } else if return_type == IrType::F32 {
+            self.state.emit("    fmov w0, s0");
+            self.emit_store_result(dest);
+        } else if return_type.is_float() {
+            self.state.emit("    fmov x0, d0");
+            self.emit_store_result(dest);
+        } else {
+            self.emit_store_result(dest);
+        }
+    }
+
     pub(super) fn emit_call_store_f128_result_impl(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
             self.emit_store_to_sp("q0", slot.0, "str");
             self.state.track_f128_self(dest.0);
         }
-        self.state.emit("    sub sp, sp, #16");
-        self.state.emit("    str q1, [sp]");
-        self.state.emit("    bl __trunctfdf2");
-        self.state.emit("    fmov x0, d0");
-        self.state.emit("    ldr q1, [sp]");
-        self.state.emit("    add sp, sp, #16");
+        // The q1 spill + __trunctfdf2 dance that used to live here was dead
+        // code: q1 is caller-clobbered by the call (it held the second
+        // argument, not the result), so it truncated garbage, and x0 was
+        // overwritten before any consumer could read the "approximation".
+        // One libcall + two memory round-trips saved per f128 call.
         self.state.reg_cache.invalidate_all();
         self.state.reg_cache.set_acc(dest.0, false);
     }

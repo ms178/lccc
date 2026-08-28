@@ -816,6 +816,19 @@ impl CodegenState {
         self.f128_load_sources.get(&value_id).copied()
     }
 
+    /// Propagate F128 source tracking through a Copy: `dest` receives the
+    /// exact same source binding as `src` (the copy moves all 16 bytes, so
+    /// every consumer of `dest` can read them from the same place `src`'s
+    /// consumers would have). Without this, a Copy through an untracked
+    /// temporary silently downgrades later uses to the lossy f64-extend
+    /// fallback.
+    #[inline]
+    pub fn track_f128_copy(&mut self, dest_id: u32, src_id: u32) {
+        if let Some(entry) = self.f128_load_sources.get(&src_id).copied() {
+            self.f128_load_sources.insert(dest_id, entry);
+        }
+    }
+
     /// Returns true if the given symbol needs GOT indirection in PIC mode.
     /// A symbol needs GOT if PIC is enabled AND it's not a local (static) symbol.
     /// Local labels (starting with '.') are always PIC-safe via RIP-relative.

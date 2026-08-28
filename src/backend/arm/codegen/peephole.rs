@@ -1436,8 +1436,15 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
     if std::env::var("CCC_NO_SLOT_LOAD_DEDUP").is_ok() {
         return false;
     }
-    // (offset, is_word) -> register holding the slot's content
-    let mut cached: FxHashMap<(i32, bool), u8> = FxHashMap::default();
+    // (frame byte, is_word) -> register holding the slot's content.
+    // Keys are ENTRY-sp-relative frame bytes (raw offset + sp displacement):
+    // inside a `sub sp` staging window the same raw offset names a different
+    // byte, and forwarding across that boundary would alias call arguments
+    // with frame slots (see sp_displacements).
+    let Some(disps) = sp_displacements(lines, kinds, n) else {
+        return false;
+    };
+    let mut cached: FxHashMap<(i64, bool), u8> = FxHashMap::default();
     let mut changed = false;
     for i in 0..n {
         match kinds[i] {
@@ -1455,7 +1462,8 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
                 offset, is_word, ..
             } => {
                 // Invalidate entries overlapping the stored range.
-                let (lo, hi) = (offset, offset + if is_word { 4 } else { 8 });
+                let lo = offset as i64 + disps[i];
+                let hi = lo + if is_word { 4 } else { 8 };
                 cached.retain(|&(off, word), _| {
                     let (l2, h2) = (off, off + if word { 4 } else { 8 });
                     h2 <= lo || l2 >= hi
@@ -1467,7 +1475,8 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
                 offset,
                 is_word,
             } => {
-                if let Some(&prev) = cached.get(&(offset, is_word)) {
+                let key = (offset as i64 + disps[i], is_word);
+                if let Some(&prev) = cached.get(&key) {
                     if prev == reg {
                         kinds[i] = LineKind::Nop;
                         changed = true;
@@ -1496,7 +1505,7 @@ fn eliminate_repeated_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n
                 // The load (or its mov replacement) writes `reg`: any entry
                 // cached under it is stale. Then record the new mapping.
                 cached.retain(|_, &mut r| r != reg);
-                cached.insert((offset, is_word), reg);
+                cached.insert(key, reg);
                 continue;
             }
             _ => {}
@@ -1767,6 +1776,12 @@ fn forward_fp_slot_loads(lines: &mut [String], kinds: &mut [LineKind], n: usize)
 }
 
 fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    // Pair store→load by FRAME BYTE (raw offset + sp displacement): the
+    // outgoing-args staging window reuses raw offsets for different bytes
+    // (see sp_displacements).
+    let Some(disps) = sp_displacements(lines, kinds, n) else {
+        return false;
+    };
     let mut changed = false;
     let mut i = 0;
     while i + 1 < n {
@@ -1787,7 +1802,9 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                         reg: load_reg,
                         offset: load_off,
                         is_word: load_word,
-                    } if store_off == load_off && store_word == load_word => {
+                    } if store_off as i64 + disps[i] == load_off as i64 + disps[j]
+                        && store_word == load_word =>
+                    {
                         if store_reg == load_reg {
                             // Same register: eliminate the load entirely
                             kinds[j] = LineKind::Nop;
@@ -1811,7 +1828,9 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                     LineKind::LoadswSp {
                         reg: load_reg,
                         offset: load_off,
-                    } if store_off == load_off && store_word => {
+                    } if store_off as i64 + disps[i] == load_off as i64 + disps[j]
+                        && store_word =>
+                    {
                         lines[j] =
                             format!("    sxtw {}, {}", xreg_name(load_reg), wreg_name(store_reg));
                         kinds[j] = LineKind::Sxtw {
@@ -2601,7 +2620,72 @@ fn global_dead_store_elimination(lines: &[String], kinds: &mut [LineKind], n: us
     changed
 }
 
+/// Entry-sp-relative displacement of sp at each line index (`disps[i]` is the
+/// displacement in effect FOR line i's own accesses). `None` when the region
+/// contains an sp write that cannot be modelled statically (register-indirect
+/// adjustment) — slot-offset passes must then stay conservative.
+///
+/// Call argument staging (`sub sp, sp, #N` / `add sp, sp, #N` around the
+/// outgoing-args area) and writeback push/pop pairs (`stp x9, x10,
+/// [sp, #-16]!` ... `ldp x9, x10, [sp], #16`) move sp mid-function. Passes
+/// that match slot offsets textually ("same [sp, #off]") would otherwise pair
+/// accesses that resolve to DIFFERENT addresses across such an adjustment —
+/// the aggregate_dse_soundness / alu_peepholes >8-argument call staging wrote
+/// argument spills to frame slots and then read them through the shifted sp
+/// while a deleted "duplicate" store had actually targeted a different byte.
+/// Displacement resets at `.cfi_startproc` (every emitted function prologue).
+fn sp_displacements(lines: &[String], kinds: &[LineKind], n: usize) -> Option<Vec<i64>> {
+    let mut disps = vec![0i64; n];
+    let mut disp: i64 = 0;
+    for i in 0..n {
+        let t = lines[i].trim();
+        if kinds[i] == LineKind::Nop {
+            // Eliminated lines do not execute in the final program: their sp
+            // effect is gone (their text lingers for the printer's skip).
+            disps[i] = disp;
+            continue;
+        }
+        if kinds[i] == LineKind::Directive && t.contains(".cfi_startproc") {
+            disp = 0;
+        }
+        disps[i] = disp;
+        // Apply line i's sp effect for subsequent lines.
+        if let Some(body) = t.strip_prefix("stp ").or_else(|| t.strip_prefix("ldp ")) {
+            if let Some(bracket) = body.find('[') {
+                let addr = &body[bracket..];
+                if addr.starts_with("[sp") {
+                    if let Some(rest) = addr.strip_prefix("[sp, #") {
+                        if let Some(stripped) = rest.strip_suffix("]!") {
+                            // Pre-index writeback: sp += offset before access.
+                            let off: i64 = stripped.parse().ok()?;
+                            disp += -off;
+                            continue;
+                        }
+                    }
+                    if let Some(rest) = addr.strip_prefix("[sp], #") {
+                        // Post-index writeback: sp += offset after access.
+                        let end = rest.find(']')?;
+                        let off: i64 = rest[..end].parse().ok()?;
+                        disp -= off;
+                        continue;
+                    }
+                }
+            }
+        }
+        if (t.starts_with("sub ") || t.starts_with("add ")) && t.contains("sp, sp, #") {
+            let off: i64 = t.rsplit('#').next()?.parse().ok()?;
+            if t.starts_with("sub ") {
+                disp += off;
+            } else {
+                disp -= off;
+            }
+        }
+    }
+    Some(disps)
+}
+
 fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end: usize) -> bool {
+    let mut changed = false;
     // Safety check: if any instruction takes the address of sp (e.g., `add xN, sp, #off`),
     // stack slots could be accessed through pointers, so we must not eliminate any stores.
     // This is conservative but sound — it prevents miscompilation when arrays or structs
@@ -2631,25 +2715,47 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
         }
     }
 
-    // Phase 1: Collect all (offset, size) byte ranges that are loaded from.
+    // Offsets are resolved through the shared sp-displacement model: a
+    // `[sp, #N]` access inside an `sub sp` staging window reads frame byte
+    // N + disp, not N (see sp_displacements for the miscompile history).
+    let Some(disps) = sp_displacements(lines, kinds, end) else {
+        return false;
+    };
+
+    // Phase 1: Collect all (offset, size) byte ranges that are loaded from,
+    // in ENTRY-sp-relative frame coordinates (raw offset + current sp disp).
     // We must use byte-range overlap (not exact offset match) because a wide
     // store (e.g. `str x` at offset 16, 8 bytes) can be partially read by a
     // narrower load at a different offset (e.g. `ldr w` at offset 20, 4 bytes).
     let mut loaded_ranges: Vec<(i32, i32)> = Vec::new(); // (offset, size)
     for i in start..end {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let sp_disp = disps[i];
+        let mut push_load = |off: i64, size: i32, out: &mut Vec<(i32, i32)>| {
+            if let Ok(off) = i32::try_from(off) {
+                out.push((off, size));
+            }
+        };
         match kinds[i] {
             LineKind::LoadSp {
                 offset, is_word, ..
             } => {
                 let size = if is_word { 4 } else { 8 };
-                loaded_ranges.push((offset, size));
+                push_load(offset as i64 + sp_disp, size, &mut loaded_ranges);
             }
             LineKind::LoadswSp { offset, .. } => {
-                loaded_ranges.push((offset, 4));
+                push_load(offset as i64 + sp_disp, 4, &mut loaded_ranges);
             }
             _ => {
                 // Check for loads in Other instructions (e.g., ldp, ldrb, ldrh, etc.)
                 let trimmed = lines[i].trim();
+                // Writeback forms move sp themselves (already tracked above);
+                // their raw offset is pre/post-adjustment — skip classification.
+                if trimmed.contains("]!") || trimmed.contains("], #") {
+                    continue;
+                }
                 let load_size = if trimmed.starts_with("ldp ") {
                     Some(16) // ldp loads two 8-byte registers
                 } else if trimmed.starts_with("ldr x") || trimmed.starts_with("ldur x") {
@@ -2671,7 +2777,7 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
                 if let Some(sz) = load_size {
                     if trimmed.contains("[sp") {
                         if let Some(off) = extract_sp_offset(trimmed) {
-                            loaded_ranges.push((off, sz));
+                            push_load(off as i64 + sp_disp, sz, &mut loaded_ranges);
                         }
                     }
                 }
@@ -2679,21 +2785,27 @@ fn gdse_one_function(lines: &[String], kinds: &mut [LineKind], start: usize, end
         }
     }
 
-    // Phase 2: Remove stores whose byte range does not overlap any load range
-    let mut changed = false;
+    // Phase 2: Remove stores whose byte range does not overlap any load range.
+    // Stores use the same displacement-adjusted coordinates as the loads.
     for i in start..end {
+        if kinds[i] == LineKind::Nop {
+            continue;
+        }
+        let sp_disp = disps[i];
         if let LineKind::StoreSp {
             offset, is_word, ..
         } = kinds[i]
         {
             let store_size = if is_word { 4 } else { 8 };
-            let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
-                // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
-                offset < load_off + load_sz && load_off < offset + store_size
-            });
-            if !overlaps_any_load {
-                kinds[i] = LineKind::Nop;
-                changed = true;
+            if let Ok(store_off) = i32::try_from(offset as i64 + sp_disp) {
+                let overlaps_any_load = loaded_ranges.iter().any(|&(load_off, load_sz)| {
+                    // Two ranges [a, a+as) and [b, b+bs) overlap iff a < b+bs && b < a+as
+                    store_off < load_off + load_sz && load_off < store_off + store_size
+                });
+                if !overlaps_any_load {
+                    kinds[i] = LineKind::Nop;
+                    changed = true;
+                }
             }
         }
     }
@@ -3158,6 +3270,15 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
     if std::env::var("CCC_NO_STORE_DSE").is_ok() {
         return false;
     }
+    // "Same slot" means the same FRAME BYTE, not the same textual offset: the
+    // outgoing-args staging window (`sub sp, sp, #N` ... `add sp, sp, #N`)
+    // reuses small offsets for call arguments, and a write there must never
+    // retire an entry-frame store at the same raw offset (see
+    // sp_displacements for the miscompile history). Unmodellable sp writes
+    // disable the pass for the whole file.
+    let Some(disps) = sp_displacements(lines, kinds, n) else {
+        return false;
+    };
     let mut changed = false;
     for i in 0..n {
         let LineKind::StoreSp {
@@ -3169,6 +3290,7 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
             continue;
         };
         let size_i = if word_i { 4u32 } else { 8 };
+        let eff_i = off_i as i64 + disps[i];
         let mut j = i + 1;
         let mut steps = 0;
         while j < n && steps < 40 {
@@ -3187,12 +3309,13 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
                     ..
                 } => {
                     let size_j = if word_j { 4u32 } else { 8 };
-                    if off_j == off_i && size_j >= size_i {
+                    let eff_j = off_j as i64 + disps[j];
+                    if eff_j == eff_i && size_j >= size_i {
                         // Fully overwritten with no intervening read.
                         kinds[i] = LineKind::Nop;
                         changed = true;
                     }
-                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + size_j as i64 {
                         break; // overlapping store: stop either way
                     }
                     j += 1;
@@ -3204,14 +3327,16 @@ fn eliminate_overwritten_stores(lines: &[String], kinds: &mut [LineKind], n: usi
                     ..
                 } => {
                     let size_j = if word_j { 4u32 } else { 8 };
-                    if off_j < off_i + size_i as i32 && off_i < off_j + size_j as i32 {
+                    let eff_j = off_j as i64 + disps[j];
+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + size_j as i64 {
                         break; // reads our slot (or overlaps it)
                     }
                     j += 1;
                     continue;
                 }
                 LineKind::LoadswSp { offset: off_j, .. } => {
-                    if off_j < off_i + size_i as i32 && off_i < off_j + 4 {
+                    let eff_j = off_j as i64 + disps[j];
+                    if eff_j < eff_i + size_i as i64 && eff_i < eff_j + 4 {
                         break;
                     }
                     j += 1;
@@ -3579,8 +3704,11 @@ mod tests {
     fn test_adjacent_store_load_same_reg() {
         let input = "    str x0, [sp, #16]\n    ldr x0, [sp, #16]\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("str x0, [sp, #16]"));
+        // The load is forwarded to the store's register; with the sole reader
+        // gone, GDSE additionally retires the now-dead store (nothing else in
+        // the frame reads slot 16). Assert the observable forwarding result.
         assert!(!result.contains("ldr x0, [sp, #16]"));
+        assert!(result.contains("ret"));
     }
 
     #[test]

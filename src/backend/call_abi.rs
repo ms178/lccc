@@ -644,9 +644,25 @@ fn classify_args_core(
                 continue;
             }
 
-            // _Float128 (IEEE binary128): ONE 16-byte XMM register per the
-            // SysV psABI (not a two-eightbyte SSE struct). Overflow (all XMM
-            // regs consumed) goes to a 16-byte stack slot.
+            // AAPCS64 (ARM): a _Float128 carrier (scalar or 16-byte
+            // aggregate flagged is_f128_sse by the lowering) goes in a Q
+            // register exactly like long double — the "SSE" naming of the
+            // flag is SysV jargon, the class itself is target-relative.
+            // Overflow takes a 16-byte-aligned stack slot (F128Stack
+            // semantics), not the x86 SysV StructByValStack rollback.
+            if info.is_f128_sse && size == 16 && config.f128_in_fp_regs {
+                if float_idx < config.max_float_regs {
+                    result.push(CoreArgClass::F128FpReg { reg_idx: float_idx });
+                    float_idx += 1;
+                } else {
+                    result.push(CoreArgClass::F128Stack);
+                }
+                continue;
+            }
+
+            // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
+            // register per the psABI (not a two-eightbyte SSE struct).
+            // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
             if info.is_f128_sse && size == 16 {
                 if float_idx < config.max_float_regs {
                     result.push(CoreArgClass::F128SseReg { reg_idx: float_idx });
