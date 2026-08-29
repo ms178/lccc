@@ -4301,6 +4301,38 @@ fn generate_function(
                 cg.state().invalidate_vec_scratch_peephole();
             }
 
+            // PF-15 deferred narrowing widens: every instruction other than
+            // the two self-managing kinds flushes the recorded moves before
+            // ANY lowering runs (fusion paths, MachInst queueing, and the
+            // generate_instruction dispatch all bypass each other, so this
+            // loop head is the only point that sees every instruction). A
+            // Cast records or flushes inside its emitter; a Cmp folds the
+            // pair into a narrow compare or flushes right here — including
+            // when MachInst would have lowered it.
+            if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
+                cg.flush_pending_widen();
+            }
+            if let Instruction::Cmp {
+                dest,
+                op: cmp_op,
+                lhs: cmp_lhs,
+                rhs: cmp_rhs,
+                ..
+            } = inst
+            {
+                if let Some((nl, nr, nty, nop)) =
+                    cg.narrow_cmp_operands(dest.0, *cmp_op, cmp_lhs, cmp_rhs)
+                {
+                    // Folded: emit the narrow compare on the classic path
+                    // (cmpb/cmpw). MachInst never sees the rewritten shape,
+                    // so its per-instruction gates stay exactly as audited.
+                    cg.flush_machinst();
+                    cg.emit_cmp(dest, nop, &nl, &nr, nty);
+                    cg.state().current_program_point += 1;
+                    continue;
+                }
+            }
+
             if let Instruction::BinOp {
                 dest,
                 op: IrBinOp::Mul,
@@ -4537,6 +4569,10 @@ fn generate_function(
             );
             cg.state().current_program_point += 1;
         }
+        // Defensive PF-15 flush: a deferred widen whose single consumer
+        // was eliminated after use counting must never leak between
+        // blocks. No-op whenever every record was consumed or flushed.
+        cg.flush_pending_widen();
 
         cg.flush_machinst();
         cg.flush_vecreg_liveout();
@@ -4650,6 +4686,15 @@ pub(super) fn generate_instruction(
     remat_global_addrs: &FxHashSet<u32>,
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
+    // PF-15 deferred narrowing widens: every instruction other than the
+    // two self-managing kinds flushes the recorded moves first, so the
+    // defer is invisible to all non-matching consumers. A Cast records or
+    // flushes inside its emitter (try_record_pending_widen's refusal
+    // contract); a Cmp folds the pair into a narrow compare or flushes in
+    // its own dispatch arm below — including when MachInst lowers it.
+    if !matches!(inst, Instruction::Cmp { .. } | Instruction::Cast { .. }) {
+        cg.flush_pending_widen();
+    }
     match inst {
         // GNU C nested-function support (static chain / trampoline /
         // non-local goto). x86-only; the trait defaults fail closed on
@@ -4804,6 +4849,9 @@ pub(super) fn generate_instruction(
             rhs,
             ty,
         } => {
+            // PF-15 consume happened at the per-instruction loop head (the
+            // only point all lowering paths share). Deferred widens are
+            // materialized or folded by the time we get here.
             cg.emit_cmp(dest, *op, lhs, rhs, *ty);
         }
         Instruction::Cast {
@@ -5384,6 +5432,9 @@ fn generate_terminator(
     frame_size: i64,
     block_label: u32,
 ) {
+    // PF-15: a terminator ends the compare's adjacency window — flush any
+    // deferred widening moves before control flow leaves the block.
+    cg.flush_pending_widen();
     match term {
         Terminator::Return(val) => {
             cg.emit_return(val.as_ref(), frame_size);

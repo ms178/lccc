@@ -76,7 +76,7 @@ pub(super) const X86_XMM_REGS: [PhysReg; 14] = [
 
 /// Convert a 64-bit register name string to its 32-bit sub-register name.
 /// Used for `xorl %eXX, %eXX` zeroing idiom (shorter encoding, breaks dependencies).
-fn reg_name_to_32(name: &str) -> &'static str {
+pub(super) fn reg_name_to_32(name: &str) -> &'static str {
     match name {
         "rax" => "eax",
         "rbx" => "ebx",
@@ -463,6 +463,23 @@ pub struct X86Codegen {
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
     /// Set by the Cmp emitter when the consumer is the next instruction.
     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
+    /// PF-15 deferred narrowing widen (2026-08-29): a single-use widening
+    /// Cast from a byte/half type whose result feeds an integer compare
+    /// DEFERS its extending move and records itself here (two slots: both
+    /// operands of a compare may be widening casts). The next Cmp consumes
+    /// the pair and emits one `cmpb`/`cmpw` on the ORIGINAL sources --
+    /// exactly GCC's shape -- instead of two extends plus a 32/64-bit
+    /// compare (PF-15: `a < b` on signed chars widened both operands three
+    /// times). Any other instruction flushes the deferred moves unchanged,
+    /// so the transform is invisible to every non-matching consumer.
+    /// Soundness rests on the record-time conflict rule in
+    /// `try_record_pending_widen`: a second cast whose destination home
+    /// equals the first cast's source register home is refused (the RA may
+    /// reuse the first source's home for the second destination once the
+    /// source's only modelled use -- the deferred move -- leaves its live
+    /// range), and the reversed aliasing (first dest == second source) is
+    /// impossible because the two SSA ranges overlap by construction.
+    pub(super) pending_widen: [Option<super::cast_ops::PendingWiden>; 2],
     /// Pending FP condition flags from a fused float Cmp: (cmp dest value,
     /// pre-computed jcc). FP ucomisd sets EFLAGS with different semantics
     /// than integer cmp (ordered via CF/ZF/PF; `ja`/`jae`/`jb`/`jbe` map to
@@ -696,6 +713,7 @@ impl X86Codegen {
             fold_skip_cast: None,
             value_types: FxHashMap::default(),
             pending_cmp: None,
+            pending_widen: [None, None],
             pending_fp_cmp: None,
             current_func: None,
             ivsr_pointers: FxHashMap::default(),
@@ -1177,17 +1195,61 @@ impl X86Codegen {
                         "    xorl %{0}, %{0}",
                         phys_reg_name_32(target)
                     )),
-                    IrConst::I8(v) => self
-                        .state
-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
-                    IrConst::I16(v) => self
-                        .state
-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
-                    IrConst::I32(v) => self
-                        .state
-                        .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, target_name)),
+                    // PF-16: non-negative immediates write the 32-bit name
+                    // with movl — the 32-bit write zero-extends to the same
+                    // 64-bit value a `movq $imm32` sign-extension would
+                    // produce, saving the REX prefix and two bytes. Negative
+                    // immediates sign-extend; movl would zero-extend instead
+                    // — they keep the q-form.
+                    IrConst::I8(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    }
+                    IrConst::I16(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    }
+                    IrConst::I32(v) => {
+                        let x = *v as i64;
+                        if x >= 0 {
+                            self.state.emit_fmt(format_args!(
+                                "    movl ${}, %{}",
+                                x,
+                                phys_reg_name_32(target)
+                            ));
+                        } else {
+                            self.state
+                                .emit_fmt(format_args!("    movq ${}, %{}", x, target_name));
+                        }
+                    },
                     IrConst::I64(v) => {
-                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                        if *v >= 0 && *v <= i32::MAX as i64 {
+                            // PF-16: fits and non-negative — 5-byte movl,
+                            // zero-extension equals the sign-extended q-form.
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                *v,
+                                phys_reg_name_32(target),
+                            );
+                        } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
                             self.state
                                 .out
                                 .emit_instr_imm_reg("    movq", *v, target_name);
@@ -2720,17 +2782,40 @@ impl X86Codegen {
                 IrConst::I64(0) => self
                     .state
                     .emit_fmt(format_args!("    xorl %{0}, %{0}", reg_name_to_32(reg))),
-                IrConst::I8(v) => self
-                    .state
-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
-                IrConst::I16(v) => self
-                    .state
-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
-                IrConst::I32(v) => self
-                    .state
-                    .emit_fmt(format_args!("    movq ${}, %{}", *v as i64, reg)),
+                // PF-16: non-negative immediates via movl (see site above).
+                IrConst::I8(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                }
+                IrConst::I16(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                }
+                IrConst::I32(v) => {
+                    let x = *v as i64;
+                    if x >= 0 {
+                        self.state
+                            .emit_fmt(format_args!("    movl ${}, %{}", x, reg_name_to_32(reg)));
+                    } else {
+                        self.state.emit_fmt(format_args!("    movq ${}, %{}", x, reg));
+                    }
+                },
                 IrConst::I64(v) => {
-                    if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
+                    if *v >= 0 && *v <= i32::MAX as i64 {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movl", *v, reg_name_to_32(reg));
+                    } else if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
                         self.state.out.emit_instr_imm_reg("    movq", *v, reg);
                     } else {
                         self.state.out.emit_instr_imm_reg("    movabsq", *v, reg);
@@ -3603,6 +3688,20 @@ impl ArchCodegen for X86Codegen {
         self.reg_assignments.contains_key(&vid)
     }
 
+    fn flush_pending_widen(&mut self) {
+        self.flush_pending_widen_impl();
+    }
+
+    fn narrow_cmp_operands(
+        &mut self,
+        dest: u32,
+        op: crate::ir::reexports::IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
+        self.narrow_cmp_operands_impl(dest, op, lhs, rhs)
+    }
+
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state
     }
@@ -3782,6 +3881,27 @@ impl ArchCodegen for X86Codegen {
         // boolean is never needlessly materialized (gzip huft_build regression).
         match inst {
             crate::ir::reexports::Instruction::Select { .. } => return false,
+            // PF-15: single-use widening casts from byte/half types stay on
+            // the mature path, where try_record_pending_widen can defer them
+            // into a narrow compare. MachInst would emit the extending move
+            // eagerly, which forecloses the fold. Eligibility mirrors
+            // try_record_pending_widen (the record path re-checks everything
+            // and emits normally on any mismatch, so a lenient gate here is
+            // merely an optimization hint, never a correctness input).
+            crate::ir::reexports::Instruction::Cast {
+                dest,
+                from_ty,
+                to_ty,
+                ..
+            } if matches!(
+                from_ty,
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+            ) && !to_ty.is_float()
+                && (to_ty.size() == 4 || to_ty.size() == 8)
+                && self.value_use_counts.get(&dest.0).copied() == Some(1) =>
+            {
+                return false;
+            }
             crate::ir::reexports::Instruction::Cmp { dest, .. }
                 if self.fused_cmp_dests.contains_key(&dest.0)
                     || self.cmp_replay.contains_key(&dest.0) =>

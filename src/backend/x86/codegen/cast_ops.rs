@@ -3,9 +3,31 @@
 use super::emit::X86Codegen;
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
+use crate::backend::regalloc::PhysReg;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
+/// One deferred widening move (PF-15): the Cast was eligible but its
+/// emission is postponed until the consuming compare (or any other next
+/// instruction) decides. See `X86Codegen::pending_widen` for the full
+/// soundness contract.
+pub(super) struct PendingWiden {
+    /// Cast destination value (single-use; the use is the consumer).
+    pub dest: u32,
+    /// Cast source operand (always `Operand::Value`, reg- or slot-homed).
+    pub src: Operand,
+    /// Narrow source type (I8/U8/I16/U16) — the compare's new width.
+    pub from_ty: IrType,
+    /// Destination register home the widening move would have written.
+    pub dest_phys: PhysReg,
+}
+
 impl X86Codegen {
+    fn pf15_trace(&self, msg: &str) {
+        if std::env::var_os("CCC_DEBUG_PF15").is_some() {
+            eprintln!("[pf15] {msg}");
+        }
+    }
+
     pub(super) fn emit_cast_instrs_impl(&mut self, from_ty: IrType, to_ty: IrType) {
         self.emit_cast_instrs_x86(from_ty, to_ty);
     }
@@ -195,6 +217,18 @@ impl X86Codegen {
                 return;
             }
         }
+        // PF-15 narrowing-widen defer: a single-use widening cast from a
+        // byte/half type is NOT emitted here — it is recorded and the
+        // consuming compare (if it is one) folds it into a narrow `cmpb`/
+        // `cmpw` on the original source. Any other consumer flushes the
+        // recorded move first, making the defer invisible. try_record
+        // returns false for every non-eligible shape (flushing whatever is
+        // deferred — its own emission could clobber a deferred source
+        // home) and this cast then emits normally below.
+        if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
+            return;
+        }
+
         // Register-direct integer casts: bypass the accumulator when the destination
         // has a physical register. Instead of load→cast→store through %rax, emit the
         // cast instruction directly targeting the destination register.
@@ -416,6 +450,393 @@ impl X86Codegen {
     /// Key optimization: when the source is a stack slot, fuse the load and cast
     /// into a single instruction (e.g., `movslq -N(%rsp), %r12`), saving 2 instructions
     /// vs the accumulator path (`movq -N(%rsp), %rax; cltq; movq %rax, %r12`).
+    /// Emit the widening move for an IntWiden cast into a register home,
+    /// from either a register or a slot source. This is the SINGLE
+    /// definition of the widening sequences: the register-direct cast path
+    /// and the PF-15 deferred-widen flush both route through it, so the
+    /// deferred form is bit-identical to the immediate form.
+    fn emit_int_widen_move(&mut self, src: &Operand, ft: IrType, dest_phys: PhysReg) {
+        use super::emit::{phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
+        let dest_64 = phys_reg_name(dest_phys);
+        let dest_32 = phys_reg_name_32(dest_phys);
+        let src_phys = self.operand_reg(src);
+        let src_slot = match src {
+            Operand::Value(v) => self.state.get_slot(v.0).map(|sl| sl.0),
+            _ => None,
+        };
+        if let Some(src_reg) = src_phys {
+            // Source is in a register — emit reg-to-reg extending move.
+            let src_typed = typed_phys_reg_name(src_reg, ft);
+            if ft.is_signed() {
+                match ft.size() {
+                    1 => self
+                        .state
+                        .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
+                    2 => self
+                        .state
+                        .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
+                    4 => self.state.emit_fmt(format_args!(
+                        "    movslq %{}, %{}",
+                        phys_reg_name_32(src_reg),
+                        dest_64
+                    )),
+                    _ => {
+                        self.operand_to_callee_reg(src, dest_phys);
+                    }
+                }
+            } else {
+                match ft.size() {
+                    1 => self
+                        .state
+                        .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
+                    2 => self
+                        .state
+                        .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
+                    4 => {
+                        let src_32 = phys_reg_name_32(src_reg);
+                        self.state
+                            .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
+                    }
+                    _ => {
+                        self.operand_to_callee_reg(src, dest_phys);
+                    }
+                }
+            }
+        } else if let Some(slot_off) = src_slot {
+            // Source is a stack slot — emit fused load+extend directly to
+            // dest. Uses emit_instr_rbp_reg which handles rbp/rsp
+            // addressing automatically.
+            if ft.is_signed() {
+                match ft.size() {
+                    1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+                    2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+                    4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                }
+            } else {
+                match ft.size() {
+                    1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                    2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                    4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                }
+            }
+        } else {
+            // No stable home: stage through the accumulator (the generic
+            // cast path would have done the same). Only reachable from the
+            // flush side; the record path refuses home-less sources.
+            self.operand_to_callee_reg(src, dest_phys);
+        }
+    }
+
+    /// PF-15 record path. Returns true when the cast's widening move was
+    /// DEFERRED (nothing emitted); false when the cast must emit normally.
+    ///
+    /// Eligibility: widening cast from a byte/half type to a 32/64-bit
+    /// type, destination in a GPR home, source a Value with a stable home
+    /// (register or slot), destination used exactly once. The consumer
+    /// match (is that single use an integer compare of two such casts?)
+    /// happens at the compare; any other consumer simply flushes.
+    ///
+    /// Refusal contract: the caller emits this cast normally, and those
+    /// emissions (register moves, slot stores) may legally clobber a
+    /// deferred source's home — RA reused it the moment the deferred
+    /// source's only modelled use (this cast) stopped covering it. Any
+    /// refusal therefore flushes the deferred moves FIRST.
+    fn try_record_pending_widen(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        macro_rules! refuse {
+            ($why:expr) => {{
+                self.pf15_trace(concat!("refuse: ", $why));
+                self.flush_pending_widen_impl();
+                return false;
+            }};
+        }
+        if !matches!(
+            from_ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+        ) {
+            refuse!("from_ty");
+        }
+        if to_ty.is_float() || !(to_ty.size() == 4 || to_ty.size() == 8) || is_i128_type(to_ty) {
+            refuse!("to_ty");
+        }
+        if self.value_use_counts.get(&dest.0).copied() != Some(1) {
+            refuse!("use_count");
+        }
+        let src_val = match src {
+            Operand::Value(v) => v.0,
+            _ => refuse!("src_not_value"),
+        };
+        let Some(dest_phys) = self.dest_reg(dest) else {
+            refuse!("no_dest_reg");
+        };
+        if super::emit::is_xmm_reg(dest_phys) {
+            refuse!("xmm_dest");
+        }
+        let src_reg = self.operand_reg(src);
+        let src_slot = self.state.get_slot(src_val).map(|sl| sl.0);
+        if src_reg.is_none() && src_slot.is_none() {
+            refuse!("no_src_home");
+        }
+        // A deferred cast must not be shadowed by another deferred cast
+        // whose widening move would clobber this cast's source register
+        // home before the compare (or a flush) reads it. RA may legally
+        // hand this destination the first source's home: the source's only
+        // modelled use is this deferred move, so its range appears to end
+        // here. Conflict => flush the earlier moves and emit this cast
+        // normally (the transform degrades, never miscompiles).
+        for slot in 0..2 {
+            let pending_src = self.pending_widen[slot]
+                .as_ref()
+                .map(|p| match &p.src {
+                    Operand::Value(v) => Some(v.0),
+                    _ => None,
+                })
+                .flatten();
+            if let Some(pv) = pending_src {
+                if self.reg_assignments.get(&pv).copied() == Some(dest_phys) {
+                    refuse!("conflict with earlier pending src home");
+                }
+            }
+        }
+        // Slots are never full here: only a Cmp consumes a full pair and
+        // every non-Cmp/Cast dispatch flushes first (generate_instruction).
+        // Belt-and-braces: if they somehow are, fall back to normal emit.
+        if self.pending_widen.iter().all(|p| p.is_some()) {
+            refuse!("both slots full");
+        }
+        let free = if self.pending_widen[0].is_none() {
+            0
+        } else {
+            1
+        };
+        self.pending_widen[free] = Some(PendingWiden {
+            dest: dest.0,
+            src: src.clone(),
+            from_ty,
+            dest_phys,
+        });
+        self.pf15_trace("record");
+        true
+    }
+
+    /// Emit any deferred widening moves, in program order. Called by the
+    /// generate_instruction pre-dispatch hook for every non-Cmp/non-Cast
+    /// instruction, on every refused cast, by the compare-replay exits,
+    /// and on any compare that does not (or only partially) match.
+    pub(super) fn flush_pending_widen_impl(&mut self) {
+        for slot in 0..2 {
+            if let Some(p) = self.pending_widen[slot].take() {
+                self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
+            }
+        }
+    }
+
+    /// If `lhs`/`rhs` are exactly the two recorded deferred casts (in
+    /// either order), take both records and return
+    /// `((lhs_src, lhs_ty, lhs_signed), (rhs_src, rhs_ty, rhs_signed))`.
+    /// Leaves the records untouched on any mismatch — a lone pending is
+    /// NEVER silently dropped here (its widening move would otherwise
+    /// never be emitted and the consumer would read garbage).
+    #[allow(clippy::type_complexity)]
+    fn take_pending_widen_pair(
+        &mut self,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(
+        (Operand, IrType, bool, PhysReg),
+        (Operand, IrType, bool, PhysReg),
+    )> {
+        let (lv, rv) = match (lhs, rhs) {
+            (Operand::Value(l), Operand::Value(r)) => (l.0, r.0),
+            _ => {
+                self.pf15_trace("take_pair: operands not both values");
+                return None;
+            }
+        };
+        let p0 = self.pending_widen[0].take();
+        let p1 = self.pending_widen[1].take();
+        if p0.is_none() || p1.is_none() {
+            // Partial occupancy: restore whatever was taken and refuse.
+            self.pf15_trace("take_pair: partial occupancy");
+            if let Some(a) = p0 {
+                self.pending_widen[0] = Some(a);
+            }
+            if let Some(b) = p1 {
+                self.pending_widen[1] = Some(b);
+            }
+            return None;
+        }
+        let a = p0.unwrap();
+        let b = p1.unwrap();
+        // Positional match, both orders.
+        if a.dest == lv && b.dest == rv {
+            let sa = a.from_ty.is_signed();
+            let sb = b.from_ty.is_signed();
+            return Some((
+                (a.src, a.from_ty, sa, a.dest_phys),
+                (b.src, b.from_ty, sb, b.dest_phys),
+            ));
+        }
+        if a.dest == rv && b.dest == lv {
+            let sa = b.from_ty.is_signed();
+            let sb = a.from_ty.is_signed();
+            return Some((
+                (b.src, b.from_ty, sa, b.dest_phys),
+                (a.src, a.from_ty, sb, a.dest_phys),
+            ));
+        }
+        // Mismatch: restore and report.
+        self.pf15_trace("take_pair: dest mismatch");
+        self.pending_widen[0] = Some(a);
+        self.pending_widen[1] = Some(b);
+        None
+    }
+
+    /// PF-15 consume path, called from the generate_instruction Cmp arm
+    /// BEFORE emit_cmp — including when MachInst will lower the compare —
+    /// so every possible consumer sees either a folded narrow compare or
+    /// fully materialized widening moves, never a half-deferred state.
+    ///
+    /// Full-pair shape `cmp(cast a, cast b)`: folds to
+    /// `(src_a, src_b, narrow_ty, mapped_op)` when the extension/opcode
+    /// compatibility matrix accepts; the two widening moves are then never
+    /// emitted at all. Single-side shape `cmp(cast a, C)`: folds when the
+    /// constant fits the narrow domain exactly under the same matrix.
+    /// Everything else: flush the deferred moves and return None (the
+    /// caller emits the wide compare from the original operands).
+    ///
+    /// Flag-exactness matrix (the defer-side contract lives on
+    /// `X86Codegen::pending_widen`):
+    ///   * sext+sext: sign-extension is order-preserving, so the narrow
+    ///     signed compare produces flag-identical answers for the signed
+    ///     setcc family {eq, ne, slt, sle, sgt, sge}. Unsigned opcodes on
+    ///     sign-extended operands compare negated bit patterns — refused.
+    ///   * zext+zext: zero-extension makes both values non-negative, where
+    ///     signed and unsigned relational order coincide; every IR opcode
+    ///     maps onto the unsigned narrow set {eq, ne, ult, ule, ugt, uge}.
+    ///   * mixed sext/zext: the widened values diverge (0xFF -> -1 vs
+    ///     255) — refused.
+    ///   * const rhs: allowed inside the narrow type's exact domain, with
+    ///     the same per-extension opcode sets (a negative constant can
+    ///     never compare against a zero-extended value; unsigned opcodes
+    ///     on sign-extended operands are refused, as above).
+    #[allow(clippy::type_complexity)]
+    pub(super) fn narrow_cmp_operands_impl(
+        &mut self,
+        dest: u32,
+        op: crate::ir::reexports::IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) -> Option<(
+        Operand,
+        Operand,
+        IrType,
+        crate::ir::reexports::IrCmpOp,
+    )> {
+        use crate::ir::reexports::IrCmpOp;
+        // Compare-replay dests re-emit the comparison at a DISTANT consumer
+        // (cmov/jcc far from here). The adjacency guarantee that keeps the
+        // deferred sources' homes intact does not reach there: materialize.
+        if self.cmp_replay.contains_key(&dest) {
+            self.pf15_trace("narrow: replay dest, flushing");
+            self.flush_pending_widen_impl();
+            return None;
+        }
+        self.pf15_trace("narrow: entered");
+        let op_map_zext = |op: IrCmpOp| -> IrCmpOp {
+            match op {
+                IrCmpOp::Slt => IrCmpOp::Ult,
+                IrCmpOp::Sle => IrCmpOp::Ule,
+                IrCmpOp::Sgt => IrCmpOp::Ugt,
+                IrCmpOp::Sge => IrCmpOp::Uge,
+                signed_or_unsigned_keep => signed_or_unsigned_keep,
+            }
+        };
+        let signed_only = |op: IrCmpOp| -> Option<IrCmpOp> {
+            match op {
+                IrCmpOp::Eq
+                | IrCmpOp::Ne
+                | IrCmpOp::Slt
+                | IrCmpOp::Sle
+                | IrCmpOp::Sgt
+                | IrCmpOp::Sge => Some(op),
+                _ => None,
+            }
+        };
+        // Full-pair shape.
+        if let Some(((lsrc, lty, lsign, ldest), (rsrc, rty, rsign, rdest))) =
+            self.take_pending_widen_pair(lhs, rhs)
+        {
+            let folded = if lty != rty {
+                None
+            } else if lsign && rsign {
+                signed_only(op).map(|m| (lsrc.clone(), rsrc.clone(), lty, m))
+            } else if !lsign && !rsign {
+                Some((lsrc.clone(), rsrc.clone(), lty, op_map_zext(op)))
+            } else {
+                None // mixed sext/zext: widened values diverge
+            };
+            self.pf15_trace(if folded.is_some() { "pair FOLD" } else { "pair matrix refuse" });
+            if let Some(f) = folded {
+                return Some(f);
+            }
+            // Refused: the records are already taken OUT of the slots, so
+            // re-emit both widening moves explicitly, in program order.
+            self.emit_int_widen_move(&lsrc, lty, ldest);
+            self.emit_int_widen_move(&rsrc, rty, rdest);
+            return None;
+        }
+        // Single-side const shape: cmp(cast(x), C) with C in the narrow
+        // domain. (Cmp with a constant lhs is canonicalized to rhs
+        // upstream; a const lhs here simply takes the flush path below.)
+        if self.pending_widen[1].is_some() {
+            self.flush_pending_widen_impl();
+            return None;
+        }
+        let (src, from_ty, dest_phys) = match (lhs, self.pending_widen[0].take()) {
+            (Operand::Value(v), Some(p)) if p.dest == v.0 => (p.src, p.from_ty, p.dest_phys),
+            (_, other) => {
+                self.pending_widen[0] = other;
+                self.flush_pending_widen_impl();
+                return None;
+            }
+        };
+        let (lo, hi) = if from_ty.is_signed() {
+            (
+                -(1i64 << (from_ty.size() * 8 - 1)),
+                (1i64 << (from_ty.size() * 8 - 1)) - 1,
+            )
+        } else {
+            (0i64, (1i64 << (from_ty.size() * 8)) - 1)
+        };
+        let folded = match rhs {
+            Operand::Const(c) => match c.clone().to_i64() {
+                Some(cv) if (lo..=hi).contains(&cv) => {
+                    if from_ty.is_signed() {
+                        signed_only(op).map(|m| (src.clone(), rhs.clone(), from_ty, m))
+                    } else {
+                        Some((src.clone(), rhs.clone(), from_ty, op_map_zext(op)))
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(f) = folded {
+            return Some(f);
+        }
+        // Refused after take: re-emit the taken widening move explicitly.
+        self.emit_int_widen_move(&src, from_ty, dest_phys);
+        None
+    }
+
     fn try_emit_cast_reg_direct(
         &mut self,
         _dest: &Value,
@@ -456,90 +877,10 @@ impl X86Codegen {
             }
             CastKind::IntWiden { from_ty: ft, .. } => {
                 // Widen: sign or zero extend from smaller to larger type.
-                if let Some(src_reg) = src_phys {
-                    // Source is in a register — emit reg-to-reg extending move.
-                    let src_typed = typed_phys_reg_name(src_reg, ft);
-                    if ft.is_signed() {
-                        match ft.size() {
-                            1 => self
-                                .state
-                                .emit_fmt(format_args!("    movsbq %{}, %{}", src_typed, dest_64)),
-                            2 => self
-                                .state
-                                .emit_fmt(format_args!("    movswq %{}, %{}", src_typed, dest_64)),
-                            4 => self.state.emit_fmt(format_args!(
-                                "    movslq %{}, %{}",
-                                phys_reg_name_32(src_reg),
-                                dest_64
-                            )),
-                            _ => {
-                                self.operand_to_callee_reg(src, dest_phys);
-                            }
-                        }
-                    } else {
-                        match ft.size() {
-                            1 => self
-                                .state
-                                .emit_fmt(format_args!("    movzbl %{}, %{}", src_typed, dest_32)),
-                            2 => self
-                                .state
-                                .emit_fmt(format_args!("    movzwl %{}, %{}", src_typed, dest_32)),
-                            4 => {
-                                let src_32 = phys_reg_name_32(src_reg);
-                                self.state
-                                    .emit_fmt(format_args!("    movl %{}, %{}", src_32, dest_32));
-                            }
-                            _ => {
-                                self.operand_to_callee_reg(src, dest_phys);
-                            }
-                        }
-                    }
-                } else if let Some(slot_off) = src_slot {
-                    // Source is a stack slot — emit fused load+extend directly to dest.
-                    // Uses emit_instr_rbp_reg which handles rbp/rsp addressing automatically.
-                    if ft.is_signed() {
-                        match ft.size() {
-                            1 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
-                            2 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
-                            4 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
-                            _ => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
-                        }
-                    } else {
-                        match ft.size() {
-                            1 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-                            2 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-                            4 => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movl", slot_off, dest_32),
-                            _ => self
-                                .state
-                                .out
-                                .emit_instr_rbp_reg("    movq", slot_off, dest_64),
-                        }
-                    }
-                } else {
-                    return false;
-                }
-                return true;
+                // (Single definition shared with the PF-15 deferred-widen
+                // flush — emit_int_widen_move above.)
+                self.emit_int_widen_move(src, ft, dest_phys);
+                true
             }
             CastKind::IntNarrow { to_ty: t } => {
                 // Narrow: truncate to the target width.

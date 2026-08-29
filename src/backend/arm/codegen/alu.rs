@@ -763,6 +763,12 @@ impl ArmCodegen {
     ) {
         let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
         let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        // x1/x2 (operands) and x3 (remainder scratch) are used as FIXED
+        // registers here. That is sound without any RA exclusion because
+        // the ARM allocator only ever assigns x4, x5, x6, x7, x8, x13, x14
+        // (ARM_CALLER_SAVED) and x19-x28 (ARM_CALLEE_SAVED) — x1/x2/x3 are
+        // in no pool (audited 2026-08-29; x86's counterpart needs the %rdx
+        // exclusion because x86's allocatable pool includes rdx).
         self.operand_to_x0(lhs);
         self.state.emit("    mov x1, x0");
         self.operand_to_x0(rhs);
