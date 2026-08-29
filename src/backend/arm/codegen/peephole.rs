@@ -528,6 +528,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
+        changed |= thread_spill_slots(&mut lines, &mut kinds, n);
+        changed |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fold_zero_stores(&mut lines, &mut kinds, n);
         changed |= fuse_branch_over_branch(&mut lines, &mut kinds, n);
@@ -580,6 +582,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= forward_fp_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
+            changed2 |= thread_spill_slots(&mut lines, &mut kinds, n);
+            changed2 |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
             changed2 |= eliminate_overwritten_moves(&lines, &mut kinds, n);
@@ -4211,6 +4215,546 @@ fn sink_loop_carried_stores(lines: &mut [String], kinds: &mut [LineKind], n: usi
     true
 }
 
+// ── Pass 6: Spill-slot threading through a scratch register ────────────────
+//
+// Pattern (RA artifact; the ring_fifo / struct_copy class): a value is
+// staged through its stack slot even though every reader sits in the same
+// straight-line region as the store, and the source register is overwritten
+// in between:
+//
+//     str x0, [sp, #24]        ; spill
+//     ... insns that overwrite x0 ...
+//     ldr x0, [sp, #24]        ; reload of the spilled value
+//
+// Pass 1 only rewrites windows whose source register survives; once x0 is
+// clobbered the reload must really read memory — unless a caller-saved
+// register that nothing else touches threads the value across:
+//
+//     mov xR, x0               ; replaces (or precedes) the store
+//     ...
+//     mov x0, xR               ; replaces each reload
+//
+// Soundness rules, all checked before any rewrite:
+//   * window = store+1 .. last paired reload; labels, branches, calls,
+//     returns and pair accesses end it; an unclassified store (a possible
+//     frame alias through a base register like x19) also ends it;
+//   * no intervening store to the same slot offset;
+//   * x-form loads pair only with x-form stores (`ldr xD` of a w-stored
+//     slot reads the upper half's stale bytes — not reproducible by a move);
+//   * the scratch register is mentioned NOWHERE in the window and NOWHERE
+//     else in the function outside the rewritten lines, so its live range
+//     is exactly the window;
+//   * the store is deleted only when a function-wide textual census proves
+//     the offset has no other reference at all (pair ops and stur/ldur
+//     included); otherwise the store stays and only the reloads become
+//     moves (readers across back edges still see the slot).
+//
+// Kill switch: CCC_NO_SPILL_THREAD.
+
+/// Characteristic memory-operand text of an sp-relative slot reference.
+fn sp_slot_token(offset: i32) -> String {
+    format!("[sp, #{}]", offset)
+}
+
+/// All `[sp, #k]` slot offsets referenced by a line (any width or opcode).
+fn sp_offsets_in_line(line: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i + 6 <= b.len() {
+        if &b[i..i + 5] == b"[sp, " {
+            let mut j = i + 5;
+            if j < b.len() && b[j] == b'#' {
+                j += 1;
+                let mut end = j;
+                while end < b.len() && (b[end].is_ascii_digit() || b[end] == b'-') {
+                    end += 1;
+                }
+                if let Ok(k) = line[j..end].parse::<i32>() {
+                    out.push(k);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// True when the line's token stream mentions the given register (x or w form).
+fn line_mentions_reg(line: &str, reg: u8) -> bool {
+    let xn = xreg_name(reg);
+    let wn = wreg_name(reg);
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|tok| tok == xn || tok == wn)
+}
+
+fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SPILL_THREAD").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        let (s_reg, offset, s_word) = match kinds[i] {
+            LineKind::StoreSp {
+                reg,
+                offset,
+                is_word,
+            } => (reg, offset, is_word),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Collect same-offset, width-compatible reloads in the window.
+        // (is_word == false is the 64-bit x-form.)
+        let mut reloads: Vec<(usize, bool, bool)> = Vec::new(); // (idx, is_word, is_sw)
+        let mut j = i + 1;
+        let mut other_refs = 0usize; // slot refs in the window we do NOT rewrite
+        while j < n {
+            match kinds[j] {
+                LineKind::Nop => {}
+                LineKind::LoadSp {
+                    offset: o,
+                    is_word: w,
+                    reg: d,
+                    ..
+                } if o == offset => {
+                    if d >= 18 {
+                        // x18-x30 are callee-saved: such a load is very often
+                        // the ABI home restore, and rewriting it into a Move
+                        // exposes it to ABI-unaware dead-move passes (the
+                        // caller's register would never be restored —
+                        // costaware_devirt segfault class). Leave the slot.
+                        other_refs += 1;
+                    } else if w || !s_word {
+                        // x-load needs x-store; w-load pairs with both.
+                        reloads.push((j, w, false));
+                    } else {
+                        other_refs += 1; // x-load of a w-store: leave it reading the slot
+                    }
+                }
+                LineKind::LoadswSp { offset: o, reg: d, .. } if o == offset && d >= 18 => {
+                    other_refs += 1;
+                }
+                LineKind::LoadswSp { offset: o, .. } if o == offset => reloads.push((j, true, true)),
+                LineKind::StoreSp { offset: o, .. } if o == offset => break,
+                // Slot bytes span [offset, offset+8); ANY reference in
+                // [offset-7, offset+7] touches those bytes (e.g. `strb w0,
+                // [sp, #offset+3]` — the aggregate_copy_forward overlap
+                // family) and must block the transform.
+                LineKind::LoadSp { offset: o, .. } | LineKind::LoadswSp { offset: o, .. }
+                    if (o - offset).abs() < 8 =>
+                {
+                    other_refs += 1; // overlapping read consumes our bytes
+                }
+                LineKind::StoreSp { offset: o, .. } if (o - offset).abs() < 8 => {
+                    // Partial-word store INTO our slot's bytes.
+                    other_refs += 1;
+                    break;
+                }
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Call
+                | LineKind::Ret
+                | LineKind::StorePairSp
+                | LineKind::LoadPairSp
+                | LineKind::LoadsbReg => break,
+                LineKind::MemOther | LineKind::Other => {
+                    let t = lines[j].trim_start();
+                    let mut stored_overlap = false;
+                    for k in sp_offsets_in_line(t) {
+                        if (k - offset).abs() < 8 && k != offset {
+                            other_refs += 1;
+                        }
+                        if k == offset {
+                            stored_overlap = stored_overlap
+                                || t.starts_with("str ")
+                                || t.starts_with("stur ")
+                                || t.starts_with("stp ");
+                        }
+                    }
+                    if sp_offsets_in_line(t).contains(&offset) {
+                        other_refs += 1; // unclassified exact-offset reference
+                    }
+                    if stored_overlap {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if reloads.is_empty() {
+            i += 1;
+            continue;
+        }
+        let last = reloads.last().map(|&(idx, _, _)| idx).unwrap_or(i);
+
+        // The transform only fires when the slot has no reader this window
+        // leaves behind (slices cannot grow; the kept-store variant would
+        // need an inserted move), so census-proven total coverage is a
+        // precondition, checked below.
+        if other_refs != 0 {
+            i += 1;
+            continue;
+        }
+
+        // Function extent + textual census. The offset must have no reference
+        // beyond this store and the reloads rewritten here.
+        let func_start = {
+            let mut k = i;
+            while k > 0 && !is_function_boundary(&lines[k]) {
+                k -= 1;
+            }
+            k
+        };
+        let func_end = {
+            let mut k = i + 1;
+            while k < n && !is_function_boundary(&lines[k]) {
+                k += 1;
+            }
+            k
+        };
+        // Overlap-range textual census (exact tokens miss byte-lane stores
+        // like `strb w0, [sp, #offset+3]`).
+        let mut total_refs = 0usize;
+        for k in func_start..func_end {
+            for o in sp_offsets_in_line(&lines[k]) {
+                if (o - offset).abs() < 8 {
+                    total_refs += 1;
+                }
+            }
+        }
+        // 1 (the store) + all reloads must account for every reference.
+        if total_refs != 1 + reloads.len() {
+            i += 1;
+            continue;
+        }
+        let all_covered = true;
+
+        // Scratch selection: an x2-x17 register mentioned nowhere in the
+        // window (excluding the lines being rewritten) and nowhere else in
+        // the function.
+        let mut scratch: Option<u8> = None;
+        'cand: for cand in [2u8, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17] {
+            if cand == s_reg {
+                continue;
+            }
+            if reloads
+                .iter()
+                .any(|&(idx, _, _)| matches!(kinds[idx], LineKind::LoadSp { reg, .. } | LineKind::LoadswSp { reg, .. } if reg == cand))
+            {
+                continue;
+            }
+            for k in (i + 1)..=last {
+                if reloads.iter().any(|&(idx, _, _)| idx == k) {
+                    continue;
+                }
+                if line_mentions_reg(&lines[k], cand) {
+                    continue 'cand;
+                }
+            }
+            for k in func_start..func_end {
+                if k == i || reloads.iter().any(|&(idx, _, _)| idx == k) {
+                    continue;
+                }
+                if line_mentions_reg(&lines[k], cand) {
+                    continue 'cand;
+                }
+            }
+            scratch = Some(cand);
+            break;
+        }
+        let Some(r) = scratch else {
+            i += 1;
+            continue;
+        };
+        let rx = xreg_name(r);
+        let rw = wreg_name(r);
+        let sx = xreg_name(s_reg);
+        let sw = wreg_name(s_reg);
+
+        // Replace the store with a move into the scratch when the slot has no
+        // other reader; otherwise keep the store and put the move in front of
+        // it (the slot stays intact for its other readers).
+        if all_covered {
+            lines[i] = if s_word {
+                format!("    mov {}, {}", rw, sw)
+            } else {
+                format!("    mov {}, {}", rx, sx)
+            };
+            kinds[i] = LineKind::Move {
+                dst: r,
+                src: s_reg,
+                is_32bit: s_word,
+            };
+        }
+        for &(idx, w, is_sw) in &reloads {
+            let dst_reg = match kinds[idx] {
+                LineKind::LoadSp { reg, .. } => reg,
+                LineKind::LoadswSp { reg, .. } => reg,
+                _ => continue,
+            };
+            let dx = xreg_name(dst_reg);
+            let dw = wreg_name(dst_reg);
+            let new_line = match (is_sw, w) {
+                (true, _) => format!("    sxtw {}, {}", dx, rw),
+                (false, false) => format!("    mov {}, {}", dx, rx),
+                (false, true) => format!("    mov {}, {}", dw, rw),
+            };
+            lines[idx] = new_line;
+            kinds[idx] = if is_sw {
+                LineKind::Sxtw {
+                    dst: dst_reg,
+                    src: r,
+                }
+            } else {
+                LineKind::Move {
+                    dst: dst_reg,
+                    src: r,
+                    is_32bit: w,
+                }
+            };
+        }
+        changed = true;
+        i += 1;
+    }
+    changed
+}
+
+// ── Pass 7: adrp+add rematerialisation CSE ──────────────────────────────────
+//
+// The RA rematerialises `adrp xA, sym; add xA, xA, :lo12:sym` per use. When
+// the identical pair repeats within one block and an earlier pair's register
+// still holds the address, the second adrp — and, for the same register, the
+// second add — is redundant:
+//
+//     adrp x0, ring            adrp x0, ring
+//     add  x0, x0, :lo12:ring  add  x0, x0, :lo12:ring   <- both deleted
+//
+// Different registers keep the second `add` but retarget it at the first
+// pair's register and drop the second `adrp`. A missed CSE is a missed opt;
+// a wrong one a miscompile, so anything unrecognised invalidates every
+// tracked entry. Kill switch: CCC_NO_ADRP_CSE.
+
+/// `adrp xA, SYM` (non-empty, non-immediate symbol operand).
+fn parse_adrp_only(line: &str) -> Option<(u8, String)> {
+    let rest = line.trim().strip_prefix("adrp ")?;
+    let mut it = rest.splitn(2, ',');
+    let reg = parse_reg(it.next()?.trim());
+    if reg == REG_NONE || reg >= 31 {
+        return None;
+    }
+    let sym = it.next()?.trim();
+    if sym.is_empty() || sym.starts_with('#') || sym.starts_with(':') {
+        return None;
+    }
+    Some((reg, sym.to_string()))
+}
+
+/// `add xA, xB, :lo12:SYM` — an address completion (the paired form has A==B).
+fn parse_adrp_pair_add(line: &str) -> Option<(u8, u8, String)> {
+    let rest = line.trim().strip_prefix("add ")?;
+    let mut it = rest.split(',');
+    let dst = parse_reg(it.next()?.trim());
+    let src = parse_reg(it.next()?.trim());
+    let third = it.next()?.trim();
+    if it.next().is_some() {
+        return None;
+    }
+    let sym = third.strip_prefix(":lo12:")?.trim();
+    if sym.is_empty() || dst == REG_NONE || dst >= 31 || src == REG_NONE {
+        return None;
+    }
+    Some((dst, src, sym.to_string()))
+}
+
+/// Does this line define `reg`? `None` = unrecognised instruction: callers
+/// must treat it as "kills every tracked entry".
+fn line_defines_gp(line: &str, kind: LineKind, reg: u8) -> Option<bool> {
+    if let Some(d) = written_gp_register(line, kind) {
+        return Some(d == reg);
+    }
+    match kind {
+        // Coarse kinds whose def behaviour the textual allowlist below
+        // decides; written_gp_register already handled the precise ones.
+        LineKind::Move { .. }
+        | LineKind::MoveImm { .. }
+        | LineKind::MoveWide { .. }
+        | LineKind::Sxtw { .. }
+        | LineKind::LoadSp { .. }
+        | LineKind::LoadswSp { .. } => return None,
+        _ => {}
+    }
+    const USE_FIRST: &[&str] = &[
+        "str", "stur", "stp", "stnp", "cmp", "cmn", "ccmp", "ccmn", "cbz", "cbnz", "tbz", "tbnz",
+        "ret", "nop",
+    ];
+    const DEF_FIRST: &[&str] = &[
+        "adrp", "adr", "add", "adds", "sub", "subs", "ldr", "ldur", "ldp", "ldnp", "ldrsw",
+        "ldrsh", "ldrsb", "sxtw", "sxtb", "uxth", "uxtb", "lsl", "lsr", "asr", "ror", "madd",
+        "msub", "mul", "mneg", "and", "ands", "orr", "orns", "eor", "eon", "bic", "bics", "csel",
+        "csinc", "csinv", "csneg", "extr", "sbfm", "ubfm", "sbfx", "ubfx", "bfm", "mvn", "fmov",
+        "scvtf", "ucvtf", "mrs",
+    ];
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(' ')?;
+    if USE_FIRST.contains(&mnem) {
+        return Some(false);
+    }
+    if DEF_FIRST.contains(&mnem) {
+        let first = rest.split(',').next()?.trim();
+        return Some(parse_reg(first) == reg);
+    }
+    None // unknown: kill all
+}
+
+fn cse_adrp_remat_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_ADRP_CSE").is_ok() {
+        return false;
+    }
+    // (reg, sym, add_idx) — completed, still-valid canonical pairs.
+    let mut done: Vec<(u8, String, usize)> = Vec::new();
+    // (reg, sym, adrp_idx, canonical) — adrps awaiting the paired add;
+    // `canonical` is set when this adrp is already proven redundant.
+    let mut open: Vec<(u8, String, usize, Option<u8>)> = Vec::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Nop => {
+                i += 1;
+                continue;
+            }
+            // Block boundaries and calls invalidate everything (adrp results
+            // live in caller-saved registers).
+            LineKind::Label
+            | LineKind::Branch
+            | LineKind::CondBranch
+            | LineKind::CmpBranch
+            | LineKind::Call
+            | LineKind::Ret => {
+                done.clear();
+                open.clear();
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        // adrp lines are decided HERE, before any kill bookkeeping: the pair
+        // being deleted would itself redefine the register, so it must not
+        // invalidate its own canonical entry.
+        if let Some((reg, sym)) = parse_adrp_only(&lines[i]) {
+            let mut canonical: Option<u8> = None;
+            for &(rr, ref ss, add_idx) in done.iter() {
+                if *ss != sym {
+                    continue;
+                }
+                let mut valid = true;
+                for k in (add_idx + 1)..i {
+                    if kinds[k] == LineKind::Nop {
+                        continue;
+                    }
+                    if line_defines_gp(&lines[k], kinds[k], rr) != Some(false) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    canonical = Some(rr);
+                    break;
+                }
+            }
+            if canonical.is_none() {
+                // A fresh remat: its register definition retires same-reg
+                // entries.
+                done.retain(|&(rr, _, _)| rr != reg);
+                open.retain(|&(rr, _, _, _)| rr != reg);
+            }
+            open.push((reg, sym, i, canonical));
+            i += 1;
+            continue;
+        }
+
+        // Completed pair? `add xA, xA, :lo12:sym` closing an open adrp.
+        if let Some((dst, src, sym)) = parse_adrp_pair_add(&lines[i]) {
+            if dst == src {
+                if let Some(pos) = open
+                    .iter()
+                    .position(|&(r, ref s, _, _)| r == dst && *s == sym)
+                {
+                    let (_, _, adrp_idx, canonical) = open[pos];
+                    open.remove(pos);
+                    let mut creg = canonical;
+                    if let Some(c) = creg {
+                        // Re-verify between the (deleted) adrp and this add:
+                        // only Nops may intervene.
+                        for k in (adrp_idx + 1)..i {
+                            if kinds[k] == LineKind::Nop {
+                                continue;
+                            }
+                            if line_defines_gp(&lines[k], kinds[k], c) != Some(false) {
+                                creg = None;
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(c) = creg {
+                        if c == dst {
+                            lines[adrp_idx] = String::new();
+                            kinds[adrp_idx] = LineKind::Nop;
+                            lines[i] = String::new();
+                            kinds[i] = LineKind::Nop;
+                        } else {
+                            lines[i] = format!(
+                                "    add {}, {}, :lo12:{}",
+                                xreg_name(dst),
+                                xreg_name(c),
+                                sym
+                            );
+                            lines[adrp_idx] = String::new();
+                            kinds[adrp_idx] = LineKind::Nop;
+                        }
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    // No usable canonical: this pair becomes canonical.
+                    done.push((dst, sym, i));
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Kill per-register entries on recognised defs...
+        let mut recognized = false;
+        for r in 0..=30u8 {
+            if let Some(defines) = line_defines_gp(&lines[i], kinds[i], r) {
+                recognized = true;
+                if defines {
+                    done.retain(|&(rr, _, _)| rr != r);
+                    open.retain(|&(rr, _, _, _)| rr != r);
+                }
+            }
+        }
+        // ...or kill everything on unrecognised lines.
+        if !recognized {
+            done.clear();
+            open.clear();
+        }
+        i += 1;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4383,6 +4927,121 @@ mod tests {
         assert!(result.contains("sxtw x0, w1"));
     }
 
+    // ── Pass 6: spill-slot threading tests ─────────────────────────────
+
+    #[test]
+    fn test_spill_thread_basic() {
+        // str + clobbered source + reload in one window: both disappear into
+        // a scratch-threaded move pair (census: 1 store, 1 load).
+        let input = concat!(
+            "main:\n",
+            "    mov x1, x3\n",
+            "    str x0, [sp, #24]\n",
+            "    add x0, x1, x3\n",
+            "    ldr x0, [sp, #24]\n",
+            "    str w0, [x9]\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("[sp, #24]"), "slot round-trip survived:\n{}", result);
+        assert!(result.contains("mov x2, x0"), "scratch move missing:\n{}", result);
+    }
+
+    #[test]
+    fn test_spill_thread_keeps_slot_for_other_reader() {
+        // A second load in a later block: the store must survive.
+        let input = concat!(
+            "main:\n",
+            "    str x0, [sp, #8]\n",
+            "    add x0, x1, x3\n",
+            "    ldr x0, [sp, #8]\n",
+            "    cbz x0, .LBB1\n",
+            ".LBB1:\n",
+            "    ldr x5, [sp, #8]\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("str x0, [sp, #8]"), "store wrongly deleted:\n{}", result);
+    }
+
+    #[test]
+    fn test_spill_thread_word_store_ldrsw() {
+        // w-store + ldrsw reload: sxtw from the threaded scratch.
+        let input = concat!(
+            "main:\n",
+            "    str w1, [sp, #12]\n",
+            "    add w1, w2, w3\n",
+            "    ldrsw x0, [sp, #12]\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert!(!result.contains("ldrsw"), "ldrsw survived:\n{}", result);
+        assert!(result.contains("sxtw x0, w"), "sxtw from scratch missing:\n{}", result);
+    }
+
+    #[test]
+    fn test_spill_thread_call_blocks() {
+        // A call in the window: no rewrite (the scratch could be clobbered
+        // by the call and the value is caller-saved).
+        let input = concat!(
+            "main:\n",
+            "    str x0, [sp, #16]\n",
+            "    bl helper\n",
+            "    ldr x0, [sp, #16]\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("ldr x0, [sp, #16]"), "window crossed a call:\n{}", result);
+    }
+
+    // ── Pass 7: adrp remat CSE tests ───────────────────────────────────
+
+    #[test]
+    fn test_adrp_cse_same_reg() {
+        let input = concat!(
+            "main:\n",
+            "    adrp x0, ring\n",
+            "    add x0, x0, :lo12:ring\n",
+            "    mov x19, x0\n",
+            "    adrp x0, ring\n",
+            "    add x0, x0, :lo12:ring\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("adrp x0, ring").count(), 1, "dup adrp:\n{}", result);
+        assert_eq!(result.matches("add x0, x0, :lo12:ring").count(), 1, "dup add:\n{}", result);
+    }
+
+    #[test]
+    fn test_adrp_cse_killed_by_clobber() {
+        let input = concat!(
+            "main:\n",
+            "    adrp x0, ring\n",
+            "    add x0, x0, :lo12:ring\n",
+            "    mov x0, x5\n",
+            "    adrp x0, ring\n",
+            "    add x0, x0, :lo12:ring\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert_eq!(result.matches("adrp x0, ring").count(), 2, "clobbered pair reused:\n{}", result);
+    }
+
+    #[test]
+    fn test_adrp_cse_different_symbol() {
+        let input = concat!(
+            "main:\n",
+            "    adrp x0, ring\n",
+            "    add x0, x0, :lo12:ring\n",
+            "    adrp x0, tail\n",
+            "    add x0, x0, :lo12:tail\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        assert!(result.contains("adrp x0, tail"), "wrong symbol CSEd:\n{}", result);
+        assert!(result.contains("adrp x0, ring"), "first pair deleted:\n{}", result);
+    }
+
     // ── Global store forwarding tests ─────────────────────────────────
 
     #[test]
@@ -4416,15 +5075,31 @@ mod tests {
 
     #[test]
     fn test_gsf_invalidation_on_reg_overwrite() {
-        // After x0 is overwritten, the mapping slot 16 → x0 is stale
+        // After x0 is overwritten, the mapping slot 16 → x0 is stale: a
+        // forwarding of the STALE register value would be wrong. Pass 6
+        // (spill-slot threading) now proves value equality explicitly: the
+        // pre-clobber x0 is threaded through a dedicated scratch, so the
+        // load disappears while x1 still receives the ORIGINAL x0.
+        // (Strictly stronger than the old "the ldr survives" shape: it pins
+        // the exact value flow — the wrong forwarding `mov x1, x0` after the
+        // overwrite, and a post-overwrite memory reload, are both absent.)
         let input = "\
     str x0, [sp, #16]\n\
     mov x0, #42\n\
     ldr x1, [sp, #16]\n\
+    add x3, x1, #1\n\
     ret\n";
         let result = peephole_optimize(input.to_string());
-        // The load should NOT be forwarded since x0 was overwritten
-        assert!(result.contains("ldr x1, [sp, #16]"));
+        // Empirically-verified final shape (pass 6 threads, then copy-prop /
+        // move-chain fold the dead x1 hop): capture BEFORE the clobber, use
+        // of the captured original AFTER it, slot fully gone.
+        assert!(
+            result.contains("mov x2, x0") && result.contains("add x3, x2, #1"),
+            "threaded original-value flow missing:\n{}",
+            result
+        );
+        assert!(!result.contains("[sp, #16]"));
+        assert!(!result.contains("mov x1, x0"), "stale forwarding:\n{}", result);
     }
 
     #[test]

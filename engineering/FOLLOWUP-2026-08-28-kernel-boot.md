@@ -229,3 +229,37 @@ real-mode setup.
 - Open: i686 trampoline emitter audit (emit_init_trampoline_impl) for the same
   hand-encoding bug class; ARM byte-loop shape thread; the 93-fail ARM corpus is
   dominated by x86-artifact tests (harness may need arch filtering).
+
+## Session S11 (post-#285 rebase onto d4283869) — i686 audit clean; ARM peephole pass 6/7
+
+- **i686 trampoline emitter audit: CLEAN** (negative result, no fix needed).
+  Template `B9 imm32 | FF 25 disp32` verified at runtime (freestanding probe +
+  full nested_functions rc=0 native), all of -O0/-O1/-O2/-fomit-frame-pointer/
+  -fPIC green; .data.rel.ro template + RWE GNU_STACK chain already correct.
+- **Driver defect fixed (2e41aca2):** i686 set_target() filtered the shared
+  multilib GCC include dir (/usr/lib/gcc/x86_64-linux-gnu/<v>/include) out of
+  the -m32 search path — stddef.h/stdarg.h unresolvable on Debian multilib
+  (real `gcc -m32` uses that exact dir). Only x86-64 *C library* dirs are
+  filtered now; dedicated i686/gcc-cross dirs still probed first.
+- **ARM peephole pass 6 (spill-slot threading) + pass 7 (adrp+add remat CSE)**
+  (this commit): pass 6 rewrites `str xS,[sp,#off] ... ldr xD,[sp,#off]`
+  round-trips through an unused caller-saved scratch when xS is clobbered in
+  between; store deleted only when a function-wide ±8-byte overlap-aware
+  census proves total coverage. Guard rails learned from red-team A/B: (1)
+  partial-word stores inside the slot's bytes (strb at #off+3) must block —
+  exact-token census is unsound; (2) x18-x30 destinations must NOT be paired
+  (ABI home restores become Move-kind and get deleted by ABI-unaware dead-
+  move passes — costaware_devirt segfault class). Pass 7 deletes duplicated
+  adrp+add remat pairs in-block (same-reg) or retargets the add (cross-reg),
+  allowlist-based def detection, unknown insns kill all state.
+  GCC-include-fixture test_gsf_invalidation_on_reg_overwrite updated to the
+  strictly-stronger threaded value-flow shape (empirically verified).
+- Gates: lib 1289/0 (-D warnings; +7 fixtures); ARM corpus 379/95 = baseline
+  d4283869 (379/93 pre-#284-env + 2 pre-existing fails that fail on pristine
+  too: i686_fused_mul_add_operand_order, segment_fill_copy_alias — came with
+  PR #284 or the refreshed toolchain); benchmark corpus 8686 -> 8630 insns
+  (15 programs shrink, 0 grow); 4-backend differentials green.
+- Known-carry-over: the big ARM size gap vs GCC (2-5x on branchy mains) is
+  dominated by RA slot-staging of loop-invariant constants/addresses — the
+  recorded RA accumulator-machine item (DECISIONS-listed, do not interleave
+  with MS-08/RA-06A).
