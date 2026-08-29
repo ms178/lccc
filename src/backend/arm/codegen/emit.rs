@@ -241,6 +241,15 @@ pub struct ArmCodegen {
     /// Total bytes of named (non-variadic) params passed on the stack.
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
+    /// Dest value-ids of Clz/Ctz/Popcount results on ≤32-bit integer types:
+    /// provably in [0, 32] (bit 31 clear), and the emitters write them with
+    /// W-register instructions (which zero the upper 32 bits of the X
+    /// register). Their I32→I64 widening casts therefore need no `sxtw` —
+    /// the value in the X register is already the correct zero-extended
+    /// (and, being non-negative, sign-extension-identical) 64-bit result.
+    /// Per-definition, never propagated through derived arithmetic (the
+    /// x86-64 backend's bitop_nonneg_values transfer).
+    pub(super) bitop_nonneg_values: FxHashSet<u32>,
     /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
     /// AArch64 target): dest value-ids of TAIL instructions — they emit
     /// nothing because the HEAD's sdiv+msub dual-store wrote their result.
@@ -291,6 +300,7 @@ impl ArmCodegen {
             va_named_gp_count: 0,
             va_named_fp_count: 0,
             va_named_stack_bytes: 0,
+            bitop_nonneg_values: FxHashSet::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             asm_scratch_idx: 0,

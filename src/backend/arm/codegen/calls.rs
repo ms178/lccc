@@ -72,8 +72,11 @@ impl ArmCodegen {
             // alignment is 16 is placed 16-byte aligned in the overflow
             // area; F128/I128 are always 16-byte aligned). Must match
             // compute_stack_arg_space.
-            let arg_padding =
-                crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
+            let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(
+                arg_classes,
+                struct_arg_aligns,
+                16,
+            );
             let mut stack_offset = 0i64;
             for (arg_idx, arg) in args.iter().enumerate() {
                 if !arg_classes[arg_idx].is_stack() {

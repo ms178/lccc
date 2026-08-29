@@ -13,6 +13,30 @@ impl RiscvCodegen {
     // ---- calculate_stack_space ----
 
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
+        // Clz/Ctz/Popcount on ≤32-bit integer types produce results in
+        // [0, bitwidth] — the count is built from 0 upward in a full 64-bit
+        // register — so their I32→I64 widening casts skip the `sext.w`
+        // (see cast_ops and the x86-64 bitop_nonneg_values design this
+        // transfers).
+        {
+            let mut nonneg = crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let crate::ir::reexports::Instruction::UnaryOp { dest, op, ty, .. } = inst {
+                        if matches!(
+                            op,
+                            crate::ir::reexports::IrUnaryOp::Clz
+                                | crate::ir::reexports::IrUnaryOp::Ctz
+                                | crate::ir::reexports::IrUnaryOp::Popcount
+                        ) && !ty.is_float() && ty.size() <= 4 {
+                            nonneg.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            self.bitop_nonneg_values = nonneg;
+        }
+
         // For variadic functions, count the actual GP registers used by named
         // parameters. A struct that occupies 2 GP regs counts as 2, not 1.
         // This is critical for va_start to correctly point to the first variadic arg.

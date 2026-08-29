@@ -376,6 +376,12 @@ pub struct X86Codegen {
     /// Whether the register save area must preserve SSE argument registers:
     /// true when any va_arg in the body reads SSE class, or the va_list escapes.
     pub(super) vararg_fp_save: bool,
+    /// True between emit_call_stack_args_impl and emit_call_cleanup_impl
+    /// when the outgoing area was dynamically realigned (a stack argument
+    /// requires alignment > 16): the cleanup must restore %rsp exactly from
+    /// the 16-byte save slot above the argument area instead of a static
+    /// `addq` (the realignment delta is runtime-dependent).
+    pub(super) dyn_align_cleanup: bool,
     /// Scratch register index for inline asm allocation (GP registers)
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm allocation (XMM registers)
@@ -702,6 +708,7 @@ impl X86Codegen {
             divrem_broken_tails: FxHashSet::default(),
             vararg_gp_save: true,
             vararg_fp_save: true,
+            dyn_align_cleanup: false,
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),

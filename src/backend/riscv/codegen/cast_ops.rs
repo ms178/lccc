@@ -204,6 +204,20 @@ impl RiscvCodegen {
         if crate::backend::f128_softfloat::f128_emit_cast(self, dest, src, from_ty, to_ty) {
             return;
         }
+        // Clz/Ctz/Popcount results are provably in [0, 32] and their emitters
+        // build the count from 0 upward in a full 64-bit register — the
+        // I32→I64 signed widen's `sext.w` is the identity. The generic `lw`
+        // reload of the 4-byte slot sign-extends a non-negative value, which
+        // is equally the identity.
+        if from_ty == IrType::I32
+            && to_ty == IrType::I64
+            && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+        {
+            self.operand_to_t0(src);
+            self.store_t0_to(dest);
+            self.state.reg_cache.invalidate_acc();
+            return;
+        }
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
     }
 }

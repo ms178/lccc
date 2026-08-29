@@ -172,6 +172,31 @@ impl ArmCodegen {
         self.conditional_increment_leaf = false;
         self.conditional_increment_leaf_condition_32 = false;
 
+        // Clz/Ctz/Popcount on ≤32-bit integer types produce results in
+        // [0, bitwidth] — bit 31 is provably zero, and the emitters write
+        // the result with W-register instructions (zeroing the upper half
+        // of the X register). Their I32→I64 widening casts therefore skip
+        // the `sxtw` (see cast_ops and the x86-64 bitop_nonneg_values
+        // design this transfers).
+        {
+            let mut nonneg = crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::UnaryOp { dest, op, ty, .. } = inst {
+                        if matches!(
+                            op,
+                            crate::ir::reexports::IrUnaryOp::Clz
+                                | crate::ir::reexports::IrUnaryOp::Ctz
+                                | crate::ir::reexports::IrUnaryOp::Popcount
+                        ) && !ty.is_float() && ty.size() <= 4 {
+                            nonneg.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            self.bitop_nonneg_values = nonneg;
+        }
+
         // Same-block div/rem pair fusion table: one sdiv/udiv serves a
         // div+rem couple with identical operands (the remainder comes from
         // msub, exactly GCC's shape). Constant-RHS pairs never fuse
