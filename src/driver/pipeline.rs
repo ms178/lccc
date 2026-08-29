@@ -142,6 +142,10 @@ pub struct Driver {
     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
     pub(super) no_sse: bool,
+    /// Set by an explicit `-mno-sse`/`-mno-sse2`. `-march=native` and CPU
+    /// profiles must not re-enable SSE after that: GCC keeps the disable
+    /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
+    pub(super) sse_explicitly_disabled: bool,
     pub(super) skip_rax_setup: bool,
     /// -mno-80387/-mno-fp-ret-in-387: no x87 instructions or x87 FP returns.
     /// Recorded so FP codegen can fail closed on long-double paths.
@@ -419,6 +423,7 @@ impl Driver {
             cf_protection_branch: false,
             cf_protection_value: None,
             no_sse: false,
+            sse_explicitly_disabled: false,
             skip_rax_setup: false,
             no_x87: false,
             indirect_branch_thunk_inline: false,
