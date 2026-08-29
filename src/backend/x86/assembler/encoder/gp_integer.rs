@@ -580,6 +580,51 @@ impl super::InstructionEncoder {
         self.encode_movzx(ops, src_size, dst_size)
     }
 
+    /// Encode suffix-less `movzx` / `movsx` where both src and dst sizes are
+    /// inferred from the register operands (e.g. `movzx %bl, %edi` from
+    /// twofish-x86_64-asm_64.S). For reg-reg, src size comes from src reg,
+    /// dst size from dst reg. For mem-reg, src size defaults to 1 when dst
+    /// is 32/64-bit and the mnemonic is ambiguous — the twofish pattern is
+    /// always reg-reg, so mem-reg falls back to byte source.
+    pub(crate) fn encode_movzx_infer_both(
+        &mut self,
+        ops: &[Operand],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movzx requires 2 operands".to_string());
+        }
+        let src_size = match &ops[0] {
+            Operand::Register(r) => infer_reg_size(&r.name),
+            Operand::Memory(_) => 1, // default byte source for ambiguous mem form
+            _ => return Err("movzx source must be register or memory".to_string()),
+        };
+        if src_size != 1 && src_size != 2 {
+            return Err(format!("movzx source must be 8 or 16-bit, got {} bytes", src_size));
+        }
+        let dst_size = infer_movext_dst_size(ops)?;
+        self.encode_movzx(ops, src_size, dst_size)
+    }
+
+    pub(crate) fn encode_movsx_infer_both(
+        &mut self,
+        ops: &[Operand],
+    ) -> Result<(), String> {
+        if ops.len() != 2 {
+            return Err("movsx requires 2 operands".to_string());
+        }
+        let src_size = match &ops[0] {
+            Operand::Register(r) => infer_reg_size(&r.name),
+            Operand::Memory(_) => 1,
+            _ => return Err("movsx source must be register or memory".to_string()),
+        };
+        if src_size != 1 && src_size != 2 && src_size != 4 {
+            return Err(format!("movsx source must be 8/16/32-bit, got {} bytes", src_size));
+        }
+        let dst_size = infer_movext_dst_size(ops)?;
+        // movsx with 32->64 is movslq (0x63), handled by encode_movsx
+        self.encode_movsx(ops, src_size, dst_size)
+    }
+
     pub(crate) fn encode_lea(&mut self, ops: &[Operand], size: u8) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("lea requires 2 operands".to_string());

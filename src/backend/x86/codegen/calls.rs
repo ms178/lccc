@@ -4,7 +4,7 @@ use super::emit::{X86_ARG_REGS, X86Codegen};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
-use crate::ir::reexports::{IrConst, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl X86Codegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
@@ -22,6 +22,68 @@ impl X86Codegen {
             align_struct_pairs: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: false,
+        }
+    }
+
+    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add offsets.
+    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds).
+    fn resolve_global_addr_chain(&self, mut val_id: u32, mut acc: i64) -> Option<(String, i64)> {
+        let mut visited = 0;
+        loop {
+            if visited > 64 {
+                return None;
+            }
+            visited += 1;
+            let inst = self.get_defining_instruction(val_id)?;
+            match inst {
+                Instruction::GlobalAddr { name, .. } => {
+                    return Some((name.clone(), acc));
+                }
+                Instruction::GetElementPtr { base, offset, .. } => {
+                    let off = match offset {
+                        Operand::Const(c) => c.to_i64()?,
+                        _ => return None,
+                    };
+                    acc = acc.checked_add(off)?;
+                    val_id = base.0;
+                }
+                Instruction::Copy { src, .. } => match src {
+                    Operand::Value(v) => val_id = v.0,
+                    _ => return None,
+                },
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    lhs,
+                    rhs,
+                    ..
+                } => {
+                    let (base_val, const_off) = match (lhs, rhs) {
+                        (Operand::Value(v), Operand::Const(c)) => (v.0, c.to_i64()?),
+                        (Operand::Const(c), Operand::Value(v)) => (v.0, c.to_i64()?),
+                        _ => return None,
+                    };
+                    acc = acc.checked_add(const_off)?;
+                    val_id = base_val;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Try to resolve an indirect call's func_ptr Operand to a global+offset.
+    /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
+    /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
+    fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<(String, i64)> {
+        let v = match op {
+            Operand::Value(v) => v,
+            _ => return None,
+        };
+        let inst = self.get_defining_instruction(v.0)?;
+        match inst {
+            Instruction::Load { ptr, .. } => self.resolve_global_addr_chain(ptr.0, 0),
+            // In case the Load was already folded or func_ptr is directly a GEP'd global
+            // address that was loaded via slot (defensive), try resolving the value itself.
+            _ => self.resolve_global_addr_chain(v.0, 0),
         }
     }
 
@@ -258,6 +320,19 @@ impl X86Codegen {
     /// on SysV x86-64, and caller-saved live values have already been spilled by
     /// `emit_pre_call_save_caller_regs` before this hook runs.
     pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
+        // Paravirt fast-path: if func_ptr is Load(GEP(GlobalAddr sym, off)),
+        // we will emit `call *sym+off(%rip)` (ff 15) directly in
+        // emit_call_instruction_impl, which is required for
+        // arch/x86/kernel/paravirt.c:apply_alternatives to patch.
+        // Skipping the r10 spill avoids the `mov $sym, %r15; call *off(%r15)`
+        // pattern (41 ff 57 disp) that is not recognized by the paravirt
+        // patcher and causes boot failures in check_tsc_warp / queued_spin_lock.
+        if self.try_resolve_indirect_call_global(func_ptr).is_some() {
+            self.state.reg_cache.invalidate_all();
+            self.flush_pending_vec_store_impl();
+            self.state.invalidate_vec_peephole();
+            return;
+        }
         self.operand_to_rax(func_ptr);
         self.state.emit("    movq %rax, %r10");
         self.state.reg_cache.invalidate_all();
@@ -777,12 +852,33 @@ impl X86Codegen {
             } else {
                 self.state.out.emit_call(name);
             }
-        } else if func_ptr.is_some() {
-            // Indirect function pointers are preloaded into r10 by
-            // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
-            // not reload the Operand here: stack argument setup changes %rsp,
-            // so RSP-relative slots would be addressed incorrectly.
-            self.emit_retpoline_call("r10");
+        } else if let Some(fp) = func_ptr {
+            // Paravirt/global fast-path: if func_ptr resolves to a global+offset
+            // (e.g. pv_ops+72), emit `call *sym+off(%rip)` directly. This produces
+            // the `ff 15 disp32` encoding with R_X86_64_PC32 reloc that
+            // arch/x86/kernel/paravirt.c:apply_alternatives expects to patch.
+            // Without this, we would emit `mov $sym, %r15; call *off(%r15)`
+            // (41 ff 57) which is not patchable and breaks boot.
+            if let Some((sym, off)) = self.try_resolve_indirect_call_global(fp) {
+                // Construct `sym+off` string for GAS. Use `sym` alone when off==0.
+                let sym_str = if off == 0 {
+                    sym.clone()
+                } else if off > 0 {
+                    format!("{}+{}", sym, off)
+                } else {
+                    format!("{}{}", sym, off) // off negative includes '-'
+                };
+                // Emit `call *sym+off(%rip)` – GAS will produce ff 15 with PC32 reloc.
+                // Use raw emit to avoid any PLT/GOT logic.
+                self.state
+                    .emit_fmt(format_args!("    call *{}({})", sym_str, "%rip"));
+            } else {
+                // Indirect function pointers are preloaded into r10 by
+                // emit_call_spill_fptr_impl before stack arguments are pushed.  Do
+                // not reload the Operand here: stack argument setup changes %rsp,
+                // so RSP-relative slots would be addressed incorrectly.
+                self.emit_retpoline_call("r10");
+            }
         }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
