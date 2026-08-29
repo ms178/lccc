@@ -3,7 +3,7 @@
 # build_kernel_full.sh — drive a full linux-cachymod kernel build with LCCC.
 #
 # This is the incremental "real workload" harness for the kernel-compilation
-# quest.  It prepares the patched 6.18.46 tree (see prepare_kernel_tree.sh),
+# quest.  It prepares the patched 6.18.47 tree (see prepare_kernel_tree.sh),
 # selects an LCCC-bootable x86_64 configuration (the package's custom
 # scheduler functionality enabled; function tracing/objtool/stack-protector
 # disabled because LCCC does not yet emit `-pg`/`__fentry__`, emit objects
@@ -22,7 +22,7 @@
 #          build_kernel_full.sh net/core/ fs/ ...        # selected subdirs
 #
 # Environment:
-#   KERNEL_DIR  patched tree  (default /home/user/kernel-work/linux-6.18.46)
+#   KERNEL_DIR  patched tree  (default /home/user/kernel-work/linux-6.18.47)
 #   PKGDIR      archpkgbuilds pkg dir (default .../packages/linux-cachymod-6.18)
 #   LCCC        compiler (default /home/user/lccc/target/fastbuild/lccc)
 #   LCCC_LD     linker   (default /home/user/lccc/target/fastbuild/lccc-ld)
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
 PKGDIR=${PKGDIR:-/home/user/archpkgbuilds/packages/linux-cachymod-6.18}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}

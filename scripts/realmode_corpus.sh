@@ -13,7 +13,7 @@ set -euo pipefail
 
 LCCC=$(realpath "${1:?usage: realmode_corpus.sh <lccc-binary> [outdir]}")
 OUT=${2:-/tmp/realmode}
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
 
 cd "$K"
 

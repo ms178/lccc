@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
 BZIMAGE=${1:-$K/arch/x86/boot/bzImage}
 QEMU=${QEMU:-qemu-system-x86_64}
 WORK=${BOOT_WORK:-/tmp/boottest}
@@ -101,5 +101,13 @@ if [[ $fail -eq 0 ]]; then
 else
   echo "QEMU BOOT: FAILURES DETECTED — full log: $LOG"
   tail -120 "$LOG"
+  # Compressed-stub error() writes to VGA via error_putstr, which -nographic
+  # does not capture. A silent SeaBIOS-only log with a later hlt loop is the
+  # ZSTD/gzip decompressor abort, not a missing serial driver. Do not pass
+  # earlyprintk= (16-bit early_serial_init livelocks on this image).
+  if ! grep -q 'Linux version' "$LOG"; then
+    echo "hint: no kernel banner — likely arch/x86/boot/compressed error() (VGA-only)."
+    echo "hint: QMP 'info registers' + x/32xb RIP-16; RBX often points at the zstd error string."
+  fi
   exit 1
 fi

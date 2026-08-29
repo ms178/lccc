@@ -39,7 +39,7 @@
 //! - GetElementPtr with constant zero offset => Copy of base
 //!
 //! Cast chain optimization (requires def lookup):
-//! - Cast(Cast(x, A->B), B->A) where A fits in B => Copy of x (widen-then-narrow)
+//! - Cast(Cast(x, A->B), B->A) where A is unsigned and fits in B => Copy of x
 //! - Cast(Cast(x, A->B), B->C) => Cast(x, A->C) (double widen/narrow)
 //! - Cast of constant => constant (fold at compile time)
 //!
@@ -463,6 +463,19 @@ struct BinOpDef {
 }
 
 /// Try to simplify an instruction using algebraic identities and strength reduction.
+/// Bisection helper for the preboot-ZSTD miscompile. `CCC_SIMPLIFY_SKIP` is a
+/// comma-separated list of fold families to disable:
+/// `bittest`, `reassoc`, `cast`, `cast_ident`, `gep`, `cmp`, `select`, `ident`.
+fn simplify_skip(family: &str) -> bool {
+    use std::sync::OnceLock;
+    static SKIP: OnceLock<String> = OnceLock::new();
+    let raw = SKIP.get_or_init(|| std::env::var("CCC_SIMPLIFY_SKIP").unwrap_or_default());
+    if raw.is_empty() {
+        return false;
+    }
+    raw.split(',').any(|s| s.trim() == family)
+}
+
 fn try_simplify_with_types(
     inst: &Instruction,
     cast_defs: &[Option<CastDef>],
@@ -638,9 +651,11 @@ fn simplify_cast(
     // its defining IR instruction already produced the requested narrow type.
     // In that case the truncation is semantically an identity and retaining it
     // creates needless extend/truncate moves and hides fusion opportunities.
-    if let Operand::Value(v) = src {
-        if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) {
-            return Some(Instruction::Copy { dest, src: *src });
+    if !simplify_skip("cast_ident") {
+        if let Operand::Value(v) = src {
+            if value_types.get(v.0 as usize).copied().flatten() == Some(to_ty) {
+                return Some(Instruction::Copy { dest, src: *src });
+            }
         }
     }
 
@@ -656,6 +671,9 @@ fn simplify_cast(
 
     // Cast chain optimization: if src is defined by another Cast, try to fold.
     // Only handle the widen-then-narrow-back case which is safe and common.
+    if simplify_skip("cast") {
+        return None;
+    }
     if let Operand::Value(v) = src {
         let idx = v.0 as usize;
         if let Some(Some(inner_cast)) = def_map.get(idx) {
@@ -665,16 +683,23 @@ fn simplify_cast(
 
             // Verify chain consistency: inner output type must match our input type
             if inner_to == from_ty {
-                // Widen then narrow back to exact same type (most common C pattern).
-                // E.g., Cast(Cast(x:I32, I32->I64), I64->I32) => Copy of x
-                // Safe because widening preserves all bits, then narrowing discards
-                // the high bits we added - yielding the original value unchanged.
-                // The size guard (inner_from.size() <= from_ty.size()) ensures the
-                // first cast was a widening, not a narrowing (which loses bits).
+                // Widen then narrow back to exact same type.
+                //   Cast(Cast(x, A->B), B->A) => Copy of x
+                // ONLY for unsigned A. Signed I32/I16/I8 homes are frequently
+                // zero-extended in the 64-bit register (`movl` / 32-bit ALU);
+                // the round-trip sign-extends (`movslq`). Collapsing to Copy
+                // keeps the zext high bits, so a later 64-bit use of that
+                // "I32" (pointer += length, size_t mix, shift count) sees
+                // 0x00000000FFFFFFFF instead of -1. That miscompiled the
+                // kernel preboot ZSTD decoder at -O1+ (`ZSTD-compressed
+                // data is corrupt` / SEGV on patterned payloads ≥ 320 B).
+                // Unsigned round-trips are already zext-canonical, so Copy
+                // is a strict win there.
                 if inner_from == to_ty
-                    && inner_from.is_integer()
+                    && inner_from.is_unsigned()
                     && from_ty.is_integer()
                     && inner_from.size() <= from_ty.size()
+                    && !simplify_skip("cast_same")
                 {
                     return Some(Instruction::Copy {
                         dest,
@@ -694,7 +719,7 @@ fn simplify_cast(
                     let a = inner_from.size();
                     let b = from_ty.size();
                     let c = to_ty.size();
-                    if a < b && b < c {
+                    if a < b && b < c && !simplify_skip("cast_widen") {
                         // Only safe when inner source and intermediate have same signedness
                         let same_sign = inner_from.is_signed() == from_ty.is_signed()
                             || inner_from.is_unsigned() == from_ty.is_unsigned();
@@ -713,7 +738,7 @@ fn simplify_cast(
                     // Safe because narrowing only keeps the low bits, so
                     // narrow(narrow(x, A->B), B->C) = narrow(x, A->C) regardless
                     // of signedness (both just truncate to C bits).
-                    if a > b && b > c {
+                    if a > b && b > c && !simplify_skip("cast_narrow") {
                         return Some(Instruction::Cast {
                             dest,
                             src: inner_src,
@@ -730,13 +755,22 @@ fn simplify_cast(
                     // equals Cast(x, A->C) for any signedness and any C.
                     // (Covers the C-promotion idiom the range-check fold emits:
                     // bool I8 -> I64 -> I32 collapses to bool I8 -> I32.)
-                    if b > a && b > c {
-                        return Some(Instruction::Cast {
-                            dest,
-                            src: inner_src,
-                            from_ty: inner_from,
-                            to_ty,
-                        });
+                    // A->B->A is exclusively `cast_same` (unsigned Copy). Folding
+                    // it here to Cast(A->A) identity-Copies on the next pass
+                    // and reintroduces the signed-home miscompile.
+                    if b > a && b > c && inner_from != to_ty && !simplify_skip("cast_mix") {
+                        let same_sign = inner_from.is_signed() == to_ty.is_signed()
+                            || inner_from.is_unsigned() == to_ty.is_unsigned();
+                        // Unsigned A is always zext-canonical, so A->B->C
+                        // matches Cast(A->C) for any C (bool U8->I64->I32).
+                        if c <= a || same_sign || inner_from.is_unsigned() {
+                            return Some(Instruction::Cast {
+                                dest,
+                                src: inner_src,
+                                from_ty: inner_from,
+                                to_ty,
+                            });
+                        }
                     }
                 }
             }
@@ -931,6 +965,9 @@ fn simplify_cmp(
     cast_defs: &[Option<CastDef>],
     is_boolean: &[bool],
 ) -> Option<Instruction> {
+    if simplify_skip("cmp") {
+        return None;
+    }
     // Self-comparison: Cmp(op, x, x) => constant
     if same_value_operands(lhs, rhs) && ty.is_integer() {
         let result: i8 = match op {
@@ -956,6 +993,10 @@ fn simplify_cmp(
     let const_i64 = cval.to_i64();
     let is_zero_const = const_i64 == Some(0);
     let is_one_const = const_i64 == Some(1);
+
+    if simplify_skip("cmp") {
+        return None;
+    }
 
     // Comparison narrowing: Cmp(op, Cast(x, T->W), C, W) => Cmp(op, x, C', T).
     //
@@ -1795,6 +1836,9 @@ fn combine_add_consts(c1: i64, c2: i64, ty: IrType) -> i64 {
 /// rewrite is a strict win. An empty use_counts slice (test entry points)
 /// keeps the historical behavior.
 fn reassociation_unprofitable(intermediate: &Operand, use_counts: &[u32]) -> bool {
+    if simplify_skip("reassoc") {
+        return true;
+    }
     if use_counts.is_empty() {
         return false;
     }
@@ -2662,8 +2706,28 @@ mod tests {
     }
 
     #[test]
-    fn test_cast_chain_widen_narrow() {
-        // Cast(Cast(x, I32->I64), I64->I32) => Copy of x
+    fn test_cast_chain_widen_narrow_unsigned() {
+        // Cast(Cast(x, U32->I64), I64->U32) => Copy of x (zext-canonical)
+        let mut defs: Vec<Option<CastDef>> = vec![None; 3];
+        defs[1] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I64,
+        });
+        let inst = Instruction::Cast {
+            dest: Value(2),
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I64,
+            to_ty: IrType::U32,
+        };
+        let result = try_simplify(&inst, &defs, &[], &[], &[], &[], &[]).unwrap();
+        assert_copy_value(&result, 0);
+    }
+
+    #[test]
+    fn test_cast_chain_widen_narrow_signed_not_copy() {
+        // Cast(Cast(x, I32->I64), I64->I32) must NOT collapse to Copy:
+        // signed 32-bit homes are often zext in the 64-bit register.
         let mut defs: Vec<Option<CastDef>> = vec![None; 3];
         defs[1] = Some(CastDef {
             src: Operand::Value(Value(0)),
@@ -2676,8 +2740,7 @@ mod tests {
             from_ty: IrType::I64,
             to_ty: IrType::I32,
         };
-        let result = try_simplify(&inst, &defs, &[], &[], &[], &[], &[]).unwrap();
-        assert_copy_value(&result, 0);
+        assert!(try_simplify(&inst, &defs, &[], &[], &[], &[], &[]).is_none());
     }
 
     #[test]
