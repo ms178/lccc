@@ -296,6 +296,13 @@ fn pin_address_taken_stack_slots(store: &LineStore, infos: &mut [LineInfo]) {
 ///    the functionality of local store-load forwarding across wider windows.
 /// 3. Run local passes one more time to clean up opportunities exposed by the
 ///    global passes (max `MAX_POST_GLOBAL_ITERATIONS` iterations).
+/// Cheap line estimate: count newline bytes (no allocation, no splitting).
+/// Used by the size-adaptive peephole gate; for LF-terminated text the
+/// newline count equals the line count, and the gate only needs a bound.
+fn line_count_estimate(asm: &str) -> usize {
+    asm.as_bytes().iter().filter(|&&b| b == b'\n').count()
+}
+
 pub fn peephole_optimize(mut asm: String) -> String {
     // ms178 debug: dump pre-peephole asm
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
@@ -322,6 +329,18 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Disable entirely with CCC_NO_PEEPHOLE=1; override the skip set with
     // CCC_PEEPHOLE_SKIP=pass1,pass2,...
     if std::env::var("CCC_NO_PEEPHOLE").is_ok() {
+        return asm;
+    }
+    // Size-adaptive gate: pathological machine-generated files (the torture
+    // memcpy-ax corpus expands to ~486k asm lines / ~246k instructions) pay a
+    // full pass-mix sweep measured at ~58 s while the output is byte-identical
+    // to the un-peepholed text — straight-line constant-size memset/memcpy
+    // expansions contain none of the staging/relay patterns the passes match.
+    // Real-world objects are orders of magnitude smaller (gzip -O2 links from
+    // ~20k asm lines), so a 150k-line threshold keeps every realistic file on
+    // the full pass mix while bounding worst-case compile time. Opt back in
+    // with CCC_FORCE_PEEPHOLE=1 (bisection hook, mirrors CCC_PEEPHOLE_PHASE4).
+    if line_count_estimate(&asm) > 150_000 && std::env::var("CCC_FORCE_PEEPHOLE").is_err() {
         return asm;
     }
     let skip_phase1 = std::env::var("CCC_NO_PEEPHOLE_PHASE1").is_ok();
@@ -360,6 +379,12 @@ pub fn peephole_optimize(mut asm: String) -> String {
     let skip_phase2 = skip_phase2;
     let skip_phase3 = skip_phase3;
     let max_phase1_iters = MAX_LOCAL_PASS_ITERATIONS;
+    // CCC_TIME_PEEPHOLE=1: per-iteration/per-phase wall-time trace on stderr.
+    // The optimizer is text-based, so pathological generated files (e.g. the
+    // torture memcpy-ax corpus: ~486k asm lines) make per-pass cost visible;
+    // this is the measurement hook for keeping the pass mix linear-ish.
+    let time_peephole = std::env::var("CCC_TIME_PEEPHOLE").is_ok();
+    let peephole_total = if time_peephole { Some(std::time::Instant::now()) } else { None };
 
     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
     // that appear in the prologue area (before the first function call).
@@ -453,6 +478,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     let mut changed = true;
     let mut pass_count = 0;
     while changed && pass_count < max_phase1_iters && !skip_phase1 {
+        let iter_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
         changed = false;
         let local_changed = if sk("combined") {
             false
@@ -618,10 +644,18 @@ pub fn peephole_optimize(mut asm: String) -> String {
                 changed |= push_pop::eliminate_binop_push_pop_pattern(&mut store, &mut infos);
             }
         }
+        if let Some(s) = iter_start {
+            eprintln!(
+                "[PEEPHOLE-TIME] phase1 iteration {}: {:.1} ms",
+                pass_count,
+                s.elapsed().as_secs_f64() * 1e3
+            );
+        }
         pass_count += 1;
     }
 
     // Phase 2: Expensive global passes (run once)
+    let phase2_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
     let global_changed = if skip_phase2 {
         false
     } else {
@@ -667,6 +701,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         global_changed
     };
+    if let Some(s) = phase2_start {
+        eprintln!("[PEEPHOLE-TIME] phase2: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
+    }
 
     // Phase 3: One more local cleanup if global passes made changes.
     if global_changed && !skip_phase3 {
@@ -851,6 +888,10 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Must run after all other transformations to catch final identical patterns.
     if !sk("identical_blocks") {
         identical_blocks::merge_identical_blocks(&mut store, &mut infos);
+    }
+
+    if let Some(s) = peephole_total {
+        eprintln!("[PEEPHOLE-TIME] total: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early

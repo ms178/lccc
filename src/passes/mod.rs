@@ -789,6 +789,14 @@ pub(crate) fn run_passes(
     // predictable for faster debug-style builds while still removing obvious
     // dead/copy/constant IR introduced by lowering.
     if opt_level == 1 {
+        // Parameter allocas are promoted up front so the folding passes
+        // below see ParamRef-SSA operands (range_fold + simplify need that
+        // shape to fold 20041114-1's unsigned-range disjunction). The
+        // reassociation single-use guard in simplify.rs removed the one
+        // rewrite that mis-compiled this shape (va-arg-21's glibc
+        // extern-inline vprintf body: the multi-use reassociation re-based a
+        // def onto a different register web while the inlined va_list ABI
+        // kept the old home).
         crate::ir::mem2reg::promote_allocas_with_params(module);
         if time_passes {
             eprintln!("[PASS] o1 mem2reg");
@@ -799,6 +807,53 @@ pub(crate) fn run_passes(
         }
         constant_fold::run(module);
         copy_prop::run(module);
+        // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
+        // all-ones arithmetic shr), `fabs(x) < 0.0` -> false and related
+        // per-instruction canonicalizations. gcc.c-torture shiftopt-1 and
+        // 20020720-1 leave their link_error calls reachable without these
+        // folds; GCC's front end / match.pd applies them at every level, so
+        // -O1 parity requires them here. One linear per-function sweep keeps
+        // the -O1 tier cheap and predictable.
+        if !pass_disabled(&disabled, "simplify") {
+            simplify::run_with_config(module, true);
+        }
+        // Inlining at -O1: GCC's -O1 tier inlines always_inline and
+        // extern-inline functions plus called-once/small static helpers, and
+        // several torture cases depend on the resulting constant propagation
+        // (20010119-1: __builtin_constant_p through extern inline; 990208-1:
+        // label-address static inline must duplicate per call site; bcp-1:
+        // opt0/opt1 inlined-constant answers). The inliner's own size and
+        // budget heuristics bound the expansion. Range-check folding runs
+        // after the post-inline promotion below: the fold matches on SSA
+        // compare operands, which only exist for actuals once param allocas
+        // are promoted (same rationale as the -O2 loop, which runs
+        // range_fold after mem2reg).
+        if !pass_disabled(&disabled, "inline") {
+            inline::run(module);
+        }
+        // Post-inline parameter promotion: with the inliner done, param
+        // allocas can become SSA values. Constants passed through inlined
+        // calls (20010119-1: a = 10) become visible to the propagation
+        // chain below, exactly like the -O2 tier's post-inline mem2reg.
+        crate::ir::mem2reg::promote_allocas_with_params(module);
+        // Range-check folding at -O1 (same transform as the -O2 loop's
+        // "range_fold" pass): (x >= lo && x <= hi) ->
+        // (unsigned)(x - lo) <= (hi - lo) plus the complement form.
+        // gcc.c-torture 20041114-1 needs it at -O1; the pass is
+        // O(instructions), idempotent, and runs before DCE so folded
+        // comparisons feed the same cleanup chain as at -O2.
+        if !pass_disabled(&disabled, "range_fold") {
+            module.for_each_function(range_check::run_function);
+        }
+        // Second copy-prop + constant-fold round: simplify rewrites shift
+        // identities into Copies (x>>0 => Copy(x)), so comparisons against the
+        // original value only become identical-operand compares after the new
+        // Copies are propagated (gcc.c-torture shiftopt-1: `(x >> 0) != x`).
+        // The -O2+ tier reaches the same fixpoint via its iterative loop; at
+        // -O1 this explicit second round keeps the tier loop-free while
+        // preserving parity. Both passes are linear and idempotent.
+        copy_prop::run(module);
+        constant_fold::run(module);
         // Same f128-builtin fold as -O0 (see above).
         simplify::fold_math_intrinsic_calls(module);
         module.for_each_function(dce::eliminate_dead_code);
@@ -808,9 +863,20 @@ pub(crate) fn run_passes(
         module.for_each_function(store_load_forward::run);
         constant_fold::run(module);
         module.for_each_function(cfg_simplify::simplify_cfg);
+        // Resolve remaining __builtin_constant_p queries BEFORE the final DCE:
+        // an unresolved IsConstant node keeps both select arms alive, so the
+        // not-taken arm's calls (20010119-1: undef()) only become removable
+        // after resolution. The final DCE then collects them; previously the
+        // resolver ran last and the dead branches survived to codegen.
+        constant_fold::resolve_remaining_is_constant(module);
+        // Post-resolution prune: resolving IsConstant turns previously
+        // both-arms-alive diamonds into constant branches, so one more
+        // cfg_simplify + DCE round folds the taken edge and deletes the
+        // dead arm's blocks (20010119-1: undef() inside the extern-inline
+        // body's not-constant arm reached codegen before this round).
+        module.for_each_function(cfg_simplify::simplify_cfg);
         module.for_each_function(dce::eliminate_dead_code);
         resolve_asm::resolve_inline_asm_symbols(module);
-        constant_fold::resolve_remaining_is_constant(module);
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
             eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
             eprintln!("{:#?}", module);

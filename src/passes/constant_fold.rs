@@ -533,6 +533,34 @@ fn try_fold_with_map(
                     src: Operand::Const(IrConst::I32(result as i32)),
                 });
             }
+            // Self-comparison of identical integer values: x == x => 1 and
+            // x != x / x < x / x > x => 0 (plus the always-true <=/>= forms).
+            // This catches equalities that only emerge after copy propagation:
+            // gcc.c-torture shiftopt-1 folds shift identities into Copies, so
+            // `(x >> 0) != x` becomes Cmp(Ne, v, v) only once those Copies are
+            // propagated. Integer types only — a floating-point x == x is the
+            // NaN test and must be preserved (the float arms above already
+            // returned for those).
+            if !ty.is_128bit() {
+                let same_value = matches!(
+                    (lhs, rhs),
+                    (Operand::Value(a), Operand::Value(b)) if a == b
+                );
+                if same_value {
+                    let result: i32 = match op {
+                        IrCmpOp::Eq | IrCmpOp::Sle | IrCmpOp::Sge | IrCmpOp::Ule | IrCmpOp::Uge => {
+                            1
+                        }
+                        IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sgt | IrCmpOp::Ult | IrCmpOp::Ugt => {
+                            0
+                        }
+                    };
+                    return Some(Instruction::Copy {
+                        dest: *dest,
+                        src: Operand::Const(IrConst::I32(result)),
+                    });
+                }
+            }
             let lhs_const = as_i64_const_mapped(lhs, const_map)?;
             let rhs_const = as_i64_const_mapped(rhs, const_map)?;
             // Truncate operands to the comparison type's width before comparing.
