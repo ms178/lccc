@@ -266,6 +266,25 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         closure.iter().map(|&i| header_insts[i].clone()).collect();
     // (phi_dest, phi_ty, preheader_incoming, latch_incoming)
     let mut phi_info: Vec<(u32, IrType, (BlockId, Operand), Operand)> = Vec::new();
+    // v18 Guard C: a header phi may have MULTIPLE non-latch incomings when
+    // the loop header has several outside predecessors (e.g. two exits of a
+    // preceding loop both flowing into this loop's header, or a break edge
+    // and a normal-exit edge merging at the header). The rotation's
+    // step-6.6 self-loop phi records exactly ONE preheader incoming
+    // (`(pre_op, pre_label)`), and the step-6/6.5 rewiring moves every
+    // original header predecessor onto the cloned guard — so after rotation
+    // the body's real entry edge comes from the GUARD block, while the
+    // self-loop phi's init incoming still names one of the ORIGINAL
+    // preheader labels. That label is no longer a predecessor of the phi's
+    // block: phi elimination then places the init copies on a dead edge,
+    // the live entry edge carries NO init, and the first iteration reads
+    // an undefined value (observed: loop_rotate_default_enable.c shape 4 —
+    // `sum_with_call(50)` accumulated garbage; the miscompile hid for
+    // months because a fresh stack page made the undefined slot read 0).
+    // The general fix — routing the init through the guard's own phis —
+    // is a future enhancement; bailing keeps rotation sound (same policy
+    // as Guard A/B).
+    let mut multi_pre_header = false;
     for inst in header_insts {
         if let Instruction::Phi {
             dest,
@@ -273,14 +292,28 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
             ty,
         } = inst
         {
-            let mut pre = None;
+            let mut pre: Option<(BlockId, Operand)> = None;
             let mut lat = None;
             for (op, lbl) in incoming {
                 if *lbl == latch_label {
                     lat = Some(*op);
+                } else if pre.is_some() && pre.as_ref().unwrap().0 != *lbl {
+                    // Second DISTINCT outside predecessor: the single-pre
+                    // self-loop phi shape cannot represent this header.
+                    multi_pre_header = true;
+                    break;
                 } else {
                     pre = Some((*lbl, *op));
                 }
+            }
+            if multi_pre_header {
+                if debug {
+                    eprintln!(
+                        "[ROT] header phi v{} has >1 non-latch incoming — bail (Guard C)",
+                        dest.0
+                    );
+                }
+                return false;
             }
             if let (Some(pre), Some(lat)) = (pre, lat) {
                 phi_info.push((dest.0, *ty, pre, lat));

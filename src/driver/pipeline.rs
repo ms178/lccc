@@ -1967,6 +1967,27 @@ impl Driver {
         // in the current iteration of a loop). Stack size reduction is handled
         // by copy coalescing in codegen instead.
 
+        // Backend IR-integrity gate (runs at EVERY opt level): no block may
+        // reach codegen without a predecessor path from the entry block.
+        // A nested short-circuit fold inside the frontend's recursive
+        // lower_condition_branch (fold_comparison_pair: `(x==0)||(x!=0)`
+        // -> true) terminates the current block with an unconditional
+        // branch while the outer `||` arm's rhs_label block has already
+        // been created and is lowered into afterwards. The stranded block
+        // is unreachable and its operands may reference values whose
+        // definitions were removed together with the folded branch
+        // (gcc.c-torture 20000314-1 at -O0: the `*(char *) winds` arm kept
+        // a Load whose pointer value lost its def; the x86 backend's
+        // session-26 hard gate — correctly — refuses to materialise a
+        // value with no home and the compile ICE'd). -O0 skips the pass
+        // pipeline entirely, so cfg_simplify's copy of this logic never
+        // ran there; late -O1+ transforms (bool_thread, phi elimination)
+        // can in principle strand blocks after the last simplify_cfg
+        // round, so the gate runs unconditionally right before codegen.
+        // Unreachable code has no observable semantics — removal is
+        // always sound and touches no reachable instruction.
+        crate::passes::cfg_simplify::for_each_function_eliminate_unreachable(&mut module);
+
         // Generate assembly using target-specific codegen
         let t8 = std::time::Instant::now();
         let opts = crate::backend::CodegenOptions {

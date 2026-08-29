@@ -38,6 +38,13 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     simplify_cfg(func)
 }
 
+/// Module-level entry for the driver's pre-codegen integrity gate: strips
+/// unreachable blocks from every defined function. See
+/// `eliminate_unreachable_blocks` for the full soundness argument.
+pub(crate) fn for_each_function_eliminate_unreachable(module: &mut crate::ir::module::IrModule) -> usize {
+    module.for_each_function(eliminate_unreachable_blocks)
+}
+
 /// Simplify the CFG of a single function.
 /// Iterates until no more simplifications are possible (fixpoint).
 ///
@@ -60,7 +67,7 @@ pub(crate) fn simplify_cfg(func: &mut IrFunction) -> usize {
         changed += fold_constant_switches(func, &label_to_idx);
         changed += simplify_redundant_cond_branches(func);
         changed += thread_jump_chains(func, &label_to_idx);
-        changed += remove_dead_blocks(func, &label_to_idx);
+        changed += eliminate_unreachable_blocks(func);
         changed += simplify_trivial_phis(func);
         changed += merge_single_pred_blocks(func);
         if changed == 0 {
@@ -775,13 +782,33 @@ fn would_create_phi_conflict(
 // Sub-pass: dead block elimination
 // ---------------------------------------------------------------------------
 
-/// Remove blocks that have no predecessors (except the entry block, blocks[0]).
-/// Returns the number of blocks removed.
-fn remove_dead_blocks(func: &mut IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> usize {
+/// Backend IR-integrity gate: remove every block unreachable from the entry
+/// block, keeping the roots that carry observable semantics (LabelAddr /
+/// static-local init labels, asm-goto targets). Runs verbatim at -O1+ as
+/// part of simplify_cfg and — via the driver's pre-codegen hook — at every
+/// opt level, so no backend can ever be handed a block without a
+/// predecessor path from the entry block.
+///
+/// Why the -O0 hook exists: -O0 skips the optimizer entirely, but the
+/// FRONTEND can still strand blocks. A nested short-circuit fold inside a
+/// recursive `lower_condition_branch` (fold_comparison_pair:
+/// `(x==0)||(x!=0)` -> true) terminates the current block with an
+/// unconditional branch while the outer `||` arm's rhs_label block has
+/// already been created and is lowered into afterwards. The stranded block
+/// is unreachable, and its operands may reference values whose definitions
+/// were removed together with the folded branch (gcc.c-torture
+/// 20000314-1: the `*(char *) winds` arm kept a Load whose pointer value
+/// lost its def; the x86 backend's session-26 hard gate — correctly —
+/// refuses to materialise a value with no home and the compile ICEs).
+/// Unreachable code has no observable semantics, so removing it is always
+/// sound; reachable code is untouched. Phis and asm-goto label references
+/// in surviving blocks are cleaned up below.
+pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
     if func.blocks.len() <= 1 {
         return 0;
     }
 
+    let label_to_idx = build_label_to_idx(func);
     // Compute the set of blocks reachable from the entry block via BFS.
     let entry = func.blocks[0].label;
     let mut reachable = FxHashSet::default();
