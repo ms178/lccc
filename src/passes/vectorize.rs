@@ -7607,6 +7607,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                 if let Instruction::BinOp {
                     op: IrBinOp::Add,
                     rhs,
+                    ty,
                     ..
                 } = &mut latch.instructions[pattern.iv_inc_idx]
                 {
@@ -7614,9 +7615,13 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                         Operand::Const(IrConst::I32(_)) => Operand::Const(IrConst::I32(128)),
                         _ => Operand::Const(IrConst::I64(128)),
                     };
+                    // Promote IV increment to I64 to eliminate movslq in backend.
+                    // The IV is byte offset (0..2048), always non-negative, so I64 is safe
+                    // and avoids sign-extension per iteration.
+                    *ty = IrType::I64;
                     changes += 1;
                     if debug {
-                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA)");
+                        eprintln!("[VEC]   Changed IV increment from +1 to +128 (quad FMA) and promoted to I64");
                     }
                 }
             }
@@ -7624,6 +7629,102 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
 
         if debug && !eliminated_mul {
             eprintln!("[VEC]   Warning: Could not find IV*8 multiply to eliminate");
+        }
+
+        // 2c: Promote IV Phi from I32 to I64 to eliminate movslq per iteration.
+        // Original loop: j is i32, but byte offset j*8 needs i64 for SIB addressing.
+        // Backend would emit movslq %r12d, %r10 per iteration. By making IV I64,
+        // we keep it in 64-bit register from start, saving 2 movslq per iter.
+        {
+            let header = &mut func.blocks[pattern.header_idx];
+            for inst in &mut header.instructions {
+                if let Instruction::Phi { dest, ty, incoming } = inst {
+                    if *dest == pattern.iv {
+                        if *ty == IrType::I32 {
+                            *ty = IrType::I64;
+                            // Promote incoming consts from I32 to I64
+                            for (op, _) in incoming.iter_mut() {
+                                if let Operand::Const(IrConst::I32(v)) = op {
+                                    *op = Operand::Const(IrConst::I64(*v as i64));
+                                }
+                            }
+                            changes += 1;
+                            if debug {
+                                eprintln!("[VEC]   Promoted IV Phi Value({}) from I32 to I64", dest.0);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Also promote any Cast I32->I64 of IV-derived values to Copy (eliminates movslq)
+            for &block_idx in &innermost_blocks {
+                let block = &mut func.blocks[block_idx];
+                for inst in &mut block.instructions {
+                    if let Instruction::Cast {
+                        dest,
+                        src,
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    } = inst
+                    {
+                        if let Operand::Value(v) = src {
+                            if iv_derived.contains(v) || *v == pattern.iv {
+                                // Replace Cast with Copy: IV is now I64, no conversion needed
+                                let cast_dest = *dest;
+                                let cast_src = src.clone();
+                                *inst = Instruction::Copy {
+                                    dest: cast_dest,
+                                    src: cast_src,
+                                };
+                                changes += 1;
+                                if debug {
+                                    eprintln!(
+                                        "[VEC]   Promoted Cast I32->I64 for Value({}) to Copy (IV now I64)",
+                                        cast_dest.0
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Promote comparison type to I64 if it compares IV
+            for block_idx in [pattern.header_idx] {
+                let block = &mut func.blocks[block_idx];
+                for inst in &mut block.instructions {
+                    if let Instruction::Cmp { lhs, rhs, ty, .. } = inst {
+                        let lhs_is_iv = if let Operand::Value(v) = lhs {
+                            iv_derived.contains(v) || *v == pattern.iv
+                        } else {
+                            false
+                        };
+                        let rhs_is_iv = if let Operand::Value(v) = rhs {
+                            iv_derived.contains(v) || *v == pattern.iv
+                        } else {
+                            false
+                        };
+                        if lhs_is_iv || rhs_is_iv {
+                            if *ty == IrType::I32 {
+                                *ty = IrType::I64;
+                                // Also promote const RHS/LHS if needed
+                                if let Operand::Const(IrConst::I32(v)) = rhs {
+                                    *rhs = Operand::Const(IrConst::I64(*v as i64));
+                                }
+                                if let Operand::Const(IrConst::I32(v)) = lhs {
+                                    *lhs = Operand::Const(IrConst::I64(*v as i64));
+                                }
+                                changes += 1;
+                                if debug {
+                                    eprintln!("[VEC]   Promoted IV comparison to I64");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
