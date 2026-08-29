@@ -228,6 +228,28 @@ impl X86Codegen {
         if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
             return;
         }
+        // PF-16b: widening casts of Clz/Ctz/Popcount results (bit31
+        // provably zero, upper bits zeroed by the 32-bit write itself)
+        // take the UNSIGNED path: zero-extension equals the required
+        // sign-extension, and movl/movzbl beats cltq/movslq/movsbq on
+        // length and decoded opacity. The rewrite is a pure from_ty
+        // reclassification — every downstream unsigned path (register-
+        // direct, slot, accumulator) then emits the zero form.
+        let from_ty = if from_ty.is_signed()
+            && !from_ty.is_float()
+            && from_ty.size() <= 4
+            && to_ty.size() == 8
+            && !to_ty.is_float()
+            && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+        {
+            match from_ty {
+                IrType::I8 => IrType::U8,
+                IrType::I16 => IrType::U16,
+                _ => IrType::U32,
+            }
+        } else {
+            from_ty
+        };
 
         // Register-direct integer casts: bypass the accumulator when the destination
         // has a physical register. Instead of load→cast→store through %rax, emit the

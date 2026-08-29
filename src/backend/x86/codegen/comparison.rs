@@ -5,6 +5,121 @@ use crate::backend::regalloc::PhysReg;
 use crate::common::types::IrType;
 use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 
+/// IR-level scan for compare-replay candidates, shared by the x86-64
+/// prologue (which consumes `replay` as the emitter contract) and the RA
+/// link builder (which consumes `operand_links` to extend operand live
+/// intervals) — allocator and emitter can never disagree about which
+/// values the backend reads at the consumer position.
+///
+/// A Cmp is a replay candidate when its destination has exactly one use,
+/// the compare is an integer compare of non-wide type, it is not already
+/// handled by the better ADJACENT flag fusion (`fused`), and that single
+/// use is a same-block Select or the block-terminator CondBranch. The
+/// consumer then re-emits the comparison from the recorded operands right
+/// before its cmov/jcc instead of testing a materialized boolean.
+///
+/// `operand_links` maps each Value operand to the Cmp DEST: the dest's
+/// single use IS the consumer, so the dest's live-interval end marks the
+/// replay position. Extending the operand's interval to that end (via
+/// RegAllocConfig::folded_index_uses, whose contract — "the backend reads
+/// this value at the consumer's position" — covers this case exactly)
+/// guarantees register homes survive intervening instructions. Operands
+/// that end up with no home at all (never-materialized values) are
+/// pruned post-RA by the prologue; slot-homed operands never needed the
+/// extension (the slot is written at every definition).
+pub(crate) struct CmpReplayScan {
+    pub replay: crate::common::fx_hash::FxHashMap<
+        u32,
+        (IrCmpOp, Operand, Operand, IrType),
+    >,
+    pub operand_links:
+        crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+}
+
+pub(crate) fn compute_cmp_replay_scan(
+    func: &crate::ir::reexports::IrFunction,
+    use_counts: &crate::common::fx_hash::FxHashMap<u32, u32>,
+    fused: &crate::common::fx_hash::FxHashMap<u32, u32>,
+) -> CmpReplayScan {
+    let mut replay = crate::common::fx_hash::FxHashMap::default();
+    let mut operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>> =
+        crate::common::fx_hash::FxHashMap::default();
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        for (ii, inst) in insts.iter().enumerate() {
+            let (cdest, cop, clhs, crhs, cty) = match inst {
+                crate::ir::reexports::Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
+                _ => continue,
+            };
+            if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            // Integer comparisons only: float comparisons use ucomiss/
+            // ucomisd with a different flag contract (PF for NaN, the
+            // setnp/sete dance) — replaying them as integer cmps produces
+            // wrong selects (simd_sse2_arith regression). WIDE (I128)
+            // compares are excluded too: emit_cmp routes them to
+            // emit_i128_cmp, which ignores cmp_replay AND could not be
+            // replayed by emit_int_cmp_replay_insn (multi-instruction
+            // 128-bit compare).
+            if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
+                continue;
+            }
+            // Already handled by the (better) adjacent fusion.
+            if fused.contains_key(&cdest) {
+                continue;
+            }
+            // The single use must be a Select in this block or the
+            // block-terminator CondBranch.
+            let mut used_by_select = false;
+            for (jj, other) in insts.iter().enumerate() {
+                if jj == ii {
+                    continue;
+                }
+                if let crate::ir::reexports::Instruction::Select {
+                    cond: Operand::Value(v),
+                    ..
+                } = other
+                {
+                    if v.0 == cdest {
+                        used_by_select = true;
+                        break;
+                    }
+                }
+            }
+            if !used_by_select {
+                if let crate::ir::reexports::Terminator::CondBranch {
+                    cond: Operand::Value(v),
+                    ..
+                } = &block.terminator
+                {
+                    if v.0 == cdest {
+                        used_by_select = true;
+                    }
+                }
+            }
+            if used_by_select {
+                for op in [&clhs, &crhs] {
+                    if let Operand::Value(v) = op {
+                        operand_links.entry(v.0).or_default().push(cdest);
+                    }
+                }
+                replay.insert(cdest, (cop, clhs, crhs, cty));
+            }
+        }
+    }
+    CmpReplayScan {
+        replay,
+        operand_links,
+    }
+}
+
 impl X86Codegen {
     pub(super) fn emit_float_cmp_impl(
         &mut self,
