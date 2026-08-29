@@ -569,7 +569,7 @@ fn run(args: &[String]) -> Result<(), String> {
     // ------------------------------------------------------------------
     if let Some(script_path) = script_path {
         let mut objects = if elf_i386 {
-            lccc::linker_entry::load_inputs_i386_script(&inputs)?
+            lccc::linker_entry::load_inputs_i386_script(&inputs, &undefined_symbols)?
         } else {
             let mut objects = Vec::new();
             lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;

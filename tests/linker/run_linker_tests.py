@@ -1505,6 +1505,72 @@ def _script_undefined_archive_test(args, oracles):
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+
+def _script_undefined_archive_test_i386(args, oracles):
+    """ELF32 `-T` links must honour `-u SYM` against archives.
+
+    Linux's real-mode `setup.elf` is `lccc-ld -m elf_i386 -T setup.ld -u …`.
+    The x86-64 script path already seeded `-u`; the i386 loader used to
+    pass an empty extra-undefined list into archive extraction.
+    """
+    name = "script_undefined_pulls_archive_i386"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "pe.c"), "w") as f:
+            f.write("extern int efi_is64;\n"
+                    "int efi_pe_entry(void){ return efi_is64; }\n")
+        with open(os.path.join(td, "mixed.c"), "w") as f:
+            f.write("int efi_is64 = 1;\n"
+                    "void efi32_stub_entry(void){}\n")
+        with open(os.path.join(td, "head.c"), "w") as f:
+            f.write("int startup_32(void){ return 0; }\n")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write("OUTPUT_FORMAT(\"elf32-i386\")\n"
+                    "OUTPUT_ARCH(i386)\n"
+                    "ENTRY(startup_32)\n"
+                    "SECTIONS {\n"
+                    "  . = 0;\n"
+                    "  .text : { *(.text*) }\n"
+                    "  .data : { *(.data*) *(.rodata*) *(.bss*) *(COMMON) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
+                    "}\n")
+        for src in ("pe.c", "mixed.c", "head.c"):
+            r = sh([CC, "-m32", "-c", "-O1", "-ffreestanding", "-fno-pic",
+                    "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
+                    src], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:150])
+        r = sh(["ar", "rcs", "libstub.a", "pe.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "ar libstub failed")
+        r = sh(["ar", "rcs", "libstartup.a", "mixed.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "ar startup failed")
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        common = ["-m", "elf_i386", "-u", "efi_pe_entry",
+                  "-T", "t.lds", "head.o", "libstub.a", "libstartup.a"]
+        r = sh([lccc_ld] + common + ["-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          f"lccc-ld -m elf_i386 -T -u failed: {r.stderr.decode()[:400]}")
+        nm = sh(["nm", "out.lccc"], cwd=td).stdout.decode()
+        for required in ("efi_pe_entry", "efi_is64", "efi32_stub_entry"):
+            if not re.search(rf"\b{required}$", nm, re.M):
+                return Result(name, "FAIL",
+                              f"-u did not pull archive member defining {required}")
+        r = sh([lccc_ld, "-m", "elf_i386", "-T", "t.lds",
+                "head.o", "libstub.a", "libstartup.a", "-o", "out.nou"], cwd=td)
+        if r.returncode == 0:
+            nm_nou = sh(["nm", "out.nou"], cwd=td).stdout.decode()
+            if re.search(r"\befi_pe_entry$", nm_nou, re.M):
+                return Result(name, "FAIL",
+                              "archive member pulled without -u (over-broad extract)")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 VDSO_SCRIPT = r"""
 PHDRS {
  text PT_LOAD FILEHDR PHDRS FLAGS(5);
@@ -4489,6 +4555,7 @@ def main():
     if (not args.filter or "undefined" in args.filter or "efi" in args.filter) \
             and (not args.tag or args.tag == "script"):
         results.append(_script_undefined_archive_test(args, oracles))
+        results.append(_script_undefined_archive_test_i386(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
     if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \

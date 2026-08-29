@@ -41,8 +41,12 @@ pub fn load_inputs_x86(
 }
 
 /// Load ELF32/i386 objects and archives for a script-driven link.
-pub fn load_inputs_i386_script(inputs: &[(String, bool)]) -> Result<Vec<Elf64Object>, String> {
-    crate::backend::i686::linker::load_inputs_for_script(inputs)
+/// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
+pub fn load_inputs_i386_script(
+    inputs: &[(String, bool)],
+    undefined: &[String],
+) -> Result<Vec<Elf64Object>, String> {
+    crate::backend::i686::linker::load_inputs_for_script(inputs, undefined)
 }
 
 /// Append a synthetic object carrying an empty `.note.gnu.build-id`
