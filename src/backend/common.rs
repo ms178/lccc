@@ -284,7 +284,7 @@ pub fn link_with_args(
                     }
                 }
                 let mut objects = Vec::new();
-                crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects)?;
+                crate::backend::x86::linker::load_inputs_for_ld(&inputs, &mut objects, &[])?;
                 crate::backend::x86::linker::emit_rel::link_relocatable(&objects, output_path)?;
                 // `-Map FILE` (any spelling): glibc's elf/Makefile builds
                 // librtld.map with `$(reloc-link) ... -Wl,-Map,$@T` and then

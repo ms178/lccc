@@ -31,11 +31,13 @@ mod version_tests {
 
 /// Load a mix of relocatable objects (.o) and archives (.a) for x86-64 with
 /// whole-command-line group semantics. `inputs` is (path, whole_archive).
+/// `undefined` are `-u`/`--undefined` symbols that must pull archive members.
 pub fn load_inputs_x86(
     inputs: &[(String, bool)],
     objects: &mut Vec<Elf64Object>,
+    undefined: &[String],
 ) -> Result<(), String> {
-    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects)
+    crate::backend::x86::linker::load_inputs_for_ld(inputs, objects, undefined)
 }
 
 /// Load ELF32/i386 objects and archives for a script-driven link.

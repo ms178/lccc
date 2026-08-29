@@ -1424,6 +1424,87 @@ def _pie_script_test(args, oracles):
     finally:
         shutil.rmtree(td, ignore_errors=True)
 
+
+def _script_undefined_archive_test(args, oracles):
+    """`-T` script links must honour `-u SYM` against archives.
+
+    Linux's compressed vmlinux is linked as
+        lccc-ld -pie -u efi_pe_entry -T vmlinux.lds ... libstub/lib.a startup/lib.a
+    `efi_pe_entry` lives in an archive member nothing else references; that
+    member then pulls `efi_is64` from efi-mixed.o, which is what supplies
+    `efi32_stub_entry` / `efi64_stub_entry`. Those two labels must sit
+    exactly 0x200 apart or header.S dies with
+        "32-bit and 64-bit EFI entry points do not match".
+
+    The userspace `-Wl,-u` path already had a test (`undefined_flag_pulls_archive`);
+    the script-driven driver used to swallow `-u` into unused passthrough.
+    """
+    name = "script_undefined_pulls_archive"
+    td = tempfile.mkdtemp(prefix=f"lnk.{name}.")
+    try:
+        with open(os.path.join(td, "pe.c"), "w") as f:
+            f.write("extern int efi_is64;\n"
+                    "int efi_pe_entry(void){ return efi_is64; }\n")
+        with open(os.path.join(td, "mixed.c"), "w") as f:
+            f.write("int efi_is64 = 1;\n"
+                    "void efi32_stub_entry(void){}\n"
+                    "void efi64_stub_entry(void){}\n")
+        with open(os.path.join(td, "head.c"), "w") as f:
+            f.write("int startup_32(void){ return 0; }\n")
+        with open(os.path.join(td, "t.lds"), "w") as f:
+            f.write("ENTRY(startup_32)\n"
+                    "SECTIONS {\n"
+                    "  . = 0;\n"
+                    "  .text : { *(.text*) }\n"
+                    "  .data : { *(.data*) *(.rodata*) *(.bss*) *(COMMON) }\n"
+                    "  /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }\n"
+                    "}\n")
+        for src in ("pe.c", "mixed.c", "head.c"):
+            r = sh([CC, "-c", "-O1", "-ffreestanding", "-fno-pic",
+                    "-fno-asynchronous-unwind-tables", "-fno-stack-protector",
+                    src], cwd=td)
+            if r.returncode != 0:
+                return Result(name, "SKIP", r.stderr.decode()[:150])
+        r = sh(["ar", "rcs", "libstub.a", "pe.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "ar libstub failed")
+        r = sh(["ar", "rcs", "libstartup.a", "mixed.o"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "SKIP", "ar startup failed")
+        lccc_ld = os.path.join(os.path.dirname(args.lccc), "lccc-ld")
+        common = ["-pie", "--no-dynamic-linker", "-u", "efi_pe_entry",
+                  "-T", "t.lds", "head.o", "libstub.a", "libstartup.a"]
+        r = sh([lccc_ld] + common + ["-o", "out.lccc"], cwd=td)
+        if r.returncode != 0:
+            return Result(name, "FAIL",
+                          f"lccc-ld -T -u failed: {r.stderr.decode()[:400]}")
+        nm = sh(["nm", "out.lccc"], cwd=td).stdout.decode()
+        for required in ("efi_pe_entry", "efi_is64",
+                         "efi32_stub_entry", "efi64_stub_entry"):
+            if not re.search(rf"\b{required}$", nm, re.M):
+                return Result(name, "FAIL",
+                              f"-u did not pull archive member defining {required}")
+        # Negative control: without -u the EFI symbols must stay out.
+        r = sh([lccc_ld, "-pie", "--no-dynamic-linker", "-T", "t.lds",
+                "head.o", "libstub.a", "libstartup.a", "-o", "out.nou"], cwd=td)
+        if r.returncode == 0:
+            nm_nou = sh(["nm", "out.nou"], cwd=td).stdout.decode()
+            if re.search(r"\befi_pe_entry$", nm_nou, re.M):
+                return Result(name, "FAIL",
+                              "archive member pulled without -u (over-broad extract)")
+        r2 = sh(["ld"] + common + ["-o", "out.ld"], cwd=td)
+        if r2.returncode == 0:
+            nm2 = sh(["nm", "out.ld"], cwd=td).stdout.decode()
+            for required in ("efi_pe_entry", "efi32_stub_entry"):
+                if not re.search(rf"\b{required}$", nm2, re.M):
+                    return Result(name, "SKIP",
+                                  "GNU ld did not pull EFI symbols either")
+        return Result(name, "PASS")
+    except Exception as e:
+        return Result(name, "FAIL", f"harness exception: {e!r}")
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
 VDSO_SCRIPT = r"""
 PHDRS {
  text PT_LOAD FILEHDR PHDRS FLAGS(5);
@@ -4405,6 +4486,9 @@ def main():
 
     if (not args.filter or "pie" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_pie_script_test(args, oracles))
+    if (not args.filter or "undefined" in args.filter or "efi" in args.filter) \
+            and (not args.tag or args.tag == "script"):
+        results.append(_script_undefined_archive_test(args, oracles))
     if (not args.filter or "vdso" in args.filter) and (not args.tag or args.tag == "script"):
         results.append(_vdso_script_test(args, oracles))
     if (not args.filter or "elf32" in args.filter or "kernel" in args.filter) \
