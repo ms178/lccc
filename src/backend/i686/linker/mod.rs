@@ -68,6 +68,7 @@ pub use link::link_shared;
 /// still follows the i686 linker's demand-driven fixed-point algorithm.
 pub fn load_inputs_for_script(
     input_paths: &[(String, bool)],
+    extra_undefined: &[String],
 ) -> Result<Vec<linker_common::Elf64Object>, String> {
     use parse::{parse_archive, parse_elf32, parse_thin_archive_i686};
     use types::{InputObject, SHT_NOBITS};
@@ -102,7 +103,7 @@ pub fn load_inputs_for_script(
             direct.push(parse_elf32(&data, path)?);
         }
     }
-    input::resolve_archive_members(&mut direct, &mut archive_pool, &[]);
+    input::resolve_archive_members(&mut direct, &mut archive_pool, &[], extra_undefined);
 
     Ok(direct
         .into_iter()

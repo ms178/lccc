@@ -19,10 +19,8 @@
 use crate::backend::elf::{
     self as elf_mod, parse_section_flags, resolve_numeric_labels, ElfConfig, ObjReloc, ObjSection,
     ObjSymbol, SymbolTableInput, SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS,
-    STB_GLOBAL,
-    STB_LOCAL,
-    STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_DEFAULT, STV_HIDDEN,
-    STV_INTERNAL, STV_PROTECTED,
+    STB_GLOBAL, STB_LOCAL, STB_WEAK, STT_FUNC, STT_GNU_IFUNC, STT_NOTYPE, STT_OBJECT, STT_TLS,
+    STV_DEFAULT, STV_HIDDEN, STV_INTERNAL, STV_PROTECTED,
 };
 use crate::backend::x86::assembler::parser::*;
 use crate::common::fx_hash::FxHashMap;
@@ -229,8 +227,17 @@ struct AlignMarker {
 enum AlignMarkerKind {
     /// .balign N — pad to N-byte boundary.
     Align(u32),
-    /// .org label + offset — advance to a fixed position.
-    Org { label: String, addend: i64 },
+    /// .org label + offset — advance to a fixed position, filling with `fill`.
+    ///
+    /// `fill` is load-bearing: GAS pads `.org` with its fill byte (default 0)
+    /// even in an executable section. Regenerating the run with multi-byte
+    /// NOPs would change the bytes the kernel's IDT stub `.fill …, 1, 0xcc`
+    /// (lowered to `.org`) depends on.
+    Org {
+        label: String,
+        addend: i64,
+        fill: u8,
+    },
 }
 
 /// A pending `(a - b) * scale + addend` datum, folded once both labels are
@@ -385,6 +392,67 @@ pub(crate) fn exec_padding(count: usize, after_insn: bool) -> Vec<u8> {
         count -= MAX_NOP;
     }
     out
+}
+
+/// `.fill LABEL + N - ., 1, FILL` (and the equivalent `.skip`) is a
+/// location-counter *target*, not a one-shot gap.
+///
+/// Jump relaxation changes instruction sizes after a deferred skip is
+/// first measured. Sizing `LABEL + N - .` against the pre-growth layout
+/// leaves extra fill bytes once a nearby `jmp` grows from rel8 back to
+/// rel32 — observed as Linux `early_idt_handler_array` slots overflowing
+/// `EARLY_IDT_HANDLER_SIZE` (13 with IBT) from vector 9 onwards, so the
+/// IDT entry for #GP pointed into `int3` padding and the kernel halted
+/// in `early_fixup_exception`.
+///
+/// Lowering the shape to `.org LABEL+N` reuses the post-relaxation org
+/// fixup, matching GAS. Numeric local labels (`0b + 16 - .`, the
+/// ALTERNATIVE pad) stay on the deferred-skip path: their skip/relax
+/// order is already tuned and they are not named-symbol targets.
+pub(crate) fn parse_org_style_skip(expr: &str) -> Option<(String, i64)> {
+    let s = expr.trim();
+    let without_dot = {
+        let t = s.trim_end();
+        if let Some(rest) = t.strip_suffix("-.") {
+            rest
+        } else if let Some(rest) = t.strip_suffix('.') {
+            let rest = rest.trim_end();
+            rest.strip_suffix('-')?
+        } else {
+            return None;
+        }
+    };
+    let without_dot = without_dot.trim();
+    if without_dot.is_empty() {
+        return None;
+    }
+    let bytes = without_dot.as_bytes();
+    // Numeric local labels (`0b`, `1f`) keep the deferred-skip path.
+    if bytes[0].is_ascii_digit() {
+        return None;
+    }
+    if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' || bytes[0] == b'.') {
+        return None;
+    }
+    let mut i = 1;
+    while i < bytes.len()
+        && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'.')
+    {
+        i += 1;
+    }
+    let ident = &without_dot[..i];
+    let rest = without_dot[i..].trim();
+    if rest.is_empty() {
+        return Some((ident.to_string(), 0));
+    }
+    if !(rest.starts_with('+') || rest.starts_with('-')) {
+        return None;
+    }
+    if rest.bytes().any(|b| b.is_ascii_alphabetic() || b == b'_') {
+        return None;
+    }
+    let addend = crate::backend::asm_expr::parse_integer_expr(rest).ok()?;
+    Some((ident.to_string(), addend))
 }
 
 /// Parse a `.skip`/`.space` size that is a self-contained constant.
@@ -787,12 +855,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 // is always PROGBITS). For custom sections the type change is
                 // an error — mixing e.g. @nobits and @progbits content in one
                 // section would silently drop one of them.
-                if let Some(well_known) =
-                    crate::backend::elf::well_known_section_type(name)
-                {
+                if let Some(well_known) = crate::backend::elf::well_known_section_type(name) {
                     eprintln!(
                         "warning: ignoring incorrect section type for {name} (@{} requested)",
-                        if well_known == SHT_NOBITS { "nobits" } else { "progbits" }
+                        if well_known == SHT_NOBITS {
+                            "nobits"
+                        } else {
+                            "progbits"
+                        }
                     );
                     return Ok(idx);
                 }
@@ -1025,6 +1095,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     if let Some(n) = parse_const_skip(expr) {
                         let section = self.current_section_mut()?;
                         section.data.extend(std::iter::repeat_n(*fill, n));
+                    } else if let Some((sym, addend)) = parse_org_style_skip(expr) {
+                        // `LABEL + N - .` is a location-counter target. Emit
+                        // it as `.org` so jump relaxation can restretch the
+                        // padding (early_idt_handler_array).
+                        self.process_org(&sym, addend, *fill)?;
                     } else {
                         let offset = self.sections[sec_idx].data.len();
                         // Remember which labels are already parked at this
@@ -1138,7 +1213,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         // build() after all items are parsed).
                         self.symver_refs.insert(name.clone(), ver_string.clone());
                         if let Some(f) = flag {
-                            self.symver_flags.insert(name.clone(), (ver_string.clone(), *f));
+                            self.symver_flags
+                                .insert(name.clone(), (ver_string.clone(), *f));
                         }
                     }
                 }
@@ -1230,6 +1306,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 kind: AlignMarkerKind::Org {
                     label: sym.to_string(),
                     addend: offset,
+                    fill,
                 },
                 after_insn,
             });
@@ -1249,12 +1326,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
 
     fn ensure_section(&mut self) -> Result<(), String> {
         if self.current_section.is_none() {
-            let idx = self.get_or_create_section(
-                ".text",
-                SHT_PROGBITS,
-                SHF_ALLOC | SHF_EXECINSTR,
-                None,
-            )?;
+            let idx =
+                self.get_or_create_section(".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, None)?;
             self.current_section = Some(idx);
         }
         Ok(())
@@ -1625,9 +1698,7 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 eprintln!("[C16] dispatch code16 for {}", instr.mnemonic);
             }
             A::encode_instruction_code16(instr, base_offset)?
-        } else if (self.code_mode == 16 || self.code_mode == 17)
-            && A::default_code_mode() == 64
-        {
+        } else if (self.code_mode == 16 || self.code_mode == 17) && A::default_code_mode() == 64 {
             // .code16/.code16gcc inside a 64-bit TU: real-mode code must be
             // assembled via the -m16 (i686) path where operand-size
             // semantics are modeled. Encoding it with the 64-bit encoder
@@ -3061,7 +3132,11 @@ impl<A: X86Arch> ElfWriterCore<A> {
                     }
                     (current_offset + a - 1) & !(a - 1)
                 }
-                AlignMarkerKind::Org { label, addend } => {
+                AlignMarkerKind::Org {
+                    label,
+                    addend,
+                    fill: _,
+                } => {
                     if label.is_empty() {
                         *addend as usize
                     } else if let Some(&(l_sec, l_off)) = self.label_positions.get(label.as_str()) {
@@ -3091,7 +3166,14 @@ impl<A: X86Arch> ElfWriterCore<A> {
                 let start = current_offset;
                 let old_end = start + existing_padding;
                 let after_insn = self.sections[sec_idx].align_markers[marker_idx].after_insn;
-                let new_bytes = section_padding(needed_padding, is_exec, after_insn);
+                // `.org` / org-style `.fill LABEL+N-.` pad with the fill
+                // byte, not multi-byte NOPs, even in an executable section.
+                let new_bytes = match &kind {
+                    AlignMarkerKind::Org { fill, .. } => vec![*fill; needed_padding],
+                    AlignMarkerKind::Align(_) => {
+                        section_padding(needed_padding, is_exec, after_insn)
+                    }
+                };
                 debug_assert_eq!(new_bytes.len(), needed_padding);
                 if old_end <= self.sections[sec_idx].data.len() {
                     self.sections[sec_idx]
@@ -3523,7 +3605,8 @@ mod tests {
         let shstr = {
             let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
             let off = e_shoff + shstr_idx * e_shentsize;
-            let sh_offset = u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
+            let sh_offset =
+                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
             let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
             &obj[sh_offset..sh_offset + sh_size]
         };
@@ -3535,7 +3618,9 @@ mod tests {
                 end += 1;
             }
             if &shstr[name_off..end] == name.as_bytes() {
-                return Some(u32::from_le_bytes(obj[off + 4..off + 8].try_into().unwrap()));
+                return Some(u32::from_le_bytes(
+                    obj[off + 4..off + 8].try_into().unwrap(),
+                ));
             }
         }
         None
@@ -3571,5 +3656,109 @@ mod tests {
         let data = std::fs::read(&out).unwrap();
         assert_eq!(sec_type_of(&data, ".data"), Some(1 /* SHT_PROGBITS */));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn section_bytes(obj: &[u8], name: &str) -> Option<Vec<u8>> {
+        let e_shoff = u64::from_le_bytes(obj[40..48].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(obj[58..60].try_into().unwrap()) as usize;
+        let e_shnum = u16::from_le_bytes(obj[60..62].try_into().unwrap()) as usize;
+        let shstr = {
+            let shstr_idx = u16::from_le_bytes(obj[62..64].try_into().unwrap()) as usize;
+            let off = e_shoff + shstr_idx * e_shentsize;
+            let sh_offset =
+                u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
+            let sh_size = u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
+            &obj[sh_offset..sh_offset + sh_size]
+        };
+        for i in 0..e_shnum {
+            let off = e_shoff + i * e_shentsize;
+            let name_off = u32::from_le_bytes(obj[off..off + 4].try_into().unwrap()) as usize;
+            let mut end = name_off;
+            while shstr[end] != 0 {
+                end += 1;
+            }
+            if &shstr[name_off..end] == name.as_bytes() {
+                let sh_offset =
+                    u64::from_le_bytes(obj[off + 24..off + 32].try_into().unwrap()) as usize;
+                let sh_size =
+                    u64::from_le_bytes(obj[off + 32..off + 40].try_into().unwrap()) as usize;
+                return Some(obj[sh_offset..sh_offset + sh_size].to_vec());
+            }
+        }
+        None
+    }
+
+    /// Linux `early_idt_handler_array` (head_64.S): each stub is
+    /// `endbr64; [push $0;] push $n; jmp common` padded with
+    /// `.fill array + (i+1)*SIZE - ., 1, 0xcc` to exactly SIZE bytes.
+    /// The jmp is far, so it stays rel32 (5 bytes). No-error body is 13
+    /// bytes; error-code body is 11 + 2×cc. Slots must not grow when
+    /// jump relaxation runs.
+    #[test]
+    fn early_idt_handler_fill_slots_are_exact() {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_idt_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("idt.o");
+        let asm = concat!(
+            ".text\n",
+            ".globl array\n",
+            "array:\n",
+            "i = 0\n",
+            ".rept 12\n",
+            "    endbr64\n",
+            "    .if (i == 8) || (i == 10)\n",
+            "        pushq $i\n",
+            "    .else\n",
+            "        pushq $0\n",
+            "        pushq $i\n",
+            "    .endif\n",
+            "    jmp common\n",
+            "    .fill array + (i + 1) * 13 - ., 1, 0xcc\n",
+            "    i = i + 1\n",
+            ".endr\n",
+            ".skip 400, 0x90\n",
+            "common:\n",
+            "    ret\n",
+        );
+        assemble(asm, out.to_str().unwrap()).expect("assemble early_idt shape");
+        let obj = std::fs::read(&out).unwrap();
+        let text = section_bytes(&obj, ".text").expect(".text");
+        const SIZE: usize = 13;
+        for n in 0..12 {
+            let off = n * SIZE;
+            assert_eq!(
+                &text[off..off + 4],
+                &[0xf3, 0x0f, 0x1e, 0xfa],
+                "vector {n} does not start at {off}: next 8 = {:02x?}",
+                &text[off..off + 8.min(text.len() - off)]
+            );
+        }
+        assert_ne!(text[10 * SIZE], 0xcc, "vector 10 drifted into padding");
+        for n in [8usize, 10] {
+            let off = n * SIZE;
+            assert_eq!(text[off + 11], 0xcc, "vec {n} missing fill");
+            assert_eq!(text[off + 12], 0xcc, "vec {n} missing fill");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_org_style_skip_recognizes_named_label_dot_diff() {
+        use super::parse_org_style_skip;
+        assert_eq!(
+            parse_org_style_skip("early_idt_handler_array + 9 * 13 - ."),
+            Some(("early_idt_handler_array".into(), 117))
+        );
+        assert_eq!(
+            parse_org_style_skip("array+13-."),
+            Some(("array".into(), 13))
+        );
+        assert_eq!(parse_org_style_skip("array - ."), Some(("array".into(), 0)));
+        assert_eq!(parse_org_style_skip("0b + 16 - ."), None);
+        assert_eq!(parse_org_style_skip("16"), None);
     }
 }

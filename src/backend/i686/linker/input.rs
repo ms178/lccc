@@ -337,7 +337,7 @@ pub(super) fn load_and_parse_objects(
     }
 
     // Demand-driven archive member extraction
-    resolve_archive_members(&mut inputs, &mut archive_pool, defsym_defs);
+    resolve_archive_members(&mut inputs, &mut archive_pool, defsym_defs, &[]);
 
     Ok((inputs, archive_pool))
 }
@@ -347,6 +347,7 @@ pub(super) fn resolve_archive_members(
     inputs: &mut Vec<InputObject>,
     archive_pool: &mut Vec<InputObject>,
     defsym_defs: &[(String, String)],
+    extra_undefined: &[String],
 ) {
     let mut defined: FxHashSet<String> = FxHashSet::default();
     let mut undefined: FxHashSet<String> = FxHashSet::default();
@@ -364,6 +365,16 @@ pub(super) fn resolve_archive_members(
         }
     }
     undefined.retain(|s| !defined.contains(s));
+
+    // `-u SYM` / `--undefined=SYM` on a script-driven i386 link (Linux
+    // real-mode setup.elf) must pull archive members the same way the
+    // x86-64 `-T` path does. Without this seed, EFI stub objects that
+    // only appear in an archive stay out of the image.
+    for name in extra_undefined {
+        if !defined.contains(name) {
+            undefined.insert(name.clone());
+        }
+    }
 
     // For --defsym aliases (e.g. fmod=__ieee754_fmod), if the alias is
     // undefined we also need the target symbol to be pulled from archives.
