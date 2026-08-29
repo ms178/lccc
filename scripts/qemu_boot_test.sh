@@ -67,7 +67,7 @@ timeout 600 "$QEMU" -m 512 -smp 2 \
     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
     -nographic -no-reboot \
     -accel tcg,thread=multi \
-    -append "console=ttyS0,115200 nokaslr panic=-1" > "$LOG" 2>&1 || true
+    -append "console=ttyS0,115200 nokaslr panic=-1 vga=normal" > "$LOG" 2>&1 || true
 
 # ---- verdict ------------------------------------------------------------------
 fail=0

@@ -43,7 +43,9 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 impl Driver {
     fn enable_x86_avx_profile(&mut self) {
-        self.no_sse = false;
+        if !self.sse_explicitly_disabled {
+            self.no_sse = false;
+        }
         self.enable_avx = true;
         self.enable_sse4_2 = true;
         self.enable_sse4_1 = true;
@@ -131,7 +133,9 @@ impl Driver {
         self.enable_avx512vp2intersect = true;
     }
     fn enable_x86_nehalem_profile(&mut self) {
-        self.no_sse = false;
+        if !self.sse_explicitly_disabled {
+            self.no_sse = false;
+        }
         self.enable_sse3 = true;
         self.enable_ssse3 = true;
         self.enable_sse4_1 = true;
@@ -906,7 +910,19 @@ impl Driver {
                         self.target = Target::X86_64;
                     }
                 }
-                "-mno-sse" | "-mno-sse2" => self.no_sse = true,
+                "-mno-sse" | "-mno-sse2" => {
+                    // Sticky disable: later `-march=native` / CPU profiles must
+                    // not revive SSE. GCC keeps `-mno-sse` in either flag order
+                    // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
+                    self.no_sse = true;
+                    self.sse_explicitly_disabled = true;
+                    self.enable_sse3 = false;
+                    self.enable_ssse3 = false;
+                    self.enable_sse4_1 = false;
+                    self.enable_sse4_2 = false;
+                    self.enable_avx = false;
+                    self.enable_avx2 = false;
+                }
                 "-mno-mmx" | "-mno-3dnow" => {}
                 // ── Kernel -m flags with per-flag semantic justification ──
                 // (The blanket -mno-* fallback below covers pure ISA-disable
@@ -1078,10 +1094,14 @@ impl Driver {
                 "-msse3" => {
                     self.enable_sse3 = true;
                 }
-                // Baseline x86-64 ISA flags: accepted as no-ops (SSE2/MMX are
-                // always on for x86-64). Build systems (zlib-ng cmake, kernel
-                // Makefiles) probe with them before enabling SIMD sources.
-                "-msse2" | "-msse" | "-mmmx" => {}
+                // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
+                // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
+                // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
+                "-mmmx" => {}
+                "-msse2" | "-msse" => {
+                    self.no_sse = false;
+                    self.sse_explicitly_disabled = false;
+                }
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
                 "-mgeneral-regs-only" => self.general_regs_only = true,
                 "-mcmodel=kernel" => self.code_model_kernel = true,
@@ -1168,27 +1188,29 @@ impl Driver {
                                 // also reads the host CPUID).
                                 #[cfg(target_arch = "x86_64")]
                                 {
-                                    self.no_sse = false;
-                                    if std::arch::is_x86_feature_detected!("sse3") {
-                                        self.enable_sse3 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("ssse3") {
-                                        self.enable_ssse3 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("sse4.1") {
-                                        self.enable_sse4_1 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("sse4.2") {
-                                        self.enable_sse4_2 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("avx") {
-                                        self.enable_avx = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("avx2") {
-                                        self.enable_avx2 = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("fma") {
-                                        self.enable_fma = true;
+                                    if !self.sse_explicitly_disabled {
+                                        self.no_sse = false;
+                                        if std::arch::is_x86_feature_detected!("sse3") {
+                                            self.enable_sse3 = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("ssse3") {
+                                            self.enable_ssse3 = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("sse4.1") {
+                                            self.enable_sse4_1 = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("sse4.2") {
+                                            self.enable_sse4_2 = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("avx") {
+                                            self.enable_avx = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("avx2") {
+                                            self.enable_avx2 = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("fma") {
+                                            self.enable_fma = true;
+                                        }
                                     }
                                     if std::arch::is_x86_feature_detected!("bmi1") {
                                         self.enable_bmi = true;
@@ -1202,17 +1224,19 @@ impl Driver {
                                     if std::arch::is_x86_feature_detected!("movbe") {
                                         self.enable_movbe = true;
                                     }
-                                    if std::arch::is_x86_feature_detected!("aes") {
-                                        self.enable_aes = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("pclmulqdq") {
-                                        self.enable_pclmul = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("f16c") {
-                                        self.enable_f16c = true;
-                                    }
-                                    if std::arch::is_x86_feature_detected!("avx512f") {
-                                        self.enable_x86_avx512_profile();
+                                    if !self.sse_explicitly_disabled {
+                                        if std::arch::is_x86_feature_detected!("aes") {
+                                            self.enable_aes = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+                                            self.enable_pclmul = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("f16c") {
+                                            self.enable_f16c = true;
+                                        }
+                                        if std::arch::is_x86_feature_detected!("avx512f") {
+                                            self.enable_x86_avx512_profile();
+                                        }
                                     }
                                 }
                                 #[cfg(not(target_arch = "x86_64"))]
@@ -1864,6 +1888,41 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         assert!(d.parse_cli_args(&args).is_ok());
+    }
+
+    /// Kernel decompressor: `-mno-sse` then Cachy `-march=native`. GCC keeps
+    /// the disable; LCCC must not revive SSE via the native CPUID probe.
+    #[test]
+    fn mno_sse_survives_march_native() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "-march=native", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.no_sse, "explicit -mno-sse must survive -march=native");
+        assert!(d.sse_explicitly_disabled);
+        // Reverse order: later -mno-sse still wins.
+        let mut d2 = Driver::new();
+        let args2: Vec<String> = ["ccc", "-march=native", "-mno-sse", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d2.parse_cli_args(&args2).is_ok());
+        assert!(d2.no_sse);
+    }
+
+    /// An explicit `-msse` after `-mno-sse` re-enables (GCC last ISA flag).
+    #[test]
+    fn msse_reenable_after_mno_sse() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "-msse", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.no_sse);
+        assert!(!d.sse_explicitly_disabled);
     }
 
     #[test]
