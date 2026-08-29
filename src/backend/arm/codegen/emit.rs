@@ -755,22 +755,39 @@ impl ArmCodegen {
     }
 
     /// Check for the unshifted immediate form of CMP (0..=4095).
-    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
+    /// CMP immediate in one of the two AArch64 encodable forms:
+    /// `#imm12` (0..=4095) or `#imm12, LSL #12` (nonzero multiples of
+    /// 4096 up to 0xFFF000). Returns (imm12, shift). The shifted form
+    /// kills a movz/movk materialisation + register compare for the
+    /// page-aligned constant family (4096, 65536, 0x1000*k).
+    fn const_as_cmp_imm12(c: &IrConst, ty: IrType) -> Option<(u64, u32)> {
         let value = Self::normalized_cmp_const(c, ty)?;
-        (value <= 4095).then_some(value)
+        if value <= 4095 {
+            return Some((value, 0));
+        }
+        if value <= 0xFFF000 && value & 0xFFF == 0 {
+            return Some((value >> 12, 12));
+        }
+        None
     }
 
     /// Check whether CMN with an imm12 is bit-exact at the actual machine
     /// compare width. Testing the full-width two's-complement relation avoids
     /// treating a narrow unsigned 0xfffe as 32-bit -2.
-    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<u64> {
+    fn const_as_cmn_imm12(c: &IrConst, ty: IrType) -> Option<(u64, u32)> {
         let value = Self::normalized_cmp_const(c, ty)?;
         let negated = if ty.size() <= 4 {
             (value as u32).wrapping_neg() as u64
         } else {
             value.wrapping_neg()
         };
-        (1..=4095).contains(&negated).then_some(negated)
+        if (1..=4095).contains(&negated) {
+            return Some((negated, 0));
+        }
+        if negated != 0 && negated <= 0xFFF000 && negated & 0xFFF == 0 {
+            return Some((negated >> 12, 12));
+        }
+        None
     }
 
     /// Get the register name for a Value if it has a register assignment.
@@ -838,15 +855,17 @@ impl ArmCodegen {
 
                 // cmp reg, #imm12
                 if let Operand::Const(c) = rhs {
-                    if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
+                    if let Some((imm, sh)) = Self::const_as_cmp_imm12(c, ty) {
+                        let suffix = if sh == 12 { ", lsl #12" } else { "" };
                         self.state
-                            .emit_fmt(format_args!("    cmp {}, #{}", lhs_reg, imm));
+                            .emit_fmt(format_args!("    cmp {}, #{}{}", lhs_reg, imm, suffix));
                         return;
                     }
                     // cmn reg, #imm12 (for negative constants)
-                    if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
+                    if let Some((imm, sh)) = Self::const_as_cmn_imm12(c, ty) {
+                        let suffix = if sh == 12 { ", lsl #12" } else { "" };
                         self.state
-                            .emit_fmt(format_args!("    cmn {}, #{}", lhs_reg, imm));
+                            .emit_fmt(format_args!("    cmn {}, #{}{}", lhs_reg, imm, suffix));
                         return;
                     }
                 }
@@ -896,21 +915,27 @@ impl ArmCodegen {
 
         // Try: lhs in x0 (accumulator), rhs is immediate
         if let Operand::Const(c) = rhs {
-            if let Some(imm) = Self::const_as_cmp_imm12(c, ty) {
+            if let Some((imm, sh)) = Self::const_as_cmp_imm12(c, ty) {
+                let suffix = if sh == 12 { ", lsl #12" } else { "" };
                 self.operand_to_x0(lhs);
                 if use_32bit {
-                    self.state.emit_fmt(format_args!("    cmp w0, #{}", imm));
+                    self.state
+                        .emit_fmt(format_args!("    cmp w0, #{}{}", imm, suffix));
                 } else {
-                    self.state.emit_fmt(format_args!("    cmp x0, #{}", imm));
+                    self.state
+                        .emit_fmt(format_args!("    cmp x0, #{}{}", imm, suffix));
                 }
                 return;
             }
-            if let Some(imm) = Self::const_as_cmn_imm12(c, ty) {
+            if let Some((imm, sh)) = Self::const_as_cmn_imm12(c, ty) {
+                let suffix = if sh == 12 { ", lsl #12" } else { "" };
                 self.operand_to_x0(lhs);
                 if use_32bit {
-                    self.state.emit_fmt(format_args!("    cmn w0, #{}", imm));
+                    self.state
+                        .emit_fmt(format_args!("    cmn w0, #{}{}", imm, suffix));
                 } else {
-                    self.state.emit_fmt(format_args!("    cmn x0, #{}", imm));
+                    self.state
+                        .emit_fmt(format_args!("    cmn x0, #{}{}", imm, suffix));
                 }
                 return;
             }
@@ -3250,7 +3275,7 @@ mod compare_immediate_tests {
         );
         assert_eq!(
             ArmCodegen::const_as_cmp_imm12(&IrConst::I8(-2), IrType::U8),
-            Some(254)
+            Some((254, 0))
         );
     }
 
@@ -3262,15 +3287,15 @@ mod compare_immediate_tests {
         );
         assert_eq!(
             ArmCodegen::const_as_cmn_imm12(&IrConst::I16(-2), IrType::I16),
-            Some(2)
+            Some((2, 0))
         );
         assert_eq!(
             ArmCodegen::const_as_cmn_imm12(&IrConst::I32(-2), IrType::U32),
-            Some(2)
+            Some((2, 0))
         );
         assert_eq!(
             ArmCodegen::const_as_cmn_imm12(&IrConst::I64(-2), IrType::U64),
-            Some(2)
+            Some((2, 0))
         );
     }
 }

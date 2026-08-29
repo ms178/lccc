@@ -610,6 +610,28 @@ impl X86Codegen {
         self.skip_i32_sext = needs_sext_set.is_empty();
         self.needs_sext_values = needs_sext_set;
 
+        // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
+        // [0, bitwidth] — bit 31 is provably zero, so their widening casts
+        // can take the unsigned (movl) path (see bitop_nonneg_values).
+        {
+            let mut nonneg = crate::common::fx_hash::FxHashSet::default();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::UnaryOp { dest, op, ty, .. } = inst {
+                        if matches!(
+                            op,
+                            crate::ir::reexports::IrUnaryOp::Clz
+                                | crate::ir::reexports::IrUnaryOp::Ctz
+                                | crate::ir::reexports::IrUnaryOp::Popcount
+                        ) && !ty.is_float() && ty.size() <= 4 {
+                            nonneg.insert(dest.0);
+                        }
+                    }
+                }
+            }
+            self.bitop_nonneg_values = nonneg;
+        }
+
         // ── Value type map, use counts and Cmp→consumer flag fusion ──────
         //
         // The codegen emits IR instructions strictly in order. When a Cmp's
@@ -895,101 +917,22 @@ impl X86Codegen {
             // cmovcc/jcc directly. This removes the
             // setcc/movzbl + testq (3 instructions) per select in hot loops.
             //
-            // Soundness: the Cmp dest has exactly one use (the consumer), the
-            // operands are pure SSA values (side-effect-free re-materialization
-            // at the consumer; the accumulator cache is invalidated first so a
-            // value that only lived in %rax is reloaded from its slot), and the
-            // replayed cmp is emitted immediately before the cmov/jcc with no
-            // intervening flag mutation.
-            let mut cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
-                FxHashMap::default();
-            for block in &func.blocks {
-                let insts = &block.instructions;
-                for (ii, inst) in insts.iter().enumerate() {
-                    let (cdest, cop, clhs, crhs, cty) = match inst {
-                        Instruction::Cmp {
-                            dest,
-                            op,
-                            lhs,
-                            rhs,
-                            ty,
-                        } => (dest.0, *op, lhs.clone(), rhs.clone(), *ty),
-                        _ => continue,
-                    };
-                    if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
-                        continue;
-                    }
-                    // Integer comparisons only: float comparisons use ucomiss/
-                    // ucomisd with a different flag contract (PF for NaN, the
-                    // setnp/sete dance) — replaying them as integer cmps
-                    // produces wrong selects (simd_sse2_arith regression).
-                    // WIDE (I128) compares are excluded too: emit_cmp routes
-                    // them to emit_i128_cmp, which ignores cmp_replay AND
-                    // could not be replayed by emit_int_cmp_replay_insn
-                    // (multi-instruction 128-bit compare).
-                    if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
-                        continue;
-                    }
-                    // Replay soundness: the operands are re-materialized at the
-                    // consumer via a STACK-SLOT load. A register assignment is
-                    // NOT a stable location here: the allocator sized the
-                    // operand's live range against the ORIGINAL Cmp position,
-                    // but the replay executes LATER (after intervening
-                    // instructions), and a later-defined value may share the
-                    // register — the replay would compare the wrong value
-                    // (sqlite3 yy_shift: `state > 599 ? state+415 : state`
-                    // compared state+415 instead of state because the Cmp lhs
-                    // register had been reused by the +415 add). Slot-only
-                    // operands are always safe: store_rax_to writes the slot
-                    // for every non-register-allocated value.
-                    let op_has_location = |op: &Operand| -> bool {
-                        match op {
-                            Operand::Const(_) => true,
-                            Operand::Value(v) => self.state.get_slot(v.0).is_some(),
-                        }
-                    };
-                    if !op_has_location(&clhs) || !op_has_location(&crhs) {
-                        continue;
-                    }
-                    // Already handled by the (better) adjacent fusion.
-                    if fused.contains_key(&cdest) {
-                        continue;
-                    }
-                    // The single use must be a Select in this block or the
-                    // block-terminator CondBranch.
-                    let mut used_by_select = false;
-                    for (jj, other) in insts.iter().enumerate() {
-                        if jj == ii {
-                            continue;
-                        }
-                        if let Instruction::Select {
-                            cond: Operand::Value(v),
-                            ..
-                        } = other
-                        {
-                            if v.0 == cdest {
-                                used_by_select = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !used_by_select {
-                        if let Terminator::CondBranch {
-                            cond: Operand::Value(v),
-                            ..
-                        } = &block.terminator
-                        {
-                            if v.0 == cdest {
-                                used_by_select = true;
-                            }
-                        }
-                    }
-                    if used_by_select {
-                        cmp_replay.insert(cdest, (cop, clhs, crhs, cty));
-                    }
-                }
-            }
-            self.cmp_replay = cmp_replay;
+            // Candidate selection lives in
+            // comparison::compute_cmp_replay_scan — the SAME function the
+            // RA-link builder consumes below, so allocator and emitter can
+            // never disagree about which operands are read at the consumer
+            // position.
+            //
+            // Home soundness is decided POST-RA (prune_replay_entries): a
+            // register-homed operand is safe because its interval was
+            // extended to the consumer position through RegAllocConfig::
+            // folded_index_uses; a slot-homed operand is always safe; an
+            // operand with no home at all (never-materialized) prunes the
+            // entry (the Cmp then materializes its boolean normally).
+            let replay_scan =
+                super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
+            self.cmp_replay_operand_links = replay_scan.operand_links;
+            self.cmp_replay = replay_scan.replay;
 
             self.fused_cmp_dests = fused;
             self.fused_forward_dests = fused_forward;
@@ -1253,8 +1196,73 @@ impl X86Codegen {
                 // plus indexed-fold base AND index intervals to their consumers,
                 // so every address register survives intervening calls and value
                 // staging (zlib-ng gz_reset NULL-store crash class).
-                crate::backend::generation::collect_folded_gep_links_all(func),
+                {
+                    // CMP-REPLAY operand reads (IS-09): the consumer re-emits
+                    // the comparison at the SELECT/CondBranch position, so a
+                    // REGISTER-homed operand's interval must extend to the
+                    // consumer — otherwise the allocator frees the register
+                    // at the original Cmp position and a later-defined value
+                    // reuses it (sqlite3 yy_shift compared state+415 instead
+                    // of state). The links map each operand to its Cmp dest,
+                    // whose single use marks the replay position; the
+                    // extension then treats the replayed read exactly like
+                    // the folded-GEP address reads this map already covers.
+                    // Links are a SUPERSET of what the emitter finally
+                    // accepts (built with an empty fused set is not needed:
+                    // the scan skipped fused dests, and those operands keep
+                    // their normal adjacency-synchronized ranges) — a
+                    // retained link for a pruned entry only over-constrains
+                    // the allocator, never under-constrains.
+                    let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
+                    for (operand, dests) in &self.cmp_replay_operand_links {
+                        links.entry(*operand).or_default().extend(dests.iter().copied());
+                    }
+                    links
+                }
             );
+
+        // ── CMP-REPLAY post-RA home pruning (IS-09) ─────────────────────────
+        // The scan accepted every Value operand optimistically; now that
+        // homes are final, keep only entries whose operands are readable at
+        // the replay point:
+        //   * pre-existing stack slot (param/alloca)  — always safe: the
+        //     slot is written at the definition and never reused while the
+        //     SSA value is live;
+        //   * register assignment — safe because the operand's interval was
+        //     extended to the consumer position via the folded_index links
+        //     (unless the extension is disabled: CCC_NO_FOLDED_INDEX_LIVENESS
+        //     removes the guarantee, so reg-homed operands revert to
+        //     refused);
+        //   * neither — safe only when the allocator will hand the value a
+        //     spill slot (every non-never-materialized value gets one).
+        //     never-materialized values have no home at all: reading one at
+        //     the replay would consume stale register/slot state — prune.
+        {
+            let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
+            let mut prune: Vec<u32> = Vec::new();
+            for (cdest, (_op, lhs, rhs, _ty)) in self.cmp_replay.iter() {
+                let readable = |op: &Operand| -> bool {
+                    match op {
+                        Operand::Const(_) => true,
+                        Operand::Value(v) => {
+                            if self.state.get_slot(v.0).is_some() {
+                                return true;
+                            }
+                            if self.reg_assignments.contains_key(&v.0) {
+                                return ext_active;
+                            }
+                            !self.state.never_materialized_values.contains(&v.0)
+                        }
+                    }
+                };
+                if !readable(lhs) || !readable(rhs) {
+                    prune.push(*cdest);
+                }
+            }
+            for d in prune {
+                self.cmp_replay.remove(&d);
+            }
+        }
 
         // MachInst is profitable on straight-line and modest-CFG code, but its
         // current local scheduler regressed gzip's large hot loops by ~3% even

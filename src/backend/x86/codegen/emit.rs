@@ -425,6 +425,16 @@ pub struct X86Codegen {
     /// Set of value IDs that need sign-extension because they're used in 64-bit
     /// contexts (Cast to I64, GEP operands). Values NOT in this set can skip movslq.
     pub(super) needs_sext_values: FxHashSet<u32>,
+    /// Values whose low-32 form is PROVABLY NON-NEGATIVE because they are
+    /// the result of a Clz/Ctz/Popcount on a type of at most 32 bits
+    /// (PF-16b). Any 32-bit register write zeroes bits 32..63 on x86-64,
+    /// and these results are <= their bit width, so bits 31..63 are all
+    /// zero: ZERO-extension of the 32-bit form equals the required
+    /// SIGN-extension. Widening casts of such values take the cheaper
+    /// unsigned path (movl, no REX-prefixed movs) instead of cltq/movslq.
+    /// Membership is per-definition — derived values (adds etc. on top of
+    /// a bitop result can wrap negative) are deliberately NOT propagated.
+    pub(super) bitop_nonneg_values: FxHashSet<u32>,
     /// Cmp destinations whose result is consumed ONLY by the immediately
     /// following Select/CondBranch (same block, possibly after a flag-neutral
     /// Copy chain): maps the Cmp dest to the chain-end value the consumer
@@ -443,6 +453,12 @@ pub struct X86Codegen {
     /// recorded operands and uses cmovcc/jcc directly instead of testing the
     /// materialized boolean (setcc/movzbl/testq chain). Keyed by Cmp dest.
     pub(super) cmp_replay: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    /// CMP-REPLAY operand -> consumer links built with `cmp_replay` (IS-09):
+    /// merged into the RA's folded_index_uses so register-homed replay
+    /// operands keep their homes until the consumer re-emits the compare.
+    /// Cleared after the merge; exists only to bridge the pre-RA scan and
+    /// the RA invocation inside this very large prepare function.
+    pub(super) cmp_replay_operand_links: FxHashMap<u32, Vec<u32>>,
     /// Number of uses of each SSA value (instructions + terminators).
     pub(super) value_use_counts: FxHashMap<u32, u32>,
     /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
@@ -704,9 +720,11 @@ impl X86Codegen {
             optimize_for_size: false,
             skip_i32_sext: false,
             needs_sext_values: FxHashSet::default(),
+            bitop_nonneg_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
+            cmp_replay_operand_links: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
             load_cast_fold: FxHashMap::default(),
             folded_cast_dests: FxHashSet::default(),
@@ -3899,6 +3917,21 @@ impl ArchCodegen for X86Codegen {
             ) && !to_ty.is_float()
                 && (to_ty.size() == 4 || to_ty.size() == 8)
                 && self.value_use_counts.get(&dest.0).copied() == Some(1) =>
+            {
+                return false;
+            }
+            // PF-16b: widening casts of provably-nonnegative bitop results
+            // reclassify to the unsigned path in the mature emitter; MachInst
+            // would sign-extend eagerly (cltq/movslq) and foreclose that.
+            crate::ir::reexports::Instruction::Cast {
+                src: Operand::Value(sv),
+                from_ty,
+                to_ty,
+                ..
+            } if from_ty.is_signed()
+                && from_ty.size() <= 4
+                && to_ty.size() == 8
+                && self.bitop_nonneg_values.contains(&sv.0) =>
             {
                 return false;
             }
