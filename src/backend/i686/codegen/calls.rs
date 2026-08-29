@@ -24,6 +24,12 @@ impl I686Codegen {
             align_struct_pairs: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: true,
+            // GCC i386 cdecl never aligns stack args beyond the 4-byte slot
+            // granularity (GCC 14.2 -m32 oracle: 3-int prefix + aligned(32)
+            // struct -> arg offset 12, callee reads 4-granular via %ebp).
+            // The caller packs 4-granular and va_arg walks 4-granular, so the
+            // callee layout must agree — see CallAbiConfig::stack_arg_align_cap.
+            stack_arg_align_cap: 4,
         }
     }
 

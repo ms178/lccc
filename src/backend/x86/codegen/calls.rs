@@ -36,6 +36,10 @@ impl X86Codegen {
             align_struct_pairs: false,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: false,
+            // GCC >= 4.6 honors the full natural alignment of MEMORY-class
+            // stack arguments (SysV AMD64); the >16 case is completed by the
+            // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
+            stack_arg_align_cap: usize::MAX,
         }
     }
 
@@ -75,6 +79,8 @@ impl X86Codegen {
     /// for `apply_alternatives` to patch. The resolver is intentionally generous:
     /// it follows Cast (bitcast/ptrtoint/inttoptr), Copy, Add (Value+Const), Sub (Value-Const),
     /// and GEP with const or Copy-of-const offsets, with checked arithmetic and 64-hop bound.
+    /// The symbol name is returned VERBATIM (version suffix intact) — folding policy
+    /// (`.symver` rejection, GOT/TLS/absolute guards) lives in the caller.
     fn resolve_global_addr_chain(&self, mut val_id: u32, mut acc: i64) -> Option<(String, i64)> {
         let mut visited = 0;
         loop {
@@ -85,10 +91,7 @@ impl X86Codegen {
             let inst = self.get_defining_instruction(val_id)?;
             match inst {
                 Instruction::GlobalAddr { name, .. } => {
-                    // Strip version suffix for GAS: `sym@VER+off(%rip)` is rejected by gas 2.47,
-                    // while `sym+off(%rip)` with base name is accepted and linker resolves version.
-                    let base = name.split('@').next().unwrap_or(name).to_string();
-                    return Some((base, acc));
+                    return Some((name.clone(), acc));
                 }
                 Instruction::GetElementPtr { base, offset, .. } => {
                     let off = self.operand_const_i64(offset)?;
@@ -142,6 +145,16 @@ impl X86Codegen {
     /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
     /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
     /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
+    ///
+    /// Versioned symbols (`sym@VER`, bound by a top-level `.symver real, sym@VER`
+    /// directive) are rejected outright: the memory-indirect form
+    /// `call *sym@VER+off(%rip)` is rejected by GAS 2.47, the stripped base
+    /// name would silently re-bind the call to the DEFAULT version (a
+    /// .symver semantic change, not a fold), and the GOT/TLS/absolute guards
+    /// below are keyed by the full symbol name. The value-based fallback
+    /// (load the pointer, call through it) is correct for every binding, so
+    /// rejecting the fold is strictly safe — and versioned function-pointer
+    /// slots are glibc-internal compat shapes, so the cost is nil.
     fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<ResolvedIndirectCall> {
         let v = match op {
             Operand::Value(v) => v,
@@ -154,6 +167,9 @@ impl X86Codegen {
                 // the memory-indirect form. Guard against GOT/TLS/absolute symbols that
                 // need different addressing.
                 let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
+                if sym.contains('@') {
+                    return None;
+                }
                 // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
                 // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
                 if self.state.needs_got_for_addr(&sym)
@@ -169,6 +185,9 @@ impl X86Codegen {
             // target value itself, so only a DIRECT call is semantically correct.
             _ => {
                 let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
+                if sym.contains('@') {
+                    return None;
+                }
                 if self.state.needs_got_for_addr(&sym)
                     || self.state.tls_symbols.contains(&sym)
                     || self.state.absolute_symbols.contains(&sym)
@@ -1047,15 +1066,14 @@ impl X86Codegen {
                     // offset into the callee (`&func + off`, computed-goto
                     // style block addresses) is never interposed — the PLT
                     // entry is only defined for offset 0 — so the offset is
-                    // preserved and @PLT is used only for it. The version
-                    // suffix is stripped in both cases: GAS 2.47 rejects
-                    // `sym@ver@PLT`, and the linker resolves the default
-                    // version from the base name.
+                    // preserved and @PLT is used only for it. (Versioned
+                    // symbols never reach this arm: they are rejected in
+                    // try_resolve_indirect_call_global and fall back to the
+                    // value-based call, which preserves the .symver binding.)
                     ResolvedIndirectCall::Direct(..) => {
-                        let name = sym.split('@').next().unwrap_or(&sym).to_string();
-                        if off == 0 && self.state.needs_plt(&name) {
+                        if off == 0 && self.state.needs_plt(&sym) {
                             self.state
-                                .emit_fmt(format_args!("    call {}@PLT", name));
+                                .emit_fmt(format_args!("    call {}@PLT", sym));
                         } else {
                             self.state.out.emit_call(&sym_str);
                         }

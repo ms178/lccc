@@ -947,40 +947,71 @@ impl I686Codegen {
                         emit!(self.state, "    movl %eax, {}", dst_ref);
                     }
                 }
-                ParamClass::StructStack { offset, size } => {
+                ParamClass::StructStack { offset, size }
+                | ParamClass::LargeStructStack { offset, size } => {
                     let src = stack_base + offset - stack_offset_adjust;
-                    let mut copied = 0usize;
-                    while copied + 4 <= size {
-                        let src_ref = self.param_ref(src + copied as i64);
-                        let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
-                        copied += 4;
-                    }
-                    while copied < size {
-                        let src_ref = self.param_ref(src + copied as i64);
-                        let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                        emit!(self.state, "    movb {}, %al", src_ref);
-                        emit!(self.state, "    movb %al, {}", dst_ref);
-                        copied += 1;
-                    }
-                }
-                ParamClass::LargeStructStack { offset, size } => {
-                    let src = stack_base + offset - stack_offset_adjust;
-                    let mut copied = 0usize;
-                    while copied + 4 <= size {
-                        let src_ref = self.param_ref(src + copied as i64);
-                        let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                        emit!(self.state, "    movl {}, %eax", src_ref);
-                        emit!(self.state, "    movl %eax, {}", dst_ref);
-                        copied += 4;
-                    }
-                    while copied < size {
-                        let src_ref = self.param_ref(src + copied as i64);
-                        let dst_ref = self.slot_ref_offset(slot, copied as i64);
-                        emit!(self.state, "    movb {}, %al", src_ref);
-                        emit!(self.state, "    movb %al, {}", dst_ref);
-                        copied += 1;
+                    // Over-aligned (>16) parameter allocas: the slot is
+                    // oversized by (align-1) and the EFFECTIVE address is
+                    // align_up(slot, align) — every alloca-address user
+                    // (emit_alloca_addr_to, memcpy paths) resolves that same
+                    // aligned address, so the incoming-parameter copy must
+                    // target it too. Writing the raw slot desyncs the two by
+                    // the alignment pad (mirrors the x86-64 prologue's
+                    // _Alignas(32) fix; i686 repro: over_aligned_struct_arg).
+                    //
+                    // %ecx holds the aligned destination for the whole copy.
+                    // It is caller-saved and, in a plain cdecl prologue (no
+                    // regparm, no fastcall), provably dead here: register
+                    // parameters are captured through the same loop's
+                    // earlier arms and the function body has not started.
+                    // With regparm/fastcall, %ecx may still carry an
+                    // uncaptured register argument (the capture arms run in
+                    // parameter order), so it is saved/restored around the
+                    // copy — esp_adjust is kept in sync so that esp-relative
+                    // slot/param references below the push stay exact.
+                    let over_align = self.state.alloca_over_align(dest_id);
+                    let ecx_free = self.regparm == 0 && !self.is_fastcall;
+                    if over_align.is_some() {
+                        if ecx_free {
+                            self.emit_alloca_addr_to("ecx", dest_id, slot);
+                        } else {
+                            self.state.emit("    pushl %ecx");
+                            self.esp_adjust += 4;
+                            self.emit_alloca_addr_to("ecx", dest_id, slot);
+                        }
+                        let mut copied = 0usize;
+                        while copied + 4 <= size {
+                            let src_ref = self.param_ref(src + copied as i64);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}(%ecx)", copied);
+                            copied += 4;
+                        }
+                        while copied < size {
+                            let src_ref = self.param_ref(src + copied as i64);
+                            emit!(self.state, "    movb {}, %al", src_ref);
+                            emit!(self.state, "    movb %al, {}(%ecx)", copied);
+                            copied += 1;
+                        }
+                        if !ecx_free {
+                            self.state.emit("    popl %ecx");
+                            self.esp_adjust -= 4;
+                        }
+                    } else {
+                        let mut copied = 0usize;
+                        while copied + 4 <= size {
+                            let src_ref = self.param_ref(src + copied as i64);
+                            let dst_ref = self.slot_ref_offset(slot, copied as i64);
+                            emit!(self.state, "    movl {}, %eax", src_ref);
+                            emit!(self.state, "    movl %eax, {}", dst_ref);
+                            copied += 4;
+                        }
+                        while copied < size {
+                            let src_ref = self.param_ref(src + copied as i64);
+                            let dst_ref = self.slot_ref_offset(slot, copied as i64);
+                            emit!(self.state, "    movb {}, %al", src_ref);
+                            emit!(self.state, "    movb %al, {}", dst_ref);
+                            copied += 1;
+                        }
                     }
                 }
                 ParamClass::F128AlwaysStack { offset } => {

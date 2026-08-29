@@ -1,0 +1,1 @@
+-m32 -Os -fno-pic -nostdlib -static -Wl,-e,_start

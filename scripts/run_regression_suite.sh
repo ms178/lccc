@@ -20,6 +20,12 @@
 # Environment:
 #   LCCC_BIN   compiler under test (default target/fastbuild/lccc)
 #   GCC_BIN    oracle compiler    (default gcc)
+#   LCCC_I686_RUNNER  user-mode ELF32 runner (e.g. qemu-i386) for hosts
+#                     whose kernel/seccomp cannot execute i386 binaries
+#                     natively. Auto-detected: $LCCC_I686_RUNNER, then
+#                     qemu-i386 on PATH. Without a working execution path,
+#                     ELF32 tests SKIP — they must never pass vacuously by
+#                     comparing two SIGSYS deaths (exit 159 == exit 159).
 # ============================================================================
 set -u
 
@@ -31,6 +37,57 @@ GCC_INC="-I$(gcc -print-file-name=include)"
 FILTER=${1:-}
 WORK=$(mktemp -d /tmp/lccc-reg.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
+
+# ── ELF32 execution capability probe ─────────────────────────────────────
+# A regression test that cannot RUN is worthless, and an ELF32 binary that
+# dies with SIGSYS under both compilers "matches" the oracle vacuously.
+# Probe once with a trivial gcc -m32 freestanding binary and select an
+# execution strategy: native, runner, or honest SKIP.
+is_elf32() {  # is_elf32 <file>: e_machine == EM_386 (3) at offset 18
+    [[ -f "$1" ]] || return 1
+    local em
+    em=$(dd if="$1" bs=1 skip=18 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [[ "$em" == "0300" ]]
+}
+RUNNER32=""
+ELF32_MODE=""   # native | runner | none | native-no-oracle
+probe_src="$WORK/elf32probe.c"
+probe_bin="$WORK/elf32probe.bin"
+cat > "$probe_src" <<'PEOF'
+void _start(void) {
+    __asm__ volatile ("int $0x80" : : "a"(1), "b"(42) : "memory");
+    __builtin_unreachable();
+}
+PEOF
+if "$GCC_BIN" -m32 -O2 -fno-pic -nostdlib -static -Wl,-e,_start \
+        "$probe_src" -o "$probe_bin" 2>/dev/null; then
+    # Run the probe with SIGSYS silenced: seccomp-blocked int $0x80 kills the
+    # process with a shell "Bad system call" notice on some bash versions even
+    # under redirection — that is exactly the case the probe exists to detect.
+    { "$probe_bin" >/dev/null 2>&1; } 2>/dev/null
+    probe_ec=$?
+    if [[ $probe_ec -eq 42 ]]; then
+        ELF32_MODE="native"
+    else
+        for cand in "${LCCC_I686_RUNNER:-}" qemu-i386 qemu-i386-static; do
+            [[ -n "$cand" ]] || continue
+            command -v "$cand" >/dev/null 2>&1 || [[ -x "$cand" ]] || continue
+            { "$cand" "$probe_bin" >/dev/null 2>&1; } 2>/dev/null
+            if [[ $? -eq 42 ]]; then
+                RUNNER32="$cand"
+                ELF32_MODE="runner"
+                break
+            fi
+        done
+        [[ -z "$ELF32_MODE" ]] && ELF32_MODE="none"
+    fi
+else
+    # gcc -m32 unavailable (no multilib): the GCC oracle side skips ELF32
+    # anyway; run lccc binaries natively as before.
+    ELF32_MODE="native-no-oracle"
+fi
+rm -f "$probe_src" "$probe_bin"
+el_f32_warned=0
 
 pass=0; fail=0; skip=0; ab_fail=0
 declare -a FAILED=()
@@ -44,8 +101,17 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     if ! "$LCCC_BIN" $GCC_INC -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
         echo "BUILDFAIL"; return
     fi
+    # ELF32 binaries need either a native i386 kernel path or the runner;
+    # without either the test cannot run — and must not vacuously pass.
+    if is_elf32 "$obj" && [[ "$ELF32_MODE" == "none" ]]; then
+        echo "NOELF32"; return
+    fi
     local out
-    out=$(timeout 20 "$obj" 2>&1); local ec=$?
+    if is_elf32 "$obj" && [[ "$ELF32_MODE" == "runner" ]]; then
+        out=$(timeout 20 "$RUNNER32" "$obj" 2>&1); local ec=$?
+    else
+        out=$(timeout 20 "$obj" 2>&1); local ec=$?
+    fi
     [[ $ec -eq 124 ]] && { echo "TIMEOUT"; return; }
     echo "$out|$ec"
 }
@@ -70,11 +136,19 @@ for src in "$REG"/*.c; do
     done
 
     # 1. lccc run (default configuration)
-    res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK'; run_one '$src'")
+    res=$(env ${env_vars[@]:-} bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
 
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
         fail=$((fail+1)); FAILED+=("$name:build"); continue
+    fi
+    if [[ $res == "NOELF32" ]]; then
+        if [[ $el_f32_warned -eq 0 ]]; then
+            echo "NOTE  host cannot execute ELF32 and no runner found"
+            echo "      (set LCCC_I686_RUNNER=/path/qemu-i386); ELF32 tests SKIP"
+            el_f32_warned=1
+        fi
+        skip=$((skip+1)); continue
     fi
     if [[ $res == "TIMEOUT" ]]; then
         echo "FAIL  $name (timeout)"
@@ -89,7 +163,15 @@ for src in "$REG"/*.c; do
         if ! "$GCC_BIN" -O2 "${gflags[@]}" "$src" -o "$gbin" -lm 2>/dev/null; then
             skip=$((skip+1))   # GCC can't build it (lccc-specific asm) — lccc-only test
         else
-            gout=$(timeout 20 "$gbin" 2>&1); gec=$?
+            gpfx=""
+            if [[ "$ELF32_MODE" == "runner" ]] && is_elf32 "$gbin"; then
+                gpfx="$RUNNER32"
+            fi
+            if [[ -n "$gpfx" ]]; then
+                gout=$(timeout 20 "$gpfx" "$gbin" 2>&1); gec=$?
+            else
+                gout=$(timeout 20 "$gbin" 2>&1); gec=$?
+            fi
             if [[ "$gout|$gec" != "$res" ]]; then
                 echo "FAIL  $name (GCC mismatch)"
                 echo "      gcc : $(echo "$gout|$gec" | head -2)"
@@ -101,7 +183,7 @@ for src in "$REG"/*.c; do
 
     # 3. A/B differential: small slots on (default) vs off
     if [[ $no_ab -eq 0 ]]; then
-        res_ab=$(env ${env_vars[@]:-} CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK'; run_one '$src'")
+        res_ab=$(env ${env_vars[@]:-} CCC_NO_SMALL_SLOTS=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
         if [[ $res_ab != "$res" ]]; then
             echo "FAIL  $name (A/B small-slot differential)"
             echo "      default : $(echo "$res" | head -2)"
