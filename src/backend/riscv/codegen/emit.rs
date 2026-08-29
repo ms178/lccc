@@ -128,6 +128,9 @@ pub struct RiscvCodegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Whether to suppress linker relaxation (-mno-relax).
     pub(super) no_relax: bool,
+    /// Current function (for definition lookups in consumer-side
+    /// rematerialisation gates; raw pointer mirrors the x86-64 backend).
+    pub(super) current_func: Option<*const IrFunction>,
 }
 
 impl RiscvCodegen {
@@ -146,6 +149,7 @@ impl RiscvCodegen {
             reg_assignments: FxHashMap::default(),
             used_callee_saved: Vec::new(),
             no_relax: false,
+            current_func: None,
         }
     }
 
@@ -401,8 +405,102 @@ impl RiscvCodegen {
                     || self.state.reg_cache.acc_has(v.0, true)
                 {
                 } else {
-                    self.state.emit("    li t0, 0");
-                    self.state.reg_cache.invalidate_acc();
+                    // HARD GATE (ported from x86-64 session 26): a live
+                    // operand value with no register home, no stack slot and
+                    // no accumulator-cache entry cannot be materialised —
+                    // this spot used to emit a silent `li t0, 0`, fabricating
+                    // zero and corrupting whatever consumed it (same class
+                    // as x86-64's sqlite3KeyInfoAlloc NULL store).  Reaching
+                    // here means a producer/consumer handoff is broken; fail
+                    // loudly.
+                    //
+                    // Rematerialisable GlobalAddr defs deliberately have no
+                    // home: the address computation is omitted at the
+                    // definition and every consumer rebuilds it — rebuild
+                    // here (la/lla per the GOT check, mirroring
+                    // emit_global_addr_impl).
+                    let global_addr_name: Option<String> = self
+                        .get_defining_instruction(v.0)
+                        .and_then(|inst| match inst {
+                            crate::ir::reexports::Instruction::GlobalAddr { name, .. } => {
+                                Some(name.clone())
+                            }
+                            _ => None,
+                        });
+                    if let Some(name) = global_addr_name {
+                        if self.state.needs_got(&name) {
+                            self.state.emit_fmt(format_args!("    la t0, {}", name));
+                        } else {
+                            self.state.emit_fmt(format_args!("    lla t0, {}", name));
+                        }
+                        self.state.reg_cache.set_acc(v.0, is_alloca);
+                        return;
+                    }
+                    // Fallback for coalescing failures: a same-size Cast
+                    // (U64<->I64 etc) or a Copy whose SOURCE has a home —
+                    // materialize the source instead (x86-64
+                    // print_cfs_group_stats precedent).
+                    let fallback_src: Option<Operand> = self
+                        .get_defining_instruction(v.0)
+                        .and_then(|def_inst| match def_inst {
+                            crate::ir::reexports::Instruction::Cast {
+                                src,
+                                from_ty,
+                                to_ty,
+                                ..
+                            } => {
+                                if from_ty.size() == to_ty.size() {
+                                    Some(src.clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            crate::ir::reexports::Instruction::Copy { src, .. } => {
+                                Some(src.clone())
+                            }
+                            _ => None,
+                        });
+                    if let Some(src_op) = fallback_src {
+                        let src_has_home = match &src_op {
+                            Operand::Value(src_v) => {
+                                self.reg_assignments.contains_key(&src_v.0)
+                                    || self.state.get_slot(src_v.0).is_some()
+                                    || self
+                                        .state
+                                        .reg_cache
+                                        .acc_has(src_v.0, self.state.is_alloca(src_v.0))
+                                    || self
+                                        .state
+                                        .reg_cache
+                                        .sec_has(src_v.0, self.state.is_alloca(src_v.0))
+                            }
+                            Operand::Const(_) => true,
+                        };
+                        if src_has_home {
+                            self.operand_to_t0(&src_op);
+                            self.state.reg_cache.set_acc(v.0, is_alloca);
+                            return;
+                        }
+                    }
+                    // Include the tail of the asm emitted so far: the
+                    // instruction context around the failure is exactly what
+                    // a soundness hunt needs, and it is otherwise lost
+                    // because the panic aborts before the .s file is written.
+                    let tail: Vec<&str> = {
+                        let lines: Vec<&str> = self.state.out.buf.lines().collect();
+                        let n = lines.len();
+                        lines[n.saturating_sub(30)..].to_vec()
+                    };
+                    panic!(
+                        "riscv64 codegen: operand_to_t0: value {} in function '{}' \
+                         has no register home, no stack slot and no acc-cache \
+                         entry — refusing to fabricate a value\n\
+                         --- last {} asm lines ---\n{}",
+                        v.0,
+                        self.state.current_func_name,
+                        tail.len(),
+                        tail.join("\n")
+                    );
                 }
             }
         }
@@ -417,6 +515,44 @@ impl RiscvCodegen {
             self.emit_store_to_s0("t0", slot.0, "sd");
         }
         self.state.reg_cache.set_acc(dest.0, false);
+    }
+
+    /// Find the instruction that defines `val_id` in the current function.
+    /// Consumer-side rematerialisation (operand_to_t0's no-home gate)
+    /// depends on this lookup locating slot-less defs — GlobalAddr dests in
+    /// particular, whose addresses are deliberately never materialised at
+    /// the definition.  Mirrors the x86-64 helper of the same name.
+    pub(super) fn get_defining_instruction(
+        &self,
+        val_id: u32,
+    ) -> Option<&crate::ir::reexports::Instruction> {
+        let func_ptr = self.current_func?;
+        let func = unsafe { &*func_ptr };
+
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                use crate::ir::reexports::Instruction;
+                let dest_id = match inst {
+                    Instruction::BinOp { dest, .. } => Some(dest.0),
+                    Instruction::UnaryOp { dest, .. } => Some(dest.0),
+                    Instruction::Cast { dest, .. } => Some(dest.0),
+                    Instruction::GetElementPtr { dest, .. } => Some(dest.0),
+                    Instruction::Load { dest, .. } => Some(dest.0),
+                    Instruction::Cmp { dest, .. } => Some(dest.0),
+                    Instruction::Phi { dest, .. } => Some(dest.0),
+                    // GlobalAddr dests must be found: rematerialisable
+                    // addresses have deliberately no home, so every
+                    // consumer-side rebuild depends on this lookup.
+                    Instruction::GlobalAddr { dest, .. } => Some(dest.0),
+                    _ => None,
+                };
+
+                if dest_id == Some(val_id) {
+                    return Some(inst);
+                }
+            }
+        }
+        None
     }
 
     // --- 128-bit integer helpers ---
@@ -728,6 +864,24 @@ impl ArchCodegen for RiscvCodegen {
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         self.state
             .emit_fmt(format_args!("    mv t0, {}", callee_saved_name(reg)));
+        // t0 no longer holds whatever the cache recorded.  x86-64, i686 and
+        // ARM all invalidate here; riscv64 predated that discipline, so the
+        // default emit_gep's general path (`emit_reg_to_acc(base);
+        // emit_acc_to_secondary(); emit_load_operand(offset)`) hit a stale
+        // acc entry for the OFFSET and skipped its load — the address became
+        // base+base and every deref of the computed pointer went through a
+        // wild doubled address (gcc.c-torture pr113787 / pr36034-2 SIGSEGV
+        // at -O2, same signature as ARM's hash_table table[h]+table[h]).
+        self.state.reg_cache.invalidate_acc();
+    }
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move: staging a register-resident GEP base
+        // must not pass through the accumulator, which may still hold the
+        // live offset the very next emit_load_operand needs (see the trait
+        // default for the full rationale).  t1 is an untracked scratch in
+        // the riscv64 cache, so no invalidation is needed here.
+        self.state
+            .emit_fmt(format_args!("    mv t1, {}", callee_saved_name(reg)));
     }
     fn emit_reg_to_addr(&mut self, reg: PhysReg) {
         self.state
@@ -877,6 +1031,13 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) => emit_int_cmp_impl;
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        // GNU C nested-function direct static-chain calls.
+        fn emit_get_static_chain(&mut self, dest: &Value) => emit_get_static_chain_impl;
+        fn emit_set_static_chain(&mut self, src: &Operand) => emit_set_static_chain_impl;
+        // GNU C nested-function trampolines + non-local goto.
+        fn emit_init_trampoline(&mut self, buffer: &Value, chain: &Operand, func: &str) => emit_init_trampoline_impl;
+        fn emit_nonlocal_goto_save(&mut self, frame: &Value, rbp_off: i64, rsp_off: i64) => emit_nonlocal_goto_save_impl;
+        fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
         fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;

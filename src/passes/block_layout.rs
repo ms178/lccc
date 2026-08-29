@@ -57,7 +57,13 @@ pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
             }
         }
         for &s in &succs {
-            if !visited.contains(&s) {
+            // Non-local goto label aliases are file-unique: a nested
+            // function's InlineAsm goto edge can name a block of the
+            // ENCLOSING function, which is not in this function's
+            // pos_of_label map.  Such an edge is not a real CFG successor
+            // here (the branch happens after a full frame restore), so
+            // skip it instead of panicking on the map index below.
+            if pos_of_label.contains_key(&s) && !visited.contains(&s) {
                 stack.push((s, false));
             }
         }

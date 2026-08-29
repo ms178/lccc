@@ -3016,6 +3016,14 @@ impl ArchCodegen for ArmCodegen {
         // f958b6a's emit_load_indexed_impl cache-wipe finding.
         self.state.reg_cache.invalidate_acc();
     }
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move for the default emit_gep's general
+        // path: staging a register-resident base must not pass through the
+        // accumulator (which may still hold the live GEP offset).  x1 is an
+        // untracked scratch in the ARM cache, so no invalidation is needed.
+        self.state
+            .emit_fmt(format_args!("    mov x1, {}", callee_saved_name(reg)));
+    }
     fn emit_reg_to_addr(&mut self, reg: PhysReg) {
         self.state
             .emit_fmt(format_args!("    mov x9, {}", callee_saved_name(reg)));

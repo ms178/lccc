@@ -1322,16 +1322,18 @@ pub trait ArchCodegen {
                 SlotAddr::Direct(slot) => self.emit_slot_addr_to_secondary(slot, true, base.0),
                 SlotAddr::Indirect(slot) => self.emit_slot_addr_to_secondary(slot, false, base.0),
                 SlotAddr::Reg(reg) => {
-                    self.emit_reg_to_acc(reg);
-                    self.emit_acc_to_secondary();
+                    // Register-resident base: stage straight into the
+                    // secondary register.  The old two-step through the
+                    // accumulator clobbered acc while the offset might still
+                    // be live there (see emit_reg_to_secondary).
+                    self.emit_reg_to_secondary(reg);
                 }
             }
         } else if let Some(br) = self.get_phys_reg_for_value(base.0) {
             // SOUNDNESS FALLBACK: slot-less register-resident base — move it
             // into the secondary register; without this the add below would
             // read a stale scratch (same class as the const-offset case).
-            self.emit_reg_to_acc(br);
-            self.emit_acc_to_secondary();
+            self.emit_reg_to_secondary(br);
         }
         self.emit_load_operand(offset);
         self.emit_add_secondary_to_acc();
@@ -1391,8 +1393,9 @@ pub trait ArchCodegen {
         dest_reg: Option<PhysReg>,
     ) {
         // Default: load base to secondary, load index to acc, add, store
-        self.emit_reg_to_acc(base_reg);
-        self.emit_acc_to_secondary();
+        // (straight to secondary: no accumulator round-trip — acc may hold
+        // a live operand and the round-trip would also cost a move).
+        self.emit_reg_to_secondary(base_reg);
         self.emit_reg_to_acc(index_reg);
         self.emit_add_secondary_to_acc();
         self.emit_store_result(dest);
@@ -1401,6 +1404,22 @@ pub trait ArchCodegen {
     /// Move a physical register's value to the accumulator.
     fn emit_reg_to_acc(&mut self, _reg: PhysReg) {
         // Default: no-op (backends override)
+    }
+    /// Move a physical register's value directly to the secondary register.
+    ///
+    /// The default `emit_gep` general path stages a register-resident base
+    /// into the secondary register.  Routing it through the accumulator
+    /// (`emit_reg_to_acc` + `emit_acc_to_secondary`) is semantically fine —
+    /// with the invalidate discipline every backend now keeps — but it
+    /// clobbers the accumulator BEFORE `emit_load_operand(offset)` runs, so
+    /// an offset that lived in the accumulator is force-reloaded (or worse:
+    /// was silently reused stale before the invalidate discipline existed —
+    /// the riscv64 pr113787/pr36034-2 `base+base` SIGSEGV class).  Backends
+    /// override this with a single home→secondary move; the default is the
+    /// historical two-step so unmodified backends are bit-identical.
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        self.emit_reg_to_acc(reg);
+        self.emit_acc_to_secondary();
     }
     /// Move a register-resident pointer to the architecture address scratch.
     fn emit_reg_to_addr(&mut self, _reg: PhysReg) {

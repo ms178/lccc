@@ -1727,6 +1727,17 @@ impl ArchCodegen for I686Codegen {
         self.state.reg_cache.invalidate_sec();
     }
 
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move for the default emit_gep's general
+        // path: staging a register-resident base must not pass through the
+        // accumulator (which may still hold the live GEP offset).  The
+        // secondary cache cannot be updated (the hook carries no value id),
+        // so invalidate it — matches the conservative emit_reg_to_addr
+        // precedent.
+        emit!(self.state, "    movl %{}, %ecx", phys_reg_name(reg));
+        self.state.reg_cache.invalidate_sec();
+    }
+
     fn emit_reg_to_acc(&mut self, reg: PhysReg) {
         // The trait DEFAULT for this hook is a NO-OP ("backends override").
         // i686 never overrode it, so emit_leaq_base_index's default path

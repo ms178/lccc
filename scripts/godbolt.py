@@ -55,6 +55,14 @@ COMPILER_ALIASES: dict[str, str] = {
     "icc2021.10": "cicc2021100",
     "icx": "cicxlatest",
     "icx-latest": "cicxlatest",
+    # RISC-V (64-bits) GCC channels on CE. "latest-toolchains-only" policy:
+    # the trunk channel plus the two newest releases are kept as oracles.
+    "crv64gtrunk": "rv64-cgcctrunk",
+    "crv64g1610": "rv64-cgcc1610",
+    "crv64g1520": "rv64-cgcc1520",
+    "crv64g1430": "rv64-cgcc1430",
+    # RISC-V (32-bits) trunk, for the LP64/ILP32 cross-checks.
+    "crv32gtrunk": "rv32-cgcctrunk",
 }
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
 

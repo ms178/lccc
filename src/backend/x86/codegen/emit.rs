@@ -4582,6 +4582,19 @@ impl ArchCodegen for X86Codegen {
         self.state.reg_cache.invalidate_acc();
     }
 
+    fn emit_reg_to_secondary(&mut self, reg: PhysReg) {
+        // Single home->secondary move for the default emit_gep's general
+        // path: staging a register-resident base must not pass through the
+        // accumulator (which may still hold the live GEP offset).  The
+        // secondary cache cannot be updated (the hook carries no value id),
+        // so invalidate it — matches the conservative emit_reg_to_addr
+        // precedent.
+        let name = phys_reg_name(reg);
+        self.state
+            .emit_fmt(format_args!("    movq %{}, %rcx", name));
+        self.state.reg_cache.invalidate_sec();
+    }
+
     fn emit_gep_reg_const(&mut self, dest: &Value, base: &Value, offset: i64) -> bool {
         // Register-resident base + constant offset → `leaq off(%base), %dest`.
         // Without this hook the default emit_gep silently drops the base for

@@ -656,10 +656,17 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
             if dst == REG_NONE {
                 return None;
             }
+            // Sext-wide producers: only instructions whose RV64 semantics
+            // GUARANTEE sext32 canonical results — the *w family, addiw,
+            // srai (sign-shifting keeps the sign-extension), and lui
+            // (sign-extended imm20).  slli/srli are 64-bit shifts: their
+            // results are NOT sext32 in general (e.g. `slli rX,rX,32`
+            // of a negative sext32 value zero-fills the top half), so a
+            // following `sext.w rX,rX` is real code, never a no-op.
             let wide = matches!(
                 mnem,
                 "addw" | "subw" | "mulw" | "divw" | "divuw" | "remw" | "remuw"
-                    | "sllw" | "srlw" | "sraw" | "addiw" | "slli" | "srli" | "srai"
+                    | "sllw" | "srlw" | "sraw" | "addiw" | "srai"
             ) || mnem == "lui";
             Some((dst, wide))
         }

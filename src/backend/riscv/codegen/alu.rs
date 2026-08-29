@@ -20,27 +20,63 @@ impl RiscvCodegen {
     }
 
     pub(super) fn emit_int_neg_impl(&mut self, ty: IrType) {
-        self.state.emit("    neg t0, t0");
-        // Zero-extend to 32 bits for 32-bit types, matching the convention
-        // used by emit_bswap/clz (the upper half of a 64-bit neg on a
-        // zero-extended U32 is 0xFFFFFFFF — x86-64 audit, claim 1).
-        if matches!(
-            ty,
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
-        ) {
-            self.state.emit("    slli t0, t0, 32");
-            self.state.emit("    srli t0, t0, 32");
+        // Canonical-form discipline (rv64 codegen invariant): every <=32-bit
+        // integer in a 64-bit register equals signext(low32); signed narrow
+        // values are additionally sign-filled to their own width, unsigned
+        // narrow/U32 keep an explicit zero-extension (sltu staging and U64
+        // widening read the raw low bits).  Two's-complement negation
+        // preserves sign-extension, so the refill below only re-establishes
+        // the width canonical the consumers expect — and for I32 the *w
+        // form IS the canonical signed-32 op (GCC-identical).
+        match ty {
+            IrType::I32 => self.state.emit("    negw t0, t0"),
+            IrType::I8 => {
+                self.state.emit("    neg t0, t0");
+                self.state.emit("    slli t0, t0, 56");
+                self.state.emit("    srai t0, t0, 56");
+            }
+            IrType::I16 => {
+                self.state.emit("    neg t0, t0");
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srai t0, t0, 48");
+            }
+            IrType::U8 | IrType::U16 | IrType::U32 => {
+                // Zero-extend to 32 bits, matching the convention used by
+                // emit_bswap/clz (the upper half of a 64-bit neg on a
+                // zero-extended U32 is 0xFFFFFFFF — x86-64 audit, claim 1).
+                self.state.emit("    neg t0, t0");
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            _ => self.state.emit("    neg t0, t0"),
         }
     }
 
     pub(super) fn emit_int_not_impl(&mut self, ty: IrType) {
-        self.state.emit("    not t0, t0");
-        if matches!(
-            ty,
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
-        ) {
-            self.state.emit("    slli t0, t0, 32");
-            self.state.emit("    srli t0, t0, 32");
+        // Bitwise complement also preserves sign-extension of a canonical
+        // input: ~sextN(x) = sextN(~x).  I32 therefore needs NO truncation
+        // pair at all — plain 64-bit `not` (xori -1) is already sext32
+        // canonical and GCC-identical; the old unconditional zext pair
+        // violated the invariant.  Signed narrow widths refill their own
+        // width; unsigned keep the explicit zero-extension.
+        match ty {
+            IrType::I32 => self.state.emit("    not t0, t0"),
+            IrType::I8 => {
+                self.state.emit("    not t0, t0");
+                self.state.emit("    slli t0, t0, 56");
+                self.state.emit("    srai t0, t0, 56");
+            }
+            IrType::I16 => {
+                self.state.emit("    not t0, t0");
+                self.state.emit("    slli t0, t0, 48");
+                self.state.emit("    srai t0, t0, 48");
+            }
+            IrType::U8 | IrType::U16 | IrType::U32 => {
+                self.state.emit("    not t0, t0");
+                self.state.emit("    slli t0, t0, 32");
+                self.state.emit("    srli t0, t0, 32");
+            }
+            _ => self.state.emit("    not t0, t0"),
         }
     }
 
