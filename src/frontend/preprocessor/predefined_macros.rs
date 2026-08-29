@@ -1076,9 +1076,21 @@ impl Preprocessor {
                 self.define_simple_macro("__INT_FAST64_TYPE__", "long long int");
                 self.define_simple_macro("__UINT_FAST16_TYPE__", "unsigned int");
                 self.define_simple_macro("__UINT_FAST64_TYPE__", "long long unsigned int");
-                // Replace x86-64 include paths with i686 paths
+                // Replace x86-64 include paths with i686 paths. The GCC
+                // *header* directory must survive this filter: on multilib
+                // layouts (Debian/Ubuntu gcc-multilib, which is also what
+                // real `gcc -m32` uses) /usr/lib/gcc/x86_64-linux-gnu/<v>/
+                // include serves BOTH word sizes — stddef.h, stdarg.h,
+                // stdatomic.h and the -march-guarded intrinsic headers are
+                // word-size-agnostic or macro-guarded. Dropping it left -m32
+                // compiles without stddef.h/stdarg.h entirely. Only the
+                // x86-64 *C library* dirs (glibc's /usr/include/x86_64-
+                // linux-gnu bits) are x86-64-specific and get filtered.
                 self.system_include_paths.retain(|p| {
                     let s = p.to_string_lossy();
+                    if s.contains("/usr/lib/gcc/x86_64-") {
+                        return true;
+                    }
                     !s.contains("x86_64")
                 });
                 let i686_paths = [
