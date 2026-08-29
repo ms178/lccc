@@ -168,20 +168,46 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 // leave garbage in %rax. Extract the source (first
                                 // operand) and refuse to treat rax-reading sources as
                                 // an overwrite.
+                                //
+                                // The source operand spans up to the LAST comma:
+                                // SIB-addressing forms like
+                                // `leaq (%rax, %rax, 2), %rax` contain commas inside
+                                // the parens, so a first-comma split would cut the
+                                // source at "(%rax" and lose the register reference.
+                                //
+                                // register_family_fast only matches bare "%reg"
+                                // operands (it returns REG_NONE for anything not
+                                // starting with '%'), so memory forms that READ %rax
+                                // — `movq (%rax), %rax` loads through it,
+                                // `-16(%rbp,%rax,8)` uses it as index — must be
+                                // detected textually. gcc.c-torture 931004-11 (both
+                                // miscompilation modes) pins this: `xorl %eax,%eax`
+                                // materializing a zero index was removed before
+                                // `leaq (%rax, %rax, 2), %rax`, leaving the entry
+                                // value of %rax scaled into the element address.
                                 // "movq %r12, %rax" -> src = "%r12"; "movl %eax, %eax" -> src = "%eax".
                                 let src = nj
-                                    .split_once(',')
-                                    .map(|(s, _)| {
-                                        // Strip the leading mnemonic (first whitespace token).
-                                        let mut toks = s.splitn(2, char::is_whitespace);
-                                        let _mnemonic = toks.next();
-                                        toks.next().unwrap_or("").trim()
-                                    })
-                                    .unwrap_or("");
+                                    .rsplit_once(',')
+                                    .map(|(s, _)| s)
+                                    .unwrap_or(nj)
+                                    .splitn(2, char::is_whitespace)
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .trim();
                                 let src_fam = register_family_fast(src);
-                                // Source must not be the %rax family. REG_NONE (255) for
-                                // memory/immediate sources -> overwrites (%rax not read).
-                                src_fam != 0
+                                // Source must not reference the %rax family —
+                                // register form (family 0) or memory/index form
+                                // (textual check; REG_NONE covers all parenthesized
+                                // forms and immediates, and immediates never name
+                                // a register).
+                                let src_touches_rax = src_fam == 0
+                                    || src.contains("%rax")
+                                    || src.contains("%eax")
+                                    || src.contains("%ax")
+                                    || src.contains("%al")
+                                    || src.contains("%ah");
+                                // Overwrite only when the source cannot read %rax.
+                                !src_touches_rax
                             } else {
                                 false
                             }

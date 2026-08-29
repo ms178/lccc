@@ -1133,7 +1133,7 @@ impl Lowerer {
     // ===== Vector type helpers =====
 
     /// Get the IR type for a vector element CType.
-    fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
+    pub(super) fn vector_elem_ir_type(elem_ct: &CType) -> IrType {
         IrType::from_ctype(elem_ct)
     }
 

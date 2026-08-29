@@ -362,6 +362,24 @@ impl SemanticAnalyzer {
 
     // === Declaration analysis ===
 
+    /// Resolve a declaration's vector size: explicit total bytes
+    /// (`vector_size`), element-count × element size (`ext_vector_type`), or
+    /// a deferred expression (`vector_size(EXPR)` not evaluable at parse
+    /// time — e.g. `16 * sizeof(some_typedef)` — resolved here where typedef
+    /// sizes are known via the type context).
+    fn resolve_decl_vector_size(&self, decl: &Declaration, elem_size: usize) -> Option<usize> {
+        if let Some(vs) = decl.vector_size {
+            return Some(vs);
+        }
+        if let Some(n) = decl.ext_vector_nelem {
+            return Some(n * elem_size);
+        }
+        decl.vector_size_expr
+            .as_deref()
+            .and_then(|e| self.eval_const_expr(e))
+            .map(|v| v as usize)
+    }
+
     fn analyze_declaration(&mut self, decl: &Declaration, _is_global: bool) {
         // Register enum constants from this declaration's type specifier.
         // This recursively walks into struct/union fields to find inline
@@ -492,7 +510,8 @@ impl SemanticAnalyzer {
                 // lr_vector at offset 96 instead of 192 in the gen-as-const
                 // pipeline, and elf/dl-trampoline.S failed its
                 // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
-                let resolved_ctype = match decl.resolve_vector_size(resolved_ctype.size()) {
+                let resolved_ctype = match self.resolve_decl_vector_size(decl, resolved_ctype.size())
+                {
                     Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
                     None => resolved_ctype,
                 };
@@ -533,6 +552,26 @@ impl SemanticAnalyzer {
             }
             return; // typedefs don't declare variables
         }
+
+        // Declaration-level __attribute__((vector_size(N))) /
+        // __attribute__((ext_vector_type(N))): apply the Vector wrap here for
+        // VARIABLE declarations.  Builtin element types already carry the
+        // wrap inside their resolved TypeSpecifier (the parser attaches the
+        // attribute to the specifier itself); when the element type is a
+        // typedef name, however, the attribute is parsed after the typedef
+        // name and lands in decl.vector_size, and without this wrap the
+        // object collapses to its element type: partial initializers and
+        // element stores overrun the (too small) object and element indexing
+        // dereferences the first element's value as a base address
+        // (gcc.c-torture pr123625: SEGV + wrong checksum on both backends at
+        // every opt level).  Mirrors the typedef path above; the matches!
+        // guard keeps already-wrapped specifiers from being wrapped twice.
+        let base_type = match self.resolve_decl_vector_size(decl, base_type.size()) {
+            Some(vs) if !matches!(base_type, CType::Vector(_, _)) => {
+                CType::Vector(Box::new(base_type), vs)
+            }
+            _ => base_type,
+        };
 
         for init_decl in &decl.declarators {
             let mut full_type = if init_decl.derived.is_empty() {
