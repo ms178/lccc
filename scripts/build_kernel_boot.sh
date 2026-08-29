@@ -21,7 +21,7 @@
 # ============================================================================
 set -euo pipefail
 
-K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.46}
+K=${KERNEL_DIR:-/home/user/kernel-work/linux-6.18.47}
 LCCC=${LCCC:-/home/user/lccc/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-/home/user/lccc/target/fastbuild/lccc-ld}
 OUT=${OUT:-/tmp/bootbuild}

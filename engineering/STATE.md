@@ -71,9 +71,12 @@ plain-char signedness. Re-verify line numbers before editing. The item catalog i
   (CASP, MOVW `:abs_g*:`, `.org`, PREL64, G1/G2/SABS reloc repair),
   RISC-V (va_arg struct{long double} end-to-end padding). Assembler +
   ELF linker in-tree for all four.
-- **Kernel bring-up**: linux-cachymod 6.18.46 boot code compiles + links;
-  `-pg`/`-mfentry` mcount family emitted; objtool interop is the next hard
-  gate (see `tasks/`).
+- **Kernel bring-up**: linux-cachymod **6.18.47** (bumped from 6.18.46;
+  `scripts/prepare_kernel_tree.sh` + boot harnesses). Early IDT `.fill`
+  → `.org` restretch landed in PR #289 (`12c80ed`) and confirmed on the
+  6.18.47 bzImage (32×9-byte slots). **P0:** lccc-built preboot ZSTD
+  decoder reports `ZSTD-compressed data is corrupt` (host-zstd payload
+  is intact). See `FOLLOWUP-2026-08-29-kernel-6.18.47.md`.
 
 ## What is still losing vs GCC (canonical 2026-08-28 screening)
 
@@ -118,6 +121,16 @@ Not all dead code should be deleted:
    root-caused.
 6. Preserve `ExplicitLocation::{Reg,Accumulator}` and exact
    `SlotAddr::Reg(PhysReg)`; no dummy frame offsets.
+
+## S09: preboot ZSTD signed cast-chain Copy (2026-08-29)
+
+- **P0 kernel boot**: lccc -O1+ `simplify_cast` folded `Cast(I32→I64→I32)` to
+  `Copy`. Signed I32 homes are zext (`movl`); the round-trip is `movslq`.
+  Copy kept garbage high bits; ZSTD match/RLE (≥320 B patterned) SEGV /
+  `ZSTD-compressed data is corrupt`. Fix: Copy only for **unsigned** A;
+  mixed B-widest fold skips A→B→A and mixed-sign C>A. Oracle +
+  `tests/regression/signed_i32_ptr_add.c`. Unsigned Copy kept (perf).
+- Do not relink mixed gcc objects on the 6.18.47 tree; rebuild compressed/.
 
 ## S08: wide va_arg + target char signedness (2026-08-28)
 

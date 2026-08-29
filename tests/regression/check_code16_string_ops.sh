@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Session-04 (Cachymod 6.18.46 QEMU boot): `.code16` string ops must carry
+# Session-04 (Cachymod 6.18.47 QEMU boot): `.code16` string ops must carry
 # the correct operand-size override.
 #
 # Root cause: the i686 encoder emitted the bare opcode for `movsl`/`stosl`/

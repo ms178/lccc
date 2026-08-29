@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Session-04 (Cachymod 6.18.46 boot): a C `section` attribute on a
+# Session-04 (Cachymod 6.18.47 boot): a C `section` attribute on a
 # zero-initialized global must emit PROGBITS zero bytes, NOT @nobits.
 #
 # Root cause: emit_globals() marked EVERY zero-initialized writable custom
