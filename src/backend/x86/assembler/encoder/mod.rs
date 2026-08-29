@@ -716,6 +716,8 @@ impl InstructionEncoder {
             }
             "movzb" => self.encode_movzx_infer_dst(ops, 1),
             "movzw" => self.encode_movzx_infer_dst(ops, 2),
+            "movzx" => self.encode_movzx_infer_both(ops),
+            "movsx" => self.encode_movsx_infer_both(ops),
             "movsb" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 1),
             "movsw" if !ops.is_empty() => self.encode_movsx_infer_dst(ops, 2),
 
