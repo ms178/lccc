@@ -799,6 +799,46 @@ impl X86Codegen {
                                     cur = cd.0;
                                     k += 1;
                                 }
+                                // IS-07: a flag-neutral, side-effect-free,
+                                // boolean-independent data movement between
+                                // the Cmp and its Select consumer does not
+                                // disturb the fusion — the flags survive
+                                // mov/movz/movs/lea untouched, and the Cmp's
+                                // boolean is still consumed by the SAME
+                                // select (use_counts==1 on the Cmp dest is
+                                // checked before the walk starts). This is
+                                // the `limit` clamp shape:
+                                //   cmp x>100; movslq x, x64; select(100, x64)
+                                // which previously lost the fusion to the
+                                // intervening widening move and fell back to
+                                // setcc+movzbl+testq+cmovne (4 extra
+                                // instructions). These instructions are NOT
+                                // boolean forwarding (their values must and
+                                // do emit normally) — they are transparent
+                                // to the handshake, so they are neither
+                                // chained nor added to fused_forward.
+                                // Accepted kind: a widening integer cast of
+                                // an UNRELATED value — its emission (any
+                                // path: mature direct move, accumulator
+                                // staging, or a MachInst-queued movslq) is
+                                // pure data movement and leaves EFLAGS
+                                // untouched. Deliberately NOT accepted:
+                                // UnaryOp (Neg/Not write flags), BinOp
+                                // (writes flags), GEP (scaled indices may
+                                // emit imul — writes flags), anything that
+                                // touches memory or the pending boolean.
+                                Instruction::Cast {
+                                    src: Operand::Value(sv),
+                                    from_ty: ft,
+                                    to_ty: tt,
+                                    ..
+                                } if sv.0 != cur
+                                    && ft.is_integer()
+                                    && tt.is_integer()
+                                    && tt.size() > ft.size() =>
+                                {
+                                    k += 1;
+                                }
                                 Instruction::Select {
                                     cond: Operand::Value(v),
                                     ..

@@ -2196,6 +2196,32 @@ pub trait ArchCodegen {
     //    loudly instead of emitting wrong code.
 
     /// Read the incoming static-chain register into `dest`.
+    /// Flush deferred narrowing widening moves (PF-15, x86-64). Default:
+    /// nothing is ever deferred on this target.
+    fn flush_pending_widen(&mut self) {
+        let _ = self;
+    }
+
+    /// PF-15: consume a deferred narrowing-widen compare (x86-64). Called
+    /// from the Cmp dispatch arm before any lowering; on Some the caller
+    /// emits the compare from the returned (lhs, rhs, ty, op) instead.
+    /// Default: never folds (returns None).
+    fn narrow_cmp_operands(
+        &mut self,
+        _dest: u32,
+        op: crate::ir::reexports::IrCmpOp,
+        lhs: &crate::ir::reexports::Operand,
+        rhs: &crate::ir::reexports::Operand,
+    ) -> Option<(
+        crate::ir::reexports::Operand,
+        crate::ir::reexports::Operand,
+        crate::common::types::IrType,
+        crate::ir::reexports::IrCmpOp,
+    )> {
+        let _ = (op, lhs, rhs);
+        None
+    }
+
     fn emit_get_static_chain(&mut self, _dest: &Value) {
         unimplemented_target("nested functions (static chain)");
     }

@@ -155,6 +155,11 @@ impl X86Codegen {
         // comparison from the recorded operands right before its cmov/jcc.
         // Emitting the cmp here too would double the compare in the hot loop.
         if self.cmp_replay.contains_key(&dest.0) {
+            // The comparison re-emits later from the recorded operands, so
+            // any deferred narrowing widens (PF-15) must materialize NOW:
+            // the replay will read these homes at a distance where the
+            // adjacency guarantee no longer holds.
+            self.flush_pending_widen_impl();
             return;
         }
         self.emit_int_cmp_insn_typed(lhs, rhs, ty);
@@ -689,7 +694,9 @@ impl X86Codegen {
                 self.state.reg_cache.invalidate_acc();
             }
             if c.is_zero() {
-                self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
+                // PF-16: movl $0 writes the same canonical value (zero-extend)
+                // two bytes shorter; neither form touches flags.
+                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
                 return;
             }
             match c {
@@ -739,7 +746,9 @@ impl X86Codegen {
                     }
                 }
                 IrConst::Zero => {
-                    self.state.emit_fmt(format_args!("    movq $0, %{}", reg64));
+                    // PF-16: movl $0 writes the same canonical value (zero-extend)
+                // two bytes shorter; neither form touches flags.
+                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
                 }
             }
             let _ = reg32;
