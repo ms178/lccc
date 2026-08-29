@@ -4013,6 +4013,7 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::FmaF64x4
                 | O::FmaF64x4Hoisted
                 | O::FmaF64x4SIB
+                | O::FmaF64x4HoistedSIB
                 | O::BroadcastLoadF64
                 | O::LoadF64x2
                 | O::LoadF64x4

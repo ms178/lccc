@@ -163,6 +163,16 @@ pub enum IntrinsicOp {
     /// args[2] = B base pointer (row base, loop-invariant in j-loop)
     /// args[3] = byte offset (the j-loop IV, increments by 32 each iteration)
     FmaF64x4SIB,
+    /// Like FmaF64x4SIB but with A broadcast hoisted to ymm1.
+    /// Eliminates both GEP address computation AND broadcast load from inner loop.
+    /// args[0] = C base pointer (row base, loop-invariant)
+    /// args[1] = B base pointer (row base, loop-invariant)
+    /// args[2] = byte offset (j-loop IV, shared across chunks)
+    /// args[3] = optional displacement (0,32,64,96) for quad unroll — if present,
+    ///           emits disp(%base,%off) SIB, avoiding extra leaq/addq.
+    ///           If absent, behaves like 3-arg form (offset already includes chunk).
+    /// ymm1 must already hold broadcasted A[i][k] (from BroadcastLoadF64).
+    FmaF64x4HoistedSIB,
 
     // --- Vector loads for reduction patterns ---
     /// Load 4 packed doubles (256-bit unaligned): vmovupd
@@ -1119,7 +1129,7 @@ impl IntrinsicOp {
             | Psllwi256 | Psrlwi256 | Broadcast128to256 | Zext128to256
             | Insert128to256 | SetEpi16_256 | SetEpi32_256 | SetEpi64x256 | SetEpi8_256
             | Dpbusd256 | Dpbssd256 | Dpwuud256 | Aesenc256 | Vpclmulqdq256
-            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB
+            | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4

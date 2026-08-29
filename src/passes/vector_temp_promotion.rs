@@ -393,6 +393,7 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
         O::FmaF64x2 | O::FmaF64x4 => index < 2,
         O::FmaF64x2Hoisted | O::FmaF64x4Hoisted => index == 0,
         O::FmaF64x4SIB => index < 3,
+        O::FmaF64x4HoistedSIB => index < 2,
         O::BroadcastLoadF64 | O::Rdtscp | O::Clflush => index == 0,
         _ => false,
     };
@@ -425,7 +426,8 @@ fn intrinsic_dest_required_alignment(
         | O::FmaF64x2Hoisted
         | O::FmaF64x4
         | O::FmaF64x4Hoisted
-        | O::FmaF64x4SIB => Some(0),
+        | O::FmaF64x4SIB
+        | O::FmaF64x4HoistedSIB => Some(0),
         // The aligned AVX store contract must survive even though today's
         // backend happens to use its generic unaligned destination helper.
         O::Store256 => Some(32),
@@ -449,6 +451,7 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::FmaF64x4HoistedSIB
             | IntrinsicOp::BroadcastLoadF64
             | IntrinsicOp::Storedqu
             | IntrinsicOp::Storeldi128
@@ -470,6 +473,7 @@ fn intrinsic_dest_reads_old_value(op: IntrinsicOp) -> bool {
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::FmaF64x4HoistedSIB
     )
 }
 

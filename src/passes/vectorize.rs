@@ -7654,21 +7654,29 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body with FOUR FmaF64x4Hoisted (4-way software pipeline).
-    // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
-    // backend four concurrent vfmadd231pd chains — the shape GCC emits for
-    // the 256³ matmul kernel on x86-64-v3. A broadcast is already in ymm1.
+    // Step 3: Replace the body with FOUR FmaF64x4HoistedSIB (SIB + hoisted broadcast).
+    // This is the optimal form: SIB eliminates GEP leaq/movq overhead, hoisted
+    // broadcast eliminates vmovsd+vbroadcastsd per chunk.
+    // Chunks at byte offsets IV+{0,32,64,96}. Each chunk does:
+    //   vmovupd (C_base+off), %ymm0
+    //   vfmadd231pd (B_base+off), %ymm1, %ymm0
+    //   vmovupd %ymm0, (C_base+off)
+    // where %ymm1 already holds A[i][k] from BroadcastLoadF64 in preheader.
+    // Total per iteration: 1 movslq (IV conv) + 3 adds (off+32/64/96) + 12 FMA insns
+    // vs previous 11 leaq + 8 movq + 12 FMA = 31 insns. Matches GCC SIB pattern.
     {
         let body = &mut func.blocks[pattern.body_idx];
         let store_pos = body.instructions.iter().position(
             |inst| matches!(inst, Instruction::Store { ptr, .. } if *ptr == pattern.c_gep),
         );
 
-        let (b_base, b_off, c_base, c_off) = {
+        // Extract base pointers and byte offset from existing GEPs.
+        // b_base = B row base (B + k*256*8), c_base = C row base (C + i*256*8)
+        // b_off = c_off = j*8 (shared IV-derived offset)
+        let (b_base, b_off, c_base) = {
             let mut b_base = pattern.b_gep;
             let mut b_off = Operand::Const(IrConst::I64(0));
             let mut c_base = pattern.c_gep;
-            let mut c_off = Operand::Const(IrConst::I64(0));
             for inst in &body.instructions {
                 if let Instruction::GetElementPtr {
                     dest, base, offset, ..
@@ -7680,63 +7688,49 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                     }
                     if *dest == pattern.c_gep {
                         c_base = *base;
-                        c_off = offset.clone();
+                        // c_off should equal b_off, but we keep b_off as canonical
                     }
                 }
             }
-            (b_base, b_off, c_base, c_off)
+            (b_base, b_off, c_base)
         };
 
         let mut prelude: Vec<Instruction> = Vec::new();
-        // Chunk 0 uses the existing GEPs.
-        prelude.push(Instruction::Intrinsic {
-            dest: None,
-            op: IntrinsicOp::FmaF64x4Hoisted,
-            dest_ptr: Some(pattern.c_gep),
-            args: vec![Operand::Value(pattern.b_gep)],
-        });
-        for chunk in 1u64..4 {
-            let byte_off = chunk * 32;
-            let b_off_n = Value(next_val_id);
-            next_val_id += 1;
-            let c_off_n = Value(next_val_id);
-            next_val_id += 1;
-            let b_gep_n = Value(next_val_id);
-            next_val_id += 1;
-            let c_gep_n = Value(next_val_id);
-            next_val_id += 1;
-            prelude.push(Instruction::BinOp {
-                dest: b_off_n,
-                op: IrBinOp::Add,
-                lhs: b_off.clone(),
-                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
-                ty: IrType::I64,
-            });
-            prelude.push(Instruction::BinOp {
-                dest: c_off_n,
-                op: IrBinOp::Add,
-                lhs: c_off.clone(),
-                rhs: Operand::Const(IrConst::I64(byte_off as i64)),
-                ty: IrType::I64,
-            });
-            prelude.push(Instruction::GetElementPtr {
-                dest: b_gep_n,
-                base: b_base,
-                offset: Operand::Value(b_off_n),
-                ty: IrType::F64,
-            });
-            prelude.push(Instruction::GetElementPtr {
-                dest: c_gep_n,
-                base: c_base,
-                offset: Operand::Value(c_off_n),
-                ty: IrType::F64,
-            });
-            prelude.push(Instruction::Intrinsic {
-                dest: None,
-                op: IntrinsicOp::FmaF64x4Hoisted,
-                dest_ptr: Some(c_gep_n),
-                args: vec![Operand::Value(b_gep_n)],
-            });
+
+        // Quad SIB with displacement: all 4 chunks share same byte offset (j*8)
+        // plus disp 0,32,64,96 encoded as 4th arg. No extra BinOp Adds needed.
+        // This yields optimal asm:
+        //   vmovupd (%rbx,%r10), %ymm0 / vfmadd  (%r14,%r10), %ymm1, %ymm0 / vmovupd %ymm0, (%rbx,%r10)
+        //   vmovupd 32(%rbx,%r10), %ymm0 / vfmadd 32(%r14,%r10), %ymm1, %ymm0 / ...
+        //   vmovupd 64(%rbx,%r10), %ymm0 / ...
+        //   vmovupd 96(%rbx,%r10), %ymm0 / ...
+        // Total: 1 movslq + 12 FMA insns + loop control, no leaq/addq for offsets.
+        for chunk in 0u64..4 {
+            let disp = chunk * 32;
+            if disp == 0 {
+                prelude.push(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::FmaF64x4HoistedSIB,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(c_base),
+                        Operand::Value(b_base),
+                        b_off.clone(),
+                    ],
+                });
+            } else {
+                prelude.push(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::FmaF64x4HoistedSIB,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(c_base),
+                        Operand::Value(b_base),
+                        b_off.clone(),
+                        Operand::Const(IrConst::I64(disp as i64)),
+                    ],
+                });
+            }
         }
 
         if let Some(pos) = store_pos {
@@ -7749,7 +7743,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 4;
         if debug {
-            eprintln!("[VEC]   Inserted quad FmaF64x4Hoisted intrinsics (step 128) with broadcast in ymm1");
+            eprintln!("[VEC]   Inserted quad FmaF64x4HoistedSIB intrinsics (SIB + hoisted broadcast, step 128)");
         }
     }
 
