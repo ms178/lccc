@@ -93,11 +93,14 @@ impl I686Codegen {
         self.current_return_type = func.return_type;
 
         // Same-block div/rem pair fusion table (one divl serves a
-        // URem+UDiv couple with identical operands). Constant divisors pair
-        // only at -Os, where the magic-number strength reduction is off and
-        // the general divl path is guaranteed for both sides.
-        let pairs =
-            crate::backend::regalloc::compute_i686_divrem_pairs(func, self.optimize_for_size);
+        // URem+UDiv couple with identical operands). Constant-RHS pairs
+        // never fuse (compute_i686_divrem_pairs excludes them
+        // unconditionally): the magic-number path may claim them at any
+        // optimisation level, and the RA model must stay exact.
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+            func,
+            crate::backend::regalloc::DivRemTarget::I686,
+        );
         self.divrem_tail_dests = pairs.tail_dests;
         self.divrem_head_partners = pairs.head_partners;
         self.divrem_broken_tails.clear();

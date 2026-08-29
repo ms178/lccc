@@ -8,7 +8,7 @@ use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::fp_contract::FpContract;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
@@ -241,6 +241,12 @@ pub struct ArmCodegen {
     /// Total bytes of named (non-variadic) params passed on the stack.
     /// This includes all stack-passed scalars, F128, I128, and structs with alignment.
     pub(super) va_named_stack_bytes: usize,
+    /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+    /// AArch64 target): dest value-ids of TAIL instructions — they emit
+    /// nothing because the HEAD's sdiv+msub dual-store wrote their result.
+    pub(super) divrem_tail_dests: FxHashSet<u32>,
+    /// Head dest value-id -> partner (tail) dest value-id.
+    pub(super) divrem_head_partners: FxHashMap<u32, u32>,
     /// Scratch register index for inline asm GP register allocation
     pub(super) asm_scratch_idx: usize,
     /// Scratch register index for inline asm FP register allocation
@@ -285,6 +291,8 @@ impl ArmCodegen {
             va_named_gp_count: 0,
             va_named_fp_count: 0,
             va_named_stack_bytes: 0,
+            divrem_tail_dests: FxHashSet::default(),
+            divrem_head_partners: FxHashMap::default(),
             asm_scratch_idx: 0,
             asm_fp_scratch_idx: 0,
             reg_assignments: FxHashMap::default(),

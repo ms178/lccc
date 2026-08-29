@@ -358,6 +358,17 @@ pub struct X86Codegen {
     pub(super) reg_save_area_offset: i64,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
+    /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+    /// X86_64 target): dest value-ids of TAIL instructions — they emit
+    /// nothing because the HEAD's dual-store wrote their result.
+    pub(super) divrem_tail_dests: FxHashSet<u32>,
+    /// Head dest value-id -> (partner tail dest, partner result is the
+    /// quotient in %rax). `false` means the partner wants the remainder
+    /// in %rdx.
+    pub(super) divrem_head_partners: FxHashMap<u32, (u32, bool)>,
+    /// Tails whose pair was broken at head-emission time (pathological home
+    /// combination): they must emit their own standalone division.
+    pub(super) divrem_broken_tails: FxHashSet<u32>,
     /// Whether the register save area must preserve GP argument registers:
     /// true when any va_arg in the body reads INTEGER class, or the va_list
     /// escapes to a callee (which may read any class).
@@ -653,6 +664,9 @@ impl X86Codegen {
             num_named_stack_bytes: 0,
             reg_save_area_offset: 0,
             is_variadic: false,
+            divrem_tail_dests: FxHashSet::default(),
+            divrem_head_partners: FxHashMap::default(),
+            divrem_broken_tails: FxHashSet::default(),
             vararg_gp_save: true,
             vararg_fp_save: true,
             asm_scratch_idx: 0,
@@ -3685,6 +3699,27 @@ impl ArchCodegen for X86Codegen {
             || self.machinst_disabled_kinds & machinst_kind_bit(inst) != 0
         {
             return false;
+        }
+        // Div/rem pair heads and tails must stay on the classic emitter path:
+        // the fusion (emit_divrem_pair_head) lives there and the MachInst
+        // lowering emits standalone divisions for each side, which would both
+        // duplicate the divide and skip the tail elimination.
+        if let crate::ir::reexports::Instruction::BinOp {
+            dest,
+            op:
+                crate::ir::reexports::IrBinOp::SDiv
+                | crate::ir::reexports::IrBinOp::UDiv
+                | crate::ir::reexports::IrBinOp::SRem
+                | crate::ir::reexports::IrBinOp::URem,
+            ..
+        } = inst
+        {
+            if self.divrem_tail_dests.contains(&dest.0)
+                || self.divrem_head_partners.contains_key(&dest.0)
+                || self.divrem_broken_tails.contains(&dest.0)
+            {
+                return false;
+            }
         }
         // W2 Load->Cast folding is a two-instruction runtime handshake: the
         // default Load emitter redirects into the Cast destination and arms

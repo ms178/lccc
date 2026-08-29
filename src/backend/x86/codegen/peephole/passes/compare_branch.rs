@@ -4,6 +4,7 @@
 //! eliminating the boolean materialization overhead from the codegen model.
 
 use super::super::types::*;
+use super::liveness::FileLiveness;
 
 /// Maximum number of store/load offsets tracked during compare-and-branch fusion.
 const MAX_TRACKED_STORE_LOAD_OFFSETS: usize = 4;
@@ -23,6 +24,54 @@ fn parse_stack_operand(text: &str, source: bool) -> Option<(u8, i32)> {
                 n.trim().parse::<i32>().ok()?
             };
             return Some((base, off));
+        }
+    }
+    None
+}
+
+/// True when the instruction READS the EFLAGS register without rewriting it
+/// (or rewrites only part of it — see `flags_partial_writers`). A reader on
+/// the fall-through path after a fused jcc would observe the PRODUCER cmp's
+/// flags instead of the dropped `testq`'s flags: the fusion must refuse.
+fn flags_reader(t: &str) -> bool {
+    const READERS: &[&str] = &[
+        "cmov", "set", "adc", "sbb", "rcl", "rcr", "pushfq", "popfq", "sahf", "lahf",
+    ];
+    READERS.iter().any(|p| t.starts_with(p))
+        || (t.starts_with('j') && !t.starts_with("jmp"))
+}
+
+/// True when the instruction ends the flags-observation window: it rewrites
+/// all six arithmetic flags, so any later reader observes ITS flags on both
+/// the original and the fused path. `inc`/`dec` deliberately do NOT qualify
+/// (they preserve CF, so a later `adc` would still see the dropped
+/// producer's vs. the fused cmp's carry).
+fn flags_full_writer(t: &str) -> bool {
+    const WRITERS: &[&str] = &[
+        "cmp", "test", "add", "sub", "and", "or", "xor", "neg", "mul", "imul", "div",
+        "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc",
+        "popfq", "clc", "stc", "cmc", "call", "ret", "jmp",
+    ];
+    WRITERS.iter().any(|p| t.starts_with(p))
+}
+
+/// Parse `testq %rX, %rX` / `testl %eXd, %eXd` / `testb %rXb, %rXb` as a
+/// single-register test of a 64/32/8-bit register name. Returns the register
+/// text.
+fn parse_self_test(t: &str) -> Option<&str> {
+    for (mnem, w) in [("testq %", 1), ("testl %", 1), ("testb %", 1)] {
+        if let Some(rest) = t.strip_prefix(mnem) {
+            let mut parts = rest.split(", ");
+            let a = parts.next()?.trim();
+            let b = parts.next()?.trim();
+            if a == b && !a.contains(',') && !a.contains('(') {
+                // Return a 'static slice of the register text.
+                let start = mnem.len();
+                let end = start + a.len();
+                let full = t;
+                let leaked = &full[start..end];
+                return Some(leaked);
+            }
         }
     }
     None
@@ -71,6 +120,10 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         // Track StoreRbp offsets so we can bail out if any store's slot is
         // potentially read by another basic block (no matching load nearby).
         let mut test_idx = None;
+        // Final carrier of the boolean: %rax/%eax (legacy, corpus-validated
+        // contract) or a register-relay destination (%rX — NEW capability,
+        // gated on exact liveness below).
+        let mut relay_reg: Option<String> = None;
         let mut store_offsets: [(u8, i32); MAX_TRACKED_STORE_LOAD_OFFSETS] =
             [(0, 0); MAX_TRACKED_STORE_LOAD_OFFSETS];
         let mut store_count = 0usize;
@@ -79,15 +132,27 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             let si = seq_indices[scan];
             let line = infos[si].trimmed(store.get(si));
 
-            // Skip zero-extend of setcc result ONLY when it lands in %rax/%eax.
-            // `movzbl %al, %r12d` leaves the boolean in r12; a later
-            // `testq %rax, %rax` is then a DIFFERENT value (zlib-ng
-            // zng_deflateSetParams: size<4's setb was fused with the
-            // test of a slotted `new_strategy`, so a 4-byte buffer
-            // became Z_BUF_ERROR).
+            // Relay hop of the setcc result: `movzbq %al, %rax` /
+            // `movzbl %al, %eax` (legacy rax carrier, corpus-validated) or a
+            // register relay `movzbq %al, %rX` / `movzbl %al, %rXd` (RA-homed
+            // booleans). A later test MUST be of the relay's destination —
+            // a test of a different register is a DIFFERENT value (zlib-ng
+            // zng_deflateSetParams: size<4's setb was fused with the test of
+            // a slotted `new_strategy`, so a 4-byte buffer became
+            // Z_BUF_ERROR).
             if line == "movzbq %al, %rax" || line == "movzbl %al, %eax" {
                 scan += 1;
                 continue;
+            }
+            if let Some(dst) = line
+                .strip_prefix("movzbq %al, %")
+                .or_else(|| line.strip_prefix("movzbl %al, %"))
+            {
+                if !dst.contains(',') && !dst.contains('(') {
+                    relay_reg = Some(dst.trim().to_string());
+                    scan += 1;
+                    continue;
+                }
             }
             // Skip store/load to rbp (pre-parsed fast check).
             if let LineKind::StoreRbp { offset, .. } = infos[si].kind {
@@ -122,10 +187,23 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
                 scan += 1;
                 continue;
             }
-            // Check for test
-            if line == "testq %rax, %rax" || line == "testl %eax, %eax" {
+            // Check for test: legacy rax carrier (ONLY when no non-rax
+            // relay intervenes — a rax test after `movzbl %al, %r12d` tests
+            // a DIFFERENT value), or a test of the relay's destination
+            // register.
+            if relay_reg.is_none()
+                && (line == "testq %rax, %rax" || line == "testl %eax, %eax")
+            {
                 test_idx = Some(scan);
                 break;
+            }
+            if let Some(relay) = relay_reg.clone() {
+                if line == format!("testq %{}, %{}", relay, relay)
+                    || line == format!("testl %{}, %{}", relay, relay)
+                {
+                    test_idx = Some(scan);
+                    break;
+                }
             }
             break;
         }
@@ -197,6 +275,62 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             i += 1;
             continue;
         };
+
+        // NEW capability gate: a non-rax carrier relay is only sound when
+        // BOTH the carrier register and %rax are dead after the fused jump
+        // (their definitions are being NOPed; a live later reader would see
+        // stale values). The legacy rax path keeps its corpus-validated
+        // contract (no deadness check; the relay lands in %rax whose byte
+        // the setCC wrote and the test consumed).
+        let relay_fam = relay_reg
+            .as_deref()
+            .map(register_family_fast)
+            .filter(|&f| f != REG_NONE);
+        if let Some(fam) = relay_fam {
+            let mut lv = FileLiveness::new(store, infos);
+            let jcc_pos = seq_indices[test_scan + 1];
+            let relay_dead = lv.live_after(jcc_pos, fam) == Some(false);
+            let al_dead = lv.live_after(jcc_pos, 0) == Some(false);
+            if !relay_dead || !al_dead {
+                if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
+                    eprintln!(
+                        "[CMPFUSE] refusing relay carrier {:?} (relay_dead={} al_dead={})",
+                        relay_reg, relay_dead, al_dead
+                    );
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        // Flags-reader guard (pure correctness, applies to every fusion):
+        // the fall-through path after the fused jcc now carries the
+        // PRODUCER cmp's flags where the dropped `testq`'s flags used to
+        // be. A reader (cmov/setCC/adc/sbb/conditional jump/pushfq) before
+        // the next full flag writer would observe the wrong flags.
+        let guard_end = (seq_indices[test_scan + 1] + 64).min(len);
+        let mut flags_hazard = false;
+        for g in (seq_indices[test_scan + 1] + 1)..guard_end {
+            if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty)
+            {
+                continue;
+            }
+            let gt = infos[g].trimmed(store.get(g)).to_string();
+            if flags_reader(&gt) {
+                flags_hazard = true;
+                break;
+            }
+            if flags_full_writer(&gt) {
+                break;
+            }
+        }
+        if flags_hazard {
+            if std::env::var_os("CCC_DEBUG_CMP_FUSE").is_some() {
+                eprintln!("[CMPFUSE] flags-reader hazard after fused jcc — refusing");
+            }
+            i += 1;
+            continue;
+        }
 
         let fused_cc = if is_jne { cc } else { invert_cc(cc) };
         let fused_jcc = format!("    j{} {}", fused_cc, branch_target);

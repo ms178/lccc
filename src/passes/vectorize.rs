@@ -5304,17 +5304,19 @@ fn emit_stencil_expr(
                 }
                 _ => None,
             },
-            // Invariant leaf reached as a Value (defined outside the loop):
-            // broadcast it.
-            _ => broadcast(
-                &Operand::Value(node),
-                func,
-                broadcast_op,
-                preheader_idx,
-                next_val_id,
-                changes,
-                cache,
-            ),
+            // Any other loop-local definition (Select, Copy, Load, Call,
+            // Phi, ...) can NEVER be soundly broadcast: the broadcast lands
+            // in the preheader, but the value is defined inside the loop —
+            // a use-before-def dominance violation (the broadcast reads the
+            // value's uninitialized home and is then reused for every
+            // iteration). True invariant leaves never reach this match (the
+            // `defs.get(node)?` above already bailed on them; the per-arm
+            // `is_invariant` checks broadcast operands directly), so this
+            // arm's historical "invariant leaf" comment was wrong: it only
+            // ever matched loop-local defs. Fail soft — return None so the
+            // stencil transform declines the pattern and the scalar loop
+            // runs.
+            _ => None,
         }
     }
 

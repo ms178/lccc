@@ -60,7 +60,10 @@ pub fn analyze_accumulator_assignments(
     // the accumulator at its IR def point (it was stored by the head). An
     // accumulator chain starting from a tail dest would let the consumer
     // read a stale %eax.
-    let divrem = compute_i686_divrem_pairs(func, false);
+    let divrem = match divrem_target_for_current_arch() {
+        Some(t) => compute_i686_divrem_pairs(func, t),
+        None => return Vec::new(),
+    };
     if !divrem.tail_dests.is_empty() {
         let filtered: Vec<u32> = candidates
             .into_iter()
@@ -440,19 +443,48 @@ fn overlaps_inclusive_skip_birth(iv: &LiveInterval, points: &[u32]) -> bool {
 /// not depend on what lies between the two instructions: SSA operands cannot
 /// change, and both stores happen at the head, before anything else runs.
 ///
-/// `allow_const_rhs` covers the constant-divisor strength-reduction path: at
-/// -O2 the emitter replaces constant divisions with magic-number sequences
-/// that never execute `divl`, so those pairs must not fuse. At -Os the magic
-/// path is disabled and constant pairs are legal. The register allocator
-/// always passes `false` — a tail it models as "emits nothing" must be one
-/// whose head provably emits the real division (non-constant RHS pairs never
-/// take the magic path, so they can never break).
+/// Constant-RHS divisions never pair: at -O2 the emitters replace constant
+/// divisions with magic-number sequences that never execute the hardware
+/// divide, so a fused pair there would be dead code feeding nothing (and
+/// keeping the emitter side unconditional is the only model the register
+/// allocator can share soundly — the RA always models exactly what every
+/// optimisation level emits for these pairs).
+///
+/// The `target` gate selects the operand width class per backend: i686 pairs
+/// 32-bit GPR ops, x86-64 additionally pairs 64-bit ops (divq/idivq), and
+/// AArch64 pairs both (sdiv/udiv + msub shape). RISC-V never pairs: div and
+/// rem are separate single-uop instructions there and the sdiv+msub shape
+/// would be three operations instead of two.
+///
+/// The function name keeps the historical `I686` prefix in the pair struct
+/// (the shape originated there); the shared RA consumes pairs for every
+/// target the gate enables.
+///
 ///
 /// The greedy pairing is order-stable: scanning forward, each still-unpaired
 /// division pairs with the next unpaired compatible division in the same
 /// block. Compatibility requires identical `lhs`/`rhs` operands and matching
 /// signedness (`URem` with `UDiv`/`URem`, `SRem` with `SDiv`/`SRem`); mixing
 /// flavours would change the executed instruction.
+/// Per-backend div/rem fusion gate (see `compute_i686_divrem_pairs`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DivRemTarget {
+    I686,
+    X86_64,
+    AArch64,
+}
+
+/// The fusion target for the CURRENT compilation unit, or None where fusion
+/// never pays (RISC-V and any non-registered target).
+pub(crate) fn divrem_target_for_current_arch() -> Option<DivRemTarget> {
+    match crate::common::types::target_elf_machine() {
+        crate::backend::elf::EM_386 => Some(DivRemTarget::I686),
+        crate::backend::elf::EM_X86_64 => Some(DivRemTarget::X86_64),
+        crate::backend::elf::EM_AARCH64 => Some(DivRemTarget::AArch64),
+        _ => None,
+    }
+}
+
 pub(crate) struct I686DivRemPairs {
     /// Dest value-ids of tail instructions — the emitter skips them entirely.
     pub tail_dests: FxHashSet<u32>,
@@ -471,7 +503,7 @@ pub(crate) struct I686DivRemPairs {
 
 pub(crate) fn compute_i686_divrem_pairs(
     func: &IrFunction,
-    allow_const_rhs: bool,
+    target: DivRemTarget,
 ) -> I686DivRemPairs {
     let mut pairs = I686DivRemPairs {
         tail_dests: FxHashSet::default(),
@@ -492,6 +524,7 @@ pub(crate) fn compute_i686_divrem_pairs(
         pt += block.instructions.len() as u32 + 1;
     }
 
+    let pairs_64 = target != DivRemTarget::I686;
     let is_gpr32_ty = |ty: &IrType| {
         matches!(
             ty,
@@ -502,7 +535,7 @@ pub(crate) fn compute_i686_divrem_pairs(
                 | IrType::I32
                 | IrType::U32
                 | IrType::Ptr
-        )
+        ) || (pairs_64 && matches!(ty, IrType::I64 | IrType::U64))
     };
     let div_flavor = |op: IrBinOp| -> Option<bool> {
         // Some(true) = quotient (div), Some(false) = remainder, None = not div-like
@@ -528,10 +561,11 @@ pub(crate) fn compute_i686_divrem_pairs(
             } = inst
             {
                 if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
-                    // Constant-RHS divisions only pair when the caller has
-                    // established the magic path is off (see doc comment).
-                    let rhs_ok = allow_const_rhs || !matches!(rhs, Operand::Const(_));
-                    if rhs_ok {
+                    // Constant-RHS divisions NEVER pair: the emitters may
+                    // strength-reduce them to magic sequences, so the RA
+                    // model ("tail emits nothing, head emits the divide")
+                    // would not describe the emitted code.
+                    if !matches!(rhs, Operand::Const(_)) {
                         cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
                     }
                 }
@@ -586,7 +620,10 @@ pub(crate) fn compute_i686_divrem_pairs(
 /// This patches both the fat intervals and the hole-aware segments, then
 /// restores the segments' `(start, value_id)` sort order.
 fn patch_divrem_tail_intervals(func: &IrFunction, liveness: &mut LivenessResult) {
-    let pairs = compute_i686_divrem_pairs(func, false);
+    let Some(target) = divrem_target_for_current_arch() else {
+        return;
+    };
+    let pairs = compute_i686_divrem_pairs(func, target);
     if pairs.head_point_of_tail.is_empty() {
         return;
     }
@@ -5057,9 +5094,16 @@ fn collect_i686_scratch_hazard_points_refined(
 
     // Same-block div/rem pair tails emit no code (the head stored both
     // results); see compute_i686_divrem_pairs for the soundness model.
-    // Conservative constant-RHS rule keeps the RA model a subset of what the
-    // emitter will actually fuse.
-    let divrem_pairs = compute_i686_divrem_pairs(func, false);
+    // Constant-RHS divisions never pair, so the model is exact.
+    let divrem_pairs = match divrem_target_for_current_arch() {
+        Some(t) => compute_i686_divrem_pairs(func, t),
+        None => I686DivRemPairs {
+            tail_dests: Default::default(),
+            head_partners: Default::default(),
+            tail_points: Default::default(),
+            head_point_of_tail: Default::default(),
+        },
+    };
 
     // Values defined by a GetElementPtr (refinement (b)).
     let mut gep_defined: FxHashSet<u32> = FxHashSet::default();

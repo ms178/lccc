@@ -90,6 +90,20 @@ impl X86Codegen {
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
 
+        // Same-block div/rem pair fusion table (one divq/divl serves a
+        // URem+UDiv couple with identical operands). Constant-RHS pairs
+        // never fuse (compute_i686_divrem_pairs excludes them
+        // unconditionally): the magic-number path may claim them, and the
+        // RA model must stay exact. The X86_64 target pairs 64-bit ops in
+        // addition to the 32-bit classes.
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+            func,
+            crate::backend::regalloc::DivRemTarget::X86_64,
+        );
+        self.divrem_tail_dests = pairs.tail_dests;
+        self.divrem_head_partners = pairs.head_partners;
+        self.divrem_broken_tails.clear();
+
         // Analyze IVSR patterns for Phase 9b indexed addressing optimization
         self.analyze_ivsr_pointers(func);
 

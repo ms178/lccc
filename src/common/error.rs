@@ -135,6 +135,7 @@ impl WarningKind {
             "implicit" => Some(WarningKind::ImplicitFunctionDeclaration),
             "cpp" => Some(WarningKind::Cpp),
             "return-type" => Some(WarningKind::ReturnType),
+            "incompatible-pointer-types" => Some(WarningKind::IncompatiblePointerTypes),
             _ => None,
         }
     }
@@ -145,6 +146,7 @@ impl WarningKind {
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
             WarningKind::ReturnType,
+            WarningKind::IncompatiblePointerTypes,
             // WarningKind::Undeclared is now a hard error, not a warning
         ]
     }
@@ -162,6 +164,7 @@ impl WarningKind {
             WarningKind::ImplicitFunctionDeclaration,
             WarningKind::Cpp,
             WarningKind::ReturnType,
+            WarningKind::IncompatiblePointerTypes,
         ]
     }
 }
