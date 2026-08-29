@@ -14,6 +14,71 @@ use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
 };
 
+/// Def-chain stability classification for a va_list root (see the analysis
+/// in `calculate_stack_space_impl`): `true` only when the chain bottoms out
+/// in an Alloca, ParamRef, Call result, or a constant — i.e. an id that can
+/// never be re-derived under a different SSA name. Copy/Cast are walked
+/// through (pure renames); everything else — Load, GEP, Select, Phi — can be
+/// re-emitted per source mention with a fresh id and is reported unstable.
+/// The walk is bounded; a cycle (phi loops) classifies unstable.
+fn va_root_is_stable(func: &IrFunction, root: u32) -> bool {
+    let mut cur = root;
+    for _ in 0..16 {
+        let mut next: Option<u32> = None;
+        let mut stable = false;
+        let mut decided = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Alloca { dest, .. } | Instruction::ParamRef { dest, .. } => {
+                        if dest.0 == cur {
+                            stable = true;
+                            decided = true;
+                        }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        if let Some(dest) = info.dest.as_ref() {
+                            if dest.0 == cur {
+                                stable = true;
+                                decided = true;
+                            }
+                        }
+                    }
+                    Instruction::Copy { dest, src } | Instruction::Cast { dest, src, .. } => {
+                        if dest.0 == cur {
+                            match src {
+                                Operand::Value(v) => next = Some(v.0),
+                                Operand::Const(_) => {
+                                    stable = true;
+                                    decided = true;
+                                }
+                            }
+                        }
+                    }
+                    // Load/GEP/Select/Phi and every other def form: the value
+                    // is memory- or control-derived; a second source mention
+                    // re-derives it under a fresh id. Unstable.
+                    _ => {}
+                }
+                if decided {
+                    break;
+                }
+            }
+            if decided {
+                break;
+            }
+        }
+        if decided {
+            return stable;
+        }
+        match next {
+            Some(n) if n != cur => cur = n,
+            _ => return false, // no def found (should not happen) or a cycle
+        }
+    }
+    false
+}
+
 impl X86Codegen {
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         // ms178 debug: dump IR per function
@@ -41,17 +106,22 @@ impl X86Codegen {
             let (mut needs_gp, mut needs_fp) = (false, false);
             // va_list-aliased values (VaStart root + every va_copy src/dest),
             // closed transitively over Copy so `va_list ap2 = ap; f(ap2)` is
-            // still detected as an escape.
+            // still detected as an escape. The raw seed values are kept for
+            // the stability classification below.
+            let mut seeds: Vec<Value> = Vec::new();
             let mut va_ids: FxHashSet<u32> = FxHashSet::default();
             for block in &func.blocks {
                 for inst in &block.instructions {
                     match inst {
                         Instruction::VaStart { va_list_ptr } => {
                             va_ids.insert(va_list_ptr.0);
+                            seeds.push(*va_list_ptr);
                         }
                         Instruction::VaCopy { dest_ptr, src_ptr } => {
                             va_ids.insert(dest_ptr.0);
                             va_ids.insert(src_ptr.0);
+                            seeds.push(*dest_ptr);
+                            seeds.push(*src_ptr);
                         }
                         Instruction::VaArg { result_ty, .. } => {
                             if result_ty.is_128bit() || !result_ty.is_float() {
@@ -169,8 +239,47 @@ impl X86Codegen {
                     }
                 }
             }
+            // Fail-closed root classification. The value-alias closure can
+            // only see SAME-ID aliases; a va_list whose address arrives
+            // through memory (a Load — gcc.c-torture va-arg-21's
+            // `va_list *ap_array[]` keeps the pointer in an array element, so
+            // every textual mention re-loads it under a fresh SSA id) or
+            // through address arithmetic (a GEP — `va_list a[2]`'s `a[0]`
+            // re-emits the GEP per mention) can hand the SAME va_list to a
+            // callee under an id the closure never matches, hiding the
+            // escape. The dead-save elimination would then skip the
+            // register-save prologue and the callee's va_arg reads
+            // uninitialized save-area bytes (observed: "hello (null)").
+            //
+            // A root is *stable* only when its def chain bottoms out in an
+            // Alloca (the canonical local `va_list ap;`, where every mention
+            // decays to the alloca's own id), a ParamRef, a fresh Call
+            // result (unaliased until stored, which the store-escape rule
+            // above already catches), or a constant. Copy/Cast are walked
+            // through. Every other root — Load, GEP, Select, Phi, unknown —
+            // conservatively requires BOTH save classes. This costs nothing
+            // on the canonical shapes (the dead-save optimization's measured
+            // corpus is local-va_list printf wrappers) and closes the whole
+            // re-load blind spot at once. Kill switch for bisection:
+            // CCC_NO_VA_ROOT_GUARD=1 restores the pre-guard analysis.
+            if std::env::var("CCC_NO_VA_ROOT_GUARD").is_err()
+                && seeds.iter().any(|s| !va_root_is_stable(func, s.0))
+            {
+                needs_gp = true;
+                needs_fp = true;
+            }
             self.vararg_gp_save = needs_gp;
             self.vararg_fp_save = needs_fp;
+            if std::env::var("CCC_DEBUG_VARARG").is_ok() {
+                eprintln!(
+                    "debug vararg {}: gp={} fp={} stable={} va_ids={:?}",
+                    func.name,
+                    needs_gp,
+                    needs_fp,
+                    seeds.iter().all(|s| va_root_is_stable(func, s.0)),
+                    va_ids
+                );
+            }
         }
         // Count named params using the shared ABI classification, so this
         // stays in sync with classify_call_args (caller side) automatically.

@@ -16,6 +16,7 @@ pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
+pub(crate) mod bool_thread;
 pub(crate) mod block_layout;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
@@ -876,6 +877,17 @@ pub(crate) fn run_passes(
         // body's not-constant arm reached codegen before this round).
         module.for_each_function(cfg_simplify::simplify_cfg);
         module.for_each_function(dce::eliminate_dead_code);
+        // Bool-phi merge-diamond branch threading (same call as the -O2+
+        // tier's late phase; see there for the rationale).
+        if !pass_disabled(&disabled, "boolthread")
+            && std::env::var("CCC_NO_BOOL_THREAD").is_err()
+        {
+            let n = module.for_each_function(bool_thread::run);
+            if n > 0 {
+                module.for_each_function(cfg_simplify::simplify_cfg);
+                module.for_each_function(dce::eliminate_dead_code);
+            }
+        }
         resolve_asm::resolve_inline_asm_symbols(module);
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
             eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
@@ -1738,6 +1750,35 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "bepre") {
         let n = module.for_each_function(backedge_pre::run);
         if n > 0 { module.for_each_function(dce::eliminate_dead_code); }
+    }
+
+    // Phase 10.9: Bool-phi merge-diamond branch threading.
+    // Value-context short-circuits (`int ok = a && b; if (ok) ...`) and
+    // explicit `if (a) ok = 1; else ok = cmp;` merges keep a phi-only block
+    // whose sole terminator is a branch on the phi. With if-conversion off
+    // (-m16 size profile) that diamond survives every pipeline phase and
+    // phi elimination materializes one arm store per predecessor plus a
+    // reload-and-test in the merge (~18 bytes per site, ~40 sites in the
+    // boot corpus). GCC's jump threader folds it while still SSA; this is
+    // the same transform: each predecessor branches on its own incoming
+    // value, the phi, the stores, the merge test, and (all preds threaded)
+    // the merge block die. IR-level, so every backend benefits; strictly
+    // fewer executed instructions on the threaded paths (no store, no
+    // reload, no extra branch) — a size and speed win at every tier.
+    // Fail-closed soundness rules in the pass header; nothing is ever
+    // duplicated. Kill switches: CCC_NO_BOOL_THREAD=1,
+    // CCC_DISABLE_PASSES=boolthread.
+    if !pass_disabled(&disabled, "boolthread")
+        && std::env::var("CCC_NO_BOOL_THREAD").is_err()
+    {
+        let n = module.for_each_function(bool_thread::run);
+        if n > 0 {
+            // Threaded merges leave unreachable phi-only blocks and dead
+            // arm computations behind; cfg_simplify removes the blocks and
+            // DCE collects the dead def chains (compare feeds, arm values).
+            module.for_each_function(cfg_simplify::simplify_cfg);
+            module.for_each_function(dce::eliminate_dead_code);
+        }
     }
 
     // Phase 11: Dead static function elimination.
