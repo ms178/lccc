@@ -2559,7 +2559,11 @@ impl X86Codegen {
         // explicit vzeroupper prevents any later legacy-SSE transition. Smaller
         // 32/48-byte copies stay XMM (the vzeroupper cost erases their one- or
         // two-instruction saving in hot struct loops).
-        if size == 64 && self.avx2_enabled && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none() {
+        if size == 64
+            && self.avx2_enabled
+            && !self.no_sse
+            && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
+        {
             self.state.emit("    vmovdqu (%rsi), %ymm0");
             self.state.emit("    vmovdqu %ymm0, (%rdi)");
             self.state.emit("    vmovdqu 32(%rsi), %ymm1");
