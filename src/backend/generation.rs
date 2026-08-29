@@ -3953,6 +3953,7 @@ fn generate_function(
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();
             cg.flush_pending_vec_store();
+            cg.flush_x87_pending();
             cg.state().vec_last_store_slot = None;
             cg.state().vec_last_store_val = None;
             cg.state().vec_last_store_reg = false;

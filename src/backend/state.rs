@@ -200,6 +200,28 @@ pub struct CodegenState {
     /// This makes deferred stores sound by construction, independent of the
     /// IR analysis' adjacency precision.
     pub pending_vec_store: Option<(u32, &'static str, bool)>,
+    /// i686 x87 top-of-stack cache (the FP twin of `pending_vec_store`).
+    /// `x87_pending == Some(v)` means: st(0) holds a copy of the F64 value
+    /// `v`, its slot was already written by a non-popping `fstl`, and no
+    /// other x87 instruction has executed since. `emit_float_binop` sets it
+    /// so the next consumer of `v` can dup the register copy (`fld %st(0)`)
+    /// or consume it in place (non-popping `fsub %st(1), %st` forms)
+    /// instead of reloading from the slot. Flushed (`fstp %st(0)`) by the
+    /// central hook in `emit`/`emit_fmt` before any other x87-mutating or
+    /// label line, at block labels, calls, inline asm, and returns — so the
+    /// x87 stack depth stays bounded by construction and the slot copy is
+    /// always correct for ordinary memory readers.
+    pub x87_pending: Option<u32>,
+    /// F64 binop results whose single use is the operand of the
+    /// immediately-following F64 binop (`compute_x87_defer_values`). Only
+    /// these may leave their result on the x87 stack with a non-popping
+    /// `fstl`, because the adjacency guarantee means no other instruction
+    /// can observe or clobber the window between store and consumption.
+    pub x87_defer_values: FxHashSet<u32>,
+    /// Suppresses the central x87-pending flush while `emit_float_binop`
+    /// emits its own controlled x87 sequences (dup / in-place arith / fstl).
+    /// Never set across an early-return boundary without being reset.
+    pub x87_suppress: bool,
     /// Scalar FP value already resident in the SysV return register xmm0.
     /// Set only by exact direct-result intrinsics immediately before Return.
     pub direct_fp_result: Option<u32>,
@@ -469,6 +491,9 @@ impl CodegenState {
             sse_last_store_reg_name: None,
             vector_defer_values: FxHashSet::default(),
             pending_vec_store: None,
+            x87_pending: None,
+            x87_defer_values: FxHashSet::default(),
+            x87_suppress: false,
             direct_fp_result: None,
             vec_live_regs: FxHashMap::default(),
             dirty_upper_ymm: false,
@@ -559,7 +584,26 @@ impl CodegenState {
         format!(".L{}_{}", prefix, id)
     }
 
+    /// Central x87-pending flush gate. Any emitted line that could mutate
+    /// the x87 stack (all x87 mnemonics start with `f`) or that begins a
+    /// merge point (label lines end with `:`) invalidates the cached
+    /// top-of-stack copy first by popping it. The slot copy written by the
+    /// non-popping `fstl` remains correct for memory readers, so this only
+    /// ever costs one `fstp %st(0)`. Inert on every backend that never sets
+    /// `x87_pending` (x86-64/ARM/RISC-V) and while `x87_suppress` is set
+    /// (the binop's own controlled sequences).
+    fn x87_pre_emit(&mut self, s: &str) {
+        if self.x87_pending.is_some() && !self.x87_suppress {
+            let is_x87_line = s.len() >= 5 && s.starts_with("    f");
+            if is_x87_line || s.ends_with(':') {
+                self.x87_pending = None;
+                self.out.emit("    fstp %st(0)");
+            }
+        }
+    }
+
     pub fn emit(&mut self, s: &str) {
+        self.x87_pre_emit(s);
         self.out.emit(s);
     }
 
@@ -614,7 +658,15 @@ impl CodegenState {
     /// Emit formatted assembly directly (no temporary String allocation).
     #[inline]
     pub fn emit_fmt(&mut self, args: std::fmt::Arguments<'_>) {
-        self.out.emit_fmt(args);
+        // Only pay for string formatting when a pending x87 copy is live
+        // (the flush gate needs the fully-formatted line to classify it).
+        if self.x87_pending.is_some() && !self.x87_suppress {
+            let s = std::fmt::format(args);
+            self.x87_pre_emit(&s);
+            self.out.emit(&s);
+        } else {
+            self.out.emit_fmt(args);
+        }
     }
 
     /// Emit a visibility directive (.hidden, .protected, .internal) if the symbol
@@ -687,6 +739,9 @@ impl CodegenState {
         self.protected_slot_values.clear();
         self.vector_defer_values.clear();
         self.pending_vec_store = None;
+        self.x87_pending = None;
+        self.x87_defer_values.clear();
+        self.x87_suppress = false;
         self.direct_fp_result = None;
         self.vec_live_regs.clear();
         self.dirty_upper_ymm = false;

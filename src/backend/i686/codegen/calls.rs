@@ -257,6 +257,8 @@ impl I686Codegen {
         indirect: bool,
         _stack_arg_space: usize,
     ) {
+        // x87 registers are caller-saved: drop any cached st(0) copy first.
+        self.flush_x87_pending_copy();
         if let Some(name) = direct_name {
             if self.state.needs_plt(name) {
                 emit!(self.state, "    call {}@PLT", name);

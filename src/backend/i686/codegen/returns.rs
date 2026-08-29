@@ -8,6 +8,9 @@ use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
+        // The callee's FP stack must be empty at `ret`; drop any cached
+        // st(0) copy before the return sequence is emitted.
+        self.flush_x87_pending_copy();
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
             if ret_ty == IrType::I64 || ret_ty == IrType::U64 {

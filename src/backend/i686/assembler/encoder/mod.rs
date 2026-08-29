@@ -1176,6 +1176,11 @@ impl InstructionEncoder {
             "fmul" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xC8),
             "fsub" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xE0),
             "fdiv" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF0),
+            // Reversed non-popping forms (D8 /5, D8 /7): st(0) = st(i) op st(0).
+            // Required by the x87 top-of-stack binop consumer when the cached
+            // value plays the lhs role (st(1) op st(0) computed in st(0)).
+            "fsubr" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xE8),
+            "fdivr" => self.encode_x87_arith_reg(ops, 0xD8, 0xDC, 0xF8),
 
             // x87 additional
             "fxtract" => {

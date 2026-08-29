@@ -165,6 +165,121 @@ pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
 }
 
 impl I686Codegen {
+
+    /// Pop the cached x87 top-of-stack copy, if one is live. The slot copy
+    /// was already written by the non-popping `fstl`, so this is purely an
+    /// FP-stack hygiene step (bounded depth); the popped value is dead.
+    pub(super) fn flush_x87_pending_copy(&mut self) {
+        if self.state.x87_pending.take().is_some() {
+            self.state.out.emit("    fstp %st(0)");
+        }
+    }
+
+    /// F64 binop with x87 top-of-stack tracking (the FP twin of the vector
+    /// deferred-store mechanism).
+    ///
+    /// Stack-depth invariant: exactly one register is occupied while
+    /// `x87_pending` is `Some(v)` (a copy of `v`; its slot is already
+    /// correct via `fstl`), none while it is `None`. Every path below
+    /// restores the invariant before returning, and the central
+    /// `x87_pre_emit` hook flushes the copy before any foreign x87 line or
+    /// label, so no sequence of foreign emissions can unbalance the stack.
+    ///
+    /// Operand cases (P = pending copy; non-commutative mappings follow the
+    /// classic popping-form operand roles, where the lhs sits in the higher
+    /// slot and the mnemonic carries the reversed-direction suffix):
+    ///   [P] + dup(P)                -> `fld %st(0)` then `f{add,mul}p %st, %st(1)`
+    ///   [P] as lhs + push(R): st0=R,st1=P -> `f{add,subr,mul,divr} %st(1), %st`
+    ///                                   computes st0 = st1 op st0 = P op R,
+    ///                                   then `fstp %st(1)` frees the dead
+    ///                                   original (the new top holds the
+    ///                                   result afterwards).
+    ///   [P] as rhs + push(L): st0=L,st1=P -> `f{add,sub,mul,div} %st(1), %st`
+    ///                                   computes st0 = st0 op st1 = L op P,
+    ///                                   then `fstp %st(1)` as above.
+    ///   no P: push(L) + push(R)     -> `f{add,subr,mul,divr}p %st, %st(1)`
+    ///                                   (unchanged classic path)
+    ///
+    /// The result stays on the stack (non-popping `fstl`) exactly when the
+    /// precomputed `x87_defer_values` analysis guarantees the next F64 binop
+    /// is its single consumer; otherwise it is stored with `fstpl` as before.
+    fn emit_f64_binop_tracked(
+        &mut self,
+        dest: &Value,
+        op: crate::backend::cast::FloatOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        let mnemonic = self.emit_float_binop_mnemonic(op);
+        // Forward-direction (non-reversed) mnemonics, for the case where the
+        // pending value plays the rhs role: with L on top (st0) and the
+        // pending P below (st1), `f{op} %st(1), %st` computes st0 op st1,
+        // which is exactly L op P.
+        let plain_mnemonic = match op {
+            crate::backend::cast::FloatOp::Add => "add",
+            crate::backend::cast::FloatOp::Sub => "sub",
+            crate::backend::cast::FloatOp::Mul => "mul",
+            crate::backend::cast::FloatOp::Div => "div",
+        };
+
+        let lhs_matches = matches!(lhs, Operand::Value(v)
+            if self.state.x87_pending == Some(v.0));
+        let rhs_matches = matches!(rhs, Operand::Value(v)
+            if self.state.x87_pending == Some(v.0));
+
+        // Every controlled emission in this arm is suppressed: the central
+        // hook must not fire on our own x87 lines while we manage the cache.
+        self.state.x87_suppress = true;
+
+        if !lhs_matches && !rhs_matches {
+            // Pending copy not consumed here: pop it before building the
+            // fresh operand pair so the depth invariant holds on every path.
+            self.flush_x87_pending_copy();
+            self.emit_f64_load_to_x87(lhs);
+            self.emit_f64_load_to_x87(rhs);
+            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
+        } else if lhs_matches && rhs_matches {
+            // Square of the pending value: duplicate and fold with the
+            // popping form. Consumes both the duplicate and the original.
+            // (Only reachable for Add/Mul: both operands of a Sub/Div can
+            // only be the same pending value if the IR reuses it twice,
+            // which the single-use deferral excludes.)
+            self.state.out.emit("    fld %st(0)");
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
+        } else if lhs_matches {
+            // Pending value is the lhs: push the rhs on top, compute
+            // st0 = st1 op st0 with the same reversed-direction mnemonic the
+            // classic path uses when the lhs sits in the higher slot, then
+            // free the consumed original.
+            self.emit_f64_load_to_x87(rhs);
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{} %st(1), %st", mnemonic);
+            self.state.out.emit("    fstp %st(1)");
+        } else {
+            // Pending value is the rhs: push the lhs on top, compute
+            // st0 = st0 op st1 with the forward-direction mnemonic.
+            self.emit_f64_load_to_x87(lhs);
+            self.state.x87_pending = None;
+            emit!(self.state, "    f{} %st(1), %st", plain_mnemonic);
+            self.state.out.emit("    fstp %st(1)");
+        }
+
+        // Result is now in st(0). Defer the pop exactly when the analysis
+        // proved this value's next (and only) use is the adjacent binop;
+        // otherwise pop-and-store as the classic path does.
+        let defer = self.state.x87_defer_values.contains(&dest.0);
+        if defer && self.state.get_slot(dest.0).is_some() {
+            let sr = self.slot_ref(self.state.get_slot(dest.0).unwrap());
+            emit!(self.state, "    fstl {}", sr);
+            self.state.x87_pending = Some(dest.0);
+        } else {
+            self.emit_f64_store_from_x87(dest);
+            self.state.x87_pending = None;
+        }
+        self.state.x87_suppress = false;
+        self.state.reg_cache.invalidate_acc();
+    }
     pub fn new() -> Self {
         Self {
             state: CodegenState::new(),
@@ -1498,6 +1613,10 @@ impl ArchCodegen for I686Codegen {
         self.reg_assignments.contains_key(&vid)
     }
 
+    fn flush_x87_pending(&mut self) {
+        self.flush_x87_pending_copy();
+    }
+
     fn state(&mut self) -> &mut CodegenState {
         &mut self.state
     }
@@ -2254,12 +2373,7 @@ impl ArchCodegen for I686Codegen {
         ty: IrType,
     ) {
         if ty == IrType::F64 {
-            let mnemonic = self.emit_float_binop_mnemonic(op);
-            self.emit_f64_load_to_x87(lhs);
-            self.emit_f64_load_to_x87(rhs);
-            emit!(self.state, "    f{}p %st, %st(1)", mnemonic);
-            self.emit_f64_store_from_x87(dest);
-            self.state.reg_cache.invalidate_acc();
+            self.emit_f64_binop_tracked(dest, op, lhs, rhs);
             return;
         }
         if ty == IrType::F128 {
@@ -2475,6 +2589,9 @@ impl ArchCodegen for I686Codegen {
         goto_labels: &[(String, BlockId)],
         input_symbols: &[Option<String>],
     ) {
+        // Inline assembly may clobber the full x87 stack; drop the cached
+        // copy before the user's template is emitted.
+        self.flush_x87_pending_copy();
         crate::backend::inline_asm::emit_inline_asm_common(
             self,
             template,

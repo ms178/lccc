@@ -2470,6 +2470,13 @@ pub trait ArchCodegen {
     /// the slot must be written before another block can read it. No-op on
     /// backends without the deferred-store mechanism.
     fn flush_pending_vec_store(&mut self) {}
+
+    /// Called at block boundaries next to `flush_pending_vec_store`: pop any
+    /// i686 x87 top-of-stack copy cached by `emit_float_binop` (`x87_pending`)
+    /// so the next block starts with a clean FP stack. The slot copy is
+    /// already correct (non-popping `fstl`), so this is always safe. No-op on
+    /// backends without the x87 cache.
+    fn flush_x87_pending(&mut self) {}
 }
 
 // ── Shared jump table helpers ─────────────────────────────────────────────────

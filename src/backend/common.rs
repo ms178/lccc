@@ -1332,7 +1332,7 @@ impl AsmOutput {
 #[macro_export]
 macro_rules! emit {
     ($state:expr, $($arg:tt)*) => {
-        $state.out.emit_fmt(format_args!($($arg)*))
+        $state.emit_fmt(format_args!($($arg)*))
     };
 }
 
