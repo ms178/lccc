@@ -3603,6 +3603,9 @@ fn generate_function(
             matches!(inst, Instruction::Intrinsic { op, .. }
             if matches!(op,
                 crate::ir::intrinsics::IntrinsicOp::FmaF64x4
+                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4Hoisted
+                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4SIB
+                | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
                 | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4

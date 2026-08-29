@@ -1855,6 +1855,7 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::FmaF64x4
             | O::FmaF64x4Hoisted
             | O::FmaF64x4SIB
+            | O::FmaF64x4HoistedSIB
             | O::BroadcastLoadF64
             | O::LoadF64x2
             | O::LoadF64x4

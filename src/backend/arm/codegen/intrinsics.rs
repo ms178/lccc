@@ -529,6 +529,7 @@ impl ArmCodegen {
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
+            | IntrinsicOp::FmaF64x4HoistedSIB
             | IntrinsicOp::LoadF64x4
             | IntrinsicOp::LoadF64x2
             | IntrinsicOp::LoadI32x8

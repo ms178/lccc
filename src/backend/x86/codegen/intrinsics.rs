@@ -2597,6 +2597,146 @@ impl X86Codegen {
 
                 self.state.reg_cache.invalidate_all();
             }
+            IntrinsicOp::FmaF64x4HoistedSIB => {
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                // Optimal quad-FMA: SIB + hoisted broadcast.
+                // args[0] = C base pointer (row base, loop-invariant)
+                // args[1] = B base pointer (row base, loop-invariant)
+                // args[2] = byte offset (j*8, shared across 4 chunks)
+                // args[3] = optional displacement (0,32,64,96) as const
+                //           If present, emits disp(%base,%off) without extra leaq.
+                //           If absent, falls back to 3-arg form where offset
+                //           may itself be Add(base, disp) — we fold that too.
+                //
+                // Result per iteration (godlike):
+                //   movslq %r12d, %r10
+                //   vmovupd (%rbx,%r10), %ymm0 / vfmadd (%r14,%r10), %ymm1, %ymm0 / vmovupd %ymm0, (%rbx,%r10)
+                //   vmovupd 32(%rbx,%r10), %ymm0 / vfmadd 32(%r14,%r10), %ymm1, %ymm0 / ...
+                //   vmovupd 64(%rbx,%r10), %ymm0 / ...
+                //   vmovupd 96(%rbx,%r10), %ymm0 / ...
+                // Total: 1 movslq + 12 FMA + loop control = ~15 insns vs GCC 25 total func.
+
+                // Extract displacement from 4th arg if present
+                let mut disp: i64 = 0;
+                if args.len() >= 4 {
+                    if let Operand::Const(c) = &args[3] {
+                        if let Some(d) = c.to_i64() {
+                            disp = d;
+                        }
+                    }
+                } else {
+                    // Backward compat: try to fold offset = base + const
+                    if let Operand::Value(v) = &args[2] {
+                        if let Some(inst) = self.get_defining_instruction(v.0) {
+                            if let crate::ir::reexports::Instruction::BinOp {
+                                op: crate::ir::reexports::IrBinOp::Add,
+                                lhs,
+                                rhs,
+                                ..
+                            } = inst
+                            {
+                                let try_extract =
+                                    |a: &Operand, b: &Operand| -> Option<(Operand, i64)> {
+                                        match (a, b) {
+                                            (Operand::Value(_), Operand::Const(c)) => {
+                                                c.to_i64().map(|d| (a.clone(), d))
+                                            }
+                                            (Operand::Const(c), Operand::Value(_)) => {
+                                                c.to_i64().map(|d| (b.clone(), d))
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                if let Some((_, d)) = try_extract(lhs, rhs) {
+                                    disp = d;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If we folded from Add, we need base offset Value, not the Add result.
+                // For 4-arg form, base is args[2]; for 3-arg folded form, base is lhs of Add.
+                let off_operand: Operand = if args.len() >= 4 {
+                    args[2].clone()
+                } else if disp != 0 {
+                    // Extract base from Add
+                    if let Operand::Value(v) = &args[2] {
+                        if let Some(crate::ir::reexports::Instruction::BinOp {
+                            lhs, rhs, ..
+                        }) = self.get_defining_instruction(v.0)
+                        {
+                            if matches!(lhs, Operand::Value(_))
+                                && matches!(rhs, Operand::Const(_))
+                            {
+                                lhs.clone()
+                            } else if matches!(rhs, Operand::Value(_))
+                                && matches!(lhs, Operand::Const(_))
+                            {
+                                rhs.clone()
+                            } else {
+                                args[2].clone()
+                            }
+                        } else {
+                            args[2].clone()
+                        }
+                    } else {
+                        args[2].clone()
+                    }
+                } else {
+                    args[2].clone()
+                };
+
+                let c_name = if let Some(r) = self.operand_reg(&args[0]) {
+                    super::emit::phys_reg_name(r)
+                } else {
+                    self.operand_to_reg(&args[0], "rax");
+                    "rax"
+                };
+                let b_name = if let Some(r) = self.operand_reg(&args[1]) {
+                    super::emit::phys_reg_name(r)
+                } else {
+                    self.operand_to_reg(&args[1], "rdx");
+                    "rdx"
+                };
+                let off_name = if let Some(r) = self.operand_reg(&off_operand) {
+                    super::emit::phys_reg_name(r)
+                } else {
+                    self.operand_to_reg(&off_operand, "rsi");
+                    "rsi"
+                };
+
+                if disp == 0 {
+                    self.state.emit_fmt(format_args!(
+                        "    vmovupd (%{},%{}), %ymm0",
+                        c_name, off_name
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vfmadd231pd (%{},%{}), %ymm1, %ymm0",
+                        b_name, off_name
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vmovupd %ymm0, (%{},%{})",
+                        c_name, off_name
+                    ));
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    vmovupd {}(%{},%{}), %ymm0",
+                        disp, c_name, off_name
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vfmadd231pd {}(%{},%{}), %ymm1, %ymm0",
+                        disp, b_name, off_name
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vmovupd %ymm0, {}(%{},%{})",
+                        disp, c_name, off_name
+                    ));
+                }
+
+                self.state.reg_cache.invalidate_all();
+            }
 
             // --- Vector loads for reduction patterns ---
             IntrinsicOp::LoadF64x4 => {
