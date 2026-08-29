@@ -20,7 +20,7 @@ use crate::backend::liveness::{
 use crate::backend::regalloc::{detect_phi_coalesce_groups, PhysReg};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator};
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 
 fn cfg_copy_coalesce_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -2025,6 +2025,98 @@ fn is_user_store_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
         op,
         O::Storedqu | O::Storeu256 | O::Store256 | O::Storeldi128 | O::Movntdq | O::Movntpd
     )
+}
+
+/// i686 x87 top-of-stack deferral (`state.x87_defer_values`): an F64 binop
+/// result whose ONLY use is as an operand of the immediately-following F64
+/// binop, in the same block. The emitter may then store the result with a
+/// non-popping `fstl` and let the consumer take it from st(0) (`fld %st(0)`
+/// dup or an in-place non-popping arith form) instead of reloading the slot.
+/// Sound because adjacency + single-use means no other instruction can run
+/// between the store and the consumption: nothing can clobber the slot or
+/// push/pop x87 within the window (any such instruction would be a second
+/// use or would break adjacency). The emitter still flushes defensively at
+/// every boundary, so a stale entry only ever costs a redundant store.
+pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+
+    // Total use count per value, across all instructions and terminators.
+    let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *uses.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                *uses.entry(v.0).or_insert(0) += 1;
+            }
+        });
+    }
+
+    // Adjacency window: BinOp(F64) immediately followed by BinOp(F64) that
+    // consumes the first result as one operand. classify_float_binop maps
+    // Add/Sub/Mul/SDiv/UDiv to float ops; any other op on F64 would have
+    // panicked in emit_binop, so the whitelist mirrors it exactly.
+    for block in &func.blocks {
+        let insts = &block.instructions;
+        for w in insts.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            let dest = match a {
+                Instruction::BinOp {
+                    dest, op, ty: IrType::F64, ..
+                } => {
+                    if !matches!(
+                        op,
+                        IrBinOp::Add
+                            | IrBinOp::Sub
+                            | IrBinOp::Mul
+                            | IrBinOp::SDiv
+                            | IrBinOp::UDiv
+                    ) {
+                        continue;
+                    }
+                    dest.0
+                }
+                _ => continue,
+            };
+            let consumed = match b {
+                Instruction::BinOp {
+                    op: b_op,
+                    lhs,
+                    rhs,
+                    ty: IrType::F64,
+                    ..
+                } => {
+                    if !matches!(
+                        b_op,
+                        IrBinOp::Add
+                            | IrBinOp::Sub
+                            | IrBinOp::Mul
+                            | IrBinOp::SDiv
+                            | IrBinOp::UDiv
+                    ) {
+                        continue;
+                    }
+                    match (lhs, rhs) {
+                        (Operand::Value(l), Operand::Value(r)) => l.0 == dest || r.0 == dest,
+                        (Operand::Value(l), _) => l.0 == dest,
+                        (_, Operand::Value(r)) => r.0 == dest,
+                        (_, _) => false,
+                    }
+                }
+                _ => continue,
+            };
+            if consumed && uses.get(&dest).copied().unwrap_or(0) == 1 {
+                result.insert(dest);
+            }
+        }
+    }
+
+    result
 }
 
 /// Defer a vector home-slot store when every def is consumed once from the

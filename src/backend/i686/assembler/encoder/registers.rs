@@ -96,7 +96,8 @@ pub(crate) fn mnemonic_size_suffix(mnemonic: &str) -> Option<u8> {
         | "fprem" | "fprem1" | "fyl2x" | "fyl2xp1" | "fptan" | "fsin"
         | "fcos" | "fsincos" | "fxtract" | "ftst" | "fxam" | "fnclex"
         | "fclex" | "fxch" | "fnop" | "fincstp" | "fdecstp" | "ffree"
-        | "fadd" | "fmul" | "fsub" | "fdiv" | "fcom" | "fcomp" | "fcompp"
+        | "fadd" | "fmul" | "fsub" | "fdiv" | "fsubr" | "fdivr" | "fcom" | "fcomp"
+        | "fcompp"
         | "fcomip" | "fucom" | "fucomp" | "fucomi" | "fucomip" | "fucompp"
         | "fnstenv" | "fstenv" | "fldenv" | "fnsave" | "fsave" | "frstor"
         | "fnstsw" | "fstsw" => return None,

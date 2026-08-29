@@ -226,13 +226,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     assembler_version = tool_version([str(args.assembler), "--version"])
-    if "GNU assembler" not in assembler_version:
-        raise SystemExit(f"error: --assembler must be GNU as, got: {assembler_version}")
     if "2.47" not in assembler_version:
-        # The reference environment pins GNU as 2.47; older assemblers still
-        # encode everything lccc emits (validated against the full
-        # gcc.c-torture/execute corpus with gas 2.44), so this is advisory.
-        print(f"warning: --assembler validated against GNU as 2.47, got: {assembler_version}")
+        raise SystemExit(f"error: --assembler must be GNU as 2.47, got: {assembler_version}")
 
     tools = Toolchain(
         corpus_root=args.corpus.resolve(),

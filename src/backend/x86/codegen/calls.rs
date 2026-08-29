@@ -6,6 +6,20 @@ use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
+/// How a resolved global call target must be emitted.
+enum ResolvedIndirectCall {
+    /// func_ptr was `Load(ptr)` with ptr = GlobalAddr(sym)+off: the loaded
+    /// VALUE is the target, so fold load+call into the patchable
+    /// memory-indirect form `call *sym+off(%rip)` (ff 15).
+    MemorySlot(String, i64),
+    /// func_ptr's VALUE itself resolves to sym+off (a GlobalAddr chain with
+    /// no intervening Load): the value IS the target, so it must be a
+    /// DIRECT `call sym+off`. Emitting `call *sym(%rip)` here would read
+    /// sym's first 8 code/data bytes as the target (pic_extern_addr
+    /// SIGSEGV: `call *add7(%rip)` jumped into `movq %rdi+7, %rax`).
+    Direct(String, i64),
+}
+
 impl X86Codegen {
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
         CallAbiConfig {
@@ -128,7 +142,7 @@ impl X86Codegen {
     /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
     /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
     /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
-    fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<(String, i64)> {
+    fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<ResolvedIndirectCall> {
         let v = match op {
             Operand::Value(v) => v,
             _ => return None,
@@ -136,8 +150,9 @@ impl X86Codegen {
         let inst = self.get_defining_instruction(v.0)?;
         match inst {
             Instruction::Load { ptr, .. } => {
-                // If the loaded pointer's defining chain is global+off, we can emit direct call.
-                // Guard against GOT/TLS/absolute symbols that need different addressing.
+                // If the loaded pointer's defining chain is global+off, we can fold into
+                // the memory-indirect form. Guard against GOT/TLS/absolute symbols that
+                // need different addressing.
                 let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
                 // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
                 // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
@@ -147,10 +162,11 @@ impl X86Codegen {
                 {
                     return None;
                 }
-                Some((sym, off))
+                Some(ResolvedIndirectCall::MemorySlot(sym, off))
             }
-            // Defensive: func_ptr itself might be the GEP chain (if Load was optimized away
-            // or value is in slot that holds address, not loaded value). Try resolving it.
+            // Defensive: func_ptr itself might be the GlobalAddr/GEP chain (if the
+            // Load was optimized away). The resolved symbol+offset is then the call
+            // target value itself, so only a DIRECT call is semantically correct.
             _ => {
                 let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
                 if self.state.needs_got_for_addr(&sym)
@@ -159,7 +175,7 @@ impl X86Codegen {
                 {
                     return None;
                 }
-                Some((sym, off))
+                Some(ResolvedIndirectCall::Direct(sym, off))
             }
         }
     }
@@ -936,8 +952,12 @@ impl X86Codegen {
             // arch/x86/kernel/paravirt.c:apply_alternatives expects to patch.
             // Without this, we would emit `mov $sym, %r15; call *off(%r15)`
             // (41 ff 57) which is not patchable and breaks boot.
-            if let Some((sym, off)) = self.try_resolve_indirect_call_global(fp) {
+            if let Some(target) = self.try_resolve_indirect_call_global(fp) {
                 // Construct `sym+off` string for GAS. Use `sym` alone when off==0.
+                let (sym, off) = match &target {
+                    ResolvedIndirectCall::MemorySlot(sym, off)
+                    | ResolvedIndirectCall::Direct(sym, off) => (sym.clone(), *off),
+                };
                 let sym_str = if off == 0 {
                     sym.clone()
                 } else if off > 0 {
@@ -945,10 +965,26 @@ impl X86Codegen {
                 } else {
                     format!("{}{}", sym, off) // off negative includes '-'
                 };
-                // Emit `call *sym+off(%rip)` – GAS will produce ff 15 with PC32 reloc.
-                // Use raw emit to avoid any PLT/GOT logic.
-                self.state
-                    .emit_fmt(format_args!("    call *{}({})", sym_str, "%rip"));
+                match target {
+                    // Memory-indirect through the slot: GAS produces ff 15 with a
+                    // PC32 reloc (the paravirt patchable form). Raw emit avoids
+                    // any PLT/GOT logic.
+                    ResolvedIndirectCall::MemorySlot(..) => {
+                        self.state
+                            .emit_fmt(format_args!("    call *{}({})", sym_str, "%rip"));
+                    }
+                    // The resolved value IS the target: direct call, with the same
+                    // PLT handling as a syntactically direct call.
+                    ResolvedIndirectCall::Direct(..) => {
+                        if self.state.needs_plt(&sym) {
+                            let n = sym.split('@').next().unwrap_or(&sym).to_string();
+                            self.state
+                                .emit_fmt(format_args!("    call {}@PLT", n));
+                        } else {
+                            self.state.out.emit_call(&sym_str);
+                        }
+                    }
+                }
             } else {
                 // Indirect function pointers are preloaded into r10 by
                 // emit_call_spill_fptr_impl before stack arguments are pushed.  Do

@@ -345,7 +345,9 @@ impl super::InstructionEncoder {
                                 0xC0 => 0xC0, // fadd
                                 0xC8 => 0xC8, // fmul
                                 0xE0 => 0xE8, // fsub -> fsubr encoding in DC
+                                0xE8 => 0xE0, // fsubr -> fsub encoding in DC
                                 0xF0 => 0xF8, // fdiv -> fdivr encoding in DC
+                                0xF8 => 0xF0, // fdivr -> fdiv encoding in DC
                                 _ => base_modrm,
                             };
                             self.bytes

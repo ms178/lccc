@@ -122,6 +122,7 @@ struct StackLayoutContext {
     /// set. The backend may skip their slot store entirely (accumulator
     /// renaming).
     vector_defer_values: FxHashSet<u32>,
+    x87_defer_values: FxHashSet<u32>,
     /// Values that appear as incoming operands in Phi instructions.
     /// These must NOT be classified as block-local (Tier 3) because phi
     /// elimination places Copies at predecessor block ends. If the source
@@ -354,6 +355,13 @@ pub fn calculate_stack_space_common(
     // vector-intrinsic results that can skip their slot store (their only
     // use is the adjacent intrinsic's args[0]/args[1] load).
     state.vector_defer_values = ctx.vector_defer_values.clone();
+    // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
+    // by the adjacent F64 binop (the x87 twin of the vector deferral above;
+    // backends that never set x87_pending ignore it).
+    state.x87_defer_values = ctx.x87_defer_values.clone();
+    // i686 x87 top-of-stack deferral: F64 binop results consumed exactly once
+    // by the adjacent F64 binop (the x87 twin of the vector deferral above;
+    // backends that never set x87_pending ignore it).
 
     // Phase 2: Classify all instructions into the three tiers.
     let mut non_local_space = initial_offset;
@@ -620,6 +628,7 @@ fn build_layout_context(
         }
     }
     let vector_defer_values = copy_coalescing::compute_vector_defer_values(func);
+    let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
 
     // Propagate copy-alias uses into use_blocks_map so that root values account
     // for their aliases' use sites when deciding block-local vs. multi-block.
@@ -757,6 +766,7 @@ fn build_layout_context(
         coalescable_allocas,
         immediately_consumed,
         vector_defer_values,
+        x87_defer_values,
         phi_incoming_values,
         memcpy_value_sizes,
         large_blocks,
