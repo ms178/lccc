@@ -1548,6 +1548,49 @@ impl X86Codegen {
                         self.state.reg_cache.set_acc(v.0, is_alloca);
                         return;
                     }
+                    // Fallback for coalescing failures: if the value is defined
+                    // by a same-size Cast (U64<->I64, etc) or a Copy, and its
+                    // source HAS a home, materialize the source instead. This
+                    // handles the kernel's print_cfs_group_stats where a U64
+                    // Load is cast to I64 for a Cmp Slt — the cast had no home
+                    // due to RA coalesce miss, but its source does.
+                    // Clone def info to avoid borrow conflicts.
+                    let fallback_src = {
+                        if let Some(def_inst) = self.get_defining_instruction(v.0) {
+                            match def_inst {
+                                crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. } => {
+                                    if from_ty.size() == to_ty.size() {
+                                        Some(src.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                crate::ir::reexports::Instruction::Copy { src, .. } => {
+                                    Some(src.clone())
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(src_op) = fallback_src {
+                        // Check if src has a home
+                        let src_has_home = match &src_op {
+                            crate::ir::reexports::Operand::Value(src_v) => {
+                                self.reg_assignments.contains_key(&src_v.0)
+                                    || self.state.get_slot(src_v.0).is_some()
+                                    || self.state.reg_cache.acc_has(src_v.0, self.state.is_alloca(src_v.0))
+                                    || self.state.reg_cache.sec_has(src_v.0, self.state.is_alloca(src_v.0))
+                            }
+                            crate::ir::reexports::Operand::Const(_) => true,
+                        };
+                        if src_has_home {
+                            self.operand_to_rax(&src_op);
+                            self.state.reg_cache.set_acc(v.0, is_alloca);
+                            return;
+                        }
+                    }
                     // HARD GATE (session 26): a live operand value with no
                     // register home, no stack slot and no accumulator-cache
                     // entry cannot be materialised — this spot used to emit a
@@ -2389,11 +2432,16 @@ impl X86Codegen {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }
         } else {
+            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op)
             let source = self.get_defining_instruction(val.0).and_then(|inst| {
-                if let crate::ir::reexports::Instruction::Copy { src, .. } = inst {
-                    Some(*src)
-                } else {
-                    None
+                match inst {
+                    crate::ir::reexports::Instruction::Copy { src, .. } => Some(src.clone()),
+                    crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. }
+                        if from_ty.size() == to_ty.size() =>
+                    {
+                        Some(src.clone())
+                    }
+                    _ => None,
                 }
             });
             match source {
