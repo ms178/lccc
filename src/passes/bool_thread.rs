@@ -178,6 +178,12 @@ fn thread_round(func: &mut IrFunction) -> usize {
         }
     }
 
+    // Immediate-dominator tree for the value-RHS admissibility check
+    // (G6). Computed lazily on the first value-RHS candidate — the CFG is
+    // stable during candidate classification (rewrites happen only on the
+    // return path, after which this round is over).
+    let mut idom: Vec<usize> = Vec::new();
+
     for (mi, _) in func.blocks.iter().enumerate() {
         if preds[mi].len() < 2 {
             continue; // single-pred phis are cfg_simplify's trivial-phi case
@@ -241,10 +247,16 @@ fn thread_round(func: &mut IrFunction) -> usize {
             }
             if dests.contains(&cond_val) {
                 // Bool shape: the branch tests a phi directly. A tolerated
-                // merge-local Cmp must then be provably dead: its dest has
-                // no legitimate use anywhere (the merge terminator tests the
-                // phi, not the compare), and the merge dies on a full
-                // thread — an unchecked external use would dangle.
+                // merge-local Cmp's dest must be provably dead — a use
+                // ANYWHERE outside the defining Cmp vetoes threading, even
+                // partial threading: a threaded predecessor branches
+                // directly to Bt/Bf, BYPASSING the merge where the Cmp is
+                // defined, so every downstream use (including Bt/Bf phi
+                // arms, whose per-predecessor substitution would append a
+                // non-dominating (q, pred) arm) reads an undefined value
+                // on shortcut paths. (The tempting "partial threading
+                // keeps the merge alive" refinement is unsound for exactly
+                // this dominance reason.)
                 if let Some((cdest, _, _, _, _)) = non_phi {
                     if cmp_dest_used_elsewhere(func, mi, *cdest) {
                         continue;
@@ -258,14 +270,39 @@ fn thread_round(func: &mut IrFunction) -> usize {
                 }
                 // ... whose LHS must be a merge phi and whose RHS an integer
                 // constant (a constant dominates every predecessor, so the
-                // re-materialized compare is always well-formed).
+                // re-materialized compare is always well-formed) — or, as
+                // the value-RHS extension (G6), an SSA value whose
+                // definition dominates EVERY predecessor's end and survives
+                // the merge's death (a merge-local def — e.g. another merge
+                // phi, which passes the dominance test for loop-header
+                // merges — would dangle once the full thread kills the
+                // merge, so merge-local defs are rejected outright).
                 let p = match lhs {
                     Operand::Value(v) if dests.contains(v) => *v,
                     _ => continue,
                 };
-                let rhs_const = match rhs {
-                    Operand::Const(c) => c.clone(),
-                    _ => continue,
+                let rhs_op = match rhs {
+                    Operand::Const(c) => Operand::Const(c.clone()),
+                    Operand::Value(rv) => {
+                        if idom.is_empty() {
+                            let (p_adj, s_adj) = crate::ir::analysis::build_cfg(func, &idx_of);
+                            idom = crate::ir::analysis::compute_dominators(
+                                func.blocks.len(),
+                                &p_adj,
+                                &s_adj,
+                            );
+                        }
+                        let def_block = def_block_of(func, *rv);
+                        let admissible = match def_block {
+                            Some(db) if db != mi => (0..preds[mi].len())
+                                .all(|pos| dominates(db, preds[mi][pos], &idom, func.blocks.len())),
+                            _ => false,
+                        };
+                        if !admissible {
+                            continue;
+                        }
+                        Operand::Value(*rv)
+                    }
                 };
                 let p_pos = match dests.iter().position(|d| *d == p) {
                     Some(x) => x,
@@ -291,7 +328,7 @@ fn thread_round(func: &mut IrFunction) -> usize {
                 if cmp_dest_used_elsewhere(func, mi, *cdest) {
                     continue;
                 }
-                int_cmp = Some((*op, Operand::Const(rhs_const), *ty, p_pos));
+                int_cmp = Some((*op, rhs_op, *ty, p_pos));
                 phi_dests = dests;
             } else {
                 continue;
@@ -467,13 +504,24 @@ fn thread_round(func: &mut IrFunction) -> usize {
                         }
                         _ => {
                             // Re-materialize the compare on this
-                            // predecessor's own incoming value.
+                            // predecessor's own incoming value. A constant
+                            // arm against the value-RHS extension is
+                            // normalized to the canonical (value LHS, const
+                            // RHS) form via the swap mirror, so backends see
+                            // exactly the operand shapes the original merge
+                            // compare could produce.
                             let fresh = fresh_value(func);
+                            let (op_e, lhs_e, rhs_e) = match (&arm, rhs) {
+                                (Operand::Const(_), Operand::Value(_)) => {
+                                    (mirror_cmp_op(*op), rhs.clone(), arm.clone())
+                                }
+                                _ => (*op, arm.clone(), rhs.clone()),
+                            };
                             func.blocks[pi].instructions.push(Instruction::Cmp {
                                 dest: fresh,
-                                op: *op,
-                                lhs: arm,
-                                rhs: rhs.clone(),
+                                op: op_e,
+                                lhs: lhs_e,
+                                rhs: rhs_e,
                                 ty: *ty,
                             });
                             Terminator::CondBranch {
@@ -648,6 +696,56 @@ fn cmp_dest_used_elsewhere(func: &IrFunction, mi: usize, cdest: Value) -> bool {
         }
     }
     false
+}
+
+/// Whether block `a` dominates block `b` under the immediate-dominator
+/// tree `idom` (idom[entry] == entry; unreachable blocks stay usize::MAX
+/// and dominate nothing). Bounded by the block count against corrupt trees.
+fn dominates(a: usize, b: usize, idom: &[usize], n: usize) -> bool {
+    let mut cur = b;
+    for _ in 0..n {
+        if cur == a {
+            return true;
+        }
+        match idom.get(cur) {
+            Some(&p) if p != usize::MAX && p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Block index whose instructions define `v` (a ParamRef def counts for
+/// its containing block, the entry by construction). None when the value
+/// has no definition in this function — an undefined operand, which any
+/// conservative consumer must reject.
+fn def_block_of(func: &IrFunction, v: Value) -> Option<usize> {
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for inst in &b.instructions {
+            if inst.dest() == Some(v) {
+                return Some(bi);
+            }
+        }
+    }
+    None
+}
+
+/// Swap-operand mirror of a comparison: `a op b == b mirror(op) a`.
+/// Used to normalize re-materialized compares back to the canonical
+/// (value LHS, const RHS) operand form the original merge compare had.
+fn mirror_cmp_op(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+        IrCmpOp::Slt => IrCmpOp::Sgt,
+        IrCmpOp::Sle => IrCmpOp::Sge,
+        IrCmpOp::Sgt => IrCmpOp::Slt,
+        IrCmpOp::Sge => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Ugt,
+        IrCmpOp::Ule => IrCmpOp::Uge,
+        IrCmpOp::Ugt => IrCmpOp::Ult,
+        IrCmpOp::Uge => IrCmpOp::Ule,
+    }
 }
 
 /// Mint a fresh Value id (defensive against a stale `next_value_id` cache:
@@ -866,8 +964,11 @@ mod tests {
 
     #[test]
     fn bool_shape_with_live_merge_cmp_is_rejected() {
-        // The Agent Z soundness hole: without the dead-check, the merge
-        // dies and b5's use of the Cmp dest dangles.
+        // The soundness hole: without the dead-check on a FULL thread, the
+        // merge dies and b5's use of the Cmp dest dangles. With it, the
+        // candidate (every predecessor threadable) must be rejected
+        // outright — the arms still branch to the merge and the Cmp
+        // survives with every use resolved.
         let mut f = build_bool_merge(true);
         super::run(&mut f);
         let b3 = &f.blocks[3];
@@ -877,13 +978,6 @@ mod tests {
             .any(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == Value(7)));
         let preds_still_branch_to_merge = is_branch_to(&f.blocks[1].terminator, 3)
             && is_branch_to(&f.blocks[2].terminator, 3);
-        // Either the merge was never threaded (arms still branch to it and
-        // the Cmp survives), or the rewrite kept every use resolved. A
-        // threaded merge with a live external Cmp use is the bug.
-        assert!(
-            (has_cmp && preds_still_branch_to_merge) || all_uses_resolved(&f) && false,
-            "live merge-local Cmp dest must not dangle"
-        );
         assert!(has_cmp && preds_still_branch_to_merge,
             "the live-Cmp bool candidate must be rejected outright");
         assert!(all_uses_resolved(&f));
@@ -922,5 +1016,214 @@ mod tests {
         let arms_leave = !is_branch_to(&f.blocks[1].terminator, 3)
             && !is_branch_to(&f.blocks[2].terminator, 3);
         assert!(arms_leave, "int-shape candidate (every pred threadable) must thread");
+    }
+
+    #[test]
+    fn int_shape_value_rhs_dominating_threads() {
+        // G6: the merge-local compare tests the phi against a VALUE whose
+        // definition (an entry-block ParamRef) dominates both predecessors'
+        // ends — admissible. Both predecessors re-materialize the compare
+        // against that value on their own arm; the merge dies.
+        let mut f = build_bool_merge(true);
+        f.blocks[3].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(4),
+            false_label: BlockId(5),
+        };
+        if let Terminator::Return(v) = &mut f.blocks[5].terminator {
+            *v = Some(Operand::Value(Value(8)));
+        }
+        // rhs: constant 5 -> the entry param vc (Value(2)), dominating.
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[3].instructions[1] {
+            *rhs = Operand::Value(Value(2));
+        }
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        let arms_leave =
+            !is_branch_to(&f.blocks[1].terminator, 3) && !is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(
+            arms_leave,
+            "value-RHS candidate with dominating def must thread"
+        );
+        // Both predecessors must carry a re-materialized compare whose RHS
+        // is the dominating value (the swap normalization keeps value LHS).
+        for pi in [1usize, 2] {
+            let has = f.blocks[pi].instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Cmp { lhs: Operand::Value(_), rhs: Operand::Value(rv), .. }
+                        if *rv == Value(2)
+                )
+            });
+            assert!(has, "pred b{pi} must re-materialize Cmp(arm, vc)");
+        }
+    }
+
+    #[test]
+    fn int_shape_const_arm_value_rhs_swaps_operands() {
+        // G6 normalization: a CONSTANT phi arm against a value RHS would
+        // re-materialize as Cmp(const, value); the canonical form is the
+        // mirrored Cmp(value, const) — exactly the operand shape the
+        // original merge compare could produce. The threaded predecessors
+        // must carry the normalized form.
+        let mut f = build_bool_merge(true);
+        f.blocks[3].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(4),
+            false_label: BlockId(5),
+        };
+        if let Terminator::Return(v) = &mut f.blocks[5].terminator {
+            *v = Some(Operand::Value(Value(8)));
+        }
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[3].instructions[1] {
+            *rhs = Operand::Value(Value(2));
+        }
+        // Constant arms: p = 10 on the b1 edge, 20 on the b2 edge.
+        if let Instruction::Copy { src, .. } = &mut f.blocks[1].instructions[0] {
+            *src = Operand::Const(IrConst::I32(10));
+        }
+        if let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[0] {
+            incoming[0].0 = Operand::Const(IrConst::I32(10));
+            incoming[1].0 = Operand::Const(IrConst::I32(20));
+        }
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        let arms_leave =
+            !is_branch_to(&f.blocks[1].terminator, 3) && !is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(arms_leave, "const-arm value-RHS candidate must thread");
+        // Normalized form: Cmp(Gt(v ? : vc-const pair), lhs=Value(2), rhs=Const).
+        for pi in [1usize, 2] {
+            let has = f.blocks[pi].instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::Cmp { op: IrCmpOp::Sgt, lhs: Operand::Value(l), rhs: Operand::Const(_), .. }
+                        if *l == Value(2)
+                )
+            });
+            assert!(
+                has,
+                "pred b{pi} must carry the swap-normalized Cmp(Sgt, vc, const)"
+            );
+        }
+    }
+
+    #[test]
+    fn int_shape_value_rhs_non_dominating_is_rejected() {
+        // G6 soundness: an RHS defined in ONE predecessor does not dominate
+        // the other predecessor's end — the re-materialized compare would
+        // read an undefined value there. The candidate must be rejected.
+        let mut f = build_bool_merge(true);
+        f.blocks[3].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(4),
+            false_label: BlockId(5),
+        };
+        if let Terminator::Return(v) = &mut f.blocks[5].terminator {
+            *v = Some(Operand::Value(Value(8)));
+        }
+        // rhs: a value defined inside b1 (Value(9), fresh id below).
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[3].instructions[1] {
+            *rhs = Operand::Value(Value(9));
+        }
+        f.blocks[1].instructions.push(Instruction::Copy {
+            dest: Value(9),
+            src: Operand::Const(IrConst::I32(7)),
+        });
+        f.next_value_id = f.next_value_id.max(10);
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        let arms_stay =
+            is_branch_to(&f.blocks[1].terminator, 3) && is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(
+            arms_stay,
+            "non-dominating value RHS must reject the candidate"
+        );
+    }
+
+    #[test]
+    fn int_shape_value_rhs_merge_local_is_rejected() {
+        // G6 soundness: an RHS defined IN the merge (here: another merge
+        // phi) passes dominance for loop-header merges but the full thread
+        // KILLS the merge — the re-materialized compares would dangle.
+        // Merge-local defs are rejected outright.
+        let mut f = build_bool_merge(true);
+        f.blocks[3].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(4),
+            false_label: BlockId(5),
+        };
+        if let Terminator::Return(v) = &mut f.blocks[5].terminator {
+            *v = Some(Operand::Value(Value(8)));
+        }
+        // rhs: a second merge phi (Value(10)), defined in the merge block
+        // itself — merge-local by construction.
+        if let Instruction::Cmp { rhs, .. } = &mut f.blocks[3].instructions[1] {
+            *rhs = Operand::Value(Value(10));
+        }
+        f.blocks[3].instructions.insert(
+            1,
+            Instruction::Phi {
+                dest: Value(10),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(1)), BlockId(1)),
+                    (Operand::Const(IrConst::I32(2)), BlockId(2)),
+                ],
+            },
+        );
+        f.next_value_id = f.next_value_id.max(11);
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        let arms_stay =
+            is_branch_to(&f.blocks[1].terminator, 3) && is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(arms_stay, "merge-local value RHS must reject the candidate");
+    }
+
+    #[test]
+    fn bool_shape_live_cmp_partial_thread_is_rejected_too() {
+        // The dominance control for the tempting-but-unsound refinement:
+        // even when only SOME predecessors would thread (b2 ends in a
+        // CondBranch, so it is not threadable), a live merge-local Cmp
+        // STILL vetoes threading. A threaded predecessor branches directly
+        // to Bt/Bf, bypassing the merge where the Cmp is defined — every
+        // downstream use of q (including Bt/Bf phi arms, whose
+        // per-predecessor substitution would append a non-dominating
+        // (q, pred) arm) reads an undefined value on shortcut paths. The
+        // candidate must be rejected outright: NO predecessor threads.
+        let mut f = build_bool_merge(true);
+        // b2: p = b; CondBranch(vc, merge, b5) — a conditional terminator
+        // is not threadable; b5 gains a direct b2 edge that its join phi
+        // must cover (arm 300 below).
+        f.blocks[2].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(2)),
+            true_label: BlockId(3),
+            false_label: BlockId(5),
+        };
+        if let Instruction::Phi { incoming, .. } = &mut f.blocks[5].instructions[0] {
+            if !incoming.iter().any(|(_, l)| *l == BlockId(2)) {
+                incoming.push((Operand::Const(IrConst::I32(300)), BlockId(2)));
+            }
+        }
+        super::run(&mut f);
+        assert!(
+            all_uses_resolved(&f),
+            "a rejected candidate must leave the function intact"
+        );
+        // No predecessor may thread: both arms still branch to the merge.
+        assert!(
+            is_branch_to(&f.blocks[1].terminator, 3),
+            "the live-Cmp candidate must be rejected even when threading would be partial"
+        );
+        assert!(
+            is_branch_to(&f.blocks[2].terminator, 3)
+                || matches!(&f.blocks[2].terminator,
+                    Terminator::CondBranch { true_label, .. } if *true_label == BlockId(3))
+        );
+        // The merge block (with its live Cmp) survives untouched.
+        let has_cmp = f.blocks[3]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == Value(7)));
+        assert!(has_cmp, "the merge-local Cmp must survive the rejection");
     }
 }

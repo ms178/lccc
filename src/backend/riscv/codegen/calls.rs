@@ -22,6 +22,9 @@ impl RiscvCodegen {
             align_struct_pairs: true,
             sret_uses_dedicated_reg: false,
             gcc_regparm_mode: false,
+            // RISC-V psABI caps stack-argument alignment at 2*XLEN (16);
+            // the va_arg / prologue readers cap identically.
+            stack_arg_align_cap: 16,
         }
     }
 

@@ -360,6 +360,25 @@ pub struct CallAbiConfig {
     ///  * small aggregates take ceil(size/4) consecutive registers when they
     ///    fit, otherwise stack + kill (GCC BLKmode rule).
     pub gcc_regparm_mode: bool,
+    /// The maximum alignment honored when placing stack (overflow-area)
+    /// arguments, as a byte count.
+    ///
+    /// * x86-64: `usize::MAX` — GCC >= 4.6 honors the FULL natural alignment
+    ///   of MEMORY-class stack arguments (uncapped; callers realign %rsp for
+    ///   the >16 case, see emit_call_stack_args_impl).
+    /// * AArch64/RISC-V: 16 — the psABIs cap stack-argument alignment at
+    ///   2*XLEN (the va_arg / prologue readers cap identically).
+    /// * i686: 4 — GCC's i386 cdecl NEVER aligns stack arguments beyond the
+    ///   4-byte slot granularity (PARM_BOUNDARY): not `long long` (align 8),
+    ///   not over-aligned aggregates. GCC 14.2 -m32 oracle: a 3-int prefix
+    ///   places an aligned(32)/24-byte struct at arg offset 12, and the
+    ///   callee reads it via %ebp at that same 4-granular offset — the
+    ///   `aligned` attribute only rounds the TYPE SIZE (24 -> 32). lccc's
+    ///   i686 caller packs 4-granular and its va_arg readers walk 4-granular,
+    ///   so the callee layout (and the va_start overflow offset derived from
+    ///   it) must agree — an 8-byte cap here misreads every over-aligned
+    ///   struct arg whose natural offset is 4 (mod 8).
+    pub stack_arg_align_cap: usize,
 }
 
 /// Result of SysV per-eightbyte struct classification.
@@ -1203,36 +1222,43 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 }
             }
             CoreArgClass::I128Stack => {
-                stack_offset = (stack_offset + 15) & !15;
+                // 16-byte stack alignment for __int128 per the LP64 psABIs
+                // (x86-64 SysV, AAPCS64, RISC-V) — but capped by the target's
+                // stack-arg alignment cap: i686 cdecl packs at 4-byte slot
+                // granularity and its caller/va_arg readers never realign, so
+                // __int128 (an lccc extension on i386) must stay 4-granular
+                // there too. All three i686 paths (caller, named-param
+                // layout, va_arg) then agree.
+                let a = 16.min(config.stack_arg_align_cap) as i64;
+                if a > slot_size as i64 {
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
+                }
                 let off = stack_offset;
                 stack_offset += 16;
                 ParamClass::I128Stack { offset: off }
             }
             CoreArgClass::StructByValStack { size } | CoreArgClass::LargeStructStack { size } => {
-                // psABI (RISC-V LP64D / AAPCS64 / SysV): a stack argument
-                // whose natural alignment exceeds XLEN is aligned to
-                // min(align, 2*XLEN) in the argument area — struct { long
-                // double } (align 16) is the canonical case. The va_arg /
-                // prologue readers use the same rule, so caller and callee
-                // agree. (The cap is 2*XLEN: nothing on these targets
-                // aligns stack arguments beyond that.)
+                // A stack argument whose natural alignment exceeds the slot
+                // size is aligned to min(align, stack_arg_align_cap) in the
+                // argument area:
+                //  * AAPCS64 / RISC-V LP64D psABIs cap at 2*XLEN (16) —
+                //    struct { long double } (align 16) is the canonical case;
+                //    the va_arg / prologue readers use the same rule.
+                //  * x86-64 (GCC >= 4.6) honors the FULL natural alignment
+                //    of MEMORY-class stack arguments (uncapped; callers
+                //    realign %rsp for the >16 case).
+                //  * i686 cdecl NEVER aligns beyond the 4-byte slot
+                //    granularity (GCC 14.2 -m32 oracle) — the cap (4) makes
+                //    this a no-op so size rounding is the only effect.
                 let struct_align = func
                     .params
                     .get(i)
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
                 if struct_align > slot_size as usize {
-                    // x86-64: GCC ≥ 4.6 honors the FULL natural alignment of
-                    // MEMORY-class stack arguments (>16 included) — callers
-                    // realign %rsp, so the callee's static layout must carry
-                    // the same uncapped pads. AAPCS64/RISC-V cap stack
-                    // argument alignment at 2*XLEN by psABI (the va_arg /
-                    // prologue readers cap identically).
-                    let a = if config.use_sysv_struct_classification {
-                        struct_align as i64
-                    } else {
-                        (struct_align as i64).min(2 * slot_size as i64)
-                    };
+                    let a = (struct_align as i64)
+                        .min(config.stack_arg_align_cap as i64)
+                        .max(slot_size as i64);
                     stack_offset = (stack_offset + a - 1) & !(a - 1);
                 }
                 let off = stack_offset;

@@ -1527,7 +1527,32 @@ impl I686Codegen {
         if let Operand::Value(v) = arg {
             if self.state.is_alloca(v.0) {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    self.emit_copy_slot_to_stack(slot, stack_offset, size);
+                    // Over-aligned (>16) alloca: the struct's bytes live at
+                    // align_up(slot, align) — the same address every other
+                    // alloca-storage user resolves (memcpy paths, param
+                    // copies). Copying from the raw slot would forward the
+                    // alignment-pad bytes instead of the struct (caller-side
+                    // twin of the prologue's param-copy fix).
+                    if let Some(a) = self.state.alloca_over_align(v.0) {
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    leal {}, %ecx", sr);
+                        emit!(self.state, "    addl ${}, %ecx", a - 1);
+                        emit!(self.state, "    andl ${}, %ecx", -(a as i32));
+                        let mut copied = 0usize;
+                        while copied + 4 <= size {
+                            emit!(self.state, "    movl {}(%ecx), %eax", copied);
+                            emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
+                            copied += 4;
+                        }
+                        while copied < size {
+                            emit!(self.state, "    movb {}(%ecx), %al", copied);
+                            emit!(self.state, "    movb %al, {}(%esp)", stack_offset + copied);
+                            copied += 1;
+                        }
+                        self.state.reg_cache.invalidate_acc();
+                    } else {
+                        self.emit_copy_slot_to_stack(slot, stack_offset, size);
+                    }
                 }
             } else {
                 // Non-alloca: value is a pointer to struct data.
