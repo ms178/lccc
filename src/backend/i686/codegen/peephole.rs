@@ -6000,8 +6000,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         // Pattern 8: identical adjacent block tail-merge.  When block X is
         // `[insns] jmp L`, is immediately followed by block Y holding the
         // SAME insns (text-identical), and Y falls through into L, X's body
-        // becomes `jmp Y` and the duplicated insns plus X's original jump
-        // disappear.  Text-identical insns set identical flags, so any flag
+        // becomes `jmp Y`; X's duplicated insns and X's original jump
+        // disappear, while Y's copy survives and serves both predecessor
+        // sets.  Text-identical insns set identical flags, so any flag
         // consumer at L observes the same state.
         {
             let mut i = fstart;
@@ -6099,7 +6100,15 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     i += 1;
                     continue;
                 }
-                // X -> jmp Y; duplicated body + original jmp reclaimed.
+                // X -> jmp Y; X's duplicated body and X's original jmp are
+                // reclaimed.  Y's body is the SURVIVING copy and MUST stay:
+                // every predecessor of X (and X's own fall-in) now executes
+                // it via the jmp, and Y's other predecessors always did.
+                // Deleting it as well left the merged computation nowhere —
+                // observed as a miscompile where both arms of a bool-merge
+                // diamond stored the same constant and the store vanished
+                // (upstream bool_thread_merges regression, `a && b` value
+                // context: got stale stack garbage instead of the constant).
                 // The jmp overwrites X's first body line (never i+1: the
                 // collector may have skipped nops after the label).
                 let xj = insns[0];
@@ -6113,9 +6122,6 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     infos[x].kind = LineKind::Nop;
                 }
                 infos[k].kind = LineKind::Nop;
-                for &x in &y_insns {
-                    infos[x].kind = LineKind::Nop;
-                }
                 changed = true;
                 i += 1;
             }
@@ -7716,6 +7722,39 @@ fn else_hoist_diamonds(asm: String) -> String {
             i += 1;
             continue;
         }
+        // The else block must have EXACTLY ONE predecessor: the jCC being
+        // rewritten.  The else body sits between `jmp Ljoin` and `Ljoin:`,
+        // so fallthrough entry is impossible, but another branch (the
+        // merge-diamond shape `if (a) ok = 1; else if (b) ...` compiles to
+        // two jCCs targeting the same constant-else block) can jump here
+        // directly.  Hoisting its stores above this jCC silently removes
+        // them from THAT predecessor's path (observed as a miscompile of
+        // the upstream bool_thread_merges regression: the a==0 arm read
+        // stale stack garbage instead of the constant).  Census every
+        // branch target in the function: any reference to the else label
+        // other than lines[i] vetoes the transform.
+        let mut else_refs = 0usize;
+        for (li, l) in lines.iter().enumerate() {
+            if li == i {
+                continue;
+            }
+            let t = l.trim();
+            if t.ends_with(':') || t.is_empty() {
+                continue;
+            }
+            let is_branch = t.starts_with("j")
+                || t.starts_with("call")
+                || t.starts_with("ret");
+            if is_branch
+                && t.split_whitespace().next_back().map(|x| x == else_target).unwrap_or(false)
+            {
+                else_refs += 1;
+            }
+        }
+        if else_refs != 0 {
+            i += 1;
+            continue;
+        }
         // Rewrite:
         //   ... producer          ... producer
         //   jCC Lelse             <else stores>        (hoisted)
@@ -8942,6 +8981,46 @@ mod tests {
         // the dead xors are reclaimed by the dead-move cleanup), so the
         // control flow collapses to `je .LY` falling straight through.
         assert!(!result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"), "{result}");
+    }
+
+    #[test]
+    fn fold_reg_copy_tail_merge_keeps_surviving_body() {
+        // Pattern 8 must keep Y's body: it is the surviving copy.  Both
+        // arms of this diamond store the same constant to a stack slot;
+        // the merged code must still store it on every path (a regression
+        // here miscompiled the bool-merge shape `int ok = a && b;` where
+        // the constant 0/1 the arms staged was silently dropped and the
+        // consumer read stale stack garbage).
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    testl %eax, %eax\n",
+            "    je .LY\n",
+            ".LX:\n",
+            "    movl $22, 8(%esp)\n",
+            "    jmp .LJ\n",
+            ".LY:\n",
+            "    movl $22, 8(%esp)\n",
+            ".LJ:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        let stores = result.matches("movl $22, 8(%esp)").count();
+        assert!(
+            stores == 1,
+            "tail-merge must keep exactly one surviving store (found {}):\n{}",
+            stores,
+            result
+        );
+        // .LY must still be reachable and hold the store: no empty Y.
+        assert!(
+            result.contains(".LY:\n    movl $22, 8(%esp)"),
+            "surviving block body must not be deleted:\n{}",
+            result
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! X86Codegen: integer/float arithmetic, unary ops, binop, copy.
 
-use super::emit::{shift_mnemonic, X86Codegen};
+use super::emit::{phys_reg_name, shift_mnemonic, X86Codegen};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -319,6 +319,171 @@ impl X86Codegen {
 
     // ---- Binop ----
 
+    /// Store %rdx (division remainder) to a value's location. Mirror of
+    /// `store_rax_to` with the source register changed; the accumulator
+    /// case cannot arise for remainders (pair tails are excluded from
+    /// accumulator chains by the shared RA filter), but a dead remainder
+    /// (use count 0) skips the store entirely.
+    pub(super) fn store_rdx_to(&mut self, dest: &Value, use_32bit: bool) {
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        let use_small = use_32bit && self.state.is_small_slot(dest.0);
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            let reg_name = phys_reg_name(reg);
+            if super::emit::is_xmm_reg(reg) {
+                // Integer value parked in an XMM home (bit-punned float word).
+                self.state
+                    .emit_fmt(format_args!("    movq %rdx, %{}", reg_name));
+            } else {
+                // Always movq for register stores (movl would zero-extend and
+                // corrupt negative I32 remainders flowing into 64-bit uses).
+                self.state
+                    .out
+                    .emit_instr_reg_reg("    movq", "rdx", reg_name);
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            if use_small {
+                self.state.out.emit_instr_reg_rbp("    movl", "edx", slot.0);
+            } else {
+                self.state.out.emit_instr_reg_rbp("    movq", "rdx", slot.0);
+            }
+        } else if self.state.is_accumulator_location(dest.0) {
+            // Accumulator location means %rax residency — a remainder can
+            // never claim it directly. Route through %rax: the consumer's
+            // operand_to_rax finds it there.
+            if use_32bit {
+                self.state.emit("    movl %edx, %eax");
+            } else {
+                self.state.emit("    movq %rdx, %rax");
+            }
+            self.state.reg_cache.set_acc(dest.0, false);
+        } else {
+            panic!(
+                "x86 codegen: live remainder value {} has no assigned location",
+                dest.0
+            );
+        }
+    }
+
+    /// Emit one divide serving a same-block div/rem pair and store BOTH
+    /// results. Returns false when the home combination is unstoreable
+    /// (deadlock) — the caller falls back to standalone divisions for both
+    /// sides and the tail is marked broken.
+    fn emit_divrem_pair_head(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+        partner_dest: u32,
+        _partner_from_eax: bool,
+    ) -> bool {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        let use_32bit = ty == IrType::I32 || ty == IrType::U32;
+        if use_32bit {
+            self.operand_to_eax(lhs);
+        } else {
+            self.operand_to_rax(lhs);
+        }
+        self.operand_to_rcx(rhs);
+        if signed {
+            if use_32bit {
+                self.state.emit("    cltd");
+                self.state.emit("    idivl %ecx");
+            } else {
+                self.state.emit("    cqto");
+                self.state.emit("    idivq %rcx");
+            }
+        } else {
+            self.state.emit("    xorl %edx, %edx");
+            if use_32bit {
+                self.state.emit("    divl %ecx");
+            } else {
+                self.state.emit("    divq %rcx");
+            }
+        }
+        self.state.reg_cache.invalidate_acc();
+
+        // Which value takes which output register:
+        //   div-flavoured dest -> %rax, rem-flavoured dest -> %rdx.
+        let div_dest = if self_is_div { *dest } else { Value(partner_dest) };
+        let rem_dest = if self_is_div { Value(partner_dest) } else { *dest };
+
+        let rem_home = self.dest_reg(&rem_dest);
+        let div_home = self.dest_reg(&div_dest);
+        // Immediately-consumed (accumulator-flow) values have neither a home
+        // nor a slot: their consumer reads %rax directly. The pair tail can
+        // never be one (the accumulator analysis excludes tails), so at most
+        // the HEAD's own dest is slotless.
+        let rem_slotless =
+            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
+        let div_slotless =
+            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
+        // store_rdx(rem) writes %rax iff rem is HOMED in %rdx... impossible
+        // here: %rdx (PhysReg 16) is excluded from allocation in any function
+        // containing division (prologue). store_rax(div) writes %rdx iff the
+        // quotient is HOMED in %rdx — same exclusion. Keep the screening
+        // shape for defence against future allocator changes.
+        let rdx_phys = crate::backend::regalloc::PhysReg(16);
+        let rem_in_rdx = rem_home == Some(rdx_phys);
+        let div_in_rdx = div_home == Some(rdx_phys);
+        let _ = rem_in_rdx; // cannot occur; see comment above
+
+        // Deadlock screening (mirrors the i686 fusion; with %rdx excluded
+        // from allocation only the slotless combinations can trigger).
+        if (rem_in_rdx && div_in_rdx)
+            || (rem_slotless && div_in_rdx)
+            || (div_slotless && rem_in_rdx)
+        {
+            self.divrem_broken_tails.insert(partner_dest);
+            return false;
+        }
+        let div_dead = self
+            .state
+            .value_use_counts
+            .get(div_dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0;
+        if rem_slotless {
+            // Remainder must reach %rax for its acc-flow consumer. Store the
+            // quotient first (its store cannot touch %rdx), then move the
+            // remainder into %rax.
+            self.store_rax_to(&div_dest);
+            if use_32bit {
+                self.state.emit("    movl %edx, %eax");
+            } else {
+                self.state.emit("    movq %rdx, %rax");
+            }
+            self.state.reg_cache.set_acc(rem_dest.0, false);
+        } else if div_slotless {
+            // Quotient stays in %rax for its acc-flow consumer; store the
+            // remainder first (its store cannot touch %rax).
+            self.store_rdx_to(&rem_dest, use_32bit);
+            self.state.reg_cache.set_acc(div_dest.0, false);
+        } else {
+            // Canonical order: remainder out of %rdx first (its store cannot
+            // touch %rax — see screening), then the quotient store.
+            self.store_rdx_to(&rem_dest, use_32bit);
+            if !div_dead {
+                self.store_rax_to(&div_dest);
+            } else {
+                self.state.reg_cache.invalidate_acc();
+            }
+        }
+        true
+    }
+
     pub(super) fn emit_int_binop_impl(
         &mut self,
         dest: &Value,
@@ -329,6 +494,52 @@ impl X86Codegen {
     ) {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
         let is_unsigned = ty.is_unsigned();
+
+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+        // X86_64 target). The TAIL of a pair emits nothing — its result was
+        // stored by the HEAD's dual-store emission further up in this block
+        // (one divq/idivq instead of two: the remainder is free with the
+        // quotient on x86). The HEAD emits one divide and stores its own
+        // result AND the partner's.
+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+            if self.divrem_tail_dests.contains(&dest.0)
+                && !self.divrem_broken_tails.contains(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-skip dest={}", dest.0);
+                }
+                // Tail: nothing to emit. The accumulator cache makes no
+                // claim about this dest (it was never staged through %rax),
+                // and its home/slot was written at the head.
+                return;
+            }
+            if self.divrem_broken_tails.contains(&dest.0) {
+                // Pair was broken at head-emission time (pathological home
+                // combination): both sides emit standalone divisions.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] tail-broken dest={} (standalone)", dest.0);
+                }
+            } else if let Some(&(partner_dest, partner_from_eax)) =
+                self.divrem_head_partners.get(&dest.0)
+            {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!(
+                        "[DIVREM] head-emit dest={} op={:?} partner={} partner_from_eax={}",
+                        dest.0, op, partner_dest, partner_from_eax
+                    );
+                }
+                let fused =
+                    self.emit_divrem_pair_head(dest, op, lhs, rhs, ty, partner_dest, partner_from_eax);
+                if fused {
+                    return;
+                }
+                // Broken pair: fall through to the standalone path; the
+                // partner (tail) was marked broken above.
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM] head-broken dest={} (standalone)", dest.0);
+                }
+            }
+        }
 
         // Register-direct path. An XMM-homed dest (integer value the RA
         // parked in an XMM register: bit-punned float words) has no GPR

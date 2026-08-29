@@ -287,6 +287,31 @@ impl ArmCodegen {
     ) {
         let use_32bit = ty == IrType::I32 || ty == IrType::U32;
 
+        // Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
+        // AArch64 target). The TAIL of a pair emits nothing — its result was
+        // stored by the HEAD's sdiv+msub dual-store further up in this block
+        // (exactly GCC's shape: one divide, the remainder folded as
+        // lhs - q*rhs). Dead tails skip the msub entirely — unlike x86's
+        // free dual-output, the msub costs a cycle on AArch64.
+        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+            if self.divrem_tail_dests.contains(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!("[DIVREM-ARM] tail-skip dest={}", dest.0);
+                }
+                return;
+            }
+            if let Some(&partner_dest) = self.divrem_head_partners.get(&dest.0) {
+                if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
+                    eprintln!(
+                        "[DIVREM-ARM] head-emit dest={} op={:?} partner={}",
+                        dest.0, op, partner_dest
+                    );
+                }
+                self.emit_divrem_pair_head_arm(dest, op, lhs, rhs, use_32bit, partner_dest);
+                return;
+            }
+        }
+
         // Strength reduction: UDiv/URem by power-of-2 constant
         if let Some(shift) = Self::const_as_power_of_2(rhs) {
             if op == IrBinOp::UDiv {
@@ -692,6 +717,87 @@ impl ArmCodegen {
         }
 
         self.store_x0_to(dest);
+    }
+
+    /// Store x3 (the fused pair's second result) to a value's location.
+    /// Mirror of `store_x0_to` with the source register changed; no
+    /// accumulator claim (the value sits in x3, not the x0 accumulator).
+    pub(super) fn store_x3_to(&mut self, dest: &Value, use_32bit: bool) {
+        let src = if use_32bit { "w3" } else { "x3" };
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        if let Some(&reg) = self.reg_assignments.get(&dest.0) {
+            if is_arm_fp_phys(reg) {
+                self.state
+                    .emit_fmt(format_args!("    fmov d{}, {}", reg.0 - 24, src));
+            } else {
+                let reg_name = callee_saved_name(reg);
+                self.state
+                    .emit_fmt(format_args!("    mov {}, {}", reg_name, src));
+            }
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            self.emit_store_to_sp(src, slot.0, "str");
+        }
+    }
+
+    /// Emit one divide serving a same-block div/rem pair (GCC's sdiv+msub
+    /// shape) and store BOTH results. The head's own result always lands in
+    /// x0; the partner's result is materialised in x3 via msub (quotient
+    /// heads) or taken directly from x3 (remainder heads).
+    fn emit_divrem_pair_head_arm(
+        &mut self,
+        dest: &Value,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        use_32bit: bool,
+        partner_dest: u32,
+    ) {
+        let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+        let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
+        self.operand_to_x0(lhs);
+        self.state.emit("    mov x1, x0");
+        self.operand_to_x0(rhs);
+        self.state.emit("    mov x2, x0");
+        let div_mnem = if signed { "sdiv" } else { "udiv" };
+        let w = if use_32bit { "w" } else { "x" };
+        let tail = Value(partner_dest);
+        let tail_dead = self
+            .state
+            .value_use_counts
+            .get(partner_dest as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0;
+        if self_is_div {
+            // Quotient head: x0 = q directly; remainder = lhs - q*rhs in x3.
+            self.state
+                .emit_fmt(format_args!("    {} {}0, {}1, {}2", div_mnem, w, w, w));
+            if !tail_dead {
+                self.state
+                    .emit_fmt(format_args!("    msub {}3, {}0, {}2, {}1", w, w, w, w));
+                self.store_x3_to(&tail, use_32bit);
+            }
+            self.store_x0_to(dest);
+        } else {
+            // Remainder head: x3 = q feeds the msub that produces x0 = r.
+            self.state
+                .emit_fmt(format_args!("    {} {}3, {}1, {}2", div_mnem, w, w, w));
+            self.state
+                .emit_fmt(format_args!("    msub {}0, {}3, {}2, {}1", w, w, w, w));
+            if !tail_dead {
+                self.store_x3_to(&tail, use_32bit);
+            }
+            self.store_x0_to(dest);
+        }
     }
 
     pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {

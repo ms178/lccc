@@ -171,6 +171,22 @@ impl ArmCodegen {
         self.loop_promoted_f64_values = func.loop_promoted_f64_values.clone();
         self.conditional_increment_leaf = false;
         self.conditional_increment_leaf_condition_32 = false;
+
+        // Same-block div/rem pair fusion table: one sdiv/udiv serves a
+        // div+rem couple with identical operands (the remainder comes from
+        // msub, exactly GCC's shape). Constant-RHS pairs never fuse
+        // (the strength reducer may claim them; the RA model must stay
+        // exact).
+        let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
+            func,
+            crate::backend::regalloc::DivRemTarget::AArch64,
+        );
+        self.divrem_tail_dests = pairs.tail_dests;
+        self.divrem_head_partners = pairs
+            .head_partners
+            .into_iter()
+            .map(|(k, (partner, _))| (k, partner))
+            .collect();
         let mut asm_clobbered_regs: Vec<PhysReg> = Vec::new();
         Self::prescan_inline_asm_callee_saved(func, &mut asm_clobbered_regs);
         let base_regs: &[PhysReg] = if func.is_variadic {

@@ -310,6 +310,26 @@ impl X86Codegen {
             // real operands: dummy/imm dropped, imm re-appended last).
             return self.emit_simd_scalar(dest, op, args);
         };
+        // Dead-dest skip: a vector intrinsic whose result has no uses is
+        // dead code (every op reachable here is a pure computation or a
+        // load from ordinary memory — volatile accesses never arrive as
+        // vector intrinsics with dead dests). Emitting it would only risk
+        // ICEs on location-less destinations (a dead value has neither a
+        // register home nor a slot; avx_store_dest's fallback path panics
+        // there). A dead value must never ICE codegen.
+        if self
+            .state
+            .value_use_counts
+            .get(dptr.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            if std::env::var_os("CCC_DEBUG_SIMD").is_some() {
+                eprintln!("[SIMD] skipping dead dest {} op {:?}", dptr.0, op);
+            }
+            return true;
+        }
         match op {
             // ---- 512-bit packed integer binary ----
             Paddb512 => {
