@@ -107,6 +107,12 @@ struct DseContext {
     defs: FxHashMap<u32, PtrDef>,
     /// Alloca value ids whose address provably never escapes.
     closed_allocas: FxHashSet<u32>,
+    /// This function IS a non-local-goto target (it holds a
+    /// NonlocalGotoSave area): any callee can transfer control to a label
+    /// alias inside this function, creating a re-entry edge invisible to
+    /// the per-block CFG.  Closed-alloca survival across opaque events is
+    /// unsound in that case.
+    has_nonlocal_targets: bool,
 }
 
 impl DseContext {
@@ -146,9 +152,16 @@ impl DseContext {
             }
         }
         let closed_allocas = compute_closed_allocas(func, &defs);
+        let has_nonlocal_targets = func.blocks.iter().any(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::NonlocalGotoSave { .. }))
+        });
         DseContext {
             defs,
             closed_allocas,
+            has_nonlocal_targets,
         }
     }
 
@@ -334,9 +347,21 @@ fn kill_unknown_offset(pending: &mut Vec<Pending>, root: &CellRoot) {
 }
 
 /// Kill everything an opaque memory event (call, asm, memcpy, atomics...)
-/// could touch. Closed allocas survive: no other pointer, and no callee,
-/// can name them.
+/// could touch.  Closed allocas survive only when this function cannot be
+/// re-entered by a non-local goto (see `has_nonlocal_targets`): no other
+/// pointer, and no callee, can otherwise name them.
 fn kill_opaque(pending: &mut Vec<Pending>, ctx: &DseContext) {
+    if ctx.has_nonlocal_targets {
+        // Non-local-goto re-entry: this frame carries a NonlocalGotoSave
+        // area, so any callee can transfer control to a label alias inside
+        // THIS function.  Execution resumes on an edge invisible to the
+        // per-block CFG, where a load of a "closed" alloca cell can run
+        // BEFORE the in-block overwriter this scan treated as covering the
+        // store.  Closed-alloca survival is unsound here; opaque events
+        // kill everything open.
+        pending.clear();
+        return;
+    }
     pending.retain(|p| matches!(&p.root, CellRoot::Alloca(a) if ctx.closed_allocas.contains(a)));
 }
 
@@ -606,6 +631,113 @@ mod tests {
         });
         let n = eliminate_dead_stores(&mut f);
         assert_eq!(n, 0, "the load observes the first store");
+    }
+
+    #[test]
+    fn nonlocal_goto_target_keeps_cross_call_store() {
+        // This frame IS a non-local-goto target (NonlocalGotoSave): a
+        // callee can jump to a label alias inside this function and resume
+        // on a CFG-invisible edge where x is loaded BEFORE the in-block
+        // overwriting store runs.  The closed-alloca store before the call
+        // must therefore survive DSE, while the plain dead store on the
+        // second cell (no call between the pair) is still eliminated.
+        let mut f = mkfunc();
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::NonlocalGotoSave {
+                    frame: Value(2),
+                    rbp_off: 8,
+                    rsp_off: 16,
+                },
+                store_const(0, 1, 1),
+                Instruction::Call {
+                    func: "sink".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        args: vec![],
+                        arg_types: vec![],
+                        ..crate::ir::reexports::CallInfo::default()
+                    },
+                },
+                store_const(0, 2, 2),
+                store_const(1, 3, 3),
+                store_const(1, 4, 4),
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(9),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let n = eliminate_dead_stores(&mut f);
+        assert_eq!(
+            n, 1,
+            "cell-1 store 3 dies (overwritten, no call between); the \
+             cross-call cell-0 store must survive the goto re-entry hazard"
+        );
+    }
+
+    #[test]
+    fn closed_alloca_store_dies_across_call_without_goto_targets() {
+        // Control for nonlocal_goto_target_keeps_cross_call_store: the
+        // identical shape WITHOUT a NonlocalGotoSave — no re-entry edge
+        // exists, closed-alloca survival across the opaque call is sound,
+        // and the pre-call store is eliminated as usual.
+        let mut f = mkfunc();
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                store_const(0, 1, 1),
+                Instruction::Call {
+                    func: "sink".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        args: vec![],
+                        arg_types: vec![],
+                        ..crate::ir::reexports::CallInfo::default()
+                    },
+                },
+                store_const(0, 2, 2),
+                Instruction::Load {
+                    volatile: false,
+                    dest: Value(9),
+                    ptr: Value(0),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let n = eliminate_dead_stores(&mut f);
+        assert_eq!(n, 1, "x=1 is overwritten by x=2 after the (non-goto) call");
     }
 
     #[test]

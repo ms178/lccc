@@ -94,6 +94,9 @@ impl RiscvCodegen {
 
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
+        // Store function pointer for consumer-side definition lookups
+        // (operand_to_t0's no-home hard gate), mirroring the x86-64 backend.
+        self.current_func = Some(func as *const IrFunction);
         let space = calculate_stack_space_common(
             &mut self.state,
             func,

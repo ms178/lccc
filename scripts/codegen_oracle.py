@@ -51,6 +51,7 @@ import godbolt  # noqa: E402
 DEFAULT_FLAGS = "-O3 -march=x86-64-v3"
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
 DEFAULT_AARCH64_ORACLES = ("carm64g1610", "carm64gtrunk", "cclang2210")
+DEFAULT_RISCV64_ORACLES = ("crv64g1520", "crv64g1610", "crv64gtrunk")
 
 _DIRECTIVE = re.compile(r"^\s*(?:\.|#|//|cfi_)")
 _LABEL = re.compile(r'^\s*"?([.\w$]+)"?:')
@@ -141,6 +142,26 @@ def _stats(lines: Iterable[str], arch: str) -> AsmStats:
                 stats.spills += 1
             if (re.search(r"\b[vsdq][0-9]+(?:\.|\b)", operands)
                     or mnemonic in {"addv", "smaxv", "fmaxv", "sadalp"}):
+                stats.vectors += 1
+            continue
+        if arch == "riscv64":
+            # Plain RISC-V (V/N ext aside): branches are the explicit
+            # b* comparison set plus the jump/call/return family. Loads and
+            # stores are width-mnemonic based ("li" is an immediate, not a
+            # load); spills are any sp-relative memory operand.
+            if mnemonic in {
+                "beq", "bne", "blt", "bge", "bltu", "bgeu",
+                "beqz", "bnez", "blez", "bgez", "bltz", "bgtz",
+                "j", "jal", "jr", "jalr", "call", "tail", "ret",
+            }:
+                stats.branches += 1
+            if mnemonic.startswith(("lb", "lh", "lw", "ld", "fl")):
+                stats.loads += 1
+            if mnemonic.startswith(("sb", "sh", "sw", "sd", "fs")):
+                stats.stores += 1
+            if "(sp)" in operands:
+                stats.spills += 1
+            if mnemonic.startswith("v") and len(mnemonic) > 1:
                 stats.vectors += 1
             continue
 
@@ -346,7 +367,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local-flags")
     parser.add_argument(
         "--arch",
-        choices=("x86", "aarch64"),
+        choices=("x86", "aarch64", "riscv64"),
         default="x86",
         help="assembly syntax used for structural statistics (default: x86)",
     )
@@ -366,7 +387,13 @@ def main(argv: list[str] | None = None) -> int:
     functions: list[str | None] = list(args.function) if args.function else []
     if args.all_functions or not functions:
         functions.append(None)
-    default_oracles = DEFAULT_AARCH64_ORACLES if args.arch == "aarch64" else DEFAULT_ORACLES
+    default_oracles = (
+        DEFAULT_AARCH64_ORACLES
+        if args.arch == "aarch64"
+        else DEFAULT_RISCV64_ORACLES
+        if args.arch == "riscv64"
+        else DEFAULT_ORACLES
+    )
     oracle_text = args.oracles or ",".join(default_oracles)
     oracles = [item.strip() for item in oracle_text.split(",") if item.strip()]
     requests = [Request(source, function, args.flags, args.local_flags, args.arch)
