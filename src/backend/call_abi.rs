@@ -1222,7 +1222,17 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
                 if struct_align > slot_size as usize {
-                    let a = (struct_align as i64).min(2 * slot_size as i64);
+                    // x86-64: GCC ≥ 4.6 honors the FULL natural alignment of
+                    // MEMORY-class stack arguments (>16 included) — callers
+                    // realign %rsp, so the callee's static layout must carry
+                    // the same uncapped pads. AAPCS64/RISC-V cap stack
+                    // argument alignment at 2*XLEN by psABI (the va_arg /
+                    // prologue readers cap identically).
+                    let a = if config.use_sysv_struct_classification {
+                        struct_align as i64
+                    } else {
+                        (struct_align as i64).min(2 * slot_size as i64)
+                    };
                     stack_offset = (stack_offset + a - 1) & !(a - 1);
                 }
                 let off = stack_offset;
@@ -1337,7 +1347,9 @@ pub fn compute_stack_arg_space(
     arg_classes: &[CallArgClass],
     struct_arg_aligns: &[Option<usize>],
 ) -> usize {
-    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns);
+    // ARM/RISC-V pre-allocate the outgoing area with one SP adjustment whose
+    // base is 16-aligned; their psABIs cap stack-argument alignment at 16.
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns, 16);
     let mut total: usize = 0;
     for (i, cls) in arg_classes.iter().enumerate() {
         if !cls.is_stack() {
@@ -1352,11 +1364,15 @@ pub fn compute_stack_arg_space(
 /// Returns a Vec with one entry per `arg_classes` element. Non-stack args get 0.
 /// F128Stack and I128Stack args get padding to align to 16 bytes in the overflow
 /// area; struct args whose alignment exceeds 8 (`struct_arg_aligns`) get padding
-/// to their alignment (capped at 16 — the pushq scheme's base is only guaranteed
-/// 16-aligned; `>16`-aligned args additionally need dynamic `%rsp` alignment).
+/// to their alignment, capped at `align_cap`. ARM/RISC-V pass 16 (their psABIs
+/// cap stack-argument alignment at 2*XLEN and the va_arg/prologue readers cap
+/// identically); x86-64 passes `usize::MAX` — GCC ≥ 4.6 honors the FULL natural
+/// alignment of MEMORY-class stack arguments, and the >16 case is completed by
+/// the caller's dynamic %rsp realignment (see emit_call_stack_args_impl).
 pub fn compute_stack_arg_padding(
     arg_classes: &[CallArgClass],
     struct_arg_aligns: &[Option<usize>],
+    align_cap: usize,
 ) -> Vec<usize> {
     let mut padding = vec![0usize; arg_classes.len()];
     let mut offset: usize = 0;
@@ -1375,7 +1391,7 @@ pub fn compute_stack_arg_padding(
         };
         if let Some(a) = align {
             if a > 8 {
-                let a = a.min(16);
+                let a = a.min(align_cap);
                 let align_pad = (a - (offset % a)) % a;
                 padding[i] = align_pad;
                 offset += align_pad;
@@ -1386,15 +1402,45 @@ pub fn compute_stack_arg_padding(
     padding
 }
 
-/// Compute the raw bytes that will be pushed onto the stack for stack arguments.
-/// Unlike `compute_stack_arg_space`, this does NOT apply final 16-byte alignment,
-/// because x86 uses individual `pushq` instructions and handles alignment separately.
-/// This includes alignment padding for F128/I128 and over-aligned struct args.
-pub fn compute_stack_push_bytes(
+/// The largest alignment requirement among stack-passed arguments (8 for
+/// plain scalars). x86-64 uses this to decide whether the outgoing area
+/// needs dynamic %rsp realignment: static per-arg padding is sufficient
+/// exactly while this stays ≤ 16, because the push sequence's base is only
+/// guaranteed 16-aligned.
+pub fn max_stack_arg_alignment(
     arg_classes: &[CallArgClass],
     struct_arg_aligns: &[Option<usize>],
 ) -> usize {
-    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns);
+    let mut max_align = 8usize;
+    for (i, cls) in arg_classes.iter().enumerate() {
+        if !cls.is_stack() {
+            continue;
+        }
+        let align = match cls {
+            CallArgClass::F128Stack | CallArgClass::I128Stack => 16,
+            CallArgClass::StructByValStack { .. }
+            | CallArgClass::LargeStructStack { .. }
+            | CallArgClass::StructSplitRegStack { .. } => {
+                struct_arg_aligns.get(i).copied().flatten().unwrap_or(8)
+            }
+            _ => 8,
+        };
+        max_align = max_align.max(align);
+    }
+    max_align
+}
+
+/// Compute the raw bytes that will be pushed onto the stack for stack arguments.
+/// Unlike `compute_stack_arg_space`, this does NOT apply final 16-byte alignment,
+/// because x86 uses individual `pushq` instructions and handles alignment separately.
+/// This includes alignment padding for F128/I128 and over-aligned struct args
+/// (see `compute_stack_arg_padding` for the `align_cap` semantics).
+pub fn compute_stack_push_bytes(
+    arg_classes: &[CallArgClass],
+    struct_arg_aligns: &[Option<usize>],
+    align_cap: usize,
+) -> usize {
+    let padding = compute_stack_arg_padding(arg_classes, struct_arg_aligns, align_cap);
     let mut total: usize = 0;
     for (i, cls) in arg_classes.iter().enumerate() {
         if !cls.is_stack() {

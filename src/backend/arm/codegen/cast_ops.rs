@@ -159,9 +159,22 @@ impl ArmCodegen {
                     (true, IrType::I16) => self
                         .state
                         .emit_fmt(format_args!("    sxth {}, {}", d64, s32)),
-                    (true, IrType::I32) => self
-                        .state
-                        .emit_fmt(format_args!("    sxtw {}, {}", d64, s32)),
+                    (true, IrType::I32) => {
+                        // Clz/Ctz/Popcount results are provably in [0, 32]
+                        // and were written by W-register instructions (upper
+                        // half already zero, and sign-extension is the
+                        // identity for non-negative values): the `sxtw` is
+                        // dead. A same-register W move is also dead.
+                        let bitop_src = matches!(src, Operand::Value(v)
+                            if self.bitop_nonneg_values.contains(&v.0));
+                        if !bitop_src {
+                            self.state
+                                .emit_fmt(format_args!("    sxtw {}, {}", d64, s32));
+                        } else if sp != dp {
+                            self.state
+                                .emit_fmt(format_args!("    mov {}, {}", d32, s32));
+                        }
+                    }
                     (false, IrType::U8) => self
                         .state
                         .emit_fmt(format_args!("    and {}, {}, #0xff", d32, s32)),
@@ -256,6 +269,19 @@ impl ArmCodegen {
                     return;
                 }
             }
+        }
+        // Relay fallback for bitop sources: an I32→I64 signed widen of a
+        // Clz/Ctz/Popcount result needs no `sxtw` — the W-register load of
+        // the 4-byte slot (or the bitop's own W write) already leaves the
+        // correct zero-extended, sign-extension-identical value in x0.
+        if from_ty == IrType::I32
+            && to_ty == IrType::I64
+            && matches!(src, Operand::Value(v) if self.bitop_nonneg_values.contains(&v.0))
+        {
+            self.emit_load_operand(src);
+            self.store_x0_to(dest);
+            self.state.reg_cache.invalidate_acc();
+            return;
         }
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
     }

@@ -5,7 +5,7 @@ use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{CodegenState, StackSlot};
 use crate::backend::traits::ArchCodegen;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::delegate_to_impl;
 use crate::ir::reexports::{
@@ -102,6 +102,14 @@ pub struct RiscvCodegen {
     pub(super) va_named_gp_count: usize,
     /// Total bytes of named params that overflow to the caller's stack.
     pub(super) va_named_stack_bytes: usize,
+    /// Dest value-ids of Clz/Ctz/Popcount results on ≤32-bit integer types:
+    /// provably in [0, 32], so their I32→I64 widening casts need no `sext.w`
+    /// (the loop emitters build the count from 0 upward in a full 64-bit
+    /// register; a `lw` of the stored 4-byte value sign-extends a non-negative
+    /// value, which is the identity). Per-definition, never propagated
+    /// through derived arithmetic (the x86-64 backend's bitop_nonneg_values
+    /// transfer).
+    pub(super) bitop_nonneg_values: FxHashSet<u32>,
     /// Current frame size (below s0, not including the register save area above s0).
     pub(super) current_frame_size: i64,
     /// Whether the current function is variadic.
@@ -129,6 +137,7 @@ impl RiscvCodegen {
             current_return_type: IrType::I64,
             va_named_gp_count: 0,
             va_named_stack_bytes: 0,
+            bitop_nonneg_values: FxHashSet::default(),
             current_frame_size: 0,
             is_variadic: false,
             asm_gp_scratch_idx: 0,

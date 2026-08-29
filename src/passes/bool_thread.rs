@@ -98,7 +98,10 @@
 //! `CCC_DISABLE_PASSES=boolthread`.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
+use crate::common::types::IrType;
+use crate::ir::reexports::{
+    BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 
 /// Safety bound on the per-function fixpoint. In loop-free CFGs the edge
 /// count into merges strictly decreases and functions converge in a few
@@ -181,7 +184,9 @@ fn thread_round(func: &mut IrFunction) -> usize {
         }
         let ml = func.blocks[mi].label;
 
-        // ---- Rule 1/2: phis-only block, CondBranch on one of its phis. ----
+        // ---- Rule 1/2: phis-only block (bool shape) or phis + exactly one
+        // merge-local compare (int shape), CondBranch on a phi or on that
+        // compare's dest. ----
         let (cond_val, bt, bf) = match &func.blocks[mi].terminator {
             Terminator::CondBranch {
                 cond: Operand::Value(v),
@@ -193,26 +198,111 @@ fn thread_round(func: &mut IrFunction) -> usize {
         if bt == ml || bf == ml || bt == bf {
             continue;
         }
-        let (phi_dests, phis_only) = {
+        // The int-cmp generalization: vsprintf/printf's `--precision >= 0`
+        // merges test an int phi through a merge-local compare. Threading
+        // re-materializes `Cmp(op, v_i, rhs)` on each predecessor's own
+        // incoming value. Because this shape DOES duplicate an instruction,
+        // it threads only when EVERY predecessor is threadable (the merge
+        // then dies: N added compares strictly lose against N removed arm
+        // stores plus the merge's reload-compare-branch); partial threading
+        // would let a threaded predecessor pay the compare without the
+        // merge's death, so it is rejected wholesale.
+        let mut int_cmp: Option<(IrCmpOp, Operand, IrType, usize)> = None; // (op, rhs, ty, p_pos)
+        let mut phi_dests: Vec<Value> = Vec::new();
+        {
             let merge = &func.blocks[mi];
             let mut dests: Vec<Value> = Vec::new();
+            let mut non_phi: Option<(&Value, &IrCmpOp, &Operand, &Operand, &IrType)> = None;
             let mut only = true;
             for inst in &merge.instructions {
                 match inst {
                     Instruction::Phi { dest, .. } => dests.push(*dest),
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        if non_phi.is_some() {
+                            only = false;
+                            break;
+                        }
+                        non_phi = Some((dest, op, lhs, rhs, ty));
+                    }
                     _ => {
                         only = false;
                         break;
                     }
                 }
             }
-            (dests, only)
-        };
-        if !phis_only || !phi_dests.contains(&cond_val) {
+            if !only {
+                continue;
+            }
+            if dests.contains(&cond_val) {
+                // Bool shape: the branch tests a phi directly. A tolerated
+                // merge-local Cmp must then be provably dead: its dest has
+                // no legitimate use anywhere (the merge terminator tests the
+                // phi, not the compare), and the merge dies on a full
+                // thread — an unchecked external use would dangle.
+                if let Some((cdest, _, _, _, _)) = non_phi {
+                    if cmp_dest_used_elsewhere(func, mi, *cdest) {
+                        continue;
+                    }
+                }
+                phi_dests = dests;
+            } else if let Some((cdest, op, lhs, rhs, ty)) = non_phi {
+                // Int shape: the branch tests the merge-local compare...
+                if *cdest != cond_val {
+                    continue;
+                }
+                // ... whose LHS must be a merge phi and whose RHS an integer
+                // constant (a constant dominates every predecessor, so the
+                // re-materialized compare is always well-formed).
+                let p = match lhs {
+                    Operand::Value(v) if dests.contains(v) => *v,
+                    _ => continue,
+                };
+                let rhs_const = match rhs {
+                    Operand::Const(c) => c.clone(),
+                    _ => continue,
+                };
+                let p_pos = match dests.iter().position(|d| *d == p) {
+                    Some(x) => x,
+                    None => continue,
+                };
+                // Rule 7: the compare's type equals the tested phi's type —
+                // the per-predecessor re-materialization compares the
+                // identical value (phi arms carry the phi's type).
+                let phi_ty = func.blocks[mi]
+                    .instructions
+                    .iter()
+                    .find_map(|i| match i {
+                        Instruction::Phi { dest, ty, .. } if *dest == p => Some(*ty),
+                        _ => None,
+                    });
+                if phi_ty != Some(*ty) {
+                    continue;
+                }
+                // The compare's dest may be referenced ONLY as this block's
+                // CondBranch condition (rule 3): a use anywhere else —
+                // another instruction, any terminator, any phi arm — would
+                // dangle after the merge's death.
+                if cmp_dest_used_elsewhere(func, mi, *cdest) {
+                    continue;
+                }
+                int_cmp = Some((*op, Operand::Const(rhs_const), *ty, p_pos));
+                phi_dests = dests;
+            } else {
+                continue;
+            }
+        }
+        if phi_dests.is_empty() {
             continue;
         }
 
-        // ---- Rule 3: use classification for every merge phi. ----
+        // ---- Rule 3: use classification for every merge phi. The one
+        // merge-local compare of the int shape is an allowed LHS user. ----
         if !phi_uses_are_threadable(func, &phi_dests, mi, bt, bf, ml) {
             continue;
         }
@@ -307,6 +397,25 @@ fn thread_round(func: &mut IrFunction) -> usize {
         if threaded_count == 0 {
             continue;
         }
+        // The int-cmp shape requires the merge to die (every predecessor
+        // threaded): the re-materialized compares must be paid for by the
+        // merge's death, not by an individual predecessor.
+        if int_cmp.is_some() && threaded_count != preds[mi].len() {
+            continue;
+        }
+        // Pre-validate every constant-arm constant-fold BEFORE the rewrite:
+        // an un-evaluable pair must reject the candidate wholesale, never
+        // leave it half-threaded.
+        if let Some((op, Operand::Const(rc), ty, ipos)) = &int_cmp {
+            let un_evaluable = (0..preds[mi].len()).any(|pos| {
+                !threadable[pos]
+                    || matches!(&arms[*ipos][pos], Some(Operand::Const(c))
+                        if eval_const_cmp(*op, c, rc, ty).is_none())
+            });
+            if un_evaluable {
+                continue;
+            }
+        }
 
         // ---- Rewrite (indices stay valid: no block is added or removed). ----
         // Order matters: (1) threaded predecessors' terminators, (2) Bt/Bf
@@ -314,26 +423,67 @@ fn thread_round(func: &mut IrFunction) -> usize {
         // with the merge-edge arm dropped last so every substitution still
         // reads it —, (3) the merge phis' threaded arms.
         let merge_dies = threaded_count == preds[mi].len();
-        let p_pos = phi_dests.iter().position(|d| *d == cond_val).unwrap();
 
-        // (1) New terminators from %p's arm per threaded predecessor.
+        // (1) New terminators from %p's arm per threaded predecessor. The
+        // bool shape branches on the arm itself; the int shape
+        // re-materializes the compare on the arm (constant arms fold the
+        // comparison at compile time — no instruction is emitted; pairs that
+        // cannot fold were pre-validated away above).
+        let p_pos = match &int_cmp {
+            Some((_, _, _, ipos)) => *ipos,
+            None => match phi_dests.iter().position(|d| *d == cond_val) {
+                Some(x) => x,
+                None => continue,
+            },
+        };
         for (pos, &pi) in preds[mi].iter().enumerate() {
             if !threadable[pos] {
                 continue;
             }
-            let new_term = match arms[p_pos][pos].unwrap() {
-                Operand::Const(c) => {
-                    if const_is_truthy(&c) {
-                        Terminator::Branch(bt)
-                    } else {
-                        Terminator::Branch(bf)
+            let new_term = match &int_cmp {
+                None => match arms[p_pos][pos].unwrap() {
+                    Operand::Const(c) => {
+                        if const_is_truthy(&c) {
+                            Terminator::Branch(bt)
+                        } else {
+                            Terminator::Branch(bf)
+                        }
+                    }
+                    cond => Terminator::CondBranch {
+                        cond,
+                        true_label: bt,
+                        false_label: bf,
+                    },
+                },
+                Some((op, rhs, ty, _)) => {
+                    let arm = arms[p_pos][pos].unwrap();
+                    match (&arm, rhs) {
+                        (Operand::Const(c), Operand::Const(rc)) => {
+                            match eval_const_cmp(*op, c, rc, ty) {
+                                Some(true) => Terminator::Branch(bt),
+                                Some(false) => Terminator::Branch(bf),
+                                None => unreachable!("pre-validated constant pair"),
+                            }
+                        }
+                        _ => {
+                            // Re-materialize the compare on this
+                            // predecessor's own incoming value.
+                            let fresh = fresh_value(func);
+                            func.blocks[pi].instructions.push(Instruction::Cmp {
+                                dest: fresh,
+                                op: *op,
+                                lhs: arm,
+                                rhs: rhs.clone(),
+                                ty: *ty,
+                            });
+                            Terminator::CondBranch {
+                                cond: Operand::Value(fresh),
+                                true_label: bt,
+                                false_label: bf,
+                            }
+                        }
                     }
                 }
-                cond => Terminator::CondBranch {
-                    cond,
-                    true_label: bt,
-                    false_label: bf,
-                },
             };
             func.blocks[pi].terminator = new_term;
         }
@@ -400,7 +550,8 @@ fn thread_round(func: &mut IrFunction) -> usize {
 }
 
 /// Rule 3: every use of every merge phi is either the merge block's own
-/// CondBranch condition or an incoming arm of a phi in Bt/Bf on the edge
+/// CondBranch condition, the LHS of the merge block's own (single) compare —
+/// the int-cmp shape —, or an incoming arm of a phi in Bt/Bf on the edge
 /// from the merge block. `mi` is the merge block index; `ml` its label.
 fn phi_uses_are_threadable(
     func: &IrFunction,
@@ -423,6 +574,18 @@ fn phi_uses_are_threadable(
                     }
                 }
                 continue;
+            }
+            // The merge block's own compare (the int-cmp candidate's compare)
+            // may use a merge phi as its LHS; any other regular instruction
+            // using a merge phi rejects the candidate.
+            if bi == mi {
+                if let Instruction::Cmp { lhs, .. } = inst {
+                    if let Operand::Value(v) = lhs {
+                        if is_phi_dest(v.0) {
+                            continue;
+                        }
+                    }
+                }
             }
             let mut bad = false;
             inst.for_each_used_value(|id| {
@@ -449,6 +612,93 @@ fn phi_uses_are_threadable(
     true
 }
 
+/// Whether `cdest` — the int-cmp candidate's compare dest, defined in block
+/// `mi` — is referenced anywhere other than block `mi`'s own CondBranch
+/// condition. A stray use (instruction, terminator, phi arm — including in
+/// the merge block itself) would dangle once the merge dies.
+fn cmp_dest_used_elsewhere(func: &IrFunction, mi: usize, cdest: Value) -> bool {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if bi == mi {
+                // The defining compare itself does not count as a use.
+                if let Instruction::Cmp { dest, .. } = inst {
+                    if *dest == cdest {
+                        continue;
+                    }
+                }
+            }
+            let mut bad = false;
+            inst.for_each_used_value(|id| {
+                if id == cdest.0 {
+                    bad = true;
+                }
+            });
+            if bad {
+                return true;
+            }
+        }
+        let mut bad = false;
+        block.terminator.for_each_used_value(|id| {
+            if id == cdest.0 && !(bi == mi) {
+                bad = true;
+            }
+        });
+        if bad {
+            return true;
+        }
+    }
+    false
+}
+
+/// Mint a fresh Value id (defensive against a stale `next_value_id` cache:
+/// never collide with an existing id).
+fn fresh_value(func: &mut IrFunction) -> Value {
+    let nid = func
+        .next_value_id
+        .max(func.max_value_id().saturating_add(1));
+    func.next_value_id = nid + 1;
+    Value(nid)
+}
+
+/// Integer constant → i64 carrier (sign-extended). Returns None for
+/// non-integer constants.
+fn const_to_i64(c: &IrConst) -> Option<i64> {
+    match c {
+        IrConst::I8(v) => Some(*v as i64),
+        IrConst::I16(v) => Some(*v as i64),
+        IrConst::I32(v) => Some(*v as i64),
+        IrConst::I64(v) => Some(*v),
+        IrConst::Zero => Some(0),
+        _ => None,
+    }
+}
+
+/// Compile-time evaluation of `lhs op rhs` for integer constants of type
+/// `ty`. Unsigned comparisons mask both carriers to the type width first
+/// (constants are stored sign-extended on their signed carrier).
+fn eval_const_cmp(op: IrCmpOp, lhs: &IrConst, rhs: &IrConst, ty: &IrType) -> Option<bool> {
+    if ty.size() > 8 {
+        return None;
+    }
+    let l = const_to_i64(lhs)?;
+    let r = const_to_i64(rhs)?;
+    let bits = ty.size() as u32 * 8;
+    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let (lu, ru) = ((l as u64) & mask, (r as u64) & mask);
+    Some(match op {
+        IrCmpOp::Eq => l == r,
+        IrCmpOp::Ne => l != r,
+        IrCmpOp::Slt => l < r,
+        IrCmpOp::Sle => l <= r,
+        IrCmpOp::Sgt => l > r,
+        IrCmpOp::Sge => l >= r,
+        IrCmpOp::Ult => lu < ru,
+        IrCmpOp::Ule => lu <= ru,
+        IrCmpOp::Ugt => lu > ru,
+        IrCmpOp::Uge => lu >= ru,
+    })
+}
+
 /// Truthiness of an IR constant for branch purposes (`!= 0`).
 fn const_is_truthy(c: &IrConst) -> bool {
     match c {
@@ -461,5 +711,216 @@ fn const_is_truthy(c: &IrConst) -> bool {
         IrConst::F64(v) => *v != 0.0,
         IrConst::LongDouble(v, _) => *v != 0.0,
         IrConst::Zero => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! IR-level harness for the threading rules. Constructing the blocks by
+    //! hand is the only reliable way to reach the vulnerable candidate
+    //! shapes: the earlier pipeline folds source-level diamonds into
+    //! Selects, so text-format repros cannot drive `thread_round` into the
+    //! phi-merge paths these rules guard.
+
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, IrParam};
+
+    fn empty_block(label: u32, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: Vec::new(),
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    /// b0: CondBranch(c, b1, b2)
+    /// b1: p = a; Branch(b3)   b2: p = b; Branch(b3)
+    /// b3 (merge): Phi p; Cmp q = p < 5; CondBranch(p, b4, b5)
+    /// b4: Branch(b5)          b5: ret = q*1000 (+ phi r); Return
+    /// `live_cmp`: when true, q is USED in b5 (the dangling-use hazard);
+    /// when false, q is dead (the tolerated-dead-Cmp bool shape).
+    fn build_bool_merge(live_cmp: bool) -> IrFunction {
+        let mut f = IrFunction::new(
+            "t".to_string(),
+            IrType::I32,
+            vec![
+                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
+                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
+                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
+            ],
+            false,
+        );
+        f.next_value_id = 6;
+        let (va, vb, vc) = (Value(0), Value(1), Value(2));
+        let (vp, vq) = (Value(6), Value(7));
+        let vr = Value(8); // join phi result
+        // Mirror the real front-end shape: entry block opens with one
+        // ParamRef per parameter defining its value id.
+        let b0 = BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef { dest: va, param_idx: 0, ty: IrType::I32 },
+                Instruction::ParamRef { dest: vb, param_idx: 1, ty: IrType::I32 },
+                Instruction::ParamRef { dest: vc, param_idx: 2, ty: IrType::I32 },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(vc),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        };
+        let mut arm = |label: u32, src: Value, target: BlockId| BasicBlock {
+            label: BlockId(label),
+            instructions: vec![Instruction::Copy { dest: vp, src: Operand::Value(src) }],
+            terminator: Terminator::Branch(target),
+            source_spans: Vec::new(),
+        };
+        let b1 = arm(1, va, BlockId(3));
+        let b2 = arm(2, vb, BlockId(3));
+        let b3 = BasicBlock {
+            label: BlockId(3),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: vp,
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(va), BlockId(1)),
+                        (Operand::Value(vb), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: vq,
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(vp),
+                    rhs: Operand::Const(IrConst::I32(5)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(vp),
+                true_label: BlockId(4),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        };
+        let b4 = empty_block(4, Terminator::Branch(BlockId(5)));
+        let b5 = BasicBlock {
+            label: BlockId(5),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: vr,
+                    ty: IrType::I32,
+                    incoming: vec![
+                        // false edge: b3 falls through into b5 directly
+                        (Operand::Const(IrConst::I32(100)), BlockId(4)),
+                        (Operand::Const(IrConst::I32(200)), BlockId(3)),
+                    ],
+                },
+            ],
+            terminator: if live_cmp {
+                // return q*1000 + r — q crosses the merge boundary
+                Terminator::Return(Some(Operand::Value(vq)))
+            } else {
+                Terminator::Return(Some(Operand::Value(vr)))
+            },
+            source_spans: Vec::new(),
+        };
+        f.blocks = vec![b0, b1, b2, b3, b4, b5];
+        f
+    }
+
+    /// Every used value id must have a definition (ParamRef/def in some
+    /// block). The dangling-use invariant after any threading rewrite.
+    fn is_branch_to(t: &Terminator, id: u32) -> bool {
+        matches!(t, Terminator::Branch(b) if b.0 == id)
+    }
+
+    fn all_uses_resolved(f: &IrFunction) -> bool {
+        let mut defs: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for b in &f.blocks {
+            for i in &b.instructions {
+                if let Some(d) = i.dest() {
+                    defs.insert(d.0);
+                }
+            }
+        }
+        let mut ok = true;
+        for b in &f.blocks {
+            for i in &b.instructions {
+                i.for_each_used_value(|id| {
+                    if !defs.contains(&id) {
+                        ok = false;
+                    }
+                });
+            }
+            b.terminator.for_each_used_value(|id| {
+                if !defs.contains(&id) {
+                    ok = false;
+                }
+            });
+        }
+        ok
+    }
+
+    #[test]
+    fn bool_shape_with_live_merge_cmp_is_rejected() {
+        // The Agent Z soundness hole: without the dead-check, the merge
+        // dies and b5's use of the Cmp dest dangles.
+        let mut f = build_bool_merge(true);
+        super::run(&mut f);
+        let b3 = &f.blocks[3];
+        let has_cmp = b3
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == Value(7)));
+        let preds_still_branch_to_merge = is_branch_to(&f.blocks[1].terminator, 3)
+            && is_branch_to(&f.blocks[2].terminator, 3);
+        // Either the merge was never threaded (arms still branch to it and
+        // the Cmp survives), or the rewrite kept every use resolved. A
+        // threaded merge with a live external Cmp use is the bug.
+        assert!(
+            (has_cmp && preds_still_branch_to_merge) || all_uses_resolved(&f) && false,
+            "live merge-local Cmp dest must not dangle"
+        );
+        assert!(has_cmp && preds_still_branch_to_merge,
+            "the live-Cmp bool candidate must be rejected outright");
+        assert!(all_uses_resolved(&f));
+    }
+
+    #[test]
+    fn bool_shape_with_dead_merge_cmp_still_threads() {
+        // q dead: nothing dangles; the candidate keeps the cannot-grow-code
+        // property (threading removes arm stores + the merge branch).
+        let mut f = build_bool_merge(false);
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        // The merge must not be reachable from the entry anymore.
+        let arms_leave = !is_branch_to(&f.blocks[1].terminator, 3)
+            || !is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(arms_leave, "dead-Cmp bool candidate is expected to thread");
+    }
+
+    #[test]
+    fn int_shape_threads_through_merge_local_compare() {
+        // Same skeleton, but the merge branches on the Cmp DEST (the
+        // '--precision >= 0' shape) and q has no other use.
+        let mut f = build_bool_merge(true);
+        // Redirect the merge branch to the compare dest; drop the join's
+        // use of q so the candidate is admissible.
+        f.blocks[3].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(7)),
+            true_label: BlockId(4),
+            false_label: BlockId(5),
+        };
+        if let Terminator::Return(v) = &mut f.blocks[5].terminator {
+            *v = Some(Operand::Value(Value(8)));
+        }
+        super::run(&mut f);
+        assert!(all_uses_resolved(&f));
+        let arms_leave = !is_branch_to(&f.blocks[1].terminator, 3)
+            && !is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(arms_leave, "int-shape candidate (every pred threadable) must thread");
     }
 }

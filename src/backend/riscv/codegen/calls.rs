@@ -98,8 +98,11 @@ impl RiscvCodegen {
             // natural alignment exceeds XLEN — e.g. struct { long double } —
             // are aligned to 2*XLEN in the argument area; F128/I128 are
             // always 16-byte aligned). Must match compute_stack_arg_space.
-            let arg_padding =
-                crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
+            let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(
+                arg_classes,
+                struct_arg_aligns,
+                16,
+            );
             self.emit_addi_sp(-(stack_arg_space as i64));
             let mut offset: usize = 0;
             for (arg_i, arg) in args.iter().enumerate() {

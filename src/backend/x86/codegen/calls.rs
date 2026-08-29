@@ -186,7 +186,11 @@ impl X86Codegen {
         _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
     ) -> usize {
-        compute_stack_push_bytes(arg_classes, struct_arg_aligns)
+        // x86-64: uncapped per-arg alignment padding (GCC ≥ 4.6 honors the
+        // full natural alignment of MEMORY-class stack arguments; the >16
+        // case is completed by the dynamic %rsp realignment in
+        // emit_call_stack_args_impl).
+        compute_stack_push_bytes(arg_classes, struct_arg_aligns, usize::MAX)
     }
 
     pub(super) fn emit_call_stack_args_impl(
@@ -199,9 +203,73 @@ impl X86Codegen {
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
     ) -> i64 {
-        let need_align_pad = stack_arg_space % 16 != 0;
+        // Per-call-site transient state (defensive reset: the pipeline
+        // always consumes the flag, but a stale value from an aborted
+        // emission path must never leak into the next call).
+        self.dyn_align_cleanup = false;
+
+        // SysV AMD64 (GCC ≥ 4.6 ABI change, flagged by GCC as "the ABI for
+        // passing parameters with N-byte alignment has changed in GCC 4.6"):
+        // a MEMORY-class argument whose natural alignment exceeds 16 bytes is
+        // placed at a slot aligned to its FULL alignment. The callee's va_arg
+        // overflow walk aligns dynamically (addq $A-1; andq $-A — see
+        // emit_va_arg_struct_overflow_body), anchored at the FIRST stack
+        // argument's address (= (%rsp) at the call, where the callee finds it
+        // at entry_rsp+8). A purely static layout cannot guarantee that
+        // anchor ≡ 0 mod A — the pre-push %rsp is only known to be 16-aligned,
+        // so %rsp mod 32/64 is runtime-dependent. When any stack argument
+        // needs alignment A > 16, the outgoing area is built GCC-style:
+        //   (1) %rsp is realigned BEFORE any push, by D = (R0 − TOTAL) mod A
+        //       where TOTAL = save slot + parity pad + argument area is the
+        //       static byte count the pushes will consume — so the FINAL
+        //       (%rsp) at the call (the anchor) lands exactly on an A
+        //       boundary. A is a multiple of 16 and TOTAL is 16-rounded, so D
+        //       is a multiple of 16 and %rsp stays 16-aligned at the call;
+        //   (2) a 16-byte slot above every argument (the callee's overflow
+        //       walk never reads past the last argument it consumes) saves
+        //       the pre-realignment %rsp for the exact cleanup restore —
+        //       correct even when a DynAlloca moved %rsp between prologue and
+        //       this call;
+        //   (3) the cleanup skips the static argument area and restores %rsp
+        //       exactly from the save slot.
+        // The dynamic %rsp delta forbids %rsp-relative slot addressing, so
+        // generation.rs pins such functions to an rbp frame (exactly GCC's
+        // answer: it realigns the whole frame). %rcx/%rax are free here —
+        // register arguments are loaded in Phase 3, after this function.
+        let dyn_align_a =
+            crate::backend::call_abi::max_stack_arg_alignment(arg_classes, struct_arg_aligns);
+        // generation.rs pins functions with >16-aligned stack args to an rbp
+        // frame (the dynamic %rsp delta forbids %rsp-relative addressing),
+        // so the realign path cannot be reached in FPO mode; the fallback
+        // keeps the emission self-consistent if that invariant is ever broken.
+        debug_assert!(dyn_align_a <= 16 || !self.state.out.use_rsp_addressing);
+        let dyn_align = dyn_align_a > 16 && !self.state.out.use_rsp_addressing;
+
         let mut sp_adjust: i64 = 0;
-        if need_align_pad {
+        if dyn_align {
+            let area = stack_arg_space as i64;
+            let parity_pad = if stack_arg_space % 16 != 0 { 8 } else { 0 };
+            let total = 16 + parity_pad + area; // 16-rounded by construction
+            let a = dyn_align_a as i64;
+            // (1) realign: %rsp -= (R0 - TOTAL) mod A  → anchor ≡ 0 (mod A)
+            self.state.emit("    movq %rsp, %rcx"); // %rcx = R0 (scratch only)
+            self.state.emit("    movq %rcx, %rax");
+            self.state
+                .emit_fmt(format_args!("    subq ${}, %rax", total));
+            self.state.emit_fmt(format_args!("    andq ${}, %rax", a - 1));
+            self.state.emit("    subq %rax, %rsp");
+            // (2) save the pre-realignment %rsp above every argument
+            self.state.emit("    subq $16, %rsp");
+            self.state.emit("    movq %rcx, (%rsp)");
+            sp_adjust += 16;
+            if parity_pad > 0 {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    subq", parity_pad, "rsp");
+                sp_adjust += parity_pad;
+            }
+            self.dyn_align_cleanup = true;
+        } else if stack_arg_space % 16 != 0 {
             self.state.emit("    subq $8, %rsp");
             sp_adjust += 8;
             // Adjust RSP frame size so operand_to_rax slot conversions
@@ -210,8 +278,11 @@ impl X86Codegen {
                 self.state.out.rsp_frame_size += 8;
             }
         }
-        let arg_padding =
-            crate::backend::call_abi::compute_stack_arg_padding(arg_classes, struct_arg_aligns);
+        let arg_padding = crate::backend::call_abi::compute_stack_arg_padding(
+            arg_classes,
+            struct_arg_aligns,
+            usize::MAX,
+        );
         let stack_indices: Vec<usize> = (0..args.len())
             .filter(|&i| arg_classes[i].is_stack())
             .collect();
@@ -395,11 +466,13 @@ impl X86Codegen {
             }
         }
         // Restore the original RSP frame size. The total adjustment is
-        // tracked in sp_adjust and returned to emit_call_reg_args.
+        // tracked in sp_adjust and returned to emit_call_reg_args. (The
+        // dynamic realignment delta is NOT tracked — it is invisible to the
+        // rbp-relative addressing that such functions are pinned to.)
         if self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size -= sp_adjust;
         }
-        // Return the total RSP adjustment so emit_call_reg_args can
+        // Return the total STATIC RSP adjustment so emit_call_reg_args can
         // compensate stack slot offsets when loading register arguments.
         sp_adjust
     }
@@ -413,13 +486,9 @@ impl X86Codegen {
     /// on SysV x86-64, and caller-saved live values have already been spilled by
     /// `emit_pre_call_save_caller_regs` before this hook runs.
     pub(super) fn emit_call_spill_fptr_impl(&mut self, func_ptr: &Operand) {
-        // Paravirt fast-path: if func_ptr is Load(GEP(GlobalAddr sym, off)),
-        // we will emit `call *sym+off(%rip)` (ff 15) directly in
-        // emit_call_instruction_impl, which is required for
-        // arch/x86/kernel/paravirt.c:apply_alternatives to patch.
-        // Skipping the r10 spill avoids the `mov $sym, %r15; call *off(%r15)`
-        // pattern (41 ff 57 disp) that is not recognized by the paravirt
-        // patcher and causes boot failures in check_tsc_warp / queued_spin_lock.
+        // Statically resolved targets (a paravirt data cell, or a direct
+        // `&symbol` value) need no r10 spill: emit_call_instruction_impl
+        // emits the resolved call form directly.
         if self.try_resolve_indirect_call_global(func_ptr).is_some() {
             self.state.reg_cache.invalidate_all();
             self.flush_pending_vec_store_impl();
@@ -973,13 +1042,20 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    call *{}({})", sym_str, "%rip"));
                     }
-                    // The resolved value IS the target: direct call, with the same
-                    // PLT handling as a syntactically direct call.
+                    // The resolved value IS the target: direct call, with the
+                    // same PLT handling as a syntactically direct call. An
+                    // offset into the callee (`&func + off`, computed-goto
+                    // style block addresses) is never interposed — the PLT
+                    // entry is only defined for offset 0 — so the offset is
+                    // preserved and @PLT is used only for it. The version
+                    // suffix is stripped in both cases: GAS 2.47 rejects
+                    // `sym@ver@PLT`, and the linker resolves the default
+                    // version from the base name.
                     ResolvedIndirectCall::Direct(..) => {
-                        if self.state.needs_plt(&sym) {
-                            let n = sym.split('@').next().unwrap_or(&sym).to_string();
+                        let name = sym.split('@').next().unwrap_or(&sym).to_string();
+                        if off == 0 && self.state.needs_plt(&name) {
                             self.state
-                                .emit_fmt(format_args!("    call {}@PLT", n));
+                                .emit_fmt(format_args!("    call {}@PLT", name));
                         } else {
                             self.state.out.emit_call(&sym_str);
                         }
@@ -1004,6 +1080,25 @@ impl X86Codegen {
         _f128_temp_space: usize,
         _indirect: bool,
     ) {
+        // Dynamically realigned outgoing area: after the call %rsp points at
+        // the first stack argument (the anchor). Skip the statically-pushed
+        // argument area (16-rounded) to the save slot written by
+        // emit_call_stack_args_impl, then restore %rsp EXACTLY to its
+        // pre-realignment value — correct even under DynAlloca. %r11 is the
+        // scratch — %rax may still carry the callee's return value for Phase
+        // 6's result store, which runs after this cleanup.
+        if self.dyn_align_cleanup {
+            self.dyn_align_cleanup = false;
+            let area = (stack_arg_space + 15) & !15;
+            if area > 0 {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    addq", area as i64, "rsp");
+            }
+            self.state.emit("    movq (%rsp), %r11");
+            self.state.emit("    movq %r11, %rsp");
+            return;
+        }
         let need_align_pad = stack_arg_space % 16 != 0;
         let total_cleanup = stack_arg_space + if need_align_pad { 8 } else { 0 };
         if total_cleanup > 0 {

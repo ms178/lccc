@@ -3625,11 +3625,30 @@ fn generate_function(
     // gate; previously the CLI flag was dropped entirely (so
     // `-fno-omit-frame-pointer` silently did nothing) and variadic functions
     // were unconditionally pinned to a frame pointer.
+    // Calls passing an argument whose natural alignment exceeds 16 bytes
+    // need the caller-side dynamic %rsp realignment (SysV AMD64, GCC ≥ 4.6
+    // ABI — see emit_call_stack_args_impl). The runtime realignment delta
+    // forbids %rsp-relative slot addressing for the rest of the function,
+    // so such functions keep a frame pointer. Conservative (register-passed
+    // over-aligned structs force it too): the shape is ABI-exotic either
+    // way and the frame pointer costs nothing semantically.
+    let has_overaligned_call_args = func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            match inst {
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info
+                    .struct_arg_aligns
+                    .iter()
+                    .any(|a| a.unwrap_or(0) > 16),
+                _ => false,
+            }
+        })
+    });
     cg.state().omit_frame_pointer = cg.state().fpo_requested
         && !has_dyn_alloca
         && !has_inline_asm_fp
         && !has_frame_address
         && !has_vector_intrinsics
+        && !has_overaligned_call_args
         // Classic `call mcount` (non-fentry -pg) reads the parent PC through
         // the frame; GCC rejects `-pg` together with `-fomit-frame-pointer`.
         // Keep a frame pointer so the deferred prologue site is well-defined.
