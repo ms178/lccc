@@ -215,6 +215,10 @@ fn run(args: &[String]) -> Result<(), String> {
     // Arguments forwarded verbatim into the builtin userspace pipeline
     // (parse_linker_args understands the GNU spellings directly).
     let mut passthrough: Vec<String> = Vec::new();
+    // `-u SYM` / `--undefined=SYM`: force-undefined names that pull archive
+    // members. Script links (`-T`) never consult `passthrough`, so these must
+    // be collected separately and handed to `load_inputs_x86`.
+    let mut undefined_symbols: Vec<String> = Vec::new();
     // Set when gcc handed us the LTO plugin; see the -plugin arm below.
     let mut saw_lto_plugin = false;
 
@@ -339,6 +343,20 @@ fn run(args: &[String]) -> Result<(), String> {
                 // Script links resolve every non-weak relocation eagerly.
                 passthrough.push(a.to_string());
             }
+            "--undefined" => {
+                i += 1;
+                if let Some(sym) = args.get(i) {
+                    undefined_symbols.push(sym.clone());
+                    passthrough.push(format!("-Wl,-u,{}", sym));
+                }
+            }
+            a if a.starts_with("--undefined=") => {
+                let sym = &a["--undefined=".len()..];
+                if !sym.is_empty() {
+                    undefined_symbols.push(sym.to_string());
+                    passthrough.push(format!("-Wl,-u,{}", sym));
+                }
+            }
             "-Bsymbolic" | "-Bsymbolic-functions" => {
                 bsymbolic = true;
                 passthrough.push(a.to_string());
@@ -413,6 +431,7 @@ fn run(args: &[String]) -> Result<(), String> {
                         rest.to_string()
                     };
                     if !sym.is_empty() {
+                        undefined_symbols.push(sym.clone());
                         passthrough.push(format!("-Wl,-u,{}", sym));
                     }
                 } else if let Some(rest) = a.strip_prefix("-rpath=") {
@@ -521,7 +540,7 @@ fn run(args: &[String]) -> Result<(), String> {
             eprintln!("lccc-ld: warning: -r with a linker script: script ignored");
         }
         let mut objects = Vec::new();
-        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+        lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
         return lccc::linker_entry::link_relocatable_x86(&objects, &output);
     }
 
@@ -553,7 +572,7 @@ fn run(args: &[String]) -> Result<(), String> {
             lccc::linker_entry::load_inputs_i386_script(&inputs)?
         } else {
             let mut objects = Vec::new();
-            lccc::linker_entry::load_inputs_x86(&inputs, &mut objects)?;
+            lccc::linker_entry::load_inputs_x86(&inputs, &mut objects, &undefined_symbols)?;
             objects
         };
         if build_id {
