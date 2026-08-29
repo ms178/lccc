@@ -1659,6 +1659,11 @@ impl Driver {
         }
         let t7 = std::time::Instant::now();
         eliminate_phis(&mut module);
+        if std::env::var("CCC_DUMP_IR_PHI").is_ok() {
+            eprintln!("==== IR after eliminate_phis ====");
+            eprintln!("{:#?}", module);
+            eprintln!("==== END IR after eliminate_phis ====");
+        }
         if std::env::var_os("CCC_VALIDATE_SSA").is_some() {
             crate::passes::validate_unique_defs(&module, "backend:eliminate_phis");
         }

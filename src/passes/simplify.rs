@@ -66,14 +66,33 @@ use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand,
     Value,
 };
+use crate::ir::instruction::Terminator;
 
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
 pub fn run(module: &mut IrModule) -> usize {
-    module.for_each_function(simplify_function)
+    run_with_config(module, false)
+}
+
+/// `fill_use_counts` enables the reassociation single-use profitability
+/// guard. It is requested by the -O1 tier, where the guard is REQUIRED for
+/// correctness (va-arg-21: the inlined glibc extern-inline vprintf body kept
+/// a stale register home after a multi-use reassociation re-based its def;
+/// 20050124-1 on i686: the k++ arm's leal landed in %edx while the
+/// phi-eliminated merge read %ecx). The -O2+ tiers keep the historical
+/// always-reassociate behavior: there the reassociations also serve as
+/// canonicalization for downstream vectorizer pattern matching, and blocking
+/// them changes which shape reaches the vectorizer (affine_map_vectorization
+/// regressed when the guard was active at -O2).
+pub fn run_with_config(module: &mut IrModule, fill_use_counts: bool) -> usize {
+    module.for_each_function(|f| simplify_function_with_config(f, fill_use_counts))
 }
 
 pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
+    simplify_function_with_config(func, false)
+}
+
+fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -> usize {
     let mut total = 0;
 
     // Build def maps for chain optimizations: Value -> defining instruction
@@ -93,6 +112,75 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
     // `fabs(x) < 0.0` can fold to false, including through Copies.
     // gcc.c-torture 20020720-1: `if (fabs(x) < 0.0) link_error();`
     let mut is_fabs = vec![false; max_id + 1];
+
+    // Use counts for the reassociation profitability guards. A reassociation
+    // such as (x + C1) + C2 => x + (C1 + C2) only *removes work* when the
+    // folded intermediate has no other consumers; with multiple uses the
+    // rewrite merely re-bases the def onto a different value web without
+    // deleting anything, which on i686 splits coalesced register homes
+    // (gcc.c-torture 20050124-1: the k++ arm's leal landed in %edx while the
+    // phi-eliminated merge expected %ecx). Count every value operand read by
+    // instructions and terminators; over-counting is safe (the guard only
+    // becomes more conservative).
+    let mut use_counts = vec![0u32; if fill_use_counts { max_id + 1 } else { 0 }];
+    {
+        let mut bump = |op: &Operand, uc: &mut Vec<u32>| {
+            if let Operand::Value(v) = op {
+                let id = v.0 as usize;
+                if id < uc.len() {
+                    uc[id] += 1;
+                }
+            }
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy { src, .. }
+                    | Instruction::Cast { src, .. }
+                    | Instruction::UnaryOp { src, .. } => {
+                        bump(src, &mut use_counts);
+                    }
+                    Instruction::Load { ptr, .. } => {
+                        bump(&Operand::Value(*ptr), &mut use_counts);
+                    }
+                    Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
+                        bump(lhs, &mut use_counts);
+                        bump(rhs, &mut use_counts);
+                    }
+                    Instruction::Store { ptr, val, .. } => {
+                        bump(&Operand::Value(*ptr), &mut use_counts);
+                        bump(val, &mut use_counts);
+                    }
+                    Instruction::Select {
+                        true_val,
+                        false_val,
+                        cond,
+                        ..
+                    } => {
+                        bump(true_val, &mut use_counts);
+                        bump(false_val, &mut use_counts);
+                        bump(cond, &mut use_counts);
+                    }
+                    Instruction::Phi { incoming, .. } => {
+                        for (op, _) in incoming {
+                            bump(op, &mut use_counts);
+                        }
+                    }
+                    Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                        for arg in &info.args {
+                            bump(arg, &mut use_counts);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match &block.terminator {
+                Terminator::CondBranch { cond, .. } => bump(cond, &mut use_counts),
+                Terminator::Return(Some(v)) => bump(v, &mut use_counts),
+                _ => {}
+            }
+        }
+    }
 
     // Collect definitions - first pass: mark Cmp results as boolean
     for block in &func.blocks {
@@ -303,6 +391,7 @@ pub(crate) fn simplify_function(func: &mut IrFunction) -> usize {
                 &neg_defs,
                 &is_boolean,
                 &value_types,
+                &use_counts,
             ) {
                 *inst = simplified;
                 total += 1;
@@ -383,6 +472,7 @@ fn try_simplify_with_types(
     neg_defs: &[Option<NegDef>],
     is_boolean: &[bool],
     value_types: &[Option<IrType>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -391,7 +481,9 @@ fn try_simplify_with_types(
             lhs,
             rhs,
             ty,
-        } => simplify_binop(*dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs),
+        } => simplify_binop(
+            *dest, *op, lhs, rhs, *ty, cast_defs, binop_defs, neg_defs, use_counts,
+        ),
         Instruction::Cast {
             dest,
             src,
@@ -517,6 +609,7 @@ fn try_simplify(
         binop_defs,
         neg_defs,
         is_boolean,
+        &[],
         &[],
     )
 }
@@ -1196,6 +1289,7 @@ fn simplify_binop(
     cast_defs: &[Option<CastDef>],
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     let lhs_zero = is_zero(lhs);
     let rhs_zero = is_zero(rhs);
@@ -1218,7 +1312,7 @@ fn simplify_binop(
                     return Some(Instruction::Copy { dest, src: *rhs });
                 }
                 // Reassociation: (x + C1) + C2 => x + (C1 + C2)
-                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs) {
+                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs, use_counts) {
                     return Some(inst);
                 }
             }
@@ -1238,7 +1332,7 @@ fn simplify_binop(
             if !is_float {
                 // Reassociation: (x + C1) - C2 => x + (C1 - C2)
                 // Also: (x - C1) - C2 => x - (C1 + C2)
-                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs) {
+                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs, use_counts) {
                     return Some(inst);
                 }
                 // x - (neg y) => x + y (eliminate negation)
@@ -1300,7 +1394,7 @@ fn simplify_binop(
             }
             // Reassociation: (x * C1) * C2 => x * (C1 * C2) (integers only)
             if !is_float {
-                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs) {
+                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs, use_counts) {
                     return Some(inst);
                 }
             }
@@ -1443,7 +1537,7 @@ fn simplify_binop(
             }
             // Reassociation: (x & C1) & C2 => x & (C1 & C2)
             if let Some(inst) =
-                try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs)
+                try_reassociate_bitwise(dest, IrBinOp::And, lhs, rhs, ty, binop_defs, use_counts)
             {
                 return Some(inst);
             }
@@ -1469,7 +1563,7 @@ fn simplify_binop(
                 return Some(Instruction::Copy { dest, src: *lhs });
             }
             // Reassociation: (x | C1) | C2 => x | (C1 | C2)
-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs)
+            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs, use_counts)
             {
                 return Some(inst);
             }
@@ -1492,7 +1586,7 @@ fn simplify_binop(
             }
             // Reassociation: (x ^ C1) ^ C2 => x ^ (C1 ^ C2)
             if let Some(inst) =
-                try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs)
+                try_reassociate_bitwise(dest, IrBinOp::Xor, lhs, rhs, ty, binop_defs, use_counts)
             {
                 return Some(inst);
             }
@@ -1519,7 +1613,7 @@ fn simplify_binop(
             }
             // Reassociation: (x << C1) << C2 => x << (C1 + C2)
             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
-            if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs) {
+            if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs, use_counts) {
                 return Some(inst);
             }
         }
@@ -1691,15 +1785,43 @@ fn combine_add_consts(c1: i64, c2: i64, ty: IrType) -> i64 {
 
 /// Try reassociating addition: (x + C1) + C2 => x + (C1 + C2)
 /// Also handles: C2 + (x + C1) => x + (C1 + C2)
+/// Reassociation profitability guard: folding through an intermediate whose
+/// value has other consumers re-bases the def onto a different register web
+/// without deleting any instruction (work-neutral at best). On i686 that web
+/// split changed the def's home register while the phi-eliminated merge kept
+/// the old expectation, miscompiling gcc.c-torture 20050124-1 (the k++ arm's
+/// `leal` landed in %edx while the merge read %ecx). Only fold through
+/// single-use intermediates so the intermediate's def actually dies and the
+/// rewrite is a strict win. An empty use_counts slice (test entry points)
+/// keeps the historical behavior.
+fn reassociation_unprofitable(intermediate: &Operand, use_counts: &[u32]) -> bool {
+    if use_counts.is_empty() {
+        return false;
+    }
+    // Bisection kill-switch (mirrors the other CCC_NO_* hooks): forces the
+    // historical always-reassociate behavior.
+    if std::env::var("CCC_NO_REASSOC_GUARD").is_ok() {
+        return false;
+    }
+    match intermediate {
+        Operand::Value(v) => use_counts.get(v.0 as usize).copied().unwrap_or(0) > 1,
+        _ => false,
+    }
+}
+
 fn try_reassociate_add(
     dest: Value,
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
     binop_defs: &[Option<BinOpDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
+    if reassociation_unprofitable(lhs, use_counts) {
         return None;
     }
     // Pattern: (x + C1) + C2 or (x - C1) + C2
@@ -1810,9 +1932,13 @@ fn try_reassociate_sub(
     rhs: &Operand,
     ty: IrType,
     binop_defs: &[Option<BinOpDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
+    if reassociation_unprofitable(lhs, use_counts) {
         return None;
     }
     let c2_val = match rhs {
@@ -1887,9 +2013,13 @@ fn try_reassociate_bitwise(
     rhs: &Operand,
     ty: IrType,
     binop_defs: &[Option<BinOpDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
+    if reassociation_unprofitable(lhs, use_counts) {
         return None;
     }
     // Pattern: (x op C1) op C2
@@ -1962,9 +2092,13 @@ fn try_reassociate_shift(
     rhs: &Operand,
     ty: IrType,
     binop_defs: &[Option<BinOpDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
+    if reassociation_unprofitable(lhs, use_counts) {
         return None;
     }
     let c2_val = match rhs {
@@ -2023,9 +2157,13 @@ fn try_reassociate_mul(
     rhs: &Operand,
     ty: IrType,
     binop_defs: &[Option<BinOpDef>],
+    use_counts: &[u32],
 ) -> Option<Instruction> {
     // Skip I128/U128: to_i64() truncates, which would silently corrupt 128-bit constants.
     if matches!(ty, IrType::I128 | IrType::U128) {
+        return None;
+    }
+    if reassociation_unprofitable(lhs, use_counts) || reassociation_unprofitable(rhs, use_counts) {
         return None;
     }
 
@@ -3902,6 +4040,7 @@ mod tests {
             &[],
             &binops,
             &[],
+            &[],
         )
         .unwrap();
         match got {
@@ -3944,6 +4083,7 @@ mod tests {
             &casts,
             &binops,
             &[],
+            &[],
         )
         .unwrap();
         match got {
@@ -3977,6 +4117,7 @@ mod tests {
             &Operand::Value(Value(1)),
             &Operand::Const(IrConst::I32(0)),
             IrType::I32,
+            &[],
             &[],
             &[],
             &[],
