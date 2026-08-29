@@ -133,6 +133,8 @@ impl Parser {
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
             );
+                let _dbg_vs = d.vector_size_expr.is_some();
+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
             d.set_static(self.attrs.parsing_static());
             d.set_extern(self.attrs.parsing_extern());
             d.set_typedef(self.attrs.parsing_typedef());
@@ -725,7 +727,7 @@ impl Parser {
         let is_typedef = self.attrs.parsing_typedef();
         let is_transparent_union = self.attrs.parsing_transparent_union();
         self.attrs.set_transparent_union(false);
-        self.register_typedefs(&declarators);
+        self.register_typedefs(&type_spec, &declarators);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
         let mut d = Declaration::new(
@@ -739,6 +741,7 @@ impl Parser {
             self.attrs.parsing_ext_vector_nelem.take(),
             start,
         );
+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
         d.set_static(self.attrs.parsing_static());
         d.set_extern(self.attrs.parsing_extern());
         d.set_typedef(is_typedef);
@@ -798,6 +801,7 @@ impl Parser {
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
             );
+                d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
             d.set_static(is_static);
             d.set_extern(is_extern);
             d.set_typedef(self.attrs.parsing_typedef());
@@ -909,6 +913,7 @@ impl Parser {
             self.attrs.parsing_ext_vector_nelem.take(),
             start,
         );
+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
         d.set_static(is_static);
         d.set_extern(is_extern);
         d.set_typedef(is_typedef);
@@ -1328,15 +1333,46 @@ impl Parser {
     }
 
     /// Register typedef names from declarators, if parsing_typedef is set.
-    fn register_typedefs(&mut self, declarators: &[InitDeclarator]) {
+    fn register_typedefs(&mut self, type_spec: &TypeSpecifier, declarators: &[InitDeclarator]) {
         if self.attrs.parsing_typedef() {
             for decl in declarators {
                 if !decl.name.is_empty() {
                     self.typedefs.insert(decl.name.clone());
+                    // Record the typedef's full type (base spec + derived
+                    // pointer/array layers) so parse-time constant
+                    // expressions can resolve sizeof(typedef) — required for
+                    // e.g. `__attribute__((vector_size(16 * sizeof(int64_t))))`.
+                    self.typedef_type_specs.insert(
+                        decl.name.clone(),
+                        self.typedef_spec_with_derived(type_spec.clone(), &decl.derived),
+                    );
                 }
             }
             self.attrs.set_typedef(false);
         }
+    }
+
+    /// Fold declarator-derived pointer/array layers into a TypeSpecifier so
+    /// parser-side `sizeof(typedef)` resolves through the stored spec.
+    /// Function-derived layers are left as-is: vector_size on function
+    /// typedefs is not a valid C construct and those stay sema-deferred.
+    fn typedef_spec_with_derived(
+        &self,
+        mut spec: TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> TypeSpecifier {
+        for d in derived {
+            match d {
+                DerivedDeclarator::Pointer => {
+                    spec = TypeSpecifier::Pointer(Box::new(spec), AddressSpace::Default);
+                }
+                DerivedDeclarator::Array(n) => {
+                    spec = TypeSpecifier::Array(Box::new(spec), n.clone());
+                }
+                _ => {}
+            }
+        }
+        spec
     }
 
     /// Check whether an expression contains identifiers that are NOT enum constants.

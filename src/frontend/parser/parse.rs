@@ -174,6 +174,10 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_symver: Option<String>,
     /// `__attribute__((vector_size(N)))` total vector size in bytes.
     pub parsing_vector_size: Option<usize>,
+    /// `__attribute__((vector_size(EXPR)))` whose EXPR was not parse-time
+    /// evaluable (e.g. `16 * sizeof(some_typedef)`): the raw expression is
+    /// deferred to sema, where typedef sizes are fully resolved.
+    pub parsing_vector_size_expr: Option<Box<Expr>>,
     /// `__attribute__((ext_vector_type(N)))` number of vector elements.
     /// Converted to total byte size in lowering using sizeof(element_type) * N.
     pub parsing_ext_vector_nelem: Option<usize>,
@@ -440,6 +444,11 @@ pub struct Parser {
     pub(super) tokens: Vec<Token>,
     pub(super) pos: usize,
     pub(super) typedefs: FxHashSet<String>,
+    /// Type specifier each typedef name was declared with (parser-side, for
+    /// parse-time sizeof(typedef) resolution in constant expressions such as
+    /// `__attribute__((vector_size(16 * sizeof(int64_t))))`).  Chained
+    /// typedefs, pointers and arrays fold into the stored spec recursively.
+    pub(super) typedef_type_specs: FxHashMap<String, TypeSpecifier>,
     /// Typedef names shadowed by local variable declarations in the current scope.
     pub(super) shadowed_typedefs: FxHashSet<String>,
     /// Accumulated declaration attributes from the current parse_type_specifier pass.
@@ -482,6 +491,7 @@ impl Parser {
             tokens,
             pos: 0,
             typedefs: Self::builtin_typedefs_cached(),
+            typedef_type_specs: FxHashMap::default(),
             shadowed_typedefs: FxHashSet::default(),
             attrs: ParsedDeclAttrs::default(),
             pragma_pack_stack: Vec::with_capacity(4),
@@ -1375,6 +1385,61 @@ impl Parser {
         }
     }
 
+    /// Parse-time constant evaluation with parser-side typedef size
+    /// resolution: handles `sizeof(typedef-name)` inside vector_size
+    /// expressions (e.g. `16 * sizeof(int64_t)`), which the shared static
+    /// evaluator cannot resolve because typedef sizes live in parser state
+    /// (`typedef_type_specs`).  Falls back to `None` for struct/union-typedef
+    /// sizes, which remain deferred to sema via
+    /// `parsing_vector_size_expr`.
+    fn eval_vector_size_with_typedefs(&self, expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                let l = self.eval_vector_size_with_typedefs(lhs)?;
+                let r = self.eval_vector_size_with_typedefs(rhs)?;
+                match op {
+                    BinOp::Add => Some(l.wrapping_add(r)),
+                    BinOp::Sub => Some(l.wrapping_sub(r)),
+                    BinOp::Mul => Some(l.wrapping_mul(r)),
+                    BinOp::Div if r != 0 => Some(l.wrapping_div(r)),
+                    BinOp::Mod if r != 0 => Some(l.wrapping_rem(r)),
+                    BinOp::Shl => Some(l.wrapping_shl(r as u32)),
+                    BinOp::Shr => Some(l.wrapping_shr(r as u32)),
+                    BinOp::BitOr => Some(l | r),
+                    BinOp::BitAnd => Some(l & r),
+                    BinOp::BitXor => Some(l ^ r),
+                    _ => None,
+                }
+            }
+            Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
+                Some(self.eval_vector_size_with_typedefs(inner)?.wrapping_neg())
+            }
+            Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_vector_size_with_typedefs(inner),
+            Expr::Sizeof(arg, _) => match arg.as_ref() {
+                SizeofArg::Type(ts) => {
+                    // Walk typedef chains to their base spec: the stored spec
+                    // for a chained typedef (`typedef a_t b_t;`) is itself a
+                    // TypedefName, and the static try_sizeof_type_spec cannot
+                    // resolve those.  Chains are acyclic (a typedef name is
+                    // only usable after its declaration), so this terminates.
+                    let mut spec: &TypeSpecifier = ts;
+                    loop {
+                        match spec {
+                            TypeSpecifier::TypedefName(name) => {
+                                spec = self.typedef_type_specs.get(name)?;
+                            }
+                            other => {
+                                return Some(Self::try_sizeof_type_spec(other)? as i64);
+                            }
+                        }
+                    }
+                }
+                _ => None,
+            },
+            _ => Self::eval_const_int_expr(expr),
+        }
+    }
+
     /// Parse vector_size(expr) attribute.
     fn parse_vector_size_attr(&mut self) {
         if !matches!(self.peek(), TokenKind::LParen) {
@@ -1394,6 +1459,16 @@ impl Parser {
         };
         if let Some(size) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
             self.attrs.parsing_vector_size = Some(size as usize);
+        } else if let Some(size) = self.eval_vector_size_with_typedefs(&expr) {
+            // The static evaluator cannot resolve sizeof(typedef-name)
+            // (typedef sizes live in parser state); retry with the
+            // typedef-aware walk so e.g. `vector_size(16 * sizeof(int64_t))`
+            // resolves right here.
+            self.attrs.parsing_vector_size = Some(size as usize);
+        } else {
+            // Not parse-time evaluable (e.g. sizeof(struct typedef)): defer
+            // the raw expression to sema, where all sizes are resolved.
+            self.attrs.parsing_vector_size_expr = Some(Box::new(expr));
         }
         if matches!(self.peek(), TokenKind::RParen) {
             self.advance();

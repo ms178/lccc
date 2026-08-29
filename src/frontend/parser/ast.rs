@@ -353,6 +353,10 @@ pub struct Declaration {
     /// Clang __attribute__((ext_vector_type(N))): number of vector elements.
     /// Resolved to total bytes in lowering via N * sizeof(element_type).
     pub ext_vector_nelem: Option<usize>,
+    /// Deferred vector_size(EXPR): EXPR was not parse-time evaluable (e.g.
+    /// `16 * sizeof(some_typedef)`); resolved in sema where typedef sizes are
+    /// known.
+    pub vector_size_expr: Option<Box<Expr>>,
     pub span: Span,
 }
 
@@ -409,6 +413,11 @@ impl Declaration {
     #[inline]
     pub fn set_typedef(&mut self, v: bool) {
         self.set_flag(decl_flag::TYPEDEF, v)
+    }
+    /// Attach the deferred (parse-time unevaluable) vector_size expression.
+    #[inline]
+    pub fn set_vector_size_expr(&mut self, e: Option<Box<Expr>>) {
+        self.vector_size_expr = e;
     }
     #[inline]
     pub fn set_const(&mut self, v: bool) {
@@ -467,6 +476,7 @@ impl Declaration {
             address_space,
             vector_size,
             ext_vector_nelem,
+            vector_size_expr: None,
             span,
         }
     }
@@ -517,6 +527,7 @@ impl std::fmt::Debug for Declaration {
             .field("address_space", &self.address_space)
             .field("vector_size", &self.vector_size)
             .field("ext_vector_nelem", &self.ext_vector_nelem)
+            .field("vector_size_expr", &self.vector_size_expr)
             .field("span", &self.span)
             .finish()
     }

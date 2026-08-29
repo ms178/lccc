@@ -213,7 +213,15 @@ impl Lowerer {
         }
 
         let src = self.lower_expr(inner);
-        let mut from_ty = self.get_expr_type(inner);
+        // Use the VALUE type (the defining instruction's actual result width,
+        // mirroring lower_arithmetic_binop), not the storage-level annotation.
+        // get_expr_type reports the widened carrier type (I64 for int-op-
+        // literal on LP64), which made `(long long)(4 * x)` — the inner mul
+        // materialized as a 32-bit imull with a 4-byte home — look like an
+        // I64->I64 identity: the zero-extension was dropped and the later
+        // 64-bit compare read the stale upper half of the 4-byte home
+        // (gcc.c-torture pr81588, amd64 at every opt level).
+        let mut from_ty = self.value_ir_type(inner);
         let to_ty = self.type_spec_to_ir(target_type);
 
         if let Expr::Identifier(name, _) = inner {
