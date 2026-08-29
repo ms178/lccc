@@ -43,9 +43,13 @@ fn cmp_version(a: &str, b: &str) -> std::cmp::Ordering {
 
 impl Driver {
     fn enable_x86_avx_profile(&mut self) {
-        if !self.sse_explicitly_disabled {
-            self.no_sse = false;
+        // Explicit `-mno-sse` is sticky against `-march=` CPU profiles (GCC).
+        // Do not set AVX/SSE feature bits either: `avx2_enabled` would otherwise
+        // still select `vmovdqu` for 64-byte copies while CR4.OSFXSR=0.
+        if self.sse_explicitly_disabled {
+            return;
         }
+        self.no_sse = false;
         self.enable_avx = true;
         self.enable_sse4_2 = true;
         self.enable_sse4_1 = true;
@@ -54,25 +58,38 @@ impl Driver {
     }
     fn enable_x86_avx2_profile(&mut self) {
         self.enable_x86_avx_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_avx2 = true;
     }
     fn enable_x86_v3_profile(&mut self) {
         self.enable_x86_avx2_profile();
-        self.enable_f16c = true;
-        self.enable_fma = true;
+        // BMI/LZCNT/MOVBE are integer ISA and remain legal under `-mno-sse`.
         self.enable_bmi = true;
         self.enable_bmi2 = true;
         self.enable_lzcnt = true;
         self.enable_movbe = true;
+        if self.sse_explicitly_disabled {
+            return;
+        }
+        self.enable_f16c = true;
+        self.enable_fma = true;
     }
     fn enable_x86_haswell_profile(&mut self) {
         self.enable_x86_v3_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_aes = true;
         self.enable_pclmul = true;
         self.enable_rdrnd = true;
     }
     fn enable_x86_avx512_profile(&mut self) {
         self.enable_x86_v3_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_avx512f = true;
         self.enable_avx512cd = true;
         self.enable_avx512dq = true;
@@ -111,6 +128,9 @@ impl Driver {
     }
     fn enable_x86_knl_profile(&mut self) {
         self.enable_x86_v3_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_pclmul = true;
         self.enable_rdrnd = true;
         self.enable_avx512f = true;
@@ -120,6 +140,9 @@ impl Driver {
     }
     fn enable_x86_znver3_profile(&mut self) {
         self.enable_x86_haswell_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_vaes = true;
         self.enable_vpclmulqdq = true;
     }
@@ -133,9 +156,10 @@ impl Driver {
         self.enable_avx512vp2intersect = true;
     }
     fn enable_x86_nehalem_profile(&mut self) {
-        if !self.sse_explicitly_disabled {
-            self.no_sse = false;
+        if self.sse_explicitly_disabled {
+            return;
         }
+        self.no_sse = false;
         self.enable_sse3 = true;
         self.enable_ssse3 = true;
         self.enable_sse4_1 = true;
@@ -167,6 +191,9 @@ impl Driver {
     }
     fn enable_x86_alderlake_profile(&mut self) {
         self.enable_x86_haswell_profile();
+        if self.sse_explicitly_disabled {
+            return;
+        }
         self.enable_avxvnni = true;
         self.enable_gfni = true;
         self.enable_vaes = true;
@@ -1068,8 +1095,15 @@ impl Driver {
                 "-mxsave" | "-mxsaveopt" | "-mxsavec" | "-mno-xsave" | "-mno-xsaveopt"
                 | "-mno-xsavec" => {}
                 "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
-                "-mavx2" => self.enable_x86_avx2_profile(),
+                "-mavx2" => {
+                    // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
+                    self.no_sse = false;
+                    self.sse_explicitly_disabled = false;
+                    self.enable_x86_avx2_profile();
+                }
                 "-mavx" => {
+                    self.no_sse = false;
+                    self.sse_explicitly_disabled = false;
                     self.enable_avx = true;
                     self.enable_sse4_2 = true;
                     self.enable_sse4_1 = true;
@@ -1103,7 +1137,17 @@ impl Driver {
                     self.sse_explicitly_disabled = false;
                 }
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
-                "-mgeneral-regs-only" => self.general_regs_only = true,
+                "-mgeneral-regs-only" => {
+                    self.general_regs_only = true;
+                    self.no_sse = true;
+                    self.sse_explicitly_disabled = true;
+                    self.enable_sse3 = false;
+                    self.enable_ssse3 = false;
+                    self.enable_sse4_1 = false;
+                    self.enable_sse4_2 = false;
+                    self.enable_avx = false;
+                    self.enable_avx2 = false;
+                }
                 "-mcmodel=kernel" => self.code_model_kernel = true,
                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
                 | "-mcmodel=large" => {
@@ -2135,5 +2179,33 @@ mod cli_tests {
             .collect();
         d2.parse_cli_args(&args2).ok();
         assert!(d2.linker_ordered_items.iter().any(|i| i == "-Wl,-e,main"));
+    }
+
+    /// `-mno-sse -march=haswell` must not set AVX2: the 64-byte memcpy path
+    /// keys off `avx2_enabled` and would otherwise emit `vmovdqu`.
+    #[test]
+    fn mno_sse_survives_march_haswell_without_avx() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "-march=haswell", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.no_sse);
+        assert!(!d.enable_avx);
+        assert!(!d.enable_avx2);
+        assert!(d.enable_bmi, "integer BMI remains legal under -mno-sse");
+    }
+
+    #[test]
+    fn mavx_reenable_after_mno_sse() {
+        let mut d = Driver::new();
+        let args: Vec<String> = ["ccc", "-mno-sse", "-mavx", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(!d.no_sse);
+        assert!(d.enable_avx);
     }
 }
