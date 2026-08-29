@@ -25,8 +25,42 @@ impl X86Codegen {
         }
     }
 
-    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add offsets.
-    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds).
+    /// Extract a constant i64 from an Operand, following Copy chains.
+    fn operand_const_i64(&self, op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Const(c) => c.to_i64(),
+            Operand::Value(v) => {
+                let mut cur = v.0;
+                let mut visited = 0;
+                loop {
+                    if visited > 16 {
+                        return None;
+                    }
+                    visited += 1;
+                    let inst = self.get_defining_instruction(cur)?;
+                    match inst {
+                        Instruction::Copy { src, .. } => match src {
+                            Operand::Const(c) => return c.to_i64(),
+                            Operand::Value(nv) => cur = nv.0,
+                        },
+                        Instruction::Cast { src, .. } => match src {
+                            Operand::Const(c) => return c.to_i64(),
+                            Operand::Value(nv) => cur = nv.0,
+                        },
+                        _ => return None,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve a Value chain that ends in GlobalAddr, accumulating GEP/Add/Sub/Cast offsets.
+    /// Returns (symbol_name, total_offset) if the chain is GlobalAddr (+ GEPs/Copies/Adds/Subs/Casts).
+    /// This is the paravirt fast-path: `pv_ops` is a struct of function pointers, so
+    /// `Load(GEP(GlobalAddr pv_ops, off))` must become `call *pv_ops+off(%rip)` (ff 15)
+    /// for `apply_alternatives` to patch. The resolver is intentionally generous:
+    /// it follows Cast (bitcast/ptrtoint/inttoptr), Copy, Add (Value+Const), Sub (Value-Const),
+    /// and GEP with const or Copy-of-const offsets, with checked arithmetic and 64-hop bound.
     fn resolve_global_addr_chain(&self, mut val_id: u32, mut acc: i64) -> Option<(String, i64)> {
         let mut visited = 0;
         loop {
@@ -37,34 +71,54 @@ impl X86Codegen {
             let inst = self.get_defining_instruction(val_id)?;
             match inst {
                 Instruction::GlobalAddr { name, .. } => {
-                    return Some((name.clone(), acc));
+                    // Strip version suffix for GAS: `sym@VER+off(%rip)` is rejected by gas 2.47,
+                    // while `sym+off(%rip)` with base name is accepted and linker resolves version.
+                    let base = name.split('@').next().unwrap_or(name).to_string();
+                    return Some((base, acc));
                 }
                 Instruction::GetElementPtr { base, offset, .. } => {
-                    let off = match offset {
-                        Operand::Const(c) => c.to_i64()?,
-                        _ => return None,
-                    };
+                    let off = self.operand_const_i64(offset)?;
                     acc = acc.checked_add(off)?;
                     val_id = base.0;
                 }
                 Instruction::Copy { src, .. } => match src {
                     Operand::Value(v) => val_id = v.0,
+                    Operand::Const(_) => return None, // Copy of const is not a global chain
+                },
+                Instruction::Cast { src, .. } => match src {
+                    Operand::Value(v) => val_id = v.0,
+                    Operand::Const(_) => return None,
+                },
+                Instruction::BinOp { op, lhs, rhs, .. } => match op {
+                    IrBinOp::Add => {
+                        let (base_val, const_off) = match (lhs, rhs) {
+                            (Operand::Value(v), c) => {
+                                let co = self.operand_const_i64(c)?;
+                                (v.0, co)
+                            }
+                            (c, Operand::Value(v)) => {
+                                let co = self.operand_const_i64(c)?;
+                                (v.0, co)
+                            }
+                            _ => return None,
+                        };
+                        acc = acc.checked_add(const_off)?;
+                        val_id = base_val;
+                    }
+                    IrBinOp::Sub => {
+                        // Only Value - Const is representable as sym+off (off decreases)
+                        let (base_val, const_off) = match (lhs, rhs) {
+                            (Operand::Value(v), c) => {
+                                let co = self.operand_const_i64(c)?;
+                                (v.0, co)
+                            }
+                            _ => return None,
+                        };
+                        acc = acc.checked_sub(const_off)?;
+                        val_id = base_val;
+                    }
                     _ => return None,
                 },
-                Instruction::BinOp {
-                    op: IrBinOp::Add,
-                    lhs,
-                    rhs,
-                    ..
-                } => {
-                    let (base_val, const_off) = match (lhs, rhs) {
-                        (Operand::Value(v), Operand::Const(c)) => (v.0, c.to_i64()?),
-                        (Operand::Const(c), Operand::Value(v)) => (v.0, c.to_i64()?),
-                        _ => return None,
-                    };
-                    acc = acc.checked_add(const_off)?;
-                    val_id = base_val;
-                }
                 _ => return None,
             }
         }
@@ -73,6 +127,7 @@ impl X86Codegen {
     /// Try to resolve an indirect call's func_ptr Operand to a global+offset.
     /// The func_ptr is expected to be Value(Load(ptr)), where ptr is GEP chain
     /// ending in GlobalAddr (e.g. pv_ops+72). Returns Some((sym, off)) if so.
+    /// Also handles the case where Load was folded or func_ptr itself is the GEP chain.
     fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<(String, i64)> {
         let v = match op {
             Operand::Value(v) => v,
@@ -80,10 +135,32 @@ impl X86Codegen {
         };
         let inst = self.get_defining_instruction(v.0)?;
         match inst {
-            Instruction::Load { ptr, .. } => self.resolve_global_addr_chain(ptr.0, 0),
-            // In case the Load was already folded or func_ptr is directly a GEP'd global
-            // address that was loaded via slot (defensive), try resolving the value itself.
-            _ => self.resolve_global_addr_chain(v.0, 0),
+            Instruction::Load { ptr, .. } => {
+                // If the loaded pointer's defining chain is global+off, we can emit direct call.
+                // Guard against GOT/TLS/absolute symbols that need different addressing.
+                let (sym, off) = self.resolve_global_addr_chain(ptr.0, 0)?;
+                // Don't use RIP-relative call for symbols that need GOT or are TLS/absolute —
+                // those would need GOTPCREL or fs: addressing, not plain *sym(%rip).
+                if self.state.needs_got_for_addr(&sym)
+                    || self.state.tls_symbols.contains(&sym)
+                    || self.state.absolute_symbols.contains(&sym)
+                {
+                    return None;
+                }
+                Some((sym, off))
+            }
+            // Defensive: func_ptr itself might be the GEP chain (if Load was optimized away
+            // or value is in slot that holds address, not loaded value). Try resolving it.
+            _ => {
+                let (sym, off) = self.resolve_global_addr_chain(v.0, 0)?;
+                if self.state.needs_got_for_addr(&sym)
+                    || self.state.tls_symbols.contains(&sym)
+                    || self.state.absolute_symbols.contains(&sym)
+                {
+                    return None;
+                }
+                Some((sym, off))
+            }
         }
     }
 

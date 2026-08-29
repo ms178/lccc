@@ -7627,10 +7627,37 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
     }
 
-    // Step 3: Replace the body with FOUR FmaF64x4 (4-way software pipeline).
+    // Hoist the loop-invariant A[i][k] scalar broadcast to the preheader.
+    // Backend keeps it in ymm1, reused across all 4 FMA lanes (saves 3× vmovsd+vbroadcastsd per iter).
+    if let Some(preheader_idx) = func.blocks.iter().enumerate().find_map(|(idx, block)| {
+        if pattern.loop_blocks.contains(&idx) {
+            return None;
+        }
+        matches!(block.terminator, Terminator::Branch(label)
+            if label == func.blocks[pattern.header_idx].label)
+        .then_some(idx)
+    }) {
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::BroadcastLoadF64,
+                dest_ptr: None,
+                args: vec![Operand::Value(pattern.a_ptr)],
+            });
+        changes += 1;
+        if debug {
+            eprintln!(
+                "[VEC]   Hoisted BroadcastLoadF64 for A ptr Value({}) into preheader block {}",
+                pattern.a_ptr.0, preheader_idx
+            );
+        }
+    }
+
+    // Step 3: Replace the body with FOUR FmaF64x4Hoisted (4-way software pipeline).
     // Chunks at byte offsets IV+{0,32,64,96}. Independent C/B lanes give the
     // backend four concurrent vfmadd231pd chains — the shape GCC emits for
-    // the 256³ matmul kernel on x86-64-v3.
+    // the 256³ matmul kernel on x86-64-v3. A broadcast is already in ymm1.
     {
         let body = &mut func.blocks[pattern.body_idx];
         let store_pos = body.instructions.iter().position(
@@ -7664,9 +7691,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         // Chunk 0 uses the existing GEPs.
         prelude.push(Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x4,
+            op: IntrinsicOp::FmaF64x4Hoisted,
             dest_ptr: Some(pattern.c_gep),
-            args: vec![Operand::Value(pattern.a_ptr), Operand::Value(pattern.b_gep)],
+            args: vec![Operand::Value(pattern.b_gep)],
         });
         for chunk in 1u64..4 {
             let byte_off = chunk * 32;
@@ -7706,9 +7733,9 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
             });
             prelude.push(Instruction::Intrinsic {
                 dest: None,
-                op: IntrinsicOp::FmaF64x4,
+                op: IntrinsicOp::FmaF64x4Hoisted,
                 dest_ptr: Some(c_gep_n),
-                args: vec![Operand::Value(pattern.a_ptr), Operand::Value(b_gep_n)],
+                args: vec![Operand::Value(b_gep_n)],
             });
         }
 
@@ -7722,7 +7749,7 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
         }
         changes += 4;
         if debug {
-            eprintln!("[VEC]   Inserted quad FmaF64x4 intrinsics (step 128)");
+            eprintln!("[VEC]   Inserted quad FmaF64x4Hoisted intrinsics (step 128) with broadcast in ymm1");
         }
     }
 
