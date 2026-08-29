@@ -529,6 +529,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
         changed |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
         changed |= thread_spill_slots(&mut lines, &mut kinds, n);
+        changed |= hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
+        let n = lines.len();
         changed |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
         changed |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
         changed |= fold_zero_stores(&mut lines, &mut kinds, n);
@@ -583,6 +585,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= fuse_fp_adjacent_pairs(&mut lines, &mut kinds, n);
             changed2 |= eliminate_repeated_slot_loads(&mut lines, &mut kinds, n);
             changed2 |= thread_spill_slots(&mut lines, &mut kinds, n);
+            changed2 |= hoist_loop_invariant_remats(&mut lines, &mut kinds, n);
+            let n = lines.len();
             changed2 |= cse_adrp_remat_pairs(&mut lines, &mut kinds, n);
             changed2 |= fold_destructive_pointer_updates(&mut lines, &mut kinds, n);
             changed2 |= fold_zero_stores(&mut lines, &mut kinds, n);
@@ -4755,6 +4759,320 @@ fn cse_adrp_remat_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
     changed
 }
 
+// ── Pass 8: loop-invariant rematerialisation hoisting ───────────────────────
+//
+// The RA rematerialises pure values (big constants via movz/movk, global
+// addresses via adrp+add, spilled frame addresses via sp-slot loads) AT EACH
+// USE. Inside a loop every use is per-iteration, so hot loops re-execute the
+// same pure sequence every trip (ring_fifo: `movz x0, #20000` at the header
+// AND the latch; the ring base address reloaded from [sp,#16] per push).
+// GCC/clang sink the constant into a register before the loop. DECISIONS.md
+// [history/session41] blesses exactly this transform for the x86-64 PIE
+// `leaq` shape ("hoisting is correct *and* profitable"); this is the AArch64
+// twin.
+//
+// Operative rule for a def-sequence D at position p (loop [T..L], backedge
+// at L, loop top label at T):
+//   * D is pure: `movz xD,#imm` (+ contiguous movk chain on xD),
+//     `adrp xD,sym` [+ `add xD,xD,:lo12:sym`], or `ldr xD,[sp,#off]`;
+//   * the loop is call-free (a caller-saved dest would die at the call —
+//     the original re-def at p is what saved it) and has a single backedge
+//     (no other branch targets .Ltop);
+//   * p is at the TOP of the header block: no mention of xD between the
+//     label and p, and every mention of xD after p WITHIN the header block
+//     is use-first (a reader of D's value);
+//   * every OTHER def of xD in the loop is a textually identical sequence
+//     (so xD carries the same value at every in-loop point both before and
+//     after the transform); sp-slot loads additionally require no store in
+//     the loop overlapping [off-7, off+7];
+//   * transform: copy D above the loop-top label, delete the header copy.
+//     Cross-block, same-value co-defs stay (they rewrite xD with the same
+//     constant — harmless), and post-loop readers still see the constant.
+//
+// Kill switch: CCC_NO_INVAR_HOIST.
+
+/// A maximal contiguous pure def-sequence starting at `idx`: returns the
+/// sequence length and its dest register, or None. Sequences: movz [+movk*],
+/// adrp [+ paired add], ldr-from-sp (single line).
+fn pure_def_sequence(lines: &[String], kinds: &[LineKind], n: usize, idx: usize) -> Option<(usize, u8)> {
+    let t = lines[idx].trim_start();
+    // movz + contiguous movk chain
+    if let Some(rest) = t.strip_prefix("movz ") {
+        let dst = parse_reg(rest.split(',').next()?.trim());
+        if dst == REG_NONE || dst >= 31 {
+            return None;
+        }
+        let mut len = 1;
+        let mut j = idx + 1;
+        while j < n {
+            let tj = lines[j].trim_start();
+            if let Some(rj) = tj.strip_prefix("movk ") {
+                let dj = parse_reg(rj.split(',').next()?.trim());
+                if dj == dst {
+                    len += 1;
+                    j += 1;
+                    continue;
+                }
+            }
+            if kinds[j] == LineKind::Nop {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        return Some((len, dst));
+    }
+    // adrp [+ paired add]
+    if let Some((dst, sym)) = parse_adrp_only(&lines[idx]) {
+        let mut len = 1;
+        let mut j = idx + 1;
+        while j < n && kinds[j] == LineKind::Nop {
+            j += 1;
+        }
+        if j < n {
+            if let Some((d2, s2, sym2)) = parse_adrp_pair_add(&lines[j]) {
+                if d2 == dst && s2 == dst && sym2 == sym {
+                    len = 2;
+                }
+            }
+        }
+        return Some((len, dst));
+    }
+    // sp-slot load
+    if let LineKind::LoadSp { reg, offset, .. } = kinds[idx] {
+        if sp_offsets_in_line(t).len() == 1 && sp_offsets_in_line(t)[0] == offset {
+            return Some((1, reg));
+        }
+    }
+    None
+}
+
+/// Is the line a jump/call whose target label equals `label`?
+fn branch_targets(line: &str, kind: LineKind, label: &str) -> bool {
+    match kind {
+        LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch => {
+            line.split_whitespace().any(|tok| tok == label)
+        }
+        _ => false,
+    }
+}
+
+fn hoist_loop_invariant_remats(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, mut n: usize) -> bool {
+    if std::env::var("CCC_NO_INVAR_HOIST").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    // Collect backward branches first (indices stable this pass: no inserts
+    // happen until a transform commits, and after a commit we restart).
+    let mut i = 0;
+    while i < n {
+        let is_backedge = matches!(
+            kinds[i],
+            LineKind::Branch | LineKind::CondBranch | LineKind::CmpBranch
+        );
+        if !is_backedge {
+            i += 1;
+            continue;
+        }
+        // Backedge target: the referenced label defined EARLIER.
+        let target: String = {
+            let toks: Vec<&str> = lines[i].split_whitespace().collect();
+            match toks.into_iter().rev().find(|t| t.starts_with('.')) {
+                Some(t) => t.trim_end_matches(':').to_string(),
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        };
+        let target = target.as_str();
+        let Some(top) = (0..i).rev().find(|&k| {
+            kinds[k] == LineKind::Label && lines[k].trim().trim_end_matches(':') == target
+        }) else {
+            i += 1;
+            continue;
+        };
+
+        // ── loop validity ──
+        // Entry edges into the loop top are the fallthrough and branches
+        // from ABOVE the top (handled by inserting copies at each such
+        // branch below). Branches from INSIDE the loop region to the top
+        // are additional backedges — sound without copies, because nothing
+        // in the loop defines dest after the transform (the value persists
+        // across them).
+        // Call-free loop.
+        if (top..=i).any(|k| kinds[k] == LineKind::Call) {
+            i += 1;
+            continue;
+        }
+        // Candidate scan: every position in the loop, starting at the top.
+        // The dest must be SELF-CONTAINED: defined exactly once (here), not
+        // mentioned before, and only read afterwards — then hoisting the
+        // pure sequence above the loop top preserves every value (the def
+        // executes once instead of once per trip; every reader sees the same
+        // constant/address either way).
+        let mut transformed = false;
+        let mut k = top;
+        while k <= i {
+            if kinds[k] == LineKind::Nop || lines[k].trim_start().starts_with(".cfi") {
+                k += 1;
+                continue;
+            }
+            let Some((seq_len, dest)) = pure_def_sequence(lines, kinds, n, k) else {
+                k += 1;
+                continue;
+            };
+            let seq_end = k + seq_len;
+            // No other def of dest anywhere in the loop.
+            let mut other_def = false;
+            let mut m = top;
+            while m <= i {
+                if m >= k && m < seq_end {
+                    m = seq_end;
+                    continue;
+                }
+                if kinds[m] != LineKind::Nop
+                    && !lines[m].trim_start().starts_with(".cfi")
+                    && line_defines_gp(&lines[m], kinds[m], dest) == Some(true)
+                {
+                    other_def = true;
+                    break;
+                }
+                m += 1;
+            }
+            if other_def {
+                k += 1;
+                continue;
+            }
+            // No mention of dest anywhere in the loop before the sequence.
+            if (top..k).any(|m| line_mentions_reg(&lines[m], dest)) {
+                k += 1;
+                continue;
+            }
+            // All mentions after the sequence (to the backedge) are
+            // use-first readers.
+            let mut readers_ok = true;
+            let mut m = seq_end;
+            while m <= i {
+                if line_mentions_reg(&lines[m], dest)
+                    && line_defines_gp(&lines[m], kinds[m], dest) != Some(false)
+                {
+                    readers_ok = false;
+                    break;
+                }
+                m += 1;
+            }
+            if !readers_ok {
+                k += 1;
+                continue;
+            }
+            // sp-slot loads: no overlapping store anywhere in the loop.
+            if lines[k].trim_start().starts_with("ldr ") {
+                let off = match kinds[k] {
+                    LineKind::LoadSp { offset, .. } => offset,
+                    _ => unreachable!(),
+                };
+                let mut bad = false;
+                let mut m = top;
+                while m <= i {
+                    if let LineKind::StoreSp { offset: so, .. } = kinds[m] {
+                        if (so - off).abs() < 8 {
+                            bad = true;
+                            break;
+                        }
+                    } else if matches!(kinds[m], LineKind::MemOther | LineKind::Other) {
+                        let t = lines[m].trim_start();
+                        if t.starts_with("str ") || t.starts_with("stur ") || t.starts_with("stp ") {
+                            for o in sp_offsets_in_line(t) {
+                                if (o - off).abs() < 8 {
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if bad {
+                        break;
+                    }
+                    m += 1;
+                }
+                if bad {
+                    k += 1;
+                    continue;
+                }
+            }
+
+            // Dest must be dead after the loop: on paths whose seq block did
+            // not run, the register held an older value — post-loop readers
+            // must not observe the change.
+            if ((i + 1)..n).any(|m| line_mentions_reg(&lines[m], dest)) {
+                k += 1;
+                continue;
+            }
+
+            // Entry edges: fallthrough (handled by inserting before the
+            // label) plus every branch from ABOVE the loop that targets the
+            // top. Entry branches must not read dest (the copy would change
+            // what they see). Branches from inside the loop region to the
+            // top are backedges — dest persists across them (nothing in the
+            // loop defines it), no copy needed.
+            let mut entry_branches: Vec<usize> = Vec::new();
+            let mut ok = true;
+            for m in 0..top {
+                if branch_targets(&lines[m], kinds[m], target) {
+                    if line_mentions_reg(&lines[m], dest) {
+                        ok = false;
+                        break;
+                    }
+                    entry_branches.push(m);
+                }
+            }
+            if !ok {
+                k += 1;
+                continue;
+            }
+
+            // ── transform: delete the in-loop sequence first (indices are
+            //    still valid), then insert copies before every entry branch
+            //    (descending order keeps earlier indices valid), then insert
+            //    the fallthrough copy right before the (relocated) label. ──
+            let seq_lines: Vec<String> = (k..seq_end).map(|q| lines[q].clone()).collect();
+            let seq_kinds: Vec<LineKind> = (k..seq_end).map(|q| kinds[q].clone()).collect();
+            for _ in 0..seq_len {
+                lines.remove(k);
+                kinds.remove(k);
+            }
+            for &b in entry_branches.iter().rev() {
+                for (off, l) in seq_lines.iter().enumerate() {
+                    lines.insert(b + off, l.clone());
+                    kinds.insert(b + off, seq_kinds[off].clone());
+                }
+            }
+            let label_idx = (0..lines.len())
+                .find(|&q| {
+                    kinds[q] == LineKind::Label
+                        && lines[q].trim().trim_end_matches(':') == target
+                })
+                .unwrap_or(top);
+            for (off, l) in seq_lines.iter().enumerate() {
+                lines.insert(label_idx + off, l.clone());
+                kinds.insert(label_idx + off, seq_kinds[off].clone());
+            }
+            transformed = true;
+            break;
+        }
+        if transformed {
+            changed = true;
+            n = lines.len();
+            i = 0; // loop shape changed: rescan
+            continue;
+        }
+        i += 1;
+        continue;
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4925,6 +5243,130 @@ mod tests {
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("ldrsw"));
         assert!(result.contains("sxtw x0, w1"));
+    }
+
+    // ── Pass 8: loop-invariant remat hoisting tests ────────────────────
+
+    #[test]
+    fn test_invar_hoist_slot_load() {
+        // The seed load sits in a conditional block inside the loop; the
+        // slot is written only before the loop. The load moves above the
+        // loop top (and before the entry branch), the loop body loses it.
+        let input = concat!(
+            "main:\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            "    b.lt .LBB10\n",
+            "    ldr w2, [sp, #40]\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    add w3, w2, #1\n",
+            "    add w20, w20, #1\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        let body = result.split(".LBB10:").nth(1).unwrap_or("");
+        let body_end = body.find("    ret").unwrap_or(body.len());
+        let loop_body = &body[..body_end];
+        assert!(
+            !loop_body.contains("[sp, #40]"),
+            "load not hoisted from loop body:\n{}",
+            result
+        );
+        // Empirically-verified shape: exactly one hoisted copy directly
+        // before the loop-top label (outside the loop text), the entry
+        // branch fed by an equivalent pure def (pass 6 may thread it to
+        // `mov w2, w0` — value-identical), and w2 defined on every entry.
+        let pre = &result[..result.find(".LBB10:").unwrap()];
+        assert_eq!(
+            pre.matches("ldr w2, [sp, #40]").count(),
+            1,
+            "label copy missing or duplicated:\n{}",
+            result
+        );
+        assert!(
+            pre.contains("mov w2, w0") || pre.contains("ldr w2, [sp, #40]\n    b.lt"),
+            "entry path not fed:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_invar_hoist_blocked_by_in_loop_store() {
+        // The loop stores into the slot: the load must stay.
+        let input = concat!(
+            "main:\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            "    b.lt .LBB10\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    add w3, w2, #1\n",
+            "    str w3, [sp, #40]\n",
+            "    add w20, w20, #1\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        assert!(
+            after.starts_with("    ldr w2, [sp, #40]"),
+            "load moved despite in-loop store:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_invar_hoist_blocked_by_post_loop_reader() {
+        // x1 is read after the loop: paths that skip the original def block
+        // would observe a changed value.
+        let input = concat!(
+            "main:\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            "    b.lt .LBB10\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    add w20, w20, #1\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    add w5, w2, #9\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        assert!(
+            after.starts_with("    ldr w2, [sp, #40]"),
+            "hoisted despite post-loop reader:\n{}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_invar_hoist_blocked_by_call() {
+        let input = concat!(
+            "main:\n",
+            "    mov w0, #7\n",
+            "    str w0, [sp, #40]\n",
+            "    b.lt .LBB10\n",
+            ".LBB10:\n",
+            "    ldr w2, [sp, #40]\n",
+            "    bl helper\n",
+            "    add w20, w20, #1\n",
+            "    cmp w20, #100\n",
+            "    b.lt .LBB10\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(input.to_string());
+        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        assert!(
+            after.starts_with("    ldr w2, [sp, #40]"),
+            "hoisted despite call in loop:\n{}",
+            result
+        );
     }
 
     // ── Pass 6: spill-slot threading tests ─────────────────────────────

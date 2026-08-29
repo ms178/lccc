@@ -452,6 +452,8 @@ pub fn peephole_optimize(asm: String) -> String {
         changed = false;
         changed |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
         changed |= eliminate_redundant_jumps(&lines, &mut kinds, n);
+        changed |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
+        changed |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
         changed |= eliminate_self_moves(&mut kinds, n);
         changed |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
         changed |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
@@ -479,6 +481,8 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 = false;
             changed2 |= eliminate_adjacent_store_load(&mut lines, &mut kinds, n);
             changed2 |= eliminate_redundant_jumps(&lines, &mut kinds, n);
+            changed2 |= rewrite_far_jumps_to_near(&mut lines, &mut kinds, n);
+            changed2 |= eliminate_redundant_sext_w(&lines, &mut kinds, n);
             changed2 |= eliminate_self_moves(&mut kinds, n);
             changed2 |= eliminate_redundant_mv_chain(&mut lines, &mut kinds, n);
             changed2 |= eliminate_li_mv_chain(&mut lines, &mut kinds, n);
@@ -542,6 +546,200 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
                             changed = true;
                         }
                     }
+                }
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+
+// ── Pass 6: far-jump → near-jump rewrite (auipc;jr → jal) ───────────────────
+//
+// Codegen emits every unconditional transition as `jump .Lxxx, t6`, which the
+// assembler encodes as auipc+jalr (2 instructions, 8 bytes, and a t6
+// dependency). For targets inside the same function, the plain `j` pseudo
+// (jal x0) is one 4-byte instruction — the recorded census item
+// "auipc;jr vs j". jal's range is ±1 MiB; a rewrite is only sound when the
+// target label provably lives in the same function AND the function is far
+// below the range limit, so cross-function and huge-function jumps keep the
+// unlimited-range form. Function extents are delimited by column-0 labels.
+
+fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_JUMP_NEAR").is_ok() {
+        return false;
+    }
+    // Function extents: [start, end) pairs delimited by column-0 labels.
+    let mut changed = false;
+    let mut start = 0;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && !(lines[end].starts_with(char::is_alphabetic) && kinds[end] != LineKind::Nop)
+        {
+            end += 1;
+        }
+        // Instruction budget for the jal range: 4 bytes each, stay below
+        // 1 MiB with a 4x margin for pseudo-expansion.
+        let mut insn_count = 0usize;
+        let mut range_ok = true;
+        for k in start..end {
+            if !matches!(
+                kinds[k],
+                LineKind::Label | LineKind::Nop | LineKind::Directive
+            ) {
+                insn_count += 1;
+                if insn_count > 100_000 {
+                    range_ok = false;
+                    break;
+                }
+            }
+        }
+        if range_ok {
+            // Label positions within this function.
+            for k in start..end {
+                if kinds[k] != LineKind::Jump {
+                    continue;
+                }
+                let Some(target) = jump_target(&lines[k]) else {
+                    continue;
+                };
+                if !lines[k].trim_start().starts_with("jump ") {
+                    continue;
+                }
+                // Local label only (never a function symbol / tail call).
+                if !target.starts_with(".L") {
+                    continue;
+                }
+                let found = (start..end).any(|m| {
+                    kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target)
+                });
+                if !found {
+                    continue;
+                }
+                lines[k] = format!("    j {}", target);
+                changed = true;
+            }
+        }
+        start = end;
+    }
+    changed
+}
+
+// ── Pass 7: redundant sext.w elimination ────────────────────────────────────
+//
+// `sext.w rD, rS` re-sign-extends the low 32 bits. It is a no-op when rS
+// already holds a sign-extended-32 value ("sext-wide"). Within one basic
+// block we track the sext-wide set conservatively:
+//   li (imm12 sign-extended), lui, sext.w, W-suffix ALU (addw/subw/mulw/
+//   divw/remw/sllw/srlw/sraw and their u-forms), lw, slli/srli with n>=1
+//   (zero upper bits ⇒ sext-wide), srai, and mv from a sext-wide register
+//   all PRODUCE sext-wide values; ld and 64-bit ALU (add/sub/mul/...),
+//   lla/la, jal/jalr results do not. A call clears every caller-saved
+//   register; labels and branches clear everything (join point).
+// Only registers whose value provably equals signext(low32) may have the
+// following sext.w deleted — a missed deletion is a missed opt, never a
+// miscompile.
+
+fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
+    // (dst, is_sext_wide_producer) — None for unknown lines.
+    let t = line.trim();
+    let (mnem, rest) = t.split_once(' ')?;
+    match kind {
+        LineKind::LoadImm { dst } => Some((dst, true)), // li: sign-extended imm
+        LineKind::SextW { dst, .. } => Some((dst, true)),
+        LineKind::Move { dst, .. } => Some((dst, false)), // actual update below
+        LineKind::LoadS0 { reg, is_word, .. } => Some((reg, is_word)), // lw yes, ld no
+        LineKind::LoadAddr { dst } => Some((dst, false)),
+        LineKind::Alu => {
+            let dst = parse_reg(rest.split(',').next()?.trim());
+            if dst == REG_NONE {
+                return None;
+            }
+            let wide = matches!(
+                mnem,
+                "addw" | "subw" | "mulw" | "divw" | "divuw" | "remw" | "remuw"
+                    | "sllw" | "srlw" | "sraw" | "addiw" | "slli" | "srli" | "srai"
+            ) || mnem == "lui";
+            Some((dst, wide))
+        }
+        _ => None,
+    }
+}
+
+fn eliminate_redundant_sext_w(lines: &[String], kinds: &mut [LineKind], n: usize) -> bool {
+    if std::env::var("CCC_NO_SEXT_ELIM").is_ok() {
+        return false;
+    }
+    let mut changed = false;
+    // sext-wide set: bit per register id (0..=31 GPRs).
+    let mut wide: u64 = 0;
+    let mut i = 0;
+    while i < n {
+        match kinds[i] {
+            LineKind::Label | LineKind::Branch | LineKind::Ret | LineKind::Jump => {
+                wide = 0; // join point / boundary
+                i += 1;
+                continue;
+            }
+            LineKind::Call => {
+                // Caller-saved: t0-t6 (0..=6) and a0-a7 (30..=37). Keep s-regs.
+                for r in 0..=6u8 {
+                    wide &= !(1u64 << r);
+                }
+                for r in 30..=37u8 {
+                    wide &= !(1u64 << r);
+                }
+                i += 1;
+                continue;
+            }
+            LineKind::Nop | LineKind::Directive => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // sext.w candidate — ONLY the self form `sext.w rX, rX` may be
+        // deleted outright: even when the operation is a value no-op, the
+        // instruction DEFINES rD, and cross-register consumers (`bne t2, t1`
+        // after `sext.w t2, t0`) read that definition — deleting the
+        // cross-register form leaves them with a stale register
+        // (cfg_phi_web miscompile class). Self-form deletion requires rX to
+        // be provably sext-wide; the result is unchanged either way.
+        if let LineKind::SextW { dst, src } = kinds[i] {
+            if dst == src && wide & (1u64 << src) != 0 {
+                kinds[i] = LineKind::Nop;
+                changed = true;
+                i += 1;
+                continue;
+            }
+            wide |= 1u64 << dst; // sext.w always produces a sext-wide dest
+            i += 1;
+            continue;
+        }
+        // Def tracking.
+        let (dst, producer_sext) = match sext_producing_def(&lines[i], kinds[i]) {
+            Some(x) => x,
+            None => {
+                // Unknown line: clear nothing specific, be safe — clear all.
+                wide = 0;
+                i += 1;
+                continue;
+            }
+        };
+        match kinds[i] {
+            LineKind::Move { src, .. } => {
+                if wide & (1u64 << src) != 0 {
+                    wide |= 1u64 << dst;
+                } else {
+                    wide &= !(1u64 << dst);
+                }
+            }
+            _ => {
+                if producer_sext {
+                    wide |= 1u64 << dst;
+                } else {
+                    wide &= !(1u64 << dst);
                 }
             }
         }
@@ -1490,5 +1688,54 @@ mod tests {
             "Expected t1 propagated in add, got:\n{}",
             result
         );
+    }
+}
+
+#[cfg(test)]
+mod jump_near_tests {
+    use super::*;
+
+    #[test]
+    fn near_jump_rewrite_same_function() {
+        let input = "f:\n    li t0, 5\n    jump .L1, t6\n    mv t1, t0\n.L1:\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(
+            out.contains("    j .L1") && !out.contains("jump .L1, t6"),
+            "expected near jump:\n{}",
+            out
+        );
+    }
+
+    #[test]
+    fn far_jump_kept_when_target_is_external() {
+        // Tail-call / cross-function target: no local label — must stay `jump`.
+        let input = "f:\n    jump some_function, t6\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(out.contains("jump some_function, t6"), "\n{}", out);
+    }
+
+    #[test]
+    fn sext_self_form_deleted_only_when_sext_wide() {
+        // li produces a sign-extended-32 value -> `sext.w t0, t0` is a no-op.
+        let input = "f:\n    li t0, 7\n    sext.w t0, t0\n    mv t1, t0\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(!out.contains("sext.w t0, t0"), "\n{}", out);
+    }
+
+    #[test]
+    fn sext_self_form_kept_when_not_sext_wide() {
+        // ld does NOT produce a sext-wide value; the sext.w must survive.
+        let input = "f:\n    ld t0, 0(s0)\n    sext.w t0, t0\n    mv t1, t0\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(out.contains("sext.w t0, t0"), "\n{}", out);
+    }
+
+    #[test]
+    fn sext_cross_register_form_never_deleted() {
+        // Even a value no-op must survive: the instruction DEFINES t2, and
+        // `bne t2, t1` below reads it (cfg_phi_web miscompile class).
+        let input = "f:\n    li t0, 7\n    sext.w t2, t0\n    li t1, 0\n    bne t2, t1, .L1\n.L1:\n    ret\n";
+        let out = peephole_optimize(input.to_string());
+        assert!(out.contains("sext.w t2, t0"), "\n{}", out);
     }
 }

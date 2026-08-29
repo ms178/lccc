@@ -263,3 +263,44 @@ real-mode setup.
   dominated by RA slot-staging of loop-invariant constants/addresses — the
   recorded RA accumulator-machine item (DECISIONS-listed, do not interleave
   with MS-08/RA-06A).
+
+## Session S12 (820a1077) — ARM pass 8: loop-invariant remat hoisting
+
+- **Pass 8 (CCC_NO_INVAR_HOIST)**: hoists pure def-sequences (movz/movk
+  chains, adrp+add pairs, sp-slot loads) out of call-free loops when the
+  dest is self-contained (no other in-loop def, no mention before the seq,
+  only use-first readers after, dead after the loop). Entry edges are the
+  fallthrough plus branches from above the top — each gets a copy; the
+  in-region jumps to the top are backedges (dest persists, nothing defines
+  it in-loop). Net effect on real shapes (arm_gep_regbase_acc_cache,
+  gep_family_stride_cse, range_check_fold, vectorize_iv_dependent_base):
+  per-iteration loads leave the loop body — runtime win, size neutral.
+- Design limits (measured): the RA reuses x0/x1 temps heavily, so most
+  latch `movz` remats have a *different-value* co-def in the loop and are
+  correctly rejected — those need the RA to keep loop-invariant remat
+  candidates in dedicated registers (RA-06 territory, BACKLOG P0, Wimmer-
+  style; DECISIONS-gated). Pass 8 fired zero times on the benchmark corpus
+  (that corpus's loops keep remats in the latch with co-defs) but 4+
+  regression shapes hoist.
+- Gates: lib 1293/0 (-D warnings; +4 fixtures incl. 3 negative-soundness
+  cases: in-loop store, post-loop reader, call in loop); ARM corpus
+  379/95 = exact baseline fail set; asm A/B on regression corpus: 7 files
+  differ, all in the intended direction.
+
+## Session S12b — RISC-V peephole passes 6/7 (jump-near + sext elim)
+
+- **Pass 6 (CCC_NO_JUMP_NEAR)**: `jump .Lxxx, tN` (auipc+jalr, 2 insns/8B)
+  → `j .Lxxx` (jal, 1 insn/4B) when the target label exists in the same
+  function and the function is < 100k insns (jal ±1MiB with 4x margin).
+  Tail calls / cross-function jumps keep the unlimited-range form.
+  Corpus: 740 far jumps → 0; -2.4% asm bytes; every branch transition also
+  executes 1 insn instead of 2.
+- **Pass 7 (CCC_NO_SEXT_ELIM)**: per-block sext-wide dataflow (li/lui/W-ops/
+  lw/slli|srli n>=1/srai produce sign-extended-32; ld/64-bit ALU/lla don't;
+  calls clear caller-saved; labels/branches clear all). Deletes ONLY the
+  self form `sext.w rX, rX`: even a value-no-op sext.w *defines rD*, so the
+  cross-register form must stay (cfg_phi_web: `sext.w t2,t0` deleted left
+  `bne t2,t1` reading a stale register — caught by the corpus, fixed,
+  fixture documented in-code). Corpus: 340 → 209 sext.w.
+- Gates: lib 1294/0; RISC-V corpus 360/91 = exact switch-off baseline;
+  arm corpus untouched (riscv-only change).
