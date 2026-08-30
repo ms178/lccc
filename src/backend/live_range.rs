@@ -318,6 +318,12 @@ pub struct LinearScanAllocator {
     /// is unset. With no segmented ranges the allocator is bit-identical
     /// to the pre-RA-05 fat scan.
     pub segment_mode: bool,
+    /// Fat-mode shadow of `run_with_seed`'s spans: the latest point any
+    /// SEEDED span occupies per register. Same-run commits raise
+    /// `reg_free_until` but never this map, so an eviction can tell whether
+    /// the residue past the victim is a seed (steal must be refused) or the
+    /// victim itself (steal is sound once it is cut).
+    seed_free_until: FxHashMap<PhysReg, u32>,
     pub spill_slots: FxHashMap<u32, i32>,
     pub available_regs: Vec<PhysReg>,
     pub next_spill_slot: i32,
@@ -351,6 +357,7 @@ impl LinearScanAllocator {
             reg_free_until: FxHashMap::default(),
             reg_occupancy: FxHashMap::default(),
             segment_mode,
+            seed_free_until: FxHashMap::default(),
             spill_slots: FxHashMap::default(),
             available_regs,
             next_spill_slot: 0,
@@ -561,6 +568,13 @@ impl LinearScanAllocator {
         } else {
             &range.segments
         };
+        // The range's global first live point and one past its global last
+        // live point (coverage pieces are closed [cs, ce]).
+        let first_cs = cov.first().map(|&(cs, _)| cs).unwrap_or(range.start);
+        let last_ce1 = cov
+            .last()
+            .map(|&(_, ce)| ce.saturating_add(1))
+            .unwrap_or(range.end.saturating_add(1));
         let (mut oi, mut ci) = (0usize, 0usize);
         while oi < occupied.len() && ci < cov.len() {
             let (os, oe) = occupied[oi]; // half-open [os, oe)
@@ -572,8 +586,31 @@ impl LinearScanAllocator {
                 if hi - lo > 1 {
                     return false;
                 }
+                // Single shared unit: legal die-at-birth / use-before-def
+                // adjacency ONLY at the range's global first or last live
+                // unit — the occupant dies exactly where the range is born
+                // (one instruction reads the old value, then writes the
+                // new), or is born exactly where the range dies. A unit
+                // anywhere else is a genuine clobber: an occupancy span
+                // starting strictly inside the range (seeded arg2 [19,20)
+                // vs arg0 [16,20] on %r11 in time_str) destroys the range's
+                // value while its final use still lies ahead.
+                if lo != first_cs && hi != last_ce1 {
+                    return false;
+                }
             }
+            // Advance whichever side ends first. Advancing the COVERAGE on
+            // an occupant that ends inside it (put_dec: the allowed
+            // die-at-birth unit (41,43)x(42,49] advanced ci, exhausted the
+            // coverage list and returned true WITHOUT ever examining the
+            // seeded (48,50) span — the follow hint then shared the
+            // register with the seed) silently skips every later occupancy
+            // span.
             if oe <= cs {
+                oi += 1;
+            } else if ce + 1 <= os {
+                ci += 1;
+            } else if oe <= ce + 1 {
                 oi += 1;
             } else {
                 ci += 1;
@@ -603,7 +640,25 @@ impl LinearScanAllocator {
     /// co-holder that does *not* conflict with `incoming` must be the
     /// die-at-birth partner and therefore dies at `incoming.start`.
     /// Occupying until `incoming.end + 1` cannot go live too early.
-    fn register_steal_is_safe(&self, evicted_vid: u32, incoming: &LiveRange) -> bool {
+    /// A range's live coverage as half-open spans (segment pairs closed).
+    fn coverage_spans(range: &LiveRange) -> Vec<(u32, u32)> {
+        if range.segments.is_empty() {
+            vec![(range.start, range.end.saturating_add(1))]
+        } else {
+            range
+                .segments
+                .iter()
+                .map(|&(cs, ce)| (cs, ce.saturating_add(1)))
+                .collect()
+        }
+    }
+
+    fn register_steal_is_safe(
+        &self,
+        evicted_vid: u32,
+        incoming: &LiveRange,
+        victim_cov: &[(u32, u32)],
+    ) -> bool {
         let Some(&reg) = self.assignments.get(&evicted_vid) else {
             return false;
         };
@@ -617,11 +672,52 @@ impl LinearScanAllocator {
                 holder.conflicts_with(incoming)
             }
         };
-        !self.active.iter().any(|a| {
+        if self.active.iter().any(|a| {
             a.range.value_id != evicted_vid
                 && self.assignments.get(&a.range.value_id) == Some(&reg)
                 && conflicts(&a.range)
-        })
+        }) {
+            return false;
+        }
+        // Cross-wave / cross-phase occupancy: the victim's register may
+        // still carry SEEDED spans (earlier waves' values, other phases'
+        // holders) that no `active` entry represents. A steal hands the
+        // register to `incoming` from its start onward; any seeded span
+        // still live at or past that point must refuse the steal. put_dec
+        // v50 [42,50] evicted a Wave-4 victim out of %r10 while Wave-3's
+        // v42 [48,49] seed still held [48,50) there.
+        if self.segment_mode {
+            if let Some(occupied) = self.reg_occupancy.get(&reg) {
+                let fat = [(incoming.start, incoming.end)];
+                let cov: &[(u32, u32)] = if incoming.segments.is_empty() {
+                    &fat
+                } else {
+                    &incoming.segments
+                };
+                for &(os, oe) in occupied {
+                    for &(cs, ce) in cov {
+                        // Strict unit overlap (touching counts: rotation
+                        // path semantics — no die-at-birth vs a seed).
+                        if os < ce + 1 && cs < oe {
+                            // A span fully inside the victim's own coverage
+                            // is about to be cut away by try_evict; anything
+                            // else is a seed residue and blocks the steal.
+                            let explained =
+                                victim_cov.iter().any(|&(vs, ve1)| vs <= os && oe <= ve1);
+                            if !explained {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let seed_horizon = self.seed_free_until.get(&reg).copied().unwrap_or(0);
+            if seed_horizon > incoming.start {
+                return false;
+            }
+        }
+        true
     }
 
     /// Exchange eviction (mode 5): evict the legal victim with the fewest
@@ -645,7 +741,11 @@ impl LinearScanAllocator {
             if interval.range.cascade > range.cascade {
                 continue;
             }
-            if !self.register_steal_is_safe(interval.range.value_id, range) {
+            if !self.register_steal_is_safe(
+                interval.range.value_id,
+                range,
+                &Self::coverage_spans(&interval.range),
+            ) {
                 continue;
             }
             // ABI-hinted ParamRefs are a codegen contract (see
@@ -690,7 +790,11 @@ impl LinearScanAllocator {
 
         for (idx, interval) in self.active.iter().enumerate() {
             if let Some(incoming) = incoming {
-                if !self.register_steal_is_safe(interval.range.value_id, incoming) {
+                if !self.register_steal_is_safe(
+                    interval.range.value_id,
+                    incoming,
+                    &Self::coverage_spans(&interval.range),
+                ) {
                     continue;
                 }
             }
@@ -757,7 +861,11 @@ impl LinearScanAllocator {
         let mut best_spill_weight = f64::INFINITY;
 
         for (idx, interval) in self.active.iter().enumerate() {
-            if !self.register_steal_is_safe(interval.range.value_id, incoming) {
+            if !self.register_steal_is_safe(
+                interval.range.value_id,
+                incoming,
+                &Self::coverage_spans(&interval.range),
+            ) {
                 continue;
             }
             // ABI-hinted values (leading ParamRefs) are a codegen contract:
@@ -970,7 +1078,21 @@ impl LinearScanAllocator {
         }
         let evicted_vid = self.active[evict_idx].range.value_id;
         let evicted_cascade = self.active[evict_idx].range.cascade;
-        if !self.register_steal_is_safe(evicted_vid, &incoming) {
+        // Victim coverage as half-open spans (segment pairs are closed).
+        let victim_cov: Vec<(u32, u32)> = if self.active[evict_idx].range.segments.is_empty() {
+            vec![(
+                self.active[evict_idx].range.start,
+                self.active[evict_idx].range.end.saturating_add(1),
+            )]
+        } else {
+            self.active[evict_idx]
+                .range
+                .segments
+                .iter()
+                .map(|&(cs, ce)| (cs, ce.saturating_add(1)))
+                .collect()
+        };
+        if !self.register_steal_is_safe(evicted_vid, &incoming, &victim_cov) {
             return false;
         }
         let Some(reg) = self.assignments.remove(&evicted_vid) else {
@@ -1048,6 +1170,7 @@ impl LinearScanAllocator {
         self.next_reg_idx = 0;
         self.init_registers();
         self.reg_occupancy.clear();
+        self.seed_free_until.clear();
         for (reg, spans) in seed {
             // Fat-mode invariant: reg_free_until is the latest occupied point
             // (max end across spans). Fat mode cannot represent holes, so a
@@ -1057,6 +1180,11 @@ impl LinearScanAllocator {
             if max_end > 0 {
                 let cur = self.reg_free_until.entry(*reg).or_insert(0);
                 *cur = (*cur).max(max_end);
+                // Seeds are not evictable by this run: remember their fat
+                // horizon separately so `register_steal_is_safe` can refuse
+                // steals that would strand a seed behind the victim.
+                let scur = self.seed_free_until.entry(*reg).or_insert(0);
+                *scur = (*scur).max(max_end);
             }
             if self.segment_mode && !spans.is_empty() {
                 let mut sorted: Vec<(u32, u32)> = spans.iter().copied().collect();
@@ -1511,6 +1639,46 @@ fn collect_uses_for_values(func: &IrFunction) -> FxHashMap<u32, Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: put_dec Wave-4 (vsprintf.c). v39 [41,42] takes %r10-class
+    /// PhysReg(10) by rotation (seeded spans [(13,20),(48,50)] leave it free
+    /// there); v50 [42,50] (segments [(42,49)], closed) follows v39. The
+    /// seed (48,50) — Wave-3's v42 [48,49] — overlaps v50's coverage, so the
+    /// follow hint must be refused; before the fix the scan handed v50 the
+    /// register anyway and the store index collided with the staged digit.
+    #[test]
+    fn wave4_follow_vs_seeded_span() {
+        let mut v39 = lr_seg(39, 41, 42, vec![42], 10, vec![(41, 42)]);
+        v39.follow_value = None;
+        // Pin the producer to PhysReg(10) deterministically: the rotation
+        // order of a four-register pool is otherwise free to home it
+        // elsewhere, which would mask exactly the follow-path refusal this
+        // test exists to pin.
+        v39.reg_hint = Some(PhysReg(10));
+        let mut v50 = lr_seg(50, 42, 50, vec![43, 49], 10, vec![(42, 49)]);
+        v50.follow_value = Some(39);
+        let v6 = lr_seg(6, 4, 5, vec![5], 10, vec![(4, 5)]);
+        let v24 = lr_seg(24, 26, 27, vec![27], 10, vec![(26, 27)]);
+        let v32 = lr_seg(32, 34, 35, vec![35], 10, vec![(34, 35)]);
+        let v43 = lr_seg(43, 49, 50, vec![50], 10, vec![(49, 50)]);
+        let v51 = lr_seg(51, 43, 50, vec![48], 10, vec![(43, 48)]);
+        let ranges = vec![v6, v24, v32, v39, v50, v51, v43];
+        let mut alloc = LinearScanAllocator::new(
+            ranges,
+            vec![PhysReg(10), PhysReg(11), PhysReg(12), PhysReg(13)],
+        );
+        let mut seed: FxHashMap<PhysReg, Vec<(u32, u32)>> = FxHashMap::default();
+        seed.insert(PhysReg(10), vec![(48, 50), (13, 20)]);
+        seed.insert(PhysReg(11), vec![(35, 42)]);
+        alloc.run_with_seed(&seed);
+        let got = alloc.assignments.get(&50).copied();
+        assert_ne!(
+            got,
+            Some(PhysReg(10)),
+            "v50 must not share PhysReg(10) with seeded v42 [48,50); got {:?}",
+            got
+        );
+    }
 
     fn lr(value_id: u32, start: u32, end: u32, uses: Vec<u32>, priority: u64) -> LiveRange {
         let mut r = LiveRange {

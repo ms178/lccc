@@ -752,6 +752,19 @@ pub(crate) fn collect_folded_index_links(func: &IrFunction) -> FxHashMap<u32, Ve
     for (dest, info) in &m {
         out.entry(info.index.0).or_default().push(*dest);
     }
+    if std::env::var_os("CCC_DEBUG_FOLDED_INDEX").is_some() {
+        let mut links: Vec<(&u32, &Vec<u32>)> = out.iter().collect();
+        links.sort_unstable();
+        eprintln!(
+            "[FOLDIDX] fn={} links={} gep_map={}",
+            func.name,
+            links.len(),
+            m.len()
+        );
+        for (idx, dests) in links {
+            eprintln!("[FOLDIDX]   idx=v{} consumers={:?}", idx, dests);
+        }
+    }
     out
 }
 

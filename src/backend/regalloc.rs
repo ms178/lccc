@@ -1763,6 +1763,13 @@ fn build_coalesce_groups(
             result.len(),
             result.values().map(|m| m.len()).sum::<usize>()
         );
+        if std::env::var_os("CCC_DEBUG_COALESCE_MEMBERS").is_some() {
+            let mut rows: Vec<(&u32, &Vec<u32>)> = result.iter().collect();
+            rows.sort_unstable();
+            for (leader, members) in rows {
+                eprintln!("[COALESCE]   leader=v{} members={:?}", leader, members);
+            }
+        }
     }
     result
 }
@@ -1854,16 +1861,25 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // Extend live intervals for backend-folded index consumers BEFORE any
     // interval map is derived (see RegAllocConfig::folded_index_uses).
     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
-        // value_id -> interval end, from the consumer GEP-dest intervals.
-        let mut end_of: FxHashMap<u32, u32> = FxHashMap::default();
+        // value_id -> (start, end) from the consumer GEP-dest intervals. The
+        // dest's START is the folded-away producer (the GEP / Cmp — the last
+        // IR-visible read of the operand); its END is the access that
+        // re-reads the operand RA-invisibly (SIB load/store, replayed cmp).
+        let mut bounds_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
         for iv in &liveness.intervals {
-            end_of.insert(iv.value_id, iv.end);
+            bounds_of.insert(iv.value_id, (iv.start, iv.end));
         }
         for (idx, dests) in &config.folded_index_uses {
             let mut new_end: Option<u32> = None;
+            // Real-liveness ranges the operand must survive: one per
+            // consumer, [producer position .. access position].
+            let mut required: Vec<(u32, u32)> = Vec::new();
             for d in dests {
-                if let Some(&e) = end_of.get(d) {
+                if let Some(&(s, e)) = bounds_of.get(d) {
                     new_end = Some(new_end.map_or(e, |x: u32| x.max(e)));
+                    if s < e {
+                        required.push((s, e));
+                    }
                 }
             }
             if let Some(e) = new_end {
@@ -1872,20 +1888,51 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         iv.end = e;
                     }
                 }
-                // Hole-aware segments: stretch the last segment to the new end
-                // (conservative — a contiguous live range can only over-
-                // constrain, never under-constrain).
-                let mut last_seg: Option<usize> = None;
-                for (si, seg) in liveness.segments.iter().enumerate() {
-                    if seg.value_id == *idx {
-                        last_seg = Some(si);
+                // Hole-aware segments. Stretching only the LAST segment is a
+                // silent NO-OP for multi-def latch values: their fat envelope
+                // already ends past the access (the backedge copy), so both
+                // `iv.end < e` and `last_seg.end < e` are false while a live
+                // HOLE sits exactly on the access — the IR's last read of the
+                // operand is the folded-away GEP, and liveness legitimately
+                // dies there. The scan's hole-aware interference then reused
+                // the register across the access: vsprintf number()'s
+                // `tmp[i++] = digit` wrote tmp[digit] because the digit's
+                // zext landed in i's register between the GEP and the store.
+                // The operand IS read at the producer position (its segment
+                // covers [.., producer]) and re-read at the access, so
+                // [producer, access] is real liveness: merge it into the
+                // segment union (conservative — merged coverage can only
+                // over-constrain, never under-constrain).
+                let mut pieces: Vec<(u32, u32)> = Vec::new();
+                let mut has_segments = false;
+                liveness.segments.retain(|seg| {
+                    if seg.value_id != *idx {
+                        return true;
+                    }
+                    has_segments = true;
+                    pieces.push((seg.start, seg.end));
+                    false
+                });
+                if has_segments {
+                    if !required.is_empty() {
+                        required.sort_unstable();
+                        pieces.sort_unstable();
+                        let mut merged: Vec<(u32, u32)> = Vec::new();
+                        insert_segment_union(&mut merged, &pieces);
+                        insert_segment_union(&mut merged, &required);
+                        pieces = merged;
+                    }
+                    for &(s, e2) in &pieces {
+                        liveness.segments.push(crate::backend::liveness::LiveInterval {
+                            value_id: *idx,
+                            start: s,
+                            end: e2,
+                        });
                     }
                 }
-                if let Some(si) = last_seg {
-                    if liveness.segments[si].end < e {
-                        liveness.segments[si].end = e;
-                    }
-                }
+                // Values without segment data keep the fat-envelope
+                // extension above (fail-closed: the scan and the verifier
+                // both fall back to the envelope for them).
             }
         }
     }
@@ -2453,12 +2500,31 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         caller_used_regs_set.insert(reg.0);
                         if let Some(&(start, end)) = iv_map.get(vid) {
                             if end > start {
-                                seeded.entry(*reg).or_default().push((start, end));
+                                // Seed spans are HALF-OPEN in the allocator
+                                // (`occupy_register` stores `end + 1`), while
+                                // `iv_map` ends are the last LIVE point: push
+                                // [start, end+1) or the final live point is
+                                // unseeded and a later wave reuses the
+                                // register on exactly that point (time_str:
+                                // arg0 [16,20] collided with arg2 [19,20] on
+                                // %r11 at the call staging point 20).
+                                seeded
+                                    .entry(*reg)
+                                    .or_default()
+                                    .push((start, end.saturating_add(1)));
                             }
                         }
                     }
                 }
 
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let ids: Vec<(u32, u8)> = w1
+                        .iter()
+                        .filter(|iv| assignments.contains_key(&iv.value_id))
+                        .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
+                        .collect();
+                    eprintln!("[RA-W1] fn={} homes={:?}", func.name, ids);
+                }
                 // Wave 2: indirect-call args at index 0 — avoid the indirect-
                 // target register only; argument registers are still safe.
                 let w2: Vec<LiveInterval> = scan_ivs
@@ -2477,12 +2543,24 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         caller_used_regs_set.insert(reg.0);
                         if let Some(&(start, end)) = iv_map.get(vid) {
                             if end > start {
-                                seeded.entry(*reg).or_default().push((start, end));
+                                // Half-open seed span (see the Wave 1 note).
+                                seeded
+                                    .entry(*reg)
+                                    .or_default()
+                                    .push((start, end.saturating_add(1)));
                             }
                         }
                     }
                 }
 
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let ids: Vec<(u32, u8)> = w2
+                        .iter()
+                        .filter(|iv| assignments.contains_key(&iv.value_id))
+                        .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
+                        .collect();
+                    eprintln!("[RA-W2] fn={} homes={:?}", func.name, ids);
+                }
                 // Wave 3: direct-call args at index ≥ 1 — avoid the arg
                 // registers; the indirect-target register is safe here.
                 let w3: Vec<LiveInterval> = scan_ivs
@@ -2501,14 +2579,34 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         caller_used_regs_set.insert(reg.0);
                         if let Some(&(start, end)) = iv_map.get(vid) {
                             if end > start {
-                                seeded.entry(*reg).or_default().push((start, end));
+                                // Half-open seed span (see the Wave 1 note).
+                                seeded
+                                    .entry(*reg)
+                                    .or_default()
+                                    .push((start, end.saturating_add(1)));
                             }
                         }
                     }
                 }
 
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let ids: Vec<(u32, u8)> = w3
+                        .iter()
+                        .filter(|iv| assignments.contains_key(&iv.value_id))
+                        .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
+                        .collect();
+                    eprintln!("[RA-W3] fn={} homes={:?}", func.name, ids);
+                }
                 // Wave 4: the rest (non-call-args and direct arg-0 values) —
                 // full caller-saved pool.
+                if env_on("CCC_DEBUG_RA_INTERVALS") {
+                    let mut regs = vec![];
+                    for (r, spans) in &seeded {
+                        regs.push((r.0, spans.clone()));
+                    }
+                    regs.sort_unstable();
+                    eprintln!("[RA-W4SEED] fn={} seed={:?}", func.name, regs);
+                }
                 let w4: Vec<LiveInterval> = scan_ivs
                     .iter()
                     .copied()
@@ -2524,6 +2622,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     for (vid, reg) in alloc.assignments {
                         assignments.insert(vid, reg);
                         caller_used_regs_set.insert(reg.0);
+                    }
+                    if env_on("CCC_DEBUG_RA_INTERVALS") {
+                        let ids: Vec<(u32, u8)> = w4
+                            .iter()
+                            .filter(|iv| assignments.contains_key(&iv.value_id))
+                            .map(|iv| (iv.value_id, assignments[&iv.value_id].0))
+                            .collect();
+                        eprintln!("[RA-W4] fn={} homes={:?}", func.name, ids);
                     }
                 }
             }
