@@ -1461,6 +1461,11 @@ fn fuse_fp_adjacent_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize
             FpAddr::Base(_, o) => o,
         };
         let (lo_reg, hi_reg, lo) = if oa <= ob { (ra, rc, oa) } else { (rc, ra, ob) };
+        // LDP/STP immediate offset must be in [-512, 504] and multiple of 8.
+        // Outside that range gas 2.47 rejects the encoding.
+        if !(-512..=504).contains(&lo) || lo % 8 != 0 {
+            continue;
+        }
         let base_str = match addra {
             FpAddr::Sp(_) => "sp".to_string(),
             FpAddr::Base(b, _) => xreg_name(b).to_string(),
@@ -4298,6 +4303,16 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
     if std::env::var("CCC_NO_SPILL_THREAD").is_ok() {
         return false;
     }
+    // Use SP-displacement-aware effective offsets (raw + disp) like
+    // eliminate_adjacent_store_load / eliminate_overwritten_stores.
+    // Same raw offset before and after a `sub sp, sp, #N` names different
+    // bytes; matching raw offsets across it aliases frame slots with
+    // outgoing-arg slots (920501-8.c: f=5 became p=15). Effective offsets
+    // distinguish them, fixing the miscompile while still allowing
+    // threading inside a single SP region.
+    let Some(disps) = sp_displacements(lines, kinds, n) else {
+        return false;
+    };
     let mut changed = false;
     let mut i = 0;
     while i < n {
@@ -4312,13 +4327,23 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                 continue;
             }
         };
+        let eff_store = offset as i64 + disps[i];
 
-        // Collect same-offset, width-compatible reloads in the window.
+        // Collect same-effective-offset, width-compatible reloads in the window.
         // (is_word == false is the 64-bit x-form.)
         let mut reloads: Vec<(usize, bool, bool)> = Vec::new(); // (idx, is_word, is_sw)
         let mut j = i + 1;
         let mut other_refs = 0usize; // slot refs in the window we do NOT rewrite
         while j < n {
+            // SP adjustment changes effective meaning — window ends here.
+            // (We also rely on effective matching, but breaking keeps the
+            // window tight and matches the original pass's call/branch barriers.)
+            let t_j = lines[j].trim_start();
+            if (t_j.starts_with("sub ") || t_j.starts_with("add "))
+                && t_j.contains("sp, sp, #")
+            {
+                break;
+            }
             match kinds[j] {
                 LineKind::Nop => {}
                 LineKind::LoadSp {
@@ -4326,39 +4351,41 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                     is_word: w,
                     reg: d,
                     ..
-                } if o == offset => {
-                    if d >= 18 {
-                        // x18-x30 are callee-saved: such a load is very often
-                        // the ABI home restore, and rewriting it into a Move
-                        // exposes it to ABI-unaware dead-move passes (the
-                        // caller's register would never be restored —
-                        // costaware_devirt segfault class). Leave the slot.
+                } => {
+                    let eff = o as i64 + disps[j];
+                    if eff == eff_store {
+                        if d >= 18 {
+                            other_refs += 1;
+                        } else if w || !s_word {
+                            reloads.push((j, w, false));
+                        } else {
+                            other_refs += 1;
+                        }
+                    } else if (eff - eff_store).abs() < 8 {
                         other_refs += 1;
-                    } else if w || !s_word {
-                        // x-load needs x-store; w-load pairs with both.
-                        reloads.push((j, w, false));
-                    } else {
-                        other_refs += 1; // x-load of a w-store: leave it reading the slot
                     }
                 }
-                LineKind::LoadswSp { offset: o, reg: d, .. } if o == offset && d >= 18 => {
-                    other_refs += 1;
+                LineKind::LoadswSp { offset: o, reg: d, .. } => {
+                    let eff = o as i64 + disps[j];
+                    if eff == eff_store {
+                        if d >= 18 {
+                            other_refs += 1;
+                        } else {
+                            reloads.push((j, true, true));
+                        }
+                    } else if (eff - eff_store).abs() < 8 {
+                        other_refs += 1;
+                    }
                 }
-                LineKind::LoadswSp { offset: o, .. } if o == offset => reloads.push((j, true, true)),
-                LineKind::StoreSp { offset: o, .. } if o == offset => break,
-                // Slot bytes span [offset, offset+8); ANY reference in
-                // [offset-7, offset+7] touches those bytes (e.g. `strb w0,
-                // [sp, #offset+3]` — the aggregate_copy_forward overlap
-                // family) and must block the transform.
-                LineKind::LoadSp { offset: o, .. } | LineKind::LoadswSp { offset: o, .. }
-                    if (o - offset).abs() < 8 =>
-                {
-                    other_refs += 1; // overlapping read consumes our bytes
-                }
-                LineKind::StoreSp { offset: o, .. } if (o - offset).abs() < 8 => {
-                    // Partial-word store INTO our slot's bytes.
-                    other_refs += 1;
-                    break;
+                LineKind::StoreSp { offset: o, .. } => {
+                    let eff = o as i64 + disps[j];
+                    if eff == eff_store {
+                        break;
+                    }
+                    if (eff - eff_store).abs() < 8 {
+                        other_refs += 1;
+                        break;
+                    }
                 }
                 LineKind::Label
                 | LineKind::Branch
@@ -4373,20 +4400,36 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                     let t = lines[j].trim_start();
                     let mut stored_overlap = false;
                     for k in sp_offsets_in_line(t) {
-                        if (k - offset).abs() < 8 && k != offset {
+                        let eff_k = k as i64 + disps[j];
+                        if (eff_k - eff_store).abs() < 8 && eff_k != eff_store {
                             other_refs += 1;
                         }
-                        if k == offset {
+                        if eff_k == eff_store {
                             stored_overlap = stored_overlap
                                 || t.starts_with("str ")
                                 || t.starts_with("stur ")
                                 || t.starts_with("stp ");
                         }
                     }
-                    if sp_offsets_in_line(t).contains(&offset) {
-                        other_refs += 1; // unclassified exact-offset reference
+                    // Unclassified exact-offset reference in effective space
+                    let mut has_exact = false;
+                    for k in sp_offsets_in_line(t) {
+                        if k as i64 + disps[j] == eff_store {
+                            has_exact = true;
+                            break;
+                        }
+                    }
+                    if has_exact {
+                        other_refs += 1;
                     }
                     if stored_overlap {
+                        break;
+                    }
+                    if t.starts_with("str")
+                        || t.starts_with("stur")
+                        || t.starts_with("stp")
+                        || t.starts_with("stl")
+                    {
                         break;
                     }
                 }
@@ -4425,12 +4468,13 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
             }
             k
         };
-        // Overlap-range textual census (exact tokens miss byte-lane stores
-        // like `strb w0, [sp, #offset+3]`).
+        // Overlap-range textual census in effective space (exact tokens miss
+        // byte-lane stores like `strb w0, [sp, #offset+3]`).
         let mut total_refs = 0usize;
         for k in func_start..func_end {
             for o in sp_offsets_in_line(&lines[k]) {
-                if (o - offset).abs() < 8 {
+                let eff = o as i64 + disps[k];
+                if (eff - eff_store).abs() < 8 {
                     total_refs += 1;
                 }
             }
