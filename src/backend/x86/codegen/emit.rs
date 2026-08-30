@@ -416,6 +416,14 @@ pub struct X86Codegen {
     pub(super) vec_const_counter: u32,
     /// True when the target has BMI1; enables scalar ANDN fusion.
     pub(super) bmi1_enabled: bool,
+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
+    /// When false, Clz/Ctz lower to BSR/BSF sequences with an explicit zero
+    /// fixup: F3-prefixed LZCNT/TZCNT decode as BSR/BSF on CPUs without the
+    /// feature and silently return wrong counts.
+    pub(super) lzcnt_enabled: bool,
+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
+    /// When false, Popcount lowers to an shr/adc bit loop.
+    pub(super) popcnt_enabled: bool,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
@@ -722,6 +730,8 @@ impl X86Codegen {
             vec_const_labels: crate::common::fx_hash::FxHashMap::default(),
             vec_const_counter: 0,
             bmi1_enabled: false,
+            lzcnt_enabled: false,
+            popcnt_enabled: false,
             avx2_enabled: false,
             avx512_enabled: false,
             optimize_for_size: false,
@@ -825,6 +835,8 @@ impl X86Codegen {
         self.set_code_model_kernel(opts.code_model_kernel);
         self.set_no_jump_tables(opts.no_jump_tables);
         self.bmi1_enabled = opts.bmi1;
+        self.lzcnt_enabled = opts.lzcnt;
+        self.popcnt_enabled = opts.popcnt;
         self.avx2_enabled = opts.avx2;
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;

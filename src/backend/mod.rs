@@ -137,6 +137,21 @@ pub(crate) struct CodegenOptions {
     /// Gates scalar ANDN selection; emitting it without this contract would
     /// introduce SIGILL on baseline x86-64.
     pub(crate) bmi1: bool,
+    /// Whether the target has LZCNT (`-mlzcnt`, ABM, or an enabling
+    /// `-march` such as x86-64-v3). LZCNT/TZCNT are NOT baseline x86-64:
+    /// on CPUs without the feature the F3-prefixed encodings (F3 0F BD/BC)
+    /// decode as BSR/BSF and silently return the bit INDEX instead of a
+    /// zero COUNT — no #UD, just wrong data (observed as the preboot ZSTD
+    /// decoder's "corruption detected" when an lccc-built kernel boots on
+    /// QEMU's default qemu64 TCG CPU). Gates the Clz/Ctz lowering; the
+    /// fallback is BSR/BSF plus an explicit zero fixup so the IR's defined
+    /// Clz(0)/Ctz(0) == width semantics (matching constant folding) hold.
+    pub(crate) lzcnt: bool,
+    /// Whether the target has POPCNT (`-mpopcnt` or an enabling `-march`
+    /// such as x86-64-v2/Nehalem). 0F B8 is #UD on pre-Nehalem x86-64.
+    /// Gates the Popcount lowering; the fallback is an shr/adc bit loop
+    /// in %rax/%rcx.
+    pub(crate) popcnt: bool,
     /// Whether the target has AVX2 (`-mavx2` or an enabling `-march`).
     pub(crate) avx2: bool,
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).

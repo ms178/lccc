@@ -853,7 +853,7 @@ impl X86Codegen {
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
-                        IrUnaryOp::Popcount => {
+                        IrUnaryOp::Popcount if self.popcnt_enabled => {
                             // popcnt is two-operand: popcnt %src, %dest
                             if let Some(s_reg) = self.operand_reg(src) {
                                 if !is_xmm_reg(s_reg) {
@@ -878,7 +878,8 @@ impl X86Codegen {
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
-                        _ => {} // Clz, Ctz — complex multi-instruction, fall through to default
+                        _ => {} // Clz, Ctz — complex multi-instruction; Popcount without
+                                // -mpopcnt falls through to the shr/adc loop fallback.
                     }
                 }
             }
