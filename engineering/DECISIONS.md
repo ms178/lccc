@@ -770,3 +770,25 @@ stale sections of live ones:
   briefly looked like a corrupted CI trigger. Verify suspicious output at
   the byte level (`od -c`) before acting on it; the v3 workflow "fix"
   turned out to be a no-op because nothing was broken.
+
+## 2026-08-31 — CCC fork survey: what to adopt and what to never touch
+
+Surveyed all 241 forks of `anthropics/claudes-c-compiler` via the GitHub API
+(plus levkropp/ms178 lineage). Only a handful have unique code; the default
+branch of ~230 is byte-identical to upstream `6f1b99ac`.
+
+- **ADOPT:** `regehr/claudes-c-compiler` `yarpgen` branch (John Regehr):
+  ~60 differential-testing reproducers + fixes + `yarpgen_diff.py`/`csmith_diff.py`
+  harnesses. Ported 28 reproducers into `tests/regression/`; they exposed 17 real
+  LCCC miscompiles, 8 now fixed (see
+  `FOLLOWUP-2026-08-31-regehr-yarpgen-corpus.md`).
+- **DEFER (valuable):** `CrazyTodd-one` SCCP/use_def optimizer passes; `thanhtoantnt`
+  property-based tests (needs a dev-dep).
+- **REJECT FOREVER:** `wadsaek/claudes-c-compiler` is **malicious** — its only
+  diff injects a random 4 KB penguin QUOTE string into string literals with
+  10/256 probability via `/dev/random` (`get_random_value() <= 10`). Never
+  adopt anything from it. Also rejected `rosubra` (deleted all passes),
+  `Matr1x-101` (zlib dump), `yishangzhang` (messy logging).
+- **Snapshot base:** this session rebased on `b49414c` (PR #316). The stale
+  `.base_ref` (`4630de0`) in the repo root from an earlier session is NOT the
+  base; `artifacts/.base_ref` is authoritative.

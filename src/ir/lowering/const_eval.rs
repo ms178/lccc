@@ -146,14 +146,24 @@ impl Lowerer {
                 //   "str" && x  =>  bool(x) if x is evaluable, else 1 if x is also nonzero
                 //   0 && "str"  =>  0
                 if *op == BinOp::LogicalOr {
+                    // `||` evaluates the LHS, then the RHS only if the LHS is
+                    // false. Folding to a constant is sound ONLY when the
+                    // skipped side cannot have effects that must be observed:
+                    //   - LHS always-nonzero: RHS is skipped -> 1 (sound even if
+                    //     RHS has side effects, because short-circuit skips it).
+                    //   - RHS always-nonzero/known but LHS UNKNOWN: the LHS must
+                    //     STILL be evaluated for its side effects (e.g.
+                    //     `(*q = 10) || 60` stores to *q before 60 is considered).
+                    //     Folding to 1 drops that store -> UNSOUND. Only fold via
+                    //     the RHS when the LHS is a known (pure) constant.
                     let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(lhs);
                     let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(rhs);
-                    if l_nonzero || r_nonzero {
+                    if l_nonzero || (r_nonzero && l.is_some()) {
                         return Some(IrConst::I64(1));
                     }
-                    // Both are zero constants => result is 0
+                    // Both are zero constants => result is 0 (both pure).
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
                         && r.as_ref().is_some_and(|v| !v.is_nonzero())
                     {
@@ -161,13 +171,21 @@ impl Lowerer {
                     }
                 }
                 if *op == BinOp::LogicalAnd {
-                    // If either side is a known zero, result is 0
+                    // `&&` evaluates the LHS, then the RHS only if the LHS is
+                    // true. Folding to 0 is sound when the skipped side cannot
+                    // have unobservable-missing effects:
+                    //   - LHS known-zero: RHS is skipped -> 0 (sound).
+                    //   - RHS known-zero but LHS UNKNOWN: the LHS must still be
+                    //     evaluated for side effects -> UNSOUND to fold to 0.
+                    //     Only fold via the RHS when the LHS is a known constant.
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        || r.as_ref().is_some_and(|v| !v.is_nonzero())
+                        || (r.as_ref().is_some_and(|v| !v.is_nonzero()) && l.is_some())
                     {
                         return Some(IrConst::I64(0));
                     }
-                    // If both sides are known nonzero (including string literals), result is 1
+                    // Both sides known nonzero (constants or always-nonzero pure
+                    // expressions such as string literals): result is 1. Both
+                    // operands are side-effect-free here, so folding is sound.
                     let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(lhs);
                     let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
@@ -188,9 +206,25 @@ impl Lowerer {
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
-                let promoted =
-                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
-                const_arith::bitnot_const(promoted)
+                let is_unsigned = self.is_expr_unsigned_for_const(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                let result = const_arith::bitnot_const(promoted)?;
+                // C11 6.5.3.3: the result of `~` has the promoted type of the
+                // operand. bitnot_const complements the FULL stored width, which
+                // over-widens when a 32-bit unsigned int is stored as I64:
+                // `~0xFFFFFFFFu` complements to 0xFFFFFFFF_00000000 instead of 0,
+                // flipping a boolean/short-circuit use (bug found via Regehr
+                // yarpgen test regress_logical_and_const_bitnot_short_circuit:
+                // `const unsigned u = 0xFFFFFFFFu; ~u && f()` wrongly called f()).
+                // Truncate to the operand's promoted width (integer promotion
+                // lifts sub-int to at least int, i.e. 4 bytes).
+                let inner_ty = self.infer_expr_type(inner);
+                if inner_ty.size() < 8 {
+                    if let IrConst::I64(v) = result {
+                        return Some(IrConst::I64((v as u32) as i64));
+                    }
+                }
+                Some(result)
             }
             Expr::Cast(ref target_type, inner, _) => self.eval_const_cast(target_type, inner),
             Expr::Identifier(name, _) => self.eval_const_identifier(name),

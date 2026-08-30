@@ -175,11 +175,16 @@ impl<'a> SemaConstEval<'a> {
                 // For LogicalOr/LogicalAnd, handle string literals and other
                 // always-nonzero expressions that can't be folded to numeric values.
                 if *op == BinOp::LogicalOr {
+                    // Sound short-circuit folding: `||` skips the RHS only when
+                    // the LHS is truthy. Folding to 1 via a truthy RHS while the
+                    // LHS is UNKNOWN drops the LHS's side effects (e.g.
+                    // `(*q = 10) || 60`); only the LHS-side short-circuit (or a
+                    // known-pure LHS constant) permits folding.
                     let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(lhs);
                     let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
                         || Self::expr_is_always_nonzero(rhs);
-                    if l_nonzero || r_nonzero {
+                    if l_nonzero || (r_nonzero && l.is_some()) {
                         return Some(IrConst::I64(1));
                     }
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
@@ -189,8 +194,13 @@ impl<'a> SemaConstEval<'a> {
                     }
                 }
                 if *op == BinOp::LogicalAnd {
+                    // Sound short-circuit folding: `&&` skips the RHS only when
+                    // the LHS is falsy. Folding to 0 via a falsy RHS while the
+                    // LHS is UNKNOWN drops the LHS's side effects; only the
+                    // LHS-side short-circuit (or a known-pure LHS constant) is
+                    // safe to fold.
                     if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        || r.as_ref().is_some_and(|v| !v.is_nonzero())
+                        || (r.as_ref().is_some_and(|v| !v.is_nonzero()) && l.is_some())
                     {
                         return Some(IrConst::I64(0));
                     }
@@ -693,7 +703,13 @@ impl<'a> SemaConstEval<'a> {
         let size = self.ctype_size(target);
         Some(match size {
             1 => {
-                if !target_signed {
+                if matches!(target, CType::Bool) {
+                    // C11 6.3.1.2: any nonzero value converted to _Bool becomes 1.
+                    // Without this, (_Bool)61 would stay 61 (stored as I32(61)) and
+                    // change loop trip counts / boolean arithmetic. Bug found via
+                    // Regehr yarpgen differential test regress_const_bool_cast_normalization.
+                    IrConst::I32(if bits != 0 { 1 } else { 0 })
+                } else if !target_signed {
                     // Unsigned char/bool: store as I32 to preserve unsigned value
                     // through integer promotion (e.g., (unsigned char)255 → I32(255), not I8(-1))
                     IrConst::I32(bits as u8 as i32)
@@ -781,7 +797,10 @@ impl<'a> SemaConstEval<'a> {
         Some(match target_size {
             0 => return None, // void cast
             1 => {
-                if !target_signed {
+                if matches!(target, CType::Bool) {
+                    // C11 6.3.1.2 _Bool normalization for the I128-source cast path.
+                    IrConst::I32(if bits_lo != 0 { 1 } else { 0 })
+                } else if !target_signed {
                     IrConst::I32(bits_lo as u8 as i32)
                 } else {
                     IrConst::I8(bits_lo as i8)
