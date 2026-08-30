@@ -782,6 +782,99 @@ fn would_create_phi_conflict(
 // Sub-pass: dead block elimination
 // ---------------------------------------------------------------------------
 
+/// Fold `CondBranch`/`Switch` terminators whose operand is a *direct* constant
+/// into unconditional branches, width-normalized for Switch (two's-complement
+/// comparison at the switch type's bit width — the same normalization the
+/// backends' jump-table/compare-chain emission applies at runtime).
+///
+/// GCC folds `if (0)`, `while (0)`, `switch (3)`, ... in the front end at
+/// every opt level, so dead regions never reach codegen and labeled dispatch
+/// into a dead region (case/goto targets) survives with its live edge. LCCC
+/// lowers these shapes to constant-condition terminators that this gate must
+/// resolve *before* the reachability BFS, otherwise both successors look
+/// live and dead-region calls are emitted (medce-1.c `link_error` at -O0).
+///
+/// Scope discipline: only direct `Operand::Const` is folded here. This gate
+/// is a pure local CFG computation; cross-block constant resolution stays
+/// `simplify_cfg`'s richer -O1+ contract (`fold_constant_cond_branches`).
+/// Phi entries for not-taken/dead targets are cleaned uniformly by the
+/// `dead_blocks` sweep below, so no extra phi bookkeeping is needed here.
+/// Float condition constants keep C11 6.3.1.2 truthiness (NaN != 0 -> true);
+/// float switch values are not a valid IR shape and are left unfolded.
+fn fold_constant_terminators(func: &mut IrFunction) -> usize {
+    let mut folded = 0usize;
+    for block in &mut func.blocks {
+        match &block.terminator {
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => {
+                if let Operand::Const(c) = cond {
+                    let taken = if c.is_nonzero() { *true_label } else { *false_label };
+                    block.terminator = Terminator::Branch(taken);
+                    folded += 1;
+                }
+            }
+            Terminator::Switch {
+                val,
+                cases,
+                default,
+                ty,
+            } => {
+                if let Operand::Const(c) = val {
+                    // Normalize to the switch width. Case values are i64;
+                    // sign-extend into i128 and mask both sides to the type
+                    // width so e.g. a 32-bit switch on 0xFFFFFFFFu matches a
+                    // stored I32(-1) exactly like the hardware compare does.
+                    if let Some(val_bits) = const_as_u128_masked(c, *ty) {
+                        let width_bits = (*ty).size() as u32 * 8;
+                        let mask = if width_bits >= 128 {
+                            u128::MAX
+                        } else {
+                            (1u128 << width_bits) - 1
+                        };
+                        let mut target = *default;
+                        for &(case_val, case_target) in cases {
+                            let case_bits =
+                                ((case_val as i128) as u128) & mask;
+                            if case_bits == val_bits {
+                                target = case_target;
+                                break;
+                            }
+                        }
+                        block.terminator = Terminator::Branch(target);
+                        folded += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    folded
+}
+
+/// Integer constant as u128 two's-complement bit pattern. `None` for float
+/// constants (no valid Switch producer; conservative no-fold).
+fn const_as_u128_masked(c: &IrConst, ty: crate::common::types::IrType) -> Option<u128> {
+    let raw: i128 = match c {
+        IrConst::I8(v) => *v as i128,
+        IrConst::I16(v) => *v as i128,
+        IrConst::I32(v) => *v as i128,
+        IrConst::I64(v) => *v as i128,
+        IrConst::I128(v) => *v,
+        IrConst::Zero => 0,
+        _ => return None,
+    };
+    let width_bits = ty.size() as u32 * 8;
+    let mask = if width_bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width_bits) - 1
+    };
+    Some((raw as u128) & mask)
+}
+
 /// Backend IR-integrity gate: remove every block unreachable from the entry
 /// block, keeping the roots that carry observable semantics (LabelAddr /
 /// static-local init labels, asm-goto targets). Runs verbatim at -O1+ as
@@ -807,6 +900,11 @@ pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
     if func.blocks.len() <= 1 {
         return 0;
     }
+
+    // Fold constant-condition terminators first (see fold_constant_terminators
+    // for the soundness and GCC-parity argument) so the BFS below walks the
+    // true CFG. The returned count feeds the caller's change tracking.
+    let folded = fold_constant_terminators(func);
 
     let label_to_idx = build_label_to_idx(func);
     // Compute the set of blocks reachable from the entry block via BFS.
@@ -859,7 +957,7 @@ pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
         .collect();
 
     if dead_blocks.is_empty() {
-        return 0;
+        return folded;
     }
 
     // Clean up phi nodes and InlineAsm goto_labels in reachable blocks.
@@ -878,7 +976,7 @@ pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
 
     let original_len = func.blocks.len();
     func.blocks.retain(|b| reachable.contains(&b.label));
-    original_len - func.blocks.len()
+    folded + (original_len - func.blocks.len())
 }
 
 // ---------------------------------------------------------------------------

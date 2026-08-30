@@ -1232,26 +1232,38 @@ fn gvn_dfs(
 /// external code (which could write to memory) returns true.
 fn clobbers_memory(inst: &Instruction) -> bool {
     match inst {
+        // A pure/const call cannot modify user-visible memory — EXCEPT that
+        // an sret return writes the result through the hidden sret pointer
+        // (i686: every struct/_Complex return). Cached loads across such a
+        // call must be invalidated (20070614-1 family).
         Instruction::Call {
             info:
                 CallInfo {
-                    is_pure: true, ..
+                    is_sret,
+                    is_pure: true,
+                    ..
                 }
                 | CallInfo {
-                    is_const: true, ..
+                    is_sret,
+                    is_const: true,
+                    ..
                 },
             ..
         }
         | Instruction::CallIndirect {
             info:
                 CallInfo {
-                    is_pure: true, ..
+                    is_sret,
+                    is_pure: true,
+                    ..
                 }
                 | CallInfo {
-                    is_const: true, ..
+                    is_sret,
+                    is_const: true,
+                    ..
                 },
             ..
-        } => false,
+        } => *is_sret,
         Instruction::Store { .. }
             | Instruction::Call { .. }
             | Instruction::CallIndirect { .. }

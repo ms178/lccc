@@ -13,6 +13,7 @@ use crate::frontend::parser::ast::{Expr, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
     CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator,
+    Value,
 };
 
 impl Lowerer {
@@ -847,6 +848,13 @@ impl Lowerer {
             // __builtin_shufflevector(v1, v2, i0, i1, i2, i3): 4-lane 32-bit
             // lane gather with constant indices (Clang/GCC generic shuffle).
             BuiltinIntrinsic::ShuffleVector => self.lower_shufflevector(args),
+            // GCC vector extension: __builtin_shuffle(v, mask) |
+            // __builtin_shuffle(v1, v2, mask). result[i] comes from
+            // concat(v1, v2)[mask[i] mod N] (N = element count of v1; the
+            // 2-arg form uses v twice). Fully unrolled runtime-indexed
+            // gather: correct for constant AND variable masks, any element
+            // width, any power-of-two-or-not lane count.
+            BuiltinIntrinsic::Shuffle => self.lower_shuffle(args),
             // Generic SIMD family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}
             BuiltinIntrinsic::LcccSimd => self.lower_lccc_simd(name, args),
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
@@ -1379,6 +1387,248 @@ impl Lowerer {
     /// we pick v1 lane 0). Indices must be integer constant expressions —
     /// matching the C builtin\'s contract. Scalar 4x32 gather through slots:
     /// correctness-first (a later peephole can fuse the shufps pattern).
+    /// Lower __builtin_shuffle (GCC vector extension).
+    ///
+    /// result[i] = concat(v1, v2)[mask[i] mod N] where N is the element count
+    /// of the first vector (2-arg form behaves as if v2 = v1). Mask elements
+    /// are interpreted as unsigned; only the low log2(2N) bits select, which
+    /// is exactly an unsigned remainder. The gather is fully unrolled with
+    /// runtime indices: no constant-mask special case, so variable masks are
+    /// equally correct. gcc.c-torture pr85331 (V2DF reverse) and pr94591
+    /// (V2SI identity) drive the rules.
+    fn lower_shuffle(&mut self, args: &[Expr]) -> Option<Operand> {
+        let (vec_args, mask_expr): (&[Expr], &Expr) = match args.len() {
+            2 => (&args[..1], &args[1]),
+            3 => (&args[..2], &args[2]),
+            n => panic!(
+                "__builtin_shuffle: expected (v, mask) or (v1, v2, mask), got {} args",
+                n
+            ),
+        };
+
+        // Element geometry from the first vector's CType.
+        let v0_ctype = self.expr_ctype(&vec_args[0]);
+        let (elem_size, total_bytes) = match &v0_ctype {
+            CType::Vector(elem, bytes) => (self.ctype_size(elem), *bytes),
+            other => panic!(
+                "__builtin_shuffle: first operand must be a vector type, got {:?}",
+                other
+            ),
+        };
+        if elem_size == 0 || total_bytes == 0 || total_bytes % elem_size != 0 {
+            panic!(
+                "__builtin_shuffle: degenerate vector geometry (elem={}, total={})",
+                elem_size, total_bytes
+            );
+        }
+        let n_elems: i64 = (total_bytes / elem_size) as i64;
+        // Mask element width from the mask operand's CType; the mask must
+        // have the same element count as the result.
+        let mask_ctype = self.expr_ctype(mask_expr);
+        let mask_elem_size = match &mask_ctype {
+            CType::Vector(elem, bytes) => {
+                let es = self.ctype_size(elem);
+                if es == 0 || bytes % es != 0 || (bytes / es) as i64 != n_elems {
+                    panic!(
+                        "__builtin_shuffle: mask element count mismatch (mask {} elems, vector {} elems)",
+                        if es > 0 { bytes / es } else { 0 },
+                        n_elems
+                    );
+                }
+                es
+            }
+            other => panic!(
+                "__builtin_shuffle: mask must be a vector type, got {:?}",
+                other
+            ),
+        };
+
+        let ir_ty = match elem_size {
+            1 => IrType::I8,
+            2 => IrType::I16,
+            4 => IrType::I32,
+            8 => IrType::I64,
+            16 => IrType::I128,
+            other => panic!("__builtin_shuffle: unsupported element size {}", other),
+        };
+        let mask_ir_ty = match mask_elem_size {
+            1 => IrType::U8,
+            2 => IrType::U16,
+            4 => IrType::U32,
+            8 => IrType::U64,
+            other => panic!("__builtin_shuffle: unsupported mask element size {}", other),
+        };
+
+        // Lower operands (vector-by-memory convention: alloca pointers).
+        let mut src_vals: Vec<Value> = Vec::with_capacity(vec_args.len());
+        for a in vec_args {
+            let op = self.lower_expr(a);
+            src_vals.push(self.operand_to_value(op));
+        }
+        let mask_op = self.lower_expr(mask_expr);
+        let mask_ptr = self.operand_to_value(mask_op);
+
+        let result = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: result,
+            ty: IrType::Ptr,
+            size: total_bytes,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
+
+        // Unsigned remainder by mask element count: exact for every GCC
+        // vector lane count; for power-of-two lane counts the backend
+        // lowers URem against a constant to an AND (no division).
+        for lane in 0..n_elems {
+            let mptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: mptr,
+                base: mask_ptr,
+                offset: Operand::Const(IrConst::I64(lane * mask_elem_size as i64)),
+                ty: IrType::I8,
+            });
+            let mval = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: mval,
+                ptr: mptr,
+                ty: mask_ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+            // m = mask_elem % total_selectable (N for 2-arg, 2N for 3-arg)
+            let selectable = n_elems * if vec_args.len() == 2 { 1 } else { 2 };
+            let m_idx = if selectable > 0 && (selectable & (selectable - 1)) == 0 {
+                let and_val = self.fresh_value();
+                self.emit(Instruction::BinOp {
+                    dest: and_val,
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(mval),
+                    rhs: Operand::Const(IrConst::I64(selectable - 1)),
+                    ty: mask_ir_ty,
+                });
+                and_val
+            } else {
+                let rem_val = self.fresh_value();
+                self.emit(Instruction::BinOp {
+                    dest: rem_val,
+                    op: IrBinOp::URem,
+                    lhs: Operand::Value(mval),
+                    rhs: Operand::Const(IrConst::I64(selectable)),
+                    ty: mask_ir_ty,
+                });
+                rem_val
+            };
+            // 3-arg form: base = m < N ? v1 : v2; offset within base = m mod N.
+            let (base, elem_idx) = if vec_args.len() == 3 {
+                let in_first = self.fresh_value();
+                self.emit(Instruction::Cmp {
+                    dest: in_first,
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(m_idx),
+                    rhs: Operand::Const(IrConst::I64(n_elems)),
+                    ty: mask_ir_ty,
+                });
+                let idx_in_vec = if n_elems > 0 && (n_elems & (n_elems - 1)) == 0 {
+                    let a = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: a,
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(m_idx),
+                        rhs: Operand::Const(IrConst::I64(n_elems - 1)),
+                        ty: mask_ir_ty,
+                    });
+                    a
+                } else {
+                    let r = self.fresh_value();
+                    self.emit(Instruction::BinOp {
+                        dest: r,
+                        op: IrBinOp::URem,
+                        lhs: Operand::Value(m_idx),
+                        rhs: Operand::Const(IrConst::I64(n_elems)),
+                        ty: mask_ir_ty,
+                    });
+                    r
+                };
+                let sel = self.fresh_value();
+                self.emit(Instruction::Select {
+                    dest: sel,
+                    cond: Operand::Value(in_first),
+                    true_val: Operand::Value(src_vals[0]),
+                    false_val: Operand::Value(src_vals[1]),
+                    ty: IrType::Ptr,
+                });
+                (sel, idx_in_vec)
+            } else {
+                (src_vals[0], m_idx)
+            };
+            // Widening the (possibly narrow) index to I64 for the address math.
+            let idx64 = self.fresh_value();
+            self.emit(Instruction::Cast {
+                dest: idx64,
+                src: Operand::Value(elem_idx),
+                from_ty: mask_ir_ty,
+                to_ty: IrType::I64,
+            });
+            let off_bytes = self.fresh_value();
+            self.emit(Instruction::BinOp {
+                dest: off_bytes,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(idx64),
+                rhs: Operand::Const(IrConst::I64(elem_size as i64)),
+                ty: IrType::I64,
+            });
+            let sptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: sptr,
+                base,
+                offset: Operand::Value(off_bytes),
+                ty: IrType::I8,
+            });
+            let lane_val = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: lane_val,
+                ptr: sptr,
+                ty: ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+            let dptr = self.fresh_value();
+            self.emit(Instruction::GetElementPtr {
+                dest: dptr,
+                base: result,
+                offset: Operand::Const(IrConst::I64(lane * elem_size as i64)),
+                ty: IrType::I8,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(lane_val),
+                ptr: dptr,
+                ty: ir_ty,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        // Return convention (must match lower_vector_assign /
+        // rhs_is_small_vector_call): vectors <= 8 bytes travel as packed
+        // register values (the consumer spills them back to memory);
+        // vectors > 8 bytes travel by memory — the result alloca pointer.
+        if total_bytes <= 8 {
+            let packed_ty = Self::packed_store_type(total_bytes);
+            let packed = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: packed,
+                ptr: result,
+                ty: packed_ty,
+                seg_override: AddressSpace::Default,
+            });
+            Some(Operand::Value(packed))
+        } else {
+            Some(Operand::Value(result))
+        }
+    }
+
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
             panic!("__builtin_shufflevector: only the 4-lane 32-bit form (2 vectors + 4 indices) is supported, got {} args", args.len());

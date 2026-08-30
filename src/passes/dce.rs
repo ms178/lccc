@@ -408,6 +408,23 @@ fn dump_dead_instructions(func: &IrFunction, live: &[Vec<u8>]) {
 /// that is why the historically missing `PgoCounterInc` never caused a
 /// deletion; it is now listed anyway so the predicate is truthful.)
 fn has_side_effects(inst: &Instruction) -> bool {
+    // Calls first: a pure/const call is droppable when its result is unused —
+    // EXCEPT for sret returns. The observable result of an sret call is the
+    // memory write through the hidden sret pointer, not the (always unused)
+    // dest value. On i686 every struct/_Complex return is sret, so dropping
+    // a pure struct-returning call left the result buffer uninitialized
+    // (gcc.c-torture 20070614-1: `pure _Complex double` callee).
+    if let Instruction::Call {
+        info: CallInfo { is_sret, is_pure, is_const, .. },
+        ..
+    }
+    | Instruction::CallIndirect {
+        info: CallInfo { is_sret, is_pure, is_const, .. },
+        ..
+    } = inst
+    {
+        return (!is_pure && !is_const) || *is_sret;
+    }
     // A volatile load is an observable side effect (C11 5.1.2.3) even when
     // its result is unused: it must never be dead-code eliminated.
     matches!(
@@ -417,14 +434,6 @@ fn has_side_effects(inst: &Instruction) -> bool {
         // DynAlloca modifies the stack pointer at runtime.
         Instruction::DynAlloca { .. } |
         Instruction::Store { .. } |
-        Instruction::Call {
-            info: CallInfo { is_pure: false, is_const: false, .. },
-            ..
-        } |
-        Instruction::CallIndirect {
-            info: CallInfo { is_pure: false, is_const: false, .. },
-            ..
-        } |
         Instruction::Memcpy { .. } |
         Instruction::VaStart { .. } |
         Instruction::VaEnd { .. } |

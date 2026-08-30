@@ -936,7 +936,20 @@ pub(super) fn assign_tier3_block_local_slots(
             // into a slot previously owned by an 8-byte value would leave that
             // value's stale upper half readable by later 64-bit accesses.
             // Protected values (DynAlloca results, vector temps) must get unique slots.
-            let can_reuse = !state.protected_slot_values.contains(&dest_id);
+            //
+            // Reuse is additionally gated to the four canonical size classes.
+            // The release side buckets EVERY non-16/8 size into free_4, so a
+            // 12-byte value used to reuse a 4-byte slot: its 12-byte extent
+            // then overlapped the two slots following that offset (silent
+            // corruption of live neighbours) AND block_peak never grew, so
+            // total_space undercounted and the deepest slot landed below the
+            // emitted `subl $N` frame — where the prologue's push-staging
+            // (push %esi/%edi) clobbers it (stdarg-3 va_arg temp: s2 written
+            // to fini_array instead of the global). Non-canonical sizes are
+            // never freed into a list they can safely share: allocate fresh
+            // (block_peak grows by the exact size — accounting stays sound).
+            let can_reuse = !state.protected_slot_values.contains(&dest_id)
+                && matches!(slot_size, 4 | 8 | 16 | 32);
             let free_list = if slot_size >= 32 {
                 &mut free_32
             } else if slot_size == 16 {
