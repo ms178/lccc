@@ -62,39 +62,83 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            match ty {
+                IrType::I8 | IrType::U8 => {
+                    // clz8(x) = lzcnt32(x & 0xff) - 24. The mask kills dirty high
+                    // bits so the count is width-correct.
+                    self.state.emit("    andl $0xff, %eax");
+                    self.state.emit("    lzcntl %eax, %eax");
+                    self.state.emit("    subl $24, %eax");
+                }
+                IrType::I16 | IrType::U16 => {
+                    self.state.emit("    lzcntw %ax, %ax");
+                    // lzcntw leaves %eax[31:16] unchanged — zero-extend so the
+                    // stored 32-bit result is width-correct.
+                    self.state.emit("    movzwl %ax, %eax");
+                }
+                _ => {
+                    self.state.emit("    lzcntl %eax, %eax");
+                }
+            }
+            return;
+        }
+        // Baseline i686/x86-64-v1 has no LZCNT: F3 0F BD decodes as BSR on
+        // such CPUs and silently returns the MSB *index* instead of the
+        // leading-zero *count*. The BSR+XOR fallback keeps the IR's defined
+        // Clz(0) == width semantics (constant folding matches).
         match ty {
             IrType::I8 | IrType::U8 => {
-                // clz8(x) = lzcnt32(x & 0xff) - 24. The mask kills dirty high
-                // bits so the count is width-correct.
                 self.state.emit("    andl $0xff, %eax");
-                self.state.emit("    lzcntl %eax, %eax");
+                self.emit_clz32_baseline("eax", "eax");
                 self.state.emit("    subl $24, %eax");
             }
             IrType::I16 | IrType::U16 => {
-                self.state.emit("    lzcntw %ax, %ax");
-                // lzcntw leaves %eax[31:16] unchanged — zero-extend so the
-                // stored 32-bit result is width-correct.
+                // clz16(x) = clz32(zext16(x)) - 16 == 15 - msb16(x);
+                // clz32(zext(0)) - 16 = 32 - 16 = 16 == lzcntw(0) ✓
                 self.state.emit("    movzwl %ax, %eax");
+                self.emit_clz32_baseline("eax", "eax");
+                self.state.emit("    subl $16, %eax");
             }
             _ => {
-                self.state.emit("    lzcntl %eax, %eax");
+                self.emit_clz32_baseline("eax", "eax");
             }
         }
     }
 
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            match ty {
+                IrType::I8 | IrType::U8 => {
+                    // Force a stop bit above the value so tzcnt(0) yields 8, not 32.
+                    self.state.emit("    orl $0x100, %eax");
+                    self.state.emit("    tzcntl %eax, %eax");
+                }
+                IrType::I16 | IrType::U16 => {
+                    self.state.emit("    orl $0x10000, %eax");
+                    self.state.emit("    tzcntl %eax, %eax");
+                }
+                _ => {
+                    self.state.emit("    tzcntl %eax, %eax");
+                }
+            }
+            return;
+        }
+        // TZCNT (F3 0F BC) decodes as plain BSF on CPUs without the feature;
+        // BSF == TZCNT for every nonzero input. The stop-bit trick keeps the
+        // narrow types' defined zero results (8 / 16) without a branch; the
+        // 32-bit case needs the explicit fixup for Ctz(0) == 32.
         match ty {
             IrType::I8 | IrType::U8 => {
-                // Force a stop bit above the value so tzcnt(0) yields 8, not 32.
                 self.state.emit("    orl $0x100, %eax");
-                self.state.emit("    tzcntl %eax, %eax");
+                self.state.emit("    bsfl %eax, %eax");
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    orl $0x10000, %eax");
-                self.state.emit("    tzcntl %eax, %eax");
+                self.state.emit("    bsfl %eax, %eax");
             }
             _ => {
-                self.state.emit("    tzcntl %eax, %eax");
+                self.emit_ctz32_baseline("eax", "eax");
             }
         }
     }
@@ -121,14 +165,35 @@ impl I686Codegen {
                 // The value may be sign-extended; mask to the width so the
                 // sign bits are not counted.
                 self.state.emit("    andl $0xff, %eax");
-                self.state.emit("    popcntl %eax, %eax");
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    andl $0xffff, %eax");
-                self.state.emit("    popcntl %eax, %eax");
             }
-            _ => self.state.emit("    popcntl %eax, %eax"),
+            _ => {}
         }
+        if self.popcnt_enabled {
+            self.state.emit("    popcntl %eax, %eax");
+            return;
+        }
+        // POPCNT (0F B8) is #UD on CPUs without the feature (Nehalem/
+        // Barcelona era). Baseline shr/adc loop, result in %eax, scratch %ecx.
+        // %ecx is NOT free: -mregparm=3 passes the third integer argument in
+        // it and the emitter may stage live values there. Preserve it across
+        // the loop (no calls inside, so the transient push is safe).
+        self.state.emit("    pushl %ecx");
+        self.state.emit("    movl %eax, %ecx");
+        self.state.emit("    xorl %eax, %eax");
+        let top = self.state.fresh_label("pop_loop");
+        let done = self.state.fresh_label("pop_done");
+        self.state.emit("    testl %ecx, %ecx");
+        self.state.out.emit_jcc_label("    jz", &done);
+        self.state.out.emit_named_label(&top);
+        self.state.emit("    shrl $1, %ecx");
+        self.state.emit("    adcl $0, %eax");
+        self.state.emit("    testl %ecx, %ecx");
+        self.state.out.emit_jcc_label("    jnz", &top);
+        self.state.out.emit_named_label(&done);
+        self.state.emit("    popl %ecx");
     }
 
     /// Operand location for the direct-to-dest ALU path.

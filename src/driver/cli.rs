@@ -70,6 +70,8 @@ impl Driver {
         self.enable_bmi2 = true;
         self.enable_lzcnt = true;
         self.enable_movbe = true;
+        // x86-64-v3 is a superset of v2, which added POPCNT.
+        self.enable_popcnt = true;
         if self.sse_explicitly_disabled {
             return;
         }
@@ -156,6 +158,10 @@ impl Driver {
         self.enable_avx512vp2intersect = true;
     }
     fn enable_x86_nehalem_profile(&mut self) {
+        // POPCNT shipped with Nehalem/Barcelona and is part of the
+        // x86-64-v2 baseline contract; like BMI/LZCNT it is integer ISA
+        // and stays legal under `-mno-sse`.
+        self.enable_popcnt = true;
         if self.sse_explicitly_disabled {
             return;
         }
@@ -1020,6 +1026,7 @@ impl Driver {
                 "-mbmi" => self.enable_bmi = true,
                 "-mbmi2" => self.enable_bmi2 = true,
                 "-mlzcnt" => self.enable_lzcnt = true,
+                "-mpopcnt" => self.enable_popcnt = true,
                 "-mmovbe" => self.enable_movbe = true,
                 "-mrdrnd" => self.enable_rdrnd = true,
                 // AVX-512 / AVX10 feature flags (completeness; backend coverage
@@ -1080,6 +1087,7 @@ impl Driver {
                 "-mno-bmi" => self.enable_bmi = false,
                 "-mno-bmi2" => self.enable_bmi2 = false,
                 "-mno-lzcnt" => self.enable_lzcnt = false,
+                "-mno-popcnt" => self.enable_popcnt = false,
                 "-mno-movbe" => self.enable_movbe = false,
                 "-mno-rdrnd" => self.enable_rdrnd = false,
                 "-mno-avx512f" => self.enable_avx512f = false,
@@ -1264,6 +1272,9 @@ impl Driver {
                                     }
                                     if std::arch::is_x86_feature_detected!("lzcnt") {
                                         self.enable_lzcnt = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("popcnt") {
+                                        self.enable_popcnt = true;
                                     }
                                     if std::arch::is_x86_feature_detected!("movbe") {
                                         self.enable_movbe = true;

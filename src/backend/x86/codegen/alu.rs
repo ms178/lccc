@@ -136,37 +136,130 @@ impl X86Codegen {
         }
     }
 
+    /// 32-bit leading-zero count of %eax without LZCNT: 31 - BSR(x).
+    /// BSR leaves its destination undefined for x == 0, so the zero case is
+    /// fixed up explicitly — this preserves the IR's defined
+    /// Clz(0) == width semantics, which constant folding guarantees.
+    fn emit_clz32_rax_baseline(&mut self) {
+        let nz = self.state.fresh_label("clz_nz");
+        let done = self.state.fresh_label("clz_done");
+        self.state.emit("    testl %eax, %eax");
+        self.state.out.emit_jcc_label("    jnz", &nz);
+        self.state.emit("    movl $32, %eax");
+        self.state.out.emit_jmp_label(&done);
+        self.state.out.emit_named_label(&nz);
+        self.state.emit("    bsrl %eax, %eax");
+        self.state.emit("    xorl $31, %eax");
+        self.state.out.emit_named_label(&done);
+    }
+
+    /// 32-bit trailing-zero count of %eax without TZCNT: BSF(x).
+    /// BSF's destination is undefined for x == 0; the fixup keeps the
+    /// defined Ctz(0) == 32 semantics.
+    fn emit_ctz32_rax_baseline(&mut self) {
+        let nz = self.state.fresh_label("ctz_nz");
+        let done = self.state.fresh_label("ctz_done");
+        self.state.emit("    testl %eax, %eax");
+        self.state.out.emit_jcc_label("    jnz", &nz);
+        self.state.emit("    movl $32, %eax");
+        self.state.out.emit_jmp_label(&done);
+        self.state.out.emit_named_label(&nz);
+        self.state.emit("    bsfl %eax, %eax");
+        self.state.out.emit_named_label(&done);
+    }
+
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            match ty {
+                IrType::I8 | IrType::U8 => {
+                    // clz8(x) = lzcnt32(zext(x)) - 24.
+                    self.state.emit("    movzbl %al, %eax");
+                    self.state.emit("    lzcntl %eax, %eax");
+                    self.state.emit("    subl $24, %eax");
+                }
+                IrType::I16 | IrType::U16 => {
+                    self.state.emit("    movzwl %ax, %eax");
+                    self.state.emit("    lzcntl %eax, %eax");
+                    self.state.emit("    subl $16, %eax");
+                }
+                IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
+                _ => self.state.emit("    lzcntq %rax, %rax"),
+            }
+            return;
+        }
+        // Baseline x86-64 has no LZCNT: the F3 0F BD encoding decodes as BSR
+        // on CPUs without ABM and silently yields the MSB *index* instead of
+        // the leading-zero *count* (bit-flipped result, no fault). This
+        // corrupted the preboot ZSTD decoder's FSE/Huffman table builds when
+        // an lccc-built kernel booted on QEMU's default qemu64 TCG CPU.
         match ty {
             IrType::I8 | IrType::U8 => {
-                // clz8(x) = lzcnt32(zext(x)) - 24.
                 self.state.emit("    movzbl %al, %eax");
-                self.state.emit("    lzcntl %eax, %eax");
+                self.emit_clz32_rax_baseline();
                 self.state.emit("    subl $24, %eax");
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    movzwl %ax, %eax");
-                self.state.emit("    lzcntl %eax, %eax");
+                self.emit_clz32_rax_baseline();
                 self.state.emit("    subl $16, %eax");
             }
-            IrType::I32 | IrType::U32 => self.state.emit("    lzcntl %eax, %eax"),
-            _ => self.state.emit("    lzcntq %rax, %rax"),
+            IrType::I32 | IrType::U32 => self.emit_clz32_rax_baseline(),
+            _ => {
+                let nz = self.state.fresh_label("clz_nz");
+                let done = self.state.fresh_label("clz_done");
+                self.state.emit("    testq %rax, %rax");
+                self.state.out.emit_jcc_label("    jnz", &nz);
+                self.state.emit("    movl $64, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&nz);
+                self.state.emit("    bsrq %rax, %rax");
+                self.state.emit("    xorq $63, %rax");
+                self.state.out.emit_named_label(&done);
+            }
         }
     }
 
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
+        if self.lzcnt_enabled {
+            match ty {
+                IrType::I8 | IrType::U8 => {
+                    // Zero-extend so only the real low byte's trailing zeros count.
+                    self.state.emit("    movzbl %al, %eax");
+                    self.state.emit("    tzcntl %eax, %eax");
+                }
+                IrType::I16 | IrType::U16 => {
+                    self.state.emit("    movzwl %ax, %eax");
+                    self.state.emit("    tzcntl %eax, %eax");
+                }
+                IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
+                _ => self.state.emit("    tzcntq %rax, %rax"),
+            }
+            return;
+        }
+        // TZCNT (F3 0F BC) decodes as plain BSF without the feature; the two
+        // agree for every nonzero input, but BSF's result is undefined for
+        // zero, so the zero case is fixed up to preserve Ctz(0) == width.
         match ty {
             IrType::I8 | IrType::U8 => {
-                // Zero-extend so only the real low byte's trailing zeros count.
                 self.state.emit("    movzbl %al, %eax");
-                self.state.emit("    tzcntl %eax, %eax");
+                self.emit_ctz32_rax_baseline();
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    movzwl %ax, %eax");
-                self.state.emit("    tzcntl %eax, %eax");
+                self.emit_ctz32_rax_baseline();
             }
-            IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
-            _ => self.state.emit("    tzcntq %rax, %rax"),
+            IrType::I32 | IrType::U32 => self.emit_ctz32_rax_baseline(),
+            _ => {
+                let nz = self.state.fresh_label("ctz_nz");
+                let done = self.state.fresh_label("ctz_done");
+                self.state.emit("    testq %rax, %rax");
+                self.state.out.emit_jcc_label("    jnz", &nz);
+                self.state.emit("    movl $64, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&nz);
+                self.state.emit("    bsfq %rax, %rax");
+                self.state.out.emit_named_label(&done);
+            }
         }
     }
 
@@ -181,17 +274,62 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_int_popcount_impl(&mut self, ty: IrType) {
-        match ty {
-            IrType::I8 | IrType::U8 => {
-                self.state.emit("    movzbl %al, %eax");
-                self.state.emit("    popcntl %eax, %eax");
+        let narrow = matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
+        if narrow {
+            match ty {
+                IrType::I8 | IrType::U8 => self.state.emit("    movzbl %al, %eax"),
+                _ => self.state.emit("    movzwl %ax, %eax"),
             }
-            IrType::I16 | IrType::U16 => {
-                self.state.emit("    movzwl %ax, %eax");
+        }
+        if self.popcnt_enabled {
+            if narrow {
                 self.state.emit("    popcntl %eax, %eax");
+            } else if matches!(ty, IrType::I32 | IrType::U32) {
+                self.state.emit("    popcntl %eax, %eax");
+            } else {
+                self.state.emit("    popcntq %rax, %rax");
             }
-            IrType::I32 | IrType::U32 => self.state.emit("    popcntl %eax, %eax"),
-            _ => self.state.emit("    popcntq %rax, %rax"),
+            return;
+        }
+        // POPCNT (0F B8) is #UD on pre-Nehalem/Barcelona x86-64 — it is a
+        // v2 feature, not v1. Baseline fallback: shift each bit into CF and
+        // accumulate with adc, iterating only while bits remain.
+        //
+        // %rcx is NOT free here: the surrounding accumulator-mode code may
+        // have staged a live value in it (e.g. a 64-bit multiply constant
+        // reused by a following `imulq %rcx`). Preserve it across the loop
+        // with a push/pop pair; the loop body contains no call, so the
+        // transient 8-byte stack excursion is safe at any alignment.
+        if narrow || matches!(ty, IrType::I32 | IrType::U32) {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    movl %eax, %ecx");
+            self.state.emit("    xorl %eax, %eax");
+            let top = self.state.fresh_label("pop32_loop");
+            let done = self.state.fresh_label("pop32_done");
+            self.state.emit("    testl %ecx, %ecx");
+            self.state.out.emit_jcc_label("    jz", &done);
+            self.state.out.emit_named_label(&top);
+            self.state.emit("    shrl $1, %ecx");
+            self.state.emit("    adcl $0, %eax");
+            self.state.emit("    testl %ecx, %ecx");
+            self.state.out.emit_jcc_label("    jnz", &top);
+            self.state.out.emit_named_label(&done);
+            self.state.emit("    popq %rcx");
+        } else {
+            self.state.emit("    pushq %rcx");
+            self.state.emit("    movq %rax, %rcx");
+            self.state.emit("    xorl %eax, %eax");
+            let top = self.state.fresh_label("pop64_loop");
+            let done = self.state.fresh_label("pop64_done");
+            self.state.emit("    testq %rcx, %rcx");
+            self.state.out.emit_jcc_label("    jz", &done);
+            self.state.out.emit_named_label(&top);
+            self.state.emit("    shrq $1, %rcx");
+            self.state.emit("    adcq $0, %rax");
+            self.state.emit("    testq %rcx, %rcx");
+            self.state.out.emit_jcc_label("    jnz", &top);
+            self.state.out.emit_named_label(&done);
+            self.state.emit("    popq %rcx");
         }
     }
 

@@ -62,8 +62,27 @@ chmod +x "$WORK/root/bin/busybox"
 ( cd "$WORK/root" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -1 > "$WORK/initramfs.cpio.gz" )
 
 # ---- boot --------------------------------------------------------------------
-echo "boot: $QEMU -kernel $BZIMAGE (log: $LOG)"
+# QEMU loads its PC BIOS from the compiled-in data dir; a locally extracted
+# qemu package (no root install) must point -L at its firmware directory.
+# QEMU_DATA_DIR selects it explicitly; otherwise a share/{qemu,seabios}
+# directory next to the qemu binary is auto-detected.
+qemu_l=()
+if [[ -n ${QEMU_DATA_DIR:-} ]]; then
+    [[ -f "$QEMU_DATA_DIR/bios-256k.bin" ]] || {
+        echo "qemu_boot_test: QEMU_DATA_DIR has no bios-256k.bin: $QEMU_DATA_DIR" >&2
+        exit 1
+    }
+    qemu_l=(-L "$QEMU_DATA_DIR")
+else
+    qdir=$(dirname "$(command -v "$QEMU")")
+    for d in "$qdir/../share/qemu" "$qdir/../share/seabios"; do
+        if [[ -f "$d/bios-256k.bin" ]]; then qemu_l=(-L "$d"); break; fi
+    done
+fi
+
+echo "boot: $QEMU ${qemu_l[*]} -kernel $BZIMAGE (log: $LOG)"
 timeout 600 "$QEMU" -m 512 -smp 2 \
+    "${qemu_l[@]}" \
     -kernel "$BZIMAGE" -initrd "$WORK/initramfs.cpio.gz" \
     -nographic -no-reboot \
     -accel tcg,thread=multi \

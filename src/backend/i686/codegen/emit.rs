@@ -77,6 +77,16 @@ pub struct I686Codegen {
     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
     /// (magic-number division, multi-instruction LEA multiply chains).
     pub(super) optimize_for_size: bool,
+    /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
+    /// LZCNT/TZCNT are NOT baseline i686 ISA: the F3-prefixed encodings
+    /// decode as BSR/BSF on CPUs without the feature and silently return
+    /// the bit index instead of a zero count. When false, Clz/Ctz lower to
+    /// BSR/BSF sequences with an explicit zero fixup preserving the IR's
+    /// defined Clz(0)/Ctz(0) == width semantics.
+    pub(super) lzcnt_enabled: bool,
+    /// True when the target has POPCNT (-mpopcnt or an enabling -march).
+    /// When false, Popcount lowers to an shr/adc bit loop.
+    pub(super) popcnt_enabled: bool,
     /// Same-block div/rem pair analysis (see backend::regalloc::
     /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
     /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
@@ -309,6 +319,8 @@ impl I686Codegen {
             frame_base_offset: 0,
             esp_adjust: 0,
             optimize_for_size: false,
+            lzcnt_enabled: false,
+            popcnt_enabled: false,
         }
     }
 
@@ -337,6 +349,8 @@ impl I686Codegen {
             _ => 16,
         };
         self.optimize_for_size = opts.optimize_for_size;
+        self.lzcnt_enabled = opts.lzcnt;
+        self.popcnt_enabled = opts.popcnt;
     }
 
     // --- i686 helper methods ---
@@ -1356,6 +1370,36 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> &'static str {
 // The result of clz/ctz/popcount is a small integer (0-64) that fits in eax,
 // so we zero edx to produce a proper I64 result.
 impl I686Codegen {
+    /// clz32 on a 32-bit register without LZCNT: 31 - BSR(src) into dst.
+    /// BSR leaves dst undefined for src == 0; the explicit fixup preserves
+    /// the IR's defined Clz(0) == 32 semantics (constant folding matches).
+    pub(super) fn emit_clz32_baseline(&mut self, src: &str, dst: &str) {
+        let nz = self.state.fresh_label("clz_nz");
+        let done = self.state.fresh_label("clz_done");
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", nz);
+        emit!(self.state, "    movl $32, %{d}", d = dst);
+        emit!(self.state, "    jmp {}", done);
+        emit!(self.state, "{}:", nz);
+        emit!(self.state, "    bsrl %{s}, %{d}", s = src, d = dst);
+        emit!(self.state, "    xorl $31, %{d}", d = dst);
+        emit!(self.state, "{}:", done);
+    }
+
+    /// ctz32 on a 32-bit register without TZCNT: BSF(src) into dst, with
+    /// the zero fixup so Ctz(0) == 32 holds.
+    pub(super) fn emit_ctz32_baseline(&mut self, src: &str, dst: &str) {
+        let nz = self.state.fresh_label("ctz_nz");
+        let done = self.state.fresh_label("ctz_done");
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", nz);
+        emit!(self.state, "    movl $32, %{d}", d = dst);
+        emit!(self.state, "    jmp {}", done);
+        emit!(self.state, "{}:", nz);
+        emit!(self.state, "    bsfl %{s}, %{d}", s = src, d = dst);
+        emit!(self.state, "{}:", done);
+    }
+
     /// clzll(x): Count leading zeros of 64-bit value in eax:edx.
     /// If high half (edx) != 0, result = lzcnt(edx).
     /// Otherwise, result = 32 + lzcnt(eax).
@@ -1366,12 +1410,20 @@ impl I686Codegen {
         self.state.emit("    testl %edx, %edx");
         emit!(self.state, "    je {}", hi_zero);
         // High half is non-zero: result = lzcnt(edx)
-        self.state.emit("    lzcntl %edx, %eax");
+        if self.lzcnt_enabled {
+            self.state.emit("    lzcntl %edx, %eax");
+        } else {
+            self.emit_clz32_baseline("edx", "eax");
+        }
         self.state.emit("    xorl %edx, %edx");
         emit!(self.state, "    jmp {}", done);
         // High half is zero: result = 32 + lzcnt(eax)
         emit!(self.state, "{}:", hi_zero);
-        self.state.emit("    lzcntl %eax, %eax");
+        if self.lzcnt_enabled {
+            self.state.emit("    lzcntl %eax, %eax");
+        } else {
+            self.emit_clz32_baseline("eax", "eax");
+        }
         self.state.emit("    addl $32, %eax");
         self.state.emit("    xorl %edx, %edx");
         emit!(self.state, "{}:", done);
@@ -1387,12 +1439,20 @@ impl I686Codegen {
         self.state.emit("    testl %eax, %eax");
         emit!(self.state, "    je {}", lo_zero);
         // Low half is non-zero: result = tzcnt(eax)
-        self.state.emit("    tzcntl %eax, %eax");
+        if self.lzcnt_enabled {
+            self.state.emit("    tzcntl %eax, %eax");
+        } else {
+            self.emit_ctz32_baseline("eax", "eax");
+        }
         self.state.emit("    xorl %edx, %edx");
         emit!(self.state, "    jmp {}", done);
         // Low half is zero: result = 32 + tzcnt(edx)
         emit!(self.state, "{}:", lo_zero);
-        self.state.emit("    tzcntl %edx, %eax");
+        if self.lzcnt_enabled {
+            self.state.emit("    tzcntl %edx, %eax");
+        } else {
+            self.emit_ctz32_baseline("edx", "eax");
+        }
         self.state.emit("    addl $32, %eax");
         self.state.emit("    xorl %edx, %edx");
         emit!(self.state, "{}:", done);
@@ -1401,10 +1461,55 @@ impl I686Codegen {
     /// popcountll(x): Population count of 64-bit value in eax:edx.
     /// result = popcount(eax) + popcount(edx)
     pub(super) fn emit_i64_popcount(&mut self) {
-        self.state.emit("    popcntl %edx, %ecx");
-        self.state.emit("    popcntl %eax, %eax");
+        if self.popcnt_enabled {
+            self.state.emit("    popcntl %edx, %ecx");
+            self.state.emit("    popcntl %eax, %eax");
+            self.state.emit("    addl %ecx, %eax");
+            self.state.emit("    xorl %edx, %edx");
+            return;
+        }
+        // POPCNT is #UD on i686 CPUs without the feature (SSE4.2 era /
+        // -mpopcnt). Baseline: count each half with the shr/adc loop.
+        self.emit_popcount32_baseline("edx", "ecx");
+        // careful: the loop for eax must not clobber ecx — count eax into
+        // edx's old role is unnecessary; count eax into eax directly.
+        self.emit_popcount32_baseline_eax_preserving_ecx();
         self.state.emit("    addl %ecx, %eax");
         self.state.emit("    xorl %edx, %edx");
+    }
+
+    /// 32-bit popcount of `src` into `dst` without POPCNT (shr/adc loop).
+    /// May only use the two named registers.
+    pub(super) fn emit_popcount32_baseline(&mut self, src: &str, dst: &str) {
+        let top = self.state.fresh_label("pop_loop");
+        let done = self.state.fresh_label("pop_done");
+        emit!(self.state, "    xorl %{d}, %{d}", d = dst);
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jz {}", done);
+        emit!(self.state, "{}:", top);
+        emit!(self.state, "    shrl $1, %{s}", s = src);
+        emit!(self.state, "    adcl $0, %{d}", d = dst);
+        emit!(self.state, "    testl %{s}, %{s}", s = src);
+        emit!(self.state, "    jnz {}", top);
+        emit!(self.state, "{}:", done);
+    }
+
+    /// popcount(eax) -> eax without POPCNT and without touching %ecx
+    /// (used by emit_i64_popcount, which keeps the edx count in %ecx).
+    fn emit_popcount32_baseline_eax_preserving_ecx(&mut self) {
+        // Count into edx (already consumed as the high half input).
+        let top = self.state.fresh_label("pop_lo");
+        let done = self.state.fresh_label("pop_dn");
+        self.state.emit("    xorl %edx, %edx");
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    jz {}", done);
+        emit!(self.state, "{}:", top);
+        self.state.emit("    shrl $1, %eax");
+        self.state.emit("    adcl $0, %edx");
+        self.state.emit("    testl %eax, %eax");
+        emit!(self.state, "    jnz {}", top);
+        emit!(self.state, "{}:", done);
+        self.state.emit("    movl %edx, %eax");
     }
 
     /// bswap64(x): Byte-swap 64-bit value in eax:edx.
