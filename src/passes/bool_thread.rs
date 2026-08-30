@@ -428,6 +428,13 @@ fn thread_round(func: &mut IrFunction) -> usize {
             if self_ref {
                 continue;
             }
+            // A predecessor that IS Bt or Bf must not be threaded: its new
+            // terminator would be a Branch/CondBranch back to itself
+            // (Bt==Pi => Branch(Bt) is an unconditional self-loop), an
+            // infinite loop no downstream pass can detect.
+            if pi == bti || pi == bfi {
+                continue;
+            }
             threadable[pos] = true;
         }
         let threaded_count = threadable.iter().filter(|t| **t).count();
@@ -466,6 +473,23 @@ fn thread_round(func: &mut IrFunction) -> usize {
         // re-materializes the compare on the arm (constant arms fold the
         // comparison at compile time — no instruction is emitted; pairs that
         // cannot fold were pre-validated away above).
+        //
+        // Each threaded predecessor also records which of Bt/Bf its new
+        // terminator can actually reach: a CONSTANT arm folds to exactly one
+        // target, a value arm reaches both. Step (2) must deliver phi arms
+        // only along edges that exist after the rewrite — an arm delivered
+        // from a predecessor that branches elsewhere is a use of a value on
+        // a path where the phi it feeds was never entered with that arm,
+        // which corrupts the receiving phi (seen as the zstd FSE tail-loop
+        // counter over-count: the loop header kept a stale arm from the
+        // predecessor threaded to the overflow exit).
+        #[derive(Clone, Copy, PartialEq)]
+        enum PredReach {
+            Bt,
+            Bf,
+            Both,
+        }
+        let mut reach = vec![PredReach::Both; preds[mi].len()];
         let p_pos = match &int_cmp {
             Some((_, _, _, ipos)) => *ipos,
             None => match phi_dests.iter().position(|d| *d == cond_val) {
@@ -481,28 +505,40 @@ fn thread_round(func: &mut IrFunction) -> usize {
                 None => match arms[p_pos][pos].unwrap() {
                     Operand::Const(c) => {
                         if const_is_truthy(&c) {
+                            reach[pos] = PredReach::Bt;
                             Terminator::Branch(bt)
                         } else {
+                            reach[pos] = PredReach::Bf;
                             Terminator::Branch(bf)
                         }
                     }
-                    cond => Terminator::CondBranch {
-                        cond,
-                        true_label: bt,
-                        false_label: bf,
-                    },
+                    cond => {
+                        reach[pos] = PredReach::Both;
+                        Terminator::CondBranch {
+                            cond,
+                            true_label: bt,
+                            false_label: bf,
+                        }
+                    }
                 },
                 Some((op, rhs, ty, _)) => {
                     let arm = arms[p_pos][pos].unwrap();
                     match (&arm, rhs) {
                         (Operand::Const(c), Operand::Const(rc)) => {
                             match eval_const_cmp(*op, c, rc, ty) {
-                                Some(true) => Terminator::Branch(bt),
-                                Some(false) => Terminator::Branch(bf),
+                                Some(true) => {
+                                    reach[pos] = PredReach::Bt;
+                                    Terminator::Branch(bt)
+                                }
+                                Some(false) => {
+                                    reach[pos] = PredReach::Bf;
+                                    Terminator::Branch(bf)
+                                }
                                 None => unreachable!("pre-validated constant pair"),
                             }
                         }
                         _ => {
+                            reach[pos] = PredReach::Both;
                             // Re-materialize the compare on this
                             // predecessor's own incoming value. A constant
                             // arm against the value-RHS extension is
@@ -543,6 +579,7 @@ fn thread_round(func: &mut IrFunction) -> usize {
         // arm is dropped only when the merge dies — unthreaded predecessors
         // still deliver through it.
         for &ti in &[bti, bfi] {
+            let target_is_bt = ti == bti;
             for inst in &mut func.blocks[ti].instructions {
                 let incoming = match inst {
                     Instruction::Phi { incoming, .. } => incoming,
@@ -556,6 +593,17 @@ fn thread_round(func: &mut IrFunction) -> usize {
                 for (pos, threaded) in threadable.iter().enumerate() {
                     if !*threaded {
                         continue;
+                    }
+                    // Deliver the arm only along an edge the rewritten CFG
+                    // actually has: predecessors folded to one target must
+                    // not feed the other target's phis (a stale arm from a
+                    // non-predecessor corrupts the phi's slot accounting in
+                    // phi elimination).
+                    match reach[pos] {
+                        PredReach::Both => {}
+                        PredReach::Bt if !target_is_bt => continue,
+                        PredReach::Bf if target_is_bt => continue,
+                        _ => {}
                     }
                     let repl = match merge_edge_op {
                         Operand::Value(v) => match phi_dests.iter().position(|d| *d == v) {

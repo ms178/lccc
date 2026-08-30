@@ -359,8 +359,20 @@ impl Lowerer {
         // After call to noreturn function, emit unreachable and start dead block.
         // Unlike error_functions (which skip the call entirely), noreturn functions
         // are real functions that get called but never return (e.g., panic, abort).
+        //
+        // SHADOWING: when a function-pointer variable/parameter shadows the
+        // name (the boot decompressor's `void (*error)(char *x)` parameter vs
+        // error.h's `void error(char *) __noreturn`), the call is INDIRECT
+        // through the variable's value — emit_call_instruction dispatches it
+        // via is_func_ptr_variable/load_func_ptr_variable — and the shadowed
+        // function's noreturn attribute must NOT apply: the pointer target
+        // may perfectly well return. Keying this test on the name alone
+        // terminated every such call site with Unreachable and emitted ud2
+        // after the indirect call (userspace zstd oracle SIGILL; the
+        // lccc-built preboot decompressor lost its post-error() control
+        // flow). Gate on the same predicate the call dispatch uses.
         if let Expr::Identifier(name, _) = stripped_func {
-            if self.noreturn_functions.contains(name) {
+            if self.noreturn_functions.contains(name) && !self.is_func_ptr_variable(name) {
                 self.terminate(Terminator::Unreachable);
                 let dead_label = self.fresh_label();
                 self.start_block(dead_label);

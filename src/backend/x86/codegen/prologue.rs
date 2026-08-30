@@ -1234,12 +1234,35 @@ impl X86Codegen {
         //     (unless the extension is disabled: CCC_NO_FOLDED_INDEX_LIVENESS
         //     removes the guarantee, so reg-homed operands revert to
         //     refused);
+        //   * accumulator-located (immediately-consumed) values — NOT
+        //     readable: the producer leaves the value in %rax for the
+        //     ADJACENT consumer only (store_rax_to skips the home store and
+        //     slot assignment skips the slot), so at the replay distance
+        //     there is no register, no slot and (after the replay's
+        //     invalidate_acc) no cache entry — reading one would ICE or, if
+        //     a slot was speculatively assigned, silently load a
+        //     never-written slot. The canonical case: a widening Cast
+        //     feeding a Cmp whose Select consumer is not adjacent
+        //     (io_uring kbuf io_ring_buffers_peek: `Cast U16→U64` → `Cmp
+        //     Ugt` → intervening `Cast U64→U16` → `Select`) — the Cmp is
+        //     replay-deferred and its zext operand becomes unreachable.
+        //     Prune the replay: the Cmp then emits at its own position,
+        //     where the adjacency contract holds and the acc-cache read is
+        //     valid;
         //   * neither — safe only when the allocator will hand the value a
         //     spill slot (every non-never-materialized value gets one).
         //     never-materialized values have no home at all: reading one at
         //     the replay would consume stale register/slot state — prune.
         {
             let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
+            // The RA-verified accumulator assignments: single-use values
+            // whose consumer is the immediately following instruction.
+            // These are exactly the values stack layout will give an
+            // `ExplicitLocation::Accumulator` (no home store). A register
+            // home still wins (checked first below), so only the
+            // register-less subset is refused.
+            let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
+                accumulator_assignments.iter().map(|a| a.value_id).collect();
             let mut prune: Vec<u32> = Vec::new();
             for (cdest, (_op, lhs, rhs, _ty)) in self.cmp_replay.iter() {
                 let readable = |op: &Operand| -> bool {
@@ -1251,6 +1274,9 @@ impl X86Codegen {
                             }
                             if self.reg_assignments.contains_key(&v.0) {
                                 return ext_active;
+                            }
+                            if acc_no_home.contains(&v.0) {
+                                return false;
                             }
                             !self.state.never_materialized_values.contains(&v.0)
                         }
