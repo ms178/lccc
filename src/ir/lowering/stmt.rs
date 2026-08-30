@@ -461,7 +461,22 @@ impl Lowerer {
                 {
                     if let Some(const_val) = self.eval_const_expr(expr) {
                         if let Some(ival) = self.const_to_i64(&const_val) {
-                            self.insert_const_local_scoped(declarator.name.clone(), ival);
+                            // Coerce the constant to the declared type before caching it
+                            // in const_local_values. Otherwise `const char c = 220` caches
+                            // +220 instead of -36 (char is signed on x86), so `c < 0`
+                            // wrongly folds false and a following `|| (g = 9)` side effect
+                            // runs (Regehr yarpgen regress_const_local_char_init_coercion).
+                            // Match the sign/width of the declared IR type.
+                            let coerced = match da.var_ty {
+                                IrType::I8 => ival as i8 as i64,
+                                IrType::U8 => ival as u8 as i64,
+                                IrType::I16 => ival as i16 as i64,
+                                IrType::U16 => ival as u16 as i64,
+                                IrType::I32 => ival as i32 as i64,
+                                IrType::U32 => ival as u32 as i64,
+                                _ => ival, // I64/U64 already full-width
+                            };
+                            self.insert_const_local_scoped(declarator.name.clone(), coerced);
                         }
                     }
                 }

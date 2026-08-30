@@ -943,7 +943,11 @@ impl Lowerer {
         } else {
             1
         };
-        let is_subarray = this_stride > struct_size && !remaining.is_empty();
+        // Recurse whenever there are remaining dimensions, even when this_stride
+        // == struct_size (singleton inner dimensions like `a[][1]`) — the brace
+        // level still corresponds to a sub-array (Regehr yarpgen
+        // *_singleton_inner_dim_* tests).
+        let is_subarray = !remaining.is_empty();
 
         let mut item_idx = 0usize;
         while item_idx < items.len() {
@@ -997,9 +1001,14 @@ impl Lowerer {
                         item_idx += 1;
                         continue; // flat_idx already advanced
                     } else {
-                        // Leaf: this List is a single struct initializer
+                        // Leaf: this List is a single struct initializer. For
+                        // singleton inner dimensions the parser can leave redundant
+                        // single-list wrappers (e.g. `struct S a[][1] = {{{1,2}}}`);
+                        // unwrap them so scalar fields aren't lost (Regehr yarpgen
+                        // *_singleton_inner_dim_* tests).
                         let elem_base = self.emit_gep_offset(alloca, base_byte_offset, IrType::I8);
-                        self.lower_local_struct_init(sub_items, elem_base, s_layout);
+                        let elem_items = self.normalize_leaf_struct_element_items(sub_items, s_layout);
+                        self.lower_local_struct_init(elem_items, elem_base, s_layout);
                     }
                 }
                 Initializer::Expr(e) => {
@@ -1035,6 +1044,67 @@ impl Lowerer {
 
     /// Handle field-designated list init for a struct array element:
     /// `[idx].field = { ... }`
+    /// Normalize a leaf struct-element initializer from a multi-dimensional array.
+    ///
+    /// For singleton inner dimensions (e.g., `struct S a[][1] = {{{1,2}}};`), the
+    /// parser shape at the leaf can be `List([List([expr, expr, ...])])` where the
+    /// outer list is the array-element wrapper and the inner list is the struct
+    /// initializer. Passing the outer list straight to `lower_local_struct_init`
+    /// makes scalar first fields consume only the first inner expression and the
+    /// remaining fields are lost.
+    ///
+    /// Unwrap redundant singleton list layers only when the struct's first
+    /// initializable field is scalar-like (not array/struct/union/vector/complex),
+    /// where extra wrappers cannot represent required subobject braces for the
+    /// first field. (Adopted from Regehr's yarpgen branch.)
+    fn normalize_leaf_struct_element_items<'a>(
+        &self,
+        sub_items: &'a [InitializerItem],
+        s_layout: &crate::common::types::StructLayout,
+    ) -> &'a [InitializerItem] {
+        let first_field_idx = match s_layout.resolve_init_field(
+            None,
+            0,
+            &*self.types.borrow_struct_layouts(),
+        ) {
+            Some(crate::common::types::InitFieldResolution::Direct(idx)) => idx,
+            _ => return sub_items,
+        };
+        let first_ty = &s_layout.fields[first_field_idx].ty;
+        let first_field_needs_nested_braces = matches!(
+            first_ty,
+            CType::Array(..)
+                | CType::Struct(..)
+                | CType::Union(..)
+                | CType::Vector(..)
+                | CType::ComplexFloat
+                | CType::ComplexDouble
+                | CType::ComplexLongDouble
+        );
+
+        if first_field_needs_nested_braces {
+            return sub_items;
+        }
+
+        // For scalar-leading structs, singleton inner dimensions may introduce
+        // multiple redundant list wrappers (e.g., [][1][1] with {{{{...}}}}).
+        // Peel all empty-designator single-list layers so all scalar field
+        // initializers remain visible to lower_local_struct_init.
+        let mut normalized = sub_items;
+        loop {
+            if normalized.len() != 1 || !normalized[0].designators.is_empty() {
+                break;
+            }
+            match &normalized[0].init {
+                Initializer::List(inner) => {
+                    normalized = inner.as_slice();
+                }
+                _ => break,
+            }
+        }
+        normalized
+    }
+
     fn lower_struct_array_field_designated_list(
         &mut self,
         sub_items: &[InitializerItem],
