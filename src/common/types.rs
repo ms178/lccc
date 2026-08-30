@@ -2092,6 +2092,23 @@ impl IrType {
         matches!(self, IrType::F128)
     }
 
+    /// Whether a `Cast` from `from` to `to` is a machine-level no-op whose
+    /// result is bit-identical to its source (same size, neither side
+    /// floating). This is the ONLY class of cast that consumer-side
+    /// materialization fallbacks may resolve through the source value.
+    ///
+    /// Same-size float<->int casts are VALUE conversions, not bitcasts:
+    /// `(long long)3.0` is cvttsd2si (result 3), while the bit pattern of
+    /// 3.0 is 0x4008000000000000; `(double)ptr` is cvtsi2sdq, while
+    /// `movq %rax,%xmm0` would re-interpret the address bits (the
+    /// check_ptr_to_float_cast precedent). The float guard mirrors the
+    /// in-repo convention: global_addr_cse.rs, simplify.rs and
+    /// generation.rs already refuse to fold float-involving same-size
+    /// casts for exactly this reason.
+    pub fn cast_is_bitidentical_nop(from: IrType, to: IrType) -> bool {
+        from.size() == to.size() && !from.is_float() && !to.is_float()
+    }
+
     /// Whether this is a 128-bit integer type (I128 or U128).
     pub fn is_128bit(&self) -> bool {
         matches!(self, IrType::I128 | IrType::U128)
@@ -2194,5 +2211,56 @@ impl IrType {
             // Vectors are treated as aggregate types (pointer to stack slot)
             CType::Vector(_, _) => IrType::Ptr,
         }
+    }
+}
+
+#[cfg(test)]
+mod cast_nop_tests {
+    use super::IrType;
+
+    /// The cast_is_bitidentical_nop predicate is the shared contract for every
+    /// consumer-side "materialize through the cast's source" fallback. A wrong
+    /// true here is a silent miscompile (bitcast instead of value conversion);
+    /// a wrong false is merely a missed optimization that falls back to the
+    /// loud HARD GATE. Pin both directions for every same-size type pair that
+    /// the IR's lower_cast can emit.
+    #[test]
+    fn same_size_int_casts_are_noops() {
+        // The print_cfs_group_stats shape (PR #306's intended case).
+        assert!(IrType::cast_is_bitidentical_nop(IrType::U64, IrType::I64));
+        assert!(IrType::cast_is_bitidentical_nop(IrType::I64, IrType::U64));
+        assert!(IrType::cast_is_bitidentical_nop(IrType::U32, IrType::I32));
+        assert!(IrType::cast_is_bitidentical_nop(IrType::U16, IrType::I16));
+        assert!(IrType::cast_is_bitidentical_nop(IrType::U8, IrType::I8));
+        // 128-bit integer sign flavors share a 16-byte representation.
+        assert!(IrType::cast_is_bitidentical_nop(IrType::U128, IrType::I128));
+    }
+
+    #[test]
+    fn same_size_float_int_casts_are_value_conversions() {
+        // (long long)d / (int)f — cvttsd2si/cvttss2si, NOT bitcasts.
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::I64));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F32, IrType::I32));
+        // (double)ll / (float)i — cvtsi2sdq/cvtsi2ss.
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::I64, IrType::F64));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::I32, IrType::F32));
+        // (double)ptr — the check_ptr_to_float_cast precedent (8 == 8 bytes).
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::Ptr, IrType::F64));
+        // U128 carrier -> F128 (both 16 bytes on LP64): soft-float conversion.
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::U128, IrType::F128));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::U128));
+    }
+
+    #[test]
+    fn size_changing_casts_are_never_noops() {
+        // fpext/fptrunc and widening/narrowing all change the representation.
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F32, IrType::F64));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::F32));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::I32, IrType::I64));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::I64, IrType::I32));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::I8, IrType::I32));
+        // i686: F128 is 12 bytes there but still a float — excluded by class.
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::F64));
+        assert!(!IrType::cast_is_bitidentical_nop(IrType::F64, IrType::F128));
     }
 }

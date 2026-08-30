@@ -1555,11 +1555,20 @@ impl X86Codegen {
                     // Load is cast to I64 for a Cmp Slt — the cast had no home
                     // due to RA coalesce miss, but its source does.
                     // Clone def info to avoid borrow conflicts.
+                    //
+                    // Float-involving casts are NOT bit-identical: (long
+                    // long)3.0 must cvttsd2si to 3, not re-publish the raw
+                    // bits 0x4008000000000000; (double)ptr is cvtsi2sdq, not
+                    // a movq bitcast (check_ptr_to_float_cast precedent).
+                    // cast_is_bitidentical_nop is the shared predicate every
+                    // other same-size-cast fold in this repo already honors;
+                    // anything it rejects still reaches the loud HARD GATE
+                    // below rather than silently fabricating wrong values.
                     let fallback_src = {
                         if let Some(def_inst) = self.get_defining_instruction(v.0) {
                             match def_inst {
                                 crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. } => {
-                                    if from_ty.size() == to_ty.size() {
+                                    if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) {
                                         Some(src.clone())
                                     } else {
                                         None
@@ -2432,12 +2441,15 @@ impl X86Codegen {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }
         } else {
-            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op)
+            // Try to resolve through Copy or same-size Cast (U64<->I64 no-op).
+            // Float-involving same-size casts are value conversions, never
+            // bitcasts — cast_is_bitidentical_nop is the shared predicate
+            // (see operand_to_rax's fallback for the full rationale).
             let source = self.get_defining_instruction(val.0).and_then(|inst| {
                 match inst {
                     crate::ir::reexports::Instruction::Copy { src, .. } => Some(src.clone()),
                     crate::ir::reexports::Instruction::Cast { src, from_ty, to_ty, .. }
-                        if from_ty.size() == to_ty.size() =>
+                        if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) =>
                     {
                         Some(src.clone())
                     }

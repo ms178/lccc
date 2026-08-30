@@ -458,6 +458,12 @@ impl RiscvCodegen {
                     // (U64<->I64 etc) or a Copy whose SOURCE has a home —
                     // materialize the source instead (x86-64
                     // print_cfs_group_stats precedent).
+                    //
+                    // Float-involving casts are value conversions
+                    // (fcvt.d.l / fcvt.l.d), never bit-identical re-labels —
+                    // cast_is_bitidentical_nop is the shared predicate the
+                    // repo's other same-size-cast folds honor; anything it
+                    // rejects still reaches the loud gate below.
                     let fallback_src: Option<Operand> = self
                         .get_defining_instruction(v.0)
                         .and_then(|def_inst| match def_inst {
@@ -467,7 +473,7 @@ impl RiscvCodegen {
                                 to_ty,
                                 ..
                             } => {
-                                if from_ty.size() == to_ty.size() {
+                                if IrType::cast_is_bitidentical_nop(*from_ty, *to_ty) {
                                     Some(src.clone())
                                 } else {
                                     None
