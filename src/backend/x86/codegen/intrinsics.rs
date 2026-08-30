@@ -1016,6 +1016,101 @@ impl X86Codegen {
                 self.state.emit("    jmp *%rdx");
                 self.state.reg_cache.invalidate_all();
             }
+
+            // --- GCC __builtin_apply family ---
+            //
+            // Save-area layout (x86-64 SysV, 184 bytes):
+            //   [0..48)   rdi, rsi, rdx, rcx, r8, r9   (integer argument regs)
+            //   [48]      al                            (SSE vararg count)
+            //   [56..184) xmm0..xmm7                    (SSE argument regs)
+            IntrinsicOp::ApplyArgsAreaSize => {
+                if let Some(d) = dest {
+                    self.state.emit("    movl $184, %eax");
+                    self.store_rax_to(d);
+                }
+            }
+            IntrinsicOp::SaveApplyArgs => {
+                let area_owned: Operand = dest_ptr
+                    .as_ref()
+                    .map(|v| Operand::Value(*v))
+                    .or_else(|| args.first().cloned())
+                    .expect("SaveApplyArgs requires an area pointer");
+                let area_op = &area_owned;
+                // Read-only on the argument registers: no live value is
+                // clobbered (r10/r11 are the reserved call-staging scratch
+                // pair).  movups keeps this correct regardless of the area's
+                // runtime alignment.
+                self.operand_to_reg(area_op, "r10");
+                self.state.emit("    movq %rdi, 0(%r10)");
+                self.state.emit("    movq %rsi, 8(%r10)");
+                self.state.emit("    movq %rdx, 16(%r10)");
+                self.state.emit("    movq %rcx, 24(%r10)");
+                self.state.emit("    movq %r8, 32(%r10)");
+                self.state.emit("    movq %r9, 40(%r10)");
+                self.state.emit("    movb %al, 48(%r10)");
+                self.state.emit("    testb %al, %al");
+                let no_sse = self.state.fresh_label("apply_args_no_sse");
+                self.state.out.emit_jmp_label(&no_sse);
+                for (i, reg) in [
+                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    self.state
+                        .emit_fmt(format_args!("    movups %{}, {}(%r10)", reg, 56 + i * 16));
+                }
+                self.state.out.emit_named_label(&no_sse);
+                self.state.reg_cache.invalidate_acc();
+            }
+            IntrinsicOp::DoBuiltinApply => {
+                // args: [func, save_area, result_area, size (unused: the
+                // SysV protocol is entirely register-passed; `size` is only
+                // meaningful for i686 stack arguments)]
+                let func = args.first().expect("DoBuiltinApply requires func");
+                let area = args.get(1).expect("DoBuiltinApply requires save area");
+                let result = args.get(2).expect("DoBuiltinApply requires result area");
+                self.operand_to_reg(area, "r10");
+                self.operand_to_reg(func, "r11");
+                self.state.emit("    movq 0(%r10), %rdi");
+                self.state.emit("    movq 8(%r10), %rsi");
+                self.state.emit("    movq 16(%r10), %rdx");
+                self.state.emit("    movq 24(%r10), %rcx");
+                self.state.emit("    movq 32(%r10), %r8");
+                self.state.emit("    movq 40(%r10), %r9");
+                // al must hold the SSE argument count for the callee's
+                // varargs register-save prologue, whether or not it uses it.
+                self.state.emit("    movzbl 48(%r10), %eax");
+                self.state.emit("    testb %al, %al");
+                let no_sse = self.state.fresh_label("apply_no_sse");
+                self.state.out.emit_jmp_label(&no_sse);
+                for (i, reg) in [
+                    "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    self.state
+                        .emit_fmt(format_args!("    movups {}(%r10), %{}", 56 + i * 16, reg));
+                }
+                self.state.out.emit_named_label(&no_sse);
+                self.state.emit("    call *%r11");
+                // Capture the return value: result[0]=rax, result[8]=rdx,
+                // result[16]=xmm0 (movups: alignment-agnostic).
+                self.operand_to_reg(result, "r10");
+                self.state.emit("    movq %rax, 0(%r10)");
+                self.state.emit("    movq %rdx, 8(%r10)");
+                self.state.emit("    movups %xmm0, 16(%r10)");
+                self.state.reg_cache.invalidate_all();
+            }
+            IntrinsicOp::RestoreApplyResult => {
+                let block = args.first().expect("RestoreApplyResult requires a block");
+                self.operand_to_reg(block, "r10");
+                self.state.emit("    movq 0(%r10), %rax");
+                self.state.emit("    movq 8(%r10), %rdx");
+                self.state.emit("    movups 16(%r10), %xmm0");
+                self.state.reg_cache.invalidate_acc();
+            }
             IntrinsicOp::FrameAddress => {
                 // __builtin_frame_address(0): return current frame pointer (rbp)
                 self.state.emit("    movq %rbp, %rax");

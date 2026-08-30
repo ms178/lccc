@@ -84,6 +84,24 @@ pub enum IntrinsicOp {
     BuiltinSetjmp,
     /// GCC's local-frame longjmp primitive. Args: user buffer pointer, value.
     BuiltinLongjmp,
+    /// __builtin_apply_args support: emits the target-specific save-area size
+    /// in bytes (x86-64: 6 int arg regs + al + 8 XMM arg regs = 184; i686:
+    /// 16-byte incoming-register block + the caller's stack argument area).
+    /// dest = size in bytes.
+    ApplyArgsAreaSize,
+    /// __builtin_apply_args(): snapshot the incoming argument registers (and
+    /// on i686 the caller's stack argument area) into the save area.
+    /// dest_ptr = save area.  Reads arg registers; writes only the area.
+    SaveApplyArgs,
+    /// __builtin_apply(func, args, size): restore argument registers from the
+    /// save area (i686: re-stage `size` bytes of stack arguments), perform the
+    /// indirect call, and capture the result into the result area.
+    /// Args: [func_ptr, save_area, result_area, size].
+    DoBuiltinApply,
+    /// __builtin_return(block): load the current function's return value from
+    /// the result block produced by __builtin_apply and return.
+    /// Args: [result_area].  Terminates the block.
+    RestoreApplyResult,
     /// __builtin_thread_pointer() - returns thread pointer (TLS base address)
     ThreadPointer,
     /// Scalar square root: sqrtsd/sqrtss on x86, fsqrt on ARM/RISC-V

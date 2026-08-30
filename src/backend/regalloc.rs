@@ -1810,7 +1810,23 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             )
         })
     });
+    // __builtin_apply performs an indirect call from inside the intrinsic and
+    // clobbers every argument/caller-saved register plus rax/rdx/xmm0 (resp.
+    // eax/edx on i686).  Register-homed values would be silently invalidated,
+    // so such functions fall back to pure memory allocation.
+    let has_builtin_apply = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::DoBuiltinApply,
+                    ..
+                }
+            )
+        })
+    });
     if has_builtin_setjmp
+        || has_builtin_apply
         || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
     {
         return RegAllocResult {

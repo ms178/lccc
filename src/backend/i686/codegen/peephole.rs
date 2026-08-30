@@ -5286,7 +5286,17 @@ fn staging_reads_safe(
     reg: RegId,
     excluded: &[usize],
 ) -> bool {
+    // `pending_excluded` tracks whether a DELETED definition of `reg` has
+    // been passed without an intervening pure redefinition.  A read of `reg`
+    // that satisfies the forward `dominated` check can still observe the
+    // deleted value when the dominating definition precedes the deleted
+    // write: `movl 16(%esp),%eax; movl %esi,%eax; subl $-6,%eax` (deleted)
+    // feeding `movl (%ecx,%eax,4),%eax` was judged "dominated" by the
+    // earlier slot load, so the range-check fusion deleted the subl and the
+    // jump-table fetch indexed a stale register
+    // (gcc.c-torture execute/20011109-1.c @O1/O2).
     let mut dominated = false;
+    let mut pending_excluded = false;
     let mut k = fstart;
     while k < fend {
         if infos[k].is_nop() || is_debug_location(store, infos, k) {
@@ -5294,6 +5304,7 @@ fn staging_reads_safe(
             continue;
         }
         if excluded.contains(&k) {
+            pending_excluded = true;
             k += 1;
             continue;
         }
@@ -5309,8 +5320,9 @@ fn staging_reads_safe(
         if line_references_reg(line, reg) {
             if line_writes_reg_purely(line, reg) {
                 dominated = true;
+                pending_excluded = false;
             } else {
-                if !dominated {
+                if !dominated || pending_excluded {
                     return false;
                 }
                 dominated = true;
@@ -5318,6 +5330,7 @@ fn staging_reads_safe(
         }
         if infos[k].kind == LineKind::Call && matches!(reg, REG_EAX | REG_ECX | REG_EDX) {
             dominated = true;
+            pending_excluded = false;
         }
         k += 1;
     }
@@ -5354,6 +5367,13 @@ fn census_reg_reads(
 
 /// Rewrite every branch in `[fstart, fend)` whose target is `from_name` to
 /// target `to_name` instead.  Returns the number of rewritten branches.
+///
+/// Also rewrites whole-word references to `from_name` inside `.long`/`.quad`
+/// data directives: jump tables hold ` .long LABEL - BASE` entries that bind
+/// just as strongly as branch targets.  Threaded labels whose definition is
+/// removed must not survive in table data, or the entry resolves to an
+/// undefined symbol and the indirect jump lands on garbage
+/// (gcc.c-torture execute/20011109-1.c @O1/O2, SIGSEGV in foo(1)).
 fn retarget_label_refs(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -5364,7 +5384,27 @@ fn retarget_label_refs(
 ) -> usize {
     let mut n = 0;
     for i in fstart..fend {
-        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
+        if infos[i].is_nop() {
+            continue;
+        }
+        if matches!(infos[i].kind, LineKind::Directive) {
+            // Jump-table data references: `.long LABEL - BASE` /
+            // `.long BASE - LABEL`.  Replace whole-word label tokens only
+            // (`.LBB7` must not match `.LBB77`).
+            let line = trimmed(store, &infos[i], i);
+            if !(line.starts_with(".long ") || line.starts_with(".quad ")) {
+                continue;
+            }
+            if !label_referenced_whole_word(&line, from_name) {
+                continue;
+            }
+            let new_line = replace_label_whole_word(&line, from_name, to_name);
+            store.replace(i, format!("    {}", new_line));
+            infos[i] = classify_line(store.get(i));
+            n += 1;
+            continue;
+        }
+        if !matches!(infos[i].kind, LineKind::Jmp | LineKind::CondJmp) {
             continue;
         }
         let line = trimmed(store, &infos[i], i);
@@ -5381,6 +5421,66 @@ fn retarget_label_refs(
         }
     }
     n
+}
+
+/// Whether `name` appears in `text` as a whole word (identifier-boundary
+/// delimited on both sides).  Used by retarget_label_refs for data directives.
+fn label_referenced_whole_word(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let nb = name.as_bytes();
+    if nb.len() > bytes.len() {
+        return false;
+    }
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
+    let mut start = 0usize;
+    while start + nb.len() <= bytes.len() {
+        if &bytes[start..start + nb.len()] == nb
+            && (start == 0 || !is_word(bytes[start - 1]))
+            && (start + nb.len() == bytes.len() || !is_word(bytes[start + nb.len()]))
+        {
+            return true;
+        }
+        start += 1;
+    }
+    false
+}
+
+/// Replace every whole-word occurrence of `from` with `to` in `text`.
+fn replace_label_whole_word(text: &str, from: &str, to: &str) -> String {
+    let bytes = text.as_bytes();
+    let nb = from.as_bytes();
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'$';
+    let mut out = String::with_capacity(text.len() + to.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + nb.len() <= bytes.len()
+            && &bytes[i..i + nb.len()] == nb
+            && (i == 0 || !is_word(bytes[i - 1]))
+            && (i + nb.len() == bytes.len() || !is_word(bytes[i + nb.len()]))
+        {
+            out.push_str(to);
+            i += nb.len();
+        } else {
+            let ch_len = utf8_char_len(bytes[i]);
+            out.push_str(&text[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
 }
 
 /// Jump threading through trivial blocks.  A trivial block is a `.L` label

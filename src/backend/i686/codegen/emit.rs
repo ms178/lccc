@@ -39,6 +39,15 @@ pub struct I686Codegen {
     pub(super) used_callee_saved: Vec<PhysReg>,
     /// Total stack bytes consumed by named parameters (for va_start computation).
     pub(super) va_named_stack_bytes: usize,
+    /// Bytes of the caller's stack argument area (cdecl stack args of THIS
+    /// function).  Used by __builtin_apply_args to snapshot the incoming
+    /// argument area.  Set in the prologue walk from call_abi classification.
+    pub(super) incoming_stack_arg_bytes: i64,
+    /// Offset from %ebp to the post-prologue %esp baseline:
+    /// callee_saved_bytes + frame_size.  Valid in BOTH frame-pointer modes
+    /// (unlike frame_base_offset, which is only meaningful under FPO).  Used
+    /// by DoBuiltinApply to restore %esp after its untracked staging subl.
+    pub(super) esp_baseline_offset: i64,
     /// Scratch register allocation index for inline asm GP registers.
     pub(super) asm_scratch_idx: usize,
     /// Scratch register allocation index for inline asm XMM registers.
@@ -306,6 +315,8 @@ impl I686Codegen {
             zext_wide_values: FxHashSet::default(),
             used_callee_saved: Vec::new(),
             va_named_stack_bytes: 0,
+            incoming_stack_arg_bytes: 0,
+            esp_baseline_offset: 0,
             asm_scratch_idx: 0,
             asm_xmm_scratch_idx: 0,
             is_fastcall: false,

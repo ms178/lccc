@@ -898,6 +898,102 @@ impl Lowerer {
                 });
                 Some(Operand::Value(dest))
             }
+            BuiltinIntrinsic::ApplyArgs => {
+                // __builtin_apply_args():
+                //   1. area_size = Intrinsic{ApplyArgsAreaSize} (target-specific
+                //      constant computed by the backend, which knows the
+                //      incoming argument classification)
+                //   2. area = DynAlloca(area_size, align=16) — survives across
+                //      calls (it lives inside our own frame) and forces a
+                //      frame pointer, which the i686 save arm relies on.
+                //   3. Intrinsic{SaveApplyArgs, dest_ptr: area}
+                // The result is the area pointer, valid as __builtin_apply's
+                // second argument.
+                let size_val = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(size_val),
+                    op: IntrinsicOp::ApplyArgsAreaSize,
+                    dest_ptr: None,
+                    args: Vec::new(),
+                });
+                let area = self.fresh_value();
+                self.emit(Instruction::DynAlloca {
+                    dest: area,
+                    size: Operand::Value(size_val),
+                    align: 16,
+                });
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::SaveApplyArgs,
+                    dest_ptr: Some(area),
+                    args: vec![Operand::Value(area)],
+                });
+                Some(Operand::Value(area))
+            }
+            BuiltinIntrinsic::Apply => {
+                // __builtin_apply(func, args, size):
+                //   result = DynAlloca(APPLY_RESULT_SIZE, align=16)
+                //   Intrinsic{DoBuiltinApply, args: [func, args, result, size]}
+                // The backend restores the argument registers from the save
+                // area (i686 additionally re-stages `size` bytes of stack
+                // arguments), performs the indirect call, and captures the
+                // return value (rax/rdx/xmm0 resp. eax/edx) into the result
+                // area.  The result area pointer is __builtin_apply's return
+                // value (consumed by __builtin_return).
+                let func = args
+                    .first()
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                let save_area = args
+                    .get(1)
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                let size = args
+                    .get(2)
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                let result = self.fresh_value();
+                // Result block: x86-64 stores rax(8) + rdx(8) + xmm0(16);
+                // i686 stores eax(4) + edx(4).  A uniform 32 bytes keeps the
+                // lowering target-independent.
+                self.emit(Instruction::DynAlloca {
+                    dest: result,
+                    size: Operand::Const(IrConst::I64(32)),
+                    align: 16,
+                });
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::DoBuiltinApply,
+                    dest_ptr: None,
+                    args: vec![
+                        func,
+                        save_area,
+                        Operand::Value(result),
+                        size,
+                    ],
+                });
+                Some(Operand::Value(result))
+            }
+            BuiltinIntrinsic::BuiltinReturn => {
+                // __builtin_return(block): restore the return registers from
+                // the block, then return from the current function.  Code
+                // after the builtin is unreachable; start a dead block like
+                // __builtin_unreachable does.
+                let block = args
+                    .first()
+                    .map(|arg| self.lower_expr(arg))
+                    .unwrap_or(Operand::Const(IrConst::I64(0)));
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::RestoreApplyResult,
+                    dest_ptr: None,
+                    args: vec![block],
+                });
+                self.terminate(Terminator::Return(None));
+                let dead_label = self.fresh_label();
+                self.start_block(dead_label);
+                Some(Operand::Const(IrConst::I64(0)))
+            }
             BuiltinIntrinsic::BuiltinLongjmp => {
                 let buffer = args
                     .first()

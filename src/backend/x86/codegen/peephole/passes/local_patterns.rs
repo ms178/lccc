@@ -851,9 +851,66 @@ pub(super) fn eliminate_dead_sign_extensions(
                         size,
                     } => {
                         // Narrow store persists only the low bits: the cltq
-                        // upper half is discarded by the store itself.
+                        // upper half is discarded by the store itself — BUT
+                        // only if no later full-width %rax consumer observes
+                        // the extended bits before %rax is rewritten.
+                        // `cltq; movl %eax,M; movq %rax,N; cmpq N(%rbp),%rax`
+                        // (the add_overflow truncate/extend round-trip,
+                        // gcc.c-torture execute/pr122943.c) previously
+                        // eliminated the cltq on the narrow store alone,
+                        // leaving the stale wide value in the full-width
+                        // store's slot.
                         if !matches!(size, MoveSize::Q) {
-                            can_eliminate = true;
+                            let mut k2 = j + 1;
+                            let mut narrow_only = true;
+                            let mut scans2 = 0usize;
+                            while k2 < len && scans2 < 64 {
+                                scans2 += 1;
+                                if infos[k2].is_nop() {
+                                    k2 += 1;
+                                    continue;
+                                }
+                                if infos[k2].is_barrier() {
+                                    // Conservative: the extension may escape.
+                                    narrow_only = false;
+                                    break;
+                                }
+                                match infos[k2].kind {
+                                    // Full-width store of %rax observes the
+                                    // extended upper half.
+                                    LineKind::StoreRbp {
+                                        reg: 0,
+                                        size: MoveSize::Q,
+                                        ..
+                                    } => {
+                                        narrow_only = false;
+                                        break;
+                                    }
+                                    // %eax-only store: upper half still stale.
+                                    LineKind::StoreRbp { reg: 0, .. } => {
+                                        k2 += 1;
+                                        continue;
+                                    }
+                                    // Anything that REWRITES %rax makes the
+                                    // stale extension irrelevant.
+                                    LineKind::LoadRbp { reg: 0, .. }
+                                    | LineKind::Other { dest_reg: 0 } => break,
+                                    // Any other %rax reference (e.g. a 64-bit
+                                    // `cmpq M(%rbp), %rax` or `movq %rax, %rX`)
+                                    // may observe the upper half.
+                                    _ => {
+                                        if infos[k2].reg_refs & 1 != 0 {
+                                            narrow_only = false;
+                                            break;
+                                        }
+                                        k2 += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if narrow_only {
+                                can_eliminate = true;
+                            }
                             break;
                         }
                         let mut k = j + 1;

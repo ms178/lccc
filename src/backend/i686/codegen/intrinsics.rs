@@ -10,6 +10,7 @@
 //! - x87 FPU math (sqrt, fabs) for F32/F64
 
 use super::emit::I686Codegen;
+use crate::backend::traits::ArchCodegen;
 use crate::emit;
 use crate::ir::reexports::{IntrinsicOp, IrConst, Operand, Value};
 
@@ -151,6 +152,192 @@ impl I686Codegen {
                 if let Some(d) = dest {
                     self.store_eax_to(d);
                 }
+            }
+
+            // --- GCC local-frame setjmp/longjmp (mirrors the x86-64 lowering
+            // in backend/x86/codegen/intrinsics.rs) ---
+            //
+            // jmp_buf layout (native words, little-endian):
+            //   [0] = %ebp   frame pointer of the setjmp frame
+            //   [1] = resume label address (returns 1)
+            //   [2] = %esp   stack pointer of the setjmp frame
+            //
+            // Callers must keep values live across __builtin_setjmp in memory;
+            // the pipeline marks every alloca volatile in functions containing
+            // the intrinsic and disables register allocation for them, so the
+            // frame slots are authoritative after the longjmp lands.
+            IntrinsicOp::BuiltinSetjmp => {
+                let buffer = args.first().expect("BuiltinSetjmp requires a buffer");
+                self.operand_to_eax(buffer);
+                // EAX holds the buffer pointer; EDX is our only scratch and is
+                // dead here (functions with __builtin_setjmp have no register
+                // allocation, so no live value can hide in it).
+                self.state.emit("    movl %eax, %edx");
+                let resume = self.state.fresh_label("builtin_setjmp_resume");
+                let done = self.state.fresh_label("builtin_setjmp_done");
+                self.state.emit("    movl %ebp, 0(%edx)");
+                emit!(self.state, "    movl ${}, %eax", resume);
+                self.state.emit("    movl %eax, 4(%edx)");
+                self.state.emit("    movl %esp, 8(%edx)");
+                self.state.emit("    xorl %eax, %eax");
+                self.state.out.emit_jmp_label(&done);
+                self.state.out.emit_named_label(&resume);
+                self.state.emit("    movl $1, %eax");
+                self.state.out.emit_named_label(&done);
+                self.state.reg_cache.invalidate_acc();
+                if let Some(dest) = dest {
+                    self.store_eax_to(dest);
+                }
+            }
+            IntrinsicOp::BuiltinLongjmp => {
+                let buffer = args.first().expect("BuiltinLongjmp requires a buffer");
+                self.operand_to_eax(buffer);
+                // EAX keeps the buffer pointer across the %esp restore, so all
+                // three words are read from a stable base.  This call never
+                // returns: %esp/%ebp return to the setjmp frame and control
+                // jumps to its resume label.
+                self.state.emit("    movl 8(%eax), %edx");
+                self.state.emit("    movl 4(%eax), %ecx");
+                self.state.emit("    movl %edx, %esp");
+                self.state.emit("    movl 0(%eax), %edx");
+                self.state.emit("    movl %edx, %ebp");
+                self.state.emit("    jmp *%ecx");
+                self.state.reg_cache.invalidate_all();
+            }
+
+            // --- GCC __builtin_apply family ---
+            //
+            // Save-area layout (i686):
+            //   [0]  incoming %eax   (regparm arg 0 — current value at the
+            //                        apply_args call, matching GCC's semantics)
+            //   [4]  incoming %edx   (regparm arg 1)
+            //   [8]  incoming %ecx   (regparm arg 2)
+            //   [16..16+N)           caller's stack argument area (N =
+            //                        incoming_stack_arg_bytes)
+            // Save-area size: 16 + N (ApplyArgsAreaSize).
+            IntrinsicOp::ApplyArgsAreaSize => {
+                if let Some(d) = dest {
+                    emit!(
+                        self.state,
+                        "    movl ${}, %eax",
+                        16 + self.incoming_stack_arg_bytes
+                    );
+                    self.store_eax_to(d);
+                }
+            }
+            IntrinsicOp::SaveApplyArgs => {
+                let area_owned: Operand = dest_ptr
+                    .as_ref()
+                    .map(|v| Operand::Value(*v))
+                    .or_else(|| args.first().cloned())
+                    .expect("SaveApplyArgs requires an area pointer");
+                let area_op = &area_owned;
+                // Callee-saved + arg-register preservation.  A frame pointer is
+                // guaranteed: ApplyArgs lowers through DynAlloca, and dynamic
+                // allocas force %ebp.
+                self.state.emit("    pushl %eax");
+                self.esp_adjust += 4;
+                self.state.emit("    pushl %esi");
+                self.esp_adjust += 4;
+                self.state.emit("    pushl %edi");
+                self.esp_adjust += 4;
+                self.operand_to_eax(area_op);
+                self.state.emit("    movl %eax, %edi");
+                // Snapshot the (possibly regparm) incoming register args.
+                self.state.emit("    movl %edx, 4(%edi)");
+                self.state.emit("    movl %ecx, 8(%edi)");
+                // Original %eax sits at 8(%esp): three pushes, top = saved %edi.
+                self.state.emit("    movl 8(%esp), %eax");
+                self.state.emit("    movl %eax, 0(%edi)");
+                // Copy the caller's stack argument area.
+                self.state.emit("    leal 8(%ebp), %esi");
+                self.state.emit("    addl $16, %edi");
+                emit!(self.state, "    movl ${}, %ecx", self.incoming_stack_arg_bytes);
+                self.state.emit("    cld");
+                self.state.emit("    rep movsb");
+                self.state.emit("    popl %edi");
+                self.esp_adjust -= 4;
+                self.state.emit("    popl %esi");
+                self.esp_adjust -= 4;
+                self.state.emit("    popl %eax");
+                self.esp_adjust -= 4;
+                self.state.reg_cache.invalidate_acc();
+            }
+            IntrinsicOp::DoBuiltinApply => {
+                // args: [func, save_area, result_area, size]
+                debug_assert!(args.len() >= 4, "DoBuiltinApply requires 4 operands");
+                let tracked = self.esp_adjust;
+                // Callee-saved preservation: %esi (area), %edi (staging dest),
+                // %ebx (function pointer).  A frame pointer is guaranteed via
+                // the DynAlloca areas the lowering emits.
+                self.state.emit("    pushl %esi");
+                self.esp_adjust += 4;
+                self.state.emit("    pushl %edi");
+                self.esp_adjust += 4;
+                self.state.emit("    pushl %ebx");
+                self.esp_adjust += 4;
+                self.emit_load_operand(&args[0]); // func
+                self.state.emit("    movl %eax, %ebx");
+                self.emit_load_operand(&args[1]); // save_area
+                self.state.emit("    movl %eax, %esi");
+                self.emit_load_operand(&args[3]); // size
+                self.state.emit("    movl %eax, %edx");
+                // Stage `size` (16-aligned) bytes of stack arguments from the
+                // save area.  This %esp adjustment is deliberately NOT tracked:
+                // it is undone by the ebp-relative lea below, and no tracked
+                // (esp-relative) slot is touched in between — every operand
+                // load here is ebp-relative.
+                self.state.emit("    leal 15(%edx), %eax");
+                self.state.emit("    andl $-16, %eax");
+                self.state.emit("    subl %eax, %esp");
+                self.state.emit("    movl %edx, %ecx");
+                self.state.emit("    leal 16(%esi), %esi"); // skip reg block
+                self.state.emit("    movl %esp, %edi");
+                self.state.emit("    cld");
+                self.state.emit("    rep movsb");
+                // Restore the regparm argument registers from the save block.
+                self.state.emit("    subl %edx, %esi"); // back to area base
+                self.state.emit("    movl 4(%esi), %edx");
+                self.state.emit("    movl 8(%esi), %ecx");
+                self.state.emit("    movl 0(%esi), %eax");
+                self.state.emit("    call *%ebx");
+                // Discard the staging region and return %esp to the tracked
+                // position: baseline + entry-esp_adjust + the three pushes.
+                emit!(
+                    self.state,
+                    "    leal -{}(%ebp), %esp",
+                    self.esp_baseline_offset + tracked + 12
+                );
+                // Capture the return value: result[0]=%eax, result[4]=%edx.
+                // (x87 returns are not captured; __builtin_return consumers on
+                // i686 read the integer half exactly like GCC's ax/dx block.)
+                self.state.emit("    pushl %edx");
+                self.esp_adjust += 4;
+                self.state.emit("    pushl %eax");
+                self.esp_adjust += 4;
+                self.emit_load_operand(&args[2]); // result_area
+                self.state.emit("    movl %eax, %edi");
+                self.state.emit("    popl %eax");
+                self.esp_adjust -= 4;
+                self.state.emit("    movl %eax, 0(%edi)");
+                self.state.emit("    popl %eax");
+                self.esp_adjust -= 4;
+                self.state.emit("    movl %eax, 4(%edi)");
+                self.state.emit("    popl %ebx");
+                self.esp_adjust -= 4;
+                self.state.emit("    popl %edi");
+                self.esp_adjust -= 4;
+                self.state.emit("    popl %esi");
+                self.esp_adjust -= 4;
+                self.state.reg_cache.invalidate_all();
+            }
+            IntrinsicOp::RestoreApplyResult => {
+                let block = args.first().expect("RestoreApplyResult requires a block");
+                self.operand_to_eax(block);
+                self.state.emit("    movl %eax, %esi");
+                self.state.emit("    movl 0(%esi), %eax");
+                self.state.emit("    movl 4(%esi), %edx");
+                self.state.reg_cache.invalidate_all();
             }
 
             // --- Floating-point intrinsics via x87 FPU ---
