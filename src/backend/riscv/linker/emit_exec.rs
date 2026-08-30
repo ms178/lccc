@@ -19,6 +19,7 @@ use crate::backend::elf::{
     DT_PREINIT_ARRAYSZ, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
     DT_VERNEED, DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_EXEC, PF_R, PF_W, PF_X,
     PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK, PT_INTERP, PT_LOAD, PT_NOTE, PT_TLS,
+    STT_FUNC, STT_GNU_IFUNC,
 };
 
 const PT_GNU_EH_FRAME: u32 = 0x6474e550;
@@ -287,6 +288,40 @@ pub fn emit_executable(
         vaddr += plt_size;
     }
 
+    // IFUNC support for static executables: GNU ld's .iplt/.rela.iplt scheme
+    // (port of the AArch64 linker's emit_static design to rv64).  Every ifunc
+    // becomes a 16-byte IPLT stub that jumps through a dedicated GOT slot; the
+    // slot carries R_RISCV_IRELATIVE (addend = resolver address) so glibc's
+    // static startup — which walks __rela_iplt_start .. __rela_iplt_end —
+    // resolves it before main.  Without this the slot keeps its link-time
+    // value, glibc's memcpy/strlen pointers point into .bss, and the first
+    // startup TLS-image copy fetches data as code: SIGSEGV before main in
+    // every ifunc-consuming static binary (e.g. any glibc static link).
+    let ifunc_names: Vec<String> = if is_static {
+        let mut names: Vec<String> = global_syms
+            .iter()
+            .filter(|(_, g)| g.sym_type == STT_GNU_IFUNC && g.defined)
+            .map(|(n, _)| n.clone())
+            .collect();
+        names.sort();
+        names
+    } else {
+        Vec::new()
+    };
+    let ifunc_count = ifunc_names.len() as u64;
+    let iplt_size = ifunc_count * 16;
+
+    let mut iplt_vaddr = 0u64;
+    let mut iplt_offset = 0u64;
+    if iplt_size > 0 {
+        vaddr = align_up(vaddr, 16);
+        file_offset = align_up(file_offset, 16);
+        iplt_vaddr = vaddr;
+        iplt_offset = file_offset;
+        file_offset += iplt_size;
+        vaddr += iplt_size;
+    }
+
     // Assign vaddrs to RX sections (alloc, non-write)
     let mut section_vaddrs: Vec<u64> = vec![0; merged_sections.len()];
     let mut section_offsets: Vec<u64> = vec![0; merged_sections.len()];
@@ -375,6 +410,32 @@ pub fn emit_executable(
     // RELRO boundary
     let relro_end_offset = file_offset;
     let relro_end_vaddr = vaddr;
+
+    // IFUNC GOT slots (one 8-byte slot per ifunc, initial content = its IPLT
+    // stub address) and the R_RISCV_IRELATIVE table (.rela.iplt: Elf64_Rela
+    // { r_offset = slot VA, r_info = IRELATIVE, r_addend = resolver VA }).
+    // Kept OUTSIDE the RELRO region: glibc's startup writes the resolved
+    // implementation into each slot before main runs.
+    let mut irel_slot_vaddr = 0u64;
+    let mut irel_slot_offset = 0u64;
+    let mut irela_vaddr = 0u64;
+    let mut irela_offset = 0u64;
+    let irela_size = ifunc_count * 24;
+    if ifunc_count > 0 {
+        vaddr = align_up(vaddr, 8);
+        file_offset = align_up(file_offset, 8);
+        irel_slot_vaddr = vaddr;
+        irel_slot_offset = file_offset;
+        file_offset += ifunc_count * 8;
+        vaddr += ifunc_count * 8;
+
+        vaddr = align_up(vaddr, 8);
+        file_offset = align_up(file_offset, 8);
+        irela_vaddr = vaddr;
+        irela_offset = file_offset;
+        file_offset += irela_size;
+        vaddr += irela_size;
+    }
 
     // .got.plt (only for dynamic binaries)
     let mut got_plt_vaddr = 0u64;
@@ -531,6 +592,26 @@ pub fn emit_executable(
         }
     }
 
+    // IFUNC: capture resolver addresses (the symbol's resolved value IS the
+    // resolver — an ifunc definition is the resolver function), then redirect
+    // every ifunc symbol to its IPLT stub and retype it STT_FUNC so all
+    // relocation paths treat it as a plain function.
+    let ifunc_syms: Vec<(String, u64)> = ifunc_names
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                global_syms.get(name).map(|g| g.value).unwrap_or(0),
+            )
+        })
+        .collect();
+    for (i, (name, _resolver)) in ifunc_syms.iter().enumerate() {
+        if let Some(g) = global_syms.get_mut(name) {
+            g.value = iplt_vaddr + i as u64 * 16;
+            g.sym_type = STT_FUNC;
+        }
+    }
+
     // Define linker-provided symbols
     let sdata_vaddr = merged_map
         .get(".sdata")
@@ -588,8 +669,8 @@ pub fn emit_executable(
         fini_array_size: fini_end - fini_start,
         preinit_array_start: preinit_start,
         preinit_array_size: preinit_end - preinit_start,
-        rela_iplt_start: 0,
-        rela_iplt_size: 0,
+        rela_iplt_start: irela_vaddr,
+        rela_iplt_size: irela_size,
     };
 
     {
@@ -802,6 +883,44 @@ pub fn emit_executable(
             rela_dyn_data.extend_from_slice(&r_info.to_le_bytes());
             rela_dyn_data.extend_from_slice(&0i64.to_le_bytes());
         }
+    }
+
+    // ── Phase 9c: Build IPLT stubs, IFUNC GOT slots and .rela.iplt ──────
+
+    let mut iplt_data = vec![0u8; iplt_size as usize];
+    let mut irel_slot_data = vec![0u8; (ifunc_count * 8) as usize];
+    let mut irela_data = Vec::with_capacity(irela_size as usize);
+    for (i, (_name, resolver)) in ifunc_syms.iter().enumerate() {
+        let stub_addr = iplt_vaddr + i as u64 * 16;
+        let slot_addr = irel_slot_vaddr + i as u64 * 8;
+
+        // Slot initial content: the IPLT stub address (GNU ld semantics — a
+        // sane value even if IRELATIVE processing were skipped; glibc's
+        // startup overwrites it with the resolver's choice).
+        let slot_off = i * 8;
+        irel_slot_data[slot_off..slot_off + 8].copy_from_slice(&stub_addr.to_le_bytes());
+
+        // R_RISCV_IRELATIVE (58): slot := resolver(slot_addend) at startup.
+        irela_data.extend_from_slice(&slot_addr.to_le_bytes());
+        irela_data.extend_from_slice(&58u64.to_le_bytes());
+        irela_data.extend_from_slice(&(*resolver as i64).to_le_bytes());
+
+        // Stub (GNU .iplt encoding):
+        //   auipc t3, hi(delta)        t3 = stub_pc + hi<<12
+        //   ld    t3, lo(delta)(t3)    t3 = *slot
+        //   jalr  t1, t3
+        //   nop
+        let delta = slot_addr as i64 - stub_addr as i64;
+        let hi = (delta + 0x800) >> 12;
+        let lo = delta - (hi << 12);
+        let auipc = 0x17u32 | (28 << 7) | (((hi as u32) & 0xFFFFF) << 12);
+        let ld = (((lo as u32) & 0xFFF) << 20) | (28 << 15) | (3 << 12) | (28 << 7) | 0x03;
+        let jalr: u32 = (28 << 15) | (6 << 7) | 0x67; // jalr t1, 0(t3)
+        let stub_off = (i as u64 * 16) as usize;
+        iplt_data[stub_off..stub_off + 4].copy_from_slice(&auipc.to_le_bytes());
+        iplt_data[stub_off + 4..stub_off + 8].copy_from_slice(&ld.to_le_bytes());
+        iplt_data[stub_off + 8..stub_off + 12].copy_from_slice(&jalr.to_le_bytes());
+        iplt_data[stub_off + 12..stub_off + 16].copy_from_slice(&0x13u32.to_le_bytes());
     }
 
     // ── Phase 10: Build .dynamic section ────────────────────────────────
@@ -1067,6 +1186,14 @@ pub fn emit_executable(
         elf.extend_from_slice(&plt_data);
     }
 
+    // IPLT stubs sit in the RX segment between the PLT block and the merged
+    // text sections; write them before any later (higher-offset) region so
+    // the pad_to calls stay monotone.
+    if iplt_size > 0 {
+        pad_to(&mut elf, iplt_offset as usize);
+        elf.extend_from_slice(&iplt_data);
+    }
+
     // Write RX merged sections
     for &si in sec_indices {
         let ms = &merged_sections[si];
@@ -1104,6 +1231,13 @@ pub fn emit_executable(
     if got_size > 0 {
         pad_to(&mut elf, got_offset as usize);
         elf.extend_from_slice(&got_data);
+    }
+
+    if ifunc_count > 0 {
+        pad_to(&mut elf, irel_slot_offset as usize);
+        elf.extend_from_slice(&irel_slot_data);
+        pad_to(&mut elf, irela_offset as usize);
+        elf.extend_from_slice(&irela_data);
     }
 
     if !is_static {

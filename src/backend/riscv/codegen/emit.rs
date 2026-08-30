@@ -36,6 +36,11 @@ pub(super) const CALL_TEMP_CALLEE_SAVED: [PhysReg; 5] =
     [PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5), PhysReg(6)];
 
 /// Map a PhysReg index to its RISC-V register name.
+///
+/// The allocator-visible GPR space: 1..=11 are the callee-saved s1–s11,
+/// 12..=19 are the caller-saved argument registers a0–a7 (Phase-2 homes;
+/// never saved/restored by the prologue).  Emitter scratch (t0–t6, t2 =
+/// static chain / indirect-call target) is outside the pool.
 pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
     match reg.0 {
         1 => "s1",
@@ -49,7 +54,15 @@ pub(super) fn callee_saved_name(reg: PhysReg) -> &'static str {
         9 => "s9",
         10 => "s10",
         11 => "s11",
-        _ => unreachable!("invalid RISC-V callee-saved register index"),
+        12 => "a0",
+        13 => "a1",
+        14 => "a2",
+        15 => "a3",
+        16 => "a4",
+        17 => "a5",
+        18 => "a6",
+        19 => "a7",
+        _ => unreachable!("invalid RISC-V allocatable register index"),
     }
 }
 
@@ -131,6 +144,10 @@ pub struct RiscvCodegen {
     /// Current function (for definition lookups in consumer-side
     /// rematerialisation gates; raw pointer mirrors the x86-64 backend).
     pub(super) current_func: Option<*const IrFunction>,
+    /// Frameless-leaf mode: no call points, no stack traffic, zero frame —
+    /// the prologue/epilogue (ra/s0 saves, sp adjust, s0 setup) are skipped
+    /// entirely and the function is entered and left through `ra` untouched.
+    pub(super) frameless_leaf: bool,
 }
 
 impl RiscvCodegen {
@@ -150,6 +167,7 @@ impl RiscvCodegen {
             used_callee_saved: Vec::new(),
             no_relax: false,
             current_func: None,
+            frameless_leaf: false,
         }
     }
 

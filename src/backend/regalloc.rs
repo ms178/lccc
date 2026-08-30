@@ -191,6 +191,53 @@ pub struct RegAllocResult {
 /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
 /// ParamRefs must execute in the entry prefix before any generated instruction
 /// can clobber ABI argument registers, and the function must be call-free.
+/// RISC-V analog of [`x86_param_caller_homes_safe`]: integer ABI slot i is
+/// register a_i, so a call-free function whose ParamRefs all run in the
+/// entry prefix (before any generated instruction can clobber a0–a7) can
+/// keep its scalar parameters directly in their incoming registers — the
+/// ParamRef emits nothing at all when the home matches the incoming reg.
+pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
+    if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
+        return false;
+    }
+    if func.blocks.len() > 1 && func.params.len() > 8 {
+        return false;
+    }
+    if func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+            )
+        })
+    }) {
+        return false;
+    }
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if bi != 0 {
+            if block
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::ParamRef { .. }))
+            {
+                return false;
+            }
+            continue;
+        }
+        let mut seen_code = false;
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { .. } | Instruction::ParamRef { .. } if !seen_code => {}
+                Instruction::ParamRef { .. } => return false,
+                _ => seen_code = true,
+            }
+        }
+    }
+    true
+}
+
 pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
         return false;
@@ -1983,6 +2030,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         && config.available_regs.iter().any(|r| r.0 == 1)
         && config.caller_saved_regs.iter().any(|r| r.0 == 10)
         && x86_param_caller_homes_safe(func);
+    // riscv64: same lever for the a0–a7 pool.  Param homes are pinned to
+    // their incoming registers by the ABI hints, so the "ordered copies"
+    // degenerate to zero instructions per ParamRef.
+    let riscv_ordered_param_copies = config.available_regs.iter().any(|r| r.0 == 11)
+        && config.caller_saved_regs.iter().any(|r| r.0 == 12)
+        && riscv_param_caller_homes_safe(func);
+    let ordered_param_homes = x86_ordered_param_copies || riscv_ordered_param_copies;
     let mut param_ref_values: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -2062,6 +2116,39 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             param_restricted.insert(*leader);
         }
     }
+    // riscv entry-prefix write guard: a value BORN before a still-unexecuted
+    // ParamRef must never take a caller-saved (a-reg) home — its defining
+    // instruction would write the incoming argument register out from under
+    // the not-yet-run ParamRef (GetStaticChain's chain value homed in a0
+    // destroyed the incoming parameter before its ParamRef ran: the nested
+    // `x == lim` compare then read the chain twice and returned the wrong
+    // arm).  The x86 path never saw this because its entry prefix is
+    // ParamRef-only by construction; the riscv entry prefix interleaves
+    // GetStaticChain/Alloca defs, so the guard is computed from the actual
+    // instruction order.  Params themselves are exempt (their homes are the
+    // hinted incoming registers, written by nobody but the caller).
+    let riscv_entry_guard: FxHashSet<u32> = if
+        config.available_regs.iter().any(|r| r.0 == 11)
+            && config.caller_saved_regs.iter().any(|r| r.0 == 12)
+    {
+        let mut guard = FxHashSet::default();
+        if let Some(block0) = func.blocks.first() {
+            let mut later_params: usize = 0;
+            for inst in block0.instructions.iter().rev() {
+                if let Instruction::ParamRef { dest, .. } = inst {
+                    later_params += 1;
+                    let _ = dest;
+                } else if later_params > 0 {
+                    if let Some(d) = inst.dest() {
+                        guard.insert(d.0);
+                    }
+                }
+            }
+        }
+        guard
+    } else {
+        FxHashSet::default()
+    };
 
     // Hole-aware call spanning (the "80% of LLVM's split" win): a value needs
     // a callee-saved home only when a call point falls INSIDE one of its live
@@ -2242,7 +2329,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         let base_ok = |assignments: &FxHashMap<u32, PhysReg>, iv: &LiveInterval| {
             !assignments.contains_key(&iv.value_id)
                 && !call_spanning.contains(&iv.value_id)
-                && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
+                && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
+                && !riscv_entry_guard.contains(&iv.value_id)
         };
 
         if let Some((ecx_hazards, edx_hazards)) = hazards {
@@ -2577,8 +2665,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         !assignments.contains_key(&iv.value_id)
                             && !call_spanning.contains(&iv.value_id)
                             && !scratch_denied.contains(&iv.value_id)
-                            && (x86_ordered_param_copies
+                            && (ordered_param_homes
                                 || !param_restricted.contains(&iv.value_id))
+                            && !riscv_entry_guard.contains(&iv.value_id)
                     })
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .filter(|iv| {
@@ -2698,7 +2787,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| {
                 !assignments.contains_key(&iv.value_id)
                     && !call_spanning.contains(&iv.value_id)
-                    && (x86_ordered_param_copies || !param_restricted.contains(&iv.value_id))
+                    && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
+                && !riscv_entry_guard.contains(&iv.value_id)
             })
             .filter(|iv| {
                 let idx = eax_hazards.partition_point(|&p| p <= iv.start);
@@ -3052,8 +3142,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         !assignments.contains_key(&iv.value_id)
                             && !call_spanning.contains(&iv.value_id)
                             && !scratch_denied.contains(&iv.value_id)
-                            && (x86_ordered_param_copies
+                            && (ordered_param_homes
                                 || !param_restricted.contains(&iv.value_id))
+                            && !riscv_entry_guard.contains(&iv.value_id)
                     })
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
                     .filter(|iv| {
@@ -3070,8 +3161,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             !assignments.contains_key(&iv.value_id)
                                 && !call_spanning.contains(&iv.value_id)
                                 && !scratch_denied.contains(&iv.value_id)
-                                && (x86_ordered_param_copies
+                                && (ordered_param_homes
                                     || !param_restricted.contains(&iv.value_id))
+                            && !riscv_entry_guard.contains(&iv.value_id)
                         })
                         .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
                         .collect();
