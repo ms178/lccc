@@ -796,6 +796,21 @@ fn eliminate_self_moves(kinds: &mut [LineKind], n: usize) -> bool {
             if dst == src {
                 kinds[i] = LineKind::Nop;
                 changed = true;
+                continue;
+            }
+            // Identical consecutive duplicate: `mv D, S` immediately after
+            // `mv D, S` (store-result staging followed by the identical
+            // return-value staging).  The second move is a no-op — same
+            // source still live, same destination.  Scan only across Nops
+            // so any intervening instruction (which may read D or redefine
+            // S) keeps the move.
+            let mut j = i + 1;
+            while j < n && kinds[j] == LineKind::Nop {
+                j += 1;
+            }
+            if j < n && kinds[j] == (LineKind::Move { dst, src }) {
+                kinds[j] = LineKind::Nop;
+                changed = true;
             }
         }
     }

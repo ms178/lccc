@@ -102,6 +102,21 @@ fn collect_abi_reg_hints(
             Some(PhysReg(6)),
             Some(PhysReg(7)),
         ]
+    } else if available_regs.iter().any(|r| r.0 == 11) && caller_saved_regs.iter().any(|r| r.0 == 12)
+    {
+        // riscv64: the caller pool is a0–a7 (PhysReg 12..19) and integer
+        // ABI slot i IS a_i — pinning the param home to its incoming
+        // register makes the ParamRef a no-op for the common shape.
+        vec![
+            Some(PhysReg(12)),
+            Some(PhysReg(13)),
+            Some(PhysReg(14)),
+            Some(PhysReg(15)),
+            Some(PhysReg(16)),
+            Some(PhysReg(17)),
+            Some(PhysReg(18)),
+            Some(PhysReg(19)),
+        ]
     } else {
         return hints;
     };
@@ -338,6 +353,10 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
     let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
         || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1))
+        // riscv64 with the caller-saved a0–a7 pool open (s11 + a0 in the
+        // combined pools is a unique signature): keep the same LhsFirst
+        // policy the callee-only pool ran.
+        || (available_regs.iter().any(|r| r.0 == 11) && caller_saved_regs.iter().any(|r| r.0 == 12))
     {
         super::super::regalloc::AccumulatorPolicy {
             operand_order: super::super::regalloc::AccumulatorOperandOrder::LhsFirst,

@@ -12,6 +12,104 @@ use crate::ir::reexports::IrFunction;
 impl RiscvCodegen {
     // ---- calculate_stack_space ----
 
+    /// IR-level eligibility for the caller-saved (a0–a7) register pool.
+    ///
+    /// The Phase-2 allocator homes only non-call-spanning values in the
+    /// caller-saved pool, which makes every IR-visible call safe (the same
+    /// model x86-64/i686/AArch64 already run).  What the shared liveness
+    /// cannot see on RISC-V are EMITTER-side a-register clobberers that are
+    /// not IR call points: the F128 soft-float helper sequences, the i128
+    /// helper calls, libm calls from the RoundScalar intrinsics, and the
+    /// a2–a5 scratch usage inside the atomic RMW sequences.  An eligible
+    /// function therefore contains only instructions whose emitters touch
+    /// t-regs and s-regs exclusively, over scalar (<=64-bit integer /
+    /// F32/F64/Ptr) types.  Anything else keeps the pure callee-saved pool.
+    fn riscv_caller_pool_eligible(func: &IrFunction) -> bool {
+        use crate::ir::reexports::{Instruction, IrConst, Operand};
+        if std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_some() {
+            return false;
+        }
+        let scalar = |ty: &IrType| {
+            matches!(
+                ty,
+                IrType::I8
+                    | IrType::I16
+                    | IrType::I32
+                    | IrType::I64
+                    | IrType::U8
+                    | IrType::U16
+                    | IrType::U32
+                    | IrType::U64
+                    | IrType::F32
+                    | IrType::F64
+                    | IrType::Ptr
+            )
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::BinOp { ty, .. }
+                    | Instruction::UnaryOp { ty, .. }
+                    | Instruction::Cmp { ty, .. }
+                    | Instruction::Load { ty, .. }
+                    | Instruction::Store { ty, .. }
+                    | Instruction::Select { ty, .. }
+                    | Instruction::ParamRef { ty, .. }
+                    | Instruction::Alloca { ty, .. } => {
+                        if !scalar(ty) {
+                            return false;
+                        }
+                    }
+                    Instruction::Cast { from_ty, to_ty, .. } => {
+                        if !scalar(from_ty) || !scalar(to_ty) {
+                            return false;
+                        }
+                    }
+                    // A Copy has no type of its own; a widened or 128-bit
+                    // constant always flows through a typed producer, but
+                    // the F128/I128 constant CARRIERS are checked here so a
+                    // bare const copy cannot slip through.
+                    Instruction::Copy { src, .. } => {
+                        if let Operand::Const(c) = src {
+                            if matches!(c, IrConst::LongDouble(..) | IrConst::I128(..)) {
+                                return false;
+                            }
+                        }
+                    }
+                    Instruction::GetElementPtr { .. }
+                    | Instruction::GlobalAddr { .. }
+                    | Instruction::LabelAddr { .. }
+                    | Instruction::GetStaticChain { .. }
+                    | Instruction::SetStaticChain { .. } => {}
+                    // Everything else (calls, inline asm, memcpys, atomics,
+                    // intrinsics, varargs, F128/i128 carriers, non-local
+                    // goto plumbing, dynamic allocas) keeps the pure
+                    // callee-saved pool.
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether the function contains any IR-visible call point.  Used by the
+    /// frameless-leaf gate: without a prologue the return address stays in
+    /// `ra`, so any call would clobber it before the closing `ret`.
+    fn riscv_is_call_free(func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        !func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Call { .. }
+                        | Instruction::CallIndirect { .. }
+                        | Instruction::InlineAsm { .. }
+                        | Instruction::Memcpy { .. }
+                )
+            })
+        })
+    }
+
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         // Clz/Ctz/Popcount on ≤32-bit integer types produce results in
         // [0, bitwidth] — the count is built from 0 upward in a full 64-bit
@@ -81,15 +179,46 @@ impl RiscvCodegen {
         if self.state.disable_regalloc {
             available_regs.clear();
         }
+        // Caller-saved Phase-2 pool: a0–a7 for emitter-safe functions (see
+        // riscv_caller_pool_eligible).  The allocator only homes non-
+        // call-spanning values there, and its call_arg_regs wave split keeps
+        // argument-consumed values out of the staging targets, so the call
+        // argument staging (which writes a0–a7 in ABI order) can never pull
+        // a live value out from under a later argument.  t-regs stay reserved
+        // as emitter scratch (t0 acc / t1 secondary / t2 static chain and
+        // indirect-call target / t3–t5 call staging / t6 jump tables).
+        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> =
+            if !self.state.disable_regalloc
+                && !self.is_variadic
+                && !func.uses_sret
+                && Self::riscv_caller_pool_eligible(func)
+                // The entry-prefix write guard is computed from block 0
+                // alone; opening the pool is only sound when every ParamRef
+                // really sits in that entry prefix (generation's lowering
+                // contract).  Belt and suspenders: refuse the pool outright
+                // otherwise.  Also re-asserts call-freeness.
+                && crate::backend::regalloc::riscv_param_caller_homes_safe(func)
+            {
+                (12..=19)
+                    .map(crate::backend::regalloc::PhysReg)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let call_arg_regs = caller_saved_regs.clone();
         let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
-            crate::backend::generation::run_regalloc_and_merge_clobbers(
+            crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
                 func,
                 available_regs,
-                Vec::new(),
+                caller_saved_regs,
                 &asm_clobbered_regs,
                 &mut self.reg_assignments,
                 &mut self.used_callee_saved,
                 true, // RISC-V asm emitter checks reg_assignments for inline asm operands
+                None,
+                call_arg_regs,
+                Vec::new(),
+                crate::common::fx_hash::FxHashMap::default(),
             );
 
         self.state.ra_accumulator_values =
@@ -132,6 +261,39 @@ impl RiscvCodegen {
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
         self.current_frame_size = frame_size;
+        // Frameless leaf: the 16-byte frame is EXACTLY the ra/s0 save
+        // reservation (no slots, no allocas, no callee saves) plus
+        // call-free plus every parameter in a register — there is NOTHING
+        // to set up: sp stays where the caller left it, ra/s0 are
+        // untouched, and the closing `ret` returns directly.  Stack-passed
+        // parameters would need s0 == entry sp, so they disqualify.
+        // (frame_size floors at 16 because the stack-space computation
+        // always reserves room for the ra/s0 saves the frameless form
+        // no longer makes; anything above 16 means real frame content.)
+        self.frameless_leaf = frame_size == 16
+            && !self.is_variadic
+            && !func.uses_sret
+            && Self::riscv_is_call_free(func)
+            && Self::riscv_caller_pool_eligible(func)
+            && {
+                let mut config = self.call_abi_config_impl();
+                config.variadic_floats_in_gp = func.is_variadic;
+                let classes = crate::backend::call_abi::classify_params(func, &config);
+                !classes.iter().any(|c| {
+                    matches!(
+                        c,
+                        crate::backend::call_abi::ParamClass::StackScalar { .. }
+                            | crate::backend::call_abi::ParamClass::I128Stack { .. }
+                            | crate::backend::call_abi::ParamClass::F128Stack { .. }
+                            | crate::backend::call_abi::ParamClass::F128AlwaysStack { .. }
+                            | crate::backend::call_abi::ParamClass::StructStack { .. }
+                            | crate::backend::call_abi::ParamClass::StructSplitRegStack { .. }
+                    )
+                })
+            };
+        if self.frameless_leaf {
+            return;
+        }
         self.emit_prologue_riscv(frame_size);
 
         // Save callee-saved registers used by the register allocator.
@@ -147,6 +309,9 @@ impl RiscvCodegen {
     // ---- emit_epilogue ----
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
+        if self.frameless_leaf {
+            return;
+        }
         // Restore callee-saved registers before epilogue.
         let used_regs = self.used_callee_saved.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
@@ -676,9 +841,37 @@ impl RiscvCodegen {
 
         match class {
             ParamClass::IntReg { reg_idx } => {
-                self.state
-                    .emit_fmt(format_args!("    mv t0, {}", RISCV_ARG_REGS[reg_idx]));
-                self.store_t0_to(dest);
+                // Home-aware fast paths: a register-homed destination is a
+                // single move (none at all when the home IS the incoming
+                // register); only a slot destination needs the t0 round
+                // trip.  Sub-64-bit homes keep the sign/zero-filling extend
+                // (canonical-form discipline: homes hold sext/zext values).
+                let home = self.reg_assignments.get(&dest.0).copied();
+                let is_word64 =
+                    matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+                if let Some(home) = home {
+                    let home_name = callee_saved_name(home);
+                    let arg = RISCV_ARG_REGS[reg_idx];
+                    if is_word64 {
+                        if home_name != arg {
+                            self.state
+                                .emit_fmt(format_args!("    mv {}, {}", home_name, arg));
+                        }
+                    } else if home_name == arg {
+                        // Home IS the incoming register: extend in place —
+                        // one instruction, no staging round trip.
+                        Self::emit_extend_reg(&mut self.state, arg, arg, ty);
+                    } else {
+                        Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+                        if home_name != "t0" {
+                            self.state
+                                .emit_fmt(format_args!("    mv {}, t0", home_name));
+                        }
+                    }
+                } else {
+                    Self::emit_extend_reg(&mut self.state, RISCV_ARG_REGS[reg_idx], "t0", ty);
+                    self.store_t0_to(dest);
+                }
             }
             ParamClass::FloatReg { reg_idx } => {
                 let float_arg_regs = ["fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7"];
@@ -705,6 +898,10 @@ impl RiscvCodegen {
     // ---- emit_epilogue_and_ret ----
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
+        if self.frameless_leaf {
+            self.state.emit("    ret");
+            return;
+        }
         // Restore callee-saved registers before frame teardown.
         let used_regs = self.used_callee_saved.clone();
         for (i, &reg) in used_regs.iter().enumerate() {

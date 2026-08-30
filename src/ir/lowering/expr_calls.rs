@@ -204,7 +204,23 @@ impl Lowerer {
 
         // Detect variadic status early (needed for complex arg decomposition)
         let call_is_variadic = if let Expr::Identifier(name, _) = stripped_func {
-            self.is_function_variadic(name)
+            if self.is_func_ptr_variable(name) {
+                // Call through a function-pointer variable: the POINTED-TO
+                // signature decides.  Its `...` makes the call variadic —
+                // floats belong in GP regs on rv64, AL=1 on x86-64, GP-only
+                // on aarch64.  is_function_variadic only knows function
+                // definitions, so `int (*fp)(char*, ...) -> f(fp);
+                // (*fp)(b, "%.0f", 5.0)` sent the double to fa0 instead of
+                // a2 and aborted glibc's vsprintf (gcc.c-torture 930513-1).
+                self.func_meta
+                    .ptr_sigs
+                    .get(name.as_str())
+                    .or_else(|| self.func_meta.sigs.get(name.as_str()))
+                    .map(|sig| sig.is_variadic)
+                    .unwrap_or(false)
+            } else {
+                self.is_function_variadic(name)
+            }
         } else {
             false
         };
@@ -1186,6 +1202,22 @@ impl Lowerer {
                 // Use the comprehensive is_function_pointer_deref check which also handles
                 // cases where c_type is None but ptr_sigs or known_functions provide info.
                 let is_noop_deref = self.is_function_pointer_deref(inner);
+                // A call through a dereferenced function pointer still follows
+                // the pointed-to type's signature: if that type declares `...`,
+                // the call IS variadic (floats belong in GP regs on rv64, AL=1
+                // on x86-64, GP-only on aarch64).  The hard-coded `false` sent
+                // the 5.0 of `(*fp)(buf, "%.0f", 5.0)` to fa0 instead of a2 and
+                // aborted glibc's vsprintf on rv64 (gcc.c-torture 930513-1).
+                let deref_variadic = match &**inner {
+                    Expr::Identifier(name, _) => self
+                        .func_meta
+                        .ptr_sigs
+                        .get(name.as_str())
+                        .or_else(|| self.func_meta.sigs.get(name.as_str()))
+                        .map(|sig| sig.is_variadic)
+                        .unwrap_or(false),
+                    _ => false,
+                };
                 let n = arg_vals.len();
                 let sas = struct_arg_sizes;
                 let saa = struct_arg_aligns;
@@ -1205,7 +1237,7 @@ impl Lowerer {
                         args: arg_vals,
                         arg_types,
                         return_type: indirect_ret_ty,
-                        is_variadic: false,
+                        is_variadic: deref_variadic,
                         num_fixed_args: n,
                         struct_arg_sizes: sas,
                         struct_arg_aligns: saa,
