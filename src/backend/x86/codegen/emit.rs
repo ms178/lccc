@@ -5,7 +5,7 @@ use crate::backend::common::PtrDirective;
 use crate::backend::inline_asm::emit_inline_asm_common;
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::{CodegenState, StackSlot};
-use crate::backend::traits::ArchCodegen;
+use crate::backend::traits::{ArchCodegen, MAX_JUMP_TABLE_RANGE, MIN_JUMP_TABLE_CASES, MIN_JUMP_TABLE_DENSITY_PERCENT};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::delegate_to_impl;
@@ -628,6 +628,83 @@ pub(super) struct IvsrPointerInfo {
 }
 
 impl X86Codegen {
+    /// Compare the low 64-bit half of a 128-bit switch value (already in
+    /// %rax) against `case_val` and branch to `label` on equality.  The sign
+    /// class of the case has already been verified against the high half.
+    fn emit_switch_case_branch_128_low(&mut self, case_val: i64, label: &str) {
+        if case_val == 0 {
+            self.state.emit("    testq %rax, %rax");
+        } else if case_val >= i32::MIN as i64 && case_val <= i32::MAX as i64 {
+            self.state
+                .out
+                .emit_instr_imm_reg("    cmpq", case_val, "rax");
+        } else {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movabsq", case_val, "rcx");
+            self.state.emit("    cmpq %rcx, %rax");
+        }
+        self.state.out.emit_jcc_label("    je", label);
+    }
+
+    /// Density-based switch lowering for native-width values: the trait
+    /// default's logic (jump table with PGO case hoisting, or a sparse
+    /// compare chain), reproduced here so the 128-bit path can coexist in
+    /// the override above.
+    fn emit_switch_native(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        let hint = crate::pgo::take_switch_hint();
+        let force_chain = hint.map(|h| h.force_chain).unwrap_or(false);
+        let use_jump_table = if self.state_ref().no_jump_tables || force_chain {
+            false
+        } else if cases.len() >= MIN_JUMP_TABLE_CASES {
+            let min_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .min()
+                .expect("switch must have cases");
+            let max_val = cases
+                .iter()
+                .map(|&(v, _)| v)
+                .max()
+                .expect("switch must have cases");
+            let range_i128 = max_val as i128 - min_val as i128 + 1;
+            let range_ok = range_i128 > 0 && range_i128 <= MAX_JUMP_TABLE_RANGE as i128;
+            range_ok && cases.len() * 100 / (range_i128 as usize) >= MIN_JUMP_TABLE_DENSITY_PERCENT
+        } else {
+            false
+        };
+
+        if use_jump_table {
+            let mut cases2: Vec<(i64, BlockId)> = cases.to_vec();
+            let mut hoist: Option<(i64, BlockId)> = None;
+            if let Some(h) = hint {
+                if let Some((hv, ht)) = h.hot_case {
+                    if let Some(pos) = cases2.iter().position(|&(v, t)| v == hv && t.0 == ht) {
+                        hoist = Some(cases2.remove(pos));
+                    }
+                }
+            }
+            if let Some((hv, ht)) = hoist {
+                self.emit_load_operand(val);
+                self.emit_switch_case_branch(hv, &ht.as_label(), ty);
+            }
+            self.emit_switch_jump_table(val, &cases2, default, ty);
+        } else {
+            self.emit_load_operand(val);
+            for &(case_val, target) in cases {
+                let label = target.as_label();
+                self.emit_switch_case_branch(case_val, &label, ty);
+            }
+            self.emit_branch_to_block(*default);
+        }
+    }
+
     /// Emit a retpoline-protected indirect CALL through `reg`.
     ///
     /// thunk-inline (kernel vDSO: userspace code that cannot reference the
@@ -4394,6 +4471,66 @@ impl ArchCodegen for X86Codegen {
 
     fn emit_jump_indirect(&mut self) {
         self.emit_retpoline_jump("rax");
+    }
+
+    fn emit_switch(
+        &mut self,
+        val: &Operand,
+        cases: &[(i64, BlockId)],
+        default: &BlockId,
+        ty: IrType,
+    ) {
+        // 128-bit switches need an explicit high-half guard: the compare
+        // chain and the jump table below operate on the low 64-bit half only
+        // (%rax), so a case value representable in i64 matches only when the
+        // high half is its sign extension — 0 for non-negative cases, -1 for
+        // negative ones.  Without the guard, ((__int128)1 << 64) matched
+        // `case 0` (gcc.c-torture execute/pr122943.c).
+        if matches!(ty, IrType::I128 | IrType::U128) && !cases.is_empty() {
+            let has_nonneg = cases.iter().any(|&(v, _)| v >= 0);
+            let has_neg = cases.iter().any(|&(v, _)| v < 0);
+            if has_neg && has_nonneg {
+                // Mixed sign classes: two guarded chains.
+                //   high == 0  -> non-negative chain
+                //   high == -1 -> negative chain
+                //   else       -> default
+                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
+                let nonneg_chain = self.state.fresh_label("switch128_nonneg");
+                let neg_chain = self.state.fresh_label("switch128_neg");
+                self.state.out.emit_instr_imm_reg("    cmpq", 0, "rdx");
+                self.state.out.emit_jcc_label("    je", &nonneg_chain);
+                self.state.out.emit_instr_imm_reg("    cmpq", -1, "rdx");
+                self.state.out.emit_jcc_label("    je", &neg_chain);
+                self.emit_branch_to_block(*default);
+                self.state.out.emit_named_label(&nonneg_chain);
+                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v >= 0) {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+                self.state.out.emit_named_label(&neg_chain);
+                for &(case_val, target) in cases.iter().filter(|&&(v, _)| v < 0) {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+            } else {
+                // Single sign class: one guard, then the low-half chain.
+                let required_high: i64 = if has_neg { -1 } else { 0 };
+                self.emit_load_acc_pair(val); // %rax = low, %rdx = high
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    cmpq", required_high, "rdx");
+                self.state.out.emit_jcc_label("    jne", &default.as_label());
+                for &(case_val, target) in cases {
+                    let label = target.as_label();
+                    self.emit_switch_case_branch_128_low(case_val, &label);
+                }
+                self.emit_branch_to_block(*default);
+            }
+            return;
+        }
+        self.emit_switch_native(val, cases, default, ty);
     }
 
     fn emit_switch_case_branch(&mut self, case_val: i64, label: &str, ty: IrType) {

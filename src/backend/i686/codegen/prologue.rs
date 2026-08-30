@@ -141,11 +141,37 @@ impl I686Codegen {
             self.omit_frame_pointer = false;
         }
 
+        // __builtin_frame_address(0) and __builtin_setjmp read %ebp directly;
+        // under -fomit-frame-pointer the register would hold a stale
+        // caller-owned value.  Mirror the has_frame_address veto the x86-64
+        // pipeline applies in backend/generation.rs.
+        // gcc.c-torture execute/frame-address.c caught this: at -O1/-O2 the
+        // noipa helper containing the intrinsic lost its frame pointer while
+        // its caller (holding a dynamic alloca) kept one, so the stack-address
+        // containment check failed and the test aborted.
+        if func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Intrinsic {
+                        op: crate::ir::intrinsics::IntrinsicOp::FrameAddress
+                            | crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                        ..
+                    }
+                )
+            })
+        }) {
+            self.omit_frame_pointer = false;
+        }
+
         // Compute named parameter stack bytes for va_start (variadic functions).
-        if func.is_variadic {
+        {
             let config = self.call_abi_config();
             let classification = crate::backend::call_abi::classify_params_full(func, &config);
-            self.va_named_stack_bytes = classification.total_stack_bytes;
+            self.incoming_stack_arg_bytes = classification.total_stack_bytes as i64;
+            if func.is_variadic {
+                self.va_named_stack_bytes = classification.total_stack_bytes;
+            }
         }
 
         // Run register allocator before stack space computation.
@@ -453,6 +479,11 @@ impl I686Codegen {
         if frame_size > 0 {
             emit!(self.state, "    subl ${}, %esp", frame_size);
         }
+
+        // Post-prologue %esp baseline (ebp-relative), valid in both frame
+        // pointer modes: %esp at esp_adjust==0 equals %ebp minus this value.
+        // DoBuiltinApply uses it to restore %esp after its untracked staging.
+        self.esp_baseline_offset = self.used_callee_saved.len() as i64 * 4 + frame_size;
 
         if self.omit_frame_pointer {
             let callee_saved_bytes = self.used_callee_saved.len() as i64 * 4;

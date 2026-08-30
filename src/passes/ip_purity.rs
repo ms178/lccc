@@ -273,6 +273,25 @@ fn analyze_function_purity(
                 | Instruction::StackRestore { .. } => {
                     return (false, false);
                 }
+                // Non-local control flow intrinsics: __builtin_setjmp returns
+                // twice and __builtin_longjmp never returns.  Classifying them
+                // as purity-neutral let DCE delete the very calls that perform
+                // the longjmp (gcc.c-torture execute/pr60003.c at -O1/-O2,
+                // where foo's `while (1) { a = 1; bar (); }` loop collapsed to
+                // an empty infinite loop).  They must be treated exactly like
+                // NonlocalGoto: neither pure nor const.
+                Instruction::Intrinsic { op, .. }
+                    if matches!(
+                        op,
+                        crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp
+                            | crate::ir::intrinsics::IntrinsicOp::BuiltinLongjmp
+                            | crate::ir::intrinsics::IntrinsicOp::SaveApplyArgs
+                            | crate::ir::intrinsics::IntrinsicOp::DoBuiltinApply
+                            | crate::ir::intrinsics::IntrinsicOp::RestoreApplyResult
+                    ) =>
+                {
+                    return (false, false);
+                }
                 // Pure value computations / addressing
                 Instruction::Alloca { .. }
                 | Instruction::BinOp { .. }

@@ -16,6 +16,24 @@ use crate::ir::reexports::{Instruction, IrConst, IrFunction, Operand, Terminator
 
 use super::{BlockLocalValue, DeferredSlot, MultiBlockValue, StackLayoutContext};
 
+/// Whether `func` contains a `__builtin_setjmp` intrinsic (a returns-twice
+/// function).  Such functions must never rely on liveness models that only
+/// cover the ordinary CFG: the resume edge from any call that longjmps back
+/// into the setjmp frame re-enters the function at the setjmp site.
+pub(crate) fn has_builtin_setjmp(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Intrinsic {
+                    op: crate::ir::intrinsics::IntrinsicOp::BuiltinSetjmp,
+                    ..
+                }
+            )
+        })
+    })
+}
+
 /// Determine if a non-alloca value can be assigned to a block-local pool slot (Tier 3).
 /// Returns `Some(def_block_idx)` if the value is defined and used only within a
 /// single block, making it safe to share stack space with values from other blocks.
@@ -1029,7 +1047,20 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // RA-23 makes accumulator homes explicit and the caller quarantines
     // copy/phi/multi-def webs whose edge semantics are resolved later. Ordinary
     // SSA values use hole-aware closed-boundary coloring by default.
-    if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() {
+    //
+    // Returns-twice functions (__builtin_setjmp) must never use packed slots:
+    // the resume edge from any call that longjmps back into the setjmp frame
+    // is not modeled by the plain-CFG liveness that drives the packing, so a
+    // packed slot can be handed to an unrelated value in another block while
+    // a setjmp-live value still occupies it.  gcc.c-torture
+    // execute/built-in-setjmp.c at -O2 caught exactly this: the "test" string
+    // pointer's slot was reused by the alloca/loop else-branch, so after the
+    // longjmp landed, strcmp compared against a clobbered pointer and the
+    // test aborted.  Fall back to distinct permanent slots instead.
+    if !coalesce
+        || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some()
+        || has_builtin_setjmp(func)
+    {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
