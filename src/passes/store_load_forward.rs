@@ -267,7 +267,10 @@ fn apply_inst(
             }
             None => map.clear(),
         },
-        // Pure value computations: no memory effect.
+        // Pure value computations: no memory effect. A pure/const call with
+        // an sret return DOES write memory (the hidden sret pointer — i686
+        // uses sret for every struct/_Complex return), so it must fall
+        // through to the default kill (20070614-1 family).
         Instruction::Alloca { .. }
         | Instruction::BinOp { .. }
         | Instruction::UnaryOp { .. }
@@ -284,20 +287,28 @@ fn apply_inst(
         | Instruction::Call {
             info:
                 CallInfo {
-                    is_pure: true, ..
+                    is_sret: false,
+                    is_pure: true,
+                    ..
                 }
                 | CallInfo {
-                    is_const: true, ..
+                    is_sret: false,
+                    is_const: true,
+                    ..
                 },
             ..
         }
         | Instruction::CallIndirect {
             info:
                 CallInfo {
-                    is_pure: true, ..
+                    is_sret: false,
+                    is_pure: true,
+                    ..
                 }
                 | CallInfo {
-                    is_const: true, ..
+                    is_sret: false,
+                    is_const: true,
+                    ..
                 },
             ..
         } => {}

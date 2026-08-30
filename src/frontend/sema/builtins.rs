@@ -1520,6 +1520,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::ShuffleVector),
     );
     m.insert(
+        "__builtin_shuffle",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::Shuffle),
+    );
+    m.insert(
         "__builtin_ia32_maxps256",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxPs256V),
     );
@@ -3022,6 +3026,7 @@ pub enum BuiltinIntrinsic {
     X86ShufPsValue,   // __builtin_ia32_shufps (SHUFPS imm8) — by-value raw builtin
     X86CvtPd2PsValue, // __builtin_ia32_cvtpd2ps (CVTPD2PS) — by-value raw builtin
     ShuffleVector,    // __builtin_shufflevector (4-lane 32-bit shuffles)
+    Shuffle,          // __builtin_shuffle(v[, v2], mask) — GCC vector-extension permute
     X86MaxPs256V,     // __builtin_ia32_maxps256 (VMAXPS ymm)
     X86MinPs256V,     // __builtin_ia32_minps256 (VMINPS ymm)
     X86AndPs256V,     // __builtin_ia32_andps256 (VANDPS ymm, bitwise)

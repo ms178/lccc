@@ -150,6 +150,7 @@ impl Lowerer {
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
                     | "__builtin_shufflevector"
+                    | "__builtin_shuffle"
                     | "__builtin_ia32_vextractf128_ps256" => return None,
                     _ => {}
                 }
