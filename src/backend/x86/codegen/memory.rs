@@ -6,6 +6,100 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl X86Codegen {
+    /// S11: soundness gate for raw SIB-index use of `reg_assignments`.
+    ///
+    /// `build_indexed_gep_map` peels widening casts, `add(iv, const)` and
+    /// power-of-two scale chains off a GEP offset, so the value feeding the
+    /// SIB index can be NARROWER than 64 bits (e.g. an I32 call result reached
+    /// by peeling the `Cast`+`Add` off `(i64)idx + 1` in `k[baz()+1]`).
+    /// Narrow values have no defined 64-bit home form: `store_rax_to` /
+    /// `store_eax_to` deliberately keep the whole accumulator (`movq`), and
+    /// after a Call returning I32 the upper half of %rax is undefined
+    /// (System V names only %eax as the return register). A SIB index reads
+    /// the home register directly — no reload, no `movslq` — so the peel
+    /// turns `p[idx]` into `mem(%base, %idx_home, scale)` with garbage in the
+    /// upper half (pr110115: `16(%rsp,%r9,8)` with %r9 = 0x00000000FFFFFFFF
+    /// instead of the required sign extension 0xFFFFFFFFFFFFFFFF ⇒ wild
+    /// store ⇒ SIGSEGV).
+    ///
+    /// Values that appear in a 64-bit IR position are already covered: they
+    /// land in `needs_sext_values`, whose def-side policy emits the
+    /// extending move after the 32-bit op, so their homes carry the correct
+    /// 64-bit form and this helper is a no-op for them (it re-extends the
+    /// same low bits). The peeled index never reaches such a position, which
+    /// is exactly the hole this closes.
+    ///
+    /// The extension happens IN PLACE on the home register, immediately
+    /// before the SIB operand is consumed:
+    ///   I8/I16/I32 → movsbq/movswq/movslq from the narrow sub-register
+    ///   U8/U16/U32 → movzbq/movzwq/movl (zero-extension by definition)
+    /// In-place extension is always sound for a narrow value:
+    ///   * the SIB now reads exactly the 64-bit form the type promises;
+    ///   * later 32-bit reloads (`movl %rNd`) still read the low 32 bits;
+    ///   * later sext-aware reloads re-extend from the low bits, unchanged;
+    ///   * the home only gains DEFINED upper bits — every form above
+    ///     preserves the low bits bit-exactly and MOV never touches flags
+    ///     (safe even with a fused-Cmp handshake pending).
+    ///
+    /// Returns false (caller refuses the fold) when the index has no register
+    /// home, is XMM-homed, or its IR type is not statically narrow: extending
+    /// a genuine 64-bit value in place would truncate it, and an unknown type
+    /// must not be gambled on. Refusals fall back to the `leaq` path, which
+    /// reloads the index through the sext-aware operand machinery.
+    fn ensure_sib_index_form(&mut self, index: &Value) -> bool {
+        let Some(&reg) = self.reg_assignments.get(&index.0) else {
+            return false;
+        };
+        if is_xmm_reg(reg) {
+            return false;
+        }
+        let Some(&ty) = self.value_types.get(&index.0) else {
+            return false;
+        };
+        match ty {
+            IrType::I64 | IrType::U64 | IrType::Ptr => true,
+            IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8 => {
+                let r64 = phys_reg_name(reg);
+                let instr = match ty {
+                    IrType::I32 => format!(
+                        "    movslq %{}, %{}",
+                        phys_reg_name_32(reg),
+                        r64
+                    ),
+                    IrType::U32 => format!(
+                        "    movl %{}, %{}",
+                        phys_reg_name_32(reg),
+                        phys_reg_name_32(reg)
+                    ),
+                    IrType::I16 => format!(
+                        "    movswq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::I16),
+                        r64
+                    ),
+                    IrType::U16 => format!(
+                        "    movzwq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::U16),
+                        r64
+                    ),
+                    IrType::I8 => format!(
+                        "    movsbq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::I8),
+                        r64
+                    ),
+                    IrType::U8 => format!(
+                        "    movzbq %{}, %{}",
+                        typed_phys_reg_name(reg, IrType::U8),
+                        r64
+                    ),
+                    _ => unreachable!("narrow-type match is exhaustive above"),
+                };
+                self.state.emit_fmt(format_args!("{}", instr));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Try to emit a store using x86-64 SIB indexed addressing mode.
     /// Returns true if successful, false to fall back to normal codegen.
     ///
@@ -1969,6 +2063,9 @@ impl X86Codegen {
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
             // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if !self.ensure_sib_index_form(index) {
+                return false;
+            }
             if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
                 return self.emit_load_indexed_common(dest, index, shift, ty, mem);
             }
@@ -1981,6 +2078,9 @@ impl X86Codegen {
                 .copied()
                 .map_or(true, is_xmm_reg)
         {
+            return false;
+        }
+        if !self.ensure_sib_index_form(index) {
             return false;
         }
         let mem = Self::sib_mem64(
@@ -2003,6 +2103,9 @@ impl X86Codegen {
     ) -> bool {
         let Some(&b) = self.reg_assignments.get(&base.0) else {
             // Alloca-base indexed addressing: `disp(%rbp/%rsp,%idx,scale)`.
+            if !self.ensure_sib_index_form(index) {
+                return false;
+            }
             if let Some(mem) = self.frame_sib_for_alloca_base(base, index, shift, disp) {
                 return self.emit_store_indexed_common(val, index, shift, ty, mem);
             }
@@ -2015,6 +2118,9 @@ impl X86Codegen {
                 .copied()
                 .map_or(true, is_xmm_reg)
         {
+            return false;
+        }
+        if !self.ensure_sib_index_form(index) {
             return false;
         }
         let mem = Self::sib_mem64(
@@ -2055,6 +2161,9 @@ impl X86Codegen {
         if is_xmm_reg(x) {
             return false;
         }
+        if !self.ensure_sib_index_form(index) {
+            return false;
+        }
         let index_name = phys_reg_name(x);
         let mem = if self.state.pic_mode {
             // x86 has no RIP-relative SIB form. Rebuild the legal direct
@@ -2091,6 +2200,9 @@ impl X86Codegen {
             return false;
         };
         if is_xmm_reg(x) {
+            return false;
+        }
+        if !self.ensure_sib_index_form(index) {
             return false;
         }
         let index_name = phys_reg_name(x);

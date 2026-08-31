@@ -38,14 +38,23 @@ impl Lowerer {
             let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, IrType::F128);
             return Operand::Value(result);
         }
-        if crate::common::types::target_is_32bit() && float_ty == IrType::F64 {
-            // On i686 (ILP32), the I64 bit-masking approach doesn't work because
-            // the result is a 64-bit integer that gets truncated to 32 bits when
-            // tested in conditional branches and comparisons. Use a proper F64
-            // comparison against zero instead, which handles -0.0 correctly
-            // (IEEE 754: +0.0 == -0.0) and NaN (unordered → truthy via setp).
-            let zero = Operand::Const(IrConst::F64(0.0));
-            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, IrType::F64);
+        if crate::common::types::target_is_32bit() {
+            // On i686 (ILP32), the I64 bit-masking approach doesn't work for
+            // EITHER float width: the F64 case because the 64-bit masked
+            // result is truncated when tested in 32-bit conditionals, and
+            // the F32 case (20080529-1) because materializing the I64 bit
+            // pattern of a 4-byte F32 param writes a synthesized zero high
+            // half at param_slot+4 — past the parameter, over the return
+            // address — turning `!!c` into a jump to zero. Use a proper
+            // float comparison against zero for both widths: it handles
+            // -0.0 correctly (IEEE 754: +0.0 == -0.0) and NaN (unordered →
+            // truthy via setp), matching the x86-64 bit-trick's semantics.
+            let (zero, ty) = if float_ty == IrType::F64 {
+                (Operand::Const(IrConst::F64(0.0)), IrType::F64)
+            } else {
+                (Operand::Const(IrConst::F32(0.0)), IrType::F32)
+            };
+            let result = self.emit_cmp_val(IrCmpOp::Ne, val, zero, ty);
             return Operand::Value(result);
         }
         let (abs_mask, _, _, _, _) = Self::fp_masks(float_ty);

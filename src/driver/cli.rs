@@ -888,6 +888,13 @@ impl Driver {
                 arg if arg == "-fsigned-char" => {
                     crate::common::types::set_char_unsigned(false);
                 }
+                // S13: function entry/exit instrumentation via the
+                // __cyg_profile_func_enter/exit hooks (GCC contract).
+                arg if arg == "-finstrument-functions" => {
+                    self.instrument_functions = true;
+                }
+                arg if arg == "-finstrument-functions-exclude-file-list" => {}
+                arg if arg == "-finstrument-functions-exclude-function-list" => {}
                 arg if arg.starts_with("-std=") => {
                     let std_value = &arg[5..];
                     // GNU dialects: gnu89, gnu99, gnu11, gnu17, gnu23, etc.

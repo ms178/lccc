@@ -218,6 +218,17 @@ impl Parser {
             && matches!(derived.last(), Some(DerivedDeclarator::Function(_, _)))
             && (matches!(self.peek(), TokenKind::LBrace) || self.is_type_specifier());
 
+        // S13: record file-scope function no_instrument_function
+        // attributes so a later DEFINITION inherits them (GCC merges
+        // declaration attributes into the definition).
+        if decl_attrs.is_no_instrument() {
+            if let Some(n) = &name {
+                if matches!(derived.last(), Some(DerivedDeclarator::Function(_, _))) {
+                    self.func_decl_no_instrument.insert(n.clone());
+                }
+            }
+        }
+
         if is_funcdef {
             self.parse_function_def(type_spec, name, derived, start, decl_attrs)
         } else {
@@ -280,6 +291,14 @@ impl Parser {
         // does not leak into local declarations inside the body.
         // parse_compound_stmt saves/restores attr flags, so this is safe.
         self.attrs.set_noreturn(false);
+        // S13: GCC merges declaration attributes into the
+        // definition; no_instrument_function on a prior file-scope
+        // declaration (e.g. `int main () NOCHK;`) must suppress
+        // instrumentation even when the definition does not re-state it.
+        let no_instrument_merged = decl_attrs.is_no_instrument()
+            || name
+                .as_deref()
+                .is_some_and(|n| self.func_decl_no_instrument.contains(n));
         let body = self.parse_compound_stmt();
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
@@ -305,7 +324,7 @@ impl Parser {
                 attrs.set_used(decl_attrs.is_used());
                 attrs.set_fastcall(decl_attrs.is_fastcall());
                 attrs.set_naked(decl_attrs.is_naked());
-                attrs.set_no_instrument(decl_attrs.is_no_instrument());
+                attrs.set_no_instrument(no_instrument_merged);
                 attrs.set_noreturn(decl_attrs.is_noreturn());
                 attrs.set_pure(decl_attrs.is_pure());
                 attrs.set_const_attr(decl_attrs.is_const_attr());

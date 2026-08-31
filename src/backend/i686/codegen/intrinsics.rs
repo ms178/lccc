@@ -349,6 +349,37 @@ impl I686Codegen {
                 self.state.emit("    fsqrt");
                 self.emit_f32_store_from_x87(dest);
             }
+            // S11: directed-rounding scalar intrinsics. simplify.rs
+            // rewrites floor/ceil/trunc/rint/nearbyint/roundeven into
+            // RoundScalar* intrinsics unconditionally (required for glibc
+            // self-hosting on x86-64), but the i686 backend had no arm — the
+            // `_ => {}` fallthrough silently dropped the instruction and the
+            // result slot was read unwritten (float-floor: floor(d) vanished,
+            // (int)garbage != 1023 -> abort at every opt level).
+            //
+            // x87 lowering: `frndint` rounds per the FPU control word's RC
+            // field (bits 10-11). floor/ceil/trunc need a transient RC
+            // switch (01 down / 10 up / 11 chop), roundeven forces 00
+            // (nearest-even), rint/nearbyint use the ambient mode. The
+            // original CW is kept in %ax while the modified word lives in
+            // the dynamic 4-byte scratch, so one restore suffices; the
+            // scratch window never overlaps a frame-slot reference (arg is
+            // loaded before `subl $4`, result stored after `addl $4`), so
+            // the transient %esp shift is safe in both frame modes.
+            IntrinsicOp::RoundScalarF64(imm) => {
+                self.emit_f64_load_to_x87(&args[0]);
+                self.emit_x87_frndint_with_mode(*imm);
+                if let Some(d) = dest {
+                    self.emit_f64_store_from_x87(d);
+                } else {
+                    self.state.emit("    fstp %st(0)");
+                }
+            }
+            IntrinsicOp::RoundScalarF32(imm) => {
+                self.emit_f32_load_to_x87(&args[0]);
+                self.emit_x87_frndint_with_mode(*imm);
+                self.emit_f32_store_from_x87(dest);
+            }
             IntrinsicOp::FabsF64 => {
                 self.emit_f64_unary_x87(&args[0], "fabs", dest);
             }
@@ -831,6 +862,53 @@ impl I686Codegen {
             }
         } else {
             self.state.emit("    fstp %st(0)");
+        }
+    }
+
+    /// S11: `frndint` under the rounding-control mode demanded by a
+    /// RoundScalar immediate. Encoding map (matches simplify.rs's
+    /// GCC-verified roundsd immediates): 8 = roundeven (RC 00 nearest-even),
+    /// 9 = floor (RC 01 down), 10 = ceil (RC 10 up), 11 = trunc (RC 11
+    /// chop), 4 = rint / 12 = nearbyint (ambient mode, no CW touch).
+    ///
+    /// RC switching protocol: save the CW into the dynamic 4-byte scratch,
+    /// keep the ORIGINAL in %ax, write the modified word back over the
+    /// scratch, `fldcw`, `frndint`, then restore the original word and
+    /// `fldcw` again — the FPU control word is per-thread state that must
+    /// be restored even for a single-instruction window (a caller may hold
+    /// a non-default mode, e.g. Fortran/MPFR-style code). %eax/%edx are
+    /// free here: the operand was already staged onto the x87 stack by the
+    /// caller's load helper, so no GPR holds live data across this window.
+    fn emit_x87_frndint_with_mode(&mut self, imm: u8) {
+        match imm {
+            8 | 9 | 10 | 11 => {
+                let rc: u16 = match imm {
+                    8 => 0x0000, // nearest-even
+                    9 => 0x0400, // down (floor)
+                    10 => 0x0800, // up (ceil)
+                    _ => 0x0c00, // chop (trunc)
+                };
+                self.state.emit("    subl $4, %esp");
+                self.state.emit("    fnstcw (%esp)");
+                self.state.emit("    movw (%esp), %ax");
+                self.state.emit("    movw %ax, %dx");
+                self.state.emit("    andw $0xf3ff, %dx");
+                self.state
+                    .emit_fmt(format_args!("    orw ${}, %dx", rc));
+                self.state.emit("    movw %dx, (%esp)");
+                self.state.emit("    fldcw (%esp)");
+                self.state.emit("    frndint");
+                self.state.emit("    movw %ax, (%esp)");
+                self.state.emit("    fldcw (%esp)");
+                self.state.emit("    addl $4, %esp");
+            }
+            _ => {
+                // rint (4) / nearbyint (12): round in the ambient mode.
+                // Any unknown immediate also lands here: the ambient-mode
+                // frndint is the safe conservative behavior, never a
+                // dropped instruction.
+                self.state.emit("    frndint");
+            }
         }
     }
 
