@@ -1805,6 +1805,103 @@ fn collect_gpr_scan_intervals(
     out
 }
 
+fn unite_map(parent: &mut FxHashMap<u32, u32>, a: u32, b: u32) {
+    fn find_r(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
+        let mut root = x;
+        while parent.get(&root).copied().is_some_and(|p| p != root) {
+            root = parent[&root];
+        }
+        let mut c = x;
+        while parent.get(&c).copied().is_some_and(|p| p != root) {
+            let next = parent[&c];
+            parent.insert(c, root);
+            c = next;
+        }
+        root
+    }
+    parent.entry(a).or_insert(a);
+    parent.entry(b).or_insert(b);
+    let ra = find_r(parent, a);
+    let rb = find_r(parent, b);
+    if ra != rb {
+        parent.insert(rb, ra);
+    }
+}
+
+/// Class-union overlap scan (the verifier's model, as a query): returns
+/// (reg, class_a, class_b, overlap_start, overlap_end) for every pair of
+/// DISTINCT classes whose register's merged class coverage overlaps.
+fn find_overlapping_classes(
+    liveness: &LivenessResult,
+    assignments: &FxHashMap<u32, PhysReg>,
+    parent: &FxHashMap<u32, u32>,
+) -> Vec<(u8, u32, u32, u32, u32)> {
+    fn find_ro(parent: &FxHashMap<u32, u32>, x: u32) -> u32 {
+        let mut root = x;
+        while let Some(&p) = parent.get(&root) {
+            if p == root {
+                break;
+            }
+            root = p;
+        }
+        root
+    }
+    let mut group_segments: FxHashMap<(u8, u32), Vec<(u32, u32)>> = FxHashMap::default();
+    let mut segmented: FxHashSet<u32> = FxHashSet::default();
+    for segment in &liveness.segments {
+        let Some(&reg) = assignments.get(&segment.value_id) else {
+            continue;
+        };
+        segmented.insert(segment.value_id);
+        let rep = find_ro(parent, segment.value_id);
+        group_segments
+            .entry((reg.0, rep))
+            .or_default()
+            .push((segment.start, segment.end));
+    }
+    for interval in &liveness.intervals {
+        if segmented.contains(&interval.value_id) {
+            continue;
+        }
+        let Some(&reg) = assignments.get(&interval.value_id) else {
+            continue;
+        };
+        let rep = find_ro(parent, interval.value_id);
+        group_segments
+            .entry((reg.0, rep))
+            .or_default()
+            .push((interval.start, interval.end));
+    }
+    let mut by_reg: FxHashMap<u8, Vec<(u32, u32, u32)>> = FxHashMap::default();
+    for ((reg, rep), pieces) in &mut group_segments {
+        pieces.sort_unstable();
+        let source = std::mem::take(pieces);
+        insert_segment_union(pieces, &source);
+        by_reg
+            .entry(*reg)
+            .or_default()
+            .extend(pieces.iter().map(|&(s, e)| (s, e, *rep)));
+    }
+    let mut out = Vec::new();
+    for (&reg, events) in by_reg.iter_mut() {
+        events.sort_unstable();
+        let mut previous: Option<(u32, u32, u32)> = None;
+        for &(start, end, rep) in events.iter() {
+            if let Some((_, prev_end, prev_rep)) = previous {
+                if start < prev_end && rep != prev_rep {
+                    out.push((reg, prev_rep, rep, start, prev_end.min(end)));
+                }
+            }
+            if previous.is_none_or(|(_, pe, _)| end > pe) {
+                previous = Some((start, end, rep));
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllocResult {
     let has_builtin_setjmp = func.blocks.iter().any(|b| {
         b.instructions.iter().any(|i| {
@@ -1869,6 +1966,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         for iv in &liveness.intervals {
             bounds_of.insert(iv.value_id, (iv.start, iv.end));
         }
+        // Multi-def (phi-elim latch) values: the only shape whose folded
+        // consumer can sit inside a liveness HOLE before the final segment,
+        // where a tail-only stretch is a silent no-op. For single-def values
+        // the historical LAST-segment stretch is kept: merging the consumer
+        // spans into the union moves the coverage boundary anchors
+        // (first/last live unit) that the segment scan's die-at-birth
+        // permission is computed against, and for values whose hole is not
+        // real liveness (no redefinition between producer and access) the
+        // moved anchors let a boundary touch through at a NON-boundary
+        // position — under-constraining exactly where the merge meant to
+        // over-constrain (preboot-ZSTD: every pattern failed with
+        // "ZSTD-compressed data is corrupt" until the merge was gated back
+        // to multi-def latches).
+        let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(d) = inst.dest() {
+                    *def_count.entry(d.0).or_insert(0) += 1;
+                }
+            }
+        }
+        let multi_def: FxHashSet<u32> = def_count
+            .iter()
+            .filter(|(_, &c)| c > 1)
+            .map(|(&v, _)| v)
+            .collect();
         for (idx, dests) in &config.folded_index_uses {
             let mut new_end: Option<u32> = None;
             // Real-liveness ranges the operand must survive: one per
@@ -1900,9 +2023,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 // zext landed in i's register between the GEP and the store.
                 // The operand IS read at the producer position (its segment
                 // covers [.., producer]) and re-read at the access, so
-                // [producer, access] is real liveness: merge it into the
-                // segment union (conservative — merged coverage can only
-                // over-constrain, never under-constrain).
+                // [producer, access] is real liveness for multi-def latches:
+                // merge it into the segment union. Single-def values keep
+                // the historical tail stretch (see the multi_def note above
+                // for why the unconditional merge is NOT sound).
                 let mut pieces: Vec<(u32, u32)> = Vec::new();
                 let mut has_segments = false;
                 liveness.segments.retain(|seg| {
@@ -1914,13 +2038,21 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     false
                 });
                 if has_segments {
-                    if !required.is_empty() {
+                    if multi_def.contains(idx) && !required.is_empty() {
                         required.sort_unstable();
                         pieces.sort_unstable();
                         let mut merged: Vec<(u32, u32)> = Vec::new();
                         insert_segment_union(&mut merged, &pieces);
                         insert_segment_union(&mut merged, &required);
                         pieces = merged;
+                    } else {
+                        // Historical tail stretch (single-def shapes).
+                        if let Some(last) = pieces.last_mut() {
+                            if last.1 < e {
+                                last.1 = e;
+                            }
+                        }
+                        pieces.sort_unstable();
                     }
                     for &(s, e2) in &pieces {
                         liveness.segments.push(crate::backend::liveness::LiveInterval {
@@ -3749,7 +3881,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         caller_save_spans
                             .entry(reg.0)
                             .or_default()
-                            .push((start, end));
+                            .push((start, end.saturating_add(1)));
                     }
                 }
                 propagate_coalesce_members(&mut assignments, &coalesce_member_of);
@@ -3759,6 +3891,87 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
     used_regs.sort_by_key(|r| r.0);
+
+    // ── Post-RA overlap repair (soundness backstop) ────────────────────────
+    // The allocator is a federation: linear-scan phases, wave seeds, phi
+    // propagation, hot-web/segment fills and steal passes all write
+    // `assignments` with their own (sound-in-isolation) occupancy models.
+    // The seams leak: a home that is legal for its writer can overlap a
+    // home another authority already placed (xxh64_update's pre-homed web
+    // held %r10 across [0,223] while later wave/phase values landed on the
+    // same register at [6,7) — every preboot-ZSTD pattern failed with
+    // "ZSTD-compressed data is corrupt"). CCC_VERIFY_REGALLOC proves the
+    // seam after the fact and aborts; this pass REPAIRS the output: of any
+    // two coalesce/phi classes whose register's class-union coverage
+    // overlaps, the colder class loses its register homes (demoted to
+    // stack slots — always sound). One fixpoint-free pass: evictions only
+    // remove homes, never add, so no new overlap can appear.
+    {
+        let mut parent: FxHashMap<u32, u32> = assignments.keys().map(|&v| (v, v)).collect();
+        for (&member, &leader) in &coalesce_member_of {
+            unite_map(&mut parent, member, leader);
+        }
+        for pair in &all_phi_pairs {
+            unite_map(&mut parent, pair.phi_dest, pair.backedge_src);
+        }
+        let rep = find_overlapping_classes(&liveness, &assignments, &parent);
+        if env_on("CCC_DEBUG_RA_REPAIR") {
+            eprintln!(
+                "[RA-REPAIR] fn={} scanned assignments={} classes={} overlaps={}",
+                func.name,
+                assignments.len(),
+                parent.len(),
+                rep.len()
+            );
+            for (reg, a, b, s, e) in &rep {
+                eprintln!(
+                    "[RA-REPAIR] fn={} r{}: class v{} overlaps class v{} at [{},{}] — evicting colder",
+                    func.name, reg, a, b, s, e
+                );
+            }
+        }
+        if !rep.is_empty() {
+            // Evict the colder class of each conflicting pair (fewer total
+            // uses; ties break to the LATER value id so the eviction is
+            // deterministic).
+            let class_weight = |rep_id: u32| -> u64 {
+                let mut w = 0u64;
+                for (&v, &r) in parent.iter() {
+                    if r == rep_id {
+                        w += use_count.get(&v).copied().unwrap_or(0);
+                    }
+                }
+                w
+            };
+            let mut evict_classes: FxHashSet<u32> = FxHashSet::default();
+            for &(_reg, a, b, _s, _e) in &rep {
+                if evict_classes.contains(&a) || evict_classes.contains(&b) {
+                    continue;
+                }
+                let (wa, wb) = (class_weight(a), class_weight(b));
+                let loser = if wa != wb {
+                    if wa < wb { a } else { b }
+                } else if a < b {
+                    b
+                } else {
+                    a
+                };
+                evict_classes.insert(loser);
+            }
+            let mut evicted: Vec<u32> = Vec::new();
+            for (&v, &r) in parent.iter() {
+                if evict_classes.contains(&r) && assignments.remove(&v).is_some() {
+                    evicted.push(v);
+                }
+            }
+            if env_on("CCC_DEBUG_RA_REPAIR") {
+                eprintln!(
+                    "[RA-REPAIR] fn={} evicted {:?} (classes {:?})",
+                    func.name, evicted, evict_classes
+                );
+            }
+        }
+    }
 
     if env_on("CCC_VERIFY_REGALLOC") {
         verify_no_overlap(&liveness, &assignments, &coalesce_member_of, &all_phi_pairs);

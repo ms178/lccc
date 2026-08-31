@@ -1032,7 +1032,6 @@ impl Lowerer {
             match &cur[0].init {
                 Initializer::Expr(expr) => return Some(expr),
                 Initializer::List(inner) => cur = inner.as_slice(),
-                _ => return None,
             }
         }
     }
