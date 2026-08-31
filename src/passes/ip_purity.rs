@@ -72,7 +72,13 @@ pub fn run(module: &mut IrModule) -> usize {
         let mut progress = false;
 
         for func in &module.functions {
-            if func.is_declaration || func.blocks.is_empty() {
+            // __weak definitions are not necessarily the linked definition
+            // (a strong override replaces the symbol at link time), so their
+            // bodies cannot license purity/constness for call sites: a
+            // weak-empty void callee marked "pure" gets its calls dropped by
+            // DCE even though the linked strong override has side effects
+            // (kernel 6.18 vmemmap_set_pmd — vmemmap never mapped).
+            if func.is_declaration || func.blocks.is_empty() || func.is_weak {
                 continue;
             }
 
