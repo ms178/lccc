@@ -53,9 +53,12 @@ pub(crate) mod redundant_loads;
 mod resolve_asm;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
+pub(crate) mod sccp;
 pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
+pub(crate) mod use_def;
+pub(crate) mod verify;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 
@@ -548,6 +551,7 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
             if dump_pre {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
+            verify::verify_after_pass(module, $name);
         };
     }
     // Canonicalize before cost analysis so inlining decisions use optimized
@@ -657,6 +661,17 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
     iphase_dump!("cleanup-loop-memory-promote");
     // Resolve constant branches exposed by inlining before the bounded
     // constant-call evaluator in ipcp examines the surviving call sites.
+    //
+    // SCCP leads here because this is where it pays the most: inlining has
+    // just substituted literal arguments into a callee body, so whole
+    // parameter-dependent branches are now decidable. `cfg_simplify` can only
+    // fold a branch whose condition is *already* a constant operand; SCCP
+    // proves the condition constant in the first place, including through the
+    // phis that inlining leaves at the callee's return join.
+    if !pass_disabled(disabled, "sccp") {
+        module.for_each_function(sccp::run_function);
+    }
+    iphase_dump!("cleanup-sccp");
     if !std::env::var("CCC_NO_CLEANUP_CFGSIMP").is_ok() {
         for _ in 0..3 {
             let n = module.for_each_function(cfg_simplify::run_function);
@@ -911,6 +926,9 @@ pub(crate) fn run_passes(
             if dump_each_pass {
                 dump_ir_filtered(module, &format!("pre-loop {}", $name));
             }
+            // Structural verification runs independently of dumping; see
+            // `passes::verify` (CCC_VERIFY_IR=1 / =abort).
+            verify::verify_after_pass(module, $name);
         };
     }
     let allow_inline = opt_level != 4 && opt_level != 5;
@@ -1062,12 +1080,14 @@ pub(crate) fn run_passes(
                     if dump_each_pass {
                         dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
                     }
+                    verify::verify_after_pass(module, $name);
                     n
                 } else {
                     let n = $body;
                     if dump_each_pass {
                         dump_ir_filtered(module, &format!("after iter={} {}", iter, $name));
                     }
+                    verify::verify_after_pass(module, $name);
                     n
                 }
             }};
@@ -1326,7 +1346,34 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
-        // Phase 4: Constant folding
+        // Phase 4: Sparse conditional constant propagation, then constant folding
+        //
+        // SCCP runs first because it is the strictly stronger analysis: it
+        // discovers constants that only hold on the *reachable* paths, which
+        // `constant_fold` (a local, unconditional folder) cannot see. Feeding
+        // it first means the folder and the passes after it work on IR where
+        // dead arms are already gone and joins have collapsed.
+        //
+        // It emits `Copy { dest, Const }` at each proven definition, which is
+        // exactly the form `constant_fold` and `copy_prop` already consume, so
+        // the two compose without any new plumbing.
+        //
+        // Gated at -O2+ (including -Os/-Oz, where it is a size win: folded
+        // branches delete whole blocks). Kill switch: CCC_DISABLE_PASSES=sccp.
+        //
+        // Upstream: same producers as constfold — inlining and copy_prop turn
+        //           arguments into constants, if_convert creates Selects, and
+        //           cfg_simplify exposes newly single-predecessor joins.
+        if opt_level >= 2 && !pass_disabled(&disabled, "sccp") && should_run!(4, 0, 1, 2, 3, 7, 8) {
+            let n = timed_pass!(
+                "sccp",
+                run_on_visited(module, &dirty, &mut changed, sccp::run_function)
+            );
+            cur_pass_changes[4] = n;
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Upstream: copy_prop (propagated constants), narrow, simplify (reduced exprs),
         //           if_convert (creates Select that constfold can fold with known-constant cond),
         //           copy_prop2 (propagates constants into Select/Cmp operands after if_convert)
@@ -1335,7 +1382,7 @@ pub(crate) fn run_passes(
                 "constfold",
                 run_on_visited(module, &dirty, &mut changed, constant_fold::fold_function)
             );
-            cur_pass_changes[4] = n;
+            cur_pass_changes[4] += n;
             total_changes += n;
             total_changes_excl_dce += n;
         }
