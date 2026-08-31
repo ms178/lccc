@@ -132,6 +132,10 @@ pub struct Driver {
     /// configured mcount_submode. The kernel's CFLAGS_REMOVE mechanism strips
     /// -pg (e.g. for VDSO objects) leaving the sub-modes inert, matching GCC.
     pub(super) mcount_pg: bool,
+    /// S13: set by -finstrument-functions. Runs the IR-level
+    /// instrumentation pass (__cyg_profile_func_enter/exit calls) over every
+    /// defined function that does not carry no_instrument_function.
+    pub(super) instrument_functions: bool,
     /// Whether to emit endbr64 at function entry points (-fcf-protection=branch).
     /// Required by the Linux kernel for Intel CET/IBT (Indirect Branch Tracking).
     pub(super) cf_protection_branch: bool,
@@ -421,6 +425,7 @@ impl Driver {
             patchable_function_entry: None,
             mcount_submode: crate::backend::McountInstrumentation::default(),
             mcount_pg: false,
+            instrument_functions: false,
             cf_protection_branch: false,
             cf_protection_value: None,
             no_sse: false,
@@ -1566,6 +1571,13 @@ impl Driver {
         }
 
         let t6 = std::time::Instant::now();
+        // S13: -finstrument-functions. Runs BEFORE the optimizer so
+        // the hook calls exist at every optimization level and are
+        // register-allocated like any other call (GCC instruments at the
+        // same semantic point: after prologue, before every return).
+        if self.instrument_functions {
+            crate::passes::instrument::run(&mut module);
+        }
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(
             &mut module,

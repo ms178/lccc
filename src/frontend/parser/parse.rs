@@ -465,6 +465,12 @@ pub struct Parser {
     /// Current default visibility from #pragma GCC visibility push(...).
     /// None means default visibility (no pragma active).
     pub(super) pragma_default_visibility: Option<String>,
+    /// S13: file-scope function names whose DECLARATION carried
+    /// `no_instrument_function`. GCC merges declaration attributes into the
+    /// definition (C redeclaration rules); the torture suite writes
+    /// `int main () NOCHK;` with a bare definition, and without the merge
+    /// the definition instruments anyway.
+    pub(super) func_decl_no_instrument: FxHashSet<String>,
     /// Count of parse errors encountered (invalid tokens at top level, etc.)
     pub error_count: usize,
     /// Structured diagnostic engine for error/warning reporting with source snippets.
@@ -498,6 +504,7 @@ impl Parser {
             pragma_pack_align: None,
             pragma_visibility_stack: Vec::with_capacity(4),
             pragma_default_visibility: None,
+            func_decl_no_instrument: FxHashSet::default(),
             error_count: 0,
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),

@@ -4711,6 +4711,55 @@ fn rematerialize_skipped_indexed(cg: &mut dyn ArchCodegen, ptr: &Value, info: &I
     }
 }
 
+/// S11: rematerialising a skipped GEP rebuilds the address through
+/// %rax, destroying the accumulator. A store whose value came from a
+/// dead-producer-skipped indexed load holds that value ONLY in %rax at this
+/// point — no register home, no stack slot, and its producing Load is gone
+/// from the instruction stream — so the remat makes the store's operand
+/// permanently unmaterializable and `operand_to_rax`'s hard gate ICEs
+/// (20020402-1 @O1: `listSmall[posGreatest] = listElem[i]` with the index
+/// fold refused). Push/pop the accumulator around the remat and re-register
+/// the residency afterwards so the pending store can still read its value.
+/// push/pop are flag-neutral, so a fused-Cmp handshake cannot be disturbed,
+/// and the stack stays balanced regardless of what the remat emits.
+fn remat_indexed_acc_safe(cg: &mut dyn ArchCodegen, val: &Operand, remat: impl FnOnce(&mut dyn ArchCodegen)) {
+    let protected = match val {
+        Operand::Value(v) => {
+            let st = cg.state_ref();
+            !cg.is_value_reg_assigned(v.0)
+                && st.get_slot(v.0).is_none()
+                && (st.reg_cache.acc_has(v.0, st.is_alloca(v.0))
+                    || st.is_accumulator_location(v.0))
+        }
+        Operand::Const(_) => false,
+    };
+    // The acc register name and push/pop width are per-pointer-size: the
+    // protection helper is shared by the x86-64 and i686 codegen drivers
+    // (generation.rs is arch-agnostic), and `pushq %rax` is not encodable
+    // in 32-bit mode. The push shifts %rsp for the duration of the remat,
+    // so on RSP-relative frames the slot-reference bookkeeping must shift
+    // with it (slot_ref emits `(rsp_frame_size + off)(%rsp)`); on RBP
+    // frames the field is unused and the bump is a no-op.
+    let (slot, push_acc, pop_acc) = if crate::common::types::target_ptr_size() == 8 {
+        (8i64, "    pushq %rax", "    popq %rax")
+    } else {
+        (4i64, "    pushl %eax", "    popl %eax")
+    };
+    if protected {
+        cg.state().emit(push_acc);
+        cg.state().out.rsp_frame_size += slot;
+    }
+    remat(cg);
+    if protected {
+        cg.state().out.rsp_frame_size -= slot;
+        if let Operand::Value(v) = val {
+            cg.state().emit(pop_acc);
+            let is_alloca = cg.state_ref().is_alloca(v.0);
+            cg.state().reg_cache.set_acc(v.0, is_alloca);
+        }
+    }
+}
+
 pub(super) fn generate_instruction(
     cg: &mut dyn ArchCodegen,
     inst: &Instruction,
@@ -5421,9 +5470,9 @@ fn generate_store(
             }
         }
         if let Some(info) = gep_fold_map.get(&ptr.0) {
-            rematerialize_const_addr(cg, ptr, info);
+            remat_indexed_acc_safe(cg, val, |cg| rematerialize_const_addr(cg, ptr, info));
         } else if let Some(info) = indexed_gep_map.get(&ptr.0) {
-            rematerialize_skipped_indexed(cg, ptr, info);
+            remat_indexed_acc_safe(cg, val, |cg| rematerialize_skipped_indexed(cg, ptr, info));
         }
         cg.emit_seg_store(val, ptr, ty, seg_override);
         return;
@@ -5441,7 +5490,7 @@ fn generate_store(
             cg.emit_store_with_const_offset(val, &gep_info.base, gep_info.offset, ty);
             return;
         }
-        rematerialize_const_addr(cg, ptr, gep_info);
+        remat_indexed_acc_safe(cg, val, |cg| rematerialize_const_addr(cg, ptr, gep_info));
     }
     if let Some(info) = indexed_gep_map.get(&ptr.0) {
         if !is_wide_int_type(ty) && can_indexed_addr_fold(cg, info, global_addr_map) {
@@ -5457,7 +5506,7 @@ fn generate_store(
                 }
             }
         }
-        rematerialize_skipped_indexed(cg, ptr, info);
+        remat_indexed_acc_safe(cg, val, |cg| rematerialize_skipped_indexed(cg, ptr, info));
     }
     cg.emit_store(val, ptr, ty);
 }

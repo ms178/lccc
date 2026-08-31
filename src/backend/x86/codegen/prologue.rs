@@ -671,6 +671,35 @@ impl X86Codegen {
                                 if let Some(&t) = value_types.get(&v.0) {
                                     value_types.insert(dest.0, t);
                                 }
+                            } else if let Operand::Const(c) = src {
+                                // S11: a Copy from a constant is the
+                                // def site of an otherwise untyped SSA name.
+                                // Without this seed, `posGreatest = -1;` and
+                                // every downstream Copy of it has no
+                                // `value_types` entry, so consumers that must
+                                // know the value's width (the S11 SIB-index
+                                // soundness gate in memory.rs, type-aware slot
+                                // loads) refuse or guess. The constant's own
+                                // variant IS the semantic type; `Zero` is
+                                // context-typed and stays unknown on purpose.
+                                let t = match c {
+                                    crate::ir::reexports::IrConst::I8(_) => Some(IrType::I8),
+                                    crate::ir::reexports::IrConst::I16(_) => Some(IrType::I16),
+                                    crate::ir::reexports::IrConst::I32(_) => Some(IrType::I32),
+                                    crate::ir::reexports::IrConst::I64(_) => Some(IrType::I64),
+                                    crate::ir::reexports::IrConst::I128(_) => {
+                                        Some(IrType::I128)
+                                    }
+                                    crate::ir::reexports::IrConst::F32(_) => Some(IrType::F32),
+                                    crate::ir::reexports::IrConst::F64(_) => Some(IrType::F64),
+                                    crate::ir::reexports::IrConst::LongDouble(_, _) => {
+                                        Some(IrType::F128)
+                                    }
+                                    crate::ir::reexports::IrConst::Zero => None,
+                                };
+                                if let Some(t) = t {
+                                    value_types.insert(dest.0, t);
+                                }
                             }
                         }
                         Instruction::Phi { dest, incoming, .. } => {

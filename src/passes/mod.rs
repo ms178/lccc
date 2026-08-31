@@ -31,6 +31,7 @@ pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
 pub(crate) mod inline;
+pub(crate) mod instrument;
 pub(crate) mod int_const_hoist;
 pub(crate) mod ip_purity;
 pub(crate) mod ipcp;
