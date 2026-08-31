@@ -396,15 +396,29 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
     let mut next_val = func.next_value_id;
     let mut new_loop_phis: FxHashMap<u32, u32> = FxHashMap::default(); // header_phi_dest → new_loop_phi_dest
     let mut new_phi_insts: Vec<Instruction> = Vec::with_capacity(phi_info.len());
-    for &(phi_dest, phi_ty, (pre_label, pre_op), latch_op) in &phi_info {
+    for &(phi_dest, phi_ty, (_pre_label, pre_op), latch_op) in &phi_info {
         let new_dest = Value(next_val);
         next_val += 1;
         new_loop_phis.insert(phi_dest, new_dest.0);
         new_phi_insts.push(Instruction::Phi {
             dest: new_dest,
             ty: phi_ty,
+            // The init edge is labelled with the GUARD (`header_label`), not
+            // with the original preheader (`_pre_label`). Steps 6/6.5 rewire
+            // every original header predecessor onto the guard, so after
+            // rotation the body's only entry edge is guard → body; the
+            // preheader is no longer a predecessor of this block. Naming it
+            // here produces malformed IR: phi elimination resolves the stale
+            // label to the preheader's block index and places the init copy
+            // on an edge that is not the live one, so the first iteration
+            // reads an undefined register (SIGSEGV when the phi is an array
+            // index — see tests/regression/loop_rotate_stale_phi_pred.c).
+            // `pre_op` itself is unchanged and still dominates: it is defined
+            // in the preheader, which dominates the guard and hence the body.
+            // This matches the exit-phi construction below, which already
+            // labels the guard-exit incoming with `header_label`.
             incoming: vec![
-                (pre_op, pre_label),
+                (pre_op, header_label),
                 (latch_op, latch_label),
             ],
         });

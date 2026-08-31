@@ -146,13 +146,52 @@ CCC_DISABLE_PASSES="gvn,licm" ./target/fastbuild/lccc input.c -o output
 CCC_DISABLE_PASSES="all"      ./target/fastbuild/lccc input.c -o output
 ```
 
-Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`.
+Pass names: `cfg`, `copyprop`, `narrow`, `simplify`, `constfold`, `gvn`, `licm`, `ifconv`, `dce`, `ipcp`, `inline`, `ivsr`, `divconst`, `sccp`.
 
 Timing data is available via:
 
 ```bash
 CCC_TIME_PASSES=1 ./target/fastbuild/lccc input.c -o output 2>&1 | grep PASS
 ```
+
+## Verifying IR Between Passes
+
+`CCC_VERIFY_IR` runs a structural check on the IR after **every** pass, so the
+stage it names is the pass that *produced* the malformed IR rather than a later
+pass that tripped over it:
+
+```bash
+CCC_VERIFY_IR=1     ./target/fastbuild/lccc input.c -o output   # report to stderr
+CCC_VERIFY_IR=abort ./target/fastbuild/lccc input.c -o output   # panic on the first violation
+```
+
+It checks that block labels are unique, that every branch and `asm goto` target
+names a real block, that phis form a contiguous prefix of their block, and that a
+phi's incoming labels are exactly its CFG predecessors — no stale entries, no
+duplicates, none missing.
+
+That last check matters more than it sounds. Phi elimination resolves an operand's
+label to a block *index* and emits the copy there, so a phi naming a block that is
+no longer a predecessor still "works" whenever that block happens to dominate. A
+`loop_rotate` defect hid behind exactly that accident until SCCP — which trusts the
+predecessor list and prunes operands on edges it proves dead — deleted an induction
+variable's initialisation. See
+`engineering/FOLLOWUP-2026-08-31-sccp-loop-rotate-ir-verifier.md`.
+
+Verification is off by default and costs one atomic load per pass when disabled.
+
+## Debugging SCCP
+
+SCCP performs four independent rewrites. Each can be suppressed on its own, which
+makes bisecting a miscompile a single rebuild rather than a bisect over the pass:
+
+| Variable | Suppresses |
+|---|---|
+| `CCC_SCCP_NO_PRUNE` | pruning phi operands on provably-dead edges |
+| `CCC_SCCP_NO_DEFS` | rewriting definitions to `Copy { dest, Const }` |
+| `CCC_SCCP_NO_SUBST` | substituting constants into operands |
+| `CCC_SCCP_NO_FOLD` | folding `CondBranch`/`Switch` into `Branch` |
+| `CCC_SCCP_TRACE_PRUNE` | prints every pruned phi operand and its edge verdict |
 
 ## LCCC-Specific Passes
 

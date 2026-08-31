@@ -384,51 +384,15 @@ fn try_fold_with_map(
             rhs,
             ty,
         } => {
-            // For 128-bit types, use native i128 arithmetic to avoid truncation
-            if ty.is_128bit() {
-                let lc = resolve_const(lhs, const_map)?;
-                let rc = resolve_const(rhs, const_map)?;
-                let l = lc.to_i128()?;
-                let r = rc.to_i128()?;
-                let result = op.eval_i128(l, r)?;
-                return Some(Instruction::Copy {
-                    dest: *dest,
-                    src: Operand::Const(IrConst::I128(result)),
-                });
-            }
-            // Try float folding first
-            if ty.is_float() {
-                // For F128 (long double), use full x87 precision arithmetic
-                if *ty == IrType::F128 {
-                    let lc = resolve_const(lhs, const_map)?;
-                    let rc = resolve_const(rhs, const_map)?;
-                    let result = fold_f128_binop(*op, &lc, &rc)?;
-                    return Some(Instruction::Copy {
-                        dest: *dest,
-                        src: Operand::Const(result),
-                    });
-                }
-                let l = as_f64_const_mapped(lhs, const_map)?;
-                let r = as_f64_const_mapped(rhs, const_map)?;
-                let result = fold_float_binop(*op, l, r)?;
-                return Some(Instruction::Copy {
-                    dest: *dest,
-                    src: Operand::Const(make_float_const(result, *ty)),
-                });
-            }
-            let lhs_const = as_i64_const_mapped(lhs, const_map)?;
-            let rhs_const = as_i64_const_mapped(rhs, const_map)?;
-            // Truncate operands to the BinOp's type width before folding.
-            // This is needed because constants may be stored in wider IrConst
-            // variants (e.g., a U32 value stored as IrConst::I32) and to_i64()
-            // sign-extends them. Operations like LShr and UDiv are sensitive
-            // to upper bits, so we must normalize first.
-            let lhs_trunc = ty.truncate_i64(lhs_const);
-            let rhs_trunc = ty.truncate_i64(rhs_const);
-            let result = fold_binop(*op, lhs_trunc, rhs_trunc, *ty)?;
+            // Single oracle: `eval_binop_const` owns the semantics (see the
+            // "Shared constant-evaluation oracle" section below). SCCP calls
+            // the same function, so the two passes cannot disagree.
+            let lc = resolve_const(lhs, const_map)?;
+            let rc = resolve_const(rhs, const_map)?;
+            let result = eval_binop_const(*op, lc, rc, *ty)?;
             Some(Instruction::Copy {
                 dest: *dest,
-                src: Operand::Const(IrConst::from_i64(result, *ty)),
+                src: Operand::Const(result),
             })
         }
         Instruction::UnaryOp { dest, op, src, ty } => {
@@ -448,50 +412,11 @@ fn try_fold_with_map(
                 // Not yet known to be constant - don't fold yet
                 return None;
             }
-            // For 128-bit types, fold Neg and Not using native i128
-            if ty.is_128bit() {
-                let sc = resolve_const(src, const_map)?;
-                let s = sc.to_i128()?;
-                let result = match op {
-                    // _Float128 constants are I128 bit patterns (binary128);
-                    // negation flips the SIGN BIT (bit 127), not the integer
-                    // value (-1.5 -> 0xbfff8000..., NOT 0xc0008000...).
-                    IrUnaryOp::Neg if *ty == IrType::F128 => ((s as u128) ^ (1u128 << 127)) as i128,
-                    IrUnaryOp::Neg => s.wrapping_neg(),
-                    IrUnaryOp::Not => !s,
-                    _ => return None,
-                };
-                return Some(Instruction::Copy {
-                    dest: *dest,
-                    src: Operand::Const(IrConst::I128(result)),
-                });
-            }
-            // Try float unary folding
-            if ty.is_float() {
-                // For F128 (long double), preserve full x87 precision on negation
-                if *ty == IrType::F128 && *op == IrUnaryOp::Neg {
-                    let sc = resolve_const(src, const_map)?;
-                    let result = fold_f128_neg(&sc);
-                    return Some(Instruction::Copy {
-                        dest: *dest,
-                        src: Operand::Const(result),
-                    });
-                }
-                let s = as_f64_const_mapped(src, const_map)?;
-                let result = fold_float_unaryop(*op, s)?;
-                return Some(Instruction::Copy {
-                    dest: *dest,
-                    src: Operand::Const(make_float_const(result, *ty)),
-                });
-            }
-            // Promote sub-int constants (I8/I16) for C11 integer promotion.
-            // Zero-extend unsigned sub-int (U8/U16 cast targets) and sign-extend
-            // signed sub-int (I8/I16 cast targets) to match the C promotion rules.
-            let src_const = as_i64_promoted_mapped(src, const_map)?;
-            let result = fold_unaryop(*op, src_const, *ty)?;
+            let sc = resolve_const(src, const_map)?;
+            let result = eval_unaryop_const(*op, sc, operand_cast_to_ty(src, const_map), *ty)?;
             Some(Instruction::Copy {
                 dest: *dest,
-                src: Operand::Const(IrConst::from_i64(result, *ty)),
+                src: Operand::Const(result),
             })
         }
         Instruction::Cmp {
@@ -505,32 +430,20 @@ fn try_fold_with_map(
             if ty.is_128bit() {
                 let lc = resolve_const(lhs, const_map)?;
                 let rc = resolve_const(rhs, const_map)?;
-                let l = lc.to_i128()?;
-                let r = rc.to_i128()?;
-                let result = op.eval_i128(l, r);
+                let result = eval_cmp_const(*op, lc, rc, *ty)?;
                 return Some(Instruction::Copy {
                     dest: *dest,
-                    src: Operand::Const(IrConst::I32(result as i32)),
+                    src: Operand::Const(result),
                 });
             }
             // Try float comparison folding
             if ty.is_float() {
-                // For F128 (long double), use full x87 precision comparison
-                if *ty == IrType::F128 {
-                    let lc = resolve_const(lhs, const_map)?;
-                    let rc = resolve_const(rhs, const_map)?;
-                    let result = fold_f128_cmp(*op, &lc, &rc);
-                    return Some(Instruction::Copy {
-                        dest: *dest,
-                        src: Operand::Const(IrConst::I32(result as i32)),
-                    });
-                }
-                let l = as_f64_const_mapped(lhs, const_map)?;
-                let r = as_f64_const_mapped(rhs, const_map)?;
-                let result = op.eval_f64(l, r);
+                let lc = resolve_const(lhs, const_map)?;
+                let rc = resolve_const(rhs, const_map)?;
+                let result = eval_cmp_const(*op, lc, rc, *ty)?;
                 return Some(Instruction::Copy {
                     dest: *dest,
-                    src: Operand::Const(IrConst::I32(result as i32)),
+                    src: Operand::Const(result),
                 });
             }
             // Self-comparison of identical integer values: x == x => 1 and
@@ -580,24 +493,11 @@ fn try_fold_with_map(
             from_ty,
             to_ty,
         } => {
-            // For casts involving 128-bit types, use native i128 arithmetic
-            if from_ty.is_128bit() || to_ty.is_128bit() {
-                let sc = resolve_const(src, const_map)?;
-                let result = fold_cast_i128(&sc, *from_ty, *to_ty)?;
-                return Some(Instruction::Copy {
-                    dest: *dest,
-                    src: Operand::Const(result),
-                });
-            }
-            // Handle float-to-int and int-to-float casts
-            if from_ty.is_float() || to_ty.is_float() {
-                return try_fold_float_cast_mapped(*dest, src, *from_ty, *to_ty, const_map);
-            }
-            let src_const = as_i64_const_mapped(src, const_map)?;
-            let result = fold_cast(src_const, *from_ty, *to_ty);
+            let sc = resolve_const(src, const_map)?;
+            let result = eval_cast_const(sc, *from_ty, *to_ty)?;
             Some(Instruction::Copy {
                 dest: *dest,
-                src: Operand::Const(IrConst::from_i64(result, *to_ty)),
+                src: Operand::Const(result),
             })
         }
         Instruction::Select {
@@ -655,6 +555,237 @@ fn try_fold_with_map(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared constant-evaluation oracle
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This pass and SCCP (`crate::passes::sccp`) must agree *bit for bit* on what
+// a constant expression evaluates to.  Two independent folders are a latent
+// miscompile factory: whichever pass runs last wins, and they diverge exactly
+// on the cases that matter most — x87 long double, C11 sub-int promotion,
+// 128-bit widening, saturating float→int.
+//
+// This is not hypothetical.  The upstream fork this SCCP was adapted from
+// duplicated the folding logic and *did* diverge: it routed every
+// `ty.is_float()` operation (which includes `F128`) through `f64`, so
+// `long double` arithmetic was folded with a 53-bit mantissa while both the
+// runtime and this pass use the target's real 64-bit x87 / 113-bit binary128
+// arithmetic.  See `engineering/SCCP_ADOPTION_AUDIT.md`, finding F4.
+//
+// Therefore there is exactly ONE implementation, expressed over already
+// resolved `IrConst` operands, and every caller goes through it.
+// `try_fold_with_map` resolves operands via its `const_map`; SCCP resolves
+// them from its lattice.  Neither owns a private copy of the semantics.
+
+/// Evaluate a binary operation on two constant operands.
+///
+/// `ty` is the `BinOp`'s IR type and selects the arithmetic domain. Returns
+/// `None` when the operation must not be folded (division by zero, a bitwise
+/// operator applied to floats, a non-numeric constant, ...).
+pub(crate) fn eval_binop_const(
+    op: IrBinOp,
+    lhs: IrConst,
+    rhs: IrConst,
+    ty: IrType,
+) -> Option<IrConst> {
+    if ty.is_128bit() {
+        let l = lhs.to_i128()?;
+        let r = rhs.to_i128()?;
+        return Some(IrConst::I128(op.eval_i128(l, r)?));
+    }
+    if ty.is_float() {
+        // Long double keeps the target's real precision (x87 80-bit on x86,
+        // IEEE binary128 elsewhere). Never route it through f64.
+        if ty == IrType::F128 {
+            return fold_f128_binop(op, &lhs, &rhs);
+        }
+        let l = const_as_f64(lhs)?;
+        let r = const_as_f64(rhs)?;
+        // f64 is wide enough (53 bits >= 2*24+2) that a single f32 add/sub/
+        // mul/div computed in f64 and rounded once to f32 is correctly
+        // rounded, so this is not a double-rounding hazard.
+        return Some(make_float_const(fold_float_binop(op, l, r)?, ty));
+    }
+    // Truncate operands to the BinOp's type width before folding: constants
+    // may be stored in wider IrConst variants (a U32 value held as
+    // IrConst::I32) and `to_i64()` sign-extends them, which LShr/UDiv/URem
+    // are sensitive to.
+    let l = ty.truncate_i64(lhs.to_i64()?);
+    let r = ty.truncate_i64(rhs.to_i64()?);
+    Some(IrConst::from_i64(fold_binop(op, l, r, ty)?, ty))
+}
+
+/// Evaluate a unary operation on a constant operand.
+///
+/// `src_cast_to_ty` is the `to_ty` of the `Cast` instruction that defines the
+/// source value, if any. It disambiguates the C11 integer promotion of
+/// sub-int constants: a value produced by a cast to `I8`/`I16` sign-extends,
+/// everything else (unsigned sub-int, bare literals) zero-extends. Pass
+/// `None` when the source is not defined by a `Cast`.
+///
+/// `IrUnaryOp::IsConstant` is deliberately NOT handled here: its result
+/// depends on compilation *phase*, not on operand values, so each caller
+/// applies its own policy.
+pub(crate) fn eval_unaryop_const(
+    op: IrUnaryOp,
+    src: IrConst,
+    src_cast_to_ty: Option<IrType>,
+    ty: IrType,
+) -> Option<IrConst> {
+    debug_assert!(
+        op != IrUnaryOp::IsConstant,
+        "IsConstant is phase-dependent and must be resolved by the caller"
+    );
+    if ty.is_128bit() {
+        let s = src.to_i128()?;
+        let result = match op {
+            // _Float128 constants are I128 bit patterns (binary128); negation
+            // flips the SIGN BIT (bit 127), not the integer value.
+            IrUnaryOp::Neg if ty == IrType::F128 => ((s as u128) ^ (1u128 << 127)) as i128,
+            IrUnaryOp::Neg => s.wrapping_neg(),
+            IrUnaryOp::Not => !s,
+            _ => return None,
+        };
+        return Some(IrConst::I128(result));
+    }
+    if ty.is_float() {
+        if ty == IrType::F128 && op == IrUnaryOp::Neg {
+            return Some(fold_f128_neg(&src));
+        }
+        let s = const_as_f64(src)?;
+        return Some(make_float_const(fold_float_unaryop(op, s)?, ty));
+    }
+    let promoted = promote_sub_int_const(src, src_cast_to_ty)?;
+    Some(IrConst::from_i64(fold_unaryop(op, promoted, ty)?, ty))
+}
+
+/// Evaluate a comparison on two constant operands. The result is the IR's
+/// canonical boolean encoding, `IrConst::I32(0 | 1)`.
+pub(crate) fn eval_cmp_const(
+    op: IrCmpOp,
+    lhs: IrConst,
+    rhs: IrConst,
+    ty: IrType,
+) -> Option<IrConst> {
+    if ty.is_128bit() {
+        let l = lhs.to_i128()?;
+        let r = rhs.to_i128()?;
+        return Some(IrConst::I32(op.eval_i128(l, r) as i32));
+    }
+    if ty.is_float() {
+        if ty == IrType::F128 {
+            return Some(IrConst::I32(fold_f128_cmp(op, &lhs, &rhs) as i32));
+        }
+        let l = const_as_f64(lhs)?;
+        let r = const_as_f64(rhs)?;
+        // `eval_f64` implements C's unordered semantics: every predicate but
+        // `!=` is false when either operand is NaN.
+        return Some(IrConst::I32(op.eval_f64(l, r) as i32));
+    }
+    let l = ty.truncate_i64(lhs.to_i64()?);
+    let r = ty.truncate_i64(rhs.to_i64()?);
+    Some(IrConst::I32(op.eval_i64(l, r) as i32))
+}
+
+/// Evaluate a cast of a constant operand from `from_ty` to `to_ty`.
+pub(crate) fn eval_cast_const(
+    src: IrConst,
+    from_ty: IrType,
+    to_ty: IrType,
+) -> Option<IrConst> {
+    if from_ty.is_128bit() || to_ty.is_128bit() {
+        return fold_cast_i128(&src, from_ty, to_ty);
+    }
+    if from_ty.is_float() || to_ty.is_float() {
+        return eval_float_cast_const(src, from_ty, to_ty);
+    }
+    Some(IrConst::from_i64(
+        fold_cast(src.to_i64()?, from_ty, to_ty),
+        to_ty,
+    ))
+}
+
+/// Cast evaluation for the cases where at least one side is floating point.
+fn eval_float_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
+    match (from_ty.is_float(), to_ty.is_float()) {
+        // float → float
+        (true, true) => Some(make_float_const(const_as_f64(src)?, to_ty)),
+        // float → int
+        (true, false) => {
+            // Long double keeps full x87 precision; going through f64 first
+            // would lose mantissa bits before the truncation.
+            if let IrConst::LongDouble(fv, bytes) = src {
+                return IrConst::cast_long_double_to_target(fv, &bytes, to_ty);
+            }
+            // GCC -fno-trapping-math saturates finite out-of-range values to
+            // the destination min/max. NaN/Inf stay unfolded (IEEE invalid).
+            IrConst::saturate_float_to_int(const_as_f64(src)?, to_ty)
+        }
+        // int → float
+        (false, true) => {
+            // Normalize to the source type width first (sign- or zero-extend).
+            let raw = src.to_i64()?;
+            let val = match from_ty {
+                IrType::I8 => raw as i8 as i64,
+                IrType::U8 => raw as u8 as i64,
+                IrType::I16 => raw as i16 as i64,
+                IrType::U16 => raw as u16 as i64,
+                IrType::I32 => raw as i32 as i64,
+                IrType::U32 => raw as u32 as i64,
+                _ => raw,
+            };
+            Some(if to_ty == IrType::F128 {
+                // x87 has a 64-bit mantissa; converting via f64 would drop
+                // the low 11 bits of a 64-bit integer.
+                if from_ty.is_unsigned() {
+                    IrConst::long_double_from_u64(val as u64)
+                } else {
+                    IrConst::long_double_from_i64(val)
+                }
+            } else if from_ty.is_unsigned() {
+                make_float_const(val as u64 as f64, to_ty)
+            } else {
+                make_float_const(val as f64, to_ty)
+            })
+        }
+        (false, false) => None,
+    }
+}
+
+/// Extract an `f64` from a floating-point constant. Integer constants return
+/// `None`: an integer operand in a float-typed operation is malformed IR and
+/// must not be silently reinterpreted.
+pub(crate) fn const_as_f64(c: IrConst) -> Option<f64> {
+    match c {
+        IrConst::F32(v) => Some(v as f64),
+        IrConst::F64(v) => Some(v),
+        IrConst::LongDouble(v, _) => Some(v),
+        _ => None,
+    }
+}
+
+/// Apply C11 integer promotion to a sub-int constant.
+///
+/// `cast_to_ty` is the target type of the `Cast` that defined the value:
+/// constants from a cast to `I8`/`I16` are sign-extended, everything else
+/// (unsigned sub-int, bare literals) is zero-extended, because the lowerer
+/// promotes signed sub-int to `I32` and any remaining `I8`/`I16` is unsigned.
+fn promote_sub_int_const(c: IrConst, cast_to_ty: Option<IrType>) -> Option<i64> {
+    match c {
+        IrConst::I8(v) => Some(if cast_to_ty == Some(IrType::I8) {
+            v as i64
+        } else {
+            v as u8 as i64
+        }),
+        IrConst::I16(v) => Some(if cast_to_ty == Some(IrType::I16) {
+            v as i64
+        } else {
+            v as u16 as i64
+        }),
+        _ => c.to_i64(),
+    }
+}
+
 /// Check if two operands are structurally equal.
 fn operands_equal(a: &Operand, b: &Operand) -> bool {
     match (a, b) {
@@ -685,61 +816,14 @@ fn as_i64_const_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Opt
     resolve_const(op, const_map)?.to_i64()
 }
 
-/// Extract a constant integer with proper extension for sub-int types (I8/I16),
-/// resolving through the const map.
-///
-/// For sub-int constants, we need to determine whether to zero-extend (unsigned)
-/// or sign-extend (signed) based on the Cast target type that produced the value:
-/// - Constants from Cast to U8/U16 are zero-extended (e.g., (unsigned short)(-1) = 65535)
-/// - Constants from Cast to I8/I16 are sign-extended (e.g., (signed char)(-1) = -1)
-/// - Literal I8/I16 constants (not from a Cast) are zero-extended per the original
-///   invariant: the lowerer promotes signed sub-int to I32, so remaining I8/I16 are unsigned
-fn as_i64_promoted_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<i64> {
-    let c = resolve_const(op, const_map)?;
-    match &c {
-        IrConst::I8(v) => {
-            // Check if the value came from a Cast to a signed type
-            if let Operand::Value(val) = op {
-                let id = val.0 as usize;
-                if id < const_map.len() {
-                    if let Some(entry) = &const_map[id] {
-                        if entry.cast_to_ty == Some(IrType::I8) {
-                            // Signed char: sign-extend
-                            return Some(*v as i64);
-                        }
-                    }
-                }
-            }
-            // Default: zero-extend (unsigned char or literal)
-            Some(*v as u8 as i64)
-        }
-        IrConst::I16(v) => {
-            // Check if the value came from a Cast to a signed type
-            if let Operand::Value(val) = op {
-                let id = val.0 as usize;
-                if id < const_map.len() {
-                    if let Some(entry) = &const_map[id] {
-                        if entry.cast_to_ty == Some(IrType::I16) {
-                            // Signed short: sign-extend
-                            return Some(*v as i64);
-                        }
-                    }
-                }
-            }
-            // Default: zero-extend (unsigned short or literal)
-            Some(*v as u16 as i64)
-        }
-        _ => c.to_i64(),
-    }
-}
-
-/// Extract a constant floating-point value, resolving through const map.
-fn as_f64_const_mapped(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<f64> {
-    match resolve_const(op, const_map)? {
-        IrConst::F32(v) => Some(v as f64),
-        IrConst::F64(v) => Some(v),
-        IrConst::LongDouble(v, _) => Some(v),
-        _ => None,
+/// The `to_ty` of the `Cast` instruction that defines this operand's value, if
+/// any. Feeds the C11 sub-int promotion rule in [`eval_unaryop_const`]:
+/// constants produced by a cast to `I8`/`I16` sign-extend, everything else
+/// zero-extends.
+fn operand_cast_to_ty(op: &Operand, const_map: &[Option<ConstMapEntry>]) -> Option<IrType> {
+    match op {
+        Operand::Value(v) => const_map.get(v.0 as usize)?.as_ref()?.cast_to_ty,
+        Operand::Const(_) => None,
     }
 }
 
@@ -860,74 +944,6 @@ fn fold_f128_cmp(op: IrCmpOp, lhs: &IrConst, rhs: &IrConst) -> bool {
         IrCmpOp::Sgt | IrCmpOp::Ugt => cmp == 1,
         IrCmpOp::Sge | IrCmpOp::Uge => cmp == 1 || cmp == 0,
     }
-}
-
-/// Try to fold a cast involving float types.
-// TODO: simplify.rs also has float cast folding via IrConst::cast_float_to_target
-// which doesn't check for NaN/Inf. These should be unified eventually.
-fn try_fold_float_cast_mapped(
-    dest: Value,
-    src: &Operand,
-    from_ty: IrType,
-    to_ty: IrType,
-    const_map: &[Option<ConstMapEntry>],
-) -> Option<Instruction> {
-    let src_const = resolve_const(src, const_map)?;
-    let result = match (from_ty.is_float(), to_ty.is_float()) {
-        (true, true) => {
-            // float-to-float conversion
-            let val = as_f64_const_mapped(src, const_map)?;
-            make_float_const(val, to_ty)
-        }
-        (true, false) => {
-            // float-to-int conversion
-            // For LongDouble, use full x87 precision to avoid mantissa loss
-            if let Some(IrConst::LongDouble(fv, bytes)) = resolve_const(src, const_map) {
-                return IrConst::cast_long_double_to_target(fv, &bytes, to_ty).map(|c| {
-                    Instruction::Copy {
-                        dest,
-                        src: Operand::Const(c),
-                    }
-                });
-            }
-            let val = as_f64_const_mapped(src, const_map)?;
-            // GCC -fno-trapping-math saturates finite out-of-range values to
-            // the destination min/max. NaN/Inf stay unfolded (IEEE invalid).
-            IrConst::saturate_float_to_int(val, to_ty)?
-        }
-        (false, true) => {
-            // int-to-float conversion
-            // Normalize to source type width first (sign-extend or zero-extend)
-            let raw_val = src_const.to_i64()?;
-            let val = match from_ty {
-                IrType::I8 => raw_val as i8 as i64,
-                IrType::U8 => raw_val as u8 as i64,
-                IrType::I16 => raw_val as i16 as i64,
-                IrType::U16 => raw_val as u16 as i64,
-                IrType::I32 => raw_val as i32 as i64,
-                IrType::U32 => raw_val as u32 as i64,
-                _ => raw_val,
-            };
-            if to_ty == IrType::F128 {
-                // For long double, use direct integer-to-x87 conversion to preserve
-                // full 64-bit precision (x87 has 64-bit mantissa, unlike f64's 52-bit).
-                if from_ty.is_unsigned() {
-                    IrConst::long_double_from_u64(val as u64)
-                } else {
-                    IrConst::long_double_from_i64(val)
-                }
-            } else if from_ty.is_unsigned() {
-                make_float_const(val as u64 as f64, to_ty)
-            } else {
-                make_float_const(val as f64, to_ty)
-            }
-        }
-        _ => return None,
-    };
-    Some(Instruction::Copy {
-        dest,
-        src: Operand::Const(result),
-    })
 }
 
 /// Fold a cast involving 128-bit types.
