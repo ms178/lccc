@@ -7,7 +7,7 @@
 //! block, with the copy preceding the reads.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
+use crate::ir::reexports::{BlockId, Instruction, IrFunction, Operand, Value};
 
 fn type_size(ty: crate::common::types::IrType) -> i64 {
     use crate::common::types::IrType::*;
@@ -930,6 +930,42 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
 
     // Reject escaping, written, cross-block, or pre-copy uses of each temporary.
+    //
+    // MIXED-POINT PHI HOLES: a candidate dest is only forwardable when every
+    // read of its memory is attributable to a tracked path. A phi that merges
+    // the dest (or a path-derived pointer) with an UNATTRIBUTABLE incoming
+    // (a loaded pointer, a marching `sm = phi(&dest, load sm->next)`) makes
+    // every memory op through the phi result invisible to `paths`; the
+    // memcpy deletion below would then strand the dest uninitialized while
+    // the walk still reads it (kernel 6.18 static_call __static_call_update:
+    // `first = (struct static_call_mod){...}; for (sm = &first; sm; sm = sm->next)
+    // ...` — boot died at __static_call_update+0xff reading site=1 from an
+    // uninitialized stack). Such phis fail closed here, exactly like the
+    // store-side escape rule in eliminate_dead_aggregate_field_stores.
+    fn phi_pure_root(
+        incoming: &[(Operand, BlockId)],
+        paths: &FxHashMap<u32, (u32, Vec<(Operand, crate::common::types::IrType)>)>,
+    ) -> Option<u32> {
+        let mut saw_value = false;
+        let mut root: Option<u32> = None;
+        for (op, _) in incoming {
+            if let Operand::Value(v) = op {
+                saw_value = true;
+                let Some(&(r, _)) = paths.get(&v.0) else {
+                    return None;
+                };
+                match root {
+                    Some(prev) if prev != r => return None,
+                    _ => root = Some(r),
+                }
+            }
+        }
+        if saw_value {
+            root
+        } else {
+            None
+        }
+    }
     let mut invalid = FxHashSet::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
@@ -950,9 +986,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         src: Operand::Value(v),
                         ..
                     } => v.0 == value,
-                    Instruction::Phi { incoming, .. } => incoming
-                        .iter()
-                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)),
+                    Instruction::Phi { incoming, .. } => {
+                        // Only a PURE same-root phi keeps the derivation
+                        // attributable. A phi mixing this root with a loaded
+                        // or foreign pointer turns every later memory access
+                        // through it into an unattributable read of the
+                        // candidate dest: reject.
+                        phi_pure_root(incoming, &paths) == Some(*root)
+                    }
                     _ => false,
                 };
                 let is_defining_copy = matches!(inst, Instruction::Memcpy { dest, .. } if dest.0 == *root)
@@ -960,7 +1001,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     && ii == candidate.inst;
                 let is_path_definition = matches!(inst, Instruction::GetElementPtr { base, .. } if base.0 == value)
                     || matches!(inst, Instruction::Copy { src: Operand::Value(v), .. } if v.0 == value)
-                    || matches!(inst, Instruction::Phi { incoming, .. } if incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == value)));
+                    || matches!(inst, Instruction::Phi { incoming, .. } if phi_pure_root(incoming, &paths) == Some(*root));
                 let ordered_read = if bi == candidate.block {
                     ii > candidate.inst
                 } else {

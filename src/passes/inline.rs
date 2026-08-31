@@ -1815,6 +1815,18 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
         if func.is_noinline {
             continue;
         }
+        // __weak definitions are NOT necessarily the linked definition: a
+        // strong override in another TU replaces the symbol at link time,
+        // and the linker resolves every UN-inlined call to the strong body.
+        // Cloning the weak body into a call site bypasses that resolution
+        // (kernel 6.18 sparse-vmemmap.c: the __weak empty vmemmap_set_pmd
+        // was inlined away while arch/x86/mm/init_64.c's strong override
+        // installs the PMD — vmemmap never got mapped and
+        // __init_single_page page-faulted on pfn 1). Weak callees are
+        // therefore never inlinable, no matter how tiny their body.
+        if func.is_weak {
+            continue;
+        }
 
         // Determine if this is an always_inline function
         let is_always_inline = func.is_always_inline;
