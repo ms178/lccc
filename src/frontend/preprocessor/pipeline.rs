@@ -220,6 +220,14 @@ impl Preprocessor {
         // closing `*/` or after a continuation splice).
         let (joined, join_map) = self.join_continued_lines(source);
         let (source, comment_map) = Self::strip_block_comments(&joined);
+        // Share the join map across every output line. `Rc::from(&[T])` copies
+        // the slice; doing that *per line* is Θ(N²) on amalgamations that have
+        // both a line-continuation and a multi-line block comment (sqlite3.c
+        // ~270k lines previously hung in `build_line_resolver` for minutes).
+        let join_map_rc: Rc<[LineSegments]> = match join_map.as_deref() {
+            Some(m) if !m.is_empty() => Rc::from(m),
+            _ => Rc::from([]),
+        };
         let mut output = String::with_capacity(source.len() + source.len() / 4);
         // Absolute offset of the current line's first byte within the
         // comment-stripped text: the base that translates the macro
@@ -292,7 +300,7 @@ impl Preprocessor {
                 stripped_line_start,
                 &joined_starts,
                 &comment_map,
-                &join_map,
+                &join_map_rc,
             );
             let source_line_num = line_resolver.line_at(stripped_line_start);
             last_source_line_num = source_line_num;
@@ -590,29 +598,21 @@ impl Preprocessor {
         stripped_line_start: usize,
         joined_starts: &[usize],
         comment_map: &Option<Vec<CommentSegments>>,
-        join_map: &Option<Vec<LineSegments>>,
+        join_map: &Rc<[LineSegments]>,
     ) -> LineResolver {
-        let jm = join_map.as_deref();
-        // The joined line this output line starts at, and its absolute
-        // joined-text offset.
-        let (jl0, j_start): (usize, usize) =
-            match comment_map.as_deref().and_then(|c| c.get(line_num)) {
-                Some(CommentSegments::Mapped(pts)) => match pts.first() {
-                    Some(&(_, jo, jl)) => (jl, jo),
-                    None => (
-                        line_num,
-                        joined_starts.get(line_num).copied().unwrap_or(0),
-                    ),
-                },
-                Some(CommentSegments::Flat(jl)) => (
-                    *jl,
-                    joined_starts.get(*jl).copied().unwrap_or(0),
-                ),
-                None => (
-                    line_num,
-                    joined_starts.get(line_num).copied().unwrap_or(0),
-                ),
-            };
+        let jm: &[LineSegments] = join_map.as_ref();
+        // Absolute joined-text offset of the joined line this output line
+        // starts at. (The joined-line index itself is recovered from the
+        // comment map / join map in the match below; only the offset is
+        // needed for the splice-breakpoint delta.)
+        let j_start: usize = match comment_map.as_deref().and_then(|c| c.get(line_num)) {
+            Some(CommentSegments::Mapped(pts)) => match pts.first() {
+                Some(&(_, jo, _)) => jo,
+                None => joined_starts.get(line_num).copied().unwrap_or(0),
+            },
+            Some(CommentSegments::Flat(jl)) => joined_starts.get(*jl).copied().unwrap_or(0),
+            None => joined_starts.get(line_num).copied().unwrap_or(0),
+        };
         // Stripped start - joined start: comment stripping only removes
         // bytes, so the stripped text never runs AHEAD of the joined text
         // and the splice breakpoints shift LEFT by |delta|.
@@ -621,6 +621,9 @@ impl Preprocessor {
         // joined_line). Between breakpoints on this line the stripped and
         // joined offsets advance in lockstep, so line_at()'s
         // joined = jo + (abs - so) lands inside the same splice segment.
+        //
+        // The join map is a *shared* Rc cloned in O(1). Never `Rc::from`
+        // the whole slice here: that copy is Θ(file lines) per output line.
         let splice_points = |pts: &[(usize, usize)], jl: usize| -> LineResolver {
             LineResolver::Mapped(Rc::new(LineResolverData {
                 points: pts
@@ -631,14 +634,14 @@ impl Preprocessor {
                     })
                     .collect::<Vec<_>>()
                     .into(),
-                join_map: jm.map(Rc::from).unwrap_or_else(|| Rc::from([])),
+                join_map: Rc::clone(join_map),
             }))
         };
         match comment_map.as_deref() {
             // No multi-line comments anywhere: the join map is the only
             // possible source of line shifts (single-line comment removal
             // shifts offsets, which the delta absorbs).
-            None => match jm.and_then(|j| j.get(line_num)) {
+            None => match jm.get(line_num) {
                 Some(LineSegments::Mapped(pts)) => splice_points(pts, line_num),
                 // Flat(phys): a standalone joined line. When earlier lines
                 // were spliced, phys is the PHYSICAL line and generally
@@ -647,19 +650,18 @@ impl Preprocessor {
                 None => LineResolver::Flat(line_num),
             },
             Some(c) => {
-                let jm_rc: Rc<[LineSegments]> = jm.map(Rc::from).unwrap_or_else(|| Rc::from([]));
                 match c.get(line_num) {
                     // Comment breakpoints on this line: they already carry
                     // (stripped, joined) absolute pairs.
                     Some(CommentSegments::Mapped(pts)) => {
                         LineResolver::Mapped(Rc::new(LineResolverData {
                             points: pts.clone(),
-                            join_map: jm_rc,
+                            join_map: Rc::clone(join_map),
                         }))
                     }
                     // No comment breakpoints on this line; the joined line it
                     // came from decides via the join map's splice breakpoints.
-                    Some(CommentSegments::Flat(jl)) => match jm.and_then(|j| j.get(*jl)) {
+                    Some(CommentSegments::Flat(jl)) => match jm.get(*jl) {
                         Some(LineSegments::Mapped(pts)) => splice_points(pts, *jl),
                         Some(LineSegments::Flat(phys)) => LineResolver::Flat(*phys),
                         None => LineResolver::Flat(*jl),
@@ -1221,5 +1223,74 @@ impl Preprocessor {
 impl Default for Preprocessor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod line_resolver_share_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// One splice so `join_map` is `Some`; one multi-line comment so
+    /// `comment_map` is `Some`; then `n` ordinary lines. The old per-line
+    /// `Rc::from(join_map)` is Θ(n²) and hung sqlite3.c (~270k lines) in
+    /// `build_line_resolver` for minutes. After the shared-Rc fix this is
+    /// linear and must finish well under a second on the research VM.
+    fn spliced_commented_source(n: usize) -> String {
+        let mut src = String::with_capacity(n * 12 + 64);
+        src.push_str("int a = 1 + \\\n 2;\n");
+        src.push_str("/* multi\n   line comment */\n");
+        for i in 0..n {
+            src.push_str("int x");
+            src.push_str(&i.to_string());
+            src.push_str(";\n");
+        }
+        src.push_str("int line = __LINE__;\n");
+        src
+    }
+
+    #[test]
+    fn build_line_resolver_is_linear_on_large_spliced_commented_file() {
+        let n = 12_000usize;
+        let src = spliced_commented_source(n);
+        let mut pp = Preprocessor::new();
+        pp.set_filename("quadratic.c");
+        let t0 = Instant::now();
+        let out = pp.preprocess(&src);
+        let dt = t0.elapsed();
+        assert!(
+            dt.as_millis() < 4_000,
+            "preprocess of {n} spliced+commented lines took {dt:?} \
+             (quadratic join-map clone in build_line_resolver?)"
+        );
+        assert!(out.contains("int x0;"), "lost first generated decl");
+        assert!(
+            out.contains(&format!("int x{};", n - 1)),
+            "lost last generated decl"
+        );
+        assert!(
+            pp.errors().is_empty(),
+            "unexpected preprocess errors: {:?}",
+            pp.errors()
+        );
+    }
+
+    #[test]
+    fn spliced_commented_line_macro_matches_physical_line() {
+        // Physical lines:
+        //  1: int a = 1 + \
+        //  2:  2;
+        //  3: /* multi
+        //  4:    line comment */
+        //  5: int line = __LINE__;
+        // `__LINE__` on line 5 must expand to 5, not a joined/stripped index.
+        let src = "int a = 1 + \\\n 2;\n/* multi\n   line comment */\nint line = __LINE__;\n";
+        let mut pp = Preprocessor::new();
+        pp.set_filename("line.c");
+        let out = pp.preprocess(src);
+        assert!(
+            out.contains("int line = 5;"),
+            "__LINE__ after splice+comment must be physical 5, got:\n{out}"
+        );
     }
 }
