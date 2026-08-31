@@ -23,9 +23,9 @@ warnings).
 
 ## Bug-fix status (as of the adopting session)
 
-Running the corpus against LCCC exposed genuine miscompiles. **20 of 28 cases
-now pass** (full lccc regression suite stays green: 537 pass, no A/B diffs).
-Fixed so far:
+Running the corpus against LCCC exposed genuine miscompiles. **All 28 of 28
+cases now pass** (full lccc regression suite stays green: 545 pass, no A/B
+diffs). Fixed over the v1/v2 adoption sessions:
 
 | # | Test | Root cause fixed |
 |---|------|------------------|
@@ -38,20 +38,15 @@ Fixed so far:
 | 7 | `regress_local_struct_array_singleton_inner_dim_init` | singleton inner-dim local init — fixed in `stmt_init.rs` (`is_subarray = !remaining.is_empty()`). |
 | 8 | `regress_local_struct_array_double_singleton_inner_dim_init` | double-singleton local init + redundant list wrappers — fixed in `stmt_init.rs` (new `normalize_leaf_struct_element_items`). |
 | 9 | `regress_local_union_array_singleton_inner_dim_init` | local union-array singleton init — fixed in `stmt_init.rs`. |
+| 10 | `regress_unnamed_nonaggregate_struct_member` | unnamed non-aggregate struct member must be skipped (C11 6.7.2.1p13) — fixed across the 5 struct-field layout builders (`types_ctype.rs`, `types.rs`, `type_checker.rs`, `analysis.rs`, `const_eval.rs`). |
+| 11 | `regress_struct_array_double_singleton_inner_dim_ptr_global_init` | compound-ptrs global init recursion guard changed to `!remaining_strides.is_empty()` so singleton inner dims `[][1][1]` still peel a brace level — fixed in `global_init_compound_ptrs.rs`. |
+| 12 | `regress_global_union_array_scalar_braces_ptr_field_init` | braces-around-scalar dropped on the compound-ptrs path — fixed in `global_init_compound_ptrs.rs` (`fill_scalar_array_with_ptrs` unwraps braced scalar via `unwrap_braced_scalar_expr`). |
+| 13 | `regress_cond_cast_ternary_truncation` | global const-branch fold ignored cast truncation — fixed in `cfg_simplify.rs` (`resolve_value_globally` applies `to_ty.truncate_i64(from_ty.truncate_i64(v))` for `Cast`). |
+| 14 | `regress_stmt_expr_gnu_conditional_shadowing` | GNU stmt-expr/`typeof` shadowing scope resolution — fixed in `expr_types.rs` (`get_stmt_expr_ctype` resolves the tail expr against the compound-local scope first; added `GnuConditional` arm to `get_expr_ctype_with_scope`). |
+| 15 | `regress_stmt_expr_typeof_label_tail` | `__typeof__` label-tail scoping — fixed in `expr_types.rs` (`stmt_expr_result_expr`/`unwrap_stmt_to_expr` unwrap label wrappers). |
+| 16 | `regress_stmt_expr_typeof_shadowing` | `__typeof__` shadowing — fixed in `expr_types.rs` (compound-local scope preferred over outer bindings). |
+| 17 | `regress_small_struct_packed_assign_clobber` | packed small-struct assign clobbered adjacent bytes — fixed in `structs.rs` + `expr_assign.rs` (`store_packed_data_exact`/`spill_packed_data_to_alloca`/`packed_spill_alloc_size`/`load_packed_struct_i64`). |
 
-### Still failing (open bugs — see follow-up doc)
-
-| Test | Symptom (lccc vs gcc) | Likely area |
-|------|----------------------|-------------|
-| `regress_cond_cast_ternary_truncation` | prints seed=0, gcc silent | nested-`if` branch (value 0 but branches true) |
-| `regress_global_union_array_scalar_braces_ptr_field_init` | 0 vs 6 | union-array global init; braces-around-scalar dropped (Regehr fixed in `global_init_compound_ptrs.rs`) |
-| `regress_small_struct_packed_assign_clobber` | 0 vs 4 | packed small-struct assign (Regehr fixed in `structs.rs`) |
-| `regress_stmt_expr_gnu_conditional_shadowing` | 2065871646256031088 vs 446981488 | GNU stmt-expr shadowing |
-| `regress_stmt_expr_typeof_label_tail` | 1 vs 0 | `__typeof__` label-tail scoping |
-| `regress_stmt_expr_typeof_shadowing` | 0 vs 1 | `__typeof__` shadowing |
-| `regress_struct_array_double_singleton_inner_dim_ptr_global_init` | 0 vs 4 | struct-array global init (ptr field, compound-ptrs path) |
-| `regress_unnamed_nonaggregate_struct_member` | 0 vs 3 | unnamed non-aggregate struct member |
-
-These are the next correctness targets. Regehr's branch contains the reference
+All 28 corpus cases now pass. The reference
 fixes for most of them; adapt them to LCCC's diverged lowering rather than
 copying blindly (see the project rules: understand → implement → measure).

@@ -304,7 +304,7 @@ impl Lowerer {
             }
             let struct_fields: Vec<StructField> = fs
                 .iter()
-                .map(|f| {
+                .filter_map(|f| {
                     let bit_width = f
                         .bit_width
                         .as_ref()
@@ -319,13 +319,25 @@ impl Lowerer {
                     {
                         ty = CType::UInt;
                     }
-                    StructField {
+                    // C11 6.7.2.1p13: an unnamed member must be a struct/union type.
+                    // An unnamed non-aggregate (no name, no bit-width) is a constraint
+                    // violation that GCC ignores entirely (warning: "declaration does
+                    // not declare anything"); it must not occupy layout space or
+                    // consume initializer values (Regehr yarpgen
+                    // regress_unnamed_nonaggregate_struct_member).
+                    if f.name.is_none()
+                        && bit_width.is_none()
+                        && !matches!(ty, CType::Struct(_) | CType::Union(_))
+                    {
+                        return None;
+                    }
+                    Some(StructField {
                         name: f.name.clone().unwrap_or_default(),
                         ty,
                         bit_width,
                         alignment: f.alignment,
                         is_packed: f.is_packed,
-                    }
+                    })
                 })
                 .collect();
             let mut layout = if is_union {

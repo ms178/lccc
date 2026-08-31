@@ -103,7 +103,10 @@ impl Lowerer {
 
                 match &item.init {
                     Initializer::List(sub_items) => {
-                        if this_stride > struct_size && !remaining_strides.is_empty() {
+                        // Recurse whenever there are still array dimensions left,
+                        // even when this_stride == struct_size (singleton inner
+                        // dims like [][1][1] still need one brace level peeled).
+                        if !remaining_strides.is_empty() {
                             // Sub-array dimension: recurse
                             self.fill_multidim_struct_array_with_ptrs(
                                 sub_items,
@@ -989,8 +992,48 @@ impl Lowerer {
                 } else if let Some(val) = self.eval_const_expr(expr) {
                     self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
                 }
+            } else if let Initializer::List(ref sub_items) = item.init {
+                // Braces around a scalar (e.g. `union U g[] = {{{{6}}}}` reducing to
+                // a scalar element initializer `{6}`) are valid and must initialize
+                // this element, not be silently dropped. Unwrap the brace layers and
+                // write the scalar (Regehr yarpgen
+                // regress_global_union_array_scalar_braces_ptr_field_init).
+                if let Some(expr) = Self::unwrap_braced_scalar_expr(sub_items) {
+                    if has_ptrs {
+                        self.write_expr_to_bytes_or_ptrs(
+                            expr,
+                            elem_ty,
+                            elem_offset,
+                            None,
+                            None,
+                            bytes,
+                            ptr_ranges,
+                        );
+                    } else if let Some(val) = self.eval_const_expr(expr) {
+                        self.write_const_to_bytes(bytes, elem_offset, &val, elem_ir_ty);
+                    }
+                }
             }
             current_idx += 1;
+        }
+    }
+
+    /// Unwrap redundant brace layers around a single scalar expression initializer
+    /// (e.g. `{{6}}` → `6`). Returns None when the list is empty, has designators,
+    /// or its sole item is not a single expression.
+    fn unwrap_braced_scalar_expr(
+        items: &[InitializerItem],
+    ) -> Option<&crate::frontend::parser::ast::Expr> {
+        let mut cur = items;
+        loop {
+            if cur.len() != 1 || !cur[0].designators.is_empty() {
+                return None;
+            }
+            match &cur[0].init {
+                Initializer::Expr(expr) => return Some(expr),
+                Initializer::List(inner) => cur = inner.as_slice(),
+                _ => return None,
+            }
         }
     }
 

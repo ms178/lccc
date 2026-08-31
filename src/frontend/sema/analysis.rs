@@ -2257,7 +2257,7 @@ impl SemanticAnalyzer {
     ) -> Vec<crate::common::types::StructField> {
         fields
             .iter()
-            .map(|f| {
+            .filter_map(|f| {
                 let ty = if f.derived.is_empty() {
                     self.type_spec_to_ctype(&f.type_spec)
                 } else {
@@ -2281,13 +2281,21 @@ impl SemanticAnalyzer {
                     }
                     align
                 };
-                crate::common::types::StructField {
+                // C11 6.7.2.1p13: unnamed non-aggregate members are constraint
+                // violations GCC ignores entirely; drop from layout + init.
+                if f.name.is_none()
+                    && bit_width.is_none()
+                    && !matches!(ty, crate::common::types::CType::Struct(_) | crate::common::types::CType::Union(_))
+                {
+                    return None;
+                }
+                Some(crate::common::types::StructField {
                     name,
                     ty,
                     bit_width,
                     alignment: field_alignment,
                     is_packed: f.is_packed,
-                }
+                })
             })
             .collect()
     }

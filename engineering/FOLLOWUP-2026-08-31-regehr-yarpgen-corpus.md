@@ -58,8 +58,10 @@ their diffs.
 ## Adopted + fixed (8 real miscompiles in LCCC)
 
 The 28 ported reproducers **exposed 17 genuine LCCC bugs** (the corpus is the
-finding). 8 are now fixed; full lccc regression suite stays green
-(**537 pass, 0 A/B diffs** — no regressions from any fix).
+finding). **All 17 are now fixed (all 28 corpus cases pass)**; full lccc
+regression suite stays green (**545 pass, 0 A/B diffs** — no regressions from
+any fix). The remaining 8 open bugs from the previous session were closed in the
+v2 session:
 
 | Test (regress_) | Root cause | Fix location |
 |---|---|---|
@@ -71,41 +73,49 @@ finding). 8 are now fixed; full lccc regression suite stays green
 | `struct_array_singleton_inner_dim_global_init` | `[][1]` inner-dim brace peeling | `global_init_bytes.rs` (recurse while strides remain) |
 | `local_*_singleton_inner_dim_init` (3 tests) | singleton inner-dim local init / redundant list wrappers | `stmt_init.rs` (`is_subarray = !remaining.is_empty()` + new `normalize_leaf_struct_element_items`) |
 
-## Open bugs (8 remaining) — root-cause analysis for the next agent
+## v2 session — the 8 previously-open bugs, all now fixed
 
-Each is reduced, deterministic, and oracle-verified. **Priority order:**
+Each was reduced, deterministic, and oracle-verified. The fix and location for
+each:
 
-1. **`cond_cast_ternary_truncation`** — `(char)(g ? 512 : 512)` in a nested
-   `if`. The value prints `0` (correct) but the inner branch goes *true*.
-   **Nested-`if` control-flow / block-layout bug**, not const-eval: two
-   dependent `if`s; the inner CondBranch tests a stale/incorrect condition.
-   Investigate `cfg_simplify.rs`/`block_layout.rs` and the CondBranch lowering
-   for a nested if whose outer condition is a constant.
-2. **`unnamed_nonaggregate_struct_member`** — `struct { int; char f4; }`
+1. **`unnamed_nonaggregate_struct_member`** — `struct { int; char f4; }`
    (unnamed scalar member, a GCC-accepted constraint violation). GCC ignores the
-   unnamed `int` (no layout space, no initializer slot); LCCC treats it as a real
-   member (4 bytes, consumes the first `{3}`), so `f4` stays 0. Fix in the struct
-   field lowering: skip unnamed non-struct/union members for layout *and* init.
+   unnamed `int` (no layout space, no initializer slot). **Fixed** by skipping
+   unnamed non-struct/union members for layout across all 5 struct-field builders
+   (C11 6.7.2.1p13): `types_ctype.rs`, `types.rs`, `type_checker.rs`,
+   `analysis.rs`, `const_eval.rs` (`.filter_map` dropping unnamed non-aggregate).
+2. **`struct_array_double_singleton_inner_dim_ptr_global_init`** — compound-ptrs
+   singleton inner dims `[][1][1]` must still peel a brace level. **Fixed** in
+   `global_init_compound_ptrs.rs` by changing the leaf-recursion guard to
+   `!remaining_strides.is_empty()`.
 3. **`global_union_array_scalar_braces_ptr_field_init`** — `union U g[] = {{{{6}}}}`
-   (braces around a scalar). LCCC silently drops `{{6}}`. Regehr fixed in
-   `global_init_compound_ptrs.rs`: handle `Initializer::List` around a scalar via
-   `unwrap_nested_init_expr`. Port to LCCC's compound-ptrs path (line ~941/1022).
-4. **`struct_array_double_singleton_inner_dim_ptr_global_init`** — same
-   compound-ptrs/singleton path but with pointer fields; likely shares #3's
-   `!remaining_strides.is_empty()` recursion fix (Regehr fixed in
-   `global_init_compound_ptrs.rs`).
-5. **`small_struct_packed_assign_clobber`** — packed small-struct (`<4/8` odd
-   sizes) assignment clobbers adjacent bytes. Regehr's `structs.rs` rewrite adds
-   `packed_spill_alloc_size`/`store_packed_data_exact`/`load_packed_struct_i64`
-   (spill via temp+memcpy for odd sizes). **Deep backend change — port carefully
-   with the regression tests + A/B harness.**
-6. **`stmt_expr_typeof_shadowing` / `stmt_expr_typeof_label_tail` /
-   `stmt_expr_gnu_conditional_shadowing`** — GNU statement-expression +
-   `__typeof__` scoping. LCCC's GNU-extension support is partial; Regehr fixed in
-   `expr_types.rs` (682 lines) and `expr_ops.rs`. These exercise name/type
-   shadowing across `({...})` and label-tail `__typeof__`. Verify LCCC even
-   supports the dialect before deep fixing; if it's a hard scope-resolution gap,
-   that's a frontend `typeof`/stmt-expr project.
+   (braces around a scalar) was silently dropped on the compound-ptrs path.
+   **Fixed** in `global_init_compound_ptrs.rs`: `fill_scalar_array_with_ptrs`
+   unwraps a braced scalar via `unwrap_braced_scalar_expr`.
+4. **`cond_cast_ternary_truncation`** — the nested `if` folded to *true* even
+   though `(char)(g ? 512 : 512)` is 0. **Fixed** in `cfg_simplify.rs`:
+   `resolve_value_globally()` ignored cast truncation, returning the raw source
+   constant for a `Cast` (so `(char)512` resolved to 512). Now applies
+   `to_ty.truncate_i64(from_ty.truncate_i64(v))`.
+5. **`stmt_expr_typeof_shadowing` / `stmt_expr_typeof_label_tail` /
+   `stmt_expr_gnu_conditional_shadowing`** — GNU stmt-expr/`__typeof__` scoping:
+   `get_stmt_expr_ctype()` resolved the tail expression against the sema scope
+   first, so a local declaration inside `({...})` was shadowed by an outer
+   same-named binding (`long x = ({ unsigned x = -8; x ?: x; }) * 480998226;`
+   computed the multiply in 64-bit instead of wrapping at 32-bit). **Fixed** in
+   `expr_types.rs`: build the compound-local scope up front and resolve against
+   it first (`stmt_expr_result_expr`/`unwrap_stmt_to_expr` unwrap label tails),
+   plus a `GnuConditional` arm and an `int`-for-comparison fix in
+   `get_expr_ctype_with_scope`.
+6. **`small_struct_packed_assign_clobber`** — packed small-struct (`<4/8` odd
+   sizes) assignment clobbered adjacent bytes (a 5-byte packed struct stored as
+   I64 overwrote the following `marker`). **Fixed** by porting Regehr's
+   `structs.rs` helpers (`packed_spill_alloc_size`, `spill_packed_data_to_alloca`,
+   `store_packed_data_exact`, `load_packed_struct_i64`) and routing the
+   packed-struct assignment through `store_packed_data_exact`.
+
+**Result:** all 28 Regehr corpus cases pass; full suite 545 pass / 0 fail /
+0 A/B diffs.
 
 ## To-do (future sessions)
 
