@@ -721,19 +721,24 @@ fn narrow_binops_without_cast(
                     operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
                 let rhs_narrow_ty =
                     operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
+                // Keep the narrowed operand's signedness aligned with the
+                // original 64-bit BinOp type. Picking the "other" 32-bit
+                // signedness can change the value when widened back to 64 bits
+                // (sign-extend vs zero-extend) even when low bits match
+                // (Regehr yarpgen fix 4d9913e7).
+                let op_narrow_ty = if *ty == IrType::I64 { IrType::I32 } else { IrType::U32 };
 
                 let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
-                    (Some(lt), Some(rt)) if lt == rt => lt,
-                    (Some(lt), Some(rt)) if lt.size() == rt.size() => lt,
+                    (Some(lt), Some(rt)) if lt == rt && lt == op_narrow_ty => lt,
                     (Some(t), None) => {
-                        if try_narrow_const_operand(rhs, t).is_some() {
+                        if t == op_narrow_ty && try_narrow_const_operand(rhs, t).is_some() {
                             t
                         } else {
                             continue;
                         }
                     }
                     (None, Some(t)) => {
-                        if try_narrow_const_operand(lhs, t).is_some() {
+                        if t == op_narrow_ty && try_narrow_const_operand(lhs, t).is_some() {
                             t
                         } else {
                             continue;

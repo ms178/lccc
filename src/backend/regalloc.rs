@@ -1549,6 +1549,7 @@ fn build_coalesce_groups(
     // soundness anchor: with anything between s's def and the copy, a use
     // of V's OLD incarnation could sit inside s's live range.
     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -1558,7 +1559,13 @@ fn build_coalesce_groups(
             if let Instruction::Copy { dest, .. } = inst {
                 copy_dests.insert(dest.0);
             }
+            inst.for_each_used_value(|u| {
+                *use_count.entry(u).or_insert(0) += 1;
+            });
         }
+        block
+            .terminator
+            .for_each_used_value(|u| *use_count.entry(u).or_insert(0) += 1);
     }
     let latch_dests: FxHashSet<u32> = copy_dests
         .into_iter()
@@ -1578,7 +1585,23 @@ fn build_coalesce_groups(
                 {
                     if latch_dests.contains(&d.0) {
                         if let Some(pd) = prev.dest() {
-                            if pd.0 == s.0 {
+                            // The latch-same-value relaxation is only sound when
+                            // the source `s` is single-use and therefore dies at
+                            // this copy. If `s` has another use later (e.g. a
+                            // loop-invariant like a bound operand that is re-used
+                            // in the loop header), then `s` is live across the
+                            // latch copy and holds a DIFFERENT value than `d`
+                            // after `d` is redefined — coalescing them lets the
+                            // latch redefinition corrupt `s` (the HUF rankVal
+                            // loop's `minBits` operand is exactly this shape and
+                            // previously turned the outer-loop bound into a
+                            // `consumed`-dependent value, running the loop one
+                            // iteration short and leaving the HUF DTable half
+                            // built, which made zstd's 4X2 HUF fast loop spin
+                            // forever on a zeroed table slot). Requiring
+                            // use_count == 1 restores the "s dies at the copy"
+                            // invariant.
+                            if pd.0 == s.0 && use_count.get(&s.0).copied().unwrap_or(0) == 1 {
                                 latch_same_value.insert((d.0, s.0));
                             }
                         }
