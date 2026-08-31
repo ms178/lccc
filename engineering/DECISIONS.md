@@ -792,3 +792,20 @@ branch of ~230 is byte-identical to upstream `6f1b99ac`.
 - **Snapshot base:** this session rebased on `b49414c` (PR #316). The stale
   `.base_ref` (`4630de0`) in the repo root from an earlier session is NOT the
   base; `artifacts/.base_ref` is authoritative.
+
+## v2 session (2026-08-31) — remaining 8 Regehr corpus bugs all fixed
+
+Rebased onto upstream `main` `4e20ff0` (PR #317 merged v1). Closed all 8 open
+corpus bugs; the 28 Regehr tests now pass and the full lccc suite is
+**545 pass / 0 fail / 0 A/B diffs**.
+
+| Decision | Rationale |
+|---|---|
+| **ADOPT Regehr `global_init_compound_ptrs.rs`** recursion/braces fixes | Two tests (`struct_array_double_singleton_inner_dim_ptr_global_init`, `global_union_array_scalar_braces_ptr_field_init`) share the compound-ptrs path; peeled braces for singleton inner dims and braced scalars. |
+| **ADOPT Regehr `structs.rs`** packed-struct spill helpers | `store_packed_data_exact`/`spill_packed_data_to_alloca`/`packed_spill_alloc_size`/`load_packed_struct_i64` fix the packed small-struct assign clobber; ported with lccc's `volatile`/`semantic_volatile` IR fields. |
+| **Local fix `cfg_simplify.rs`** const-branch fold cast truncation | `resolve_value_globally()` returned raw `Cast` source constants, folding `(char)512` as 512 (nonzero) instead of 0; apply `to_ty.truncate_i64(from_ty.truncate_i64(v))`. |
+| **Local fix `expr_types.rs`** GNU stmt-expr/`typeof` scope resolution | `get_stmt_expr_ctype()` must resolve the tail expression against the compound-local scope before the (shadowing) outer sema scope; added `GnuConditional` + label-tail unwrapping + comparison→`int` to `get_expr_ctype_with_scope`. |
+| **Local fix unnamed non-aggregate member** (C11 6.7.2.1p13) | Skip unnamed non-struct/union members in all 5 struct-field layout builders. |
+
+No fork-specific risk: all fixes are upstream-compatible and validated by the
+full regression suite + A/B harness.

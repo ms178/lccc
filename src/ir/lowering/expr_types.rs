@@ -1736,34 +1736,61 @@ impl Lowerer {
         compound: &CompoundStmt,
         parent_scope: Option<&FxHashMap<String, CType>>,
     ) -> Option<CType> {
-        if let Some(BlockItem::Statement(Stmt::Expr(Some(expr)))) = compound.items.last() {
-            // If the last expression is itself a StmtExpr, we must build
-            // the current scope first and pass it down, so inner typeof()
-            // expressions can reference variables from this compound
-            // (e.g., kernel atomic_cmpxchg: outer declares __ai_ptr,
-            // inner uses typeof(*__ai_ptr)).
+        if let Some(expr) = self.stmt_expr_result_expr(compound) {
+            // Build the compound scope up front so the result expression prefers
+            // local declarations over shadowed outer bindings, even when the
+            // tail expression is not a bare identifier (e.g. `x ?: x` inside
+            // `long x = ({ unsigned x = -8; x ?: x; }) * 480998226;`). Without
+            // this, the local `unsigned x` is shadowed by the outer `long x`
+            // when the multiply's operand type is resolved, and the multiply is
+            // computed in 64-bit instead of wrapping at 32-bit.
+            let scope = self.build_compound_scope(compound, parent_scope);
+
+            // If the last expression is itself a StmtExpr, pass the current scope
+            // down so nested statement expressions can reference outer locals.
             if let Expr::StmtExpr(inner_compound, _) = expr {
-                let scope = self.build_compound_scope(compound, parent_scope);
                 if !scope.is_empty() {
                     if let Some(ctype) = self.get_stmt_expr_ctype(inner_compound, Some(&scope)) {
                         return Some(ctype);
                     }
                 }
             }
-            // Try normal resolution (works if vars are in sema scope)
-            if let Some(ctype) = self.get_expr_ctype(expr) {
-                return Some(ctype);
-            }
-            // Build a local scope from declarations in this compound statement,
-            // inheriting any parent scope from enclosing statement expressions.
-            let scope = self.build_compound_scope(compound, parent_scope);
+
+            // Resolve against the compound-local scope first so local declarations
+            // shadow any outer bindings of the same name.
             if !scope.is_empty() {
                 if let Some(ctype) = self.get_expr_ctype_with_scope(expr, &scope) {
                     return Some(ctype);
                 }
             }
+            // Try normal resolution (works if vars are in sema scope)
+            if let Some(ctype) = self.get_expr_ctype(expr) {
+                return Some(ctype);
+            }
         }
         None
+    }
+
+    /// Extract the value expression of a GNU statement expression by unwrapping
+    /// top-level label wrappers around the final statement.
+    fn stmt_expr_result_expr<'a>(&self, compound: &'a CompoundStmt) -> Option<&'a Expr> {
+        let stmt = match compound.items.last() {
+            Some(BlockItem::Statement(stmt)) => stmt,
+            _ => return None,
+        };
+        self.unwrap_stmt_to_expr(stmt)
+    }
+
+    /// Unwrap label-like statement wrappers to the enclosed expression statement.
+    fn unwrap_stmt_to_expr<'a>(&self, stmt: &'a Stmt) -> Option<&'a Expr> {
+        match stmt {
+            Stmt::Expr(Some(expr)) => Some(expr),
+            Stmt::Label(_, inner, _)
+            | Stmt::Case(_, inner, _)
+            | Stmt::CaseRange(_, _, inner, _)
+            | Stmt::Default(inner, _) => self.unwrap_stmt_to_expr(inner),
+            _ => None,
+        }
     }
 
     /// Build a local scope from declarations in a compound statement.
@@ -1900,8 +1927,41 @@ impl Lowerer {
             Expr::Conditional(_, then_expr, _, _) => self
                 .get_expr_ctype(then_expr)
                 .or_else(|| self.get_expr_ctype_with_scope(then_expr, scope)),
+            // GNU conditional (`x ?: x`): both operands feed the result type, so
+            // resolve them against the scope too (allows a local `unsigned x` to
+            // shadow an outer `long x` when determining the statement-expression
+            // result type).
+            Expr::GnuConditional(cond, else_expr, _) => {
+                // Prefer the scope binding (local declaration shadows an outer
+                // same-named binding). Resolving against the normal scope first
+                // would pick up the outer `long x` instead of the inner
+                // `unsigned x`.
+                let cond_ct = self
+                    .get_expr_ctype_with_scope(cond, scope)
+                    .or_else(|| self.get_expr_ctype(cond));
+                let else_ct = self
+                    .get_expr_ctype_with_scope(else_expr, scope)
+                    .or_else(|| self.get_expr_ctype(else_expr));
+                match (cond_ct, else_ct) {
+                    (Some(l), Some(r)) => {
+                        if l.size() >= r.size() {
+                            Some(l)
+                        } else {
+                            Some(r)
+                        }
+                    }
+                    (Some(l), None) => Some(l),
+                    (None, Some(r)) => Some(r),
+                    (None, None) => None,
+                }
+            }
             // Binary ops: try to infer from operands using scope
-            Expr::BinaryOp(_, lhs, rhs, _) => {
+            Expr::BinaryOp(op, lhs, rhs, _) => {
+                // Comparison and logical operators produce `int` in C regardless
+                // of the operand types (matches get_expr_ctype_lowerer).
+                if op.is_comparison() || matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                    return Some(CType::Int);
+                }
                 let lhs_ct = self
                     .get_expr_ctype(lhs)
                     .or_else(|| self.get_expr_ctype_with_scope(lhs, scope));

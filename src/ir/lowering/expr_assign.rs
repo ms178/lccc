@@ -118,13 +118,7 @@ impl Lowerer {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
-                self.emit(Instruction::Store {
-                    volatile: lv.volatile,
-                    val: rhs_val,
-                    ptr: dest_addr,
-                    ty: Self::packed_store_type(struct_size),
-                    seg_override: AddressSpace::Default,
-                });
+                self.store_packed_data_exact(dest_addr, rhs_val, struct_size);
                 return Operand::Value(dest_addr);
             }
             return rhs_val;

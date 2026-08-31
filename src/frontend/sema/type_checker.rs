@@ -776,7 +776,7 @@ impl<'a> ExprTypeChecker<'a> {
 
         let struct_fields: Vec<StructField> = fields
             .iter()
-            .map(|f| {
+            .filter_map(|f| {
                 let mut ty = self.resolve_field_ctype(f);
                 // GCC treats enum bitfields as unsigned
                 if f.bit_width.is_some()
@@ -785,7 +785,15 @@ impl<'a> ExprTypeChecker<'a> {
                 {
                     ty = CType::UInt;
                 }
-                StructField {
+                // C11 6.7.2.1p13: unnamed non-aggregate members are constraint
+                // violations GCC ignores entirely; drop from layout + init.
+                if f.name.is_none()
+                    && f.bit_width.is_none()
+                    && !matches!(ty, CType::Struct(_) | CType::Union(_))
+                {
+                    return None;
+                }
+                Some(StructField {
                     name: f.name.clone().unwrap_or_default(),
                     ty,
                     bit_width: f
@@ -794,7 +802,7 @@ impl<'a> ExprTypeChecker<'a> {
                         .and_then(|bw| self.eval_const_expr(bw).map(|v| v as u32)),
                     alignment: f.alignment,
                     is_packed: f.is_packed,
-                }
+                })
             })
             .collect();
 

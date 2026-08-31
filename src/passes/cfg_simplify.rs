@@ -1333,13 +1333,32 @@ fn resolve_value_globally(
             Some(IrConst::I32(if result { 1 } else { 0 }))
         }
         Instruction::Cast {
+            dest: _,
             src: Operand::Const(c),
-            ..
-        } => Some(*c),
+            from_ty,
+            to_ty,
+        } => {
+            // Apply the source->target width/signedness semantics. Returning the
+            // raw source constant would ignore the truncation (e.g. `(char)512`
+            // is 0, not 512), which would fold the branch to the wrong target.
+            let v = c.to_i64()?;
+            Some(IrConst::from_i64(
+                to_ty.truncate_i64(from_ty.truncate_i64(v)),
+                *to_ty,
+            ))
+        }
         Instruction::Cast {
+            dest: _,
             src: Operand::Value(sv),
-            ..
-        } => resolve_value_globally(func, *sv, val_map, depth + 1),
+            from_ty,
+            to_ty,
+        } => {
+            let base = resolve_value_globally(func, *sv, val_map, depth + 1)?;
+            Some(IrConst::from_i64(
+                to_ty.truncate_i64(from_ty.truncate_i64(base.to_i64()?)),
+                *to_ty,
+            ))
+        }
         Instruction::Select {
             cond,
             true_val,
