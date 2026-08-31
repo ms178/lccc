@@ -3154,15 +3154,43 @@ impl X86Codegen {
                 _ => false,
             };
             if lhs_in_acc {
-                // LHS is in %rax — save it to dest first, then copy rhs (from dest) to %rax
-                self.state
-                    .out
-                    .emit_instr_reg_reg("    movq", "rax", dest_name);
-                let rhs_name = phys_reg_name(rhs_phys.unwrap());
-                self.state
-                    .out
-                    .emit_instr_reg_reg("    movq", rhs_name, "rax");
-                self.state.reg_cache.invalidate_acc();
+                // RA-09: lhs is in %rax and rhs's home IS the dest register.
+                // The old code saved lhs into dest (`movq %rax,%dest`) and then
+                // re-read "rhs" from dest (`movq %dest,%rax`) — but that first
+                // move clobbered rhs's value, so the re-read returned lhs, and
+                // `op %rax,%dest` computed `lhs op lhs` (a self-op / miscompile,
+                // e.g. base.c `xorl %ebx,%ebx` when 131/128/132 all homed rbx).
+                // Both operands are already staged correctly: lhs in %rax, rhs
+                // in dest. The common tail `op %rax, %dest` then computes
+                // `rhs op lhs` into dest, which equals `lhs op rhs` for every
+                // commutative ALU op (Add/And/Or/Xor/Mul). Sub is non-commutative
+                // and must preserve operand order (lhs - rhs), so it is staged
+                // through %rax below before the tail.
+                if op == IrBinOp::Sub {
+                    let rhs_name = phys_reg_name(rhs_phys.unwrap());
+                    let rhs_name_32 = phys_reg_name_32(rhs_phys.unwrap());
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    subl %{}, %eax", rhs_name_32));
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name_32));
+                        self.emit_sext32_for_value(
+                            dest_name_32,
+                            dest_name,
+                            is_unsigned,
+                            dest_value_id,
+                        );
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    subq %{}, %rax", rhs_name));
+                        self.state
+                            .emit_fmt(format_args!("    movq %rax, %{}", dest_name));
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    return;
+                }
+                // Commutative: leave lhs in %rax, rhs in dest. The tail emits
+                // `op %rax, %dest`.
             } else {
                 self.operand_to_rax(rhs);
                 self.operand_to_callee_reg(lhs, dest_phys);
