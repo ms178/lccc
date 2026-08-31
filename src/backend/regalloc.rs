@@ -1982,9 +1982,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // interval map is derived (see RegAllocConfig::folded_index_uses).
     if !config.folded_index_uses.is_empty() && !env_on("CCC_NO_FOLDED_INDEX_LIVENESS") {
         // value_id -> (start, end) from the consumer GEP-dest intervals. The
-        // dest's START is the folded-away producer (the GEP / Cmp — the last
-        // IR-visible read of the operand); its END is the access that
-        // re-reads the operand RA-invisibly (SIB load/store, replayed cmp).
+        // dest's END is the access that re-reads the operand RA-invisibly
+        // (SIB load/store, replayed cmp). dest.start is the GEP / Cmp itself
+        // — NOT always the last IR-visible read of `idx`: `resolve_index`
+        // peels Cast/Shl/Mul/Add, so a peeled index's last IR use is the
+        // widening Cast sitting BEFORE the GEP (sqlite3 vdbeChangeP4Full).
         let mut bounds_of: FxHashMap<u32, (u32, u32)> = FxHashMap::default();
         for iv in &liveness.intervals {
             bounds_of.insert(iv.value_id, (iv.start, iv.end));
@@ -2018,13 +2020,47 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         for (idx, dests) in &config.folded_index_uses {
             let mut new_end: Option<u32> = None;
             // Real-liveness ranges the operand must survive: one per
-            // consumer, [producer position .. access position].
+            // consumer. dest.start is the GEP, but a peeled index's last
+            // IR use is typically a widening Cast / scale BEFORE the GEP
+            // (the GEP reads orig_offset). Starting required at dest.start
+            // then misses every call between that last IR use and the GEP:
+            // sqlite3 vdbeChangeP4Full inlined sqlite3DbStrNDup homes the
+            // multi-def I32 Copy of `n` in %r10, memcpy clobbers it, then
+            // ensure_sib_index_form movslqs the stale register for p[n]=0.
+            // required starts at the last IR-visible segment end when the
+            // index is not live at dest.start (fills Cast→Store including
+            // the call). A covering segment keeps [GEP, Store].
             let mut required: Vec<(u32, u32)> = Vec::new();
+            // Fat interval end is the block envelope (join block runs through
+            // memcpy+GEP+Store), so it is NOT the last IR use. Use hole-aware
+            // segments: if idx is not live at dest.start, start required at
+            // the preceding segment end (the peeled Cast) so calls in the
+            // hole are covered. A covering segment keeps historical
+            // [GEP, Store] (vsprintf digit latch).
+            let idx_segs: Vec<(u32, u32)> = liveness
+                .segments
+                .iter()
+                .filter(|seg| seg.value_id == *idx)
+                .map(|seg| (seg.start, seg.end))
+                .collect();
             for d in dests {
                 if let Some(&(s, e)) = bounds_of.get(d) {
                     new_end = Some(new_end.map_or(e, |x: u32| x.max(e)));
                     if s < e {
-                        required.push((s, e));
+                        let covering = idx_segs.iter().any(|&(ss, ee)| ss <= s && s < ee);
+                        let req_s = if covering {
+                            s
+                        } else {
+                            idx_segs
+                                .iter()
+                                .map(|&(_, ee)| ee)
+                                .filter(|&ee| ee <= s)
+                                .max()
+                                .unwrap_or(s)
+                        };
+                        if req_s < e {
+                            required.push((req_s, e));
+                        }
                     }
                 }
             }
@@ -6336,7 +6372,7 @@ fn uses_value(inst: &Instruction, val_id: u32) -> bool {
 #[cfg(test)]
 mod phi_coalesce_tests {
     use super::*;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrCmpOp, Value};
 
     #[test]
     fn segment_interference_preserves_holes_and_half_open_handoffs() {
@@ -6792,5 +6828,158 @@ mod phi_coalesce_tests {
             Some(PhysReg(1)),
             "callee-saved home may still be shared across the call: {assignments:?}"
         );
+    }
+
+    /// sqlite3 vdbeChangeP4Full: `if (n==0) n = strlen(z); memcpy; p[n]=0`.
+    /// The join Copy of I32 `n` is multi-def. `resolve_index` peels the
+    /// widening Cast so folded_index_uses keys on that Copy dest, whose last
+    /// IR use is the Cast — before memcpy — while the GEP (dest.start) sits
+    /// after it. Multi-def required must start at idx_ir_end so the Copy dest
+    /// is live across the call (callee-saved / spilled), not a clobbered %r10.
+    #[test]
+    fn multi_def_peeled_index_covers_call_before_gep() {
+        let mut func = IrFunction::new(
+            "vdbe_strndup_shape".to_string(),
+            IrType::Ptr,
+            vec![],
+            false,
+        );
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Alloca {
+                        dest: Value(10),
+                        ty: IrType::I8,
+                        size: 64,
+                        align: 1,
+                        volatile: false,
+                        semantic_volatile: false,
+                    },
+                    Instruction::Copy {
+                        dest: Value(0),
+                        src: Operand::Const(IrConst::I32(5)),
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::I32(0)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(5),
+                        src: Operand::Const(IrConst::I32(4)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(5)),
+                    },
+                ],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                vec![
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(1)),
+                        from_ty: IrType::I32,
+                        to_ty: IrType::I64,
+                    },
+                    Instruction::Memcpy {
+                        dest: Value(10),
+                        src: Value(10),
+                        size: 8,
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(4),
+                        base: Value(10),
+                        offset: Operand::Value(Value(3)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::Store {
+                        volatile: false,
+                        val: Operand::Const(IrConst::I8(0)),
+                        ptr: Value(4),
+                        ty: IrType::I8,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+        ];
+        func.next_value_id = 11;
+
+        let mut folded = FxHashMap::default();
+        folded.insert(1u32, vec![4u32]);
+        let config = RegAllocConfig {
+            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            caller_saved_regs: vec![
+                PhysReg(10),
+                PhysReg(11),
+                PhysReg(12),
+                PhysReg(13),
+                PhysReg(14),
+                PhysReg(15),
+            ],
+            call_arg_regs: vec![PhysReg(14), PhysReg(15), PhysReg(12), PhysReg(13)],
+            indirect_target_regs: vec![PhysReg(11)],
+            allow_inline_asm_regalloc: false,
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: folded,
+            reg_hints: FxHashMap::default(),
+        };
+        let result = allocate_registers(&func, &config);
+        let liv = result.liveness.expect("liveness");
+        assert!(
+            !liv.call_points.is_empty(),
+            "Memcpy must be a call_point"
+        );
+        let segs: Vec<(u32, u32)> = liv
+            .segments
+            .iter()
+            .filter(|s| s.value_id == 1)
+            .map(|s| (s.start, s.end))
+            .collect();
+        let covered = liv
+            .call_points
+            .iter()
+            .any(|&cp| segs.iter().any(|&(s, e)| s <= cp && cp < e));
+        assert!(
+            covered,
+            "peeled multi-def index v1 must stay live across memcpy; segs={segs:?} calls={:?}",
+            liv.call_points
+        );
+        if let Some(home) = result.assignments.get(&1) {
+            assert!(
+                !matches!(home.0, 10 | 11 | 12 | 13 | 14 | 15 | 16),
+                "index live across memcpy must not take a caller-saved home (got r{})",
+                home.0
+            );
+        }
     }
 }
