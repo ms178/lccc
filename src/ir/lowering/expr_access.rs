@@ -5,7 +5,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
     SizeofArg, Stmt, TypeSpecifier,
@@ -579,13 +579,13 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Struct(Some(tag), _, _, _, _) = ts {
+        if let TypeSpecifier::Struct(Some(tag), ..) = ts {
             let key = format!("struct.{}", tag);
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Union(Some(tag), _, _, _, _) = ts {
+        if let TypeSpecifier::Union(Some(tag), ..) = ts {
             let key = format!("union.{}", tag);
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(&key) {
                 return Some(vla_size);
@@ -1166,18 +1166,35 @@ impl Lowerer {
             self.get_struct_base_addr(base_expr)
         };
 
-        let field_addr = self.fresh_value();
         let vla_offset = self.get_vla_field_offset(base_expr, field_name, is_pointer);
         let offset = if let Some(vo) = vla_offset {
             Operand::Value(vo)
         } else {
             Operand::Const(IrConst::ptr_int(field_offset as i64))
         };
+
+        // Reverse SSO bitfields sharing a multi-byte unit access the WHOLE
+        // unit (byte-swapped); compute the effective storage type up front so
+        // the field address carries the right access width.
+        let (sso, sso_unit_ty) = self.sso_storage_of_member(base_expr, is_pointer, field_name);
+        let storage_ty = if bitfield.is_some() {
+            match sso {
+                SsoMode::ByteSwapUnit(_) => sso_unit_ty
+                    .as_ref()
+                    .map(IrType::from_ctype)
+                    .unwrap_or(field_ty),
+                _ => field_ty,
+            }
+        } else {
+            field_ty
+        };
+
+        let field_addr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
             dest: field_addr,
             base: base_addr,
             offset,
-            ty: field_ty,
+            ty: storage_ty,
         });
 
         let is_addr_type = match &field_ctype {
@@ -1197,7 +1214,7 @@ impl Lowerer {
         // For bitfields, use extract_bitfield_from_addr which handles split loads
         // (packed bitfields that span storage unit boundaries).
         if let Some((bit_offset, bit_width)) = bitfield {
-            return self.extract_bitfield_from_addr(field_addr, field_ty, bit_offset, bit_width);
+            return self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
         }
 
         let dest = self.fresh_value();
@@ -1215,7 +1232,9 @@ impl Lowerer {
             ty: field_ty,
             seg_override: addr_space,
         });
-        Operand::Value(dest)
+        // Reverse scalar_storage_order: byte-fix-up the loaded scalar value.
+        let sso = self.sso_mode_of_member(base_expr, is_pointer, field_name);
+        self.emit_sso_load_fixup(Operand::Value(dest), field_ty, sso)
     }
 
     pub(super) fn lower_member_access(&mut self, base_expr: &Expr, field_name: &str) -> Operand {

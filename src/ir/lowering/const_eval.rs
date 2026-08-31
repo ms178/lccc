@@ -860,7 +860,7 @@ impl Lowerer {
                         return true;
                     }
                 }
-                TypeSpecifier::Struct(Some(tag), _, _, _, _) => {
+                TypeSpecifier::Struct(Some(tag), ..) => {
                     if fs
                         .vla_typedef_sizes
                         .contains_key(&format!("struct.{}", tag))
@@ -868,7 +868,7 @@ impl Lowerer {
                         return true;
                     }
                 }
-                TypeSpecifier::Union(Some(tag), _, _, _, _) => {
+                TypeSpecifier::Union(Some(tag), ..) => {
                     if fs.vla_typedef_sizes.contains_key(&format!("union.{}", tag)) {
                         return true;
                     }
@@ -882,8 +882,8 @@ impl Lowerer {
                 self.expr_as_array_size(size_expr).is_none() || self.type_spec_is_vla(elem)
             }
             TypeSpecifier::Array(elem, None) => self.type_spec_is_vla(elem),
-            TypeSpecifier::Struct(_, Some(fields), _, _, _)
-            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
                 fields.iter().any(|f| self.struct_field_is_vla(f))
             }
             TypeSpecifier::TypedefName(name) => {

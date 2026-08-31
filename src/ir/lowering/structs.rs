@@ -1,5 +1,5 @@
 use super::lower::Lowerer;
-use crate::common::types::{AddressSpace, CType, IrType, RcLayout, StructLayout};
+use crate::common::types::{AddressSpace, CType, IrType, RcLayout, SsoMode, StructLayout};
 use crate::frontend::parser::ast::{
     BinOp, Declaration, Expr, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
@@ -172,12 +172,23 @@ impl Lowerer {
     /// nested struct/union types defined in the fields.
     pub(super) fn register_struct_type(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout =
-                    self.compute_struct_union_layout_packed(fields, false, max_field_align);
+                let mut layout = self.compute_struct_union_layout_packed(
+                    fields,
+                    false,
+                    max_field_align,
+                    reverse_sso.is_some_and(|v| v),
+                );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -206,12 +217,23 @@ impl Lowerer {
                     self.compute_vla_field_offsets_for_decl(&key, fields, *is_packed);
                 }
             }
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Union(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 // Recursively register nested struct/union types in fields
                 self.register_nested_struct_types(fields);
                 let max_field_align = if *is_packed { Some(1) } else { *pragma_pack };
-                let mut layout =
-                    self.compute_struct_union_layout_packed(fields, true, max_field_align);
+                let mut layout = self.compute_struct_union_layout_packed(
+                    fields,
+                    true,
+                    max_field_align,
+                    reverse_sso.is_some_and(|v| v),
+                );
                 // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
                 if let Some(a) = struct_aligned {
                     if *a > layout.align {
@@ -282,8 +304,8 @@ impl Lowerer {
         out: &mut Vec<&'a TypeSpecifier>,
     ) {
         match ts {
-            TypeSpecifier::Struct(_, Some(fields), _, _, _)
-            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
                 out.push(ts);
                 for f in fields {
                     Self::collect_struct_union_type_specs(&f.type_spec, out);
@@ -296,20 +318,42 @@ impl Lowerer {
     /// Re-compute a struct/union layout if any of its fields use vector typedefs.
     /// Updates the existing layout entry in the map using the key from sema.
     fn recompute_layout_if_vector_fields(&mut self, ts: &TypeSpecifier) {
-        let (tag, fields, is_union, is_packed, pragma_pack, struct_aligned) = match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => (
-                tag,
-                fields,
-                false,
-                *is_packed,
-                *pragma_pack,
-                *struct_aligned,
-            ),
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, struct_aligned) => {
-                (tag, fields, true, *is_packed, *pragma_pack, *struct_aligned)
-            }
-            _ => return,
-        };
+        let (tag, fields, is_union, is_packed, pragma_pack, struct_aligned, reverse_sso) =
+            match ts {
+                TypeSpecifier::Struct(
+                    tag,
+                    Some(fields),
+                    is_packed,
+                    pragma_pack,
+                    struct_aligned,
+                    reverse_sso,
+                ) => (
+                    tag,
+                    fields,
+                    false,
+                    *is_packed,
+                    *pragma_pack,
+                    *struct_aligned,
+                    reverse_sso.is_some_and(|v| v),
+                ),
+                TypeSpecifier::Union(
+                    tag,
+                    Some(fields),
+                    is_packed,
+                    pragma_pack,
+                    struct_aligned,
+                    reverse_sso,
+                ) => (
+                    tag,
+                    fields,
+                    true,
+                    *is_packed,
+                    *pragma_pack,
+                    *struct_aligned,
+                    reverse_sso.is_some_and(|v| v),
+                ),
+                _ => return,
+            };
         // Check if any field uses a vector typedef
         let has_vector_field = fields.iter().any(|f| {
             let ctype = self.struct_field_ctype(f);
@@ -348,7 +392,12 @@ impl Lowerer {
         if let Some(key) = existing_key {
             let max_field_align = if is_packed { Some(1) } else { pragma_pack };
             let mut layout =
-                self.compute_struct_union_layout_packed(fields, is_union, max_field_align);
+                self.compute_struct_union_layout_packed(
+                    fields,
+                    is_union,
+                    max_field_align,
+                    reverse_sso,
+                );
             if let Some(a) = struct_aligned {
                 if a > layout.align {
                     layout.align = a;
@@ -385,11 +434,11 @@ impl Lowerer {
     /// Walk a TypeSpecifier and register any struct/union definitions found within it.
     fn register_nested_in_type_spec(&mut self, ts: &TypeSpecifier) {
         match ts {
-            TypeSpecifier::Struct(_tag, Some(_fields), _, _, _) => {
+            TypeSpecifier::Struct(_tag, Some(_fields), ..) => {
                 // This is a struct definition inside a field (named or anonymous) - register it
                 self.register_struct_type(ts);
             }
-            TypeSpecifier::Union(_tag, Some(_fields), _, _, _) => {
+            TypeSpecifier::Union(_tag, Some(_fields), ..) => {
                 // This is a union definition inside a field (named or anonymous) - register it
                 self.register_struct_type(ts);
             }
@@ -420,7 +469,7 @@ impl Lowerer {
     /// Returns the layout map key if the type is a union (directly or via typedef).
     pub(super) fn union_layout_key(&self, ts: &TypeSpecifier) -> Option<String> {
         match ts {
-            TypeSpecifier::Union(tag, _, _, _, _) => {
+            TypeSpecifier::Union(tag, ..) => {
                 let prefix = "union.";
                 tag.as_ref().map(|name| format!("{}{}", prefix, name))
             }
@@ -480,7 +529,14 @@ impl Lowerer {
         }
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _) => {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -495,9 +551,10 @@ impl Lowerer {
                     fields,
                     false,
                     max_field_align,
+                    reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Struct(Some(tag), None, ..) => {
                 let layouts = self.types.borrow_struct_layouts();
                 layouts
                     .get(&format!("struct.{}", tag))
@@ -508,7 +565,14 @@ impl Lowerer {
                         layouts.get(tag.as_str()).cloned()
                     })
             }
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _) => {
+            TypeSpecifier::Union(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -523,9 +587,10 @@ impl Lowerer {
                     fields,
                     true,
                     max_field_align,
+                    reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Union(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Union(Some(tag), None, ..) => {
                 let layouts = self.types.borrow_struct_layouts();
                 layouts.get(&format!("union.{}", tag)).cloned().or_else(|| {
                     // Anonymous unions from typeof/ctype_to_type_spec use the
@@ -947,6 +1012,39 @@ impl Lowerer {
         field_name: &str,
     ) -> (usize, IrType) {
         self.resolve_member_access_impl(base_expr, field_name, false)
+    }
+
+    /// Look up the reverse-SSO handling mode of a member access.
+    /// Returns SsoMode::None when the record is native-order or the member is
+    /// not found (the overwhelmingly common case, at zero layout cost).
+    pub(super) fn sso_mode_of_member(
+        &self,
+        base_expr: &Expr,
+        is_pointer_access: bool,
+        field_name: &str,
+    ) -> SsoMode {
+        self.sso_storage_of_member(base_expr, is_pointer_access, field_name).0
+    }
+
+    /// Look up the reverse-SSO mode AND the unit-wide access storage type
+    /// (for standard bitfields sharing a multi-byte unit under reverse SSO).
+    pub(super) fn sso_storage_of_member(
+        &self,
+        base_expr: &Expr,
+        is_pointer_access: bool,
+        field_name: &str,
+    ) -> (SsoMode, Option<CType>) {
+        if let Some(layout) = self.get_member_layout(base_expr, is_pointer_access) {
+            if !layout.reverse_sso {
+                return (SsoMode::None, None);
+            }
+            for f in &layout.fields {
+                if f.name == field_name {
+                    return (f.sso, f.sso_storage_ty.clone());
+                }
+            }
+        }
+        (SsoMode::None, None)
     }
 
     /// Resolve pointer member access (p->field): returns (byte_offset, ir_type_of_field).

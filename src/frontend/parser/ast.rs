@@ -780,21 +780,25 @@ pub enum TypeSpecifier {
     ComplexFloat,
     ComplexDouble,
     ComplexLongDouble,
-    /// Struct: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute)
+    /// Struct: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute,
+    /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = default/native)
     Struct(
         Option<String>,
         Option<Vec<StructFieldDecl>>,
         bool,
         Option<usize>,
         Option<usize>,
+        Option<bool>,
     ),
-    /// Union: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute)
+    /// Union: (name, fields, is_packed, max_field_align from #pragma pack, struct-level aligned attribute,
+    /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = default/native)
     Union(
         Option<String>,
         Option<Vec<StructFieldDecl>>,
         bool,
         Option<usize>,
         Option<usize>,
+        Option<bool>,
     ),
     /// Enum: (name, variants, is_packed)
     Enum(Option<String>, Option<Vec<EnumVariant>>, bool),

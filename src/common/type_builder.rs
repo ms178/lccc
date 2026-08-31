@@ -36,6 +36,7 @@ pub trait TypeConvertContext {
         is_packed: bool,
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
+        reverse_sso: bool,
     ) -> CType;
 
     /// Resolve an enum type to its CType.
@@ -139,24 +140,38 @@ pub trait TypeConvertContext {
 
             // === Divergent cases (delegated to implementors) ===
             TypeSpecifier::TypedefName(name) => self.resolve_typedef(name),
-            TypeSpecifier::Struct(name, fields, is_packed, pragma_pack, struct_aligned) => self
-                .resolve_struct_or_union(
-                    name,
-                    fields,
-                    false,
-                    *is_packed,
-                    *pragma_pack,
-                    *struct_aligned,
-                ),
-            TypeSpecifier::Union(name, fields, is_packed, pragma_pack, struct_aligned) => self
-                .resolve_struct_or_union(
-                    name,
-                    fields,
-                    true,
-                    *is_packed,
-                    *pragma_pack,
-                    *struct_aligned,
-                ),
+            TypeSpecifier::Struct(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.resolve_struct_or_union(
+                name,
+                fields,
+                false,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            TypeSpecifier::Union(
+                name,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.resolve_struct_or_union(
+                name,
+                fields,
+                true,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
             TypeSpecifier::Enum(name, variants, is_packed) => {
                 self.resolve_enum(name, variants, *is_packed)
             }

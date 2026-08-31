@@ -996,7 +996,7 @@ impl Parser {
     // === GCC extension helpers ===
 
     pub(super) fn skip_gcc_extensions(&mut self) {
-        let (_, aligned, _, _) = self.parse_gcc_attributes();
+        let (_, aligned, _, _, _) = self.parse_gcc_attributes();
         if let Some(a) = aligned {
             self.attrs.parsed_alignas =
                 Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
@@ -1048,12 +1048,22 @@ impl Parser {
     }
 
     /// Parse __attribute__((...)) and __extension__, returning struct attribute flags.
-    /// Returns (is_packed, aligned_value, mode_kind, is_common).
-    pub(super) fn parse_gcc_attributes(&mut self) -> (bool, Option<usize>, Option<ModeKind>, bool) {
+    /// Returns (is_packed, aligned_value, mode_kind, is_common, scalar_storage_order).
+    /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = unspecified.
+    pub(super) fn parse_gcc_attributes(
+        &mut self,
+    ) -> (
+        bool,
+        Option<usize>,
+        Option<ModeKind>,
+        bool,
+        Option<bool>,
+    ) {
         let mut is_packed = false;
         let mut aligned = None;
         let mut mode_kind: Option<ModeKind> = None;
         let mut is_common = false;
+        let mut scalar_storage_order: Option<bool> = None;
         loop {
             match self.peek() {
                 TokenKind::Extension => {
@@ -1070,6 +1080,7 @@ impl Parser {
                                 &mut aligned,
                                 &mut mode_kind,
                                 &mut is_common,
+                                &mut scalar_storage_order,
                             );
                             if matches!(self.peek(), TokenKind::RParen) {
                                 self.advance();
@@ -1093,7 +1104,13 @@ impl Parser {
                 _ => break,
             }
         }
-        (is_packed, aligned, mode_kind, is_common)
+        (
+            is_packed,
+            aligned,
+            mode_kind,
+            is_common,
+            scalar_storage_order,
+        )
     }
 
     /// Parse the comma-separated attribute list inside __attribute__((...)).
@@ -1103,6 +1120,7 @@ impl Parser {
         aligned: &mut Option<usize>,
         mode_kind: &mut Option<ModeKind>,
         is_common: &mut bool,
+        scalar_storage_order: &mut Option<bool>,
     ) {
         loop {
             match self.peek() {
@@ -1125,6 +1143,7 @@ impl Parser {
                         aligned,
                         mode_kind,
                         is_common,
+                        scalar_storage_order,
                     );
                 }
                 _ => {
@@ -1142,6 +1161,7 @@ impl Parser {
         aligned: &mut Option<usize>,
         mode_kind: &mut Option<ModeKind>,
         is_common: &mut bool,
+        scalar_storage_order: &mut Option<bool>,
     ) {
         match name {
             "constructor" | "__constructor__" => {
@@ -1161,6 +1181,25 @@ impl Parser {
             "packed" | "__packed__" => {
                 *is_packed = true;
                 self.advance();
+            }
+            "scalar_storage_order" | "__scalar_storage_order__" => {
+                self.advance();
+                // GCC form: scalar_storage_order("big-endian" | "little-endian" | "default").
+                // Only meaningful on struct/union definitions; resolved to the
+                // reversed-relative-to-target flag by parse_struct_or_union.
+                if let Some(arg) = self.parse_string_attr_arg() {
+                    match arg.as_str() {
+                        "big-endian" | "__big_endian__" => *scalar_storage_order = Some(true),
+                        "little-endian" | "__little_endian__" => {
+                            *scalar_storage_order = Some(false)
+                        }
+                        "default" | "__default__" => *scalar_storage_order = None,
+                        _ => {
+                            // Unknown argument: ignore like GCC's permerror.
+                            *scalar_storage_order = None;
+                        }
+                    }
+                }
             }
             "aligned" | "__aligned__" => {
                 self.advance();
@@ -1572,7 +1611,7 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    let (_, attr_aligned, mk, common) = self.parse_gcc_attributes();
+                    let (_, attr_aligned, mk, common, _) = self.parse_gcc_attributes();
                     mode_kind = mode_kind.or(mk);
                     has_common = has_common || common;
                     if let Some(a) = attr_aligned {
@@ -1971,8 +2010,8 @@ impl Parser {
                 }
             }
             TypeSpecifier::Array(elem, _) => Self::alignof_type_spec(elem, tag_aligns),
-            TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned)
-            | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned) => {
+            TypeSpecifier::Struct(name, fields, is_packed, _, struct_aligned, _)
+            | TypeSpecifier::Union(name, fields, is_packed, _, struct_aligned, _) => {
                 if *is_packed {
                     return 1;
                 }

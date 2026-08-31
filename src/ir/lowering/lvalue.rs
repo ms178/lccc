@@ -125,6 +125,7 @@ impl Lowerer {
                 // s.field as lvalue -> compute address of the field
                 let addr_space = self.get_addr_space_of_struct_expr(base_expr);
                 let (field_offset, _field_ty) = self.resolve_member_access(base_expr, field_name);
+                let sso = self.sso_mode_of_member(base_expr, false, field_name);
                 let vla_offset = self.get_vla_field_offset(base_expr, field_name, false);
                 let offset = if let Some(vo) = vla_offset {
                     Operand::Value(vo)
@@ -139,7 +140,9 @@ impl Lowerer {
                     offset,
                     ty: IrType::Ptr,
                 });
-                Some(LValue::address(field_addr, addr_space, vol))
+                let mut lv = LValue::address(field_addr, addr_space, vol);
+                lv.sso = sso;
+                Some(lv)
             }
             Expr::PointerMemberAccess(base_expr, field_name, _) => {
                 // p->field as lvalue -> load pointer, compute field address
@@ -158,6 +161,7 @@ impl Lowerer {
                 };
                 let (field_offset, _field_ty) =
                     self.resolve_pointer_member_access(base_expr, field_name);
+                let sso = self.sso_mode_of_member(base_expr, true, field_name);
                 let vla_offset = self.get_vla_field_offset(base_expr, field_name, true);
                 let offset = if let Some(vo) = vla_offset {
                     Operand::Value(vo)
@@ -171,7 +175,9 @@ impl Lowerer {
                     offset,
                     ty: IrType::Ptr,
                 });
-                Some(LValue::address(field_addr, addr_space, vol))
+                let mut lv = LValue::address(field_addr, addr_space, vol);
+                lv.sso = sso;
+                Some(lv)
             }
             Expr::UnaryOp(UnaryOp::RealPart, inner, _) => {
                 // __real__ z as lvalue -> address of real part (offset 0 from complex base)
@@ -302,13 +308,16 @@ impl Lowerer {
             ty,
             seg_override,
         });
-        Operand::Value(dest)
+        // Reverse scalar_storage_order members are byte-fixed-up on read.
+        self.emit_sso_load_fixup(Operand::Value(dest), ty, lv.sso)
     }
 
     /// Store a value to an lvalue with a specific type.
     pub(super) fn store_lvalue_typed(&mut self, lv: &LValue, val: Operand, ty: IrType) {
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
+        // Reverse scalar_storage_order members are byte-fixed-up before write.
+        let val = self.emit_sso_store_fixup(val, ty, lv.sso);
         self.emit(Instruction::Store {
             volatile: lv.volatile,
             val,

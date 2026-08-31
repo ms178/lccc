@@ -356,6 +356,11 @@ pub struct StructLayout {
     /// Whether this union has `__attribute__((transparent_union))`.
     /// A transparent union parameter is passed using the ABI of its first member.
     pub is_transparent_union: bool,
+    /// True when the record has `__attribute__((scalar_storage_order("big-endian")))`
+    /// on a little-endian target (or the mirrored little-endian form on a
+    /// big-endian one) — i.e. the storage order is REVERSED relative to the
+    /// target's native byte order.
+    pub reverse_sso: bool,
 }
 
 /// Builder for struct layout computation with bitfield state tracking.
@@ -368,10 +373,11 @@ struct StructLayoutBuilder {
     bf_unit_size: usize,
     in_bitfield: bool,
     is_packed_1: bool,
+    reverse_sso: bool,
 }
 
 impl StructLayoutBuilder {
-    fn new(field_count: usize, max_field_align: Option<usize>) -> Self {
+    fn new(field_count: usize, max_field_align: Option<usize>, reverse_sso: bool) -> Self {
         Self {
             offset: 0,
             max_align: 1,
@@ -381,6 +387,7 @@ impl StructLayoutBuilder {
             bf_unit_size: 0,
             in_bitfield: false,
             is_packed_1: max_field_align == Some(1),
+            reverse_sso,
         }
     }
 
@@ -447,12 +454,22 @@ impl StructLayoutBuilder {
             field.ty.clone()
         };
 
+        // Reverse SSO + packed: the bit stream fills each byte MSB-first.
+        // Layout offsets stay logical; extraction applies per-byte bit-reverse.
+        let sso = if self.reverse_sso {
+            SsoMode::ByteBitReverse
+        } else {
+            SsoMode::None
+        };
+
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             offset: storage_offset,
             ty: storage_ty,
             bit_offset: Some(bit_offset_in_storage),
             bit_width: Some(bw),
+            sso,
+            sso_storage_ty: None,
         });
         self.bf_bit_pos += bw;
     }
@@ -510,7 +527,35 @@ impl StructLayoutBuilder {
             1
         };
         let field_storage_offset = ((placed_abs_bit / 8) as usize) & !(storage_mask - 1);
-        let field_bit_in_storage = (placed_abs_bit - (field_storage_offset as u64) * 8) as u32;
+        let mut field_bit_in_storage = (placed_abs_bit - (field_storage_offset as u64) * 8) as u32;
+
+        // Reverse scalar_storage_order: bitfields are numbered from the MOST
+        // significant bit of the storage unit (GCC stor-layout semantics), and
+        // the unit itself is stored byte-reversed in memory. Mirror the bit
+        // position within the unit; for multi-byte units the access loads the
+        // whole unit (sso_storage_ty) and byteswaps it before bit math.
+        let unit_bits = (storage_mask * 8) as u32;
+        let (sso, sso_storage_ty, field_bit_in_storage, storage_ctype) = if self.reverse_sso {
+            field_bit_in_storage = unit_bits - field_bit_in_storage - bw;
+            if storage_mask >= 2 {
+                let unit_ctype = StructLayout::smallest_int_ctype_for_bytes(
+                    storage_mask,
+                    field.ty.is_signed(),
+                );
+                (
+                    SsoMode::ByteSwapUnit(storage_mask as u32),
+                    Some(unit_ctype.clone()),
+                    field_bit_in_storage,
+                    unit_ctype,
+                )
+            } else {
+                // 1-byte unit: no byte to swap; the reversed bit offset alone
+                // gives the MSB-first numbering inside the byte.
+                (SsoMode::None, None, field_bit_in_storage, field.ty.clone())
+            }
+        } else {
+            (SsoMode::None, None, field_bit_in_storage, field.ty.clone())
+        };
 
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
@@ -518,6 +563,8 @@ impl StructLayoutBuilder {
             ty: field.ty.clone(),
             bit_offset: Some(field_bit_in_storage),
             bit_width: Some(bw),
+            sso,
+            sso_storage_ty,
         });
 
         // Update bitfield tracking state
@@ -547,12 +594,23 @@ impl StructLayoutBuilder {
 
         self.offset = align_up(self.offset, field_align);
 
+        // Reverse SSO: scalar members are stored byte-reversed. Mark every
+        // multi-byte scalar for a byteswap at access (1-byte members are
+        // order-neutral; aggregates carry their own per-record order).
+        let sso = if self.reverse_sso && field_size >= 2 {
+            SsoMode::ByteSwapUnit(field_size as u32)
+        } else {
+            SsoMode::None
+        };
+
         self.field_layouts.push(StructFieldLayout {
             name: field.name.clone(),
             offset: self.offset,
             ty: field.ty.clone(),
             bit_offset: None,
             bit_width: None,
+            sso,
+            sso_storage_ty: None,
         });
 
         let is_flexible_array = matches!(&field.ty, CType::Array(_, None));
@@ -579,6 +637,7 @@ impl StructLayoutBuilder {
             align: self.max_align,
             is_union: false,
             is_transparent_union: false,
+            reverse_sso: self.reverse_sso,
         }
     }
 }
@@ -593,6 +652,7 @@ impl StructLayout {
             align: 1,
             is_union: false,
             is_transparent_union: false,
+            reverse_sso: false,
         }
     }
 
@@ -604,6 +664,7 @@ impl StructLayout {
             align: 1,
             is_union: true,
             is_transparent_union: false,
+            reverse_sso: false,
         }
     }
 
@@ -632,6 +693,27 @@ pub enum InitFieldResolution {
     },
 }
 
+/// How a field of a record with reverse `scalar_storage_order` must be
+/// byte-manipulated at every access. `None` for records with the native
+/// storage order (the overwhelmingly common case).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SsoMode {
+    /// Native order: no byteswap at access.
+    #[default]
+    None,
+    /// The field is stored with its containing storage unit byte-swapped
+    /// (big-endian unit on a little-endian host). The `u32` is the unit
+    /// size in bytes (2, 4, 8 or 16). Access = load unit, bswap, then apply
+    /// the (already reversed) bit offset / plain value semantics.
+    /// Used for scalar members and standard (non-packed) bitfields.
+    ByteSwapUnit(u32),
+    /// Packed bitfield under reverse storage order: the bit stream fills each
+    /// BYTE MSB-first. Layout bit offsets stay logical (LSB-first within the
+    /// packed run); access = per-byte bit-reverse of the loaded bytes before
+    /// extraction (and the inverse after insertion).
+    ByteBitReverse,
+}
+
 /// Layout info for a single field.
 #[derive(Debug, Clone)]
 pub struct StructFieldLayout {
@@ -642,6 +724,14 @@ pub struct StructFieldLayout {
     pub bit_offset: Option<u32>,
     /// For bitfields: width in bits.
     pub bit_width: Option<u32>,
+    /// Reverse scalar_storage_order handling for this field.
+    pub sso: SsoMode,
+    /// For reverse-SSO standard bitfields sharing a multi-byte unit: the
+    /// unit-wide storage type the access must load (e.g. the unit covering
+    /// bits 4..15 of a `short` unit is `short` even when the declared member
+    /// is `char c : 1`). Access code substitutes this for `ty` when reading
+    /// or writing the field; C-level typing keeps using `ty`.
+    pub sso_storage_ty: Option<CType>,
 }
 
 impl StructLayout {
@@ -678,8 +768,9 @@ impl StructLayout {
         fields: &[StructField],
         max_field_align: Option<usize>,
         ctx: &dyn StructLayoutProvider,
+        reverse_sso: bool,
     ) -> Self {
-        let mut b = StructLayoutBuilder::new(fields.len(), max_field_align);
+        let mut b = StructLayoutBuilder::new(fields.len(), max_field_align, reverse_sso);
 
         for field in fields {
             let (field_align, field_size) = b.compute_field_alignment(field, max_field_align, ctx);
@@ -709,6 +800,7 @@ impl StructLayout {
         fields: &[StructField],
         max_field_align: Option<usize>,
         ctx: &dyn StructLayoutProvider,
+        reverse_sso: bool,
     ) -> Self {
         let mut max_size = 0usize;
         let mut max_align = 1usize;
@@ -743,12 +835,58 @@ impl StructLayout {
                 (None, None)
             };
 
+            // Reverse SSO in a union: multi-byte scalar members and standard
+            // bitfields are byte-reversed within their storage (bit position 0
+            // in a union bitfield maps to the TOP of the unit); packed run
+            // handling follows the struct builder's convention.
+            let sso = if !reverse_sso {
+                SsoMode::None
+            } else if field.bit_width.is_some() {
+                if max_field_align == Some(1) {
+                    SsoMode::ByteBitReverse
+                } else if field_size >= 2 {
+                    SsoMode::ByteSwapUnit(field_size as u32)
+                } else {
+                    SsoMode::None
+                }
+            } else if field_size >= 2 {
+                SsoMode::ByteSwapUnit(field_size as u32)
+            } else {
+                SsoMode::None
+            };
+
+            // Reverse-SSO union bitfields with multi-byte units need the
+            // unit-wide access type; the union bit offset maps to the top of
+            // the unit.
+            let (bf_offset, sso_storage_ty) = if let (Some(bw), Some(bo)) =
+                (field.bit_width, bf_offset)
+            {
+                if reverse_sso && field_size >= 2 && max_field_align != Some(1) {
+                    let unit_ctype = StructLayout::smallest_int_ctype_for_bytes(
+                        field_size,
+                        field.ty.is_signed(),
+                    );
+                    (
+                        Some(field_size as u32 * 8 - bo - bw),
+                        Some(unit_ctype),
+                    )
+                } else if reverse_sso && field_size == 1 {
+                    (Some(8 - bo - bw), None)
+                } else {
+                    (Some(bo), None)
+                }
+            } else {
+                (bf_offset, None)
+            };
+
             field_layouts.push(StructFieldLayout {
                 name: field.name.clone(),
                 offset: 0, // All union fields start at offset 0
                 ty: field.ty.clone(),
                 bit_offset: bf_offset,
                 bit_width: bf_width,
+                sso,
+                sso_storage_ty,
             });
         }
 
@@ -760,6 +898,7 @@ impl StructLayout {
             align: max_align,
             is_union: true,
             is_transparent_union: false,
+            reverse_sso,
         }
     }
 

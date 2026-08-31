@@ -1337,7 +1337,7 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    let (_, aligned, _, _) = self.parse_gcc_attributes();
+                    let (_, aligned, _, _, _) = self.parse_gcc_attributes();
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
                             Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));

@@ -6,7 +6,7 @@
 //! metadata, and typedef helpers.
 
 use crate::common::fx_hash::FxHashMap;
-use crate::common::types::{AddressSpace, CType, IrType, RcLayout};
+use crate::common::types::{AddressSpace, CType, IrType, RcLayout, SsoMode};
 use crate::ir::reexports::{BlockId, GlobalInit, IrConst, IrParam, Value};
 
 /// Type metadata shared between local and global variables.
@@ -246,6 +246,9 @@ pub(super) enum LValueKind {
 pub(super) struct LValue {
     pub kind: LValueKind,
     pub volatile: bool,
+    /// Reverse scalar_storage_order handling for a member lvalue: the value
+    /// must be byte-fixed-up on every load/store (SsoMode::None otherwise).
+    pub sso: SsoMode,
 }
 
 impl LValue {
@@ -253,12 +256,14 @@ impl LValue {
         LValue {
             kind: LValueKind::Variable(v),
             volatile,
+            sso: SsoMode::None,
         }
     }
     pub(super) fn address(v: Value, seg: AddressSpace, volatile: bool) -> Self {
         LValue {
             kind: LValueKind::Address(v, seg),
             volatile,
+            sso: SsoMode::None,
         }
     }
 }
