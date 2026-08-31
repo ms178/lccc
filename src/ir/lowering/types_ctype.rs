@@ -81,9 +81,9 @@ impl Lowerer {
                 // For anonymous structs (key like "__anon_struct_N"), use the
                 // full key as the tag so get_struct_layout_for_type can find it.
                 if let Some(tag) = key.strip_prefix("struct.") {
-                    TypeSpecifier::Struct(Some(tag.to_string()), None, false, None, None)
+                    TypeSpecifier::Struct(Some(tag.to_string()), None, false, None, None, None)
                 } else {
-                    TypeSpecifier::Struct(Some(key.to_string()), None, false, None, None)
+                    TypeSpecifier::Struct(Some(key.to_string()), None, false, None, None, None)
                 }
             }
             CType::Union(key) => {
@@ -91,9 +91,9 @@ impl Lowerer {
                 // For anonymous unions (key like "__anon_struct_N"), use the
                 // full key as the tag so get_struct_layout_for_type can find it.
                 if let Some(tag) = key.strip_prefix("union.") {
-                    TypeSpecifier::Union(Some(tag.to_string()), None, false, None, None)
+                    TypeSpecifier::Union(Some(tag.to_string()), None, false, None, None, None)
                 } else {
-                    TypeSpecifier::Union(Some(key.to_string()), None, false, None, None)
+                    TypeSpecifier::Union(Some(key.to_string()), None, false, None, None, None)
                 }
             }
             CType::Enum(et) => TypeSpecifier::Enum(et.name.clone(), None, et.is_packed),
@@ -271,6 +271,7 @@ impl Lowerer {
         is_packed: bool,
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
+        reverse_sso: bool,
     ) -> CType {
         let prefix = if is_union { "union" } else { "struct" };
         let wrap = |key: String| -> CType {
@@ -345,12 +346,14 @@ impl Lowerer {
                     &struct_fields,
                     max_field_align,
                     &*self.types.borrow_struct_layouts(),
+                    reverse_sso,
                 )
             } else {
                 StructLayout::for_struct_with_packing(
                     &struct_fields,
                     max_field_align,
                     &*self.types.borrow_struct_layouts(),
+                    reverse_sso,
                 )
             };
             // Apply struct-level __attribute__((aligned(N))): sets minimum alignment
@@ -399,6 +402,7 @@ impl Lowerer {
                     align: 1,
                     is_union,
                     is_transparent_union: false,
+                    reverse_sso,
                 };
                 self.types.insert_struct_layout_from_ref(&key, empty_layout);
             }
@@ -418,6 +422,7 @@ impl Lowerer {
                 align: 1,
                 is_union,
                 is_transparent_union: false,
+                reverse_sso,
             };
             self.types.insert_struct_layout_from_ref(&key, empty_layout);
             wrap(key)
@@ -476,6 +481,7 @@ impl type_builder::TypeConvertContext for Lowerer {
         is_packed: bool,
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
+        reverse_sso: bool,
     ) -> CType {
         self.struct_or_union_to_ctype(
             name,
@@ -484,6 +490,7 @@ impl type_builder::TypeConvertContext for Lowerer {
             is_packed,
             pragma_pack,
             struct_aligned,
+            reverse_sso,
         )
     }
 

@@ -1142,8 +1142,9 @@ impl Lowerer {
         };
         let addr = self.emit_gep_offset(base_alloca, field_offset, field_ty);
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {
-            self.store_bitfield(addr, field_ty, bit_offset, bit_width, val, false);
+            self.store_bitfield(addr, field_ty, bit_offset, bit_width, val, false, field.sso);
         } else {
+            let val = self.emit_sso_store_fixup(val, field_ty, field.sso);
             self.emit(Instruction::Store {
                 volatile: false,
                 val,

@@ -1045,9 +1045,10 @@ impl Lowerer {
                             (field.bit_offset, field.bit_width)
                         {
                             self.store_bitfield(
-                                field_addr, field_ty, bit_offset, bit_width, val, false,
+                                field_addr, field_ty, bit_offset, bit_width, val, false, field.sso,
                             );
                         } else {
+                            let val = self.emit_sso_store_fixup(val, field_ty, field.sso);
                             self.emit(Instruction::Store {
                                 volatile: false,
                                 val,
@@ -1735,7 +1736,7 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Struct(Some(tag), _, _, _, _) = type_spec {
+        if let TypeSpecifier::Struct(Some(tag), ..) = type_spec {
             let key = format!("struct.{}", tag);
             if let Some(&vla_size) = self
                 .func_state
@@ -1745,7 +1746,7 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Union(Some(tag), _, _, _, _) = type_spec {
+        if let TypeSpecifier::Union(Some(tag), ..) = type_spec {
             let key = format!("union.{}", tag);
             if let Some(&vla_size) = self
                 .func_state
@@ -1792,10 +1793,10 @@ impl Lowerer {
                     Some(dim_value)
                 }
             }
-            TypeSpecifier::Struct(_, Some(fields), is_packed, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), is_packed, ..) => {
                 self.compute_vla_struct_sizeof(fields, false, *is_packed)
             }
-            TypeSpecifier::Union(_, Some(fields), is_packed, _, _) => {
+            TypeSpecifier::Union(_, Some(fields), is_packed, ..) => {
                 self.compute_vla_struct_sizeof(fields, true, *is_packed)
             }
             TypeSpecifier::TypedefName(name) => {

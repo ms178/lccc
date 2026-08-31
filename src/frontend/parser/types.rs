@@ -121,7 +121,7 @@ impl Parser {
                 }
                 // GNU extensions
                 TokenKind::Attribute => {
-                    let (_, aligned, mk, _) = self.parse_gcc_attributes();
+                    let (_, aligned, mk, _, _) = self.parse_gcc_attributes();
                     mode_kind = mode_kind.or(mk);
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
@@ -451,7 +451,7 @@ impl Parser {
                         self.attrs.set_inline(true);
                     }
                     TokenKind::Attribute => {
-                        let (_, aligned, mk, _) = self.parse_gcc_attributes();
+                        let (_, aligned, mk, _, _) = self.parse_gcc_attributes();
                         *mode_kind = mode_kind.or(mk);
                         if let Some(a) = aligned {
                             self.attrs.parsed_alignas =
@@ -669,7 +669,7 @@ impl Parser {
 
     /// Parse a struct or union definition/reference.
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
-        let (mut is_packed, mut struct_aligned, _, _) = self.parse_gcc_attributes();
+        let (mut is_packed, mut struct_aligned, _, _, mut sso) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -677,10 +677,13 @@ impl Parser {
         } else {
             None
         };
-        let (packed2, aligned2, _, _) = self.parse_gcc_attributes();
+        let (packed2, aligned2, _, _, sso2) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
         if aligned2.is_some() {
             struct_aligned = aligned2;
+        }
+        if sso2.is_some() {
+            sso = sso2;
         }
         let fields = if matches!(self.peek(), TokenKind::LBrace) {
             // Save and restore parsing_const across struct field parsing.
@@ -694,17 +697,39 @@ impl Parser {
         } else {
             None
         };
-        let (packed3, aligned3, _, _) = self.parse_gcc_attributes();
+        let (packed3, aligned3, _, _, sso3) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
         if aligned3.is_some() {
             struct_aligned = aligned3;
         }
+        if sso3.is_some() {
+            sso = sso3;
+        }
         // Apply current #pragma pack alignment to struct definition
         let max_field_align = self.pragma_pack_align;
+        // Both supported targets (x86-64, i686) are little-endian, so the
+        // storage order is reversed exactly when "big-endian" was requested.
+        // When a big-endian target is ever added, this must become
+        // `sso == Some(!target_is_big_endian)`.
+        let reverse_sso = sso == Some(true);
         let ts = if is_struct {
-            TypeSpecifier::Struct(name, fields, is_packed, max_field_align, struct_aligned)
+            TypeSpecifier::Struct(
+                name,
+                fields,
+                is_packed,
+                max_field_align,
+                struct_aligned,
+                Some(reverse_sso),
+            )
         } else {
-            TypeSpecifier::Union(name, fields, is_packed, max_field_align, struct_aligned)
+            TypeSpecifier::Union(
+                name,
+                fields,
+                is_packed,
+                max_field_align,
+                struct_aligned,
+                Some(reverse_sso),
+            )
         };
         // Record alignment for named struct/union definitions so that later
         // tag-only references (e.g., __alignof__(struct foo)) can look it up.
@@ -721,7 +746,7 @@ impl Parser {
 
     /// Parse an enum definition/reference.
     fn parse_enum_specifier(&mut self) -> TypeSpecifier {
-        let (mut is_packed, _, _, _) = self.parse_gcc_attributes();
+        let (mut is_packed, _, _, _, _) = self.parse_gcc_attributes();
         let name = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -729,7 +754,7 @@ impl Parser {
         } else {
             None
         };
-        let (packed2, _, _, _) = self.parse_gcc_attributes();
+        let (packed2, _, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
         let variants = if matches!(self.peek(), TokenKind::LBrace) {
             let v = self.parse_enum_variants();
@@ -740,7 +765,7 @@ impl Parser {
         } else {
             None
         };
-        let (packed3, _, _, _) = self.parse_gcc_attributes();
+        let (packed3, _, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
         TypeSpecifier::Enum(name, variants, is_packed)
     }
@@ -817,7 +842,7 @@ impl Parser {
                     self.attrs.set_inline(true);
                 }
                 TokenKind::Attribute => {
-                    let (_, aligned, _, _) = self.parse_gcc_attributes();
+                    let (_, aligned, _, _, _) = self.parse_gcc_attributes();
                     if let Some(a) = aligned {
                         self.attrs.parsed_alignas =
                             Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
@@ -948,7 +973,7 @@ impl Parser {
             };
 
             // Parse any additional trailing GCC __attribute__ (e.g., after bitfield width)
-            let (extra_packed, extra_aligned, _, _) = self.parse_gcc_attributes();
+            let (extra_packed, extra_aligned, _, _, _) = self.parse_gcc_attributes();
 
             // Combine alignment sources: explicit attribute on declarator,
             // extra attribute after bitfield, or _Alignas from type specifier
@@ -1007,7 +1032,7 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    let (_, attr_aligned, _, _) = self.parse_gcc_attributes();
+                    let (_, attr_aligned, _, _, _) = self.parse_gcc_attributes();
                     if attr_aligned.is_some() {
                         *alignas = attr_aligned;
                     }

@@ -8,7 +8,7 @@
 //! - Arithmetic conversion helpers: usual_arithmetic_conversions, promote_for_op, narrow_from_op
 
 use super::lower::Lowerer;
-use crate::common::types::{widened_op_type, AddressSpace, CType, IrType};
+use crate::common::types::{widened_op_type, AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
 
@@ -151,20 +151,30 @@ impl Lowerer {
     pub(super) fn resolve_bitfield_lvalue(
         &mut self,
         expr: &Expr,
-    ) -> Option<(Value, IrType, u32, u32)> {
+    ) -> Option<(Value, IrType, u32, u32, SsoMode)> {
         let (base_expr, field_name, is_pointer) = match expr {
             Expr::MemberAccess(base, field, _) => (base.as_ref(), field.as_str(), false),
             Expr::PointerMemberAccess(base, field, _) => (base.as_ref(), field.as_str(), true),
             _ => return None,
         };
 
-        let (field_offset, storage_ty, bitfield) = if is_pointer {
+        let (field_offset, declared_ty, bitfield) = if is_pointer {
             self.resolve_pointer_member_access_full(base_expr, field_name)
         } else {
             self.resolve_member_access_full(base_expr, field_name)
         };
 
         let (bit_offset, bit_width) = bitfield?;
+
+        // Reverse SSO bitfields in a multi-byte unit load the WHOLE unit.
+        let (sso, sso_unit_ty) = self.sso_storage_of_member(base_expr, is_pointer, field_name);
+        let storage_ty = match (&sso, bitfield.is_some()) {
+            (SsoMode::ByteSwapUnit(_), true) => sso_unit_ty
+                .as_ref()
+                .map(IrType::from_ctype)
+                .unwrap_or(declared_ty),
+            _ => declared_ty,
+        };
 
         let base_addr = if is_pointer {
             let ptr_val = self.lower_expr(base_expr);
@@ -181,7 +191,7 @@ impl Lowerer {
             ty: storage_ty,
         });
 
-        Some((field_addr, storage_ty, bit_offset, bit_width))
+        Some((field_addr, storage_ty, bit_offset, bit_width, sso))
     }
 
     /// Integer-promotion result used by arithmetic on a bit-field. Fields wider
@@ -246,7 +256,8 @@ impl Lowerer {
 
     /// Try to lower assignment to a bitfield member.
     fn try_lower_bitfield_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(lhs)?;
+        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+            self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
         let rhs_val = self.lower_expr(rhs);
         let rhs_ty = self.value_ir_type(rhs);
@@ -266,6 +277,7 @@ impl Lowerer {
             bit_width,
             store_val,
             self.expr_access_is_volatile(lhs),
+            sso,
         );
         Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
     }
@@ -277,11 +289,12 @@ impl Lowerer {
         lhs: &Expr,
         rhs: &Expr,
     ) -> Option<Operand> {
-        let (field_addr, storage_ty, bit_offset, bit_width) = self.resolve_bitfield_lvalue(lhs)?;
+        let (field_addr, storage_ty, bit_offset, bit_width, sso) =
+            self.resolve_bitfield_lvalue(lhs)?;
         let is_bool = self.is_bool_lvalue(lhs);
 
         let current_val =
-            self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width);
+            self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
         let current_ty = crate::ir::lowering::expr_types::bitfield_promoted_type(
             storage_ty,
             Some((bit_offset, bit_width)),
@@ -313,12 +326,15 @@ impl Lowerer {
             bit_width,
             store_val,
             self.expr_access_is_volatile(lhs),
+            sso,
         );
         Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
     }
 
     /// Store a value into a bitfield: load storage unit, clear field bits, OR in new value, store back.
     /// Handles packed bitfields that span beyond the storage type (bit_offset + bit_width > storage_bits).
+    /// `sso` applies the reverse-storage-order byte fixups on both the loaded
+    /// old unit and the new unit about to be stored.
     pub(super) fn store_bitfield(
         &mut self,
         addr: Value,
@@ -327,6 +343,7 @@ impl Lowerer {
         bit_width: u32,
         val: Operand,
         volatile: bool,
+        sso: SsoMode,
     ) {
         if bit_width >= 64 && bit_offset == 0 {
             // Ensure the value is widened to the storage type (e.g., I32 -> I64)
@@ -352,9 +369,10 @@ impl Lowerer {
                     }
                 }
             };
+            let stored = self.emit_sso_store_fixup(widened, storage_ty, sso);
             self.emit(Instruction::Store {
                 volatile: false,
-                val: widened,
+                val: stored,
                 ptr: addr,
                 ty: storage_ty,
                 seg_override: AddressSpace::Default,
@@ -374,6 +392,7 @@ impl Lowerer {
                 bit_width,
                 val,
                 volatile,
+                sso,
             );
             return;
         }
@@ -415,6 +434,7 @@ impl Lowerer {
             ty: storage_ty,
             seg_override: AddressSpace::Default,
         });
+        let old_fixed = self.emit_sso_load_fixup(Operand::Value(old_val), storage_ty, sso);
 
         let clear_mask = if bit_width >= op_bits {
             0u64
@@ -423,7 +443,7 @@ impl Lowerer {
         };
         let cleared = self.emit_binop_val(
             IrBinOp::And,
-            Operand::Value(old_val),
+            old_fixed,
             Operand::Const(IrConst::I64(clear_mask as i64)),
             op_ty,
         );
@@ -434,9 +454,10 @@ impl Lowerer {
             op_ty,
         );
 
+        let stored = self.emit_sso_store_fixup(Operand::Value(new_val), storage_ty, sso);
         self.emit(Instruction::Store {
             volatile,
-            val: Operand::Value(new_val),
+            val: stored,
             ptr: addr,
             ty: storage_ty,
             seg_override: AddressSpace::Default,
@@ -454,6 +475,7 @@ impl Lowerer {
         bit_width: u32,
         val: Operand,
         volatile: bool,
+        sso: SsoMode,
     ) {
         let low_bits = storage_bits - bit_offset;
         let high_bits = bit_width - low_bits;
@@ -508,10 +530,11 @@ impl Lowerer {
             ty: storage_ty,
             seg_override: AddressSpace::Default,
         });
+        let old_low_fixed = self.emit_sso_load_fixup(Operand::Value(old_low), storage_ty, sso);
         let low_clear = !(low_mask << bit_offset);
         let cleared_low = self.emit_binop_val(
             IrBinOp::And,
-            Operand::Value(old_low),
+            old_low_fixed,
             Operand::Const(IrConst::I64(low_clear as i64)),
             op_ty,
         );
@@ -521,9 +544,10 @@ impl Lowerer {
             Operand::Value(shifted_low),
             op_ty,
         );
+        let new_low_fixed = self.emit_sso_store_fixup(Operand::Value(new_low), storage_ty, sso);
         self.emit(Instruction::Store {
             volatile: false,
-            val: Operand::Value(new_low),
+            val: new_low_fixed,
             ptr: addr,
             ty: storage_ty,
             seg_override: AddressSpace::Default,
@@ -559,10 +583,11 @@ impl Lowerer {
             ty: storage_ty,
             seg_override: AddressSpace::Default,
         });
+        let old_high_fixed = self.emit_sso_load_fixup(Operand::Value(old_high), storage_ty, sso);
         let high_clear = !high_mask;
         let cleared_high = self.emit_binop_val(
             IrBinOp::And,
-            Operand::Value(old_high),
+            old_high_fixed,
             Operand::Const(IrConst::I64(high_clear as i64)),
             op_ty,
         );
@@ -572,19 +597,20 @@ impl Lowerer {
             Operand::Value(masked_high),
             op_ty,
         );
+        let new_high_fixed = self.emit_sso_store_fixup(Operand::Value(new_high), storage_ty, sso);
         self.emit(Instruction::Store {
             volatile: false,
-            val: Operand::Value(new_high),
+            val: new_high_fixed,
             ptr: high_addr,
             ty: storage_ty,
             seg_override: AddressSpace::Default,
         });
     }
 
-    /// Extract a bitfield value from a loaded storage unit.
+    /// Extract a bitfield value from a loaded (and SSO-fixed-up) storage unit.
     pub(super) fn extract_bitfield(
         &mut self,
-        loaded: Value,
+        loaded: Operand,
         storage_ty: IrType,
         bit_offset: u32,
         bit_width: u32,
@@ -599,16 +625,17 @@ impl Lowerer {
         );
 
         if bit_width >= op_bits && bit_offset == 0 {
-            return self.emit_implicit_cast(Operand::Value(loaded), storage_ty, promoted_ty);
+            return self.emit_implicit_cast(loaded, storage_ty, promoted_ty);
         }
 
         // Widen the loaded value to the operation type before performing shift/mask.
         // On i686 with I32 op_ty, a sub-32-bit storage (I8/I16) needs widening to I32.
         // On 64-bit targets, everything widens to I64.
-        let widened = if storage_ty.size() < op_ty.size() {
+        let widened: Operand = if storage_ty.size() < op_ty.size() {
             let unsigned_storage = storage_ty.to_unsigned();
             let target_unsigned = op_ty.to_unsigned();
-            self.emit_cast_val(Operand::Value(loaded), unsigned_storage, target_unsigned)
+            let v = self.emit_cast_val(loaded, unsigned_storage, target_unsigned);
+            Operand::Value(v)
         } else {
             loaded
         };
@@ -618,7 +645,7 @@ impl Lowerer {
         let raw = if storage_ty.is_signed() {
             let shl_amount = op_bits - bit_offset - bit_width;
             let ashr_amount = op_bits - bit_width;
-            let mut val = Operand::Value(widened);
+            let mut val = widened.clone();
             if shl_amount > 0 && shl_amount < op_bits {
                 let shifted = self.emit_binop_val(
                     IrBinOp::Shl,
@@ -640,7 +667,7 @@ impl Lowerer {
                 val
             }
         } else {
-            let mut val = Operand::Value(widened);
+            let mut val = widened.clone();
             if bit_offset > 0 {
                 let shifted = self.emit_binop_val(
                     IrBinOp::LShr,
@@ -668,12 +695,16 @@ impl Lowerer {
     }
 
     /// Extract a bitfield from memory, handling the case where it spans two storage units.
+    /// `sso` is the field's reverse-scalar_storage_order mode: the loaded storage
+    /// unit(s) must be byte-fixed-up (bswap / per-byte bit-reverse) before the
+    /// bit math, which always operates on the logical (host-order) unit value.
     pub(super) fn extract_bitfield_from_addr(
         &mut self,
         addr: Value,
         storage_ty: IrType,
         bit_offset: u32,
         bit_width: u32,
+        sso: SsoMode,
     ) -> Operand {
         let storage_bits = (storage_ty.size() * 8) as u32;
 
@@ -694,15 +725,17 @@ impl Lowerer {
                 ty: storage_ty,
                 seg_override: AddressSpace::Default,
             });
+            let low_fixed = self.emit_sso_load_fixup(Operand::Value(low_loaded), storage_ty, sso);
+            let low_fixed_v = match &low_fixed { Operand::Value(v) => *v, Operand::Const(_) => unreachable!() };
             let low_val = if bit_offset > 0 {
                 self.emit_binop_val(
                     IrBinOp::LShr,
-                    Operand::Value(low_loaded),
+                    low_fixed,
                     Operand::Const(IrConst::I64(bit_offset as i64)),
                     op_ty,
                 )
             } else {
-                low_loaded
+                low_fixed_v
             };
             let low_mask = if low_bits >= op_bits {
                 u64::MAX
@@ -726,6 +759,7 @@ impl Lowerer {
                 ty: storage_ty,
                 seg_override: AddressSpace::Default,
             });
+            let high_fixed = self.emit_sso_load_fixup(Operand::Value(high_loaded), storage_ty, sso);
             let high_mask = if high_bits >= op_bits {
                 u64::MAX
             } else {
@@ -733,7 +767,7 @@ impl Lowerer {
             };
             let masked_high = self.emit_binop_val(
                 IrBinOp::And,
-                Operand::Value(high_loaded),
+                high_fixed,
                 Operand::Const(IrConst::I64(high_mask as i64)),
                 op_ty,
             );
@@ -787,7 +821,8 @@ impl Lowerer {
                 ty: storage_ty,
                 seg_override: AddressSpace::Default,
             });
-            self.extract_bitfield(loaded, storage_ty, bit_offset, bit_width)
+            let fixed = self.emit_sso_load_fixup(Operand::Value(loaded), storage_ty, sso);
+            self.extract_bitfield(fixed, storage_ty, bit_offset, bit_width)
         }
     }
 

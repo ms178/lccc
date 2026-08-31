@@ -930,7 +930,14 @@ impl<'a> SemaConstEval<'a> {
                 Some(elem_size * n as usize)
             }
             TypeSpecifier::Array(_, None) => Some(ptr_sz), // incomplete array
-            TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Struct(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 // Look up cached layout for tagged structs
                 if let Some(tag) = tag {
                     let key = format!("struct.{}", tag);
@@ -947,6 +954,7 @@ impl<'a> SemaConstEval<'a> {
                                 &struct_fields,
                                 max_field_align,
                                 &*self.types.borrow_struct_layouts(),
+                                reverse_sso.is_some_and(|v| v),
                             );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -960,7 +968,14 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(0)
             }
-            TypeSpecifier::Union(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Union(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     let key = format!("union.{}", tag);
                     if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
@@ -975,6 +990,7 @@ impl<'a> SemaConstEval<'a> {
                             &union_fields,
                             max_field_align,
                             &*self.types.borrow_struct_layouts(),
+                            reverse_sso.is_some_and(|v| v),
                         );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -1095,7 +1111,14 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
             TypeSpecifier::Array(elem, _) => self.alignof_type_spec(elem),
-            TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Struct(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     let key = format!("struct.{}", tag);
                     if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
@@ -1111,6 +1134,7 @@ impl<'a> SemaConstEval<'a> {
                                 &struct_fields,
                                 max_field_align,
                                 &*self.types.borrow_struct_layouts(),
+                                reverse_sso.is_some_and(|v| v),
                             );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -1122,7 +1146,14 @@ impl<'a> SemaConstEval<'a> {
                 }
                 struct_aligned.unwrap_or(1)
             }
-            TypeSpecifier::Union(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Union(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     let key = format!("union.{}", tag);
                     if let Some(layout) = self.types.borrow_struct_layouts().get(&key) {
@@ -1137,6 +1168,7 @@ impl<'a> SemaConstEval<'a> {
                             &union_fields,
                             max_field_align,
                             &*self.types.borrow_struct_layouts(),
+                            reverse_sso.is_some_and(|v| v),
                         );
                         if let Some(a) = struct_aligned {
                             if *a > layout.align {
@@ -1321,14 +1353,14 @@ fn ctype_from_type_spec(spec: &TypeSpecifier, types: &TypeContext) -> CType {
                 CType::Int // fallback
             }
         }
-        TypeSpecifier::Struct(tag, _, _, _, _) => {
+        TypeSpecifier::Struct(tag, ..) => {
             if let Some(tag) = tag {
                 CType::Struct(format!("struct.{}", tag).into())
             } else {
                 CType::Int // anonymous struct without context
             }
         }
-        TypeSpecifier::Union(tag, _, _, _, _) => {
+        TypeSpecifier::Union(tag, ..) => {
             if let Some(tag) = tag {
                 CType::Union(format!("union.{}", tag).into())
             } else {

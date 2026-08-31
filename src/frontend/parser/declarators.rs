@@ -54,7 +54,7 @@ impl Parser {
 
         let mut pre_aligned: Option<usize> = None;
         let mut is_packed = false;
-        let (pre_packed, pre_align, _, _) = self.parse_gcc_attributes();
+        let (pre_packed, pre_align, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || pre_packed;
         if let Some(a) = pre_align {
             pre_aligned = Some(pre_aligned.map_or(a, |prev: usize| prev.max(a)));
@@ -123,7 +123,7 @@ impl Parser {
         // Combine using inside-out rule
         let combined = self.combine_declarator_parts(derived, inner_derived, outer_suffixes);
 
-        let (post_packed, post_aligned, mode_kind, has_common) = self.parse_gcc_attributes();
+        let (post_packed, post_aligned, mode_kind, has_common, _) = self.parse_gcc_attributes();
         is_packed = is_packed || post_packed;
         let aligned = match (pre_aligned, post_aligned) {
             (Some(a), Some(b)) => Some(a.max(b)),

@@ -685,7 +685,14 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::ULongLong
                 }
             }
-            TypeSpecifier::Struct(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Struct(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     CType::Struct(format!("struct.{}", tag).into())
                 } else if let Some(fs) = fields {
@@ -699,13 +706,21 @@ impl<'a> ExprTypeChecker<'a> {
                         *is_packed,
                         *pragma_pack,
                         *struct_aligned,
+                        reverse_sso.is_some_and(|v| v),
                     )
                 } else {
                     // Anonymous forward declaration (no tag, no fields)
                     CType::Int
                 }
             }
-            TypeSpecifier::Union(tag, fields, is_packed, pragma_pack, struct_aligned) => {
+            TypeSpecifier::Union(
+                tag,
+                fields,
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => {
                 if let Some(tag) = tag {
                     CType::Union(format!("union.{}", tag).into())
                 } else if let Some(fs) = fields {
@@ -716,6 +731,7 @@ impl<'a> ExprTypeChecker<'a> {
                         *is_packed,
                         *pragma_pack,
                         *struct_aligned,
+                        reverse_sso.is_some_and(|v| v),
                     )
                 } else {
                     // Anonymous forward declaration (no tag, no fields)
@@ -771,6 +787,7 @@ impl<'a> ExprTypeChecker<'a> {
         is_packed: bool,
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
+        reverse_sso: bool,
     ) -> CType {
         use crate::common::types::{StructField, StructLayout};
 
@@ -812,12 +829,14 @@ impl<'a> ExprTypeChecker<'a> {
                 &struct_fields,
                 max_field_align,
                 &*self.types.borrow_struct_layouts(),
+                reverse_sso,
             )
         } else {
             StructLayout::for_struct_with_packing(
                 &struct_fields,
                 max_field_align,
                 &*self.types.borrow_struct_layouts(),
+                reverse_sso,
             )
         };
 

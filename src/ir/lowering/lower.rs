@@ -18,7 +18,7 @@ use crate::backend::Target;
 use crate::common::error::DiagnosticEngine;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
-use crate::common::types::{AddressSpace, CType, IrType};
+use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     DerivedDeclarator, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit, TypeSpecifier,
 };
@@ -26,7 +26,7 @@ use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrCmpOp, IrConst, IrModule, Operand,
-    Terminator, Value,
+    Terminator, Value, IrUnaryOp,
 };
 use std::cell::RefCell;
 use std::mem::Discriminant;
@@ -1488,6 +1488,261 @@ impl Lowerer {
         dest
     }
 
+    // === Reverse scalar_storage_order helpers ===
+    //
+    // Fields of records with `__attribute__((scalar_storage_order("big-endian")))`
+    // (on little-endian targets) are stored byte-reversed. The layout records the
+    // per-field SsoMode; these helpers emit the byte-manipulation at access time.
+
+    /// Byteswap the raw representation of an integer `val` at the width of `ty`.
+    pub(super) fn emit_sso_bswap_int(&mut self, val: Operand, ty: IrType) -> Operand {
+        let dest = self.fresh_value();
+        self.emit(Instruction::UnaryOp {
+            dest,
+            op: IrUnaryOp::Bswap,
+            src: val,
+            ty,
+        });
+        Operand::Value(dest)
+    }
+
+    /// Bit-reinterpret `val` between two same-size types via a temporary
+    /// alloca (no value conversion — IR Cast between int/float is a VALUE
+    /// conversion, so raw reinterpretation must go through memory).
+    pub(super) fn emit_bit_reinterpret(&mut self, val: Operand, from: IrType, to: IrType) -> Operand {
+        debug_assert_eq!(from.size(), to.size(), "bit reinterpret requires same size");
+        let tmp = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: tmp,
+            ty: from,
+            size: from.size(),
+            align: from.size(),
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr: tmp,
+            ty: from,
+            seg_override: AddressSpace::Default,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest,
+            ptr: tmp,
+            ty: to,
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(dest)
+    }
+
+    /// Reverse the bits of each BYTE of `val` (an integer of type `ty`),
+    /// preserving byte order. Used for packed bitfields under reverse SSO,
+    /// where the bit stream fills each byte MSB-first. Implemented with the
+    /// classic 3-step shift/mask ladder (BitReverse is not available on i686).
+    pub(super) fn emit_sso_bitrev_bytes(&mut self, val: Operand, ty: IrType) -> Operand {
+        let uty = ty.to_unsigned();
+        let start = self.emit_implicit_cast(val, ty, uty);
+        let mut cur = self.operand_to_value(start);
+        let bytes = uty.size();
+        for i in 0..bytes {
+            let shift = 8 * i as i64;
+            // Extract byte i to bit position 0.
+            let byte = if shift > 0 {
+                let shifted = self.emit_binop_val(
+                    IrBinOp::LShr,
+                    Operand::Value(cur),
+                    Operand::Const(IrConst::I64(shift)),
+                    uty,
+                );
+                self.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(shifted),
+                    Operand::Const(IrConst::I64(0xFF)),
+                    uty,
+                )
+            } else {
+                self.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(cur),
+                    Operand::Const(IrConst::I64(0xFF)),
+                    uty,
+                )
+            };
+            // 3-step bit-reverse of the isolated byte.
+            let b = |s: &mut Self, x: Value, op: IrBinOp, k: i64, m: i64| -> (Value, Value) {
+                let a = s.emit_binop_val(op, Operand::Value(x), Operand::Const(IrConst::I64(k)), uty);
+                let b = s.emit_binop_val(IrBinOp::And, Operand::Value(a), Operand::Const(IrConst::I64(m)), uty);
+                (a, b)
+            };
+            // rev = ((byte & 0x55) << 1) | ((byte >> 1) & 0x55)
+            let (a1, m1) = b(self, byte, IrBinOp::And, 1, 0x55);
+            let (t1, m2) = b(self, m1, IrBinOp::LShr, 1, 0x55);
+            let _ = t1;
+            let mut rev = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m1), Operand::Const(IrConst::I64(1)), uty);
+            rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(rev), Operand::Value(m2), uty);
+            let _ = a1;
+            // rev = ((rev & 0x33) << 2) | ((rev >> 2) & 0x33)
+            let (t2, m3) = b(self, rev, IrBinOp::And, 2, 0x33);
+            let _ = t2;
+            let sh2 = self.emit_binop_val(IrBinOp::LShr, Operand::Value(m3), Operand::Const(IrConst::I64(2)), uty);
+            let m4 = self.emit_binop_val(IrBinOp::And, Operand::Value(sh2), Operand::Const(IrConst::I64(0x33)), uty);
+            let sh2b = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m3), Operand::Const(IrConst::I64(2)), uty);
+            rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(sh2b), Operand::Value(m4), uty);
+            // rev = ((rev & 0x0F) << 4) | ((rev >> 4) & 0x0F)
+            let (t3, m5) = b(self, rev, IrBinOp::And, 4, 0x0F);
+            let _ = t3;
+            let sh3 = self.emit_binop_val(IrBinOp::LShr, Operand::Value(m5), Operand::Const(IrConst::I64(4)), uty);
+            let m6 = self.emit_binop_val(IrBinOp::And, Operand::Value(sh3), Operand::Const(IrConst::I64(0x0F)), uty);
+            let sh3b = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m5), Operand::Const(IrConst::I64(4)), uty);
+            rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(sh3b), Operand::Value(m6), uty);
+            // Re-insert at byte i.
+            if shift > 0 {
+                let rev_shifted = self.emit_binop_val(
+                    IrBinOp::Shl,
+                    Operand::Value(rev),
+                    Operand::Const(IrConst::I64(shift)),
+                    uty,
+                );
+                let clear = self.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(cur),
+                    Operand::Const(IrConst::I64(!(0xFFi64 << shift))),
+                    uty,
+                );
+                cur = self.emit_binop_val(IrBinOp::Or, Operand::Value(clear), Operand::Value(rev_shifted), uty);
+            } else {
+                cur = rev;
+            }
+        }
+        Operand::Value(cur)
+    }
+
+    /// Apply the reverse-SSO storage transformation to a whole storage-unit
+    /// value: byteswap (and, for 16-byte units, half-swap) the raw bits.
+    /// Float types go through a bit-exact reinterpret first.
+    pub(super) fn emit_sso_swap_unit(&mut self, val: Operand, ty: IrType, unit_bytes: u32) -> Operand {
+        let (int_ty, val_int) = if ty.is_integer() {
+            (ty.to_unsigned(), val.clone())
+        } else {
+            // Float members: reinterpret the raw bits as an integer of the
+            // same size, swap, and reinterpret back.
+            match (unit_bytes as usize, ty) {
+                (4, IrType::F32) => {
+                    let as_int = self.emit_bit_reinterpret(val, IrType::F32, IrType::U32);
+                    let swapped = self.emit_sso_bswap_int(as_int, IrType::U32);
+                    return self.emit_bit_reinterpret(swapped, IrType::U32, IrType::F32);
+                }
+                (8, IrType::F64) => {
+                    let as_int = self.emit_bit_reinterpret(val, IrType::F64, IrType::U64);
+                    let swapped = self.emit_sso_bswap_int(as_int, IrType::U64);
+                    return self.emit_bit_reinterpret(swapped, IrType::U64, IrType::F64);
+                }
+                _ => {
+                    // Unhandled float width (e.g. F128/x87 long double):
+                    // conservative fallback: two 8-byte halves.
+                    return self.emit_sso_swap_unit_16(val, ty);
+                }
+            }
+            #[allow(unreachable_code)]
+            (ty.to_unsigned(), val.clone())
+        };
+        match unit_bytes {
+            2 => self.emit_sso_bswap_int(val_int, IrType::U16),
+            4 => self.emit_sso_bswap_int(val_int, IrType::U32),
+            8 => {
+                let casted = self.emit_cast_val(val_int, int_ty, IrType::U64);
+                Operand::Value(casted)
+            }
+            16 => self.emit_sso_swap_unit_16(val_int, int_ty),
+            _ => val,
+        }
+    }
+
+    /// 16-byte unit swap: bswap each 8-byte half and exchange the halves.
+    fn emit_sso_swap_unit_16(&mut self, val: Operand, ty: IrType) -> Operand {
+        // Round-trip through a 16-byte temp so we can address both halves.
+        let tmp = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: tmp,
+            ty: IrType::U128,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr: tmp,
+            ty,
+            seg_override: AddressSpace::Default,
+        });
+        // Reinterpretation note: for 16-byte float carriers the raw bytes are
+        // what matters, so load as U64 halves directly.
+        let lo_ptr = self.emit_gep_offset(tmp, 0, IrType::U64);
+        let hi_ptr = self.emit_gep_offset(tmp, 8, IrType::U64);
+        let lo = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: lo,
+            ptr: lo_ptr,
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        });
+        let hi = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest: hi,
+            ptr: hi_ptr,
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        });
+        let lo_swapped = self.emit_sso_bswap_int(Operand::Value(lo), IrType::U64);
+        let hi_swapped = self.emit_sso_bswap_int(Operand::Value(hi), IrType::U64);
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: hi_swapped,
+            ptr: lo_ptr,
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: lo_swapped,
+            ptr: hi_ptr,
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            volatile: false,
+            dest,
+            ptr: tmp,
+            ty,
+            seg_override: AddressSpace::Default,
+        });
+        Operand::Value(dest)
+    }
+
+    /// Fix up a loaded storage unit according to the field's SsoMode before
+    /// bit extraction / value use.
+    pub(super) fn emit_sso_load_fixup(&mut self, loaded: Operand, ty: IrType, sso: SsoMode) -> Operand {
+        match sso {
+            SsoMode::None => loaded,
+            SsoMode::ByteSwapUnit(u) => self.emit_sso_swap_unit(loaded, ty, u),
+            SsoMode::ByteBitReverse => self.emit_sso_bitrev_bytes(loaded, ty),
+        }
+    }
+
+    /// Inverse fixup on a unit value about to be stored (same transform —
+    /// bswap and per-byte bit-reverse are involutions).
+    pub(super) fn emit_sso_store_fixup(&mut self, val: Operand, ty: IrType, sso: SsoMode) -> Operand {
+        self.emit_sso_load_fixup(val, ty, sso)
+    }
+
     // === _Float128 (binary128) soft-float call helpers ===
     //
     // _Float128 arithmetic/comparison/conversion is lowered to calls of the
@@ -1972,8 +2227,8 @@ impl Lowerer {
                     }
                 }
             }
-            TypeSpecifier::Struct(_, Some(fields), _, _, _)
-            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
                 for field in fields {
                     self.collect_enum_constants_impl(&field.type_spec, scoped);
                 }

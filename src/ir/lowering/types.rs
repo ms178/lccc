@@ -56,7 +56,7 @@ impl Lowerer {
     /// Check if a TypeSpecifier is a transparent union (passed as first member for ABI).
     pub(super) fn is_transparent_union(&self, ts: &TypeSpecifier) -> bool {
         let key = match ts {
-            TypeSpecifier::Union(tag, _, _, _, _) => tag
+            TypeSpecifier::Union(tag, ..) => tag
                 .as_ref()
                 .map(|t| -> Rc<str> { format!("union.{}", t).into() }),
             TypeSpecifier::TypedefName(name) => {
@@ -375,7 +375,14 @@ impl Lowerer {
     /// Returns an Rc<StructLayout> for cheap cloning.
     fn struct_union_layout(&self, ts: &TypeSpecifier) -> Option<RcLayout> {
         match ts {
-            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _) => {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+            ) => {
                 // Use cached layout for tagged structs
                 if let Some(tag) = tag {
                     if let Some(layout) = self
@@ -391,9 +398,17 @@ impl Lowerer {
                     fields,
                     false,
                     max_field_align,
+                    reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _) => {
+            TypeSpecifier::Union(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                _,
+                reverse_sso,
+            ) => {
                 // Use cached layout for tagged unions
                 if let Some(tag) = tag {
                     if let Some(layout) = self
@@ -409,12 +424,13 @@ impl Lowerer {
                     fields,
                     true,
                     max_field_align,
+                    reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Struct(Some(tag), None, ..) => {
                 self.get_struct_union_layout_by_tag("struct", tag)
             }
-            TypeSpecifier::Union(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Union(Some(tag), None, ..) => {
                 self.get_struct_union_layout_by_tag("union", tag)
             }
             _ => None,
@@ -426,6 +442,7 @@ impl Lowerer {
         fields: &[StructFieldDecl],
         is_union: bool,
         max_field_align: Option<usize>,
+        reverse_sso: bool,
     ) -> StructLayout {
         let struct_fields: Vec<StructField> = fields
             .iter()
@@ -473,12 +490,14 @@ impl Lowerer {
                 &struct_fields,
                 max_field_align,
                 &*self.types.borrow_struct_layouts(),
+                reverse_sso,
             )
         } else {
             StructLayout::for_struct_with_packing(
                 &struct_fields,
                 max_field_align,
                 &*self.types.borrow_struct_layouts(),
+                reverse_sso,
             )
         }
     }

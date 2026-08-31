@@ -969,8 +969,8 @@ impl SemanticAnalyzer {
                     }
                 }
             }
-            TypeSpecifier::Struct(_, Some(fields), _, _, _)
-            | TypeSpecifier::Union(_, Some(fields), _, _, _) => {
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
                 for field in fields {
                     self.collect_enum_constants_from_type_spec(&field.type_spec);
                 }
@@ -2171,7 +2171,7 @@ impl SemanticAnalyzer {
     /// Reports an error like GCC: "invalid application of 'sizeof' to incomplete type"
     fn check_sizeof_incomplete_type(&self, ts: &TypeSpecifier, span: Span) {
         match ts {
-            TypeSpecifier::Struct(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Struct(Some(tag), None, ..) => {
                 // Reference to a named struct with no inline body.
                 // Check if it was previously defined (key format: "struct.tag").
                 let key = format!("struct.{}", tag);
@@ -2182,7 +2182,7 @@ impl SemanticAnalyzer {
                     );
                 }
             }
-            TypeSpecifier::Union(Some(tag), None, _, _, _) => {
+            TypeSpecifier::Union(Some(tag), None, ..) => {
                 let key = format!("union.{}", tag);
                 if !self.defined_structs.borrow().contains(key.as_str()) {
                     self.diagnostics
@@ -2433,6 +2433,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
         is_packed: bool,
         pragma_pack: Option<usize>,
         struct_aligned: Option<usize>,
+        reverse_sso: bool,
     ) -> CType {
         let prefix = if is_union { "union" } else { "struct" };
         let struct_fields = fields
@@ -2459,12 +2460,14 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                     &struct_fields,
                     max_field_align,
                     &*self.result.type_context.borrow_struct_layouts(),
+                    reverse_sso,
                 )
             } else {
                 StructLayout::for_struct_with_packing(
                     &struct_fields,
                     max_field_align,
                     &*self.result.type_context.borrow_struct_layouts(),
+                    reverse_sso,
                 )
             };
             if let Some(a) = struct_aligned {
@@ -2491,6 +2494,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 align,
                 is_union,
                 is_transparent_union: false,
+                reverse_sso: false,
             };
             self.result
                 .type_context
