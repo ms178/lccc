@@ -161,12 +161,34 @@ pub(super) fn load_libraries(
         libs_to_scan.extend(extra_libs.iter().cloned());
 
         for lib in &libs_to_scan {
+            // libgcc is dual-resolved like GNU ld's -lgcc_s -lgcc pair: the
+            // shared object provides lazily-bound symbols, while the static
+            // archive stays in the extraction pool for symbols the .so does
+            // not export (libbid/__bid_* DFP helpers, __addtf3 on some
+            // hosts, __gnu_lto_* stubs, ...). Without the archive in the
+            // pool, archive-only members can never be pulled and the link
+            // fails (or silently depends on dir scan order).
+            if lib == "gcc" {
+                let ar_filename = format!("lib{}.a", lib);
+                for dir in &all_lib_refs {
+                    let path = format!("{}/{}", dir, ar_filename);
+                    if Path::new(&path).exists() {
+                        if !static_lib_objects.contains(&path) {
+                            static_lib_objects.push(path);
+                        }
+                        break;
+                    }
+                }
+            }
             if !scan_shared_lib(lib, &all_lib_refs, &mut dynlib_syms) {
                 // No .so found, try static archive
                 let ar_filename = format!("lib{}.a", lib);
                 for dir in &all_lib_refs {
                     let path = format!("{}/{}", dir, ar_filename);
                     if Path::new(&path).exists() {
+                        if std::env::var("LCCC_TLS_DEBUG").is_ok() {
+                            eprintln!("[static-lib] {} -> {}", lib, path);
+                        }
                         static_lib_objects.push(path);
                         break;
                     }
@@ -219,6 +241,11 @@ pub(super) fn load_libraries(
         }
     }
 
+    // Deduplicate archive paths: libgcc.a can be pushed both by the
+    // -lgcc_s/-lgcc dual resolution and by the scan-failure fallback.
+    // Duplicate members would be pulled and relocated TWICE, corrupting
+    // any relaxation applied by the first pass.
+    static_lib_objects.dedup();
     (dynlib_syms, static_lib_objects)
 }
 

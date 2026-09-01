@@ -852,6 +852,17 @@ impl X86Codegen {
                         .out
                         .emit_instr_imm_reg("    movabsq", v.to_bits() as i64, reg64);
                 }
+                // Decimal FP bit containers: opaque bit patterns.
+                IrConst::D32(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
+                }
+                IrConst::D64(v) => {
+                    self.state
+                        .out
+                        .emit_instr_imm_reg("    movabsq", *v as i64, reg64);
+                }
                 IrConst::I128(v) => {
                     let low = *v as i64;
                     if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
