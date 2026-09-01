@@ -160,7 +160,7 @@ fn try_widen_loop(
     // For each candidate, analyze its uses. Pick the FIRST that satisfies
     // the safety contract (deterministic; the analysis is O(uses)).
     for (phi_dest, phi_ty, init_op, latch_add_dest) in &candidates {
-        let analysis = analyze_iv_uses(func, lp, *phi_dest, *latch_add_dest);
+        let analysis = analyze_iv_uses(func, lp, *phi_dest, *latch_add_dest, &cfg.idom);
         if let Some(plan) = analysis {
             if apply_widen(
                 func,
@@ -213,6 +213,26 @@ enum IvUse {
         block_idx: usize,
         inst_idx: usize,
     },
+    /// The IV ESCAPES the loop and is read, at its original I32 width, by a
+    /// block outside the loop body.
+    ///
+    /// `while (n < max && x[n] == y[n]) n++; return n;` is the canonical
+    /// shape: the exit block reads the header phi directly. Widening used to
+    /// bail here, which left `movslq %ebx, %rbx` on the loop-carried
+    /// dependency path -- the exact pattern whose removal was worth -35% on
+    /// the gzip compare loop.
+    ///
+    /// The repair is one `Cast I64->I32` per escaping block, placed after that
+    /// block's phi prefix. Because the block is OUTSIDE the loop, the
+    /// truncation executes once on the way out rather than once per
+    /// iteration, so the loop body loses an instruction and the exit path
+    /// gains one that costs nothing.
+    ///
+    /// Only recorded for blocks the loop header DOMINATES: the widened phi
+    /// must reach the truncation point on every path.
+    TruncatedEscape {
+        block_idx: usize,
+    },
 }
 
 /// A finalized widening plan: the list of rewrites we will apply.
@@ -231,9 +251,35 @@ fn analyze_iv_uses(
     lp: &NaturalLoop,
     phi_dest: Value,
     latch_add_dest: Value,
+    idom: &[usize],
 ) -> Option<WidenPlan> {
     let mut uses: Vec<IvUse> = Vec::new();
     let mut has_addressing = false;
+    // Blocks outside the loop that read the IV at I32 width and therefore
+    // need one truncation each.
+    let mut escaping_blocks: FxHashSet<usize> = FxHashSet::default();
+
+    // A use outside the loop is repairable only where the widened phi
+    // provably reaches it: the loop header must dominate the block. (A loop
+    // exit can also be reachable from outside the loop entirely, in which
+    // case the IV does not dominate it and no truncation would be valid.)
+    let escape_ok = |bi: usize| -> bool {
+        if lp.body.contains(&bi) {
+            return false; // in-loop uses are handled by the cases above
+        }
+        let mut cur = bi;
+        for _ in 0..idom.len() + 1 {
+            if cur == lp.header {
+                return true;
+            }
+            let next = idom.get(cur).copied().unwrap_or(usize::MAX);
+            if next == usize::MAX || next == cur {
+                return false;
+            }
+            cur = next;
+        }
+        false
+    };
 
     // Walk every instruction in the function (the IV can escape the loop
     // body only through a use the loop's exit-merge phi feeds; but we
@@ -359,9 +405,13 @@ fn analyze_iv_uses(
                     continue;
                 }
                 Instruction::Phi { dest: _, ty: _, incoming } => {
-                    // An exit-merge phi that uses our IV. Bail (the exit
-                    // phi is I32-typed and would need a Trunc to preserve
-                    // I32 semantics; we don't synthesize that here).
+                    // An exit-merge phi that consumes the IV. A phi operand is
+                    // evaluated on the EDGE, so a truncation for it would have
+                    // to sit at the end of a predecessor -- which for a loop
+                    // exit is a block inside the loop, i.e. once per
+                    // iteration. That trade is not worth making, so this stays
+                    // a bail; `TruncatedEscape` deliberately covers only uses
+                    // in the escaping block's own body/terminator.
                     if incoming
                         .iter()
                         .any(|(op, _)| matches!(op, Operand::Value(v) if *v == phi_dest))
@@ -371,24 +421,31 @@ fn analyze_iv_uses(
                     continue;
                 }
                 _ => {
-                    // Any other instruction that reads the phi → bail.
                     if instruction_reads_value(inst, phi_dest) {
-                        return None;
+                        if !escape_ok(bi) {
+                            return None;
+                        }
+                        escaping_blocks.insert(bi);
                     }
                 }
             }
         }
-        // Terminator uses (CondBranch reads a Cmp dest, not the IV
-        // directly; but be defensive: if a terminator reads the IV,
-        // bail). CondBranch reads the cmp result, not the IV, so the
-        // IV-read here would be a miscompile-shaped IR; bail.
+        // A terminator reading the IV is the `return n;` shape.
         if terminator_reads_value(&b.terminator, phi_dest) {
-            return None;
+            if !escape_ok(bi) {
+                return None;
+            }
+            escaping_blocks.insert(bi);
         }
     }
 
     if !has_addressing {
         return None;
+    }
+    let mut escaping: Vec<usize> = escaping_blocks.into_iter().collect();
+    escaping.sort_unstable(); // deterministic rewrite order
+    for bi in escaping {
+        uses.push(IvUse::TruncatedEscape { block_idx: bi });
     }
     Some(WidenPlan {
         uses,
@@ -411,6 +468,7 @@ fn apply_widen(
 ) -> bool {
     let mut next_id = func.next_value_id;
     let is_unsigned = matches!(phi_ty, IrType::U32);
+    let mut trunc_blocks: Vec<usize> = Vec::new();
 
     // 1. Preheader: insert `wide_init = Cast(init I32→I64)`. If the init is
     //    a Const, fold it to an I64 const directly (no Cast needed).
@@ -510,6 +568,9 @@ fn apply_widen(
                 // Value; now that phi_dest is I64, the GEP reads it
                 // directly with no Cast. No rewrite needed.
             }
+            IvUse::TruncatedEscape { block_idx } => {
+                trunc_blocks.push(*block_idx);
+            }
         }
     }
 
@@ -520,14 +581,110 @@ fn apply_widen(
         if bi < func.blocks.len() && ii < func.blocks[bi].instructions.len() {
             // Verify it's still a Cast (not already removed by a prior
             // pass iteration in this same call).
-            if matches!(
-                func.blocks[bi].instructions[ii],
-                Instruction::Cast { .. }
-            ) {
-                func.blocks[bi].instructions.remove(ii);
+            let Instruction::Cast { dest, .. } = func.blocks[bi].instructions[ii] else {
+                continue;
+            };
+            // DROP ONLY WHAT IS PROVABLY DEAD, checked HERE rather than
+            // trusted from the earlier `cast_dest_feeds_only_gep` analysis.
+            //
+            // That analysis is an approximation, and once escaping uses became
+            // widenable the pass started reaching plans it used to reject
+            // outright -- exposing a Cast whose dest still had a live consumer.
+            // Removing it orphaned the value and the backend died with "value
+            // 40 has no register, stack slot, Copy, or GlobalAddr definition"
+            // on eight corpus tests. A liveness check at the point of removal
+            // cannot be fooled by an imprecise predicate: at worst a dead Cast
+            // survives for DCE to collect, which costs nothing.
+            let mut still_used = false;
+            for (obi, ob) in func.blocks.iter().enumerate() {
+                for (oii, inst) in ob.instructions.iter().enumerate() {
+                    if obi == bi && oii == ii {
+                        continue; // the Cast's own dest is not a use
+                    }
+                    inst.for_each_used_value(|v| {
+                        if v == dest.0 {
+                            still_used = true;
+                        }
+                    });
+                }
+                if terminator_reads_value(&ob.terminator, dest) {
+                    still_used = true;
+                }
             }
+            if still_used {
+                if debug {
+                    eprintln!(
+                        "[IV-WIDEN] keeping Cast v{} in block {}: still has a live use",
+                        dest.0, bi
+                    );
+                }
+                continue;
+            }
+            func.blocks[bi].instructions.remove(ii);
         }
     }
+
+    // 6. One truncation per escaping block, inserted after that block's phi
+    //    prefix (phis must stay a contiguous prefix) and before every use.
+    //    The block is outside the loop, so this runs once on the way out.
+    //
+    //    ORDER MATTERS: this runs AFTER the cast drops above. Inserting first
+    //    shifts instruction indices up, which silently invalidates the
+    //    (block, index) pairs `cast_drops` collected earlier -- step 5 then
+    //    removes the WRONG instruction and whatever it defined loses its
+    //    definition ("value N has no register, stack slot, Copy, or
+    //    GlobalAddr definition" from the backend, on eight corpus tests).
+    for bi in trunc_blocks {
+        if bi >= func.blocks.len() {
+            continue;
+        }
+        let narrow = Value(next_id);
+        next_id += 1;
+        let insert_at = func.blocks[bi]
+            .instructions
+            .iter()
+            .position(|i| !matches!(i, Instruction::Phi { .. }))
+            .unwrap_or(func.blocks[bi].instructions.len());
+
+        // Rewrite the block's own reads FIRST, so the truncation we are about
+        // to insert is not itself rewritten into a self-reference.
+        for inst in func.blocks[bi].instructions.iter_mut() {
+            rewrite_operand_value(inst, phi_dest, Operand::Value(narrow));
+        }
+        rewrite_terminator_value(
+            &mut func.blocks[bi].terminator,
+            phi_dest,
+            Operand::Value(narrow),
+        );
+
+        func.blocks[bi].instructions.insert(
+            insert_at,
+            Instruction::Cast {
+                dest: narrow,
+                src: Operand::Value(phi_dest),
+                from_ty: if is_unsigned { IrType::U64 } else { IrType::I64 },
+                to_ty: phi_ty,
+            },
+        );
+        // `source_spans` is parallel to `instructions`; keep it that way or
+        // the backend emits .loc against the wrong instruction.
+        let n_insts = func.blocks[bi].instructions.len();
+        let spans = &mut func.blocks[bi].source_spans;
+        if spans.len() + 1 == n_insts {
+            let fill = spans.get(insert_at.saturating_sub(1)).copied();
+            match fill {
+                Some(sp) => spans.insert(insert_at.min(spans.len()), sp),
+                None => spans.clear(),
+            }
+        }
+        if debug {
+            eprintln!(
+                "[IV-WIDEN] escaping use in block {} truncated via v{}",
+                bi, narrow.0
+            );
+        }
+    }
+
 
     func.next_value_id = next_id;
     if debug {

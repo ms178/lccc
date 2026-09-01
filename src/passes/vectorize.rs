@@ -8620,6 +8620,66 @@ fn transform_reduction_avx2(
     // This must be a precondition rather than a bail-out inside the rewrite:
     // aborting midway leaves the loop half-transformed, which is worse than
     // either outcome.
+
+    // ESCAPING INDUCTION VARIABLE -- also a precondition, same reasoning.
+    //
+    // Both addressing schemes redefine what the counter counts. The
+    // byte-offset scheme steps `elem_size * vec_width` BYTES per iteration;
+    // the element-index scheme divides the trip count so the counter numbers
+    // VECTOR iterations. Inside the loop only addresses read it, so neither is
+    // visible there -- but a use AFTER the loop reads a number that is no
+    // longer the element index:
+    //
+    //     for (; n < max; n++) acc += v[n];
+    //     return acc + (n >> 2);
+    //
+    // returned 528 (byte scheme, n == 128) or 497 (element scheme, n == 4)
+    // where GCC, Clang, ICC and ICX all return 504 (n == 32). A silent wrong
+    // answer on the extremely common `for (i = 0; i < n; i++) ...;` followed
+    // by a use of `i`.
+    //
+    // Fixing the counter up in the exit block is possible in principle
+    // (`trips * vec_width`, plus whatever the scalar remainder advanced), but
+    // it has to agree with the remainder loop on every exit path; getting that
+    // subtly wrong reintroduces the same class of silent miscompile. Declining
+    // to vectorize is correct today and costs only the loops that read their
+    // counter afterwards. See tests/regression/iv_widen_escaping_iv.c.
+    {
+        let iv = pattern.iv;
+        let mut escapes = false;
+        for (bi, b) in func.blocks.iter().enumerate() {
+            if pattern.loop_blocks.contains(&bi) {
+                continue;
+            }
+            for inst in &b.instructions {
+                inst.for_each_used_value(|v| {
+                    if v == iv.0 {
+                        escapes = true;
+                    }
+                });
+            }
+            match &b.terminator {
+                Terminator::Return(Some(Operand::Value(v)))
+                | Terminator::CondBranch {
+                    cond: Operand::Value(v),
+                    ..
+                }
+                | Terminator::Switch {
+                    val: Operand::Value(v),
+                    ..
+                } => {
+                    if v.0 == iv.0 {
+                        escapes = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if escapes {
+            return 0;
+        }
+    }
+
     {
         let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
         let all_geps = reduction_array_geps(pattern);
@@ -8798,6 +8858,7 @@ fn transform_reduction_avx2(
         .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
     let mut use_byte_iv =
         byte_iv_a.is_some() && (pattern.array_b_gep.is_none() || byte_iv_b.is_some());
+
     // Every additional accumulator must have the byte-IV shape on all of its
     // arrays too; otherwise the whole loop uses the element-index scheme
     // (scaled GEP offsets), which is correct but one LEA per access heavier.

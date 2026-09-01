@@ -705,3 +705,228 @@ fn emission_is_deterministic() {
         assert_eq!(a, b, "non-deterministic emission for {:?}", inst);
     }
 }
+
+// ── 5. randomized combination stress ────────────────────────────────────────
+
+/// A deterministic 64-bit PRNG (SplitMix64). Seeded from a constant so a
+/// failure is always reproducible; there is no value in a flaky test.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[(self.next() % xs.len() as u64) as usize]
+    }
+}
+
+/// Build a large randomized corpus. The hand-written corpus covers each
+/// variant once; this explores the CROSS PRODUCT of operand shapes, widths and
+/// registers, which is where the interesting failures live -- the narrow-shift
+/// bug was a `(op, width)` pair nobody had instantiated, and a per-variant
+/// golden test would never have produced it.
+fn random_corpus(n: usize) -> Vec<MachInst> {
+    let mut rng = Rng(0x5EED_1CCC_0000_0001);
+    let regs: Vec<PhysReg> = KNOWN_REGS.iter().map(|&i| PhysReg(i)).collect();
+    let sizes = SIZES;
+    let alus = [AluOp::Add, AluOp::Sub, AluOp::And, AluOp::Or, AluOp::Xor, AluOp::Imul];
+    let shifts = [ShiftOp::Shl, ShiftOp::Shr, ShiftOp::Sar];
+    let ccs = [
+        CondCode::E, CondCode::Ne, CondCode::L, CondCode::Le, CondCode::G,
+        CondCode::Ge, CondCode::B, CondCode::Be, CondCode::A, CondCode::Ae,
+    ];
+    let offsets: [i64; 5] = [0, 8, -8, 4096, -4096];
+    let scales: [u8; 4] = [1, 2, 4, 8];
+
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        let size = *rng.pick(&sizes);
+        let a = *rng.pick(&regs);
+        let b = *rng.pick(&regs);
+        let operand = |rng: &mut Rng| -> MachOperand {
+            match rng.next() % 5 {
+                0 => MachOperand::Reg(MachReg::Phys(*rng.pick(&regs))),
+                1 => MachOperand::Imm((rng.next() % 256) as i64),
+                2 => MachOperand::Mem {
+                    base: MachReg::Phys(*rng.pick(&regs)),
+                    offset: *rng.pick(&offsets),
+                },
+                3 => MachOperand::MemIndex {
+                    base: MachReg::Phys(*rng.pick(&regs)),
+                    index: MachReg::Phys(*rng.pick(&regs)),
+                    scale: *rng.pick(&scales),
+                    offset: *rng.pick(&offsets),
+                },
+                _ => MachOperand::StackSlot(*rng.pick(&offsets)),
+            }
+        };
+        v.push(match rng.next() % 9 {
+            0 => MachInst::Mov {
+                src: operand(&mut rng),
+                dst: MachOperand::Reg(MachReg::Phys(b)),
+                size,
+            },
+            // A `Mov` destination is a register or a memory location; an
+            // immediate destination is not a representable instruction, and
+            // generating one would test the emitter's behaviour on input it
+            // can never receive.
+            1 => MachInst::Mov {
+                src: MachOperand::Reg(MachReg::Phys(a)),
+                dst: match rng.next() % 3 {
+                    0 => MachOperand::Reg(MachReg::Phys(b)),
+                    1 => MachOperand::Mem {
+                        base: MachReg::Phys(*rng.pick(&regs)),
+                        offset: *rng.pick(&offsets),
+                    },
+                    _ => MachOperand::StackSlot(*rng.pick(&offsets)),
+                },
+                size,
+            },
+            2 => MachInst::Alu {
+                op: *rng.pick(&alus),
+                src: operand(&mut rng),
+                dst: MachReg::Phys(b),
+                size,
+            },
+            3 => MachInst::Shift {
+                op: *rng.pick(&shifts),
+                amount: MachOperand::Imm((rng.next() % 32) as i64),
+                dst: MachReg::Phys(b),
+                size,
+            },
+            4 => MachInst::Cmp {
+                lhs: MachOperand::Reg(MachReg::Phys(a)),
+                rhs: operand(&mut rng),
+                size,
+            },
+            5 => MachInst::Test {
+                lhs: MachOperand::Reg(MachReg::Phys(a)),
+                rhs: MachOperand::Reg(MachReg::Phys(b)),
+                size,
+            },
+            6 => MachInst::SetCC {
+                cc: *rng.pick(&ccs),
+                dst: MachReg::Phys(b),
+            },
+            7 => MachInst::Lea {
+                base: MachReg::Phys(a),
+                index: Some((MachReg::Phys(b), *rng.pick(&scales))),
+                offset: *rng.pick(&offsets),
+                dst: MachReg::Phys(*rng.pick(&regs)),
+            },
+            _ => MachInst::Movzx {
+                src: MachOperand::Reg(MachReg::Phys(a)),
+                dst: MachReg::Phys(b),
+                from_size: if rng.next() % 2 == 0 { OpSize::S8 } else { OpSize::S16 },
+                to_size: if rng.next() % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
+            },
+        });
+    }
+    v
+}
+
+#[test]
+fn a_large_randomized_corpus_is_accepted_by_the_real_assembler() {
+    let Some(asm) = find_assembler() else {
+        eprintln!("SKIP: no system assembler; randomized MachInst stress cannot run");
+        return;
+    };
+    let corpus = random_corpus(4000);
+
+    let mut src = String::from(".text
+.globl _machinst_fuzz
+_machinst_fuzz:
+");
+    let mut kept = 0usize;
+    for inst in &corpus {
+        let mut out = AsmOutput::new();
+        emit_machinst(inst, &mut out);
+        for line in out.buf.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') || t.starts_with('j') || t.starts_with("call") {
+                continue;
+            }
+            src.push_str("    ");
+            src.push_str(t);
+            src.push('\n');
+            kept += 1;
+        }
+    }
+    src.push_str("    ret
+");
+    assert!(kept > 3000, "expected a substantial corpus, got {kept} lines");
+
+    let dir = std::env::temp_dir().join(format!("lccc-machinst-fuzz-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let s_path = dir.join("fuzz.s");
+    let o_path = dir.join("fuzz.o");
+    std::fs::write(&s_path, &src).expect("write fuzz.s");
+
+    let mut cmd = std::process::Command::new(&asm);
+    if asm == "gcc" {
+        cmd.arg("-c").arg("-x").arg("assembler");
+    } else {
+        cmd.arg("-c");
+    }
+    let output = cmd.arg(&s_path).arg("-o").arg(&o_path).output().expect("run assembler");
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        panic!(
+            "assembler REJECTED randomized emitter output ({kept} instructions).\n{}\n             --- kept at {} ---",
+            err.lines().take(25).collect::<Vec<_>>().join("\n"),
+            s_path.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_randomized_corpus_is_reproducible_and_deterministic() {
+    // A fuzz test that is not reproducible cannot be debugged.
+    let a = random_corpus(200);
+    let b = random_corpus(200);
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(format!("{:?}", x), format!("{:?}", y));
+    }
+    for inst in &a {
+        let p = {
+            let mut o = AsmOutput::new();
+            emit_machinst(inst, &mut o);
+            o.buf
+        };
+        let q = {
+            let mut o = AsmOutput::new();
+            emit_machinst(inst, &mut o);
+            o.buf
+        };
+        assert_eq!(p, q, "non-deterministic emission for {:?}", inst);
+    }
+}
+
+#[test]
+fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
+    for inst in random_corpus(2000) {
+        let mut out = AsmOutput::new();
+        emit_machinst(&inst, &mut out);
+        assert!(
+            !out.buf.contains("vreg") && !out.buf.contains("VREG"),
+            "unresolved vreg for {:?}", inst
+        );
+        // Every instruction must emit SOMETHING, except the self-move the
+        // emitter deliberately elides.
+        let elided = matches!(&inst, MachInst::Mov { src: MachOperand::Reg(a), dst: MachOperand::Reg(b), .. } if a == b)
+            || matches!(&inst, MachInst::Mov { src: MachOperand::StackSlot(a), dst: MachOperand::StackSlot(b), .. } if a == b);
+        if !elided {
+            assert!(
+                out.buf.trim().lines().any(|l| !l.trim().is_empty()),
+                "empty emission for {:?}", inst
+            );
+        }
+    }
+}

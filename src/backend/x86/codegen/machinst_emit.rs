@@ -364,6 +364,23 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Alu { op, src, dst, size } => {
             let mnem = alu_mnemonic(*op);
+            // THERE IS NO TWO-OPERAND 8-BIT `imul`. x86 offers only the
+            // one-operand `imul r/m8` (AX = AL * r/m8); `imulb %al, %bl` is
+            // rejected outright ("invalid instruction suffix for `imul'").
+            //
+            // The 32-bit form computes the identical low 8 bits, which is all
+            // an S8 multiply is defined to produce, and is what every other
+            // compiler emits for `char * char`. Widening the operands is
+            // therefore exact for the bits that matter; it additionally writes
+            // bits 8..31, which are dead for a value the IR typed as I8.
+            //
+            // Found by the randomized MachInst stress test -- an (op, width)
+            // pair no hand-written case had instantiated.
+            let size = &if matches!(op, AluOp::Imul) && matches!(size, OpSize::S8) {
+                OpSize::S32
+            } else {
+                *size
+            };
             let suffix = size.suffix();
             // A wide immediate cannot be an ALU operand; stage it first.
             assert_scratch_free(src, dst);
