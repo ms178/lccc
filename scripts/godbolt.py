@@ -8,6 +8,7 @@ The module API is intentionally small so other tools can reuse it::
 
 CLI examples::
 
+    scripts/godbolt.py audit                     # are the pinned oracles still current?
     scripts/godbolt.py list --filter 'gcc 16.2|icx|icc'
     scripts/godbolt.py compile gcc16.2 kernel.c --flags '-O3 -march=raptorlake'
     scripts/godbolt.py compare kernel.c --local target/fastbuild/lccc \
@@ -49,7 +50,11 @@ CACHE = Path(os.environ.get(
 COMPILER_ALIASES: dict[str, str] = {
     "gcc": "cg162",
     "gcc16.2": "cg162",
-    "clang": "cclang2210",
+    "gcc-trunk": "cgsnapshot",
+    # Clang 23.1.0 is the newest x86-64 release channel on CE; 22.1 is kept so
+    # a bisect across the LLVM 22 -> 23 boundary stays one flag away.
+    "clang": "cclang2310",
+    "clang23.1": "cclang2310",
     "clang22.1": "cclang2210",
     "icc": "cicc2021100",
     "icc2021.10": "cicc2021100",
@@ -65,6 +70,18 @@ COMPILER_ALIASES: dict[str, str] = {
     "crv32gtrunk": "rv32-cgcctrunk",
 }
 DEFAULT_ORACLES = ("gcc16.2", "clang", "icc", "icx")
+
+# Aliases that are supposed to point at the newest available RELEASE of a
+# family (moving channels such as icx-latest / gcc-trunk are excluded: they
+# resolve server-side and are recorded per-run in every manifest instead).
+# `godbolt.py audit` re-derives the newest release from the live API and fails
+# if one of these has gone stale, so the oracle set cannot silently rot -- the
+# clang pin sat two releases behind before this check existed.
+PINNED_LATEST: dict[str, str] = {
+    "gcc": r"^x86-64 gcc (\d+\.\d+)$",
+    "clang": r"^x86-64 clang (\d+\.\d+\.\d+)$",
+    "icc": r"^x86-64 icc (\d+\.\d+\.\d+)$",
+}
 
 
 class GodboltError(RuntimeError):
@@ -368,6 +385,79 @@ def command_compare(args: argparse.Namespace) -> int:
     return 1 if any("error" in record for record in records) else 0
 
 
+def _version_key(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split("."))
+
+
+def command_audit(args: argparse.Namespace) -> int:
+    """Fail if a pinned alias no longer names the newest release of its family.
+
+    Compiler Explorer adds releases continuously. An oracle set that is not
+    re-checked drifts: `clang` sat on 22.1.0 while 23.1.0 had shipped, so every
+    "we match Clang" claim was measured against a superseded compiler. This
+    turns that silent rot into a non-zero exit status.
+    """
+    compilers = list_compilers(args.language, refresh=True)
+    by_id = {c["id"]: c for c in compilers}
+    problems = 0
+
+    print(f"{'ALIAS':<10}{'PINNED ID':<16}{'PINNED':<12}{'NEWEST':<12}STATUS")
+    print("-" * 62)
+    for alias, pattern in PINNED_LATEST.items():
+        pinned_id = COMPILER_ALIASES[alias]
+        rx = re.compile(pattern)
+        available: list[tuple[tuple[int, ...], str, str]] = []
+        for comp in compilers:
+            match = rx.match(comp.get("name", ""))
+            if match:
+                try:
+                    available.append((_version_key(match.group(1)),
+                                      match.group(1), comp["id"]))
+                except ValueError:
+                    continue
+        if not available:
+            print(f"{alias:<10}{pinned_id:<16}{'?':<12}{'?':<12}NO MATCH FOR PATTERN")
+            problems += 1
+            continue
+        available.sort()
+        newest_key, newest_ver, newest_id = available[-1]
+
+        pinned_name = by_id.get(pinned_id, {}).get("name", "<missing>")
+        pinned_match = rx.match(pinned_name)
+        pinned_ver = pinned_match.group(1) if pinned_match else "?"
+
+        if pinned_id == newest_id:
+            status = "ok"
+        else:
+            status = f"STALE -> use {newest_id}"
+            problems += 1
+        print(f"{alias:<10}{pinned_id:<16}{pinned_ver:<12}{newest_ver:<12}{status}")
+
+    # Moving channels: report what they resolve to right now so the manifest
+    # reader can tell which build a past run actually used.
+    print()
+    for alias in ("icx", "gcc-trunk"):
+        cid = COMPILER_ALIASES.get(alias)
+        if cid:
+            name = by_id.get(cid, {}).get("name", "<missing>")
+            semver = by_id.get(cid, {}).get("semver", "")
+            print(f"  moving channel {alias:<10} -> {cid:<14} {name} {semver}")
+
+    # Every alias must at least exist, or a comparison run dies mid-way.
+    print()
+    for alias, cid in sorted(COMPILER_ALIASES.items()):
+        if cid not in by_id:
+            print(f"  BROKEN ALIAS {alias} -> {cid} (not offered by the API)")
+            problems += 1
+
+    if problems:
+        print(f"\naudit: {problems} problem(s)")
+        return 1
+    print("\naudit: all pinned aliases resolve and are current")
+    return 0
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command")
@@ -396,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
     compare_p.add_argument("--artifact-dir", type=Path)
     compare_p.add_argument("--json", type=Path)
     compare_p.set_defaults(func=command_compare)
+
+    audit_p = sub.add_parser(
+        "audit",
+        help="verify every pinned alias still resolves and names the newest release",
+    )
+    audit_p.add_argument("--language", default="c")
+    audit_p.set_defaults(func=command_audit)
     return parser
 
 
@@ -437,7 +534,7 @@ def join_dash_values(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Backward-compatible spelling: godbolt.py <compiler-id> <source> ...
-    if argv and argv[0] not in {"list", "compile", "compare", "-h", "--help"}:
+    if argv and argv[0] not in {"list", "compile", "compare", "audit", "-h", "--help"}:
         argv.insert(0, "compile")
     parser = build_parser()
     args = parser.parse_args(join_dash_values(argv))

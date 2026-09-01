@@ -203,6 +203,73 @@ fn an_asm_goto_edge_counts_as_a_real_predecessor() {
     assert_clean(&f);
 }
 
+#[test]
+fn a_missing_incoming_for_an_UNREACHABLE_predecessor_is_tolerated() {
+    // Block 2 branches to 3 but nothing branches to 2, so the edge 2 -> 3 can
+    // never execute and needs no phi operand. Reporting it would bury the
+    // reachable cases, which are the ones that miscompile.
+    let f = func_of(vec![
+        blk(0, vec![], br(3)),
+        blk(1, vec![], ret()),
+        blk(2, vec![], br(3)),
+        blk(3, vec![phi(10, vec![(c0(), 0)])], ret()),
+    ]);
+    assert_clean(&f);
+}
+
+#[test]
+fn a_missing_incoming_for_a_REACHABLE_predecessor_is_still_reported() {
+    // Same shape, except block 2 is now reachable from the entry, so the
+    // 2 -> 3 edge really executes and the phi leaves its register undefined
+    // on that path.
+    let f = func_of(vec![
+        blk(0, vec![], condbr(9, 2, 3)),
+        blk(1, vec![], ret()),
+        blk(2, vec![], br(3)),
+        blk(3, vec![phi(10, vec![(c0(), 0)])], ret()),
+    ]);
+    assert_reports(&f, "has no incoming for predecessor");
+}
+
+#[test]
+fn a_stale_predecessor_inside_an_UNREACHABLE_block_is_tolerated() {
+    // Block 2 is unreachable, so its phi is dead by construction. SCCP folds a
+    // constant Switch to a single Branch and deliberately leaves the blocks it
+    // orphaned untouched, documenting that cfg_simplify will delete them --
+    // flagging that would punish correct behaviour.
+    let f = func_of(vec![
+        blk(0, vec![], br(3)),
+        blk(1, vec![], br(2)),
+        blk(2, vec![phi(10, vec![(c0(), 1), (v(11), 9)])], br(3)),
+        blk(3, vec![], ret()),
+    ]);
+    // Block 9 does not exist, and block 1 is unreachable: neither is reported.
+    assert_clean(&f);
+}
+
+#[test]
+fn phi_contiguity_is_checked_even_in_an_unreachable_block() {
+    // Contiguity is NOT gated on reachability: passes index the phi prefix
+    // arithmetically without checking whether the block can execute, so the
+    // invariant has to hold everywhere.
+    let f = func_of(vec![
+        blk(0, vec![], br(2)),
+        blk(
+            1,
+            vec![
+                Instruction::Copy {
+                    dest: Value(20),
+                    src: c0(),
+                },
+                phi(10, vec![(c0(), 0)]),
+            ],
+            br(2),
+        ),
+        blk(2, vec![], ret()),
+    ]);
+    assert_reports(&f, "phi appears after a non-phi instruction");
+}
+
 // ── the defect this module was built for ────────────────────────────────────
 
 #[test]

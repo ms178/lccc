@@ -993,6 +993,7 @@ pub(crate) fn eliminate_unreachable_blocks(func: &mut IrFunction) -> usize {
 fn simplify_trivial_phis(func: &mut IrFunction) -> usize {
     let mut count = 0;
     for block in &mut func.blocks {
+        let mut replaced_a_phi = false;
         for inst in &mut block.instructions {
             if let Instruction::Phi { dest, incoming, .. } = inst {
                 let replacement = if incoming.len() == 1 {
@@ -1009,9 +1010,18 @@ fn simplify_trivial_phis(func: &mut IrFunction) -> usize {
                 };
                 if let Some(src) = replacement {
                     *inst = Instruction::Copy { dest: *dest, src };
+                    replaced_a_phi = true;
                     count += 1;
                 }
             }
+        }
+        // Collapsing a phi to a Copy *in place* strands every phi that followed
+        // it behind a non-phi instruction. Only some of a block's phis are
+        // trivial in general, so this is the common case rather than a corner
+        // one. Sinking the Copy below the phi prefix is sound: phis execute
+        // simultaneously on block entry, so none of them can read this Copy.
+        if replaced_a_phi {
+            super::restore_phi_prefix(block);
         }
     }
     count

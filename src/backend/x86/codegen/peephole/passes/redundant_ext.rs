@@ -232,21 +232,101 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     // re-extensions of a value that is already zero-extended to 16 bits.
     let ext16_enabled = std::env::var("CCC_NO_EXT16").is_err();
     let mut is_16 = vec![false; GP_FAMILIES];
+    // sext32[f] = true if register family f's 64-bit value is provably equal
+    // to sext(its own low 32 bits) -- exactly the postcondition of `movslq
+    // %fd, %f`. A SECOND such instruction on the same family is then a no-op
+    // and can be deleted.
+    //
+    // This fires on shared-index addressing, which is pervasive in real code:
+    // `a[i]` and `b[i]` in one expression become two GEPs over the same
+    // already-sign-extended index, and address lowering re-materialises the
+    // extension for each one. Measured on the gzip longest_match compare loop
+    // (tests/bench/k_matchlen.c), the inner loop emitted
+    //
+    //     movslq %r15d, %r15 ; movzbl (%r12,%r15), %r10d
+    //     movslq %r15d, %r15 ; movzbl (%r13,%r15), %eax
+    //
+    // where the second movslq is dead weight in a 10-instruction loop.
+    //
+    // Soundness: the fact is set ONLY by movslq and propagated only by
+    // register-to-register movq. Every other write to the family clears it,
+    // including the conservative catch-all, and it is dropped at every label
+    // because the predecessor path is unknown. Note a zero-extending write
+    // (movl, movzbl, ALU) must NOT set it: those leave bits 32..63 clear, but
+    // if bit 31 is set then sext(low32) has them all SET, so the values
+    // differ. Only the two provable cases below establish the fact.
+    let mut sext32 = vec![false; GP_FAMILIES];
 
     for i in 0..lines.len() {
         let line = &lines[i];
         let t = line.trim();
-        if t.is_empty() || t.starts_with('.') {
+        if t.is_empty() {
             continue;
         }
 
-        // Skip labels: at a label we don't know which path was taken, so we
-        // conservatively clear all flags.
+        // Labels FIRST, before the directive skip.
+        //
+        // PRE-EXISTING SOUNDNESS BUG: the directive test (`starts_with('.')`)
+        // used to run before the label test, so `.LBB1:` -- the form lccc
+        // emits for every basic-block label -- was skipped as a directive and
+        // never reached the clearing code below. Register facts therefore
+        // leaked across basic-block boundaries: a block entered from several
+        // predecessors inherited whatever the textually preceding block
+        // happened to leave behind, and a re-extension that is genuinely
+        // needed on one incoming path could be deleted. Only labels the
+        // assembler writes as `foo:` (no dot) were handled correctly.
+        //
+        // Real directives do not end in ':', so testing for the label form
+        // first is exact rather than merely conservative.
         if t.ends_with(':') {
             upper32_zero = vec![false; GP_FAMILIES];
             is_byte = vec![false; GP_FAMILIES];
             is_16 = vec![false; GP_FAMILIES];
+            sext32 = vec![false; GP_FAMILIES];
             continue;
+        }
+
+        // Assembler directives (.p2align, .size, .cfi_*, .quad, ...) define no
+        // registers and cannot be removed.
+        if t.starts_with('.') {
+            continue;
+        }
+
+        // --- Pattern: movslq %R15D, %R15 twice on the same family ---
+        // The second is a no-op: after the first, the family already holds
+        // sext(its low 32 bits), and nothing in between redefined it (any
+        // write clears the fact). Source and destination must be the SAME
+        // family -- `movslq %eax, %r15` moves a different value and must stay.
+        if t.starts_with("movslq ") || t.starts_with("movsxd ") {
+            if let Some(comma) = t.rfind(',') {
+                let mut so = t.find(' ').unwrap_or(0) + 1;
+                if so <= comma && comma < t.len() {
+                    while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+                        so += 1;
+                    }
+                    let src = t[so..comma].trim();
+                    let dst = t[comma + 1..].trim();
+                    // Register source only: a memory source is a real load.
+                    if src.starts_with('%') {
+                        if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
+                            // dst must be the 64-bit form and src the 32-bit
+                            // form of the same family, i.e. a genuine
+                            // self-extension rather than a widening move
+                            // between different registers.
+                            if sf == df
+                                && (df as usize) < sext32.len()
+                                && sext32[df as usize]
+                                && !is_32bit_or_smaller(dst)
+                                && is_32bit_or_smaller(src)
+                            {
+                                keep[i] = false;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // --- Pattern: movzbl %AL, %EAX (redundant re-zero-extend) ---
@@ -457,7 +537,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         }
 
         // --- Update flags based on this instruction ---
-        self_update(t, &mut upper32_zero, &mut is_byte, &mut is_16);
+        self_update(t, &mut upper32_zero, &mut is_byte, &mut is_16, &mut sext32);
     }
 
     if changed {
@@ -511,6 +591,7 @@ fn self_update(
     upper32_zero: &mut Vec<bool>,
     is_byte: &mut Vec<bool>,
     is_16: &mut Vec<bool>,
+    sext32: &mut Vec<bool>,
 ) {
     let toks: Vec<&str> = t.split_whitespace().collect();
     if toks.is_empty() {
@@ -525,7 +606,7 @@ fn self_update(
     // call is harmless; trusting stale upper-32-zero state across a call can
     // miscompile a later 64-bit copy.
     if op == "call" || op == "callq" {
-        for flags in [&mut *upper32_zero, &mut *is_byte, &mut *is_16] {
+        for flags in [&mut *upper32_zero, &mut *is_byte, &mut *is_16, &mut *sext32] {
             for value in flags.iter_mut() {
                 *value = false;
             }
@@ -569,6 +650,7 @@ fn self_update(
                     upper32_zero[df as usize] = upper32_zero[sf as usize];
                     is_byte[df as usize] = is_byte[sf as usize];
                     is_16[df as usize] = is_16[sf as usize];
+                    sext32[df as usize] = sext32[sf as usize];
                 }
             } else if let Some(df) = dst_fam {
                 // movq from memory/immediate (or unparsable source): the
@@ -577,6 +659,7 @@ fn self_update(
                     upper32_zero[df as usize] = false;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
+                    sext32[df as usize] = false;
                 }
             }
         }
@@ -593,6 +676,7 @@ fn self_update(
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = true;
                     is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
+                    sext32[df as usize] = false;
                 }
             }
         }
@@ -607,6 +691,7 @@ fn self_update(
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
+                    sext32[df as usize] = false;
                 }
             }
         }
@@ -622,6 +707,7 @@ fn self_update(
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
+                    sext32[df as usize] = false;
                 }
             }
         }
@@ -641,6 +727,26 @@ fn self_update(
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
+                    sext32[df as usize] = false;
+                }
+            }
+        }
+        return;
+    }
+
+    // movslq <src32>, <dst64>: by definition the destination now holds
+    // sext(its own low 32 bits) -- its low 32 bits ARE the source value. The
+    // zero-extension facts do not survive (bit 31 may have been replicated
+    // into bits 32..63).
+    if op == "movslq" || op == "movsxd" {
+        if let Some(comma) = t.rfind(',') {
+            let dst = t[comma + 1..].trim();
+            if let Some(df) = family_of_reg(dst) {
+                if (df as usize).lt(&upper32_zero.len()) {
+                    upper32_zero[df as usize] = false;
+                    is_byte[df as usize] = false;
+                    is_16[df as usize] = false;
+                    sext32[df as usize] = true;
                 }
             }
         }
@@ -656,6 +762,7 @@ fn self_update(
                 upper32_zero[fam as usize] = false;
                 is_byte[fam as usize] = false;
                 is_16[fam as usize] = false;
+                sext32[fam as usize] = false;
             }
         }
         return;
@@ -678,6 +785,7 @@ fn self_update(
                         upper32_zero[f as usize] = false;
                         is_byte[f as usize] = false;
                         is_16[f as usize] = false;
+                        sext32[f as usize] = false;
                         cleared = true;
                     }
                 }
@@ -695,6 +803,115 @@ mod tests {
         let mut asm = input.to_string();
         assert!(eliminate_redundant_zero_extend(&mut asm));
         asm
+    }
+
+    // ── redundant self sign-extension (movslq %Xd, %X) ──────────────────
+
+    fn run_maybe(input: &str) -> String {
+        let mut asm = input.to_string();
+        let _ = eliminate_redundant_zero_extend(&mut asm);
+        asm
+    }
+
+    #[test]
+    fn removes_a_second_self_sign_extension_of_the_same_register() {
+        // The real gzip longest_match compare loop: a[i] and b[i] share one
+        // sign-extended index, and address lowering re-materialises it.
+        let out = run(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movzbl (%r12, %r15), %r10d\n",
+            "    movslq %r15d, %r15\n",
+            "    movzbl (%r13, %r15), %eax\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 1);
+        // The loads must survive untouched.
+        assert!(out.contains("movzbl (%r12, %r15), %r10d"));
+        assert!(out.contains("movzbl (%r13, %r15), %eax"));
+    }
+
+    #[test]
+    fn keeps_a_sign_extension_from_a_DIFFERENT_register() {
+        // `movslq %eax, %r15` moves a different value into r15; the fact that
+        // r15 already held a sign-extended value says nothing about it.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movslq %eax, %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 2);
+    }
+
+    #[test]
+    fn keeps_a_sign_extension_after_the_register_is_redefined() {
+        // addl rewrites the low 32 bits (and zeroes the top), so the value is
+        // no longer sext(low32) -- bit 31 may now be set.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    addl $1, %r15d\n",
+            "    movslq %r15d, %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 2);
+    }
+
+    #[test]
+    fn keeps_a_sign_extension_across_a_label() {
+        // At a label the predecessor is unknown, so no fact survives. This is
+        // the loop case: the back-edge re-enters with a fresh index.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            ".LBB1:\n",
+            "    movslq %r15d, %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 2);
+    }
+
+    #[test]
+    fn keeps_a_sign_extension_across_a_call() {
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    call bar\n",
+            "    movslq %r15d, %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 2);
+    }
+
+    #[test]
+    fn keeps_a_sign_extension_of_a_memory_operand() {
+        // A memory source is a real load, not a re-extension.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movslq -8(%rbp), %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 2);
+    }
+
+    #[test]
+    fn a_zero_extending_write_does_not_establish_the_sign_extended_fact() {
+        // SOUNDNESS: movl zeroes bits 32..63, but if bit 31 is set then
+        // sext(low32) sets them all instead -- the values differ, so the
+        // following movslq is NOT removable.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movl %eax, %r15d\n",
+            "    movslq %r15d, %r15\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 1);
+    }
+
+    #[test]
+    fn the_fact_travels_through_a_register_to_register_movq() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movq %r15, %r14\n",
+            "    movslq %r14d, %r14\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 1);
     }
 
     #[test]
