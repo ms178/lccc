@@ -54,3 +54,51 @@ fuzz · kernel corpus 15/15 · nbody 5M-step bit-identical to GCC.
   or intrinsics (current guards — keep them).
 - Do not trampoline the self-loop phi copy (it splits the rotation back
   into body+latch; see DECISIONS.md v13 entry).
+- Do not drop Guard C (multi-preheader header phi), Guard D (`while (--i)`
+  latch incoming defined in the header), or Guard E (nested loops).
+- Do not revert IVSR pointer IVs that live in a rotated self-loop
+  (`univsr` skip); unrotated preheader+latch pointer IVs must still revert.
+- Do not put complete-unroll carried-phi Copies of the LAST clone dest in
+  the header (Copy-before-def). Copy INIT in the header; rewrite outside
+  uses to the last clone dest.
+
+## Session 2026-09-01 — remaining 3 of 15 root-caused
+
+The 19-name rotate-ON vs GCC -O2 A/B is **19 MATCH / 0 FAIL** (the original
+15 plus `loop_rotate_seq_loops` and `loop_rotate_while_dec`). Rotation
+stays **opt-in** (`CCC_LOOP_ROTATE=1`). Do not flip the default until the
+full 474-test corpus is green.
+
+Root causes (distinct; all three FAILs MATCH gcc with rotation OFF):
+
+1. **Pred-label (sequential loops)** — self-loop phi init incoming labeled
+   with the original preheader instead of the guard. Option A
+   `(pre_op, header_label)` + Guard C. Tests: `loop_rotate_seq_loops`,
+   `alloca_bare_builtin`, `bitops_builtins`, …
+2. **bepre hoist** — `schedule_eprime_early` used a stale `def_site` after
+   header-phi insert. Current-IR `latest_dep` + never insert inside the
+   phi cluster. Tests: `backedge_pre_int_recurrence`,
+   `backedge_pre_fp_multiuse`.
+3. **univsr × rotated pointer IVs (`alu_peepholes`)** — `detect_ivsr_pointer_ivs`
+   treated a rotated self-loop pointer phi (`incoming` from the phi's own
+   block) as an unrotated IVSR IV and reverted with the wrong index/base.
+   Skip self-incoming / self-terminating pointer phis. Unrotated
+   preheader+latch IVs still revert (SIB). Test: `alu_peepholes`.
+4. **Guard D / `while (--i)` (`huft_build_crash`)** — cloned `i_next = i - 1`
+   rewrote `i` to the latch incoming, which is the header Sub itself, so
+   the backedge tested the loop-invariant `(g-1)-1`. Infinite pointer walk,
+   SIGSEGV. Bail when a header phi's latch incoming is a non-phi header
+   inst. Test: `huft_build_crash`, `loop_rotate_while_dec`.
+5. **Complete-unroll Copy-before-def + Guard E (`simd_crc_adler`)** —
+   two-block complete unroll replaced carried phis with `Copy phi = last_clone`
+   in the header (def is in a later clone). GVN/LICM then, after inlining
+   the remainder `for (; i < sz; i++)` into `for (sz = 1; …)`, froze `sz`
+   to 1 (adler sz=2 returned `00010001`). Fix: rewrite outside uses to the
+   last clone dest; Copy INIT in the header. Guard E: do not rotate a loop
+   nested inside another (tighter "cond uses outer-header phi" is not
+   enough — copy-prop hides the phi dest). Test: `simd_crc_adler`.
+
+Still open before default-ON: full corpus, 9-worst, nbody bit-identical,
+kernel 15/15, fuzz. Guard E is a correctness fence; nested inner loops
+no longer rotate (perf left on the table — a sound nested-rotate rewrite
+is future work).

@@ -1356,7 +1356,6 @@ fn try_complete_unroll_two_block(
     func.blocks[latch].terminator = Terminator::Branch(exit_target);
     let _ = (body_entry, exit_cond_positive);
 
-    let final_map: FxHashMap<u32, u32> = final_carried.iter().copied().collect();
     let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
@@ -1364,28 +1363,42 @@ fn try_complete_unroll_two_block(
         }
         for instruction in &mut block.instructions {
             subst_value_with_operand(instruction, iv_phi.0, &final_iv);
+            for &(phi_id, final_id) in &final_carried {
+                subst_value_with_operand(
+                    instruction,
+                    phi_id,
+                    &Operand::Value(Value(final_id)),
+                );
+            }
         }
         subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
+        for &(phi_id, final_id) in &final_carried {
+            subst_value_in_terminator(
+                &mut block.terminator,
+                phi_id,
+                &Operand::Value(Value(final_id)),
+            );
+        }
     }
 
     func.blocks.extend(new_blocks);
 
-    // Replace the (now dead) carried phis with Copies of their FINAL clone
-    // values: OUTSIDE uses of the phi still reference its id, and this Copy
-    // is what delivers the post-loop value to them (the pipeline's
-    // copy-propagation then forwards the clone value directly into those
-    // uses and the Copy dies — the original design, kept verbatim).
-    for (phi_id, final_id) in final_map.iter() {
-        for block in &mut func.blocks {
-            for inst in &mut block.instructions {
-                if let Instruction::Phi { dest, .. } = inst {
-                    if dest.0 == *phi_id {
-                        *inst = Instruction::Copy {
-                            dest: Value(*phi_id),
-                            src: Operand::Value(Value(*final_id)),
-                        };
-                    }
-                }
+    // Header still executes once as a trampoline into the clone chain.
+    // Replace its (now dead) phis with Copies of the INIT values — the
+    // same as `try_complete_unroll_general`. The previous code copied the
+    // LAST clone's dest here, which is defined in a block that runs AFTER
+    // this header: Copy-before-def. GVN/copy-prop then forwarded that
+    // unordered value into inlined callers (simd_crc_adler adler sz=2
+    // returned 00010001 instead of 00bd00bc under CCC_LOOP_ROTATE=1).
+    // Outside uses were rewritten to the final clone dests above.
+    for inst in func.blocks[header].instructions.iter_mut() {
+        if let Instruction::Phi { dest, incoming, .. } = inst {
+            let init = incoming
+                .iter()
+                .find(|(_, lbl)| *lbl != latch_label)
+                .map(|(op, _)| *op);
+            if let Some(src) = init {
+                *inst = Instruction::Copy { dest: *dest, src };
             }
         }
     }

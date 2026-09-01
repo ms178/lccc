@@ -276,17 +276,33 @@ fn schedule_eprime_early(
         matches!(inst, Instruction::BinOp { dest, .. } if dest.0 == rw.eprime_dest.0)
     }) else { return };
     let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[cur_idx] else { return };
+    // Resolve operand defs against the *current* instruction list. The
+    // caller inserts the PRE phi into the header before this runs; when
+    // the loop is a rotated self-loop, header == eprime_block and that
+    // insert shifts every later index, so the `def_site` snapshot taken
+    // before the rewrite is stale. Using it moved `v*v` above `v = x+3`
+    // (use-before-def). backedge_pre_{int,fp}_* with CCC_LOOP_ROTATE=1.
     let mut latest_dep: Option<usize> = None;
     for op in [lhs, rhs] {
         if let Operand::Value(v) = op {
-            if let Some(&(db, di)) = def_site.get(&v.0) {
+            if let Some(di) = block.instructions.iter().position(|inst| {
+                inst.dest().map(|d| d.0) == Some(v.0)
+            }) {
+                latest_dep = Some(latest_dep.map_or(di, |old| old.max(di)));
+            } else if let Some(&(db, di)) = def_site.get(&v.0) {
                 if db == block_idx {
                     latest_dep = Some(latest_dep.map_or(di, |old| old.max(di)));
                 }
             }
         }
     }
-    let insert_idx = latest_dep.map_or(0, |i| i.saturating_add(1));
+    // Never land inside the leading phi cluster (phis must stay first).
+    let first_non_phi = block
+        .instructions
+        .iter()
+        .position(|i| !matches!(i, Instruction::Phi { .. }))
+        .unwrap_or(0);
+    let insert_idx = latest_dep.map_or(first_non_phi, |i| i.saturating_add(1)).max(first_non_phi);
     if insert_idx >= cur_idx {
         return;
     }

@@ -22,7 +22,9 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{
+    BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
 
 /// Information about an IVSR-created pointer IV that should be reverted to indexed form.
 #[derive(Debug, Clone)]
@@ -127,7 +129,41 @@ fn detect_ivsr_pointer_ivs(func: &IrFunction) -> Vec<IvsrPointerIV> {
                     continue;
                 }
 
+                // Rotated self-loop: the latch incoming is this block, and/or
+                // the terminator branches to self. univsr assumes a distinct
+                // preheader+latch; reverting IVs created by IVSR on a
+                // rotated body mis-addresses (alu_peepholes + CCC_LOOP_ROTATE).
+                let self_in = incoming.iter().any(|(_, lbl)| *lbl == block.label);
+                let self_term = is_rotated_self_loop_block(block);
+                if self_in || self_term {
+                    if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
+                        eprintln!(
+                            "[univsr]   skip rotated self-loop ptr phi v{} in {:?} self_in={} self_term={} incomings={:?}",
+                            dest.0,
+                            block.label,
+                            self_in,
+                            self_term,
+                            incoming.iter().map(|(_, l)| l.0).collect::<Vec<_>>()
+                        );
+                    }
+                    continue;
+                }
+
                 if let Some(ptr_iv) = analyze_pointer_phi(func, dest, incoming, block.label) {
+                    if std::env::var("LCCC_DEBUG_UNIVSR").is_ok() {
+                        eprintln!(
+                            "[univsr]   candidate v{} in {:?} self_in={} self_term={} incomings={:?} idx=v{} base=v{} off={} stride={}",
+                            dest.0,
+                            block.label,
+                            incoming.iter().any(|(_, lbl)| *lbl == block.label),
+                            is_rotated_self_loop_block(block),
+                            incoming.iter().map(|(_, l)| l.0).collect::<Vec<_>>(),
+                            ptr_iv.index_iv.0,
+                            ptr_iv.base_ptr.0,
+                            ptr_iv.init_offset,
+                            ptr_iv.stride
+                        );
+                    }
                     result.push(ptr_iv);
                 }
             }
@@ -794,6 +830,20 @@ fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
     }
 }
 
+/// True if this block is a rotated self-loop header (branches to itself).
+fn is_rotated_self_loop_block(block: &crate::ir::reexports::BasicBlock) -> bool {
+    let self_label = block.label;
+    match &block.terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => *true_label == self_label || *false_label == self_label,
+        Terminator::Branch(t) => *t == self_label,
+        _ => false,
+    }
+}
+
 /// Check if a stride in bytes is valid for x86-64 SIB encoding (1, 2, 4, or 8 bytes).
 #[inline(always)]
 fn is_valid_sib_scale(stride: i64) -> bool {
@@ -909,21 +959,43 @@ mod tests {
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{BasicBlock, IrCmpOp, Terminator};
 
-    /// Two blocks: preheader (0) and loop header/body (1).
+    /// Unrotated loop: preheader (0) → header (1) ⇄ latch (2), exit (3).
+    /// Header phis take incoming from preheader and latch (not self); this is
+    /// the shape univsr is allowed to revert. Rotated self-loops are skipped.
     fn make_test_function() -> IrFunction {
         let mut f = IrFunction::new("test_kernel".to_string(), IrType::Void, Vec::new(), false);
-        for i in 0..2u32 {
-            f.blocks.push(BasicBlock {
-                label: BlockId(i),
-                instructions: Vec::new(),
-                terminator: if i == 1 {
-                    Terminator::Branch(BlockId(1))
-                } else {
-                    Terminator::Branch(BlockId(1))
-                },
-                source_spans: Vec::new(),
-            });
-        }
+        // 0: preheader
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // 1: header
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: Vec::new(),
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        // 2: latch
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: Vec::new(),
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // 3: exit
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: Vec::new(),
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
         f
     }
 
@@ -947,14 +1019,14 @@ mod tests {
         }
     }
 
-    /// Canonical counter phi: i = phi [0 (from pre), i+1 (from latch)].
+    /// Canonical counter phi: i = phi [0 (from pre 0), i+1 (from latch 2)].
     fn counter_phi(dest: u32, next: u32) -> Instruction {
         Instruction::Phi {
             dest: Value(dest),
             ty: IrType::I64,
             incoming: vec![
                 (Operand::Const(IrConst::I64(0)), BlockId(0)),
-                (Operand::Value(Value(next)), BlockId(1)),
+                (Operand::Value(Value(next)), BlockId(2)),
             ],
         }
     }
@@ -975,7 +1047,7 @@ mod tests {
             ty: IrType::Ptr,
             incoming: vec![
                 (Operand::Value(Value(init)), BlockId(0)),
-                (Operand::Value(Value(next)), BlockId(1)),
+                (Operand::Value(Value(next)), BlockId(2)),
             ],
         }
     }
@@ -1048,10 +1120,12 @@ mod tests {
         });
         assert!(has_shl, "stride 4 must scale the index with Shl");
 
-        // The pointer IV cycle is broken: phi and increment GEP became Copies.
-        let copies = func.blocks[1]
-            .instructions
+        // The pointer IV cycle is broken: phi (header) and increment GEP (latch)
+        // became Copies.
+        let copies = func
+            .blocks
             .iter()
+            .flat_map(|b| b.instructions.iter())
             .filter(|inst| matches!(inst, Instruction::Copy { .. }))
             .count();
         assert_eq!(copies, 2, "phi + increment GEP must both become Copy(base)");
@@ -1097,6 +1171,8 @@ mod tests {
             load(3, 2, IrType::I32),
             gep_const(4, 2, 4), // q = p + 4 bytes
             load(5, 4, IrType::I32),
+        ];
+        f.blocks[2].instructions = vec![
             counter_inc(6, 1),
             gep_const(7, 2, 8), // stride 8
         ];
@@ -1131,9 +1207,8 @@ mod tests {
             load(3, 2, IrType::I32),
             store_val(3, 2, IrType::I32),
             load(5, 2, IrType::I32),
-            counter_inc(6, 1),
-            gep_const(7, 2, 4),
         ];
+        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
         f.next_value_id = 11;
 
         assert_eq!(run_univsr(&mut f), 1);
@@ -1213,6 +1288,8 @@ mod tests {
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
             load(3, 2, IrType::I32),
+        ];
+        f.blocks[2].instructions = vec![
             Instruction::BinOp {
                 dest: Value(6),
                 op: IrBinOp::Add,
@@ -1250,6 +1327,8 @@ mod tests {
             counter_phi(1, 6),
             ptr_phi(2, 10, 7),
             load(3, 2, IrType::I32),
+        ];
+        f.blocks[2].instructions = vec![
             counter_inc(6, 1),
             gep_const(7, 2, 4),
             Instruction::Cmp {
@@ -1292,9 +1371,8 @@ mod tests {
                     info,
                 }
             },
-            counter_inc(6, 1),
-            gep_const(7, 2, 4),
         ];
+        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
         f.next_value_id = 11;
         assert_eq!(
             run_univsr(&mut f),
@@ -1326,9 +1404,8 @@ mod tests {
                 ty: IrType::Ptr,
                 seg_override: AddressSpace::Default,
             },
-            counter_inc(6, 1),
-            gep_const(7, 2, 4),
         ];
+        f.blocks[2].instructions = vec![counter_inc(6, 1), gep_const(7, 2, 4)];
         f.next_value_id = 12;
         assert_eq!(
             run_univsr(&mut f),
@@ -1340,8 +1417,62 @@ mod tests {
     #[test]
     fn no_ptr_phi_fast_path() {
         let mut f = make_test_function();
-        f.blocks[1].instructions = vec![counter_phi(1, 6), counter_inc(6, 1)];
+        f.blocks[1].instructions = vec![counter_phi(1, 6)];
+        f.blocks[2].instructions = vec![counter_inc(6, 1)];
         f.next_value_id = 7;
         assert_eq!(run_univsr(&mut f), 0);
+    }
+
+    #[test]
+    fn skip_rotated_self_loop_pointer_ivs() {
+        // Loop-rotate produces a do-while self-loop whose pointer phi latch
+        // incoming is the phi's own block. Reverting those IVs mis-addresses
+        // (alu_peepholes with CCC_LOOP_ROTATE=1).
+        let mut f = IrFunction::new("rotated".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::GlobalAddr {
+                dest: Value(10),
+                name: "arr".to_string(),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (Operand::Value(Value(6)), BlockId(1)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::Ptr,
+                    incoming: vec![
+                        (Operand::Value(Value(10)), BlockId(0)),
+                        (Operand::Value(Value(7)), BlockId(1)),
+                    ],
+                },
+                load(3, 2, IrType::I32),
+                counter_inc(6, 1),
+                gep_const(7, 2, 4),
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(0),
+            },
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 11;
+        assert_eq!(
+            run_univsr(&mut f),
+            0,
+            "rotated self-loop pointer IVs must not be reverted"
+        );
     }
 }
