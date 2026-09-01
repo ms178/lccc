@@ -19,7 +19,21 @@ was an improvement.
 
 ## Tier 1 — measured, reproducible, largest first
 
-### PF-TLS-1 · TLS segment access — 2.16× slower
+### IV-DERIV-1 · Widen constant-offset derivatives of the induction variable
+*Evidence:* `tls_seg_access` carries two `movslq` per iteration, one on the
+loop-carried path. Widening the counter itself now works for every element
+width (see closed items), but this loop's counter has genuine *arithmetic*
+uses -- `s[i-1]` and `s[(i&7)+1]` -- and `analyze_iv_uses` bails on any
+non-cast use.
+
+`i-1`, `i+1` and `i&mask` feeding addressing are the stencil/recurrence shape
+and are everywhere. Widening them is value-preserving for a counted loop, but
+proving it in general needs range information, so the safe subset is:
+constant-offset derivatives of an IV whose bounds are known constants.
+
+**Done when:** `tls_seg_access`'s inner loop carries no `movslq`.
+
+### PF-TLS-1 · TLS segment access — 2.19× slower
 *Evidence:* `tls_seg_access` 24.6 ms vs GCC 11.4 ms.
 
 LCCC stages the thread pointer (`mov %fs:0x0,%rax`) in the prologue of every
@@ -147,6 +161,7 @@ bfd 2.47.
 
 | Item | Outcome |
 |---|---|
+| **IV widening** | Fired **only for byte arrays**: the addressing analysis accepted `Cast -> GEP` but not `Cast -> Shl(const) -> GEP`, which is the scaling chain for every wider element type. Now transparent to constant scales (`Shl`/`Mul`); variable scales deliberately excluded. Same-window A/B: `sieve` **−21.6%**, `nbody` −3.0%, plus small gains on `arith_loop`/`sqlite_varint`; also unblocks vectorization of int/long reductions |
 | **Block layout** | RPO linearization cost **19%** on adler32 (55.8 vs 46.9 ms) by discarding the order earlier passes produced. Now starts from the existing order and fixes only contiguity: adler32 −15.6%, sqlite_varint −4.4%, memchr's 1.39×-vs-GCC win preserved. The pass had carried this cost since long before it was loop-aware |
 | IR structural violations | 396 → **0** configs at all six opt levels; `CCC_VERIFY_IR` a permanent suite gate |
 | Machine-level loop inversion | `memchr` −49.7% → parity with GCC; placed **after** phi elimination, where rotation is pure duplication instead of phi surgery |

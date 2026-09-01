@@ -1082,6 +1082,45 @@ fn value_feeds_only_gep(func: &IrFunction, val: Value) -> bool {
                         }
                     }
                 }
+                // ELEMENT-INDEX SCALING: `index * elem_size`, spelled either
+                // as `Shl(index, k)` or `Mul(index, c)`, with the result used
+                // as a GEP offset.
+                //
+                // This is the canonical addressing chain for every array whose
+                // elements are wider than a byte, and it was not recognized:
+                // the analysis accepted `Cast -> GEP` but not
+                // `Cast -> Shl -> GEP`. The practical effect was that
+                // induction-variable widening fired **only for byte arrays**.
+                // `for (int i = 0; i < n; i++) s += a[i];` widened for
+                // `signed char` and declined for `int` and `long`, leaving two
+                // `movslq` per iteration -- one of them on the loop-carried
+                // dependency path, which is the pattern whose removal was
+                // worth 35% on the gzip compare loop.
+                //
+                // Transparency is sound because the scale is a loop-invariant
+                // CONSTANT and the shift/multiply is already performed at the
+                // wide type: widening the phi replaces the cast's dest with
+                // the I64 phi and leaves the scaling instruction untouched.
+                // A variable scale would not be safe to look through here (the
+                // other operand could itself depend on the IV), so only
+                // constant scales are accepted.
+                if let Instruction::BinOp { dest, op, lhs, rhs, .. } = inst {
+                    let scale_ok = match op {
+                        IrBinOp::Shl => matches!(lhs, Operand::Value(v) if *v == cur)
+                            && matches!(rhs, Operand::Const(_)),
+                        IrBinOp::Mul => {
+                            (matches!(lhs, Operand::Value(v) if *v == cur)
+                                && matches!(rhs, Operand::Const(_)))
+                                || (matches!(rhs, Operand::Value(v) if *v == cur)
+                                    && matches!(lhs, Operand::Const(_)))
+                        }
+                        _ => false,
+                    };
+                    if scale_ok {
+                        queue.push(*dest);
+                        continue;
+                    }
+                }
                 // Any OTHER instruction that reads `cur` → bail. Check the
                 // common instruction shapes (we don't have a generic
                 // operands() iterator; enumerate the shapes that can hold a
