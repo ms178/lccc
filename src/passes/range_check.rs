@@ -165,9 +165,38 @@ fn resolve_bool_cmp(
     };
     // Only the boolean widening (U8/I8 → wider integer); anything else is a
     // semantic cast the fold must not see through.
+    //
+    // EVERY wider integer target must be listed. The set used to stop at
+    // `I16 | I32 | U32`, which silently excluded the 64-bit widening the
+    // frontend actually emits for `char c; return c >= 'a' && c <= 'z';`:
+    //
+    //     Cmp  v10 = Sle v1, I8(122)
+    //     Cast v11 = v10 (U8 -> I64)        <-- not matched, fold gave up
+    //     Select v14 = v6 ? v11 : Const(0)  (ty I64)
+    //
+    // so the pass never fired on the very idiom it was written for, and
+    // `set_membership` (which consumes range_fold's output) was starved with
+    // it -- lccc emitted an 11-deep compare/branch chain for Expat's
+    // `xml_name_continue` classifier where GCC and ICX emit a handful of
+    // branchless instructions.
+    //
+    // Widening is value-preserving here regardless of signedness: the source
+    // is a `Cmp` result, verified below to be 0 or 1, and both zero- and
+    // sign-extension of 0/1 yield 0/1 in every width. Narrowing is NOT in the
+    // list -- that could discard bits of a non-boolean.
     if !matches!(
         (from_ty, to_ty),
-        (IrType::I8 | IrType::U8, IrType::I16 | IrType::I32 | IrType::U32)
+        (
+            IrType::I8 | IrType::U8,
+            IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::I64
+                | IrType::U64
+                | IrType::I128
+                | IrType::U128
+        )
     ) {
         return None;
     }
@@ -936,6 +965,59 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `resolve_bool_cmp` must see through the boolean widening cast at EVERY
+    /// width. The allow-list used to stop at `I16 | I32 | U32`, silently
+    /// excluding the `U8 -> I64` widening the frontend actually emits for
+    /// `char c; c >= 'a' && c <= 'z'` -- so the pass never fired on its own
+    /// headline idiom, and `set_membership` downstream was starved with it.
+    #[test]
+    fn a_boolean_widening_cast_is_transparent_at_every_width() {
+        let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; 4];
+        cmp_defs[1] = Some((
+            IrCmpOp::Sle,
+            Operand::Value(Value(0)),
+            Operand::Const(IrConst::I8(122)),
+            IrType::I8,
+        ));
+
+        for to_ty in [
+            IrType::I16,
+            IrType::U16,
+            IrType::I32,
+            IrType::U32,
+            IrType::I64,
+            IrType::U64,
+            IrType::I128,
+            IrType::U128,
+        ] {
+            let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
+            cast_defs[2] = Some((Operand::Value(Value(1)), IrType::U8, to_ty));
+            assert_eq!(
+                resolve_bool_cmp(2, &cmp_defs, &cast_defs),
+                Some(1),
+                "widening a Cmp result to {:?} must stay transparent",
+                to_ty
+            );
+        }
+    }
+
+    /// SOUNDNESS: only WIDENING is transparent. A narrowing cast can discard
+    /// bits of a value that is not actually a boolean, so the fold must not
+    /// see through it.
+    #[test]
+    fn a_narrowing_cast_is_not_transparent() {
+        let mut cmp_defs: Vec<Option<(IrCmpOp, Operand, Operand, IrType)>> = vec![None; 4];
+        cmp_defs[1] = Some((
+            IrCmpOp::Sle,
+            Operand::Value(Value(0)),
+            Operand::Const(IrConst::I32(122)),
+            IrType::I32,
+        ));
+        let mut cast_defs: Vec<Option<(Operand, IrType, IrType)>> = vec![None; 4];
+        cast_defs[2] = Some((Operand::Value(Value(1)), IrType::I32, IrType::I8));
+        assert_eq!(resolve_bool_cmp(2, &cmp_defs, &cast_defs), None);
+    }
 
     #[test]
     fn canonicalize_lower_upper() {

@@ -9,6 +9,9 @@
 #   1. A 6 GiB swap file on the largest writable filesystem   (hard requirement:
 #      the sandbox has ~1.9 GiB RAM; linking/optimising lccc OOMs without it).
 #   2. VM tuning appropriate for a swap-backed, memory-starved build box.
+#   3. A working Rust 1.98.0 toolchain, INCLUDING the rustup proxy binaries and
+#      rustup's own execute bit -- both are lost by a harness wipe and neither
+#      is restored by `rustup toolchain install` (see setup_rust).
 #   3. The lccc worktree at $LCCC_REPO, rebased on ms178/lccc main, with the
 #      accumulated session patch (ms178-1.patch) re-applied if present.
 #   4. The artifacts directory used by lccc-snapshot.sh.
@@ -80,8 +83,67 @@ setup_repo() {
   git -C "$REPO" config user.email 'agent@lccc.local'
 }
 
+
+# --------------------------------------------------------------- 4. rust -----
+# A harness wipe restores ~/.cargo/bin from the snapshot but loses two things
+# that make the toolchain unusable, and neither failure is self-explanatory:
+#
+#   1. `rustup` comes back WITHOUT its execute bit ("Permission denied"), and
+#   2. the proxy binaries (cargo, rustc, ...) are gone entirely. `rustup
+#      toolchain install` does NOT recreate them -- only `rustup-init` does --
+#      so the toolchain installs successfully and `cargo` is still not found.
+#
+# rustup dispatches on argv[0], so symlinking the proxies back to it is the
+# supported recovery. Pin 1.98.0: the tree is built and validated against it.
+RUST_VERSION=${RUST_VERSION:-1.98.0}
+RUST_PROXIES=(cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver
+              rust-gdb rust-lldb)
+
+setup_rust() {
+  local bin="$HOME/.cargo/bin"
+  export PATH="$bin:$PATH"
+
+  if [[ -f $bin/rustup && ! -x $bin/rustup ]]; then
+    log "restoring execute bit on rustup"
+    chmod +x "$bin/rustup"
+  fi
+
+  if [[ ! -x $bin/rustup ]]; then
+    log "installing rustup + Rust $RUST_VERSION"
+    curl -sSf https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION" \
+                 --no-modify-path >/dev/null
+  fi
+
+  if ! "$bin/rustup" toolchain list 2>/dev/null | grep -q "^$RUST_VERSION"; then
+    log "installing Rust $RUST_VERSION"
+    "$bin/rustup" toolchain install "$RUST_VERSION" \
+      --profile minimal --no-self-update >/dev/null
+  fi
+  "$bin/rustup" default "$RUST_VERSION" >/dev/null 2>&1 || true
+
+  # Recreate any missing proxy. Harmless when they already exist.
+  local p missing=0
+  for p in "${RUST_PROXIES[@]}"; do
+    if [[ ! -e $bin/$p ]]; then
+      ln -sf rustup "$bin/$p"
+      missing=$((missing + 1))
+    fi
+  done
+  [[ $missing -gt 0 ]] && log "recreated $missing rustup proxy binaries"
+
+  # Prove it, rather than assuming: a silent failure here wastes the whole
+  # session, because every later step blames the compiler instead of the PATH.
+  if ! "$bin/cargo" --version >/dev/null 2>&1; then
+    log "FATAL: cargo still not runnable after bootstrap"
+    return 1
+  fi
+  log "rust ready: $("$bin/rustc" --version)"
+}
+
 setup_swap
 tune_vm
+setup_rust
 setup_repo "${1:-}"
 log "environment ready:  repo=$REPO  artifacts=$ART"
 free -h | sed 's/^/    /'

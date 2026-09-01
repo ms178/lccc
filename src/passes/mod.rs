@@ -18,6 +18,7 @@ pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
 pub(crate) mod bool_thread;
 pub(crate) mod block_layout;
+pub(crate) mod loop_invert;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
