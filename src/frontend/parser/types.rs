@@ -697,6 +697,18 @@ impl Parser {
         if sso2.is_some() {
             sso = sso2;
         }
+        // An alignment attribute parsed BEFORE the `struct` keyword
+        // (`__attribute__((aligned(N))) struct T { ... } member;`) belongs to
+        // the DECLARATION that follows the struct body — GCC applies it to
+        // the member declarator, never to the nested struct's own members.
+        // Without this save/restore the pending value leaked into the body's
+        // field parsing and landed on the nested struct's first field,
+        // inflating the nested type's size and alignment
+        // (gcc.c-torture/execute pr82210.c: `aligned(16) struct T { short
+        // c; } a[size];` made sizeof(struct T) = 16 instead of 2, so the
+        // VLA member spanned 8x the bytes and every later offset was wrong).
+        let saved_pending_alignas = self.attrs.parsed_alignas.take();
+        let saved_pending_alignas_type = self.attrs.parsed_alignas_type.take();
         let fields = if matches!(self.peek(), TokenKind::LBrace) {
             // Save and restore parsing_const across struct field parsing.
             // Field types may contain `const` (e.g., `const int *p`), and without
@@ -709,6 +721,12 @@ impl Parser {
         } else {
             None
         };
+        // Body parsed: hand the pending alignment back to the declarator
+        // parsing that follows (post-body `__attribute__((aligned(N)))`
+        // attributes read below apply to the struct type itself, matching
+        // GCC's `struct T { ... } __attribute__((aligned(N)));` semantics).
+        self.attrs.parsed_alignas = saved_pending_alignas;
+        self.attrs.parsed_alignas_type = saved_pending_alignas_type;
         let (packed3, aligned3, _, _, sso3) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
         if aligned3.is_some() {

@@ -1,10 +1,62 @@
 use super::lower::Lowerer;
 use crate::common::types::{AddressSpace, CType, IrType, RcLayout, SsoMode, StructLayout};
 use crate::frontend::parser::ast::{
-    BinOp, Declaration, Expr, StructFieldDecl, TypeSpecifier, UnaryOp,
+    BinOp, Declaration, DerivedDeclarator, Expr, StructFieldDecl, TypeSpecifier, UnaryOp,
 };
 use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 use std::rc::Rc;
+
+/// Dynamic byte/bit cursor for laying out the part of a struct that follows
+/// a VLA member (GCC's VLA-in-struct extension).
+///
+/// The cursor value is `post + runtime` bytes, where `post` is a compile-time
+/// byte total and `runtime` is an IR value (the sum of VLA member sizes, plus
+/// any post-VLA runtime-aligned deltas folded in by [`Lowerer::vla_cursor_align`]).
+/// An open bitfield run tracks `run_bits` of bit-granular placement on top.
+///
+/// Invariant: at every closed-run boundary, `post + runtime ≡ 0 (mod guarantee)`
+/// at runtime. `guarantee` starts at the VLA member's element alignment (its
+/// static offset is aligned to it and its runtime size is a multiple of it)
+/// and is reduced by `gcd` on fixed deltas or raised by explicit alignment.
+/// Every divisor of `guarantee` therefore divides the cursor — which is what
+/// makes the SysV bitfield straddle test decidable for
+/// `sizeof(T) <= guarantee`.
+pub(super) struct VlaDynCursor {
+    /// Compile-time byte prefix (VLA member's static offset + fixed deltas).
+    pub(super) post: usize,
+    /// Runtime byte component, if any VLA member has been seen.
+    pub(super) runtime: Option<Value>,
+    /// An open bitfield run is placing bits.
+    pub(super) run_open: bool,
+    /// Bits placed since the run opened (measured from a cursor that was
+    /// ≡ 0 (mod guarantee) — every divisor of guarantee divides the run base).
+    pub(super) run_bits: u32,
+    /// Packed struct: bitfields pack at bit granularity, no unit constraint.
+    pub(super) packed: bool,
+    /// cursor ≡ 0 (mod guarantee) at every closed-run boundary.
+    pub(super) guarantee: usize,
+}
+
+impl VlaDynCursor {
+    pub(super) fn new(seed_offset: usize, packed: bool) -> Self {
+        Self {
+            post: seed_offset,
+            runtime: None,
+            run_open: false,
+            run_bits: 0,
+            packed,
+            guarantee: 1,
+        }
+    }
+}
+
+fn gcd_usize(a: usize, b: usize) -> usize {
+    if b == 0 {
+        a
+    } else {
+        gcd_usize(b, a % b)
+    }
+}
 
 impl Lowerer {
     /// Allocation size for a temporary that stores packed small-struct data.
@@ -198,23 +250,31 @@ impl Lowerer {
                     }
                 }
                 let key = self.struct_layout_key(tag, false);
-                self.insert_struct_layout_scoped(key.clone(), layout);
-                // Also invalidate the ctype_cache for this tag so sizeof picks
-                // up the new definition
-                if tag.is_some() {
-                    self.invalidate_ctype_cache_scoped(&key);
-                }
                 // Record runtime sizeof for structs with VLA members so
                 // sizeof(struct s) / sizeof(typedef_of_s) is not a compile-time
                 // constant. Bound expressions are evaluated here, at the type
                 // definition, matching C99/GCC (later stores to `n` are ignored).
+                // (Runs before insert_struct_layout_scoped, which takes the
+                // layout by value and the dynamic-offset walk reads it.)
                 if self.func_state.is_some() {
                     if let Some(vla_size) = self.compute_vla_size_from_type_spec(ts) {
                         self.func_mut()
                             .insert_vla_typedef_size_scoped(key.clone(), vla_size);
                     }
                     self.compute_vla_field_strides_for_decl(&key, fields);
-                    self.compute_vla_field_offsets_for_decl(&key, fields, *is_packed);
+                    self.compute_vla_field_offsets_for_decl(
+                        &key,
+                        fields,
+                        *is_packed,
+                        *pragma_pack,
+                        &layout,
+                    );
+                }
+                self.insert_struct_layout_scoped(key.clone(), layout);
+                // Also invalidate the ctype_cache for this tag so sizeof picks
+                // up the new definition
+                if tag.is_some() {
+                    self.invalidate_ctype_cache_scoped(&key);
                 }
             }
             TypeSpecifier::Union(
@@ -704,13 +764,33 @@ impl Lowerer {
             }
             Expr::MemberAccess(inner_base, inner_field, _) => {
                 // Nested member access: s.inner.field
-                let (inner_offset, _) = self.resolve_member_access(inner_base, inner_field);
+                // A field that follows a VLA member has a runtime offset
+                // (recorded by compute_vla_field_offsets_for_decl); it must
+                // be preferred over the static layout offset, which treats
+                // the VLA member as a zero-size flexible array
+                // (gcc.c-torture/execute align-nest.c: s[k].mi resolved at
+                // static offset 1 instead of the runtime 4n+5/9).
+                let inner_offset = match self.get_vla_field_offset(inner_base, inner_field, false) {
+                    Some(vo) => vo,
+                    None => {
+                        let (off, _) = self.resolve_member_access(inner_base, inner_field);
+                        let addr = self.get_struct_base_addr(inner_base);
+                        let inner_addr = self.fresh_value();
+                        self.emit(Instruction::GetElementPtr {
+                            dest: inner_addr,
+                            base: addr,
+                            offset: Operand::Const(IrConst::ptr_int(off as i64)),
+                            ty: IrType::Ptr,
+                        });
+                        return inner_addr;
+                    }
+                };
                 let inner_base_addr = self.get_struct_base_addr(inner_base);
                 let inner_addr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
                     dest: inner_addr,
                     base: inner_base_addr,
-                    offset: Operand::Const(IrConst::ptr_int(inner_offset as i64)),
+                    offset: Operand::Value(inner_offset),
                     ty: IrType::Ptr,
                 });
                 inner_addr
@@ -730,12 +810,26 @@ impl Lowerer {
                         tmp
                     }
                 };
-                let (inner_offset, _) = self.resolve_pointer_member_access(inner_base, inner_field);
+                let inner_offset = match self.get_vla_field_offset(inner_base, inner_field, true) {
+                    Some(vo) => vo,
+                    None => {
+                        let (off, _) =
+                            self.resolve_pointer_member_access(inner_base, inner_field);
+                        let inner_addr = self.fresh_value();
+                        self.emit(Instruction::GetElementPtr {
+                            dest: inner_addr,
+                            base: base_addr,
+                            offset: Operand::Const(IrConst::ptr_int(off as i64)),
+                            ty: IrType::Ptr,
+                        });
+                        return inner_addr;
+                    }
+                };
                 let inner_addr = self.fresh_value();
                 self.emit(Instruction::GetElementPtr {
                     dest: inner_addr,
                     base: base_addr,
-                    offset: Operand::Const(IrConst::ptr_int(inner_offset as i64)),
+                    offset: Operand::Value(inner_offset),
                     ty: IrType::Ptr,
                 });
                 inner_addr
@@ -1662,116 +1756,450 @@ impl Lowerer {
         struct_key: &str,
         fields: &[StructFieldDecl],
         is_packed: bool,
+        pragma_pack: Option<usize>,
+        layout: &crate::common::types::StructLayout,
     ) {
-        use crate::ir::ops::IrBinOp;
-        let ptr_int_ty = crate::common::types::target_int_ir_type();
-        let mut current_offset: Option<Value> = None;
-        let mut current_const_offset: usize = 0;
-        let mut has_seen_vla = false;
+        use crate::common::types::StructFieldLayout;
 
-        for f in fields {
+        // Locate the first VLA member. Without one there are no dynamic
+        // offsets to record.
+        let mut vla_idx = None;
+        for (idx, f) in fields.iter().enumerate() {
             if f.bit_width.is_some() {
                 continue;
             }
-            let ct = self.struct_field_ctype(f);
-            let align = if is_packed {
-                1
-            } else {
-                self.ctype_align(&ct).max(1)
-            };
-
-            // Align current offset to field's alignment
-            if align > 1 {
-                if let Some(mut cur_val) = current_offset {
-                    if current_const_offset > 0 {
-                        cur_val = self.emit_binop_val(
-                            IrBinOp::Add,
-                            Operand::Value(cur_val),
-                            Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
-                            ptr_int_ty,
-                        );
-                        current_const_offset = 0;
-                    }
-                    let align_mask = !(align as i64 - 1);
-                    let add_align = self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(cur_val),
-                        Operand::Const(IrConst::ptr_int(align as i64 - 1)),
-                        ptr_int_ty,
-                    );
-                    let aligned = self.emit_binop_val(
-                        IrBinOp::And,
-                        Operand::Value(add_align),
-                        Operand::Const(IrConst::ptr_int(align_mask)),
-                        ptr_int_ty,
-                    );
-                    current_offset = Some(aligned);
-                } else {
-                    current_const_offset = (current_const_offset + align - 1) & !(align - 1);
-                }
+            if self.field_vla_runtime_size_probe(f) {
+                vla_idx = Some(idx);
+                break;
             }
+        }
+        let Some(vla_idx) = vla_idx else { return };
 
-            // If we have already seen a VLA field in this struct, record this field's dynamic offset
-            if has_seen_vla {
-                let field_offset_val = if current_const_offset > 0 {
-                    let v = self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(current_offset.unwrap()),
-                        Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
-                        ptr_int_ty,
-                    );
-                    current_offset = Some(v);
-                    current_const_offset = 0;
-                    v
+        // Seed the dynamic cursor with the VLA member's STATIC offset: every
+        // field before it is fixed-size, so the static layout already knows
+        // its exact offset — including any bitfields that precede the VLA
+        // member. (The previous implementation recomputed the pre-VLA prefix
+        // by hand and skipped bitfields, so `struct { unsigned b:3; int
+        // i[n]; ... }` started the dynamic walk at 0 instead of 4.)
+        let vla_member_static_offset = fields[..vla_idx]
+            .iter()
+            .filter_map(|f| {
+                let name = f.name.as_deref()?;
+                layout
+                    .fields
+                    .iter()
+                    .find(|fl: &&StructFieldLayout| fl.name == name)
+                    .map(|fl| fl.offset)
+            })
+            .next()
+            .unwrap_or(0);
+
+        let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
+
+        for f in &fields[vla_idx..] {
+            let bit_width = f
+                .bit_width
+                .as_ref()
+                .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
+            if let Some(bw) = bit_width {
+                // Bitfield: advance the bit cursor. Offsets of bitfields are
+                // not recorded (member access to a bitfield that follows a
+                // VLA member keeps the static path — no test exercises it).
+                let ct = self.struct_field_ctype(f);
+                if is_packed {
+                    self.vla_cursor_bitfield_packed(&mut cursor, bw);
                 } else {
-                    current_offset.unwrap()
-                };
-                if let Some(ref name) = f.name {
+                    let unit_size = self.ctype_size(&ct);
+                    let unit_align = self.ctype_align(&ct).max(1);
+                    if unit_size == 0 {
+                        continue;
+                    }
+                    if bw == 0 {
+                        // Zero-width: next field at the type's unit boundary.
+                        self.vla_cursor_close_run_for_field(&mut cursor);
+                        self.vla_cursor_align(&mut cursor, unit_align);
+                    } else if unit_size <= cursor.guarantee {
+                        // Cursor ≡ 0 (mod unit_size) is statically known, so
+                        // the SysV straddle test is decidable.
+                        self.vla_cursor_bitfield_unit(&mut cursor, bw, unit_size);
+                    } else {
+                        // Straddle undecidable at compile time: fall back to
+                        // one fresh aligned unit per bitfield (self-consistent,
+                        // overlap-free).
+                        self.vla_cursor_close_run_for_field(&mut cursor);
+                        self.vla_cursor_align(&mut cursor, unit_align);
+                        self.vla_cursor_add_fixed(&mut cursor, unit_size);
+                    }
+                }
+                continue;
+            }
+            let ct = self.struct_field_ctype(f);
+            let align = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
+            // Close any open bitfield run and align the cursor to the field.
+            self.vla_cursor_close_run_for_field(&mut cursor);
+            self.vla_cursor_align(&mut cursor, align);
+
+            // Named field following the VLA member: record its dynamic
+            // offset so member access uses it instead of the static layout
+            // offset (which treats the VLA member as a zero-size flexible
+            // array). This includes subsequent VLA members themselves
+            // (pr82210.c: `struct S { T a[size]; int b[size]; }` — b's
+            // runtime offset is align_up(a_bytes, alignof(int))).
+            if let Some(ref name) = f.name {
+                if let Some(off_val) = self.vla_cursor_offset_value(&cursor) {
                     let field_key = format!("{struct_key}::{name}");
                     self.func_mut()
-                        .insert_vla_field_offset_scoped(field_key, field_offset_val);
+                        .insert_vla_field_offset_scoped(field_key, off_val);
                 }
             }
-
-            // Advance offset by field size
             if let Some(vla_sz) = self.field_vla_runtime_size(f) {
-                has_seen_vla = true;
-                let next_val = if let Some(prev) = current_offset {
-                    let p = if current_const_offset > 0 {
-                        let tmp = self.emit_binop_val(
-                            IrBinOp::Add,
-                            Operand::Value(prev),
-                            Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
-                            ptr_int_ty,
-                        );
-                        current_const_offset = 0;
-                        tmp
-                    } else {
-                        prev
-                    };
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(p),
-                        Operand::Value(vla_sz),
-                        ptr_int_ty,
-                    )
-                } else if current_const_offset > 0 {
-                    let added = self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(vla_sz),
-                        Operand::Const(IrConst::ptr_int(current_const_offset as i64)),
-                        ptr_int_ty,
-                    );
-                    current_const_offset = 0;
-                    added
-                } else {
-                    vla_sz
-                };
-                current_offset = Some(next_val);
-            } else {
-                let sz = self.ctype_size(&ct);
-                current_const_offset += sz;
+                self.vla_cursor_add_vla(&mut cursor, vla_sz);
+                continue;
             }
+            let sz = self.ctype_size(&ct);
+            self.vla_cursor_add_fixed(&mut cursor, sz);
+        }
+    }
+
+    /// True when `field` is (or contains) a VLA whose byte size is only
+    /// known at runtime. Pure probe: emits no IR.
+    pub(super) fn field_vla_runtime_size_probe(&self, field: &StructFieldDecl) -> bool {
+        if !field.derived.is_empty()
+            && self.probe_vla_runtime_size(&field.type_spec, &field.derived)
+        {
+            return true;
+        }
+        self.probe_vla_size_from_type_spec(&field.type_spec)
+    }
+
+    fn probe_vla_runtime_size(
+        &self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> bool {
+        let array_dims: Vec<&Option<Box<Expr>>> = derived
+            .iter()
+            .filter_map(|d| {
+                if let DerivedDeclarator::Array(size) = d {
+                    Some(size)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if array_dims.is_empty() {
+            return self.probe_vla_size_from_type_spec(type_spec);
+        }
+        // Non-constant dimension → VLA.
+        for expr in array_dims.iter().copied().flatten() {
+            if self.expr_as_array_size(expr).is_none() {
+                return true;
+            }
+        }
+        // All dimensions constant, but the element type may still be a
+        // VLA-member struct (or a VLA typedef).
+        self.probe_vla_size_from_type_spec(type_spec)
+    }
+
+    fn probe_vla_size_from_type_spec(&self, type_spec: &TypeSpecifier) -> bool {
+        match type_spec {
+            TypeSpecifier::TypedefName(name) => {
+                if let Some(fs) = self.func_state.as_ref() {
+                    if fs.vla_typedef_sizes.contains_key(name) {
+                        return true;
+                    }
+                }
+                // typedef of a struct with VLA members: the struct's size was
+                // recorded under its key when the type was defined.
+                if let Some(ct) = self.types.typedefs.get(name) {
+                    match ct {
+                        CType::Struct(key) | CType::Union(key) => {
+                            if let Some(fs) = self.func_state.as_ref() {
+                                if fs.vla_typedef_sizes.contains_key(key.as_ref()) {
+                                    return true;
+                                }
+                            }
+                        }
+                        CType::Array(_, None) => return true,
+                        _ => {}
+                    }
+                }
+                false
+            }
+            TypeSpecifier::Struct(Some(tag), ..) | TypeSpecifier::Union(Some(tag), ..) => {
+                let key = if matches!(type_spec, TypeSpecifier::Union(..)) {
+                    format!("union.{}", tag)
+                } else {
+                    format!("struct.{}", tag)
+                };
+                self.func_state
+                    .as_ref()
+                    .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(&key))
+            }
+            TypeSpecifier::Struct(_, Some(fields), ..) | TypeSpecifier::Union(_, Some(fields), ..) => {
+                fields.iter().any(|f| {
+                    if f.bit_width.is_some() {
+                        return false;
+                    }
+                    if !f.derived.is_empty()
+                        && self.probe_vla_runtime_size(&f.type_spec, &f.derived)
+                    {
+                        return true;
+                    }
+                    self.probe_vla_size_from_type_spec(&f.type_spec)
+                })
+            }
+            TypeSpecifier::Typeof(expr) => {
+                // Mirror compute_vla_size_from_type_spec: typeof(vla_local)
+                // is dynamic iff the local is a VLA with a runtime size.
+                if let Expr::Identifier(name, _) = &**expr {
+                    if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name))
+                    {
+                        return info.vla_size.is_some();
+                    }
+                }
+                false
+            }
+            TypeSpecifier::Array(_, Some(size_expr)) => self.expr_as_array_size(size_expr).is_none(),
+            TypeSpecifier::Array(_, None) => true,
+            _ => false,
+        }
+    }
+
+    /// Effective alignment of a struct field for the dynamic VLA cursor,
+    /// mirroring `StructLayoutBuilder::compute_field_alignment`: a per-field
+    /// `packed` forces 1; an explicit `aligned(N)` attribute raises above the
+    /// natural alignment and overrides struct-level packing
+    /// (pr82210.c: `__attribute__((aligned(16))) struct T { short c; }
+    /// a[size];` gives the member 16-byte alignment — the struct's size
+    /// rounds to 16 even though the member's runtime span does not); a
+    /// struct-level `packed` or `#pragma pack` caps the natural alignment.
+    pub(super) fn vla_field_effective_align(
+        &self,
+        f: &StructFieldDecl,
+        ct: &CType,
+        is_packed: bool,
+        pragma_pack: Option<usize>,
+    ) -> usize {
+        let natural = self.ctype_align(ct).max(1);
+        if f.is_packed {
+            return 1;
+        }
+        if let Some(explicit) = f.alignment {
+            return natural.max(explicit);
+        }
+        let cap = if is_packed { Some(1) } else { pragma_pack };
+        match cap {
+            Some(c) => natural.min(c.max(1)),
+            None => natural,
+        }
+    }
+
+    /// Packed bitfield placement: bits accumulate contiguously with no
+    /// storage-unit constraint (GCC packed-bitfield semantics).
+    pub(super) fn vla_cursor_bitfield_packed(&mut self, cursor: &mut VlaDynCursor, bw: u32) {
+        if bw == 0 {
+            // Zero-width packed: round up to the next byte boundary. (The
+            // type-alignment forcing of a packed `T :0` is applied by the
+            // caller, which knows the type.)
+            self.vla_cursor_close_run_for_field(cursor);
+            return;
+        }
+        if !cursor.run_open {
+            cursor.run_open = true;
+            cursor.run_bits = 0;
+        }
+        cursor.run_bits += bw;
+    }
+
+    /// Unpacked bitfield placement with a decidable straddle rule: the field
+    /// must fit inside one `unit_size`-byte storage unit; a straddling field
+    /// starts a fresh unit. Requires cursor ≡ 0 (mod unit_size) at run start
+    /// (guaranteed by the caller checking `unit_size <= cursor.guarantee`).
+    pub(super) fn vla_cursor_bitfield_unit(&mut self, cursor: &mut VlaDynCursor, bw: u32, unit_size: usize) {
+        if !cursor.run_open {
+            cursor.run_open = true;
+            cursor.run_bits = 0;
+        }
+        let unit_bits = (unit_size * 8) as u32;
+        let unit_rel = cursor.run_bits % unit_bits;
+        if unit_rel + bw > unit_bits {
+            // Straddle: start the next unit.
+            cursor.run_bits += unit_bits - unit_rel;
+        }
+        cursor.run_bits += bw;
+    }
+
+    /// Close an open bitfield run so a byte-addressed field can follow.
+    /// Packed: next byte after the last bit. Unpacked: same rounding (the
+    /// caller then aligns to the field's alignment).
+    pub(super) fn vla_cursor_close_run_for_field(&mut self, cursor: &mut VlaDynCursor) {
+        if !cursor.run_open {
+            return;
+        }
+        let bytes = ((cursor.run_bits + 7) / 8) as usize;
+        cursor.post += bytes;
+        cursor.guarantee = gcd_usize(cursor.guarantee, bytes.max(1));
+        cursor.run_open = false;
+        cursor.run_bits = 0;
+    }
+
+    /// Close an open bitfield run at the END of the struct: the size extends
+    /// to the end of the last storage unit (GCC: `struct {unsigned b:1;}` is
+    /// 4 bytes, not 1). `last_unit` is the last bitfield's storage size;
+    /// packed structs round to a byte instead.
+    pub(super) fn vla_cursor_close_run_for_size(&mut self, cursor: &mut VlaDynCursor, last_unit: usize) {
+        if !cursor.run_open {
+            return;
+        }
+        if cursor.packed {
+            let bytes = ((cursor.run_bits + 7) / 8) as usize;
+            cursor.post += bytes;
+            cursor.guarantee = gcd_usize(cursor.guarantee, bytes.max(1));
+        } else {
+            let unit = last_unit.max(1);
+            let units = (cursor.run_bits as usize).div_ceil(unit * 8);
+            cursor.post += units * unit;
+            cursor.guarantee = gcd_usize(cursor.guarantee, unit);
+        }
+        cursor.run_open = false;
+        cursor.run_bits = 0;
+    }
+
+    /// Align the byte cursor up to `align` (no-op when already guaranteed).
+    pub(super) fn vla_cursor_align(&mut self, cursor: &mut VlaDynCursor, align: usize) {
+        if align <= 1 {
+            return;
+        }
+        if align <= cursor.guarantee {
+            return; // cursor is already ≡ 0 (mod align)
+        }
+        let mask = (align - 1) as i64;
+        match cursor.runtime.take() {
+            Some(rt) => {
+                // Fold the static prefix into the runtime value, align the
+                // sum, and restart the static tail at zero.
+                let v = if cursor.post > 0 {
+                    self.emit_binop_val(
+                        crate::ir::ops::IrBinOp::Add,
+                        Operand::Value(rt),
+                        Operand::Const(IrConst::ptr_int(cursor.post as i64)),
+                        crate::common::types::target_int_ir_type(),
+                    )
+                } else {
+                    rt
+                };
+                let ty = crate::common::types::target_int_ir_type();
+                let added = self.emit_binop_val(
+                    crate::ir::ops::IrBinOp::Add,
+                    Operand::Value(v),
+                    Operand::Const(IrConst::ptr_int(mask)),
+                    ty,
+                );
+                let aligned = self.emit_binop_val(
+                    crate::ir::ops::IrBinOp::And,
+                    Operand::Value(added),
+                    Operand::Const(IrConst::ptr_int(!mask)),
+                    ty,
+                );
+                cursor.runtime = Some(aligned);
+                cursor.post = 0;
+            }
+            None => {
+                cursor.post = (cursor.post + align - 1) & !(align - 1);
+            }
+        }
+        cursor.guarantee = align;
+    }
+
+    /// Add a runtime-sized contribution (a VLA member's byte size).
+    ///
+    /// The cursor's alignment guarantee drops to 1: a VLA member's runtime
+    /// size carries no statically decidable divisibility in general — its
+    /// element may itself be dynamically sized (arrays of VLA-member
+    /// structs), and a member alignment attribute (e.g.
+    /// `__attribute__((aligned(16))) struct T a[size];`) raises the member's
+    /// OFFSET alignment without constraining its runtime SIZE at all
+    /// (gcc.c-torture/execute pr82210.c: sizeof(struct T) = 2, so a[15]
+    /// spans 30 bytes — not a multiple of the member's 16-byte alignment).
+    /// The worst case costs one runtime align-up for the first post-VLA
+    /// field; soundness comes first.
+    pub(super) fn vla_cursor_add_vla(&mut self, cursor: &mut VlaDynCursor, sz: Value) {
+        match cursor.runtime.take() {
+            Some(rt) => {
+                let v = if cursor.post > 0 {
+                    self.emit_binop_val(
+                        crate::ir::ops::IrBinOp::Add,
+                        Operand::Value(rt),
+                        Operand::Const(IrConst::ptr_int(cursor.post as i64)),
+                        crate::common::types::target_int_ir_type(),
+                    )
+                } else {
+                    rt
+                };
+                let added = self.emit_binop_val(
+                    crate::ir::ops::IrBinOp::Add,
+                    Operand::Value(v),
+                    Operand::Value(sz),
+                    crate::common::types::target_int_ir_type(),
+                );
+                cursor.runtime = Some(added);
+                cursor.post = 0;
+            }
+            None => {
+                cursor.runtime = Some(sz);
+            }
+        }
+        cursor.guarantee = 1;
+    }
+
+    /// Add a fixed-size contribution (a non-bitfield field's byte size).
+    pub(super) fn vla_cursor_add_fixed(&mut self, cursor: &mut VlaDynCursor, d: usize) {
+        if d == 0 {
+            return;
+        }
+        cursor.post += d;
+        cursor.guarantee = gcd_usize(cursor.guarantee.max(1), d);
+    }
+
+    /// Materialize the current byte cursor as an IR value, if it has any
+    /// runtime component. Pure in the `None` case (compile-time-only cursor);
+    /// the `Some` case emits one Add when a static tail is pending.
+    pub(super) fn vla_cursor_offset_value(&mut self, cursor: &VlaDynCursor) -> Option<Value> {
+        let rt = cursor.runtime?;
+        let ty = crate::common::types::target_int_ir_type();
+        Some(if cursor.post > 0 {
+            self.emit_binop_val(
+                crate::ir::ops::IrBinOp::Add,
+                Operand::Value(rt),
+                Operand::Const(IrConst::ptr_int(cursor.post as i64)),
+                ty,
+            )
+        } else {
+            rt
+        })
+    }
+
+    /// Total byte size accumulated by the cursor, as an IR value. Unlike
+    /// [`Lowerer::vla_cursor_offset_value`] this also materializes a pure
+    /// constant cursor (used for the sizeof walk, where the trailing
+    /// alignment rounding needs an operand either way).
+    pub(super) fn vla_cursor_total(&mut self, cursor: &VlaDynCursor) -> Operand {
+        let ty = crate::common::types::target_int_ir_type();
+        match cursor.runtime {
+            Some(rt) => {
+                if cursor.post > 0 {
+                    Operand::Value(self.emit_binop_val(
+                        crate::ir::ops::IrBinOp::Add,
+                        Operand::Value(rt),
+                        Operand::Const(IrConst::ptr_int(cursor.post as i64)),
+                        ty,
+                    ))
+                } else {
+                    Operand::Value(rt)
+                }
+            }
+            None => Operand::Const(IrConst::ptr_int(cursor.post as i64)),
         }
     }
 }

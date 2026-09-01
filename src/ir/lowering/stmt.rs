@@ -1,5 +1,6 @@
 use super::definitions::{DeclAnalysis, FuncSig, GlobalInfo, LocalInfo};
 use super::lower::Lowerer;
+use super::structs::VlaDynCursor;
 use crate::common::types::{target_int_ir_type, AddressSpace, CType, IrType, StructLayout};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, Expr, InitDeclarator,
@@ -1490,8 +1491,39 @@ impl Lowerer {
             }
         }
 
+        // Runtime element size: GCC's VLA-in-struct extension makes arrays
+        // of such structs (or of VLA typedefs) dynamically sized even when
+        // every dimension is a compile-time constant. For `struct S s[2]`
+        // with `struct S { int i[n]; ... }`, the object needs
+        // 2 * sizeof(S) bytes of dynamic stack storage — a static alloca
+        // sized from the FAM-based static sizeof would only reserve a
+        // fraction, and the k * sizeof(S) element addressing would then
+        // write past the object (gcc.c-torture/execute align-nest.c).
+        let elem_runtime = self.compute_vla_size_from_type_spec(type_spec);
+
         if !has_vla {
-            return None; // All dimensions are compile-time constants
+            // All dimensions are compile-time constants: dynamic iff the
+            // element type is.
+            if let Some(ev) = elem_runtime {
+                let mut count: usize = 1;
+                for expr in array_dims.iter().copied().flatten() {
+                    if let Some(c) = self.expr_as_array_size(expr) {
+                        count = count.saturating_mul(c as usize);
+                    }
+                }
+                let ptr_int_ty = target_int_ir_type();
+                return Some(if count > 1 {
+                    self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(ev),
+                        Operand::Const(IrConst::ptr_int(count as i64)),
+                        ptr_int_ty,
+                    )
+                } else {
+                    ev
+                });
+            }
+            return None;
         }
 
         // Compute element size, accounting for pointer/function-pointer derivations.
@@ -1501,9 +1533,11 @@ impl Lowerer {
         // appears before (or among) the array dimensions.
         let base_elem_size = self.vla_base_element_size(type_spec, derived);
 
-        // Build runtime product: dim0 * dim1 * ... * base_elem_size
+        // Build runtime product: dim0 * dim1 * ... * elem_size
         let mut result: Option<Value> = None;
-        let mut const_product: usize = base_elem_size;
+        // With a runtime element size, the constant dimension product folds
+        // separately and the element factor is multiplied in at the end.
+        let mut const_product: usize = if elem_runtime.is_some() { 1 } else { base_elem_size };
 
         for expr in array_dims.iter().copied().flatten() {
             if let Some(const_val) = self.expr_as_array_size(expr) {
@@ -1539,6 +1573,43 @@ impl Lowerer {
                     }
                 };
             }
+        }
+
+        // Multiply in the runtime element factor (VLA-member struct or VLA
+        // typedef element): total = dims_product * elem_size.
+        if let Some(ev) = elem_runtime {
+            let ptr_int_ty = target_int_ir_type();
+            let dims_val = match result {
+                Some(r) if const_product > 1 => Some(self.emit_binop_val(
+                    IrBinOp::Mul,
+                    Operand::Value(r),
+                    Operand::Const(IrConst::ptr_int(const_product as i64)),
+                    ptr_int_ty,
+                )),
+                r => r,
+            };
+            return match dims_val {
+                Some(d) => Some(self.emit_binop_val(
+                    IrBinOp::Mul,
+                    Operand::Value(d),
+                    Operand::Value(ev),
+                    ptr_int_ty,
+                )),
+                None => {
+                    // No runtime dims reached the loop: const_product holds
+                    // the full constant count.
+                    if const_product > 1 {
+                        Some(self.emit_binop_val(
+                            IrBinOp::Mul,
+                            Operand::Value(ev),
+                            Operand::Const(IrConst::ptr_int(const_product as i64)),
+                            ptr_int_ty,
+                        ))
+                    } else {
+                        Some(ev)
+                    }
+                }
+            };
         }
 
         // If we have remaining constant factors, multiply them in
@@ -1793,12 +1864,36 @@ impl Lowerer {
                     Some(dim_value)
                 }
             }
-            TypeSpecifier::Struct(_, Some(fields), is_packed, ..) => {
-                self.compute_vla_struct_sizeof(fields, false, *is_packed)
-            }
-            TypeSpecifier::Union(_, Some(fields), is_packed, ..) => {
-                self.compute_vla_struct_sizeof(fields, true, *is_packed)
-            }
+            TypeSpecifier::Struct(
+                _,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.compute_vla_struct_sizeof(
+                fields,
+                false,
+                *is_packed,
+                *struct_aligned,
+                *pragma_pack,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            TypeSpecifier::Union(
+                _,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => self.compute_vla_struct_sizeof(
+                fields,
+                true,
+                *is_packed,
+                *struct_aligned,
+                *pragma_pack,
+                reverse_sso.is_some_and(|v| v),
+            ),
             TypeSpecifier::TypedefName(name) => {
                 if let Some(ct) = self.types.typedefs.get(name).cloned() {
                     match ct {
@@ -1828,110 +1923,161 @@ impl Lowerer {
         fields: &[StructFieldDecl],
         is_union: bool,
         is_packed: bool,
+        struct_aligned: Option<usize>,
+        pragma_pack: Option<usize>,
+        reverse_sso: bool,
     ) -> Option<Value> {
         let ptr_int_ty = target_int_ir_type();
-        let mut vla_total: Option<Value> = None;
-        let mut const_total: usize = 0;
-        let mut has_vla = false;
-        let mut max_align: usize = 1;
 
-        for f in fields {
-            if f.bit_width.is_some() {
-                continue;
-            }
-            let ct = self.struct_field_ctype(f);
-            let align = if is_packed {
-                1
-            } else {
-                self.ctype_align(&ct).max(1)
-            };
-            if align > max_align {
-                max_align = align;
-            }
-
-            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
-                has_vla = true;
-                if !is_packed && align > 1 {
-                    const_total = (const_total + align - 1) & !(align - 1);
-                }
-                let combined = if let Some(prev) = vla_total {
-                    self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(prev),
-                        Operand::Value(vla_sz),
-                        ptr_int_ty,
-                    )
-                } else if const_total > 0 {
-                    let added = self.emit_binop_val(
-                        IrBinOp::Add,
-                        Operand::Value(vla_sz),
-                        Operand::Const(IrConst::ptr_int(const_total as i64)),
-                        ptr_int_ty,
-                    );
-                    const_total = 0;
-                    added
-                } else {
-                    vla_sz
-                };
-                vla_total = Some(combined);
-            } else {
-                let sz = self.ctype_size(&ct);
-                if !is_packed && align > 1 {
-                    const_total = (const_total + align - 1) & !(align - 1);
-                }
-                if let Some(prev) = vla_total {
-                    if sz > 0 {
-                        vla_total = Some(self.emit_binop_val(
-                            IrBinOp::Add,
-                            Operand::Value(prev),
-                            Operand::Const(IrConst::ptr_int(sz as i64)),
-                            ptr_int_ty,
-                        ));
-                    }
-                } else {
-                    const_total += sz;
-                }
-            }
-        }
-
-        if !has_vla {
-            return None;
-        }
+        // Locate the first VLA member (pure probe — the walk below produces
+        // the size Values, so probing must not emit).
+        let vla_idx = fields.iter().position(|f| {
+            f.bit_width.is_none() && self.field_vla_runtime_size_probe(f)
+        });
+        let Some(vla_idx) = vla_idx else { return None };
 
         // Union size is the max of members, not the sum. The VLA member is
         // typically the largest; returning it is correct for a single VLA
-        // field (the only form the torture suite uses).
+        // field (the only form the torture suite uses). Bitfield members
+        // never grow a union past its VLA member here.
         if is_union {
-            return vla_total;
+            let f = &fields[vla_idx];
+            return self.field_vla_runtime_size(f);
         }
 
-        let mut result = match (vla_total, const_total) {
-            (Some(v), 0) => v,
-            (Some(v), c) => self.emit_binop_val(
-                IrBinOp::Add,
-                Operand::Value(v),
-                Operand::Const(IrConst::ptr_int(c as i64)),
-                ptr_int_ty,
-            ),
-            (None, _) => return None,
-        };
+        // Seed the cursor with the VLA member's STATIC offset: everything
+        // before it is fixed-size and its exact offset (including any
+        // pre-VLA bitfield units) is already in the static layout.
+        let max_field_align = if is_packed { Some(1) } else { pragma_pack };
+        let layout = self.compute_struct_union_layout_packed(
+            fields,
+            false,
+            max_field_align,
+            reverse_sso,
+        );
+        let vla_member_static_offset = fields[..vla_idx]
+            .iter()
+            .filter_map(|f| {
+                let name = f.name.as_deref()?;
+                layout
+                    .fields
+                    .iter()
+                    .find(|fl| fl.name == name)
+                    .map(|fl| fl.offset)
+            })
+            .next()
+            .unwrap_or(0);
 
-        if !is_packed && max_align > 1 {
+        let mut cursor = VlaDynCursor::new(vla_member_static_offset, is_packed);
+        let mut max_align: usize = 1;
+        let mut last_bitfield_unit = 0usize;
+
+        for f in &fields[vla_idx..] {
+            let bit_width = f
+                .bit_width
+                .as_ref()
+                .and_then(|bw| self.eval_const_expr(bw).and_then(|c| c.to_u32()));
+            if let Some(bw) = bit_width {
+                let ct = self.struct_field_ctype(f);
+                if is_packed {
+                    // A packed zero-width bitfield still forces the next
+                    // boundary of its declared type (GCC packed `T :0`
+                    // semantics); nonzero widths pack bit-granularly.
+                    if bw == 0 {
+                        let a = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
+                        self.vla_cursor_close_run_for_field(&mut cursor);
+                        self.vla_cursor_align(&mut cursor, a);
+                        if a > max_align {
+                            max_align = a;
+                        }
+                    } else {
+                        self.vla_cursor_bitfield_packed(&mut cursor, bw);
+                        last_bitfield_unit = 1; // byte-rounded on close
+                    }
+                } else {
+                    let unit_size = self.ctype_size(&ct);
+                    let unit_align = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
+                    if unit_size == 0 {
+                        continue;
+                    }
+                    if unit_align > max_align {
+                        max_align = unit_align;
+                    }
+                    if bw == 0 {
+                        self.vla_cursor_close_run_for_field(&mut cursor);
+                        self.vla_cursor_align(&mut cursor, unit_align);
+                    } else if unit_size <= cursor.guarantee {
+                        self.vla_cursor_bitfield_unit(&mut cursor, bw, unit_size);
+                        last_bitfield_unit = unit_size;
+                    } else {
+                        // Straddle undecidable: fresh aligned unit.
+                        self.vla_cursor_close_run_for_field(&mut cursor);
+                        self.vla_cursor_align(&mut cursor, unit_align);
+                        self.vla_cursor_add_fixed(&mut cursor, unit_size);
+                        last_bitfield_unit = 0;
+                    }
+                }
+                continue;
+            }
+            let ct = self.struct_field_ctype(f);
+            let align = self.vla_field_effective_align(f, &ct, is_packed, pragma_pack);
+            if align > max_align {
+                max_align = align;
+            }
+            self.vla_cursor_close_run_for_field(&mut cursor);
+            self.vla_cursor_align(&mut cursor, align);
+            last_bitfield_unit = 0;
+
+            if let Some(vla_sz) = self.field_vla_runtime_size(f) {
+                self.vla_cursor_add_vla(&mut cursor, vla_sz);
+                continue;
+            }
+            let sz = self.ctype_size(&ct);
+            self.vla_cursor_add_fixed(&mut cursor, sz);
+        }
+        // A trailing bitfield run extends the size to the end of its last
+        // storage unit (packed: to the next byte).
+        if cursor.run_open {
+            let close_unit = if is_packed || last_bitfield_unit == 0 {
+                0
+            } else {
+                last_bitfield_unit
+            };
+            self.vla_cursor_close_run_for_size(&mut cursor, close_unit);
+        }
+
+        let total = self.vla_cursor_total(&cursor);
+
+        // Struct-level __attribute__((aligned(N))) raises the minimum
+        // alignment (and rounds the size) exactly like the static path in
+        // resolve_struct_or_union does. A packed struct without it rounds to
+        // alignment 1 (no rounding).
+        if struct_aligned.is_some_and(|a| a > max_align) {
+            max_align = struct_aligned.unwrap();
+        }
+        if max_align > 1 {
             let mask = (max_align - 1) as i64;
             let added = self.emit_binop_val(
                 IrBinOp::Add,
-                Operand::Value(result),
+                total,
                 Operand::Const(IrConst::ptr_int(mask)),
                 ptr_int_ty,
             );
-            result = self.emit_binop_val(
+            let aligned = self.emit_binop_val(
                 IrBinOp::And,
                 Operand::Value(added),
                 Operand::Const(IrConst::ptr_int(!mask)),
                 ptr_int_ty,
             );
+            Some(aligned)
+        } else {
+            match total {
+                Operand::Value(v) => Some(v),
+                // The walk only runs after the probe found a runtime-VLA
+                // member, so the total always carries a runtime component.
+                _ => None,
+            }
         }
-        Some(result)
     }
 
     /// Runtime byte size of a struct field if it is (or contains) a VLA.

@@ -151,6 +151,39 @@ fn line_info(kind: LineKind, ts: u16) -> LineInfo {
     }
 }
 
+/// Classify a `cmpX`/`testX` line.
+///
+/// A compare/test with a base-only frame memory operand READS that slot
+/// (`cmpl $0, 44(%esp)` reads bytes 44..48). The offset must be recorded in
+/// `ebp_offset` so every slot-liveness guard sees the reader: the
+/// compare-with-memory fold (`movl SLOT,%R; testl %R,%R` → `cmpl $0, SLOT`)
+/// produces exactly this shape, and with `ebp_offset` left at NONE both the
+/// windowed `eliminate_dead_stores` and the global
+/// `eliminate_never_read_stores_range` deleted the still-live store feeding
+/// the folded read — a union type-pun then read uninitialized stack
+/// (gcc.c-torture/execute cbrt.c: `n0 = (ut.pt[0] == 0)` saw garbage, every
+/// call at -O1+ returned -nan; the store survived only when a previous call
+/// happened to leave zeros on the same stack bytes).
+///
+/// Mirrors the x86-64 backend's `cmp_line_info`, which has parsed the frame
+/// offset for compare lines for the same reason. Indexed forms
+/// (`12(%esp,%ebx,4)`) are runtime-computed addresses: `has_indirect_mem`
+/// marks them and the offset stays NONE (same rule as the generic arm).
+fn cmp_line_info(ts: u16, s: &str) -> LineInfo {
+    let has_indirect = has_indirect_memory_access(s);
+    let ebp_offset = if has_indirect {
+        EBP_OFFSET_NONE
+    } else {
+        parse_ebp_offset_in_line(s)
+    };
+    LineInfo {
+        kind: LineKind::Cmp,
+        trim_start: ts,
+        has_indirect_mem: has_indirect,
+        ebp_offset,
+    }
+}
+
 // ── Register parsing ─────────────────────────────────────────────────────────
 
 /// Map i686 register name to family ID.
@@ -576,7 +609,7 @@ fn classify_line(raw: &str) -> LineInfo {
             return line_info(LineKind::Call, ts);
         }
         if bytes.len() >= 4 && bytes[1] == b'm' && bytes[2] == b'p' {
-            return line_info(LineKind::Cmp, ts);
+            return cmp_line_info(ts, s);
         }
     }
 
@@ -587,7 +620,7 @@ fn classify_line(raw: &str) -> LineInfo {
     // test instructions
     if first == b't' && bytes.len() >= 5 && bytes[1] == b'e' && bytes[2] == b's' && bytes[3] == b't'
     {
-        return line_info(LineKind::Cmp, ts);
+        return cmp_line_info(ts, s);
     }
 
     // push/pop
