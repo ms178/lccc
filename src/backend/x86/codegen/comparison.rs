@@ -899,13 +899,31 @@ impl X86Codegen {
         }
     }
 
+    /// `cmovl`/`cmovq` chosen by type. 32-bit cmov is restricted to unsigned
+    /// types: `cmovl` zero-extends dest, which is the U32 home invariant but
+    /// would drop the sign of a negative I32 that a later 64-bit signed use
+    /// (without an explicit `movslq`) would read.
+    fn emit_cmov_typed(&mut self, cc: &str, src64: &str, dst64: &str, ty: IrType) {
+        if ty.size() <= 4 && ty.is_unsigned() {
+            self.state.emit_fmt(format_args!(
+                "    cmov{}l %{}, %{}",
+                cc,
+                super::emit::reg_name_to_32(src64),
+                super::emit::reg_name_to_32(dst64),
+            ));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    cmov{}q %{}, %{}", cc, src64, dst64));
+        }
+    }
+
     pub(super) fn emit_select_impl(
         &mut self,
         dest: &Value,
         cond: &Operand,
         true_val: &Operand,
         false_val: &Operand,
-        _ty: IrType,
+        ty: IrType,
     ) {
         // legacy-compat path (debugging): the legacy emission order.
         if std::env::var("CCC_V9_SELECT").is_ok() {
@@ -1043,12 +1061,7 @@ impl X86Codegen {
                             phys_reg_name(d_reg),
                             phys_reg_name_32(d_reg),
                         );
-                        self.state.emit_fmt(format_args!(
-                            "    cmov{}q %{}, %{}",
-                            cmov_cc,
-                            phys_reg_name(src_reg),
-                            d_name
-                        ));
+                        self.emit_cmov_typed(cmov_cc, phys_reg_name(src_reg), d_name, ty);
                     } else {
                         self.select_operand_to_reg(true_val, "rcx", "ecx");
                         self.select_operand_to_reg(
@@ -1056,8 +1069,7 @@ impl X86Codegen {
                             phys_reg_name(d_reg),
                             phys_reg_name_32(d_reg),
                         );
-                        self.state
-                            .emit_fmt(format_args!("    cmov{}q %rcx, %{}", cmov_cc, d_name));
+                        self.emit_cmov_typed(cmov_cc, "rcx", d_name, ty);
                     }
                     self.state.reg_cache.invalidate_acc();
                     return;
@@ -1090,8 +1102,7 @@ impl X86Codegen {
             // select_operand_to_reg).
             self.select_operand_to_reg(false_val, "rax", "eax");
             self.select_operand_to_reg(true_val, "rcx", "ecx");
-            self.state
-                .emit_fmt(format_args!("    cmov{}q %rcx, %rax", cmov_cc));
+            self.emit_cmov_typed(cmov_cc, "rcx", "rax", ty);
             self.state.reg_cache.invalidate_acc();
             self.store_rax_to(dest);
             return;

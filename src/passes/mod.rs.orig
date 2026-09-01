@@ -1362,10 +1362,9 @@ pub(crate) fn run_passes(
         // setup only, `is_cloneable_pure` rejects Vec* intrinsics so
         // vectorized loops bail) and the exit-merge-phi reads the body's
         // post-iteration value (latch incoming) on the test-exit edge.
-        // -O2+, not -Os/-Oz (cloned cond grows code size). Opt-in via
-        // `CCC_LOOP_ROTATE=1`; kill-switch `CCC_NO_LOOP_ROTATE` wins.
-        // Runs at iter 0 so the rotated form flows through
-        // GVN/LICM/if-convert/dce/cfg_simplify.
+        // -O2+, not -Os/-Oz (cloned cond grows code size). Gated by
+        // `CCC_NO_LOOP_ROTATE`. Runs at iter 0 so the rotated form flows
+        // through GVN/LICM/if-convert/dce/cfg_simplify.
         if iter == 0 && opt_level >= 2 && !optimize_for_size {
             let n = timed_pass!(
                 "loop_rotate",

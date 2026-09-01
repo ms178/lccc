@@ -7,21 +7,18 @@ preheader (~1 branch/iteration across the whole suite).
 ## Objective
 
 The pass is correctness-clean for the canonical counted-loop shape and
-ships opt-in (`CCC_LOOP_ROTATE=1`). Root-cause the 15 remaining
-default-enable miscompile shapes, harden, then flip the default to ON at
--O2+.
+ships opt-in (`CCC_LOOP_ROTATE=1`). The 15 v16/v17 default-enable
+miscompile shapes MATCH GCC on the 21-name A/B (PRs #325 pred-label,
+#327 remaining-three). Flip the default to ON at -O2+ only after the
+full 474-test corpus is green.
 
-Known failing shapes (from the v16/v17 default-enable experiments; full
-list with the v14 root-cause pattern in DECISIONS.md):
+Historical failing shapes (all MATCH as of `453cbea` + post-merge
+audit; full v14 pattern in DECISIONS.md):
 vectorize_sse2_path, vectorize_reduction_dyn, simd_crc_adler, simd_vecreg,
 backedge_pre_*, bitops_builtins, adler_inline_tail,
 aggregate_dse_soundness, alloca_bare_builtin, alu_peepholes,
 arm_vec_load_offset, huft_build_crash, loop_promote_affine_alias,
 stmt_expr_asm_typeof, vectorize_iv_dependent_base.
-
-Working hypothesis: exit-merge-phi off-by-one for cross-phi latch operands
-used externally (the v14 class), plus cloned-closure header-phi reference
-collapse.
 
 ## Files
 
@@ -102,3 +99,22 @@ Still open before default-ON: full corpus, 9-worst, nbody bit-identical,
 kernel 15/15, fuzz. Guard E is a correctness fence; nested inner loops
 no longer rotate (perf left on the table — a sound nested-rotate rewrite
 is future work).
+
+## Session 2026-09-01 — post-merge audit (`453cbea`, PRs #325–#328)
+
+HEAD = `origin/main`. Merge vs our remaining-three: `loop_rotate.rs`
+diff is #325's pred-label comment only (code already used
+`(pre_op, header_label)`). Fastbuild + 21-name rot-ON/OFF A/B vs GCC
+-O2: **21 MATCH / 0 FAIL** (original 15 + seq/while_dec/stale_phi_pred
++ ra09_selfop_xor).
+
+Polish landed this audit (not a new miscompile):
+- `CCC_LOOP_ROTATE` is truthy-only (`1`/`true`/`yes`/`on`); empty/`0`
+  no longer silently enables. `CCC_NO_LOOP_ROTATE` is implemented
+  (was documented, never checked).
+- Guard C comment no longer claims `(pre_op, pre_label)`.
+- `godbolt.py` `clang` alias → CE `cclang2310` (Clang 23.1.0).
+- univsr `reject_nonzero_init_counter` latch label is BlockId(2).
+
+Do not flip the default. Do not re-try tight Guard E. ZSTD P0 still
+needs kernel tree + qemu.

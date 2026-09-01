@@ -683,6 +683,36 @@ mod tests {
     }
 
     #[test]
+    fn leftover_staging_movq_before_popcnt_is_deleted() {
+        // Acc-path unary used to emit `movq %rdi, %rax; popcntl %edi, %eax`.
+        // popcntl writes eax without reading it, so the staging movq is dead.
+        let out = run(concat!(
+            "popcount32:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %rax\n",
+            "    popcntl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movq %rdi, %rax"), "{out}");
+        assert!(out.contains("popcntl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn leftover_staging_movq_before_lzcnt_is_deleted() {
+        let out = run(concat!(
+            "clz32:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %rax\n",
+            "    lzcntl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movq %rdi, %rax"), "{out}");
+        assert!(out.contains("lzcntl %edi, %eax"), "{out}");
+    }
+
+    #[test]
     fn dead_scaled_lea_is_deleted() {
         let out = run(concat!(
             "foo:\n",

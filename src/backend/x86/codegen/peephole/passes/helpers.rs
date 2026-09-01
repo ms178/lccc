@@ -420,6 +420,24 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         return false;
     }
 
+    // Dest-only two/three-operand BMI1/ABM: dest is written, not read.
+    // Default-true would treat `popcntl %edi, %eax` as RMW of eax and keep
+    // a dead staging `movq %rdi, %rax` that the producer never needed.
+    if trimmed.starts_with("popcnt")
+        || trimmed.starts_with("lzcnt")
+        || trimmed.starts_with("tzcnt")
+        || trimmed.starts_with("andn")
+        || trimmed.starts_with("blsr")
+        || trimmed.starts_with("blsi")
+        || trimmed.starts_with("blsmsk")
+        || trimmed.starts_with("bzhi")
+        || trimmed.starts_with("bextr")
+        || trimmed.starts_with("pext")
+        || trimmed.starts_with("pdep")
+    {
+        return false;
+    }
+
     // Default: assume read-modify-write (conservative)
     true
 }

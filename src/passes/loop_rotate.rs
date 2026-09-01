@@ -33,9 +33,9 @@
 //! the header, or whose cond-setup closure touches memory or calls. Only
 //! SSA-pure arithmetic/cmp instructions are cloned.
 //!
-//! Kill-switch: set `CCC_NO_LOOP_ROTATE=1` to disable the pass at runtime.
-//! Opt-in: set `CCC_LOOP_ROTATE=1` to enable the pass at -O2+ (it is a
-//! no-op otherwise).
+//! Kill-switch: set `CCC_NO_LOOP_ROTATE=1` to disable the pass at runtime
+//! (wins over opt-in). Opt-in: set `CCC_LOOP_ROTATE=1` to enable the pass
+//! at -O2+ (empty / `0` / unset is a no-op).
 //!
 //! v17: REVERTED to opt-in. The v16 default-enable introduced 16
 //! miscompiles (15 remaining after the v17 cross-phi self-loop-phi
@@ -46,8 +46,14 @@
 //! single-predecessor, Guard B dominance-checked external phi uses,
 //! v17 undo-on-bail for `next_value_id` consistency, v17 cross-phi
 //! self-loop-phi latch-incoming rewrite) is KEPT — it makes the pass
-//! safer when opt-in. A future session will root-cause the 15 remaining
-//! miscompiles before flipping the default again.
+//! safer when opt-in.
+//!
+//! PF-17 (2026-09-01, PRs #325/#327): those 15 shapes MATCH GCC on the
+//! 19-name A/B. Pred-label uses `(pre_op, header_label)` (never the
+//! original preheader). Guards C/D/E, bepre `latest_dep`, univsr skip of
+//! rotated self-loop pointer IVs, and complete-unroll Copy-INIT are in
+//! tree. Rotation STAYS opt-in (`CCC_LOOP_ROTATE=1`) until the full 474
+//! corpus is green. Kill-switch `CCC_NO_LOOP_ROTATE=1` wins.
 //!
 //! v16: the pass was DEFAULT-ON at -O2+. The v14 hardening (exit-merge-phi
 //! off-by-one fix, post-vectorize placement, conservative body guards)
@@ -81,6 +87,23 @@ const MAX_ROTATIONS_PER_FUNC: usize = 256;
 /// duplicate.
 const MAX_CLOSURE: usize = 8;
 
+/// True when `name` is set to a truthy value (`1` / `true` / `yes` / `on`).
+/// Empty, `0`, `false`, `no`, `off`, or unset => false. Used for
+/// `CCC_LOOP_ROTATE` so `CCC_LOOP_ROTATE=` (empty) no longer silently
+/// enables the pass.
+fn env_flag_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let t = v.trim();
+            t == "1"
+                || t.eq_ignore_ascii_case("true")
+                || t.eq_ignore_ascii_case("yes")
+                || t.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
+    }
+}
+
 pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
     // v17: REVERTED to OPT-IN (CCC_LOOP_ROTATE=1). The v16 default-enable
     // introduced 16 miscompiles (15 remaining after the v17 cross-phi
@@ -101,9 +124,15 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
     // latch_ops used externally, plus the cloned-closure header-phi
     // reference collapse) before flipping the default again.
     //
-    // Kill-switch: `CCC_NO_LOOP_ROTATE=1` (still honored, no-op when
-    // opt-in is already off). Opt-in: `CCC_LOOP_ROTATE=1`.
-    if std::env::var("CCC_LOOP_ROTATE").is_err() {
+    // Opt-in: `CCC_LOOP_ROTATE=1` (also true/yes/on). Empty, `0`, `false`,
+    // `no`, `off`, or unset => the pass is a no-op. A previous `is_err()`
+    // check treated `CCC_LOOP_ROTATE=` (empty) as enabled — a silent
+    // A/B footgun. Kill-switch: `CCC_NO_LOOP_ROTATE` set (any value,
+    // matching `CCC_NO_IVSR`) wins even when opt-in is on.
+    if std::env::var("CCC_NO_LOOP_ROTATE").is_ok() {
+        return 0;
+    }
+    if !env_flag_truthy("CCC_LOOP_ROTATE") {
         return 0;
     }
     if func.blocks.len() < 3 {
@@ -117,9 +146,9 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
             break;
         }
         let loops = merge_loops_by_header(raw);
-    if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
-        eprintln!("[ROT] found {} loops", loops.len());
-    }
+        if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
+            eprintln!("[ROT] found {} loops", loops.len());
+        }
         // Process innermost loops first (smallest body) — their rotation is
         // least likely to disturb outer-loop assumptions, and nested
         // rotation can cascade (an outer loop becomes rotatable once an
@@ -344,21 +373,17 @@ fn try_rotate_loop(
     // v18 Guard C: a header phi may have MULTIPLE non-latch incomings when
     // the loop header has several outside predecessors (e.g. two exits of a
     // preceding loop both flowing into this loop's header, or a break edge
-    // and a normal-exit edge merging at the header). The rotation's
-    // step-6.6 self-loop phi records exactly ONE preheader incoming
-    // (`(pre_op, pre_label)`), and the step-6/6.5 rewiring moves every
-    // original header predecessor onto the cloned guard — so after rotation
-    // the body's real entry edge comes from the GUARD block, while the
-    // self-loop phi's init incoming still names one of the ORIGINAL
-    // preheader labels. That label is no longer a predecessor of the phi's
-    // block: phi elimination then places the init copies on a dead edge,
-    // the live entry edge carries NO init, and the first iteration reads
-    // an undefined value (observed: loop_rotate_default_enable.c shape 4 —
-    // `sum_with_call(50)` accumulated garbage; the miscompile hid for
-    // months because a fresh stack page made the undefined slot read 0).
-    // The general fix — routing the init through the guard's own phis —
-    // is a future enhancement; bailing keeps rotation sound (same policy
-    // as Guard A/B).
+    // and a normal-exit edge merging at the header). Step 6.6 records
+    // exactly ONE init incoming, labelled with the GUARD
+    // (`(pre_op, header_label)` — never the original preheader). That is
+    // enough for a single outside predecessor. Multiple distinct outside
+    // preds cannot be represented by one init edge: after rotation the
+    // body's only forward predecessor is the guard, and dropping the extra
+    // incomings would lose an init value. Observed historically as
+    // loop_rotate_default_enable.c shape 4 (`sum_with_call(50)` garbage)
+    // when the init edge still named a dead preheader. Routing every
+    // extra init through the guard's own phis is a future enhancement;
+    // bailing keeps rotation sound (same policy as Guard A/B).
     let mut multi_pre_header = false;
     for inst in header_insts {
         if let Instruction::Phi {

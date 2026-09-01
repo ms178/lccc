@@ -54,6 +54,7 @@ COMPILER_ALIASES: dict[str, str] = {
     # Clang 23.1.0 is the newest x86-64 release channel on CE; 22.1 is kept so
     # a bisect across the LLVM 22 -> 23 boundary stays one flag away.
     "clang": "cclang2310",
+    "clang23": "cclang2310",
     "clang23.1": "cclang2310",
     "clang22.1": "cclang2210",
     "icc": "cicc2021100",
