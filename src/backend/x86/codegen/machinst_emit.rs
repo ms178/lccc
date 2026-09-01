@@ -310,12 +310,17 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             match (src, dst) {
                 (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
                 (MachOperand::StackSlot(a), MachOperand::StackSlot(b)) if a == b => return,
-                // x86 can't do mem-to-mem moves. Use rax as relay.
+                // x86 can't do mem-to-mem moves. Use rax as relay. The relay
+                // register must be named at the INSTRUCTION's operand size:
+                // `movb …, %rax` / `movw …, %rax` are unencodable (mnemonic
+                // size suffix must match the register operand width) — narrow
+                // sizes reach this relay for 8/16-bit loads/stores, so name
+                // the sub-register (%al/%ax) via the canonical size table.
                 (MachOperand::StackSlot(_), MachOperand::StackSlot(_)) => {
                     let src_str = fmt_operand(src, *size, out);
                     let dst_str = fmt_operand(dst, *size, out);
                     let suffix = size.suffix();
-                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                    let rax = sized_reg_name(RAX, *size);
                     out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
                     out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
                     return;
@@ -323,11 +328,11 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 (MachOperand::Mem { .. }, MachOperand::Mem { .. })
                 | (MachOperand::Mem { .. }, MachOperand::StackSlot(_))
                 | (MachOperand::StackSlot(_), MachOperand::Mem { .. }) => {
-                    // Also mem-to-mem: use rax relay
+                    // Also mem-to-mem: use rax relay (size-correct name, see above)
                     let src_str = fmt_operand(src, *size, out);
                     let dst_str = fmt_operand(dst, *size, out);
                     let suffix = size.suffix();
-                    let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                    let rax = sized_reg_name(RAX, *size);
                     out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, src_str, rax));
                     out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
                     return;
@@ -537,7 +542,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             );
             if both_mem {
                 let rhs_str = fmt_operand(&rhs, *size, out);
-                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                // Relay register named at operand size (%al/%ax/%eax/%rax):
+                // a `movb …, %rax` relay load is unencodable.
+                let rax = sized_reg_name(RAX, *size);
                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
                 let lhs_str = fmt_operand(&lhs, *size, out);
                 // AT&T: cmp rhs, lhs
@@ -571,7 +578,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             );
             if both_mem {
                 let rhs_str = fmt_operand(&rhs, *size, out);
-                let rax = if *size == OpSize::S32 { "eax" } else { "rax" };
+                // Relay register named at operand size (%al/%ax/%eax/%rax):
+                // a `movb …, %rax` relay load is unencodable.
+                let rax = sized_reg_name(RAX, *size);
                 out.emit_fmt(format_args!("    mov{} {}, %{}", suffix, rhs_str, rax));
                 let lhs_str = fmt_operand(&lhs, *size, out);
                 out.emit_fmt(format_args!("    test{} %{}, {}", suffix, rax, lhs_str));
