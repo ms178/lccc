@@ -1383,22 +1383,81 @@ fn try_complete_unroll_two_block(
 
     func.blocks.extend(new_blocks);
 
-    // Header still executes once as a trampoline into the clone chain.
-    // Replace its (now dead) phis with Copies of the INIT values — the
-    // same as `try_complete_unroll_general`. The previous code copied the
-    // LAST clone's dest here, which is defined in a block that runs AFTER
-    // this header: Copy-before-def. GVN/copy-prop then forwarded that
-    // unordered value into inlined callers (simd_crc_adler adler sz=2
-    // returned 00010001 instead of 00bd00bc under CCC_LOOP_ROTATE=1).
-    // Outside uses were rewritten to the final clone dests above.
+    // Resolve EVERY phi in the header. The loop is now straight-line -- the
+    // header's terminator is an unconditional branch into the clone chain and
+    // the latch no longer branches back -- so the header has exactly one
+    // predecessor (the preheader), executes exactly once, and a phi there is
+    // both malformed and meaningless.
+    //
+    // The value to use is the NON-LATCH (init) incoming, for every phi
+    // including the loop-carried ones. Two independent reasons, and BOTH have
+    // been violated by real code in this function's history:
+    //
+    //  1. SSA ORDER. Copying the final clone's dest here is a copy-before-def:
+    //     the clone that defines it runs AFTER this header, so the definition
+    //     does not dominate the use. GVN/copy-prop then forwards an unordered
+    //     value into inlined callers -- observed as simd_crc_adler returning
+    //     00010001 instead of 00bd00bc for sz=2 under CCC_LOOP_ROTATE=1.
+    //     Do NOT "fix" this by reaching for `final_carried` here.
+    //
+    //  2. IT IS UNNECESSARY. Outside uses of a carried phi were already
+    //     rewritten to the final clone's dest by the substitution loop above,
+    //     which visits every block NOT in `lp.body`. Nothing outside still
+    //     reads the phi id, so the header Copy only has to be well-formed.
+    //
+    // Rewriting only *some* of the phis is what made this latent: the pass
+    // used to convert the loop-carried ones and leave the induction variable's
+    // phi behind, still naming the latch as a predecessor (a block that no
+    // longer branches here) and -- because the carried phis ahead of it had
+    // become Copies -- sitting after a non-phi instruction. DCE deletes that
+    // dead phi before codegen, which is the only reason it never showed up in
+    // output, but every pass scheduled between here and DCE consumed invalid
+    // IR. `try_complete_unroll_general` always did this correctly; the two
+    // paths had simply diverged.
+    //
+    // Regression coverage: tests/regression/unroll_header_phi_resolve.c (a
+    // true negative control -- with this loop removed it reports both
+    // STALE_PRED and PHI_ORDER against `loop_unroll`) and the unit test
+    // `complete_unroll_leaves_structurally_valid_ir`.
+    //
+    // Scanning the header alone is sufficient AND cheaper than the historical
+    // `carried` x every-block x every-instruction sweep: `carried` is built
+    // exclusively from `func.blocks[header]` (see its construction above), so
+    // no phi outside the header could ever have matched.
     for inst in func.blocks[header].instructions.iter_mut() {
-        if let Instruction::Phi { dest, incoming, .. } = inst {
-            let init = incoming
-                .iter()
-                .find(|(_, lbl)| *lbl != latch_label)
-                .map(|(op, _)| *op);
-            if let Some(src) = init {
-                *inst = Instruction::Copy { dest: *dest, src };
+        let Instruction::Phi { dest, incoming, .. } = inst else {
+            continue;
+        };
+        let dest = *dest;
+        let init = incoming
+            .iter()
+            .find(|(_, lbl)| *lbl != latch_label)
+            .map(|(op, _)| *op);
+        // Guard the copy-before-def hazard described above: a future edit that
+        // reaches for the final clone's value here would reintroduce an SSA
+        // violation that the corpus CANNOT catch (every test still prints the
+        // right answer; only the IR is malformed). Fail loudly in debug builds
+        // instead.
+        debug_assert!(
+            !matches!(init, Some(Operand::Value(v))
+                if final_carried.iter().any(|&(_, final_id)| final_id == v.0)),
+            "header phi v{} resolved to a clone value defined after the header \
+             (copy-before-def); it must resolve to its non-latch incoming",
+            dest.0
+        );
+        match init {
+            Some(src) => *inst = Instruction::Copy { dest, src },
+            None => {
+                // Unreachable for a natural loop: the header is dominated by a
+                // preheader, so every header phi has a non-latch incoming.
+                // Leaving the phi in place would keep the exact structural
+                // violation this loop exists to remove, so make the impossible
+                // case loud in debug builds instead of silently malformed.
+                debug_assert!(
+                    false,
+                    "header phi v{} has no non-latch incoming after complete unroll",
+                    dest.0
+                );
             }
         }
     }
@@ -2963,4 +3022,39 @@ mod tests {
             }
         }
     }
+
+    /// Unrolling must leave STRUCTURALLY VALID IR, not merely IR that happens
+    /// to produce the right answer once DCE has swept up after it.
+    ///
+    /// `try_complete_unroll_two_block` used to rewrite only the loop-carried
+    /// phis (those in `final_map`) into Copies and leave the induction
+    /// variable's phi untouched. Once the loop is straight-line that phi is
+    /// malformed twice over: it still names the latch as a predecessor, and
+    /// because the carried phis ahead of it have become Copies it now sits
+    /// after a non-phi instruction. `try_complete_unroll_general` always got
+    /// this right; the two paths had diverged.
+    ///
+    /// This is asserted with the real IR verifier rather than a hand-rolled
+    /// check so any future structural invariant is enforced here for free.
+    #[test]
+    fn complete_unroll_leaves_structurally_valid_ir() {
+        for trip in [2i32, 4, 8, 16] {
+            let mut func = make_counting_loop(trip);
+            unroll_loops(&mut func);
+
+            let mut violations = Vec::new();
+            crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
+            assert!(
+                violations.is_empty(),
+                "trip={} left malformed IR after unrolling:\n{}",
+                trip,
+                violations
+                    .iter()
+                    .map(|v| format!("  {}", v))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+
 }

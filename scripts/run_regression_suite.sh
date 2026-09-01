@@ -18,6 +18,7 @@
 # Usage:
 #   ./run_regression_suite.sh [filter-substring]
 # Environment:
+#   LCCC_IR_VERIFY  0 disables the inter-pass IR structural gate (default 1)
 #   LCCC_BIN   compiler under test (default target/fastbuild/lccc)
 #   GCC_BIN    oracle compiler    (default gcc)
 #   LCCC_I686_RUNNER  user-mode ELF32 runner (e.g. qemu-i386) for hosts
@@ -98,8 +99,18 @@ run_one() {  # run_one <src> ; env may override CCC_NO_SMALL_SLOTS etc.
     local flags=()
     [[ -f "$base.flags" ]] && read -r -a flags < "$base.flags"
     local obj="$WORK/$(basename "$base").bin"
-    if ! "$LCCC_BIN" $GCC_INC -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
+    # IR STRUCTURAL GATE: compile with the inter-pass verifier armed. A pass
+    # that emits malformed IR (a phi naming a block that is not a predecessor,
+    # a phi stranded after a non-phi, a branch to a nonexistent block) is a
+    # latent miscompile even when the program still prints the right answer --
+    # every one found so far was invisible to the output comparison below.
+    # Opt out with LCCC_IR_VERIFY=0.
+    if ! CCC_VERIFY_IR="${LCCC_IR_VERIFY:-1}" \
+         "$LCCC_BIN" $GCC_INC -O2 "${flags[@]}" "$src" -o "$obj" 2>"$WORK/cc.err"; then
         echo "BUILDFAIL"; return
+    fi
+    if [[ "${LCCC_IR_VERIFY:-1}" != "0" ]] && grep -q '\[ir-verify\]' "$WORK/cc.err"; then
+        echo "IRVERIFY"; return
     fi
     # ELF32 binaries need either a native i386 kernel path or the runner;
     # without either the test cannot run — and must not vacuously pass.
@@ -141,6 +152,11 @@ for src in "$REG"/*.c; do
     if [[ $res == "BUILDFAIL" ]]; then
         echo "FAIL  $name (lccc build failed: $(head -3 "$WORK/cc.err" | tr '\n' ' '))"
         fail=$((fail+1)); FAILED+=("$name:build"); continue
+    fi
+    if [[ $res == "IRVERIFY" ]]; then
+        echo "FAIL  $name (IR verifier: malformed IR between passes)"
+        grep '\[ir-verify\]' "$WORK/cc.err" | head -3 | sed 's/^/      /'
+        fail=$((fail+1)); FAILED+=("$name:ir-verify"); continue
     fi
     if [[ $res == "NOELF32" ]]; then
         if [[ $el_f32_warned -eq 0 ]]; then

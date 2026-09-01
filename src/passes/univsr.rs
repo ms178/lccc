@@ -808,6 +808,7 @@ fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
     let gep_id = ptr_iv.increment_gep_dest.0;
 
     for block in &mut func.blocks {
+        let mut replaced_a_phi = false;
         for inst in &mut block.instructions {
             if let Instruction::Phi { dest, .. } = inst {
                 if dest.0 == phi_id {
@@ -815,6 +816,7 @@ fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
                         dest: ptr_iv.ptr_phi_dest,
                         src: Operand::Value(ptr_iv.base_ptr),
                     };
+                    replaced_a_phi = true;
                 }
             }
 
@@ -826,6 +828,16 @@ fn remove_dead_pointer_iv_cycle(func: &mut IrFunction, ptr_iv: &IvsrPointerIV) {
                     };
                 }
             }
+        }
+        // Rewriting a phi into a Copy *in place* strands every phi that
+        // followed it behind a non-phi instruction. A loop header commonly
+        // carries several pointer IVs, so reverting one of them leaves the
+        // rest malformed. Sinking the Copy below the phi prefix is sound —
+        // phis execute simultaneously on block entry, so none of them can read
+        // this Copy's result — and restores the invariant that loop_rotate,
+        // mem2reg and phi elimination all rely on.
+        if replaced_a_phi {
+            super::restore_phi_prefix(block);
         }
     }
 }

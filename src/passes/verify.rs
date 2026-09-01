@@ -196,6 +196,8 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
         }
     }
 
+    let reachable = reachable_blocks(func, &label_to_idx);
+
     for (bi, block) in func.blocks.iter().enumerate() {
         // 3. phis must be a contiguous prefix.
         let mut seen_non_phi = false;
@@ -212,6 +214,11 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                 break;
             }
             seen_non_phi |= !is_phi;
+        }
+
+        // Edge-set checks are meaningful only for blocks that can execute.
+        if !reachable[bi] {
+            continue;
         }
 
         // The entry block has no predecessors by construction; a phi there is
@@ -249,9 +256,13 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                     );
                 }
             }
-            // 6. coverage.
+            // 6. coverage -- reachable predecessors only (see `reachable_blocks`).
             for from in real.iter() {
-                if !listed.contains(from) {
+                let from_reachable = label_to_idx
+                    .get(from)
+                    .map(|&i| reachable[i])
+                    .unwrap_or(false);
+                if from_reachable && !listed.contains(from) {
                     push(
                         out,
                         format!(
@@ -263,6 +274,62 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
             }
         }
     }
+}
+
+/// Blocks reachable from the entry block, following terminator and `asm goto`
+/// edges.
+///
+/// Reachability gates the three checks that concern a phi's *edge set*
+/// (stale / duplicate / missing predecessors) and nothing else. Those checks
+/// describe which value arrives along which edge, so they are vacuous when the
+/// edge or the block cannot execute:
+///
+/// * a missing incoming for an unreachable predecessor needs no copy, because
+///   phi elimination emits one copy per *listed* edge and that edge is never
+///   taken; and
+/// * any phi inside an unreachable block is dead by construction. Passes
+///   legitimately leave such blocks alone -- SCCP explicitly does, documenting
+///   that `cfg_simplify` will delete them -- so flagging them would punish
+///   correct behaviour.
+///
+/// What survives the gate is the case that actually miscompiles: a *reachable*
+/// block whose phi names a predecessor that is not one. Phi elimination
+/// resolves that label to a block index and emits the copy there, so the value
+/// either lands on the wrong edge or never lands at all.
+///
+/// Phi *contiguity* is deliberately NOT gated: passes index the phi prefix
+/// arithmetically (`loop_rotate` scans instructions at block start) without
+/// first checking reachability, so the invariant must hold everywhere.
+fn reachable_blocks(
+    func: &IrFunction,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> Vec<bool> {
+    let mut seen = vec![false; func.blocks.len()];
+    if func.blocks.is_empty() {
+        return seen;
+    }
+    let mut stack = vec![0usize];
+    seen[0] = true;
+    while let Some(bi) = stack.pop() {
+        let block = &func.blocks[bi];
+        let mut go = |label: BlockId, stack: &mut Vec<usize>| {
+            if let Some(&to) = label_to_idx.get(&label) {
+                if !seen[to] {
+                    seen[to] = true;
+                    stack.push(to);
+                }
+            }
+        };
+        for_each_target(&block.terminator, |l| go(l, &mut stack));
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    go(*label, &mut stack);
+                }
+            }
+        }
+    }
+    seen
 }
 
 /// Stable ordering for diagnostics (hash-set iteration order is not stable).
@@ -283,6 +350,34 @@ pub fn verify_module(module: &IrModule, stage: &str) -> Vec<Violation> {
         verify_function(func, stage, &mut out);
     }
     out
+}
+
+/// Per-function pass hook, for passes that run inside a shared-analysis loop
+/// rather than through `timed_pass!` (gvn / licm / ivsr / univsr /
+/// load_forward). Without these, a defect from one of them is first reported
+/// by whichever *wrapped* pass runs next, which points the blame at an
+/// innocent pass -- exactly the mis-attribution this module exists to prevent.
+pub fn verify_after_func_pass(func: &IrFunction, stage: &str) {
+    let m = mode();
+    if m == Mode::Off || func.blocks.is_empty() {
+        return;
+    }
+    let mut violations = Vec::new();
+    verify_function(func, stage, &mut violations);
+    if violations.is_empty() {
+        return;
+    }
+    for v in &violations {
+        eprintln!("{}", v);
+    }
+    if m == Mode::Abort {
+        panic!(
+            "IR verification failed after `{}`: {} violation(s); \
+             the pass named here produced malformed IR",
+            stage,
+            violations.len()
+        );
+    }
 }
 
 /// Pass-loop hook: a no-op unless `CCC_VERIFY_IR` is set.

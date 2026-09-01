@@ -65,7 +65,7 @@ pub(crate) mod vectorize;
 use crate::common::fx_hash::FxHashSet;
 use crate::common::fp_contract::FpContract;
 use crate::ir::analysis::CfgAnalysis;
-use crate::ir::reexports::{Instruction, IrFunction, IrModule, Operand};
+use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operand};
 
 /// CCC_VALIDATE_SSA=1 debug validator: every Value id must have exactly one
 /// defining instruction, InlineAsm outputs and Phi dests included, and every
@@ -365,6 +365,7 @@ fn run_gvn_licm_ivsr_shared(
         if num_blocks == 1 {
             if run_gvn {
                 let n = gvn::run_gvn_function_with_context(func, &gvn_context);
+                verify::verify_after_func_pass(func, "gvn");
                 if n > 0 {
                     gvn_total += n;
                     if i < changed.len() {
@@ -387,6 +388,7 @@ fn run_gvn_licm_ivsr_shared(
                 None
             };
             let n = gvn::run_gvn_with_analysis_and_context(func, &cfg, &gvn_context);
+            verify::verify_after_func_pass(func, "gvn");
             if let Some(t0) = t0 {
                 eprintln!(
                     "[PASS] iter={} gvn (func {}): {:.4}s ({} changes)",
@@ -413,6 +415,7 @@ fn run_gvn_licm_ivsr_shared(
                 None
             };
             let n = licm::licm_with_analysis(func, &cfg);
+            verify::verify_after_func_pass(func, "licm");
             if let Some(t0) = t0 {
                 eprintln!(
                     "[PASS] iter={} licm (func {}): {:.4}s ({} changes)",
@@ -449,6 +452,7 @@ fn run_gvn_licm_ivsr_shared(
             let mut n = 0;
             for _ in 0..4 {
                 let round = iv_strength_reduce::ivsr_with_analysis(func, &cfg);
+                verify::verify_after_func_pass(func, "ivsr");
                 n += round;
                 if round == 0 {
                     break;
@@ -468,6 +472,7 @@ fn run_gvn_licm_ivsr_shared(
         // the pass rewrites instructions in place and never edits the CFG.
         if run_univsr {
             let n = univsr::run_univsr(func);
+            verify::verify_after_func_pass(func, "univsr");
             if n > 0 {
                 ivsr_total += n;
                 if i < changed.len() {
@@ -540,6 +545,79 @@ impl DisabledPasses {
             unroll: pass_disabled(&disabled, "unroll"),
         }
     }
+}
+
+/// Restore the invariant that every phi forms a contiguous prefix of its block.
+///
+/// Several passes rewrite a phi into a non-phi *in place* — `univsr` turns a
+/// reverted pointer-IV phi into a `Copy`, `cfg_simplify` collapses a
+/// single-predecessor phi the same way. When the rewritten phi is not the last
+/// one in the block, every phi after it is suddenly preceded by a non-phi, and
+/// passes that assume contiguity (`loop_rotate`, `mem2reg`, phi elimination)
+/// silently read the wrong instruction range.
+///
+/// Sinking the non-phis below the phi prefix is always sound: phis are defined
+/// to execute simultaneously on entry to the block, so no phi may read a value
+/// defined by a non-phi in that same block. (A phi's back-edge operand is
+/// evaluated at the end of the *predecessor*, not here.) A stable partition
+/// therefore preserves program semantics exactly while restoring the
+/// invariant, and it keeps the relative order within each group so unrelated
+/// diffs do not appear in dumps.
+///
+/// Returns `true` if anything moved. Runs in O(n) and allocates only when a
+/// repair is actually needed, so callers can invoke it unconditionally.
+pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
+    let insts = &block.instructions;
+    // Fast path: find the first non-phi, then check nothing after it is a phi.
+    let first_non_phi = match insts
+        .iter()
+        .position(|i| !matches!(i, Instruction::Phi { .. }))
+    {
+        Some(p) => p,
+        None => return false, // all phis (or empty): already contiguous
+    };
+    if !insts[first_non_phi + 1..]
+        .iter()
+        .any(|i| matches!(i, Instruction::Phi { .. }))
+    {
+        return false; // already contiguous
+    }
+
+    // `source_spans` is parallel to `instructions`; permute it identically or
+    // the backend emits .loc directives against the wrong instruction. Passes
+    // have been observed to leave it desynchronised, so only touch it when the
+    // lengths agree.
+    let spans_valid = block.source_spans.len() == block.instructions.len();
+
+    let n = block.instructions.len();
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    order.extend(
+        (0..n).filter(|&i| matches!(block.instructions[i], Instruction::Phi { .. })),
+    );
+    order.extend(
+        (0..n).filter(|&i| !matches!(block.instructions[i], Instruction::Phi { .. })),
+    );
+
+    let mut old_insts = std::mem::take(&mut block.instructions);
+    let mut taken: Vec<Option<Instruction>> = old_insts.drain(..).map(Some).collect();
+    block.instructions = order
+        .iter()
+        .map(|&i| taken[i].take().expect("each index used once"))
+        .collect();
+
+    if spans_valid {
+        let old_spans = std::mem::take(&mut block.source_spans);
+        block.source_spans = order.iter().map(|&i| old_spans[i]).collect();
+    }
+    true
+}
+
+/// Apply [`restore_phi_prefix`] to every block of a function.
+pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
+    func.blocks
+        .iter_mut()
+        .map(|b| usize::from(restore_phi_prefix(b)))
+        .sum()
 }
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
@@ -1446,6 +1524,7 @@ pub(crate) fn run_passes(
             // conditional arm makes the arm side-effect-free so
             // if-conversion can fire.
             module.for_each_function(load_forward::run);
+            verify::verify_after_pass(module, "load_forward");
             let n = timed_pass!(
                 "if_convert",
                 run_on_visited(
@@ -1889,5 +1968,117 @@ mod m16_size_policy_tests {
             disabled,
             "vectorize,postinline,ifconv,gaddrcse,licm"
         );
+    }
+
+    // ── restore_phi_prefix ──────────────────────────────────────────────────
+
+    mod phi_prefix {
+        use super::super::restore_phi_prefix;
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{
+            BasicBlock, BlockId, Instruction, IrConst, Operand, Terminator, Value,
+        };
+
+        fn phi(dest: u32) -> Instruction {
+            Instruction::Phi {
+                dest: Value(dest),
+                ty: IrType::I32,
+                incoming: vec![(Operand::Const(IrConst::I32(0)), BlockId(0))],
+            }
+        }
+
+        fn copy(dest: u32) -> Instruction {
+            Instruction::Copy {
+                dest: Value(dest),
+                src: Operand::Const(IrConst::I32(1)),
+            }
+        }
+
+        fn block(instructions: Vec<Instruction>) -> BasicBlock {
+            BasicBlock {
+                label: BlockId(1),
+                instructions,
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }
+        }
+
+        fn shape(b: &BasicBlock) -> Vec<(bool, u32)> {
+            b.instructions
+                .iter()
+                .map(|i| match i {
+                    Instruction::Phi { dest, .. } => (true, dest.0),
+                    _ => (false, i.dest().map(|d| d.0).unwrap_or(u32::MAX)),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn an_already_contiguous_block_is_left_alone() {
+            let mut b = block(vec![phi(1), phi(2), copy(3), copy(4)]);
+            let before = shape(&b);
+            assert!(!restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), before);
+        }
+
+        #[test]
+        fn a_block_with_no_phis_is_left_alone() {
+            let mut b = block(vec![copy(3), copy(4)]);
+            assert!(!restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), vec![(false, 3), (false, 4)]);
+        }
+
+        #[test]
+        fn an_empty_block_is_left_alone() {
+            let mut b = block(vec![]);
+            assert!(!restore_phi_prefix(&mut b));
+        }
+
+        #[test]
+        fn a_stranded_phi_is_lifted_above_the_copy() {
+            // Exactly what univsr and cfg_simplify produce: one phi of several
+            // is rewritten into a Copy in place, stranding those after it.
+            let mut b = block(vec![phi(1), copy(9), phi(2), phi(3)]);
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(
+                shape(&b),
+                vec![(true, 1), (true, 2), (true, 3), (false, 9)]
+            );
+        }
+
+        #[test]
+        fn relative_order_is_preserved_within_each_group() {
+            let mut b = block(vec![copy(7), phi(1), copy(8), phi(2), copy(9)]);
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(
+                shape(&b),
+                vec![(true, 1), (true, 2), (false, 7), (false, 8), (false, 9)]
+            );
+        }
+
+        #[test]
+        fn source_spans_are_permuted_with_their_instructions() {
+            use crate::common::source::Span;
+            let mut b = block(vec![phi(1), copy(9), phi(2)]);
+            // Distinguishable spans, parallel to the instructions.
+            let mk = |start: u32| Span::new(start, start + 1, 0);
+            b.source_spans = vec![mk(10), mk(20), mk(30)];
+            assert!(restore_phi_prefix(&mut b));
+            assert_eq!(shape(&b), vec![(true, 1), (true, 2), (false, 9)]);
+            // The span must follow its instruction, or -g emits .loc against
+            // the wrong line.
+            let starts: Vec<u32> = b.source_spans.iter().map(|s| s.start).collect();
+            assert_eq!(starts, vec![10, 30, 20]);
+        }
+
+        #[test]
+        fn a_desynchronised_span_vector_is_left_untouched() {
+            // Passes have been observed to drop instructions without shrinking
+            // source_spans; permuting a mismatched vector would make it worse.
+            let mut b = block(vec![phi(1), copy(9), phi(2)]);
+            b.source_spans = Vec::new();
+            assert!(restore_phi_prefix(&mut b));
+            assert!(b.source_spans.is_empty());
+        }
     }
 }
