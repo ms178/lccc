@@ -38,6 +38,11 @@ Thumbs.db
 a.out
 test_*
 bench_*
+# ...but the benchmark HARNESS is source, not a build artifact. Without this
+# negation `bench_*` silently swallows it: tests/bench/ (the kernels and the
+# timing driver) shipped upstream while the script that runs them did not,
+# leaving a corpus nobody could execute.
+!scripts/bench_kernels.py
 
 # Benchmark / test output
 /test-results/

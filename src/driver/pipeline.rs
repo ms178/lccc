@@ -1735,10 +1735,20 @@ impl Driver {
         // liveness/regalloc relies on. Re-layout in reverse post-order so loop
         // bodies and their exit blocks stay contiguous and loop-carried values
         // don't falsely span calls.
+        // Bottom-test counted loops BEFORE laying blocks out: inversion
+        // changes the CFG (the back edge moves from the latch to the body
+        // entry), and the layout pass recomputes loops from scratch, so it
+        // sees and lays out the rotated shape.
+        for func in &mut module.functions {
+            if !func.is_declaration {
+                crate::passes::loop_invert::invert_loops(func);
+            }
+        }
+
         if std::env::var("CCC_NO_BLOCK_RELAYOUT").is_err() {
             for func in &mut module.functions {
                 if !func.is_declaration {
-                    crate::passes::block_layout::relayout_blocks_rpo(func);
+                    crate::passes::block_layout::relayout_blocks_loop_aware(func);
                 }
             }
         }
