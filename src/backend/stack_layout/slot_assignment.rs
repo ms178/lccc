@@ -170,6 +170,53 @@ pub(super) fn classify_instructions(
         }
     }
 
+    // F128 Copy webs.  Copy carries no result type after phi elimination, so
+    // a Copy of an F128 value (loads that mem2reg turned into copies, phi
+    // elimination temps, staging values for x87 compares) would otherwise be
+    // classified by the default 8-byte arm.  fstpt spills 10 raw bytes of
+    // 80-bit x87 data, so an 8-byte slot lets the store run into the low half
+    // of the adjacent slot and corrupts it (observed as va-arg-pack-1.c
+    // aborting its long-double compare on i686 at -O1/-O2).  Propagate
+    // F128-ness to a fixed point over Copy{src: Value} edges and give the
+    // whole web the wide F128 slot class.  Target-independent: x86-64's
+    // 16-byte movdqu spills have exactly the same overflow shape.
+    let mut f128_web_values: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                if inst.result_type() == Some(IrType::F128) {
+                    f128_web_values.insert(dest.0);
+                }
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Const(IrConst::LongDouble(..)),
+                } = inst
+                {
+                    f128_web_values.insert(dest.0);
+                }
+            }
+        }
+    }
+    loop {
+        let before = f128_web_values.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } = inst
+                {
+                    if f128_web_values.contains(&src.0) {
+                        f128_web_values.insert(dest.0);
+                    }
+                }
+            }
+        }
+        if f128_web_values.len() == before {
+            break;
+        }
+    }
+
     // Build set of values that are defined (as dest) by non-InlineAsm
     // instructions. This identifies "indirect" asm output pointers:
     //
@@ -411,6 +458,7 @@ pub(super) fn classify_instructions(
                     ctx,
                     reg_assigned,
                     &compact_i686_values,
+                    &f128_web_values,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -423,6 +471,7 @@ pub(super) fn classify_instructions(
                     ctx,
                     reg_assigned,
                     &compact_i686_values,
+                    &f128_web_values,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -539,6 +588,7 @@ fn classify_value(
     ctx: &StackLayoutContext,
     reg_assigned: &FxHashMap<u32, PhysReg>,
     compact_i686_values: &FxHashSet<u32>,
+    f128_web_values: &FxHashSet<u32>,
     collected_values: &mut FxHashSet<u32>,
     multi_block_values: &mut Vec<MultiBlockValue>,
     block_local_values: &mut Vec<BlockLocalValue>,
@@ -551,7 +601,8 @@ fn classify_value(
                 src: Operand::Const(IrConst::LongDouble(..)),
                 ..
             }
-        );
+        )
+        || f128_web_values.contains(&dest.0);
 
     // Copy instructions have result_type() = None, so we must check whether
     // the source operand is an I128 value. If it is, the Copy dest also needs
