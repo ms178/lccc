@@ -126,9 +126,29 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
         // inner latch becomes a conditional test).
         let mut sorted: Vec<&NaturalLoop> = loops.iter().collect();
         sorted.sort_by_key(|lp| lp.body.len());
+        let all_headers: crate::common::fx_hash::FxHashSet<usize> =
+            loops.iter().map(|lp| lp.header).collect();
         let mut did = false;
         for lp in sorted.into_iter() {
-            if try_rotate_loop(func, lp, &cfg) {
+            // Guard E: do not rotate a loop nested inside another.
+            // After inlining, `for (; i < sz; i++)` sits inside
+            // `for (sz = 1; ...)`. Rotating the inner remainder is
+            // locally SSA-legal, but GVN+LICM on the combined CFG freeze
+            // the outer IV to its init (simd_crc_adler adler sz=2
+            // returned the sz=1 result 00010001). Outermost loops and
+            // sequential (non-nested) loops still rotate. A tighter
+            // "cond uses outer-header phi" check is not enough: after
+            // copy-prop `sz` is no longer the phi dest.
+            let nested = loops.iter().any(|outer| {
+                outer.header != lp.header && outer.body.contains(&lp.header)
+            });
+            if nested {
+                if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
+                    eprintln!("[ROT] nested loop header={} — bail (Guard E)", lp.header);
+                }
+                continue;
+            }
+            if try_rotate_loop(func, lp, &cfg, &all_headers) {
                 total += 1;
                 did = true;
                 break; // CFG changed — rebuild before the next candidate.
@@ -142,7 +162,12 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
 }
 
 /// Try to rotate one natural loop. Returns true if the transform was applied.
-fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -> bool {
+fn try_rotate_loop(
+    func: &mut IrFunction,
+    lp: &NaturalLoop,
+    cfg: &CfgAnalysis,
+    all_headers: &FxHashSet<usize>,
+) -> bool {
     let debug = std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok();
     // 1. Single latch that is NOT the header (a self-loop is already rotated).
     let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
@@ -257,6 +282,56 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         return false; // cond is loop-invariant — wouldn't terminate, bail
     }
 
+    // Guard E: refuse to rotate when the cloned cond consumes a phi that
+    // lives in a DIFFERENT loop header. After inlining, a remainder loop
+    // `for (; i < sz; i++)` has `sz` as the IV of an outer counted loop.
+    // Rotating the inner loop is locally SSA-legal, but GVN+LICM on the
+    // combined CFG then freeze that outer IV to its init (simd_crc_adler
+    // adler sz=2 returned the sz=1 result 00010001). Constant-trip inner
+    // loops (`k < 8`) and loops whose limit is a param/invariant still
+    // rotate. Nested loops whose trip count is an outer IV do not.
+    {
+        let mut used_outside: Vec<u32> = Vec::new();
+        for &idx in &closure {
+            header_insts[idx].for_each_used_value(|v| {
+                if !def_idx.contains_key(&v) {
+                    used_outside.push(v);
+                }
+            });
+        }
+        // The cond value itself may be defined outside (rare); include it.
+        if !def_idx.contains_key(&cond_val.0) {
+            used_outside.push(cond_val.0);
+        }
+        let mut foreign_iv = false;
+        let mut foreign_phi = 0u32;
+        'scan: for vid in used_outside {
+            for (bi, block) in func.blocks.iter().enumerate() {
+                if bi == lp.header || !all_headers.contains(&bi) {
+                    continue;
+                }
+                for inst in &block.instructions {
+                    if let Instruction::Phi { dest, .. } = inst {
+                        if dest.0 == vid {
+                            foreign_iv = true;
+                            foreign_phi = vid;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+        }
+        if foreign_iv {
+            if debug {
+                eprintln!(
+                    "[ROT] cond uses foreign loop-header phi v{} — bail (Guard E, nested IV as trip limit)",
+                    foreign_phi
+                );
+            }
+            return false;
+        }
+    }
+
     // 5.5 Collect owned snapshots of the closure instructions and the header
     //     phi metadata so the immutable borrow of `func.blocks[header]` ends
     //     before we take mutable borrows of `func.blocks[latch]` below. The
@@ -327,6 +402,40 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
         phi_latch_val.insert(phi_dest, lat);
         phi_pre_val.insert(phi_dest, pre);
     }
+
+    // Guard D: refuse to rotate when a header phi's latch incoming is
+    // defined by a NON-PHI instruction in the header. That is the
+    // `while (--i)` / header-decremented IV shape:
+    //
+    //   header: i = phi(g, i_next); i_next = i - 1; if i_next { body }
+    //   body:   ...; goto header
+    //
+    // Step 7 rewrites cloned-closure phi uses to the latch incoming, so
+    // the cloned `i_next' = i - 1` becomes `i_next' = i_next - 1` with
+    // `i_next` the GUARD's already-computed `g-1`. After rotation that
+    // value is loop-invariant, the backedge test is `(g-1)-1 != 0`
+    // forever, and the body walks off the end of the array (SIGSEGV on
+    // huft_build's `while (--i) { *xp++ = (j += *p++); }`, PF-17).
+    // Canonical `for (i = 0; i < n; i++)` is unaffected: its latch
+    // incoming is the body-defined `i + 1`.
+    for &(phi_dest, _, _, latch_op) in &phi_info {
+        let Operand::Value(v) = latch_op else {
+            continue;
+        };
+        let Some(&idx) = def_idx.get(&v.0) else {
+            continue; // defined outside the header (body / preheader)
+        };
+        if matches!(header_insts[idx], Instruction::Phi { .. }) {
+            continue; // cross-phi latch incoming: v17 rewrite handles this
+        }
+        if debug {
+            eprintln!(
+                "[ROT] header phi v{} latch incoming v{} is defined in the header (not a phi) — bail (Guard D, while(--i) shape)",
+                phi_dest, v.0
+            );
+        }
+        return false;
+    }
     // The immutable header borrow (`header_insts`) ends here under NLL —
     // its last use was the phi_info collection above. The mutable borrows
     // of `func.blocks[...]` below are disjoint from that borrow. (A prior
@@ -381,11 +490,26 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
     }
 
     // 6.6 Create a fresh self-loop phi in body_latch for each header phi.
-    //     The new phi `i_loop = phi[header_label: v_pre, latch_label: v_latch]`
+    //     The new phi `i_loop = phi[header: v_pre, latch: v_latch]`
     //     becomes the IV for the rotated self-loop. The header's original
     //     phi is left in place (step 10 strips its latch incoming so
     //     cfg_simplify collapses it to the preheader value — which is what
     //     the guard now checks).
+    //
+    //     The init incoming MUST be labeled with the HEADER (the guard),
+    //     not the original preheader. After rotation the body's only
+    //     forward predecessor is the header's continue edge; the original
+    //     preheader still branches to the header. Naming the preheader
+    //     here records a dead edge: cfg_simplify then drops that incoming
+    //     (jump-threading + unreachable-block sweep) and collapses the
+    //     phi to a Copy of the latch operand, which is defined LATER in
+    //     the same block — use-before-def, garbage IV, SIGSEGV. Observed
+    //     on every function with a second sequential counted loop
+    //     (alloca_bare_builtin, alu_peepholes, bitops_builtins, huft,
+    //     arm_vec_load_offset, …): the first loop's preheader is the
+    //     entry and accidentally becomes a predecessor after header-merge,
+    //     so the bug hid there; the second loop's preheader is a
+    //     now-dead jump block. PF-17.
     //
     //     CRITICAL: uses of the header phi inside body_latch (e.g.
     //     `load a[i]` or `i_next = i + 1`) must be rewritten to the new
@@ -686,12 +810,20 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
             // backedge writeback only fires on the next iteration's
             // entry); reading it on the exit edge would lose the final
             // iteration's contribution (off-by-one accumulator).
+            //
+            // Exception: when latch_op IS another header phi (cross-phi
+            // swap: `a_next = b`), that header phi collapses to its
+            // preheader value after step 10. The value we want on the
+            // test-exit edge is the corresponding new self-loop phi
+            // (start-of-this-iteration of the sibling), which is what
+            // rewrite_header_phi_operand substitutes.
+            let latch_for_exit = rewrite_header_phi_operand(latch_op, &new_loop_phis);
             exit_phi_insts.push(Instruction::Phi {
                 dest: nd,
                 ty,
                 incoming: vec![
-                    (pre_op, header_label),      // guard-exit path: preheader value (0-trip)
-                    (latch_op, latch_label),     // test-exit path: post-iteration value
+                    (pre_op, header_label),          // guard-exit path: preheader value (0-trip)
+                    (latch_for_exit, latch_label),   // test-exit path: post-iteration value
                 ],
             });
         }
@@ -742,6 +874,12 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
 
     // 7. Clone the closure instructions to the latch, allocating fresh dest
     //    IDs and rewriting: cloned refs → new dests, phi refs → latch values.
+    //    If a header phi's latch incoming is itself a header phi (cross-phi),
+    //    rewrite it to the new self-loop phi — the old header phi is about
+    //    to collapse to its preheader value in step 10.
+    for latch_op in phi_latch_val.values_mut() {
+        *latch_op = rewrite_header_phi_operand(*latch_op, &new_loop_phis);
+    }
     let mut clone_map: FxHashMap<u32, u32> = FxHashMap::default();
     let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(closure_insts_owned.len());
     for inst in &closure_insts_owned {
@@ -808,6 +946,19 @@ fn try_rotate_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis) -
 
     if debug { eprintln!("[ROT] SUCCESS: rotated header={} latch={}", lp.header, latch_idx); }
     true
+}
+
+/// If `op` is a header phi of the loop being rotated, rewrite it to the
+/// corresponding new self-loop phi. Needed whenever a latch incoming or
+/// cloned-closure operand still names the old header phi: after step 10
+/// that phi collapses to the preheader value.
+fn rewrite_header_phi_operand(op: Operand, new_loop_phis: &FxHashMap<u32, u32>) -> Operand {
+    if let Operand::Value(v) = op {
+        if let Some(&np) = new_loop_phis.get(&v.0) {
+            return Operand::Value(Value(np));
+        }
+    }
+    op
 }
 
 /// Check if a block label is inside the loop body (or is the header).
