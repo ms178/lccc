@@ -247,6 +247,9 @@ impl Lowerer {
             TypeSpecifier::Double => IrType::F64,
             TypeSpecifier::LongDouble => IrType::F128,
             TypeSpecifier::Float128 => IrType::U128,
+            TypeSpecifier::Decimal32 => IrType::D32,
+            TypeSpecifier::Decimal64 => IrType::D64,
+            TypeSpecifier::Decimal128 => IrType::U128,
             TypeSpecifier::ComplexFloat
             | TypeSpecifier::ComplexDouble
             | TypeSpecifier::ComplexLongDouble => IrType::Ptr,

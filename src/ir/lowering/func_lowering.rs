@@ -307,7 +307,7 @@ impl Lowerer {
             // _Float128 parameters: ONE 16-byte XMM register (SysV psABI).
             // Carried in a U128-typed param (bit-exact storage); classified as
             // a 16-byte SSE struct so the backend routes it through XMM regs.
-            if matches!(param_ctype, CType::Float128) {
+            if matches!(param_ctype, CType::Float128 | CType::Decimal128) {
                 let ir_idx = params.len();
                 params.push(IrParam {
                     ty: IrType::U128,

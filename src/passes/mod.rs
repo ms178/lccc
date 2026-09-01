@@ -874,6 +874,14 @@ pub(crate) fn run_passes(
     // correct backend emission of asm operands.
     if opt_level == 0 {
         resolve_asm::resolve_inline_asm_symbols(module);
+        // GCC semantics: always_inline is a correctness constraint, honored at
+        // every optimization level.  gnu_inline wrappers (glibc
+        // _FORTIFY_SOURCE, gcc.c-torture va-arg-pack-1.c) have no out-of-line
+        // body, so an un-inlined always_inline call cannot link.  This tier
+        // clones only always_inline callees; everything else is untouched.
+        if !pass_disabled(&disabled, "inline") {
+            inline::run_always_inline_only(module);
+        }
         // _Float128 math builtins lower to libgcc helper calls (__copysigntf3,
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).

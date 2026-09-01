@@ -544,6 +544,27 @@ impl Lexer {
             }
             kind
         } else if self.pos < self.input.len()
+            && (self.input[self.pos] == b'd' || self.input[self.pos] == b'D')
+        {
+            // C23 decimal floating suffixes: df/Df -> _Decimal32,
+            // dd/DD -> _Decimal64, dl/DL -> _Decimal128 (case-insensitive).
+            // A bare 'd'/'D' is NOT consumed here (not a valid suffix; the
+            // caller treats the token as a double with a trailing identifier,
+            // producing the same diagnostics GCC emits).
+            if self.pos + 1 < self.input.len() {
+                let second = self.input[self.pos + 1].to_ascii_lowercase();
+                if second == b'f' || second == b'd' || second == b'l' {
+                    self.pos += 2;
+                    let kind = match second {
+                        b'f' => 4u8,
+                        b'd' => 5u8,
+                        _ => 6u8,
+                    };
+                    return (kind, false);
+                }
+            }
+            0
+        } else if self.pos < self.input.len()
             && (self.input[self.pos] == b'q' || self.input[self.pos] == b'Q')
         {
             // __float128 / _Float128 GNU suffix
@@ -633,6 +654,39 @@ impl Lexer {
                     let f128_bytes =
                         crate::common::long_double::parse_long_double_to_f128_bytes(text);
                     Token::new(TokenKind::FloatLiteralF128(value, f128_bytes), span)
+                }
+                4 | 5 | 6 => {
+                    // C23 decimal floating literal: encode the exact decimal
+                    // value into the BID bit pattern for the target width.
+                    let width = match float_kind {
+                        4 => 32u8,
+                        5 => 64u8,
+                        _ => 128u8,
+                    };
+                    let bits = crate::common::decimal::parse_decimal_literal(text)
+                        .map(|lit| match width {
+                            32 => {
+                                let b = crate::common::decimal::encode_bid32(false, &lit.digits, lit.exponent).to_le_bytes();
+                                let mut out = [0u8; 16];
+                                out[..4].copy_from_slice(&b);
+                                out
+                            }
+                            64 => {
+                                let b = crate::common::decimal::encode_bid64(false, &lit.digits, lit.exponent).to_le_bytes();
+                                let mut out = [0u8; 16];
+                                out[..8].copy_from_slice(&b);
+                                out
+                            }
+                            _ => {
+                                let (hi, lo) = crate::common::decimal::encode_bid128(false, &lit.digits, lit.exponent);
+                                let mut out = [0u8; 16];
+                                out[..8].copy_from_slice(&lo.to_le_bytes());
+                                out[8..].copy_from_slice(&hi.to_le_bytes());
+                                out
+                            }
+                        })
+                        .unwrap_or([0u8; 16]);
+                    Token::new(TokenKind::FloatLiteralDecimal(width, bits), span)
                 }
                 _ => Token::new(TokenKind::FloatLiteral(value), span),
             }
