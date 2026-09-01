@@ -991,7 +991,6 @@ fn kind_name(inst: &Instruction) -> &'static str {
         | Instruction::AtomicRmw { .. }
         | Instruction::AtomicCmpxchg { .. } => "Atomic*",
         Instruction::ParamRef { .. } => "ParamRef",
-        Instruction::Phi { .. } => "Phi",
         Instruction::GetElementPtr { .. } => "GetElementPtr",
         Instruction::GlobalAddr { .. } => "GlobalAddr",
         Instruction::Copy { .. } => "Copy",
