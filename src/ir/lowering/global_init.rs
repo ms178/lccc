@@ -288,11 +288,6 @@ impl Lowerer {
             IrConst::I16(v) => le(i64_to_f128_bytes(*v as i64)),
             IrConst::I8(v) => le(i64_to_f128_bytes(*v as i64)),
             IrConst::I128(v) => *v as u128, // already a binary128 payload
-            // Decimal FP bit containers: pass BID bits through unchanged
-            // (only reachable for Decimal128 globals, which use this exact
-            // payload path; D32/D64 targets never call this helper).
-            IrConst::D64(v) => *v as u128,
-            IrConst::D32(v) => *v as u128,
             IrConst::Zero => le(i64_to_f128_bytes(0)),
         })
     }

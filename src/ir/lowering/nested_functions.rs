@@ -412,7 +412,6 @@ impl Lowerer {
             | Expr::FloatLiteralF32(..)
             | Expr::FloatLiteralLongDouble(..)
             | Expr::FloatLiteralF128(..)
-            | Expr::FloatLiteralDecimal(..)
             | Expr::ImaginaryLiteral(..)
             | Expr::ImaginaryLiteralF32(..)
             | Expr::ImaginaryLiteralLongDouble(..)

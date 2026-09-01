@@ -590,8 +590,6 @@ impl<'a> SemaConstEval<'a> {
             IrConst::I128(_) => Some(CType::Int128),
             IrConst::F32(_) => Some(CType::Float),
             IrConst::F64(_) => Some(CType::Double),
-            IrConst::D32(_) => Some(CType::Decimal32),
-            IrConst::D64(_) => Some(CType::Decimal64),
             IrConst::LongDouble(..) => Some(CType::LongDouble),
             IrConst::Zero => Some(CType::Int),
         }

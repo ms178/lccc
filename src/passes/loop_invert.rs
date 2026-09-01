@@ -255,14 +255,15 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
 }
 
 fn apply(func: &mut IrFunction, plan: &Plan) {
-    // Seed from the SOUND high-water mark: InlineAsm outputs are definitions
-    // that `dest()` does not report, so a dest-only max() scan silently
-    // re-issues IDs already taken by an inline-asm output and corrupts SSA
-    // numbering (pr84524: the cloned latch test collided with `"+r"(v)` at
-    // id 55, demoted the asm output to an indirect slot, and stored through
-    // an uninitialized pointer). Write the new bound back so every later
-    // pass seeds above it.
-    let mut next_id = func.sound_next_value_id();
+    let mut next_id = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| i.dest())
+        .map(|d| d.0)
+        .max()
+        .unwrap_or(0)
+        + 1;
 
     let header_insts = func.blocks[plan.header].instructions.clone();
     let header_term = func.blocks[plan.header].terminator.clone();
@@ -313,7 +314,6 @@ fn apply(func: &mut IrFunction, plan: &Plan) {
     }
     latch.instructions.extend(cloned);
     latch.terminator = term;
-    func.next_value_id = func.next_value_id.max(next_id);
 }
 
 fn set_dest(inst: &mut Instruction, new: Value) {
@@ -475,61 +475,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// pr84524 end-to-end shape: an InlineAsm output lives at an ID above
-    /// every `dest()` ID. The latch clone's fresh-ID allocator must seed from
-    /// the sound high-water mark (InlineAsm outputs are definitions that
-    /// `dest()` does not report) or it re-issues the asm output's ID, which
-    /// demotes the asm output slot to indirect storage and miscompiles the
-    /// asm-emit path (store through an uninitialized pointer).
-    #[test]
-    fn inversion_never_reuses_inline_asm_output_ids() {
-        let asm_out = Value(55);
-        let asm = Instruction::InlineAsm {
-            template: String::new(),
-            outputs: vec![("+r".to_string(), asm_out, None)],
-            inputs: vec![("r".to_string(), Operand::Value(Value(99)), None)],
-            clobbers: Vec::new(),
-            operand_types: vec![IrType::U16, IrType::U16],
-            goto_labels: Vec::new(),
-            input_symbols: vec![None],
-            seg_overrides: vec![
-                crate::common::types::AddressSpace::Default,
-                crate::common::types::AddressSpace::Default,
-            ],
-        };
-        // The asm lives OUTSIDE the rotated loop (pr84524: the colliding asm
-        // sat in a sibling inner loop while the outer loop was inverted);
-        // the collision is purely an ID-allocation hazard across the function.
-        let mut f = counted_loop();
-        f.blocks[4].instructions.insert(0, asm);
-        assert_eq!(invert_loops(&mut f), 1);
-
-        let mut seen = FxHashSet::default();
-        for b in &f.blocks {
-            for i in &b.instructions {
-                if let Some(d) = i.dest() {
-                    assert!(seen.insert(d.0), "duplicate definition of v{}", d.0);
-                }
-                if let Instruction::InlineAsm { outputs, .. } = i {
-                    for (_, v, _) in outputs {
-                        assert!(
-                            seen.insert(v.0),
-                            "inline-asm output v{} re-defined elsewhere",
-                            v.0
-                        );
-                    }
-                }
-            }
-        }
-        assert!(seen.contains(&55), "asm output id must survive");
-        // The allocator high-water mark must be published for later passes.
-        assert!(
-            f.next_value_id > 55,
-            "next_value_id must be bumped above the allocated range, got {}",
-            f.next_value_id
-        );
     }
 
     // ── negative controls ───────────────────────────────────────────────────

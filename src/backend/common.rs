@@ -448,28 +448,6 @@ struct DirectLdArchConfig {
     crt_package_hint: &'static str,
     /// Package hint for GCC lib not-found error messages
     gcc_package_hint: &'static str,
-    /// Multilib sub-directories probed beneath each `gcc_multilib_base_paths`
-    /// entry.  A native amd64 host with `gcc-multilib` installed (the standard
-    /// Debian/Ubuntu 32-bit build environment, and the layout this compiler
-    /// must support when driving its own i686 code generator with host
-    /// CRT/libgcc) keeps the 32-bit support libraries at
-    /// `/usr/lib/gcc/x86_64-linux-gnu/<ver>/32/` — crtbegin.o/crtend.o,
-    /// libgcc.a and libgcc_eh.a all live there.  Without probing that
-    /// sub-directory the i686 built-in linker resolves no GCC library dir at
-    /// all and every static link dies with undefined
-    /// `__letf2`/`__unordtf2`/`__udivti3` (soft-float TF and 128-bit integer
-    /// helpers that only libgcc.a provides).
-    /// Empty for the 64-bit-only targets, whose support libraries never live
-    /// in a multilib subdir.
-    gcc_multilib_subdirs: &'static [&'static str],
-    /// Base paths probed ONLY through their multilib sub-directories
-    /// (`gcc_multilib_subdirs`), never through the plain `<base>/<version>`
-    /// directory itself.  This is what makes the i686-on-amd64 discovery safe:
-    /// the 64-bit GCC dir must never satisfy the i686 probe even though it
-    /// contains crtbegin.o — linking 32-bit objects against 64-bit libgcc
-    /// would produce an ELF-class mismatch.  Only `<base>/<ver>/32` (etc.) is
-    /// accepted from these bases.
-    gcc_multilib_base_paths: &'static [&'static str],
 }
 
 /// Standard GCC versions to probe (newest to oldest), shared across most architectures.
@@ -510,9 +488,6 @@ const DIRECT_LD_X86_64: DirectLdArchConfig = DirectLdArchConfig {
     crti_from_gcc_dir: false,
     crt_package_hint: "Is the libc development package installed?",
     gcc_package_hint: "Is the GCC development package installed?",
-    // Native amd64 support libs never live in a multilib sub-directory.
-    gcc_multilib_subdirs: &[],
-    gcc_multilib_base_paths: &[],
 };
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -541,8 +516,6 @@ const DIRECT_LD_RISCV64: DirectLdArchConfig = DirectLdArchConfig {
         (e.g., libc6-dev-riscv64-cross)",
     gcc_package_hint: "Is the riscv64-linux-gnu GCC cross-compiler installed? \
         (e.g., gcc-riscv64-linux-gnu)",
-    gcc_multilib_subdirs: &[],
-    gcc_multilib_base_paths: &[],
 };
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -579,15 +552,6 @@ const DIRECT_LD_I686: DirectLdArchConfig = DirectLdArchConfig {
     crti_from_gcc_dir: false,
     crt_package_hint: "Is the libc-dev-i386-cross or libc6-dev-i386 package installed?",
     gcc_package_hint: "Is the gcc-i686-linux-gnu package installed?",
-    // Debian/Ubuntu `gcc-multilib` keeps the 32-bit support libraries
-    // (crtbegin.o, libgcc.a, libgcc_eh.a) in the `32/` sub-directory of the
-    // *64-bit* GCC lib dir.  Without probing that layout, a native i686
-    // static link cannot resolve libgcc at all and dies on undefined
-    // __udivti3/__letf2-class helper symbols.  The x86_64 base is probed
-    // multilib-only so its 64-bit crtbegin.o can never satisfy the i686
-    // probe (that would link 32-bit code against 64-bit libgcc).
-    gcc_multilib_subdirs: &["32"],
-    gcc_multilib_base_paths: &["/usr/lib/gcc/x86_64-linux-gnu"],
 };
 
 #[cfg(not(feature = "gcc_linker"))]
@@ -624,8 +588,6 @@ const DIRECT_LD_AARCH64: DirectLdArchConfig = DirectLdArchConfig {
     crti_from_gcc_dir: false,
     crt_package_hint: "Is the libc-dev-arm64-cross package installed?",
     gcc_package_hint: "Is the gcc-aarch64-linux-gnu package installed?",
-    gcc_multilib_subdirs: &[],
-    gcc_multilib_base_paths: &[],
 };
 
 // ── LCCC_SYSROOT: prefix-aware multilib discovery ────────────────────────────
@@ -679,34 +641,12 @@ fn resolve_sysroot_dir(path: &str) -> Option<String> {
 /// root whose crtbegin.o satisfied the probe.
 #[cfg(not(feature = "gcc_linker"))]
 fn find_gcc_lib_dir(arch: &DirectLdArchConfig) -> Option<String> {
-    // Plain bases: `<base>/<ver>` itself is eligible, plus any multilib
-    // sub-directory variants (only relevant when the base is multilib-aware).
     for base in arch.gcc_lib_base_paths {
         for ver in arch.gcc_versions {
             let dir = format!("{}/{}", base, ver);
-            let mut candidates = vec![dir];
-            for sub in arch.gcc_multilib_subdirs {
-                candidates.push(format!("{}/{}", candidates[0], sub));
-            }
-            for dir in candidates {
-                let crtbegin = format!("{}/crtbegin.o", dir);
-                if exists_with_sysroot(&crtbegin) {
-                    return resolve_sysroot_dir(&dir);
-                }
-            }
-        }
-    }
-    // Multilib-only bases: the plain `<base>/<ver>` directory belongs to a
-    // different ELF class (e.g. the amd64 GCC dir when targeting i686), so
-    // only its `<ver>/<subdir>` variants may satisfy the probe.
-    for base in arch.gcc_multilib_base_paths {
-        for ver in arch.gcc_versions {
-            for sub in arch.gcc_multilib_subdirs {
-                let dir = format!("{}/{}/{}", base, ver, sub);
-                let crtbegin = format!("{}/crtbegin.o", dir);
-                if exists_with_sysroot(&crtbegin) {
-                    return resolve_sysroot_dir(&dir);
-                }
+            let crtbegin = format!("{}/crtbegin.o", dir);
+            if exists_with_sysroot(&crtbegin) {
+                return resolve_sysroot_dir(&dir);
             }
         }
     }
@@ -2086,18 +2026,6 @@ pub fn emit_const_data(out: &mut AsmOutput, c: &IrConst, ty: IrType, ptr_dir: Pt
         IrConst::I64(v) => emit_int_data(out, *v, ty, ptr_dir),
         IrConst::F32(v) => {
             out.emit_fmt(format_args!("    .long {}", v.to_bits()));
-        }
-        // Decimal FP constants are emitted as raw BID bit patterns at the
-        // carrier width (identical layout to the integer emission path).
-        IrConst::D32(v) => {
-            out.emit_fmt(format_args!("    .long {}", v));
-        }
-        IrConst::D64(v) => {
-            if ptr_dir.is_32bit() {
-                emit_u64_as_long_pair(out, *v);
-            } else {
-                out.emit_fmt(format_args!("    {} {}", ptr_dir.as_str(), v));
-            }
         }
         IrConst::F64(v) => {
             let bits = v.to_bits();

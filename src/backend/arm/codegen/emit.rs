@@ -1455,12 +1455,6 @@ impl ArmCodegen {
                             self.emit_load_imm64("x0", *v as i64);
                         }
                     }
-                    IrConst::D32(v) => {
-                        self.state.emit_fmt(format_args!("    mov x0, #{}", *v as i64));
-                    }
-                    IrConst::D64(v) => {
-                        self.emit_load_imm64("x0", *v as i64);
-                    }
                     IrConst::I64(v) => {
                         if *v >= -65536 && *v <= 65535 {
                             self.state.emit_fmt(format_args!("    mov x0, #{}", v));

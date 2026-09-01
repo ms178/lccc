@@ -193,26 +193,6 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
-        // C23 decimal floating point casts: route through the libbid
-        // (__bid_*) conversion helpers, exactly like GCC.
-        if (inner_ctype.is_decimal() || target_ctype.is_decimal())
-            && target_ctype != CType::Bool
-        {
-            if target_ctype.is_decimal() && inner_ctype.is_decimal()
-                && inner_ctype == target_ctype
-            {
-                // same-type decimal cast: identity (handled below by the
-                // generic same-type path) — fall through with nothing.
-            } else {
-                let src = self.lower_expr(inner);
-                return self.convert_decimal_scalar(
-                    src,
-                    IrType::from_ctype(&inner_ctype),
-                    &inner_ctype,
-                    &target_ctype,
-                );
-            }
-        }
         // _Float128 (binary128) casts route through the libgcc soft-float
         // conversion helpers (__extendsftf2, __trunctfdf2, __fixtfdi, ...),
         // exactly like GCC. Both directions are covered.
@@ -254,12 +234,6 @@ impl Lowerer {
 
         // C standard: conversion to _Bool yields 0 or 1
         if target_ctype == CType::Bool {
-            if inner_ctype.is_decimal() {
-                // decimal zero test: +0 == -0 compares equal (IEEE 754
-                // totalOrder semantics do NOT apply here; plain ==/!= does)
-                let dsrc = self.lower_expr(inner);
-                return self.lower_decimal_truthiness(dsrc, &inner_ctype);
-            }
             if from_ty.is_float() {
                 let zero = match from_ty {
                     IrType::F32 => Operand::Const(IrConst::F32(0.0)),

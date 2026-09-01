@@ -12,7 +12,7 @@
 use crate::common::asm_constraints::constraint_is_immediate_only;
 use crate::common::fx_hash::FxHashMap as FxInlineMap;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::common::types::{AddressSpace, EightbyteClass, IrType, RiscvFloatClass};
+use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
     BasicBlock, BlockId, CallInfo, GlobalInit, Instruction, IrBinOp, IrConst, IrFunction, IrModule,
     Operand, Terminator, Value,
@@ -568,20 +568,6 @@ pub fn run_size_optimized(module: &mut IrModule) -> usize {
 }
 
 fn inline_run(module: &mut IrModule, size_optimized: bool) -> usize {
-    inline_run_impl(module, size_optimized, false)
-}
-
-/// `-O0` entry point: GCC semantics require `__attribute__((always_inline))`
-/// functions to be inlined at EVERY optimization level — the attribute is a
-/// correctness constraint (gnu_inline wrappers have no out-of-line body, so
-/// an un-inlined call is a hard undefined-symbol link error), not an
-/// optimization choice.  This tier admits ONLY always_inline callees and
-/// leaves every other body untouched, preserving -O0's no-optimizer contract.
-pub fn run_always_inline_only(module: &mut IrModule) -> usize {
-    inline_run_impl(module, false, true)
-}
-
-fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_only: bool) -> usize {
     let mut total_inlined = 0;
     let debug_inline = std::env::var("CCC_INLINE_DEBUG").is_ok();
     let skip_list: Vec<String> = std::env::var("CCC_INLINE_SKIP")
@@ -593,10 +579,7 @@ fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_on
 
     // Build a snapshot of eligible callees (we can't borrow module mutably while reading callees).
     // We clone the callee function bodies since we need them while mutating callers.
-    let mut callee_map = build_callee_map(module);
-    if always_inline_only {
-        callee_map.retain(|_, data| data.is_always_inline);
-    }
+    let callee_map = build_callee_map(module);
 
     if callee_map.is_empty() {
         return 0;
@@ -1574,155 +1557,7 @@ fn short_inst_name(inst: &Instruction) -> &'static str {
     }
 }
 
-/// ABI metadata for a call site's argument list (S17 va_arg_pack forwarding).
-/// Parallel arrays lifted from the caller's `CallInfo` so that forwarded
-/// variadic arguments can be spliced into an inlined wrapper body's call with
-/// a correct ABI description (struct-by-value sizes/classes matter: glibc's
-/// _FORTIFY_SOURCE wrappers forward 16-byte structs through va_arg_pack).
-#[derive(Clone, Default)]
-struct CallArgMeta {
-    arg_types: Vec<IrType>,
-    struct_arg_sizes: Vec<Option<usize>>,
-    struct_arg_aligns: Vec<Option<usize>>,
-    struct_arg_classes: Vec<Vec<EightbyteClass>>,
-    struct_arg_riscv_float_classes: Vec<Option<RiscvFloatClass>>,
-    struct_arg_is_f128_sse: Vec<bool>,
-}
-
-impl CallArgMeta {
-    fn from_call_info(info: &CallInfo) -> Self {
-        CallArgMeta {
-            arg_types: info.arg_types.clone(),
-            struct_arg_sizes: info.struct_arg_sizes.clone(),
-            struct_arg_aligns: info.struct_arg_aligns.clone(),
-            struct_arg_classes: info.struct_arg_classes.clone(),
-            struct_arg_riscv_float_classes: info.struct_arg_riscv_float_classes.clone(),
-            struct_arg_is_f128_sse: info.struct_arg_is_f128_sse.clone(),
-        }
-    }
-
-    /// Extract the metadata slice for arguments `[from..to]`.
-    fn slice(&self, from: usize, to: usize) -> CallArgMeta {
-        let take = |v: &[IrType]|
-            -> Vec<IrType> { v[from.min(v.len())..to.min(v.len())].to_vec() };
-        CallArgMeta {
-            arg_types: take(&self.arg_types),
-            struct_arg_sizes: self.struct_arg_sizes[from.min(self.struct_arg_sizes.len())
-                ..to.min(self.struct_arg_sizes.len())]
-                .to_vec(),
-            struct_arg_aligns: self.struct_arg_aligns[from.min(self.struct_arg_aligns.len())
-                ..to.min(self.struct_arg_aligns.len())]
-                .to_vec(),
-            struct_arg_classes: self.struct_arg_classes[from.min(self.struct_arg_classes.len())
-                ..to.min(self.struct_arg_classes.len())]
-                .to_vec(),
-            struct_arg_riscv_float_classes: self.struct_arg_riscv_float_classes
-                [from.min(self.struct_arg_riscv_float_classes.len())
-                ..to.min(self.struct_arg_riscv_float_classes.len())]
-                .to_vec(),
-            struct_arg_is_f128_sse: self.struct_arg_is_f128_sse
-                [from.min(self.struct_arg_is_f128_sse.len())
-                ..to.min(self.struct_arg_is_f128_sse.len())]
-                .to_vec(),
-        }
-    }
-}
-
-/// `__builtin_va_arg_pack()` forwarding plan for an always_inline variadic
-/// wrapper (S17).  The lowering emits zero-arg sentinel calls
-/// (`__lccc_va_arg_pack` / `__lccc_va_arg_pack_len`); this records their
-/// callee-space destination values so `inline_call_site` can delete the
-/// sentinels and splice the call site's arguments beyond the wrapper's named
-/// parameters into the consuming call.  `vp_value` uses are validated to be
-/// direct arguments of Call instructions only; `len_values` become I32
-/// constants (rewritten as `Copy { src: Const }`, so any use shape works).
-#[derive(Clone, Default)]
-struct VaArgPackPlan {
-    /// Destination values of ALL `__lccc_va_arg_pack` sentinel calls.  The
-    /// C source may use `__builtin_va_arg_pack()` several times (one per
-    /// return path — gcc.c-torture va-arg-pack-1.c does exactly that); each
-    /// use expands to the same forwarded argument list, and because the
-    /// forwarded operands are already-evaluated SSA values, splicing the
-    /// same list at every consuming call is sound and evaluates each
-    /// caller argument exactly once.
-    vp_values: Vec<Value>,
-    len_values: Vec<Value>,
-}
-
-impl VaArgPackPlan {
-    fn is_empty(&self) -> bool {
-        self.vp_values.is_empty() && self.len_values.is_empty()
-    }
-}
-
-/// Analyze `func` for va_arg_pack forwarding.  Returns None when the body
-/// uses the sentinels in a way the splice cannot express (multiple vp
-/// sentinel calls, or the vp value consumed outside a call argument list).
-fn analyze_va_arg_pack(func: &IrFunction) -> Option<VaArgPackPlan> {
-    const VP: &str = "__lccc_va_arg_pack";
-    const VPLEN: &str = "__lccc_va_arg_pack_len";
-    let mut plan = VaArgPackPlan::default();
-    let mut vp_invalid = false;
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Call { func: f, info } = inst {
-                if f == VP {
-                    if let Some(d) = info.dest {
-                        plan.vp_values.push(d);
-                    }
-                } else if f == VPLEN {
-                    plan.len_values.push(info.dest?);
-                }
-            }
-        }
-    }
-    if plan.is_empty() {
-        return None;
-    }
-    for v in plan.vp_values.clone() {
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                match inst {
-                    Instruction::Call { func: f, info } => {
-                        if f == VP || f == VPLEN {
-                            continue;
-                        }
-                        // The vp value may appear ONLY among the call's
-                        // forwarded arguments (where splicing is defined).
-                        // Direct calls have a String target; nothing else in
-                        // a direct Call can reference the value.
-                    }
-                    Instruction::CallIndirect { func_ptr, .. } => {
-                        if func_ptr == &Operand::Value(v) {
-                            return None;
-                        }
-                    }
-                    other => {
-                        let mut bad = false;
-                        other.for_each_used_value(|u| {
-                            if u == v.0 {
-                                bad = true;
-                            }
-                        });
-                        if bad {
-                            return None;
-                        }
-                    }
-                }
-            }
-            block.terminator.for_each_used_value(|u| {
-                if u == v.0 {
-                    vp_invalid = true;
-                }
-            });
-        }
-        if vp_invalid {
-            return None;
-        }
-    }
-    Some(plan)
-}
-
+/// Information about a callee function eligible for inlining.
 #[derive(Clone)]
 struct CalleeData {
     blocks: Vec<BasicBlock>,
@@ -1773,10 +1608,6 @@ struct CalleeData {
     /// fixed-point policy will necessarily inline have expanded.  -Os uses
     /// this rather than the stale raw snapshot for its nested-loop limit.
     size_inline_cost: usize,
-    /// va_arg_pack forwarding plan (S17): present only for variadic
-    /// always_inline wrappers whose sentinel uses validate.  Empty for every
-    /// other callee.
-    va_arg_pack: Option<VaArgPackPlan>,
 }
 
 /// A call site that is eligible for inlining.
@@ -1798,10 +1629,6 @@ struct InlineCallSite {
     /// normally skip it — the PGO advantage LLVM/ICC have over a plain build.
     /// Still bounded by a dedicated budget to prevent unbounded bloat.
     pgo_force: bool,
-    /// ABI metadata of the call's argument list (S17): required to splice
-    /// forwarded variadic arguments (va_arg_pack) with correct types and
-    /// struct-by-value classification.
-    arg_meta: CallArgMeta,
 }
 
 /// Check if a GlobalInit contains references to local labels (`.LBBxx`).
@@ -2001,10 +1828,6 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             continue;
         }
 
-        // va_arg_pack forwarding plan (S17) — computed before the variadic
-        // gate below, consumed by the CalleeData construction at the loop tail.
-        let mut va_arg_pack_plan: Option<VaArgPackPlan> = None;
-
         // Determine if this is an always_inline function
         let is_always_inline = func.is_always_inline;
 
@@ -2184,27 +2007,9 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 func.params.len()
             );
         }
-        // Don't inline variadic functions (complex ABI) — EXCEPT the
-        // always_inline wrapper shape whose only variadic forwarding is a
-        // validated __builtin_va_arg_pack()/__builtin_va_arg_pack_len()
-        // sentinel pair (glibc _FORTIFY_SOURCE wrappers,
-        // gcc.c-torture/execute/va-arg-pack-1.c).  GCC always inlines those;
-        // with gnu_inline semantics an un-inlined wrapper has no out-of-line
-        // body, so refusing to inline them is a hard link error.
+        // Don't inline variadic functions (complex ABI)
         if func.is_variadic {
-            let plan = if func.is_always_inline {
-                analyze_va_arg_pack(func)
-            } else {
-                None
-            };
-            match plan {
-                Some(p) => {
-                    va_arg_pack_plan = Some(p);
-                }
-                None => {
-                    continue;
-                }
-            }
+            continue;
         }
 
         // Check size limits.
@@ -2351,7 +2156,6 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 // Filled from the complete map below, after every eligible
                 // descendant is known.
                 size_inline_cost: inst_count,
-                va_arg_pack: va_arg_pack_plan.take(),
             },
         );
         // Register the same body under its __asm__ label so call sites that
@@ -2535,7 +2339,6 @@ fn find_inline_call_sites(
                             dest: info.dest,
                             args: info.args.clone(),
                             pgo_force: false,
-                            arg_meta: CallArgMeta::from_call_info(info),
                         });
                     }
                 }
@@ -2645,8 +2448,6 @@ fn const_ir_type(c: &IrConst) -> Option<IrType> {
         IrConst::I128(_) => IrType::I128,
         IrConst::F32(_) => IrType::F32,
         IrConst::F64(_) => IrType::F64,
-        IrConst::D32(_) => IrType::D32,
-        IrConst::D64(_) => IrType::D64,
         IrConst::LongDouble(..) => IrType::F128,
         IrConst::Zero => crate::common::types::target_int_ir_type(),
     })
@@ -2713,114 +2514,6 @@ fn inline_call_site(
         }
 
         inlined_blocks.push(new_block);
-    }
-
-    // ── S17: __builtin_va_arg_pack() forwarding ────────────────────────────
-    // The wrapper's caller evaluated ALL its arguments (named + variadic)
-    // before the call; the cloned body's sentinel call is deleted and the
-    // arguments beyond the wrapper's named parameters are spliced into the
-    // consuming call's argument list with their full ABI metadata.  A
-    // va_arg_pack_len sentinel becomes an I32 constant via Copy, so the
-    // regular const-propagation machinery sees the count.
-    if let Some(plan) = &callee.va_arg_pack {
-        let named = callee.num_params.min(site.args.len());
-        let extra: Vec<Operand> = site.args[named..].to_vec();
-        let extra_meta = site.arg_meta.slice(named, site.args.len());
-
-        for v in plan.vp_values.clone() {
-            let vrem = Value(v.0 + value_offset);
-            let vp_name = "__lccc_va_arg_pack";
-            for block in &mut inlined_blocks {
-                // Delete the sentinel call itself.
-                block
-                    .instructions
-                    .retain(|inst| {
-                        !matches!(inst, Instruction::Call { func, info }
-                            if func == vp_name && info.dest == Some(vrem))
-                    });
-                // Splice the forwarded arguments at every consuming site.
-                for inst in &mut block.instructions {
-                    if let Instruction::Call { info, .. } = inst {
-                        // Replace the single forwarded-argument slot with the
-                        // call site's extra arguments.  Every parallel ABI
-                        // array must drop the vp slot's own entry AND take
-                        // the extras' entries, keeping it index-aligned with
-                        // `args` (an insert-without-removal leaves the arrays
-                        // one entry longer than `args`, and every later ABI
-                        // classification reads shifted metadata — the wrong
-                        // struct slot got memcpy'd, va_start read past the
-                        // named args, and the wrapper's own checks aborted).
-                        fn splice_slot<T: Clone>(arr: &mut Vec<T>, i: usize, extra: &[T]) {
-                            match i.cmp(&arr.len()) {
-                                std::cmp::Ordering::Less => {
-                                    arr.splice(i..i + 1, extra.iter().cloned());
-                                }
-                                std::cmp::Ordering::Equal => {
-                                    arr.extend(extra.iter().cloned());
-                                }
-                                std::cmp::Ordering::Greater => {}
-                            }
-                        }
-                        let mut i = 0;
-                        while i < info.args.len() {
-                            if info.args[i] == Operand::Value(vrem) {
-                                info.args.splice(i..i + 1, extra.iter().cloned());
-                                splice_slot(&mut info.arg_types, i, &extra_meta.arg_types);
-                                splice_slot(
-                                    &mut info.struct_arg_sizes,
-                                    i,
-                                    &extra_meta.struct_arg_sizes,
-                                );
-                                splice_slot(
-                                    &mut info.struct_arg_aligns,
-                                    i,
-                                    &extra_meta.struct_arg_aligns,
-                                );
-                                splice_slot(
-                                    &mut info.struct_arg_classes,
-                                    i,
-                                    &extra_meta.struct_arg_classes,
-                                );
-                                splice_slot(
-                                    &mut info.struct_arg_riscv_float_classes,
-                                    i,
-                                    &extra_meta.struct_arg_riscv_float_classes,
-                                );
-                                splice_slot(
-                                    &mut info.struct_arg_is_f128_sse,
-                                    i,
-                                    &extra_meta.struct_arg_is_f128_sse,
-                                );
-                                i += extra.len();
-                            } else {
-                                i += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !plan.len_values.is_empty() && !extra.is_empty() {
-            let len_const = IrConst::I32(extra.len() as i32);
-            for block in &mut inlined_blocks {
-                for inst in &mut block.instructions {
-                    if let Instruction::Call { func, info } = inst {
-                        if func == "__lccc_va_arg_pack_len" {
-                            if let Some(d) = info.dest {
-                                if plan.len_values.contains(&Value(d.0 + value_offset)) {
-                                    // Rewrite in place: sentinel call -> Copy of the count.
-                                    *inst = Instruction::Copy {
-                                        dest: Value(d.0 + value_offset),
-                                        src: Operand::Const(len_const.clone()),
-                                    };
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     // Create a merge block that the callee's return statements will branch to

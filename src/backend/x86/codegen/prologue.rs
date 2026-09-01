@@ -692,8 +692,6 @@ impl X86Codegen {
                                     }
                                     crate::ir::reexports::IrConst::F32(_) => Some(IrType::F32),
                                     crate::ir::reexports::IrConst::F64(_) => Some(IrType::F64),
-                                    crate::ir::reexports::IrConst::D32(_) => Some(IrType::D32),
-                                    crate::ir::reexports::IrConst::D64(_) => Some(IrType::D64),
                                     crate::ir::reexports::IrConst::LongDouble(_, _) => {
                                         Some(IrType::F128)
                                     }
@@ -2235,7 +2233,7 @@ impl X86Codegen {
                         .emit_instr_reg_rbp("    movq", X86_ARG_REGS[reg_idx], slot.0);
                 }
                 ParamClass::FloatReg { reg_idx } => {
-                    if ty == IrType::F32 || ty == IrType::D32 {
+                    if ty == IrType::F32 {
                         self.state
                             .out
                             .emit_instr_reg_reg("    movd", xmm_regs[reg_idx], "eax");

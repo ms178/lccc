@@ -855,8 +855,6 @@ fn const_is_truthy(c: &IrConst) -> bool {
         IrConst::I128(v) => *v != 0,
         IrConst::F32(v) => *v != 0.0,
         IrConst::F64(v) => *v != 0.0,
-        IrConst::D32(v) => *v != 0,
-        IrConst::D64(v) => *v != 0,
         IrConst::LongDouble(v, _) => *v != 0.0,
         IrConst::Zero => false,
     }

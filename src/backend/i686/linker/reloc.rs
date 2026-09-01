@@ -33,9 +33,6 @@ pub(super) struct RelocContext<'a> {
     pub tls_addr: u32,
     pub tls_mem_size: u32,
     pub has_tls: bool,
-    /// Absolute addresses of PLT32 relocation slots suppressed by a
-    /// preceding TLS GD→LE relaxation (the call they patched is now a NOP).
-    pub tls_relaxed_call_slots: crate::common::fx_hash::FxHashSet<u32>,
 }
 
 /// Apply all relocations from input objects to the output sections.
@@ -140,11 +137,6 @@ fn apply_one_reloc(
             }
         }
         R_386_PC32 | R_386_PLT32 => {
-            if ctx.tls_relaxed_call_slots.contains(&patch_addr) {
-                // The GD→LE relaxation NOPed out this `call ___tls_get_addr`;
-                // leave the NOP encoding intact.
-                return Ok(None);
-            }
             let s = if is_dyn {
                 ctx.global_symbols
                     .get(sym.name.as_str())
@@ -175,74 +167,8 @@ fn apply_one_reloc(
         R_386_TLS_GOTIE => resolve_tls_gotie(sym, sym_addr, addend, ctx),
         R_386_TLS_GD => {
             if ctx.has_tls && sym.sym_type == STT_TLS {
-                let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32
-                    + addend;
-                // GD→LE relaxation for executables (matches GNU ld's
-                // elf32-i386 tls transform). The GD sequence is:
-                //   lea  sym@tlsgd(%x), %y   ; 8d /r disp32   (6 bytes)
-                //   call ___tls_get_addr@PLT ; e8 disp32      (5 bytes)
-                // Rewrite it into a local-exec access:
-                //   movl $sym@tpoff, %y      ; c7 /0 modrm imm32 (6 bytes)
-                //   <5-byte NOP>             ; 0f 1f 44 00 00    (5 bytes)
-                // and suppress the call's own PLT32 relocation.
-                let out_sec = &mut ctx.output_sections[out_sec_idx];
-                let off = patch_offset as usize;
-                // Detect the lea that hosts @tlsgd. GNU as emits either the
-                // 7-byte SIB form `8d 04 1d disp32` (lea (%ebx,%ebx),reg —
-                // the -fpic default via get_pc_thunk) or the 6-byte form
-                // `8d modrm disp32` (lea disp32(%ebx),reg, mod=10).
-                let sib_form = off >= 3
-                    && off + 11 <= out_sec.data.len()
-                    && out_sec.data[off - 3] == 0x8d
-                    // modrm: mod=00 (disp32), reg=dest, rm=100 (SIB follows)
-                    && (out_sec.data[off - 2] & 0xC7) == 0x04;
-                let plain_form = off >= 2
-                    && off + 10 <= out_sec.data.len()
-                    && out_sec.data[off - 2] == 0x8d
-                    && (out_sec.data[off - 1] & 0xC0) == 0x80;
-                let (lea_start, dest) = if sib_form {
-                    (off - 3, ((out_sec.data[off - 2] >> 3) & 7) as usize)
-                } else if plain_form {
-                    (off - 2, ((out_sec.data[off - 1] >> 3) & 7) as usize)
-                } else {
-                    (0, 0)
-                };
-                if lea_start != 0 && dest == 0 {
-                    // dest == %eax (libbid's get_pc_thunk.ax pattern):
-                    //   movl %gs:0, %eax        ; 65 a1 00000000  (6 bytes)
-                    //   addl $tpoff, %eax       ; 05 imm32        (5 bytes)
-                    // total 11 bytes; the 12-byte SIB form gets a 1-byte NOP.
-                    // (TPOFF here is `sym - tp`, so the address is tp + tpoff.)
-                    // Locate the `call ___tls_get_addr` BEFORE overwriting:
-                    // it is the byte right after the lea (off+4 in both
-                    // encodings — the lea is either 6 or 7 bytes ending at
-                    // off+4).
-                    let call_at = if out_sec.data.get(off + 4) == Some(&0xe8) {
-                        Some(off + 4)
-                    } else {
-                        None
-                    };
-                    out_sec.data[lea_start..lea_start + 6]
-                        .copy_from_slice(&[0x65, 0xa1, 0x00, 0x00, 0x00, 0x00]);
-                    // addl $tpoff, %eax: opcode 05 at +6, imm32 at +7..+11.
-                    out_sec.data[lea_start + 6] = 0x05;
-                    out_sec.data[lea_start + 7..lea_start + 11]
-                        .copy_from_slice(&(tpoff as u32).to_le_bytes());
-                    if sib_form {
-                        out_sec.data[lea_start + 11] = 0x90; // 1-byte nop fill
-                    }
-                    if let Some(call_at) = call_at {
-                        // Sequence above already covers the original call bytes; no NOP needed.
-
-                        // Suppress the call's PLT32 relocation (disp field).
-                        ctx.tls_relaxed_call_slots.insert(patch_addr + (call_at - off) as u32 + 1);
-                        // The relaxed bytes at the reloc offset are the zero
-                        // displacement of ; patching the
-                        // returned value there would corrupt the sequence.
-                        return Ok(None);
-                    }
-                }
-                tpoff as u32
+                let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32;
+                (tpoff + addend) as u32
             } else {
                 addend as u32
             }
