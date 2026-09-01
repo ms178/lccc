@@ -7893,6 +7893,159 @@ fn reduction_gep_base(func: &IrFunction, body_idx: usize, gep: Value) -> Value {
     gep
 }
 
+
+/// Repair uses of the loop counter that ESCAPE a vectorized loop.
+///
+/// # The defect
+///
+/// Vectorizing redefines what the counter counts. Under the byte-offset scheme
+/// it steps `elem_size * vec_width` BYTES per iteration; under the
+/// element-index scheme the trip count is divided so it numbers VECTOR
+/// iterations. Inside the loop only addresses read it, so neither is visible
+/// there. A use AFTER the loop reads a number that is no longer the element
+/// index:
+///
+/// ```c
+/// for (; n < max; n++) acc += v[n];
+/// return acc + (n >> 2);
+/// ```
+///
+/// returned 528 (byte scheme, `n` == 128) or 497 (element scheme, `n` == 4)
+/// where GCC 16.2, Clang 23.1, ICC and ICX all return 504 (`n` == 32). A
+/// silent wrong answer -- not a crash -- on `for (i = 0; i < n; i++) ...;`
+/// followed by any use of `i`.
+///
+/// # The repair, and why it is free
+///
+/// The transform already builds a scalar remainder loop whose induction
+/// variable counts ELEMENTS: its preheader converts the vector counter back to
+/// an element index (`v27 >> 2` for 4-byte elements), and it steps by one
+/// until it reaches the ORIGINAL trip bound. Its value on exit is therefore
+/// exactly the final value the source-level counter would have had.
+///
+/// So the correct value already exists in the function and no arithmetic needs
+/// to be synthesized: the escaping uses simply have to name it. This costs
+/// **zero instructions** and keeps the loop vectorized -- strictly better than
+/// declining to vectorize, and better than materializing
+/// `trips * vec_width + remainder` in the exit block, which would add
+/// instructions AND have to be kept in agreement with the remainder loop on
+/// every exit path.
+///
+/// # Why the value dominates every escaping use
+///
+/// The vector loop's only exit goes to the remainder preheader, and the
+/// remainder loop's only exit goes to the original loop exit. Every path that
+/// leaves the loop nest therefore passes through the remainder header, so its
+/// phi dominates everything downstream. The rewrite is restricted to blocks
+/// that existed before the remainder was created (`outside_labels`), which
+/// excludes the remainder's own blocks -- their use of the vector counter is
+/// the legitimate byte-to-element conversion and must not be touched.
+fn rewire_escaping_iv_uses(
+    func: &mut IrFunction,
+    pattern: &ReductionPattern,
+    rem_iv: Option<Value>,
+    outside_labels: &[BlockId],
+    debug: bool,
+) -> usize {
+    let iv = pattern.iv;
+    let Some(rem_iv) = rem_iv else {
+        // No remainder loop was built, so there is no element-counting value
+        // to point at. This cannot happen for the element types the reduction
+        // path accepts (the only early return in
+        // `insert_reduction_remainder_loop` rejects types this transform never
+        // reaches), but a wrong answer is not an acceptable failure mode for a
+        // "cannot happen".
+        debug_assert!(
+            false,
+            "vectorized a reduction without a remainder loop; an escaping \
+             counter would read the vector counter"
+        );
+        return 0;
+    };
+
+    let mut rewrites = 0usize;
+    for label in outside_labels {
+        let Some(bi) = func.blocks.iter().position(|b| b.label == *label) else {
+            continue;
+        };
+        for inst in func.blocks[bi].instructions.iter_mut() {
+            let mut hit = false;
+            inst.for_each_used_value(|v| {
+                if v == iv.0 {
+                    hit = true;
+                }
+            });
+            if hit {
+                rewrite_value_use(inst, iv, rem_iv);
+                rewrites += 1;
+            }
+        }
+        if terminator_uses_value(&func.blocks[bi].terminator, iv) {
+            rewrite_terminator_use(&mut func.blocks[bi].terminator, iv, rem_iv);
+            rewrites += 1;
+        }
+    }
+
+    if debug && rewrites > 0 {
+        eprintln!(
+            "[VEC-RED]   Rewired {} escaping use(s) of counter v{} to the \
+             remainder IV v{}",
+            rewrites, iv.0, rem_iv.0
+        );
+    }
+    rewrites
+}
+
+/// Replace every use of `old` in `inst` with `new`.
+fn rewrite_value_use(inst: &mut Instruction, old: Value, new: Value) {
+    inst.for_each_operand_mut(|op| {
+        if matches!(op, Operand::Value(v) if *v == old) {
+            *op = Operand::Value(new);
+        }
+    });
+    // Operand-shaped fields are covered above; the pointer-like fields that
+    // hold a bare `Value` are not.
+    match inst {
+        Instruction::Load { ptr, .. } => {
+            if *ptr == old {
+                *ptr = new;
+            }
+        }
+        Instruction::GetElementPtr { base, .. } => {
+            if *base == old {
+                *base = new;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn terminator_uses_value(term: &Terminator, v: Value) -> bool {
+    let is = |op: &Operand| matches!(op, Operand::Value(x) if *x == v);
+    match term {
+        Terminator::Return(Some(op)) => is(op),
+        Terminator::CondBranch { cond, .. } => is(cond),
+        Terminator::Switch { val, .. } => is(val),
+        Terminator::IndirectBranch { target, .. } => is(target),
+        _ => false,
+    }
+}
+
+fn rewrite_terminator_use(term: &mut Terminator, old: Value, new: Value) {
+    let mut fix = |op: &mut Operand| {
+        if matches!(op, Operand::Value(x) if *x == old) {
+            *op = Operand::Value(new);
+        }
+    };
+    match term {
+        Terminator::Return(Some(op)) => fix(op),
+        Terminator::CondBranch { cond, .. } => fix(cond),
+        Terminator::Switch { val, .. } => fix(val),
+        Terminator::IndirectBranch { target, .. } => fix(target),
+        _ => {}
+    }
+}
+
 fn insert_reduction_remainder_loop(
     func: &mut IrFunction,
     pattern: &ReductionPattern,
@@ -7904,6 +8057,11 @@ fn insert_reduction_remainder_loop(
     seconds: &[SecondaryAccumulator], // Extra independent accumulators (multi-reduction)
     next_val_id: &mut u32,
     next_label: &mut u32,
+    // Out: the remainder loop's induction variable, which counts ELEMENTS and
+    // runs to the original trip count. It is the correct final value of the
+    // source-level loop counter, so the caller can rewire uses that escape the
+    // loop to it. See `rewire_escaping_iv_uses`.
+    rem_iv_out: &mut Option<Value>,
 ) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
 
@@ -8018,6 +8176,7 @@ fn insert_reduction_remainder_loop(
     };
     let i_rem_iv = Value(*next_val_id);
     *next_val_id += 1;
+    *rem_iv_out = Some(i_rem_iv);
     let i_rem_iv_next = Value(*next_val_id);
     *next_val_id += 1;
     let i_rem_cmp = Value(*next_val_id);
@@ -8621,64 +8780,6 @@ fn transform_reduction_avx2(
     // aborting midway leaves the loop half-transformed, which is worse than
     // either outcome.
 
-    // ESCAPING INDUCTION VARIABLE -- also a precondition, same reasoning.
-    //
-    // Both addressing schemes redefine what the counter counts. The
-    // byte-offset scheme steps `elem_size * vec_width` BYTES per iteration;
-    // the element-index scheme divides the trip count so the counter numbers
-    // VECTOR iterations. Inside the loop only addresses read it, so neither is
-    // visible there -- but a use AFTER the loop reads a number that is no
-    // longer the element index:
-    //
-    //     for (; n < max; n++) acc += v[n];
-    //     return acc + (n >> 2);
-    //
-    // returned 528 (byte scheme, n == 128) or 497 (element scheme, n == 4)
-    // where GCC, Clang, ICC and ICX all return 504 (n == 32). A silent wrong
-    // answer on the extremely common `for (i = 0; i < n; i++) ...;` followed
-    // by a use of `i`.
-    //
-    // Fixing the counter up in the exit block is possible in principle
-    // (`trips * vec_width`, plus whatever the scalar remainder advanced), but
-    // it has to agree with the remainder loop on every exit path; getting that
-    // subtly wrong reintroduces the same class of silent miscompile. Declining
-    // to vectorize is correct today and costs only the loops that read their
-    // counter afterwards. See tests/regression/iv_widen_escaping_iv.c.
-    {
-        let iv = pattern.iv;
-        let mut escapes = false;
-        for (bi, b) in func.blocks.iter().enumerate() {
-            if pattern.loop_blocks.contains(&bi) {
-                continue;
-            }
-            for inst in &b.instructions {
-                inst.for_each_used_value(|v| {
-                    if v == iv.0 {
-                        escapes = true;
-                    }
-                });
-            }
-            match &b.terminator {
-                Terminator::Return(Some(Operand::Value(v)))
-                | Terminator::CondBranch {
-                    cond: Operand::Value(v),
-                    ..
-                }
-                | Terminator::Switch {
-                    val: Operand::Value(v),
-                    ..
-                } => {
-                    if v.0 == iv.0 {
-                        escapes = true;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if escapes {
-            return 0;
-        }
-    }
 
     {
         let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
@@ -9840,7 +9941,22 @@ fn transform_reduction_avx2(
     // iteration; `sum += x*x` and `b += v*w` after `a += u*v` both benefit).
     changes += deduplicate_vector_loads(func, &pattern.loop_blocks);
 
-    // Step 4: Create remainder loop
+    // Step 4: Create remainder loop.
+    //
+    // Snapshot the labels of every block OUTSIDE the loop first. The remainder
+    // blocks are created below and legitimately consume the vector IV (the
+    // preheader converts the byte counter back to an element index), so they
+    // must be excluded from the escaping-use rewrite that follows.
+    let outside_labels: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
+        .map(|(_, b)| b.label)
+        .collect();
+
+    let mut rem_iv: Option<Value> = None;
+    let mut rem_iv_unused: Option<Value> = None;
     let remainder_changes = insert_reduction_remainder_loop(
         func,
         pattern,
@@ -9852,6 +9968,7 @@ fn transform_reduction_avx2(
         &pattern.seconds, // Extra independent accumulators, if any
         &mut next_val_id,
         &mut next_label,
+        &mut rem_iv,
     );
     changes += remainder_changes;
 
@@ -9861,6 +9978,9 @@ fn transform_reduction_avx2(
             remainder_changes / 4
         );
     }
+
+    // Step 5: repair uses of the loop counter that ESCAPE the loop.
+    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
 
     // Update the function's next_value_id and next_label
     func.next_value_id = next_val_id;
@@ -11070,7 +11190,22 @@ fn transform_reduction_sse2(
     // iteration; `sum += x*x` and `b += v*w` after `a += u*v` both benefit).
     changes += deduplicate_vector_loads(func, &pattern.loop_blocks);
 
-    // Step 4: Create remainder loop
+    // Step 4: Create remainder loop.
+    //
+    // Snapshot the labels of every block OUTSIDE the loop first; see the AVX2
+    // path and `rewire_escaping_iv_uses` for why. Both vector paths need this:
+    // the counter is redefined by the transform regardless of which vector
+    // width was chosen, and an i64 reduction (SSE2, 2-wide) leaked a BYTE
+    // count exactly as the i32 one (AVX2, 8-wide) did.
+    let outside_labels: Vec<BlockId> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(bi, _)| !pattern.loop_blocks.contains(bi))
+        .map(|(_, b)| b.label)
+        .collect();
+
+    let mut rem_iv: Option<Value> = None;
     let remainder_changes = insert_reduction_remainder_loop(
         func,
         pattern,
@@ -11082,6 +11217,7 @@ fn transform_reduction_sse2(
         &pattern.seconds, // Extra independent accumulators, if any
         &mut next_val_id,
         &mut next_label,
+        &mut rem_iv,
     );
     changes += remainder_changes;
 
@@ -11091,6 +11227,9 @@ fn transform_reduction_sse2(
             remainder_changes / 4
         );
     }
+
+    // Step 5: repair uses of the loop counter that ESCAPE the loop.
+    changes += rewire_escaping_iv_uses(func, pattern, rem_iv, &outside_labels, debug);
 
     // Update the function's next_value_id and next_label
     func.next_value_id = next_val_id;

@@ -579,32 +579,82 @@ fn instruction_corpus() -> Vec<MachInst> {
     v
 }
 
-/// Locate a usable assembler, preferring the project's pinned GAS.
-fn find_assembler() -> Option<String> {
-    for cand in ["as", "gcc"] {
-        if std::process::Command::new(cand)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.to_string());
+/// Locate an assembler, preferring the project's pinned **GAS 2.47**.
+///
+/// The differential is only as authoritative as the assembler behind it: a
+/// pass against an older GAS proves the text was valid for *that* release, not
+/// for the one the project targets. Search order:
+///
+///   1. `$LCCC_GAS` — an explicit override;
+///   2. the cache `scripts/ensure_gas_247.sh` provisions;
+///   3. whatever `as` is on PATH, and finally `gcc -x assembler`.
+///
+/// The chosen assembler and its version are reported on every run, so a probe
+/// that fell back to an older GAS is visible rather than silently weaker.
+fn find_assembler() -> Option<(String, String)> {
+    let mut cands: Vec<String> = Vec::new();
+    if let Ok(p) = std::env::var("LCCC_GAS") {
+        cands.push(p);
+    }
+    // ensure_gas_247.sh installs to /home/user/.cache/gas-2.47-<target>/bin/as
+    if let Ok(entries) = std::fs::read_dir("/home/user/.cache") {
+        let mut hits: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.starts_with("gas-2.47-").then(|| {
+                    e.path().join("bin").join("as").to_string_lossy().to_string()
+                })
+            })
+            .filter(|p| std::path::Path::new(p).exists())
+            .collect();
+        hits.sort();
+        cands.extend(hits);
+    }
+    cands.push("as".to_string());
+    cands.push("gcc".to_string());
+
+    for cand in cands {
+        if let Ok(out) = std::process::Command::new(&cand).arg("--version").output() {
+            if out.status.success() {
+                let ver = String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                return Some((cand, ver));
+            }
         }
     }
     None
 }
 
+/// Report which assembler backed a differential run. Loud on purpose: the
+/// project pins GAS 2.47 and a run against anything older is weaker evidence.
+fn announce_assembler(which: &str, ver: &str) {
+    if ver.contains("2.47") {
+        eprintln!("MachInst differential: using {which} ({ver})");
+    } else {
+        eprintln!(
+            "MachInst differential: using {which} ({ver}) -- NOT the pinned GAS 2.47. \
+             Run scripts/ensure_gas_247.sh or set LCCC_GAS to probe against the \
+             assembler the project actually targets."
+        );
+    }
+}
+
 #[test]
 fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
-    let Some(asm) = find_assembler() else {
+    let Some((asm, ver)) = find_assembler() else {
         // Do NOT pass silently: a vacuous green here would hide the strongest
         // check in the file.
         eprintln!(
-            "SKIP: no system assembler found; the MachInst differential test \
-             cannot run in this environment"
+            "SKIP: no assembler found; the MachInst differential test cannot \
+             run in this environment"
         );
         return;
     };
+    announce_assembler(&asm, &ver);
 
     let corpus = instruction_corpus();
     assert!(corpus.len() > 300, "corpus too small: {}", corpus.len());
@@ -638,7 +688,7 @@ fn every_emitted_instruction_is_accepted_by_the_real_assembler() {
     std::fs::write(&s_path, &src).expect("write probe.s");
 
     let mut cmd = std::process::Command::new(&asm);
-    if asm == "gcc" {
+    if asm.ends_with("gcc") {
         cmd.arg("-c").arg("-x").arg("assembler");
     } else {
         cmd.arg("-c");
@@ -831,10 +881,11 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
 
 #[test]
 fn a_large_randomized_corpus_is_accepted_by_the_real_assembler() {
-    let Some(asm) = find_assembler() else {
-        eprintln!("SKIP: no system assembler; randomized MachInst stress cannot run");
+    let Some((asm, ver)) = find_assembler() else {
+        eprintln!("SKIP: no assembler; randomized MachInst stress cannot run");
         return;
     };
+    announce_assembler(&asm, &ver);
     let corpus = random_corpus(4000);
 
     let mut src = String::from(".text
@@ -867,7 +918,7 @@ _machinst_fuzz:
     std::fs::write(&s_path, &src).expect("write fuzz.s");
 
     let mut cmd = std::process::Command::new(&asm);
-    if asm == "gcc" {
+    if asm.ends_with("gcc") {
         cmd.arg("-c").arg("-x").arg("assembler");
     } else {
         cmd.arg("-c");
