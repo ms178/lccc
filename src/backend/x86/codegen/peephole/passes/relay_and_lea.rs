@@ -805,7 +805,17 @@ mod tests {
     }
 
     #[test]
-    fn relay_is_kept_when_target_is_read_again() {
+    fn both_readers_of_a_relayed_value_see_the_same_register() {
+        // The relay has TWO consumers, so it may not be retired by rewriting
+        // only one of them -- that would leave the second reading a register
+        // nobody wrote.
+        //
+        // Asserting the exact text `movl %eax, %r10d` would be wrong here:
+        // `copy_fold` retires the relay by rewriting BOTH consumers to `%eax`
+        // (which holds the same value and outlives them), giving three
+        // instructions instead of four. What must hold is the invariant, not
+        // the spelling: both adds read one and the same register, and it is a
+        // register that actually holds the relayed value.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -815,8 +825,29 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movl %eax, %r10d"), "{out}");
-        assert!(out.contains("addl %r10d, %r9d"), "{out}");
+        let src_of = |dst: &str| -> String {
+            out.lines()
+                .find(|l| l.trim().starts_with("addl") && l.trim().ends_with(dst))
+                .unwrap_or_else(|| panic!("missing `addl ..., {dst}`:\n{out}"))
+                .trim()
+                .trim_start_matches("addl ")
+                .split(',')
+                .next()
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        let a = src_of("%r8d");
+        let b = src_of("%r9d");
+        assert_eq!(a, b, "both consumers must read the same register:\n{out}");
+        assert!(
+            a == "%r10d" || a == "%eax",
+            "consumers must read the relayed value, got {a}:\n{out}"
+        );
+        // If the relay survived, it must still be written before both uses.
+        if a == "%r10d" {
+            assert!(out.contains("movl %eax, %r10d"), "{out}");
+        }
     }
 
     #[test]

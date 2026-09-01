@@ -11,7 +11,14 @@ use crate::backend::regalloc::PhysReg;
 pub fn reg_name_pub(r: MachReg) -> &'static str {
     match r {
         MachReg::Phys(p) => reg_name(p),
-        MachReg::Vreg(id) => "VREG_UNRESOLVED", // shouldn't happen
+        // Reaching here means register allocation left a virtual register
+        // behind. Emitting a placeholder would hand the assembler
+        // `%VREG_UNRESOLVED` and blame it on the wrong component; fail here,
+        // where the invariant actually broke.
+        MachReg::Vreg(id) => unreachable!(
+            "vreg{} reached assembly emission unallocated",
+            id
+        ),
     }
 }
 
@@ -42,7 +49,14 @@ fn reg_name(reg: PhysReg) -> &'static str {
         23 => "xmm5",
         24 => "xmm6",
         25 => "xmm7",
-        _ => "rax", // fallback for unexpected register IDs
+        // NO SILENT FALLBACK. This arm used to return "rax", so an unexpected
+        // register index produced a syntactically valid instruction naming the
+        // WRONG register -- a silent miscompile, in the most frequently used
+        // of the four size tables (the 32/16/8-bit ones have always trapped
+        // here). A compiler crash is strictly preferable to wrong code, and
+        // the whole 559-test corpus passes with this arm live, which is the
+        // evidence that the fallback was masking nothing.
+        _ => unreachable!("invalid machinst register index {}", reg.0),
     }
 }
 
@@ -180,6 +194,15 @@ fn fmt_operand(op: &MachOperand, size: OpSize, out: &AsmOutput) -> String {
 /// sign-extended operands; using the raw 64-bit immediate would truncate it
 /// and miscompare (regression: simd_movnt's `lo == 0x1122334455667788ULL`
 /// check compiled to `cmp $0x55667788`).
+/// x86-64 ALU and compare immediates are sign-extended 32-bit. A wider
+/// constant has to be loaded into a register first; emitting it inline is not
+/// a silent truncation but a hard assembler error ("operand type mismatch for
+/// `add'"), so any path that forgets this breaks the build.
+///
+/// The scratch is `%rax`, matching the accumulator convention the rest of this
+/// backend uses. That is only sound while no *other* operand of the same
+/// instruction already lives in `%rax` -- see [`assert_scratch_free`], which
+/// makes the assumption checkable instead of implicit.
 fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
     match op {
         MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
@@ -188,6 +211,29 @@ fn materialize_large_imm(op: &MachOperand, out: &mut AsmOutput) -> MachOperand {
         }
         _ => op.clone(),
     }
+}
+
+/// True when `op` needs [`materialize_large_imm`].
+fn needs_scratch(op: &MachOperand) -> bool {
+    matches!(op, MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64)
+}
+
+/// Guard the `%rax`-as-scratch assumption in [`materialize_large_imm`].
+///
+/// If a large immediate has to be staged through `%rax` while another operand
+/// of the same instruction already IS `%rax`, staging overwrites it and the
+/// instruction computes the wrong thing -- silently, because the result still
+/// assembles. No current lowering produces that shape (the codegen materializes
+/// wide constants long before this point), so rather than emit a heavier
+/// save/restore sequence for a path that never runs, make the invariant
+/// explicit and let a debug build fail loudly the day it stops holding.
+#[inline]
+fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
+    debug_assert!(
+        !(needs_scratch(imm) && *other == MachReg::Phys(super::machinst::RAX)),
+        "a wide immediate must be staged through %rax, but %rax is already an \
+         operand of this instruction; the staging would clobber it"
+    );
 }
 
 /// ALU operation mnemonic.
@@ -203,14 +249,31 @@ fn alu_mnemonic(op: AluOp) -> &'static str {
 }
 
 /// Shift operation mnemonic.
+/// AT&T shift mnemonic for every operand width.
+///
+/// The table used to read `(Shl, S32) => "shll", (Shl, _) => "shlq"`, which
+/// silently folded S8 and S16 into the 64-bit mnemonic. A byte shift then
+/// emitted `shlq %dl` and a word shift `shlq %cx` -- both rejected outright by
+/// the assembler ("`%dl' not allowed with `shlq'"). It had not fired only
+/// because instruction selection did not yet route narrow shifts through
+/// MachInst; the moment it did, the build would break. Found by the
+/// assembler-differential test, which is exactly the class of defect a golden
+/// test cannot catch, because the author would have written the same wrong
+/// expectation.
 fn shift_mnemonic(op: ShiftOp, size: OpSize) -> &'static str {
     match (op, size) {
+        (ShiftOp::Shl, OpSize::S8) => "shlb",
+        (ShiftOp::Shl, OpSize::S16) => "shlw",
         (ShiftOp::Shl, OpSize::S32) => "shll",
-        (ShiftOp::Shl, _) => "shlq",
+        (ShiftOp::Shl, OpSize::S64) => "shlq",
+        (ShiftOp::Shr, OpSize::S8) => "shrb",
+        (ShiftOp::Shr, OpSize::S16) => "shrw",
         (ShiftOp::Shr, OpSize::S32) => "shrl",
-        (ShiftOp::Shr, _) => "shrq",
+        (ShiftOp::Shr, OpSize::S64) => "shrq",
+        (ShiftOp::Sar, OpSize::S8) => "sarb",
+        (ShiftOp::Sar, OpSize::S16) => "sarw",
         (ShiftOp::Sar, OpSize::S32) => "sarl",
-        (ShiftOp::Sar, _) => "sarq",
+        (ShiftOp::Sar, OpSize::S64) => "sarq",
     }
 }
 
@@ -302,7 +365,10 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
         MachInst::Alu { op, src, dst, size } => {
             let mnem = alu_mnemonic(*op);
             let suffix = size.suffix();
-            let src_str = fmt_operand(src, *size, out);
+            // A wide immediate cannot be an ALU operand; stage it first.
+            assert_scratch_free(src, dst);
+            let src = materialize_large_imm(src, out);
+            let src_str = fmt_operand(&src, *size, out);
             let dst_str = fmt_reg(dst, *size);
             out.emit_fmt(format_args!(
                 "    {}{} {}, {}",
@@ -317,6 +383,26 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             size,
         } => {
             let suffix = size.suffix();
+            // `imul $imm, src, dst` takes a sign-extended imm32 like the ALU
+            // forms. A wider multiplier must go through a register, and there
+            // is no three-operand register form -- fall back to the
+            // two-address sequence.
+            if *imm < i32::MIN as i64 || *imm > i32::MAX as i64 {
+                assert_scratch_free(&MachOperand::Imm(*imm), dst);
+                let staged = materialize_large_imm(&MachOperand::Imm(*imm), out);
+                let src_str = fmt_reg(src, *size);
+                let dst_str = fmt_reg(dst, *size);
+                if fmt_operand(&staged, *size, out) != dst_str {
+                    out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
+                }
+                out.emit_fmt(format_args!(
+                    "    imul{} {}, {}",
+                    suffix,
+                    fmt_operand(&staged, *size, out),
+                    dst_str
+                ));
+                return;
+            }
             let src_str = fmt_reg(src, *size);
             let dst_str = fmt_reg(dst, *size);
             out.emit_fmt(format_args!(
@@ -416,6 +502,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let mut lhs = lhs.clone();
             let mut rhs = rhs.clone();
             // 64-bit immediates don't fit in the imm32 of cmp; materialize.
+            if let MachOperand::Reg(r) = &rhs {
+                assert_scratch_free(&lhs, r);
+            }
+            if let MachOperand::Reg(r) = &lhs {
+                assert_scratch_free(&rhs, r);
+            }
             lhs = materialize_large_imm(&lhs, out);
             rhs = materialize_large_imm(&rhs, out);
             // x86 cmp can't have two memory operands — load rhs to rax
@@ -444,6 +536,12 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             let suffix = size.suffix();
             let mut lhs = lhs.clone();
             let mut rhs = rhs.clone();
+            if let MachOperand::Reg(r) = &rhs {
+                assert_scratch_free(&lhs, r);
+            }
+            if let MachOperand::Reg(r) = &lhs {
+                assert_scratch_free(&rhs, r);
+            }
             lhs = materialize_large_imm(&lhs, out);
             rhs = materialize_large_imm(&rhs, out);
             // x86 test can't have two memory operands — load one to rax

@@ -330,7 +330,17 @@ mod tests {
     }
 
     #[test]
-    fn copy_is_kept_when_the_source_is_read_again() {
+    fn the_source_family_is_not_renamed_when_it_is_read_again() {
+        // Rule 2: `%rdi` is read after the copy, so coalescing must NOT rename
+        // the `%rsi` family onto it -- doing so would rewrite that earlier
+        // read as well and change which register the function loads from.
+        //
+        // The assertion deliberately targets the EARLIER read rather than the
+        // survival of the copy itself. `copy_fold` legitimately retires the
+        // copy afterwards by rewriting `(%rsi)` to `(%rdi)`: the two registers
+        // hold the same value and `%rsi` is dead at the return, so three
+        // instructions replace four. That is a strictly better result and must
+        // not be mistaken for a coalescing failure.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -340,7 +350,14 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movq %rdi, %rsi"), "{out}");
+        assert!(
+            out.contains("movq (%rdi), %rax"),
+            "the pre-existing read of %rdi must survive unrenamed:\n{out}"
+        );
+        assert!(
+            !out.contains("movq (%rsi), %rax"),
+            "coalescing must not rewrite the earlier read onto %rsi:\n{out}"
+        );
     }
 
     #[test]
