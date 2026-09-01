@@ -35,6 +35,7 @@ mod liveness;
 mod local_patterns;
 mod loop_trampoline;
 mod memory_fold;
+mod narrow_copy_fold;
 mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
@@ -668,6 +669,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("copy_prop") {
             global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
+        }
+        // After copy propagation (64-bit chains) and before dead-code removal,
+        // so the copies this fold orphans are retired in the same round.
+        if !sk("copy_fold") {
+            global_changed |= narrow_copy_fold::fold_register_copies(&mut store, &mut infos);
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);

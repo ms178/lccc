@@ -15,6 +15,8 @@ mod intrinsics_simd;
 pub(crate) mod isel;
 pub(crate) mod machinst;
 pub(crate) mod machinst_emit;
+#[cfg(test)]
+mod machinst_tests;
 mod memory;
 mod nested_fn;
 pub(crate) mod peephole;
