@@ -667,6 +667,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit_fmt(format_args!("    call *{}", reg_str));
         }
 
+        MachInst::LeaSym { sym, dst } => {
+            // Always 64-bit: an address.
+            out.emit_fmt(format_args!(
+                "    leaq {}(%rip), {}",
+                sym,
+                fmt_reg(dst, OpSize::S64)
+            ));
+        }
+
         MachInst::Ret => {
             out.emit("    ret");
         }

@@ -173,6 +173,19 @@ pub enum MachInst {
         dst: MachReg,
     },
 
+    /// `leaq sym(%rip), dst` — the address of a global.
+    ///
+    /// This needs its own variant because `Mov` with a [`MachOperand::RipRel`]
+    /// source means "load FROM the symbol" (`movq sym(%rip), %dst`), whereas a
+    /// `GlobalAddr` wants the address ITSELF. Without the distinction the
+    /// lowering had no way to express `leaq` and bailed to the text emitter --
+    /// 293 of 2162 instructions across the corpus, 13.6%, the single largest
+    /// hole in MachInst coverage.
+    LeaSym {
+        sym: String,
+        dst: MachReg,
+    },
+
     // ── Division (implicit rax:rdx) ──────────────────────────────────
     /// Sign-extend rax → rdx:rax. x86: `cqto` (64-bit) or `cltd` (32-bit).
     Cqto {
