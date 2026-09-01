@@ -234,16 +234,6 @@ pub enum CType {
     /// ISO C _Float128 / __float128: IEEE binary128, 16 bytes.
     /// Distinct from long double (80-bit x87 on x86-64).
     Float128,
-    /// ISO C23 / TS 18661-2 decimal floating point (_Decimal32), IEEE 754-2008
-    /// BID encoding, 7 decimal digits, 4 bytes. Values are bit containers;
-    /// every operation is lowered to libbid (__bid_*) helper calls at the
-    /// CType level, mirroring the Float128 strategy.
-    Decimal32,
-    /// _Decimal64: 16 decimal digits, 8 bytes, BID encoding.
-    Decimal64,
-    /// _Decimal128: 34 decimal digits, 16 bytes, BID encoding. Carried in IR
-    /// as U128 (bit-exact 16-byte moves) with the Float128 SSE ABI flags.
-    Decimal128,
     /// C99 _Complex float: two f32 values (real, imag)
     ComplexFloat,
     /// C99 _Complex double: two f64 values (real, imag)
@@ -1006,24 +996,6 @@ impl StructLayout {
                     classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
                 }
             }
-            // Decimal FP members classify like the binary floats of equal
-            // width (GCC SysV: _Decimal32/_Decimal64 are SSE, _Decimal128
-            // occupies two SSE eightbytes).
-            CType::Decimal32 | CType::Decimal64 => {
-                let eb_idx = base_offset / 8;
-                if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
-            CType::Decimal128 => {
-                let eb_idx = base_offset / 8;
-                if eb_idx + 1 < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                    classes[eb_idx + 1] = classes[eb_idx + 1].merge(EightbyteClass::Sse);
-                } else if eb_idx < n_eightbytes {
-                    classes[eb_idx] = classes[eb_idx].merge(EightbyteClass::Sse);
-                }
-            }
             // Array: classify each element
             CType::Array(elem_ty, Some(count)) => {
                 let elem_size = elem_ty.size();
@@ -1515,9 +1487,6 @@ impl std::fmt::Display for CType {
             CType::Double => write!(f, "double"),
             CType::LongDouble => write!(f, "long double"),
             CType::Float128 => write!(f, "_Float128"),
-            CType::Decimal32 => write!(f, "_Decimal32"),
-            CType::Decimal64 => write!(f, "_Decimal64"),
-            CType::Decimal128 => write!(f, "_Decimal128"),
             CType::ComplexFloat => write!(f, "_Complex float"),
             CType::ComplexDouble => write!(f, "_Complex double"),
             CType::ComplexLongDouble => write!(f, "_Complex long double"),
@@ -1653,11 +1622,6 @@ impl CType {
                 }
             }
             CType::Float128 => 16,
-            // Decimal floating point (BID): same sizes as the binary types of
-            // equal width (GCC: sizeof = 4/8/16 on both x86-64 and i386).
-            CType::Decimal32 => 4,
-            CType::Decimal64 => 8,
-            CType::Decimal128 => 16,
             CType::ComplexFloat => 8,   // 2 * sizeof(float)
             CType::ComplexDouble => 16, // 2 * sizeof(double)
             CType::ComplexLongDouble => {
@@ -1723,11 +1687,6 @@ impl CType {
                 }
             }
             CType::Float128 => 16,
-            // GCC aligns _Decimal64 to 8 and _Decimal128 to 16 on both
-            // x86-64 and i386 (measured: alignof = 4/8/16 for D32/D64/D128).
-            CType::Decimal32 => 4,
-            CType::Decimal64 => 8,
-            CType::Decimal128 => 16,
             CType::ComplexFloat => 4, // align of float component
             CType::ComplexDouble => {
                 if ptr_sz == 4 {
@@ -1824,24 +1783,6 @@ impl CType {
     /// Whether this is a floating-point type (float, double, long double).
     pub fn is_floating(&self) -> bool {
         matches!(self, CType::Float | CType::Double | CType::LongDouble)
-    }
-
-    /// Whether this is a decimal floating-point type (C23 _DecimalN).
-    /// Deliberately excluded from is_floating(): decimal types never mix
-    /// with binary floats in the usual arithmetic conversions and never
-    /// reach binary FP codegen paths.
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, CType::Decimal32 | CType::Decimal64 | CType::Decimal128)
-    }
-
-    /// Decimal precision rank: 0 = not decimal, else 32 < 64 < 128.
-    pub fn decimal_rank(&self) -> u8 {
-        match self {
-            CType::Decimal32 => 1,
-            CType::Decimal64 => 2,
-            CType::Decimal128 => 3,
-            _ => 0,
-        }
     }
 
     /// Whether this is an arithmetic type (integer, floating-point, or complex).
@@ -1980,26 +1921,6 @@ impl CType {
                     }
                 }
             };
-        }
-
-        // Decimal floating point (C23/TS 18661-2): decimal types form their
-        // own hierarchy and absorb integers, but never mix with binary
-        // floats in the usual arithmetic conversions (GCC errors on that
-        // combination; we fall through to the binary-float hierarchy, which
-        // requires an explicit __bid_* conversion the lowering provides).
-        let ld = l.decimal_rank();
-        let rd = r.decimal_rank();
-        if ld > 0 || rd > 0 {
-            if ld > 0 && rd > 0 {
-                return if ld >= rd { l.clone() } else { r.clone() };
-            }
-            if ld > 0 && !r.is_floating() {
-                return l.clone(); // integer operand converts to decimal
-            }
-            if rd > 0 && !l.is_floating() {
-                return r.clone();
-            }
-            // one decimal + one binary float: binary float wins (see above)
         }
 
         // Non-complex: standard type hierarchy
@@ -2215,13 +2136,6 @@ pub enum IrType {
     U128,
     F32,
     F64,
-    /// _Decimal32 BID bit container (C23 decimal floating point).
-    /// Classified like F32 for call/return ABI (SSE on x86-64) but never
-    /// reaches binary FP arithmetic: ops lower to __bid_* helper calls at
-    /// the CType level.
-    D32,
-    /// _Decimal64 BID bit container; classified like F64 for ABI.
-    D64,
     /// 128-bit floating point (long double on AArch64/RISC-V, 80-bit extended on x86-64).
     /// Computation is done in F64 precision; this type exists to ensure correct
     /// ABI handling (16-byte storage, proper variadic argument passing, va_arg).
@@ -2242,8 +2156,6 @@ impl IrType {
             IrType::I128 | IrType::U128 => 16,
             IrType::F32 => 4,
             IrType::F64 => 8,
-            IrType::D32 => 4,
-            IrType::D64 => 8,
             // i686: F128 (long double) is 12 bytes (80-bit x87 + 2 bytes padding)
             // LP64: F128 is 16 bytes
             IrType::F128 => {
@@ -2276,10 +2188,6 @@ impl IrType {
                 IrType::F64 => 4,
                 // i686: long double (80-bit x87, 12 bytes) aligned to 4
                 IrType::F128 => 4,
-                // Decimal FP: GCC i386 aligns _Decimal64 to 8 (unlike the
-                // integer long long align-4 rule), _Decimal32 to 4.
-                IrType::D32 => 4,
-                IrType::D64 => 8,
             }
         } else {
             match self {
@@ -2314,13 +2222,7 @@ impl IrType {
     /// F128 (long double) is included because at computation level it is treated
     /// as F64 (stored in D registers), with 16-byte storage for ABI correctness.
     pub fn is_float(&self) -> bool {
-        matches!(self, IrType::F32 | IrType::F64 | IrType::F128 | IrType::D32 | IrType::D64)
-    }
-
-    /// Whether this is a decimal floating-point carrier type (D32/D64).
-    /// D128 is carried as U128 (Float128 model) and is not included here.
-    pub fn is_decimal(&self) -> bool {
-        matches!(self, IrType::D32 | IrType::D64)
+        matches!(self, IrType::F32 | IrType::F64 | IrType::F128)
     }
 
     /// Whether this is a long double type (F128).
@@ -2441,13 +2343,6 @@ impl IrType {
             // and would round to 80-bit). Arithmetic/comparison/conversion on
             // Float128 is lowered to libgcc soft-float calls at the CType level.
             CType::Float128 => IrType::U128,
-            // Decimal floating point (C23): D32/D64 are first-class SSE-class
-            // bit containers (ABI-identical to F32/F64); D128 uses the U128
-            // carrier with the Float128 SSE ABI flags, exactly matching GCC's
-            // x86-64 classification of TDmode as a 16-byte SSE value.
-            CType::Decimal32 => IrType::D32,
-            CType::Decimal64 => IrType::D64,
-            CType::Decimal128 => IrType::U128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,
             CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,

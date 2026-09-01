@@ -1555,27 +1555,6 @@ impl X86Codegen {
                                 .emit_instr_imm_reg("    movabsq", bits as i64, "rax");
                         }
                     }
-                    // Decimal FP bit containers materialize like 64-bit
-                    // integer immediates (BID patterns are opaque bits).
-                    IrConst::D32(v) => {
-                        let bits = *v as u64;
-                        if bits == 0 {
-                            self.state.emit("    xorl %eax, %eax");
-                        } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movl", *v as i64, "eax");
-                        }
-                    }
-                    IrConst::D64(v) => {
-                        if *v == 0 {
-                            self.state.emit("    xorl %eax, %eax");
-                        } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", *v as i64, "rax");
-                        }
-                    }
                     IrConst::I128(v) => {
                         // Truncate to low 64 bits for rax-only path
                         let low = *v as i64;
@@ -1889,7 +1868,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
                 }
-            } else if ty == IrType::F32 || ty == IrType::D32 {
+            } else if ty == IrType::F32 {
                 self.state.emit_fmt(format_args!(
                     "    movd %{}, %{}",
                     src_xmm,
@@ -1903,7 +1882,7 @@ impl X86Codegen {
         }
         if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
             if let Some(slot) = self.state.get_slot(dest.0) {
-                let instr = if matches!(ty, IrType::F32 | IrType::D32) {
+                let instr = if ty == IrType::F32 {
                     "    movss"
                 } else {
                     "    movsd"
@@ -1913,7 +1892,7 @@ impl X86Codegen {
             }
         }
         // Fallback: route through %rax like store_rax_to does.
-        if ty == IrType::F32 || ty == IrType::D32 {
+        if ty == IrType::F32 {
             self.state
                 .emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
         } else {
@@ -2339,26 +2318,6 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movq", low, "rcx");
                         } else {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
-                        }
-                    }
-                    // Decimal FP bit containers materialize like integer
-                    // immediates (BID patterns are opaque bits).
-                    IrConst::D32(v) => {
-                        if *v == 0 {
-                            self.state.emit("    xorl %ecx, %ecx");
-                        } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movl", *v as i64, "ecx");
-                        }
-                    }
-                    IrConst::D64(v) => {
-                        if *v == 0 {
-                            self.state.emit("    xorl %ecx, %ecx");
-                        } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movabsq", *v as i64, "rcx");
                         }
                     }
                     IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),

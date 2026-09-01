@@ -1,5 +1,5 @@
 use super::constants::IrConst;
-use super::instruction::{BasicBlock, Instruction, Terminator, Value};
+use super::instruction::{BasicBlock, Value};
 /// IR module, function, and global variable definitions.
 ///
 /// `IrModule` is the top-level compilation unit containing functions, globals,
@@ -372,109 +372,17 @@ impl IrFunction {
             // next_value_id is the first *unused* ID, so max used is one less
             return self.next_value_id - 1;
         }
-        // Fallback: sound scan (expensive). InlineAsm outputs are definitions
-        // that `dest()` does not cover; a dest-only fallback would under-report
-        // and any pass seeding fresh IDs from it would collide with asm outputs
-        // (pr84524: an InlineAsm output at id 55 above every dest() id was
-        // silently reused by loop_invert's cloned latch test).
-        Self::scan_max_mentioned_value_id(self)
-    }
-
-    /// First unused Value ID, computed soundly.
-    ///
-    /// Passes that clone instructions or synthesize new values MUST seed
-    /// their fresh-ID allocator from this method and write the result back to
-    /// `next_value_id` (see `bit_idioms`, `iv_widen`). It is deliberately
-    /// defensive: the cached `next_value_id` is cross-checked against a full
-    /// scan of every definition form (`dest()`, InlineAsm outputs — which are
-    /// side-channel definitions invisible to `dest()` —) and every use, so a
-    /// pass that forgot to maintain the cache cannot resurrect already-taken
-    /// IDs and corrupt SSA numbering downstream.
-    pub fn sound_next_value_id(&self) -> u32 {
-        Self::scan_max_mentioned_value_id(self).saturating_add(1)
-    }
-
-    /// Highest Value ID mentioned anywhere in the function: destinations of
-    /// every definition form, InlineAsm output values (defs not covered by
-    /// `dest()`), and every operand use including terminator operands.
-    fn scan_max_mentioned_value_id(func: &IrFunction) -> u32 {
+        // Fallback: scan all instructions (expensive)
         let mut max_id: u32 = 0;
-        // The cached bound stays authoritative when present.
-        if func.next_value_id > 0 {
-            max_id = func.next_value_id - 1;
-        }
-        for block in &func.blocks {
+        for block in &self.blocks {
             for inst in &block.instructions {
                 if let Some(v) = inst.dest() {
                     if v.0 > max_id {
                         max_id = v.0;
                     }
                 }
-                if let Instruction::InlineAsm { outputs, .. } = inst {
-                    for (_, v, _) in outputs {
-                        if v.0 > max_id {
-                            max_id = v.0;
-                        }
-                    }
-                }
-                // Uses cover parameters, terminator-feeding chains, and any
-                // id that only appears as an operand (e.g. a def forgotten by
-                // a misbehaving pass must not be re-issued either).
-                for u in inst.used_values() {
-                    if u > max_id {
-                        max_id = u;
-                    }
-                }
-            }
-            for u in block.terminator.used_values() {
-                if u > max_id {
-                    max_id = u;
-                }
             }
         }
         max_id
-    }
-}
-
-#[cfg(test)]
-mod value_id_tests {
-    use super::*;
-    use crate::common::types::AddressSpace;
-    use crate::ir::instruction::BlockId;
-
-    /// InlineAsm outputs are definitions invisible to `dest()`. Both the
-    /// cached-bound cross-check and the fallback scan must account for them,
-    /// including DEAD asm outputs (no uses anywhere).
-    #[test]
-    fn sound_next_value_id_covers_dead_inline_asm_outputs() {
-        let mut f = IrFunction::new("t".into(), IrType::Void, Vec::new(), false);
-        f.blocks = vec![BasicBlock {
-            label: BlockId(0),
-            instructions: vec![Instruction::InlineAsm {
-                template: String::new(),
-                outputs: vec![("+r".to_string(), Value(55), None)],
-                inputs: Vec::new(),
-                clobbers: Vec::new(),
-                operand_types: vec![IrType::U16],
-                goto_labels: Vec::new(),
-                input_symbols: vec![None],
-                seg_overrides: vec![AddressSpace::Default],
-            }],
-            terminator: Terminator::Return(None),
-            source_spans: Vec::new(),
-        }];
-        f.next_value_id = 0; // force the scan fallback path
-        assert_eq!(f.max_value_id(), 55, "fallback scan must see asm outputs");
-        assert_eq!(
-            f.sound_next_value_id(),
-            56,
-            "first unused id must be above the dead asm output"
-        );
-
-        // With the cache present, the cached bound is authoritative and the
-        // scan must never lower it below an observed def.
-        f.next_value_id = 60;
-        assert_eq!(f.max_value_id(), 59);
-        assert_eq!(f.sound_next_value_id(), 60);
     }
 }

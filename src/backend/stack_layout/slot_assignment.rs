@@ -346,7 +346,7 @@ pub(super) fn classify_instructions(
                         {
                             let is_wide = matches!(
                                 operand_types[out_idx],
-                                IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64
+                                IrType::F64 | IrType::I64 | IrType::U64
                             );
                             if is_wide {
                                 state.wide_values.insert(out_val.0);
@@ -395,7 +395,7 @@ pub(super) fn classify_instructions(
                                 state.i128_values.insert(dest.0);
                             }
                             if crate::common::types::target_is_32bit()
-                                && matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64)
+                                && matches!(ty, IrType::F64 | IrType::I64 | IrType::U64)
                             {
                                 state.wide_values.insert(dest.0);
                             }
@@ -1298,7 +1298,7 @@ pub(super) fn propagate_wide_values(
         return;
     }
 
-    let is_wide_ty = |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64);
+    let is_wide_ty = |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64);
 
     for block in &func.blocks {
         for inst in &block.instructions {

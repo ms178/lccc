@@ -13,7 +13,7 @@ impl I686Codegen {
         self.flush_x87_pending_copy();
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
-            if ret_ty == IrType::I64 || ret_ty == IrType::U64 || ret_ty == IrType::D64 {
+            if ret_ty == IrType::I64 || ret_ty == IrType::U64 {
                 self.emit_load_acc_pair(val);
                 self.emit_epilogue_and_ret(frame_size);
                 return;

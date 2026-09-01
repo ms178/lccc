@@ -77,17 +77,6 @@ impl Lowerer {
             }
         }
 
-        // C23 decimal floating point: decimal operands never reach the
-        // generic integer/float paths — all arithmetic and comparisons go
-        // through the libbid (__bid_*) helper family (GCC-compatible).
-        {
-            let lhs_dec = self.expr_ctype(lhs).is_decimal();
-            let rhs_dec = self.expr_ctype(rhs).is_decimal();
-            if lhs_dec || rhs_dec {
-                return self.lower_decimal_binop(op, lhs, rhs);
-            }
-        }
-
         // Fast path: constant-fold pure integer arithmetic at lowering time.
         // This ensures correct C type semantics (e.g., 32-bit int width for
         // expressions like (1 << 31) / N) which the IR-level fold pass may lose
@@ -113,9 +102,9 @@ impl Lowerer {
             // _Float128 (carrier U128) is NOT an integer: folding its bit
             // pattern as an i128 would compute garbage (e.g. 1.5F128 * 3.125F128
             // multiplied as integers). F128 ops go through libgcc soft-float.
-            let lhs_no_fold = matches!(self.expr_ctype(lhs), CType::Float128) || self.expr_ctype(lhs).is_decimal();
-            let rhs_no_fold = matches!(self.expr_ctype(rhs), CType::Float128) || self.expr_ctype(rhs).is_decimal();
-            if !lhs_ty.is_float() && !rhs_ty.is_float() && !lhs_no_fold && !rhs_no_fold {
+            let lhs_f128 = matches!(self.expr_ctype(lhs), CType::Float128);
+            let rhs_f128 = matches!(self.expr_ctype(rhs), CType::Float128);
+            if !lhs_ty.is_float() && !rhs_ty.is_float() && !lhs_f128 && !rhs_f128 {
                 if let Some(val) = self.eval_const_expr_from_parts(op, lhs, rhs) {
                     return Operand::Const(val);
                 }
@@ -449,7 +438,7 @@ impl Lowerer {
         Operand::Value(scaled)
     }
 
-    pub(super) fn lower_arithmetic_binop(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
+    fn lower_arithmetic_binop(&mut self, op: &BinOp, lhs: &Expr, rhs: &Expr) -> Operand {
         let lhs_ty = self.infer_expr_type(lhs);
         let rhs_ty = self.infer_expr_type(rhs);
         let lhs_expr_ty = self.get_expr_type(lhs);
@@ -651,97 +640,6 @@ impl Lowerer {
                 // 0xbfff8000... (-1.5), NOT 0xc0008000... (-3.0). Fold here
                 // so no UnaryOp(Neg) with a U128-typed bit pattern ever
                 // reaches the generic i128 negator.
-                if inner_ct.is_decimal() {
-                    // Decimal negation = BID sign-bit flip (bit 63/31/127).
-                    // Constants fold directly; D128 variables toggle bit 127
-                    // of the U128 carrier (a plain integer xor); D32/D64 go
-                    // through a typed alloca round-trip (BinOp on decimal
-                    // carriers is reserved for libbid lowering).
-                    match inner {
-                        Expr::FloatLiteralDecimal(w, bytes, _) => {
-                            let mut b = *bytes;
-                            match w {
-                                32 => b[3] ^= 0x80,
-                                64 => b[7] ^= 0x80,
-                                _ => b[15] ^= 0x80,
-                            }
-                            let c = match *w {
-                                32 => IrConst::D32(u32::from_le_bytes(b[..4].try_into().unwrap())),
-                                64 => IrConst::D64(u64::from_le_bytes(b[..8].try_into().unwrap())),
-                                _ => IrConst::I128(u128::from_le_bytes(b) as i128),
-                            };
-                            return Operand::Const(c);
-                        }
-                        _ => {}
-                    }
-                    let val = self.lower_expr(inner);
-                    let w = crate::ir::lowering::lower::Lowerer::decimal_width(&inner_ct)
-                        .unwrap_or(64);
-                    if w == 128 {
-                        // carrier is U128: xor bit 127 directly
-                        let ty = IrType::U128;
-                        let dest = self.fresh_value();
-                        self.emit(Instruction::BinOp {
-                            dest,
-                            op: crate::ir::ops::IrBinOp::Xor,
-                            lhs: val,
-                            rhs: Operand::Const(IrConst::I128(1i128 << 127)),
-                            ty,
-                        });
-                        return Operand::Value(dest);
-                    }
-                    // D32/D64: alloca store -> integer load -> xor -> store -> load
-                    let ty = if w == 32 { IrType::D32 } else { IrType::D64 };
-                    let ity = if w == 32 { IrType::I32 } else { IrType::I64 };
-                    let tmp = self.fresh_value();
-                    self.emit(Instruction::Alloca {
-                        dest: tmp,
-                        ty,
-                        size: w as usize / 8,
-                        align: w as usize / 8,
-                        volatile: false,
-                        semantic_volatile: false,
-                    });
-                    self.emit(Instruction::Store {
-                        volatile: false,
-                        val: val.clone(),
-                        ptr: tmp,
-                        ty,
-                        seg_override: crate::common::types::AddressSpace::Default,
-                    });
-                    let bits = self.fresh_value();
-                    self.emit(Instruction::Load {
-                        dest: bits,
-                        ptr: tmp,
-                        ty: ity,
-                        seg_override: crate::common::types::AddressSpace::Default,
-                        volatile: false,
-                    });
-                    let xored = self.fresh_value();
-                    self.emit(Instruction::BinOp {
-                        dest: xored,
-                        op: crate::ir::ops::IrBinOp::Xor,
-                        lhs: Operand::Value(bits),
-                        rhs: Operand::Const(if w == 32 { IrConst::I32(i32::MIN) } else { IrConst::I64(i64::MIN) }),
-                        ty: ity,
-                    });
-                    self.emit(Instruction::Store {
-                        volatile: false,
-                        val: Operand::Value(xored),
-                        ptr: tmp,
-                        ty: ity,
-                        seg_override: crate::common::types::AddressSpace::Default,
-                    });
-                    let res = self.fresh_value();
-                    self.emit(Instruction::Load {
-                        dest: res,
-                        ptr: tmp,
-                        ty,
-                        seg_override: crate::common::types::AddressSpace::Default,
-                        volatile: false,
-                    });
-                    return Operand::Value(res);
-                }
                 if inner_ct == CType::Float128 {
                     // _Float128 negation = toggle sign bit 127. Constants fold
                     // directly; variables go through the F128Neg intrinsic
@@ -836,18 +734,6 @@ impl Lowerer {
             UnaryOp::LogicalNot => {
                 let int_ty = crate::common::types::target_int_ir_type();
                 let inner_ct = self.expr_ctype(inner);
-                if inner_ct.is_decimal() {
-                    // !d == (d == 0) under decimal semantics.
-                    let val = self.lower_expr(inner);
-                    let truthy = self.lower_decimal_truthiness(val, &inner_ct);
-                    let dest = self.emit_cmp_val(
-                        IrCmpOp::Eq,
-                        truthy,
-                        Operand::Const(IrConst::I32(0)),
-                        IrType::I32,
-                    );
-                    return Operand::Value(dest);
-                }
                 if inner_ct.is_complex() {
                     // !complex_val => (real == 0) && (imag == 0)
                     let val = self.lower_expr(inner);

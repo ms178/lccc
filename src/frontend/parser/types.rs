@@ -221,18 +221,6 @@ impl Parser {
                     self.advance();
                     return Some(TypeSpecifier::Float128);
                 }
-                TokenKind::Decimal32 => {
-                    self.advance();
-                    return Some(TypeSpecifier::Decimal32);
-                }
-                TokenKind::Decimal64 => {
-                    self.advance();
-                    return Some(TypeSpecifier::Decimal64);
-                }
-                TokenKind::Decimal128 => {
-                    self.advance();
-                    return Some(TypeSpecifier::Decimal128);
-                }
                 TokenKind::Bool => {
                     self.advance();
                     flags.has_bool = true;

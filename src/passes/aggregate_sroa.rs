@@ -40,8 +40,6 @@ fn ty_size(ty: IrType) -> i64 {
         IrType::I16 | IrType::U16 => 2,
         IrType::I32 | IrType::U32 | IrType::F32 => 4,
         IrType::I64 | IrType::U64 | IrType::F64 => 8,
-        IrType::D32 => 4,
-        IrType::D64 => 8,
         IrType::Ptr => crate::common::types::target_ptr_size() as i64,
         IrType::I128 | IrType::U128 | IrType::F128 => 16,
         IrType::Void => 0,

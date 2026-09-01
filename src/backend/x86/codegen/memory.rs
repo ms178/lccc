@@ -162,10 +162,8 @@ impl X86Codegen {
 
         // Load the value to be stored into the accumulator/xmm register.
         // FP constants load directly from the rodata constant pool into xmm0.
-        let fp_const = matches!(
-            val,
-            Operand::Const(IrConst::F64(_) | IrConst::F32(_) | IrConst::D64(_) | IrConst::D32(_))
-        ) && matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32);
+        let fp_const = matches!(val, Operand::Const(IrConst::F64(_) | IrConst::F32(_)))
+            && matches!(ty, IrType::F64 | IrType::F32);
         if fp_const {
             self.emit_fp_operand_to_xmm(val, ty, "xmm0");
         } else {
@@ -429,10 +427,10 @@ impl X86Codegen {
 
         // Update register cache - for FP types, value is in xmm0, for integers in rax
         match ty {
-            IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32 => {
+            IrType::F64 | IrType::F32 => {
                 // For floating point, the value is in xmm0, not rax
                 // We need to move it to rax for the common code path
-                if matches!(ty, IrType::F64 | IrType::D64) {
+                if ty == IrType::F64 {
                     self.state.emit("    movq %xmm0, %rax");
                 } else {
                     self.state.emit("    movd %xmm0, %eax");
@@ -542,10 +540,10 @@ impl X86Codegen {
 
         // Update register cache - for FP types, value is in xmm0, for integers in rax
         match ty {
-            IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32 => {
+            IrType::F64 | IrType::F32 => {
                 // For floating point, the value is in xmm0, not rax
                 // We need to move it to rax for the common code path
-                if matches!(ty, IrType::F64 | IrType::D64) {
+                if ty == IrType::F64 {
                     self.state.emit("    movq %xmm0, %rax");
                 } else {
                     self.state.emit("    movd %xmm0, %eax");
@@ -611,10 +609,8 @@ impl X86Codegen {
 
         // Scalar FP store: keep the value in the SSE domain instead of
         // round-tripping through %rax.
-        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
-            // Decimal carriers: D64 moves like a 64-bit double, D32 like a
-            // 32-bit float — bit-exact SSE moves, never a value conversion.
-            let store_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let store_instr = if ty == IrType::F64 {
                 "    movsd"
             } else {
                 "    movss"
@@ -872,8 +868,8 @@ impl X86Codegen {
         // Scalar FP load: keep the value in the SSE domain — load directly
         // into an XMM register (the destination's own XMM register when it
         // has one) instead of round-tripping through %rax.
-        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
-            let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let load_instr = if ty == IrType::F64 {
                 "    movsd"
             } else {
                 "    movss"
@@ -1154,8 +1150,8 @@ impl X86Codegen {
         }
         // Scalar FP store: keep the value in the SSE domain instead of
         // round-tripping through %rax.
-        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
-            let store_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let store_instr = if ty == IrType::F64 {
                 "    movsd"
             } else {
                 "    movss"
@@ -1543,8 +1539,8 @@ impl X86Codegen {
         // has one) instead of round-tripping through %rax. Covers Direct,
         // Indirect (register-held or slot-held base) and OverAligned bases,
         // so FP-struct field loads in loops never pay the GPR shuttle.
-        if matches!(ty, IrType::F64 | IrType::F32 | IrType::D64 | IrType::D32) {
-            let load_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+        if matches!(ty, IrType::F64 | IrType::F32) {
+            let load_instr = if ty == IrType::F64 {
                 "    movsd"
             } else {
                 "    movss"

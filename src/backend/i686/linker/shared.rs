@@ -773,7 +773,6 @@ pub(super) fn emit_shared_library_32(
             tls_addr,
             tls_mem_size,
             has_tls,
-            tls_relaxed_call_slots: Default::default(),
         };
 
         for (obj_idx, obj) in inputs.iter().enumerate() {

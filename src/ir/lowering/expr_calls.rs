@@ -281,7 +281,7 @@ impl Lowerer {
         // indirect/function-pointer calls and variadic positions.
         let struct_arg_is_f128_sse: Vec<bool> = args
             .iter()
-            .map(|a| matches!(self.get_expr_ctype(a), Some(CType::Float128) | Some(CType::Decimal128)))
+            .map(|a| matches!(self.get_expr_ctype(a), Some(CType::Float128)))
             .collect();
         let mut struct_arg_is_f128_sse = struct_arg_is_f128_sse;
         if sret_alloca.is_some() {

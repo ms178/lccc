@@ -902,13 +902,6 @@ impl X86Codegen {
                         Operand::Const(IrConst::F32(_)) => {
                             self.emit_fp_operand_to_xmm(arg, IrType::F32, xmm_regs[reg_idx]);
                         }
-                        // Decimal carriers: bit-exact SSE moves.
-                        Operand::Const(IrConst::D64(_)) => {
-                            self.emit_fp_operand_to_xmm(arg, IrType::D64, xmm_regs[reg_idx]);
-                        }
-                        Operand::Const(IrConst::D32(_)) => {
-                            self.emit_fp_operand_to_xmm(arg, IrType::D32, xmm_regs[reg_idx]);
-                        }
                         _ => {
                             self.operand_to_rax(arg);
                             self.state
@@ -1225,7 +1218,7 @@ impl X86Codegen {
             } else {
                 self.store_rax_rdx_to(dest);
             }
-        } else if return_type == IrType::F32 || return_type == IrType::D32 {
+        } else if return_type == IrType::F32 {
             self.store_xmm_to(dest, "xmm0", IrType::F32);
         } else if return_type == IrType::F128 {
             if let Some(slot) = self.state.get_slot(dest.0) {
@@ -1242,7 +1235,7 @@ impl X86Codegen {
                 self.state.emit("    popq %rax");
                 self.store_rax_to(dest);
             }
-        } else if return_type == IrType::F64 || return_type == IrType::D64 {
+        } else if return_type == IrType::F64 {
             self.store_xmm_to(dest, "xmm0", IrType::F64);
         } else {
             self.store_rax_to(dest);
