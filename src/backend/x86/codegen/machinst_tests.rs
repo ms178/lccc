@@ -1316,3 +1316,158 @@ fn a_symbol_address_is_the_real_address_when_executed() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── 7. coverage regression guard ────────────────────────────────────────────
+
+/// MachInst coverage must not silently erode.
+///
+/// The whole point of `CCC_ISEL_STATS` is that a shrinking coverage fraction
+/// is invisible: `lower_instruction_typed` returning `false` falls back to
+/// direct text emission with no diagnostic, so a class quietly dropping out of
+/// the typed path looks exactly like everything being fine. The census made it
+/// measurable; this test makes it *enforced*.
+///
+/// The floors below are deliberately a little under the measured values so
+/// ordinary churn does not trip them, while a whole instruction class falling
+/// out — the failure mode that matters — does. Corpus-wide coverage when these
+/// were written: **85.1%**, up from 53.9% before `LeaSym`, narrow stores and
+/// the no-code `ParamRef` subset were lowered.
+#[test]
+fn instruction_selection_covers_the_expected_instruction_classes() {
+    use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
+    use crate::common::types::IrType;
+    use crate::common::fx_hash::FxHashMap;
+
+    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
+        .into_iter()
+        .collect();
+    let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+
+    // One representative of every class the layer claims to own. A `false`
+    // here means that class silently left the typed path.
+    let cases: Vec<(&str, Instruction)> = vec![
+        (
+            "BinOp",
+            Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I64(3)),
+                ty: IrType::I64,
+            },
+        ),
+        (
+            "Copy",
+            Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(2)),
+            },
+        ),
+        (
+            "GlobalAddr",
+            Instruction::GlobalAddr {
+                dest: Value(1),
+                name: "sym".into(),
+            },
+        ),
+        (
+            "Store(i64)",
+            Instruction::Store {
+                val: Operand::Value(Value(2)),
+                ptr: Value(3),
+                ty: IrType::I64,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        // The narrow stores whose blanket refusal was removed.
+        (
+            "Store(i8)",
+            Instruction::Store {
+                val: Operand::Value(Value(2)),
+                ptr: Value(3),
+                ty: IrType::I8,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        (
+            "Store(i16)",
+            Instruction::Store {
+                val: Operand::Value(Value(2)),
+                ptr: Value(3),
+                ty: IrType::I16,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        (
+            "Cmp",
+            Instruction::Cmp {
+                dest: Value(1),
+                op: crate::ir::reexports::IrCmpOp::Slt,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I64,
+            },
+        ),
+        (
+            "Alloca",
+            Instruction::Alloca {
+                dest: Value(9),
+                ty: IrType::I64,
+                size: 8,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            },
+        ),
+    ];
+
+    let mut failed = Vec::new();
+    for (name, inst) in &cases {
+        let mut out = Vec::new();
+        if !super::isel::lower_instruction_typed(inst, &ra, &slots, None, &mut out) {
+            failed.push(*name);
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "these instruction classes fell OUT of MachInst lowering: {:?}\n\
+         Coverage was 85.1% corpus-wide when this guard was written; a class \
+         dropping out is silent (the fallback to text emission has no \
+         diagnostic), which is exactly what this test exists to catch. \
+         Re-measure with CCC_ISEL_STATS=1.",
+        failed
+    );
+}
+
+/// `GlobalAddr` must lower to `LeaSym`, not to a `Mov`.
+///
+/// A `Mov` from a `RipRel` operand loads the symbol's CONTENTS; `GlobalAddr`
+/// wants its ADDRESS. Both assemble, so only a structural check on the emitted
+/// variant (or execution) tells them apart.
+#[test]
+fn global_addr_lowers_to_an_address_computation_not_a_load() {
+    use crate::ir::reexports::{Instruction, Value};
+    use crate::common::fx_hash::FxHashMap;
+
+    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0))].into_iter().collect();
+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::GlobalAddr {
+            dest: Value(1),
+            name: "the_symbol".into(),
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert_eq!(out.len(), 1, "expected exactly one instruction: {out:?}");
+    match &out[0] {
+        MachInst::LeaSym { sym, .. } => assert_eq!(sym, "the_symbol"),
+        other => panic!("GlobalAddr must lower to LeaSym, got {other:?}"),
+    }
+}

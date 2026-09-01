@@ -4000,6 +4000,44 @@ impl ArchCodegen for X86Codegen {
         {
             return false;
         }
+        // ParamRef: lower ONLY the subset that provably emits no code.
+        //
+        // A ParamRef is not a no-op in general -- `emit_param_ref_impl` has
+        // four cases: pre-stored (nothing to do), a parameter homed in an
+        // alloca slot (a load), an incoming ABI register that must be copied
+        // to a different home, and a stack-passed argument loaded from
+        // `16(%rbp)`/`8(%rsp)`. A previous attempt returned `true` for all of
+        // them and broke four corpus tests, every one parameter-related.
+        //
+        // The pre-stored subset is different in kind: `emit_store_params`
+        // already placed the value in the destination's register during the
+        // prologue, so the body emits literally nothing. Buffering it costs
+        // nothing and, crucially, does NOT flush the MachInst run -- which is
+        // the whole point, because a ParamRef sitting between two lowerable
+        // instructions used to split them onto separate paths. Parameters are
+        // 10.8% of all instructions in the corpus.
+        //
+        // The remaining cases keep the text path, where the ABI contract
+        // (including the pinned "read the *incoming* register even if another
+        // pre-store aliased that name" rule) is already implemented.
+        if let crate::ir::reexports::Instruction::ParamRef { param_idx, .. } = inst {
+            let no_code = *param_idx >= self.state.param_classes.len()
+                || (self.state.param_pre_stored.contains(param_idx)
+                    && self
+                        .state
+                        .param_alloca_slots
+                        .get(*param_idx)
+                        .copied()
+                        .flatten()
+                        .is_none());
+            if no_code {
+                super::isel::stats::note_lowered();
+                return true;
+            }
+            super::isel::stats::note_reject_named("ParamRef(needs-code)");
+            return false;
+        }
+
         // Div/rem pair heads and tails must stay on the classic emitter path:
         // the fusion (emit_divrem_pair_head) lives there and the MachInst
         // lowering emits standalone divisions for each side, which would both
