@@ -956,8 +956,6 @@ impl DestValue for Instruction {
 }
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
-
-// ─── Tests ─────────────────────────────────────────────────────────────────
 //
 // Rewritten against the real IR API (PR #59's version used a non-existent
 // IrFunction/IrBlock shape). Each test builds the canonical IVSR output
@@ -1271,7 +1269,7 @@ mod tests {
                 ty: IrType::I64,
                 incoming: vec![
                     (Operand::Const(IrConst::I64(5)), BlockId(0)), // init 5!
-                    (Operand::Value(Value(6)), BlockId(1)),
+                    (Operand::Value(Value(6)), BlockId(2)), // latch, unrotated
                 ],
             },
             ptr_phi(2, 10, 7),

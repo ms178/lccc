@@ -778,6 +778,71 @@ impl X86Codegen {
         }
     }
 
+    /// Dest-only ABM/BMI: `popcnt`/`lzcnt`/`tzcnt %src, %dest`.
+    ///
+    /// Intel (pre Ice Lake) has a false dependency on the destination of these
+    /// instructions; GCC breaks it with `xorl %dest32, %dest32` whenever dest
+    /// is distinct from src. We do the same. When dest has no GPR home the
+    /// result is written to `%eax`/`%rax` so the return path does not emit a
+    /// staging `movq %src, %rax` that the peephole then fails to delete.
+    fn emit_bitcount_direct(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        ty: IrType,
+        mnem: &str,
+    ) -> bool {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        let suffix = if use_32bit { "l" } else { "q" };
+        let src_gpr = self.operand_reg(src).filter(|r| !is_xmm_reg(*r));
+        let dest_gpr = self.dest_reg(dest).filter(|r| !is_xmm_reg(*r));
+
+        let src_name: String = if let Some(s_reg) = src_gpr {
+            if use_32bit {
+                phys_reg_name_32(s_reg).to_string()
+            } else {
+                phys_reg_name(s_reg).to_string()
+            }
+        } else if let Some(d_reg) = dest_gpr {
+            self.operand_to_callee_reg(src, d_reg);
+            if use_32bit {
+                phys_reg_name_32(d_reg).to_string()
+            } else {
+                phys_reg_name(d_reg).to_string()
+            }
+        } else {
+            return false;
+        };
+
+        let (dst_name, dst32): (&str, &str) = if let Some(d_reg) = dest_gpr {
+            if use_32bit {
+                (phys_reg_name_32(d_reg), phys_reg_name_32(d_reg))
+            } else {
+                (phys_reg_name(d_reg), phys_reg_name_32(d_reg))
+            }
+        } else if use_32bit {
+            ("eax", "eax")
+        } else {
+            ("rax", "eax")
+        };
+
+        // False-dependency break: only when dest is a different register from
+        // src (xor would otherwise destroy the input).
+        if src_name != dst_name && src_name != dst32 {
+            self.state
+                .emit_fmt(format_args!("    xorl %{0}, %{0}", dst32));
+        }
+        self.state.emit_fmt(format_args!(
+            "    {}{} %{}, %{}",
+            mnem, suffix, src_name, dst_name
+        ));
+        self.state.reg_cache.invalidate_acc();
+        if dest_gpr.is_none() {
+            self.store_rax_to(dest);
+        }
+        true
+    }
+
     pub(super) fn emit_unaryop_impl(
         &mut self,
         dest: &Value,
@@ -805,8 +870,28 @@ impl X86Codegen {
             }
             return;
         }
-        // Register-direct path for integer unary ops when dest has a register.
+        // Integer dest-only two-operand ABM/BMI: popcnt/lzcnt/tzcnt write dest
+        // without reading it. Emit `mnem %src, %dest` (or `%src, %eax` when dest
+        // is the accumulator / return) so we never stage through `movq %src, %rax`
+        // then `mnem %eax, %eax`. Sub-32-bit types still take the default path
+        // (they need an explicit zero-extend first).
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+            if matches!(
+                ty,
+                IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
+            ) {
+                let bitcount = match op {
+                    IrUnaryOp::Popcount if self.popcnt_enabled => Some("popcnt"),
+                    IrUnaryOp::Clz if self.lzcnt_enabled => Some("lzcnt"),
+                    IrUnaryOp::Ctz if self.lzcnt_enabled => Some("tzcnt"),
+                    _ => None,
+                };
+                if let Some(mnem) = bitcount {
+                    if self.emit_bitcount_direct(dest, src, ty, mnem) {
+                        return;
+                    }
+                }
+            }
             if let Some(d_reg) = self.dest_reg(dest) {
                 if !is_xmm_reg(d_reg) {
                     let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
@@ -853,33 +938,8 @@ impl X86Codegen {
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
-                        IrUnaryOp::Popcount if self.popcnt_enabled => {
-                            // popcnt is two-operand: popcnt %src, %dest
-                            if let Some(s_reg) = self.operand_reg(src) {
-                                if !is_xmm_reg(s_reg) {
-                                    let s_name = if use_32bit {
-                                        phys_reg_name_32(s_reg)
-                                    } else {
-                                        phys_reg_name(s_reg)
-                                    };
-                                    self.state.emit_fmt(format_args!(
-                                        "    popcnt{} %{}, %{}",
-                                        suffix, s_name, d_name
-                                    ));
-                                    self.state.reg_cache.invalidate_acc();
-                                    return;
-                                }
-                            }
-                            self.operand_to_callee_reg(src, d_reg);
-                            self.state.emit_fmt(format_args!(
-                                "    popcnt{} %{}, %{}",
-                                suffix, d_name, d_name
-                            ));
-                            self.state.reg_cache.invalidate_acc();
-                            return;
-                        }
-                        _ => {} // Clz, Ctz — complex multi-instruction; Popcount without
-                                // -mpopcnt falls through to the shr/adc loop fallback.
+                        _ => {} // Popcount without -mpopcnt / Clz/Ctz without -mlzcnt
+                                // fall through to the baseline sequences.
                     }
                 }
             }

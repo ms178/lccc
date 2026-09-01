@@ -66,11 +66,21 @@ fn const_to_i64(c: &IrConst) -> i64 {
 
 /// Check if an operand is an immediate that fits in a signed 32-bit value.
 fn const_as_imm32(op: &Operand) -> Option<i64> {
+    const_as_imm32_size(op, OpSize::S64)
+}
+
+/// Immediate-32 encoding. 64-bit ops sign-extend imm32, so only the signed
+/// i32 range is representable. 32-bit ops use the imm32 bit pattern verbatim,
+/// so any value in `[0, u32::MAX]` encodes (as a signed i32 with the same
+/// low 32 bits — `2654435761u` → `-1640531535`).
+fn const_as_imm32_size(op: &Operand, size: OpSize) -> Option<i64> {
     match op {
         Operand::Const(c) => {
             let v = const_to_i64(c);
             if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
                 Some(v)
+            } else if size == OpSize::S32 && v >= 0 && v <= u32::MAX as i64 {
+                Some(v as i32 as i64)
             } else {
                 None
             }
@@ -156,9 +166,19 @@ fn emit_alu_operand_r(
 ) {
     let src_op = lower_operand_with_regs(src, ra);
     // x86 ALU instructions only support i32 immediates. For larger values,
-    // materialize to the scratch register (rax) first.
+    // materialize to the scratch register (rax) first. 32-bit ops can encode
+    // any u32 bit pattern as a signed imm32, so skip the movabsq shuttle.
     if let MachOperand::Imm(v) = &src_op {
         if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+            if size == OpSize::S32 && *v >= 0 && *v <= u32::MAX as i64 {
+                out.push(MachInst::Alu {
+                    op,
+                    src: MachOperand::Imm(*v as i32 as i64),
+                    dst,
+                    size,
+                });
+                return;
+            }
             out.push(MachInst::Mov {
                 src: MachOperand::Imm(*v),
                 dst: MachOperand::Reg(MachReg::Phys(RAX)),
@@ -279,7 +299,7 @@ pub fn lower_binop(
     // ── Simple ALU operations (two-address form) ─────────────────────
     if let Some(alu_op) = binop_to_alu(op) {
         if op == IrBinOp::Mul {
-            if let Some(imm) = const_as_imm32(rhs) {
+            if let Some(imm) = const_as_imm32_size(rhs, size) {
                 if let Some(scale) = lea_scale_for_mul(imm) {
                     emit_mov_operand_r(lhs, dst, size, ra, out);
                     out.push(MachInst::Lea {
@@ -534,11 +554,22 @@ pub fn lower_cmp(
             rhs_op = MachOperand::Reg(MachReg::Phys(RCX));
         }
     }
-    out.push(MachInst::Cmp {
-        lhs: lhs_op,
-        rhs: rhs_op,
-        size,
-    });
+    // `cmp $0, %reg` ≡ `test %reg, %reg` for the integer condition codes we
+    // emit (ZF/SF/CF/OF). `test` is shorter and does not take an immediate.
+    let rhs_is_zero = matches!(rhs_op, MachOperand::Imm(0));
+    if rhs_is_zero && matches!(lhs_op, MachOperand::Reg(_)) {
+        out.push(MachInst::Test {
+            lhs: lhs_op.clone(),
+            rhs: lhs_op,
+            size,
+        });
+    } else {
+        out.push(MachInst::Cmp {
+            lhs: lhs_op,
+            rhs: rhs_op,
+            size,
+        });
+    }
     out.push(MachInst::SetCC { cc, dst });
     out.push(MachInst::Movzx {
         src: MachOperand::Reg(dst),
@@ -562,11 +593,19 @@ pub fn lower_cmp_branch(
     let cc = cmp_to_cc(op);
     let lhs_op = lower_operand(lhs);
     let rhs_op = lower_operand(rhs);
-    out.push(MachInst::Cmp {
-        lhs: lhs_op,
-        rhs: rhs_op,
-        size,
-    });
+    if matches!(rhs_op, MachOperand::Imm(0)) && matches!(lhs_op, MachOperand::Reg(_)) {
+        out.push(MachInst::Test {
+            lhs: lhs_op.clone(),
+            rhs: lhs_op,
+            size,
+        });
+    } else {
+        out.push(MachInst::Cmp {
+            lhs: lhs_op,
+            rhs: rhs_op,
+            size,
+        });
+    }
     out.push(MachInst::Jcc {
         cc,
         target: format!(".LBB{}", true_block.0),
@@ -1323,9 +1362,9 @@ mod tests {
         ));
         assert!(out.iter().any(|inst| matches!(
             inst,
-            MachInst::Cmp {
+            MachInst::Test {
                 lhs: MachOperand::Reg(MachReg::Phys(RAX)),
-                rhs: MachOperand::Imm(0),
+                rhs: MachOperand::Reg(MachReg::Phys(RAX)),
                 size: OpSize::S64,
             }
         )));
@@ -1396,6 +1435,70 @@ mod tests {
                 dst: MachReg::Phys(PhysReg(3)),
             }]
         ));
+    }
+
+    #[test]
+    fn u32_mul_large_imm_uses_signed_imm32_not_movabs() {
+        // Knuth multiplicative hash: 2654435761u as i32 is -1640531535.
+        // Encoding it as imm32 avoids `movabsq` + `imull %eax, %edi`.
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(14)); // rdi
+        assignments.insert(2, PhysReg(14));
+        let mut out = Vec::new();
+        lower_binop(
+            &Value(2),
+            IrBinOp::Mul,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(2654435761)),
+            IrType::U32,
+            &assignments,
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|inst| matches!(
+                inst,
+                MachInst::Imul3 {
+                    imm: -1640531535,
+                    size: OpSize::S32,
+                    ..
+                }
+            )),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|inst| matches!(
+            inst,
+            MachInst::Mov {
+                src: MachOperand::Imm(2654435761),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn cmp_against_zero_lowers_to_test() {
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(14));
+        assignments.insert(2, PhysReg(1));
+        let mut out = Vec::new();
+        lower_cmp(
+            &Value(2),
+            IrCmpOp::Ne,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(0)),
+            IrType::I32,
+            &assignments,
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.first(),
+                Some(MachInst::Test {
+                    size: OpSize::S32,
+                    ..
+                })
+            ),
+            "{out:?}"
+        );
     }
 
     #[test]

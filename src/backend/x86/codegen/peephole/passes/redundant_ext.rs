@@ -166,6 +166,10 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
             | "cmovael"
             | "cmovbel"
             | "cmoval"
+            | "popcntl"
+            | "lzcntl"
+            | "tzcntl"
+            | "andnl"
     )
 }
 
@@ -583,6 +587,13 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
             | "cmovael"
             | "cmovbel"
             | "cmoval"
+            | "popcntl"
+            | "lzcntl"
+            | "tzcntl"
+            | "andnl"
+            | "blsrl"
+            | "blsil"
+            | "bzhil"
     )
 }
 

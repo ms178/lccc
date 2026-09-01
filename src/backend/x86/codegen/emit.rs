@@ -1520,25 +1520,10 @@ impl X86Codegen {
                     IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
                     IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %eax, %eax"),
                     IrConst::I64(0) => self.state.emit("    xorl %eax, %eax"),
-                    IrConst::I8(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rax"),
-                    IrConst::I16(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rax"),
-                    IrConst::I32(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rax"),
-                    IrConst::I64(v) => {
-                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", *v, "rax");
-                        } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", *v, "rax");
-                        }
-                    }
+                    IrConst::I8(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I16(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
+                    IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rax", "eax"),
                     IrConst::F32(v) => {
                         let bits = v.to_bits() as u64;
                         if bits == 0 {
@@ -1756,8 +1741,13 @@ impl X86Codegen {
                         self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
                     } else if self.value_types.get(&v.0).is_some_and(|t| t.size() <= 4) {
                         let name32 = phys_reg_name_32(reg);
-                        self.state
-                            .emit_fmt(format_args!("    movl %{name32}, %eax"));
+                        // Identity `movl %eax, %eax` is a 2-byte no-op (and a
+                        // false dependency). Skip it when the value is already
+                        // in the return register.
+                        if name32 != "eax" {
+                            self.state
+                                .emit_fmt(format_args!("    movl %{name32}, %eax"));
+                        }
                     } else {
                         self.state.emit_fmt(format_args!("    movq %{name}, %rax"));
                     }
@@ -2286,25 +2276,10 @@ impl X86Codegen {
                     IrConst::I16(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
                     IrConst::I32(v) if *v == 0 => self.state.emit("    xorl %ecx, %ecx"),
                     IrConst::I64(0) => self.state.emit("    xorl %ecx, %ecx"),
-                    IrConst::I8(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rcx"),
-                    IrConst::I16(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rcx"),
-                    IrConst::I32(v) => self
-                        .state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, "rcx"),
-                    IrConst::I64(v) => {
-                        if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                            self.state.out.emit_instr_imm_reg("    movq", *v, "rcx");
-                        } else {
-                            self.state.out.emit_instr_imm_reg("    movabsq", *v, "rcx");
-                        }
-                    }
+                    IrConst::I8(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I16(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
+                    IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rcx", "ecx"),
                     IrConst::F32(v) => {
                         let bits = v.to_bits() as u64;
                         if bits == 0 {
@@ -2380,6 +2355,27 @@ impl X86Codegen {
                 // Record what's now in %rcx
                 self.state.reg_cache.set_sec(v.0, is_alloca);
             }
+        }
+    }
+
+    /// PF-16: materialise a GPR immediate. Non-negative values in `[0, i32::MAX]`
+    /// use `movl` (zero-extends, two bytes shorter than `movq $imm32`); negative
+    /// values keep `movq` (sign-extend); values outside imm32 use `movabsq`.
+    pub(super) fn emit_imm_to_gpr(&mut self, val: i64, name64: &str, name32: &str) {
+        if val == 0 {
+            self.state
+                .emit_fmt(format_args!("    xorl %{0}, %{0}", name32));
+        } else if val >= 0 && val <= i32::MAX as i64 {
+            self.state
+                .emit_fmt(format_args!("    movl ${}, %{}", val, name32));
+        } else if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movq", val, name64);
+        } else {
+            self.state
+                .out
+                .emit_instr_imm_reg("    movabsq", val, name64);
         }
     }
 
@@ -3107,9 +3103,11 @@ impl X86Codegen {
                         ));
                     }
                 } else if use_32bit {
+                    // Encode u32 constants as signed imm32 (same bits).
+                    let imm32 = imm as i32 as i64;
                     self.state.emit_fmt(format_args!(
                         "    imull ${}, %{}, %{}",
-                        imm, dest_name_32, dest_name_32
+                        imm32, dest_name_32, dest_name_32
                     ));
                     self.emit_sext32_for_value(dest_name_32, dest_name, is_unsigned, dest_value_id);
                 } else {
@@ -3348,7 +3346,7 @@ impl X86Codegen {
 
         // Immediate multiply
         if op == IrBinOp::Mul {
-            if let Some(imm) = Self::const_as_imm32(rhs) {
+            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
                 self.operand_to_rax(lhs);
                 // LEA strength reduction: x*3/5/9 → lea (%rax, %rax, scale), %rax.
                 // lea has 1-cycle latency vs 3 cycles for imul on modern x86.
@@ -3364,8 +3362,9 @@ impl X86Codegen {
                             .emit_fmt(format_args!("    leaq (%rax, %rax, {}), %rax", scale));
                     }
                 } else if use_32bit {
+                    let imm32 = imm as i32 as i64;
                     self.state
-                        .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm));
+                        .emit_fmt(format_args!("    imull ${}, %eax, %eax", imm32));
                     if !is_unsigned {
                         self.state.emit("    cltq");
                     }
