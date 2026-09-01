@@ -860,15 +860,52 @@ impl Lowerer {
             // __builtin___*_chk: fortification builtins forward to unchecked libc equivalents.
             // Each __builtin___X_chk(args..., extra_check_args...) becomes X(args...).
             BuiltinIntrinsic::FortifyChk => self.lower_fortify_chk(name, args),
-            // TODO: __builtin_va_arg_pack / __builtin_va_arg_pack_len are stubbed
-            // to return 0. Proper implementation requires forwarding the caller's
-            // variadic args during inlining. Since _FORTIFY_SOURCE is disabled,
-            // this code path should not be reached in practice.
+            // __builtin_va_arg_pack / __builtin_va_arg_pack_len: forward the
+            // wrapper's caller variadic arguments during inlining.  Lowered
+            // to a zero-arg sentinel CALL (`__lccc_va_arg_pack` /
+            // `__lccc_va_arg_pack_len`) that the inliner expands when the
+            // enclosing always_inline variadic wrapper is cloned into a call
+            // site: the sentinel call is deleted and the call site's
+            // arguments beyond the wrapper's named parameters are spliced
+            // into the consuming call's argument list (va_arg_pack_len
+            // becomes an I32 constant — the count of forwarded arguments).
+            // If the sentinel ever survives inlining (wrapper not inlined),
+            // the undefined symbol `__lccc_va_arg_pack` at link time mirrors
+            // GCC's "va_arg_pack must be inlined" diagnostic class.
             BuiltinIntrinsic::VaArgPack => {
                 for arg in args {
                     self.lower_expr(arg);
                 }
-                Some(Operand::Const(IrConst::I32(0)))
+                let sentinel = if name == "__builtin_va_arg_pack" {
+                    "__lccc_va_arg_pack"
+                } else {
+                    "__lccc_va_arg_pack_len"
+                };
+                let dest = self.fresh_value();
+                let struct_arg_sizes = vec![];
+                self.emit(Instruction::Call {
+                    func: sentinel.to_string(),
+                    info: CallInfo {
+                        dest: Some(dest),
+                        args: vec![],
+                        arg_types: vec![],
+                        return_type: IrType::I32,
+                        is_variadic: false,
+                        num_fixed_args: 0,
+                        struct_arg_sizes,
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: Vec::new(),
+                        struct_arg_riscv_float_classes: Vec::new(),
+                        struct_arg_is_f128_sse: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        is_pure: false,
+                        is_const: false,
+                        ret_eightbyte_classes: Vec::new(),
+                        ret_is_f128_sse: false,
+                    },
+                });
+                Some(Operand::Value(dest))
             }
             // __builtin_thread_pointer() -> returns the TLS base address (thread pointer)
             BuiltinIntrinsic::ThreadPointer => {
@@ -2510,6 +2547,7 @@ fn classify_ctype(ty: &CType) -> i64 {
         | CType::UInt128
         | CType::Enum(_) => 1, // integer_type_class
         CType::Float | CType::Double | CType::LongDouble | CType::Float128 => 8, // real_type_class
+        CType::Decimal32 | CType::Decimal64 | CType::Decimal128 => 8, // real_type_class (decimal FP)
         CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9, // complex_type_class
         CType::Pointer(_, _) => 5, // pointer_type_class
         CType::Array(_, _) => 5,   // GCC decays arrays to pointers

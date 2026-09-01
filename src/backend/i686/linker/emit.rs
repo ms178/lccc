@@ -896,6 +896,7 @@ pub(super) fn emit_executable(
             tls_addr,
             tls_mem_size,
             has_tls,
+            tls_relaxed_call_slots: Default::default(),
         };
         text_relocs = reloc::apply_relocations(inputs, &mut reloc_ctx)?;
     }

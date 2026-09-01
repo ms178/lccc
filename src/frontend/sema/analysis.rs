@@ -1804,6 +1804,7 @@ impl SemanticAnalyzer {
             | Expr::FloatLiteralF32(_, _)
             | Expr::FloatLiteralLongDouble(_, _, _)
             | Expr::FloatLiteralF128(_, _, _)
+            | Expr::FloatLiteralDecimal(_, _, _)
             | Expr::ImaginaryLiteral(_, _)
             | Expr::ImaginaryLiteralF32(_, _)
             | Expr::ImaginaryLiteralLongDouble(_, _, _)

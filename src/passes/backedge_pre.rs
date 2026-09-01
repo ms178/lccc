@@ -86,6 +86,8 @@ fn const_key(c: &IrConst) -> Option<ConstKey> {
         IrConst::I128(v) => ConstKey::I(*v),
         IrConst::F32(v) => ConstKey::F32(v.to_bits()),
         IrConst::F64(v) => ConstKey::F64(v.to_bits()),
+        IrConst::D32(v) => ConstKey::I(*v as i128),
+        IrConst::D64(v) => ConstKey::I(*v as i128),
         IrConst::Zero => ConstKey::Zero,
         // LongDouble carries a lossy f64 plus exact bytes; skip rather than
         // risk equating distinct constants.

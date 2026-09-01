@@ -956,7 +956,8 @@ impl I686Codegen {
             match class {
                 ParamClass::StackScalar { offset } => {
                     let src_offset = stack_base + offset - stack_offset_adjust;
-                    if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
+                    // D64: BID bit container — integer pair copy, no x87.
+                    if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
                         let src_ref = self.param_ref(src_offset);
                         let dst_ref = self.slot_ref(slot);
                         emit!(self.state, "    movl {}, %eax", src_ref);
