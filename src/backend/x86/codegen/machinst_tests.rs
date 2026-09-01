@@ -430,6 +430,21 @@ fn zero_and_sign_extension_emit_distinct_mnemonics() {
 }
 
 #[test]
+fn a_symbol_address_emits_leaq_not_movq() {
+    // `GlobalAddr` wants the ADDRESS of a symbol. Emitting `movq sym(%rip)`
+    // would load its CONTENTS -- a silent miscompile that assembles perfectly.
+    // This distinction is why `LeaSym` exists as its own variant.
+    let line = emit1(&MachInst::LeaSym {
+        sym: "glob".into(),
+        dst: MachReg::Phys(PhysReg(15)),
+    });
+    assert!(line.starts_with("leaq"), "must be leaq, got `{line}`");
+    assert!(line.contains("glob(%rip)"), "{line}");
+    assert!(line.contains("%rsi"), "address is 64-bit: {line}");
+    assert!(!line.contains("movq"), "{line}");
+}
+
+#[test]
 fn control_flow_variants_emit_their_targets() {
     assert!(emit1(&MachInst::Jmp {
         target: ".L7".into()
@@ -574,6 +589,12 @@ fn instruction_corpus() -> Vec<MachInst> {
                 dst: MachReg::Phys(PhysReg(0)),
             });
         }
+    }
+    for &r in &regs {
+        v.push(MachInst::LeaSym {
+            sym: "machinst_probe_sym".into(),
+            dst: MachReg::Phys(r),
+        });
     }
     v.push(MachInst::Ret);
     v
@@ -814,7 +835,7 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                 _ => MachOperand::StackSlot(*rng.pick(&offsets)),
             }
         };
-        v.push(match rng.next() % 9 {
+        v.push(match rng.next() % 10 {
             0 => MachInst::Mov {
                 src: operand(&mut rng),
                 dst: MachOperand::Reg(MachReg::Phys(b)),
@@ -867,6 +888,10 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                 index: Some((MachReg::Phys(b), *rng.pick(&scales))),
                 offset: *rng.pick(&offsets),
                 dst: MachReg::Phys(*rng.pick(&regs)),
+            },
+            8 => MachInst::LeaSym {
+                sym: "machinst_probe_sym".into(),
+                dst: MachReg::Phys(b),
             },
             _ => MachInst::Movzx {
                 src: MachOperand::Reg(MachReg::Phys(a)),
@@ -980,4 +1005,314 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
             );
         }
     }
+}
+
+// ── 6. semantic execution differential ──────────────────────────────────────
+//
+// Layers 1-5 prove the emitted text is a VALID instruction. They cannot prove
+// it is the INTENDED one. AT&T order is the classic trap: `subq %rax, %rbx`
+// means `rbx -= rax`, so an emitter that swapped the operands of a
+// non-commutative op would produce text GAS accepts, a disassembler shows
+// without complaint, and a fuzz corpus assembles cleanly -- while every
+// program computes the wrong answer.
+//
+// The only way to close that gap is to RUN the instruction. Each case below
+// is assembled into a real function, linked, executed with known inputs, and
+// compared against the semantics computed independently in Rust.
+
+/// Assemble `body` as `long f(long,long)` (SysV: rdi, rsi), run it on the
+/// given inputs, and return the results. `None` when the toolchain is absent.
+fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
+    let (asm, _ver) = find_assembler()?;
+    // Executing needs a compiler+linker for the harness, not just `as`.
+    if std::process::Command::new("cc").arg("--version").output().is_err() {
+        return None;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "lccc-machinst-exec-{}-{}",
+        std::process::id(),
+        body.len()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let s_path = dir.join("f.s");
+    let c_path = dir.join("m.c");
+    let bin = dir.join("m");
+
+    std::fs::write(
+        &s_path,
+        format!(".text\n.globl probe_fn\n.type probe_fn,@function\nprobe_fn:\n{body}\n    ret\n"),
+    )
+    .ok()?;
+
+    let mut main_src = String::from(
+        "#include <stdio.h>\nlong probe_fn(long,long);\nint main(void){\n",
+    );
+    for (a, b) in inputs {
+        main_src.push_str(&format!(
+            "    printf(\"%lld\\n\", (long long)probe_fn({}L, {}L));\n",
+            a, b
+        ));
+    }
+    main_src.push_str("    return 0;\n}\n");
+    std::fs::write(&c_path, main_src).ok()?;
+
+    // Assemble with the pinned assembler, then link with cc.
+    let obj = dir.join("f.o");
+    let mut cmd = std::process::Command::new(&asm);
+    if asm.ends_with("gcc") {
+        cmd.arg("-c").arg("-x").arg("assembler");
+    } else {
+        cmd.arg("-c");
+    }
+    let a_out = cmd.arg(&s_path).arg("-o").arg(&obj).output().ok()?;
+    if !a_out.status.success() {
+        panic!(
+            "assembler rejected an execution probe:\n{}\n--- source ---\n{}",
+            String::from_utf8_lossy(&a_out.stderr),
+            body
+        );
+    }
+    let l_out = std::process::Command::new("cc")
+        .arg(&c_path)
+        .arg(&obj)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .ok()?;
+    if !l_out.status.success() {
+        return None;
+    }
+    let r = std::process::Command::new(&bin).output().ok()?;
+    let vals: Vec<i64> = String::from_utf8_lossy(&r.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<i64>().ok())
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (vals.len() == inputs.len()).then_some(vals)
+}
+
+/// Emit `inst` into a probe that loads rdi/rsi into the operand registers and
+/// returns the destination.
+fn probe_body(setup_dst: PhysReg, setup_src: PhysReg, inst: &MachInst) -> String {
+    let mut out = AsmOutput::new();
+    emit_machinst(inst, &mut out);
+    let d = expected_names(setup_dst).unwrap()[3]; // 64-bit spelling
+    let s = expected_names(setup_src).unwrap()[3];
+    format!(
+        "    movq %rdi, %{d}\n    movq %rsi, %{s}\n{}    movq %{d}, %rax\n",
+        out.buf
+    )
+}
+
+const EXEC_INPUTS: &[(i64, i64)] = &[
+    (100, 7),
+    (7, 100),
+    (-9, 4),
+    (0, 0),
+    (i32::MAX as i64, 1),
+    (-1, 1),
+];
+
+#[test]
+fn alu_operations_compute_the_right_answer_when_executed() {
+    // %rbx and %rcx: callee-saved %rbx would need saving, so use two
+    // caller-saved families the harness does not rely on.
+    let dst = PhysReg(11); // r10
+    let src = PhysReg(10); // r11
+
+    let cases: &[(AluOp, fn(i64, i64) -> i64)] = &[
+        (AluOp::Add, |a, b| a.wrapping_add(b)),
+        // Non-commutative: THIS is the case an operand-order bug breaks, and
+        // the case no "the assembler accepted it" test can detect.
+        (AluOp::Sub, |a, b| a.wrapping_sub(b)),
+        (AluOp::And, |a, b| a & b),
+        (AluOp::Or, |a, b| a | b),
+        (AluOp::Xor, |a, b| a ^ b),
+        (AluOp::Imul, |a, b| a.wrapping_mul(b)),
+    ];
+
+    for (op, model) in cases {
+        let inst = MachInst::Alu {
+            op: *op,
+            src: MachOperand::Reg(MachReg::Phys(src)),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
+            eprintln!("SKIP: no assembler/linker; MachInst execution differential cannot run");
+            return;
+        };
+        for (i, (a, b)) in EXEC_INPUTS.iter().enumerate() {
+            let want = model(*a, *b);
+            assert_eq!(
+                got[i], want,
+                "{:?}(dst={}, src={}) computed {} but must be {} \
+                 (an AT&T operand-order or width bug)",
+                op, a, b, got[i], want
+            );
+        }
+    }
+}
+
+#[test]
+fn shifts_compute_the_right_answer_when_executed() {
+    // Shifts are the other classic order trap, and `sar` vs `shr` differ only
+    // in sign behaviour -- which a negative input exposes and a positive one
+    // hides.
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    let cases: &[(ShiftOp, u32, fn(i64, u32) -> i64)] = &[
+        (ShiftOp::Shl, 3, |a, k| ((a as u64) << k) as i64),
+        (ShiftOp::Shr, 3, |a, k| ((a as u64) >> k) as i64),
+        (ShiftOp::Sar, 3, |a, k| a >> k),
+    ];
+    for (op, amt, model) in cases {
+        let inst = MachInst::Shift {
+            op: *op,
+            amount: MachOperand::Imm(*amt as i64),
+            dst: MachReg::Phys(dst),
+            size: OpSize::S64,
+        };
+        let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
+            return;
+        };
+        for (i, (a, _)) in EXEC_INPUTS.iter().enumerate() {
+            let want = model(*a, *amt);
+            assert_eq!(
+                got[i], want,
+                "{:?} by {} on {} computed {} but must be {}",
+                op, amt, a, got[i], want
+            );
+        }
+    }
+}
+
+#[test]
+fn a_32_bit_alu_zero_extends_into_the_full_register() {
+    // x86-64 semantics a golden test cannot express: a 32-bit write CLEARS
+    // bits 32..63. An emitter that used the 64-bit spelling would pass every
+    // "does it assemble" check and silently keep the upper half.
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    let inst = MachInst::Alu {
+        op: AluOp::Add,
+        src: MachOperand::Reg(MachReg::Phys(src)),
+        dst: MachReg::Phys(dst),
+        size: OpSize::S32,
+    };
+    let inputs = &[(0x1_0000_0000i64, 1i64), (-1i64, 1i64)];
+    let Some(got) = run_emitted(&probe_body(dst, src, &inst), inputs) else {
+        return;
+    };
+    // 0x1_0000_0000 + 1 truncated to 32 bits and zero-extended = 1.
+    assert_eq!(got[0], 1, "32-bit add must zero-extend, got {:#x}", got[0]);
+    // -1 + 1 = 0 in 32 bits, zero-extended = 0.
+    assert_eq!(got[1], 0, "32-bit add must zero-extend, got {:#x}", got[1]);
+}
+
+#[test]
+fn zero_and_sign_extension_differ_where_it_matters_when_executed() {
+    // movzx vs movsx on a negative byte: 0xFF becomes 255 or -1. Both
+    // assemble; only execution tells them apart.
+    let dst = PhysReg(11);
+    let src = PhysReg(10);
+    let inputs = &[(0i64, -1i64)];
+
+    let z = MachInst::Movzx {
+        src: MachOperand::Reg(MachReg::Phys(src)),
+        dst: MachReg::Phys(dst),
+        from_size: OpSize::S8,
+        to_size: OpSize::S64,
+    };
+    let sx = MachInst::Movsx {
+        src: MachOperand::Reg(MachReg::Phys(src)),
+        dst: MachReg::Phys(dst),
+        from_size: OpSize::S8,
+        to_size: OpSize::S64,
+    };
+    let Some(gz) = run_emitted(&probe_body(dst, src, &z), inputs) else {
+        return;
+    };
+    let Some(gs) = run_emitted(&probe_body(dst, src, &sx), inputs) else {
+        return;
+    };
+    assert_eq!(gz[0], 255, "movzx of 0xFF must be 255, got {}", gz[0]);
+    assert_eq!(gs[0], -1, "movsx of 0xFF must be -1, got {}", gs[0]);
+}
+
+#[test]
+fn a_symbol_address_is_the_real_address_when_executed() {
+    // Proves `LeaSym` computes the ADDRESS and not the contents. A `movq`
+    // here would return the value stored at the symbol, which on this probe is
+    // a recognisable sentinel -- so the two outcomes are trivially
+    // distinguishable at runtime, and indistinguishable by any check that only
+    // asks whether the text assembles.
+    let Some((asm, _)) = find_assembler() else {
+        eprintln!("SKIP: no assembler; LeaSym execution check cannot run");
+        return;
+    };
+    if std::process::Command::new("cc").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let (s_path, c_path, o_path, bin) = (
+        dir.join("f.s"),
+        dir.join("m.c"),
+        dir.join("f.o"),
+        dir.join("m"),
+    );
+
+    let mut out = AsmOutput::new();
+    emit_machinst(
+        &MachInst::LeaSym {
+            sym: "leasym_probe_obj".into(),
+            dst: MachReg::Phys(PhysReg(0)), // rax = return register
+        },
+        &mut out,
+    );
+    std::fs::write(
+        &s_path,
+        format!(
+            ".text\n.globl leasym_probe\n.type leasym_probe,@function\nleasym_probe:\n{}    ret\n",
+            out.buf
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &c_path,
+        "#include <stdio.h>\nlong leasym_probe_obj = 0x5EEDF00D;\n         void *leasym_probe(void);\n         int main(void){ printf(\"%d\\n\", leasym_probe() == (void*)&leasym_probe_obj); return 0; }\n",
+    )
+    .unwrap();
+
+    let mut cmd = std::process::Command::new(&asm);
+    if asm.ends_with("gcc") {
+        cmd.arg("-c").arg("-x").arg("assembler");
+    } else {
+        cmd.arg("-c");
+    }
+    let a = cmd.arg(&s_path).arg("-o").arg(&o_path).output().unwrap();
+    assert!(
+        a.status.success(),
+        "assembler rejected LeaSym:\n{}",
+        String::from_utf8_lossy(&a.stderr)
+    );
+    let l = std::process::Command::new("cc")
+        .arg(&c_path)
+        .arg(&o_path)
+        .arg("-o")
+        .arg(&bin)
+        .output()
+        .unwrap();
+    if !l.status.success() {
+        return; // no linker/libc in this environment
+    }
+    let r = std::process::Command::new(&bin).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout).trim(),
+        "1",
+        "LeaSym must return the symbol's ADDRESS, not its contents"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

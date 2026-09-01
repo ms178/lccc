@@ -54,3 +54,9 @@ pub fn compiler_main() {
         }
     }
 }
+
+/// Print the MachInst instruction-selection coverage census (no-op unless
+/// `CCC_ISEL_STATS=1`). Exposed for the driver binary.
+pub fn isel_stats_report() {
+    crate::backend::x86::codegen::isel::stats::report();
+}

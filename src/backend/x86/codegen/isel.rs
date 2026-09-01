@@ -885,6 +885,113 @@ pub fn lower_cond_branch(
 
 /// Check if an IR instruction can be lowered to MachInst.
 /// Instructions that can't are emitted as Raw passthrough via the existing codegen.
+/// Per-run ISel coverage census, printed at process exit when
+/// `CCC_ISEL_STATS=1`.
+///
+/// "How much of codegen actually flows through MachInst?" is the structural
+/// health metric for this layer, and it was previously unmeasurable: the
+/// fallback to direct text emission is silent, so a shrinking coverage
+/// fraction -- or a whole instruction class nobody noticed was excluded --
+/// looks exactly like everything being fine. The counters make the gap
+/// visible and rank it, so work targets the biggest class rather than the
+/// most obvious one.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    pub static LOWERED: AtomicU64 = AtomicU64::new(0);
+    pub static REJECTED: AtomicU64 = AtomicU64::new(0);
+
+    static BY_KIND: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
+    }
+
+    pub fn note_reject(kind: &'static str) {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut v) = BY_KIND.lock() {
+            match v.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => *n += 1,
+                None => v.push((kind, 1)),
+            }
+        }
+    }
+
+    /// Print the census. Call once, at the end of compilation.
+    pub fn report() {
+        if !enabled() {
+            return;
+        }
+        let lowered = LOWERED.load(Ordering::Relaxed);
+        let rejected = REJECTED.load(Ordering::Relaxed);
+        let total = lowered + rejected;
+        if total == 0 {
+            return;
+        }
+        eprintln!(
+            "[ISEL-STATS] {} of {} instructions lowered through MachInst ({:.1}%)",
+            lowered,
+            total,
+            lowered as f64 * 100.0 / total as f64
+        );
+        if let Ok(mut v) = BY_KIND.lock() {
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            for (kind, n) in v.iter().take(12) {
+                eprintln!(
+                    "[ISEL-STATS]   rejected {:>7}  {} ({:.1}% of all)",
+                    n,
+                    kind,
+                    *n as f64 * 100.0 / total as f64
+                );
+            }
+        }
+    }
+}
+
+/// Discriminant name, for the coverage census.
+fn kind_name(inst: &Instruction) -> &'static str {
+    match inst {
+        Instruction::BinOp { ty, .. } if ty.is_float() => "BinOp(float)",
+        Instruction::BinOp { .. } => "BinOp(other)",
+        Instruction::Load { ty, .. } if ty.is_float() => "Load(float)",
+        Instruction::Load { .. } => "Load(other)",
+        Instruction::Store { ty, .. } if ty.is_float() => "Store(float)",
+        Instruction::Store { .. } => "Store(other)",
+        Instruction::Cmp { ty, .. } if ty.is_float() => "Cmp(float)",
+        Instruction::Cmp { .. } => "Cmp(other)",
+        Instruction::Cast { .. } => "Cast",
+        Instruction::UnaryOp { .. } => "UnaryOp",
+        Instruction::Select { .. } => "Select",
+        Instruction::Call { .. } => "Call",
+        Instruction::CallIndirect { .. } => "CallIndirect",
+        Instruction::Phi { .. } => "Phi",
+        Instruction::Alloca { .. } => "Alloca",
+        Instruction::Intrinsic { .. } => "Intrinsic",
+        Instruction::InlineAsm { .. } => "InlineAsm",
+        Instruction::Memcpy { .. } => "Memcpy",
+        Instruction::AtomicLoad { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicCmpxchg { .. } => "Atomic*",
+        Instruction::ParamRef { .. } => "ParamRef",
+        Instruction::Phi { .. } => "Phi",
+        Instruction::GetElementPtr { .. } => "GetElementPtr",
+        Instruction::GlobalAddr { .. } => "GlobalAddr",
+        Instruction::Copy { .. } => "Copy",
+        Instruction::VaArg { .. } => "VaArg",
+        Instruction::Fence { .. } => "Fence",
+        other => {
+            // Name the remaining variants rather than lumping them into a
+            // bucket that hides the biggest opportunity.
+            let d = format!("{:?}", other);
+            let name = d.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("other");
+            Box::leak(format!("other:{}", name).into_boxed_str())
+        }
+    }
+}
+
 pub fn can_lower(inst: &Instruction) -> bool {
     match inst {
         Instruction::BinOp { ty, .. } => !ty.is_float() && !ty.is_128bit(),
@@ -948,6 +1055,24 @@ pub fn lower_instruction_typed(
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     out: &mut Vec<MachInst>,
 ) -> bool {
+    let lowered = lower_instruction_typed_inner(inst, reg_assignments, alloca_slots, value_types, out);
+    if stats::enabled() {
+        if lowered {
+            stats::LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            stats::note_reject(kind_name(inst));
+        }
+    }
+    lowered
+}
+
+fn lower_instruction_typed_inner(
+    inst: &Instruction,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    alloca_slots: &FxHashMap<u32, i64>,
+    value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
+    out: &mut Vec<MachInst>,
+) -> bool {
     // For values that already have register allocations from the existing
     // allocator, use their physical register directly (MachReg::Phys).
     // The MachInst allocator only handles the remaining Vreg values.
@@ -985,9 +1110,6 @@ pub fn lower_instruction_typed(
             ..
         } => {
             if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
-                return false;
-            }
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
                 return false;
             }
             if *seg_override != AddressSpace::Default {
@@ -1187,17 +1309,33 @@ pub fn lower_instruction_typed(
             lower_gep(dest, base, offset, ra, out);
             true
         }
-        Instruction::GlobalAddr { .. } => {
-            // GlobalAddr needs leaq symbol(%rip) which isn't directly
-            // expressible in MachInst Mov (would produce movq, not leaq).
-            // Handled by the default codegen path for now.
-            false
+        Instruction::GlobalAddr { dest, name, .. } => {
+            // `leaq sym(%rip), %dst`. Previously bailed to the text emitter
+            // because MachInst could not express "address of" as distinct from
+            // "load from"; `LeaSym` now does.
+            out.push(MachInst::LeaSym {
+                sym: name.clone(),
+                dst: value_to_reg(dest, ra),
+            });
+            true
         }
         Instruction::Alloca { .. } => {
             // Alloca produces no code (stack allocated in prologue).
             // Return true to avoid flushing the MachInst buffer.
             true
         }
+        // ParamRef is DELIBERATELY not lowered here, despite being 11.7% of
+        // all instructions and appearing to emit nothing.
+        //
+        // Treating it as a no-op like Alloca fails four corpus tests, all of
+        // them parameter-related (x86_fpo_stack_params_many_args,
+        // nested_nonlocal_goto_callee_saved, pgo_branchy, value_profiling):
+        // a parameter is only already-in-place when it arrived in a register
+        // and kept that home. Stack-passed arguments and nested-function
+        // frames still need the text path to materialize them, and the buffer
+        // flush that `false` triggers is what orders that against surrounding
+        // MachInst code. Lowering ParamRef properly means modelling the
+        // incoming-argument location, not asserting there is nothing to do.
         _ => false,
     }
 }
