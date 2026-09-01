@@ -292,43 +292,65 @@ impl X86Codegen {
             return;
         }
         // POPCNT (0F B8) is #UD on pre-Nehalem/Barcelona x86-64 — it is a
-        // v2 feature, not v1. Baseline fallback: shift each bit into CF and
-        // accumulate with adc, iterating only while bits remain.
+        // v2 feature, not v1. Baseline fallback: the classic O(1) SWAR
+        // Hamming-weight sequence (the same code GCC emits for `__builtin_
+        // popcount` on a baseline target), replacing the previous per-bit
+        // `shr/adc` loop that iterated once per set bit (up to 64 trips —
+        // the largest single benchmark gap on this compiler, ~3.85x on the
+        // bitops kernel).
         //
-        // %rcx is NOT free here: the surrounding accumulator-mode code may
-        // have staged a live value in it (e.g. a 64-bit multiply constant
-        // reused by a following `imulq %rcx`). Preserve it across the loop
-        // with a push/pop pair; the loop body contains no call, so the
-        // transient 8-byte stack excursion is safe at any alignment.
+        // The SWAR form is straight-line and data-independent, so it costs
+        // ~1 round trip regardless of input. It needs scratch registers:
+        //  - 32-bit path uses only %eax (in/out) + %ecx.
+        //  - 64-bit path uses %rax (in/out) + %rcx + %rdx (the full-width
+        //    masks 0x55.., 0x33.., 0x0f.. and 0x0101.. do not fit an imm32,
+        //    so they must be loaded with movabsq into a scratch GPR).
+        // %rcx (and %rdx on the 64-bit path) are NOT free here: the
+        // surrounding accumulator-mode code may have staged live values in
+        // them (e.g. a 64-bit multiply constant reused by a later `imulq`).
+        // Preserve them with push/pop pairs; the sequence contains no call,
+        // so the transient 16-byte stack excursion is safe at any alignment.
         if narrow || matches!(ty, IrType::I32 | IrType::U32) {
             self.state.emit("    pushq %rcx");
-            self.state.emit("    movl %eax, %ecx");
-            self.state.emit("    xorl %eax, %eax");
-            let top = self.state.fresh_label("pop32_loop");
-            let done = self.state.fresh_label("pop32_done");
-            self.state.emit("    testl %ecx, %ecx");
-            self.state.out.emit_jcc_label("    jz", &done);
-            self.state.out.emit_named_label(&top);
-            self.state.emit("    shrl $1, %ecx");
-            self.state.emit("    adcl $0, %eax");
-            self.state.emit("    testl %ecx, %ecx");
-            self.state.out.emit_jcc_label("    jnz", &top);
-            self.state.out.emit_named_label(&done);
+            self.state.emit("    movl %eax, %ecx");   // c = x
+            self.state.emit("    shrl $1, %eax");
+            self.state.emit("    andl $0x55555555, %eax"); // (x>>1)&0x55..
+            self.state.emit("    subl %eax, %ecx");   // c = x - pairs
+            self.state.emit("    movl %ecx, %eax");
+            self.state.emit("    shrl $2, %eax");
+            self.state.emit("    andl $0x33333333, %eax");
+            self.state.emit("    andl $0x33333333, %ecx");
+            self.state.emit("    addl %eax, %ecx");   // c = nibble counts
+            self.state.emit("    movl %ecx, %eax");
+            self.state.emit("    shrl $4, %eax");
+            self.state.emit("    addl %ecx, %eax");
+            self.state.emit("    andl $0x0f0f0f0f, %eax"); // byte counts
+            self.state.emit("    imull $0x01010101, %eax, %eax"); // *0x01010101
+            self.state.emit("    shrl $24, %eax");    // top byte = popcount
             self.state.emit("    popq %rcx");
         } else {
             self.state.emit("    pushq %rcx");
-            self.state.emit("    movq %rax, %rcx");
-            self.state.emit("    xorl %eax, %eax");
-            let top = self.state.fresh_label("pop64_loop");
-            let done = self.state.fresh_label("pop64_done");
-            self.state.emit("    testq %rcx, %rcx");
-            self.state.out.emit_jcc_label("    jz", &done);
-            self.state.out.emit_named_label(&top);
-            self.state.emit("    shrq $1, %rcx");
-            self.state.emit("    adcq $0, %rax");
-            self.state.emit("    testq %rcx, %rcx");
-            self.state.out.emit_jcc_label("    jnz", &top);
-            self.state.out.emit_named_label(&done);
+            self.state.emit("    pushq %rdx");
+            self.state.emit("    movq %rax, %rcx");   // c = x
+            self.state.emit("    shrq $1, %rax");
+            self.state.emit("    movabsq $0x5555555555555555, %rdx");
+            self.state.emit("    andq %rdx, %rax");   // (x>>1)&0x55..
+            self.state.emit("    subq %rax, %rcx");   // c = x - pairs
+            self.state.emit("    movq %rcx, %rax");
+            self.state.emit("    shrq $2, %rax");
+            self.state.emit("    movabsq $0x3333333333333333, %rdx");
+            self.state.emit("    andq %rdx, %rax");
+            self.state.emit("    andq %rdx, %rcx");
+            self.state.emit("    addq %rax, %rcx");   // c = nibble counts
+            self.state.emit("    movq %rcx, %rax");
+            self.state.emit("    shrq $4, %rax");
+            self.state.emit("    addq %rcx, %rax");
+            self.state.emit("    movabsq $0x0f0f0f0f0f0f0f0f, %rdx");
+            self.state.emit("    andq %rdx, %rax");   // byte counts
+            self.state.emit("    movabsq $0x0101010101010101, %rdx");
+            self.state.emit("    imulq %rdx, %rax");  // *0x0101..0101
+            self.state.emit("    shrq $56, %rax");    // top byte = popcount
+            self.state.emit("    popq %rdx");
             self.state.emit("    popq %rcx");
         }
     }
