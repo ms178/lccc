@@ -697,11 +697,32 @@ impl X86Codegen {
                         self.state.emit("    addq $8, %rsp");
                     }
                 } else if let Some(slot) = self.state.get_slot(v.0) {
-                    if self.state.is_alloca(v.0) {
-                        // Alloca containing a long double; use fldt from alloca
+                    if self.state.is_alloca(v.0)
+                        || !matches!(
+                            self.value_types.get(&v.0),
+                            Some(IrType::F64) | Some(IrType::F32)
+                        )
+                    {
+                        // Slot holding the canonical 80-bit x87 image: use
+                        // fldt. Every F128 producer writes fstpt format into
+                        // 16-byte slots (casts via fldl+fstpt, copies via
+                        // fldt/fstpt, va_arg long double, returns, calls), so
+                        // an F128-typed compare operand must be loaded as
+                        // extended precision. The old unconditional
+                        // movq+fldl here reinterpreted the 80-bit mantissa's
+                        // low quad as an IEEE double bit pattern: 41.0L's
+                        // low quad 0xa400000000000000 became a negative
+                        // denormal, so `v5 != ld` misfired after every
+                        // va_arg(long double) whose result was not registered
+                        // in f128_direct_slots (va-arg-pack-1, both x86
+                        // backends, -O1/-O2).
                         self.state.out.emit_instr_rbp("    fldt", slot.0);
+                        self.state.reg_cache.invalidate_all();
                     } else {
-                        // Regular f64 value in slot; push and fldl
+                        // Provably F32/F64-typed payload reaching an F128
+                        // compare (widening is the lowering's job, but if a
+                        // raw narrow FP value arrives its slot holds the
+                        // IEEE bit pattern); reinterpret via fldl/flds.
                         self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
                         self.state.emit("    subq $8, %rsp");
                         self.state.emit("    movq %rax, (%rsp)");

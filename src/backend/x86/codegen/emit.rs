@@ -1555,6 +1555,27 @@ impl X86Codegen {
                                 .emit_instr_imm_reg("    movabsq", bits as i64, "rax");
                         }
                     }
+                    // Decimal FP bit containers materialize like 64-bit
+                    // integer immediates (BID patterns are opaque bits).
+                    IrConst::D32(v) => {
+                        let bits = *v as u64;
+                        if bits == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movl", *v as i64, "eax");
+                        }
+                    }
+                    IrConst::D64(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %eax, %eax");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", *v as i64, "rax");
+                        }
+                    }
                     IrConst::I128(v) => {
                         // Truncate to low 64 bits for rax-only path
                         let low = *v as i64;
@@ -1868,7 +1889,7 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    movapd %{}, %{}", src_xmm, reg_name));
                 }
-            } else if ty == IrType::F32 {
+            } else if ty == IrType::F32 || ty == IrType::D32 {
                 self.state.emit_fmt(format_args!(
                     "    movd %{}, %{}",
                     src_xmm,
@@ -1882,7 +1903,7 @@ impl X86Codegen {
         }
         if !self.state.is_alloca(dest.0) && !self.state.vector_values.contains(&dest.0) {
             if let Some(slot) = self.state.get_slot(dest.0) {
-                let instr = if ty == IrType::F32 {
+                let instr = if matches!(ty, IrType::F32 | IrType::D32) {
                     "    movss"
                 } else {
                     "    movsd"
@@ -1892,7 +1913,7 @@ impl X86Codegen {
             }
         }
         // Fallback: route through %rax like store_rax_to does.
-        if ty == IrType::F32 {
+        if ty == IrType::F32 || ty == IrType::D32 {
             self.state
                 .emit_fmt(format_args!("    movd %{}, %eax", src_xmm));
         } else {
@@ -2320,6 +2341,26 @@ impl X86Codegen {
                             self.state.out.emit_instr_imm_reg("    movabsq", low, "rcx");
                         }
                     }
+                    // Decimal FP bit containers materialize like integer
+                    // immediates (BID patterns are opaque bits).
+                    IrConst::D32(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movl", *v as i64, "ecx");
+                        }
+                    }
+                    IrConst::D64(v) => {
+                        if *v == 0 {
+                            self.state.emit("    xorl %ecx, %ecx");
+                        } else {
+                            self.state
+                                .out
+                                .emit_instr_imm_reg("    movabsq", *v as i64, "rcx");
+                        }
+                    }
                     IrConst::Zero => self.state.emit("    xorl %ecx, %ecx"),
                 }
             }
@@ -2522,6 +2563,31 @@ impl X86Codegen {
                         self.state.out.emit_instr_rbp_reg("    movl", slot.0, reg32);
                     }
                 }
+            } else if self.state.f128_direct_slots.contains(&val.0)
+                || self.value_types.get(&val.0) == Some(&IrType::F128)
+            {
+                // F128 (long double) value: its 16-byte slot holds the
+                // canonical 80-bit x87 image, whose low quad is the MANTISSA,
+                // not an IEEE double bit pattern. The GP-register view of an
+                // F128 value is its truncated f64 copy (the convention every
+                // producer establishes with fstpl into %rax), so materialise
+                // it by a REAL conversion — fldt + fstpl — instead of a
+                // movq bit-copy of the mantissa. The bit-copy made
+                // 41.0L's low quad 0xa400000000000000 read back as a
+                // negative denormal double: `v5 != ld` misfired and the
+                // (double) print of an intact 41.0L showed -0.0
+                // (va-arg-pack-1, both levels >= O1).
+                self.state.out.emit_instr_rbp("    fldt", slot.0);
+                self.state.emit("    subq $8, %rsp");
+                self.state.emit("    fstpl (%rsp)");
+                if reg == "rax" {
+                    self.state.emit("    popq %rax");
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq (%rsp), %{}", reg));
+                    self.state.emit("    addq $8, %rsp");
+                }
+                self.state.reg_cache.set_acc(val.0, false);
             } else {
                 self.state.out.emit_instr_rbp_reg("    movq", slot.0, reg);
             }

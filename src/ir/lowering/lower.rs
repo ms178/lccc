@@ -20,7 +20,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
-    DerivedDeclarator, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit, TypeSpecifier,
+    self, DerivedDeclarator, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
@@ -1118,7 +1118,7 @@ impl Lowerer {
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
         let mut ret_is_f128_sse = false;
-        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128) {
+        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
             ret_is_f128_sse = true;
             vec![
                 crate::common::types::EightbyteClass::Sse,
@@ -1222,7 +1222,7 @@ impl Lowerer {
                     Some(CType::ComplexDouble.size())
                 } else if !decomposes_cf && matches!(ctype, CType::ComplexFloat) {
                     Some(CType::ComplexFloat.size())
-                } else if matches!(ctype, CType::Float128) {
+                } else if matches!(ctype, CType::Float128) || ctype == CType::Decimal128 {
                     // _Float128 is passed as a 16-byte SSE-class value (SysV psABI).
                     Some(16)
                 } else {
@@ -1237,7 +1237,9 @@ impl Lowerer {
             .enumerate()
             .map(|(i, p)| {
                 if param_struct_sizes.get(i).copied().flatten().is_some() {
-                    if matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128) {
+                    if matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
+                        || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
+                    {
                         vec![
                             crate::common::types::EightbyteClass::Sse,
                             crate::common::types::EightbyteClass::Sse,
@@ -1256,7 +1258,7 @@ impl Lowerer {
         // _Float128 params: ONE 16-byte XMM register per arg (SysV psABI).
         let param_is_f128_sse: Vec<bool> = params
             .iter()
-            .map(|p| matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128))
+            .map(|p| matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128) || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128)
             .collect();
 
         // Compute RISC-V LP64D float field classification for struct params
@@ -1911,6 +1913,12 @@ impl Lowerer {
         target_ct: &CType,
     ) -> Operand {
         use crate::common::types::CType;
+        // C23 decimal floating point: any conversion touching a decimal type
+        // is a genuine value conversion through the libbid helpers — bit-cast
+        // machinery must never see decimal carriers.
+        if target_ct.is_decimal() || src_ct.is_decimal() {
+            return self.convert_decimal_scalar(src, src_ty, src_ct, target_ct);
+        }
         if *target_ct == CType::Float128 {
             // A source that is ALREADY the 128-bit carrier — an I128 constant
             // payload (a `1.5F128` literal or a `__builtin_*f128` result) or a
@@ -2545,4 +2553,379 @@ pub(super) fn is_x86_register_name(name: &str) -> bool {
         "ymm11", "ymm12", "ymm13", "ymm14", "ymm15",
     ];
     REGS.contains(&name)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// C23 decimal floating point (_Decimal32/_Decimal64/_Decimal128, IEEE 754-2008
+// BID encoding). Every operation is lowered to the libbid helper family that
+// GCC's own DFP lowering calls, so lccc is ABI- and semantics-compatible with
+// GCC-compiled DFP code and links against the same libgcc.a archives.
+//
+// Carrier mapping (mirrors the _Float128 strategy):
+//   _Decimal32  -> IrType::D32  (SSE-class bit container on x86-64)
+//   _Decimal64  -> IrType::D64  (SSE-class bit container on x86-64)
+//   _Decimal128 -> IrType::U128 carrier with the f128_sse ABI flags
+//                  (16-byte single-XMM class, identical to GCC's TDmode)
+// ─────────────────────────────────────────────────────────────────────────────
+impl Lowerer {
+    /// Width (32/64/128) of a decimal C type, or None for non-decimal types.
+    pub(super) fn decimal_width(ct: &CType) -> Option<u8> {
+        match ct {
+            CType::Decimal32 => Some(32),
+            CType::Decimal64 => Some(64),
+            CType::Decimal128 => Some(128),
+            _ => None,
+        }
+    }
+
+    /// libbid three-letter suffix for a decimal width: sd / dd / td.
+    fn dec_suffix(width: u8) -> &'static str {
+        match width {
+            32 => "sd",
+            64 => "dd",
+            _ => "td",
+        }
+    }
+
+    /// IR carrier type for a decimal width.
+    fn dec_ty(width: u8) -> IrType {
+        match width {
+            32 => IrType::D32,
+            64 => IrType::D64,
+            _ => IrType::U128,
+        }
+    }
+
+    /// libbid suffix for an integer width: si (i32) / di (i64) / ti (i128).
+    fn int_suffix(ty: IrType) -> &'static str {
+        match ty {
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => "si",
+            IrType::I64 | IrType::U64 => "di",
+            _ => "ti",
+        }
+    }
+
+    /// Emit a libbid helper call with decimal-aware ABI marking.
+    /// `args`: (value, IR carrier type, is_decimal128) triples. 128-bit
+    /// decimal operands are spilled to 16-byte temps exactly like _Float128
+    /// (single-XMM class); D32/D64 operands pass directly.
+    pub(super) fn emit_decimal_call(
+        &mut self,
+        helper: &str,
+        args: Vec<(Operand, IrType, bool)>,
+        ret: IrType,
+        ret_is_decimal128: bool,
+    ) -> Value {
+        let mut vals = Vec::with_capacity(args.len());
+        let mut tys = Vec::with_capacity(args.len());
+        let mut infos = Vec::with_capacity(args.len());
+        for (op, ty, is128) in args {
+            if is128 {
+                infos.push(Self::f128_arg_info());
+            } else {
+                infos.push(None);
+            }
+            vals.push(op);
+            tys.push(ty);
+        }
+        let ret_classes = if ret_is_decimal128 {
+            Self::f128_ret_classes()
+        } else {
+            Vec::new()
+        };
+        self.emit_softfloat_call(helper, vals, tys, infos, ret, ret_classes, ret_is_decimal128)
+    }
+
+    /// Convert an operand of C type `src_ct` into decimal type `dst_ct`
+    /// (width `dst_w`) via the libbid conversion helpers.
+    fn convert_to_decimal(&mut self, src: Operand, src_ct: &CType, dst_w: u8) -> Operand {
+        use crate::common::types::target_ptr_size;
+        let d = Self::dec_suffix(dst_w);
+        let dst_ty = Self::dec_ty(dst_w);
+        // Identity: same-width decimal carrier (constants or variables).
+        if Self::decimal_width(src_ct) == Some(dst_w) {
+            return src;
+        }
+        // Integer source: __bid_float{si,di,ti}{sd,dd,td} / floatuns*.
+        if src_ct.is_integer() {
+            let src_ty = IrType::from_ctype(src_ct);
+            // Narrow integer constants ride as I32/I64; use the operand's IR
+            // width for the helper family so char/short widen correctly.
+            let eff_ty = match src {
+                Operand::Const(IrConst::I64(_)) => IrType::I64,
+                Operand::Const(IrConst::I128(_)) => IrType::I128,
+                _ => src_ty,
+            };
+            let is128 = matches!(eff_ty, IrType::I128 | IrType::U128);
+            let s = Self::int_suffix(eff_ty);
+            let uns = if src_ct.is_unsigned() { "uns" } else { "" };
+            let helper = format!("__bid_float{uns}{s}{d}");
+            let v = self.emit_decimal_call(
+                &helper,
+                vec![(src, eff_ty, false)],
+                dst_ty,
+                dst_w == 128,
+            );
+            return Operand::Value(v);
+        }
+        // Decimal source (different width): extend/trunc family.
+        if let Some(sw) = Self::decimal_width(src_ct) {
+            let s = Self::dec_suffix(sw);
+            let helper = if sw < dst_w {
+                format!("__bid_extend{s}{d}2")
+            } else {
+                format!("__bid_trunc{s}{d}2")
+            };
+            let v = self.emit_decimal_call(
+                &helper,
+                vec![(src, Self::dec_ty(sw), sw == 128)],
+                dst_ty,
+                dst_w == 128,
+            );
+            return Operand::Value(v);
+        }
+        // Binary float source: sf/df/xf/tf -> {sd,dd,td}.
+        let s = match src_ct {
+            CType::Float => "sf",
+            CType::Double => "df",
+            CType::LongDouble => "xf",
+            CType::Float128 => "tf",
+            _ => "df",
+        };
+        // Ground-truth helper names from the libbid symbol table (GCC 16):
+        // widening vs narrowing follows GCC's own naming.
+        let helper = match (s, d) {
+            ("sf", "sd") => "__bid_extendsfsd".to_string(),
+            ("df", "sd") => "__bid_truncdfsd".to_string(),
+            ("xf", "sd") => "__bid_truncxfsd".to_string(),
+            ("tf", "sd") => "__bid_trunctfsd".to_string(),
+            ("sf", "dd") => "__bid_extendsfdd".to_string(),
+            ("df", "dd") => "__bid_extenddfdd".to_string(),
+            ("xf", "dd") => "__bid_truncxfdd".to_string(),
+            ("tf", "dd") => "__bid_trunctfdd".to_string(),
+            ("sf", "td") => "__bid_extendsftd".to_string(),
+            ("df", "td") => "__bid_extenddftd".to_string(),
+            ("xf", "td") => "__bid_extendxftd".to_string(),
+            ("tf", "td") => "__bid_extendtftd".to_string(),
+            _ => format!("__bid_extend{s}{d}2"),
+        };
+        let src_ty = match src_ct {
+            CType::Float => IrType::F32,
+            CType::Double => IrType::F64,
+            CType::LongDouble => IrType::F128,
+            CType::Float128 => IrType::U128,
+            _ => IrType::F64,
+        };
+        // xf (x87 long double) args/rets use the F128 memory class.
+        let arg_is_128 = src_ty == IrType::U128;
+        let v = self.emit_decimal_call(&helper, vec![(src, src_ty, arg_is_128)], dst_ty, dst_w == 128);
+        let _ = target_ptr_size();
+        Operand::Value(v)
+    }
+
+    /// Convert a decimal operand (width `src_w`) to a non-decimal C type.
+    fn convert_from_decimal(&mut self, src: Operand, src_w: u8, target_ct: &CType) -> Operand {
+        let s = Self::dec_suffix(src_w);
+        let src_ty = Self::dec_ty(src_w);
+        // Decimal -> integer: __bid_fix{,uns}{sd,dd,td}{si,di,ti}.
+        if target_ct.is_integer() {
+            let dst_ty = IrType::from_ctype(target_ct);
+            let d = Self::int_suffix(dst_ty);
+            let uns = if target_ct.is_unsigned() { "uns" } else { "" };
+            let helper = format!("__bid_fix{uns}{s}{d}");
+            let ret128 = matches!(dst_ty, IrType::I128 | IrType::U128);
+            let v = self.emit_decimal_call(
+                &helper,
+                vec![(src, src_ty, src_w == 128)],
+                dst_ty,
+                false,
+            );
+            return Operand::Value(v);
+        }
+        // Decimal -> binary float: {sd,dd,td} -> sf/df/xf/tf.
+        let d = match target_ct {
+            CType::Float => "sf",
+            CType::Double => "df",
+            CType::LongDouble => "xf",
+            CType::Float128 => "tf",
+            _ => "df",
+        };
+        let helper = match (s, d) {
+            ("sd", "sf") => "__bid_truncsdsf".to_string(),
+            ("sd", "df") => "__bid_truncsddf".to_string(),
+            ("sd", "xf") => "__bid_extendsdxf".to_string(),
+            ("sd", "tf") => "__bid_extendsdtf".to_string(),
+            ("dd", "sf") => "__bid_truncddsf".to_string(),
+            ("dd", "df") => "__bid_truncdddf".to_string(),
+            ("dd", "xf") => "__bid_extendddxf".to_string(),
+            ("dd", "tf") => "__bid_extendddtf".to_string(),
+            ("td", "sf") => "__bid_trunctdsf".to_string(),
+            ("td", "df") => "__bid_trunctddf".to_string(),
+            ("td", "xf") => "__bid_trunctdxf".to_string(),
+            ("td", "tf") => "__bid_trunctdtf".to_string(),
+            _ => format!("__bid_trunc{s}{d}"),
+        };
+        let ret_ty = match target_ct {
+            CType::Float => IrType::F32,
+            CType::Double => IrType::F64,
+            CType::LongDouble => IrType::F128,
+            CType::Float128 => IrType::U128,
+            _ => IrType::F64,
+        };
+        let ret_is_128 = ret_ty == IrType::U128;
+        let v = self.emit_decimal_call(
+            &helper,
+            vec![(src, src_ty, src_w == 128)],
+            ret_ty,
+            ret_is_128,
+        );
+        Operand::Value(v)
+    }
+
+    /// Full decimal-aware scalar conversion dispatcher (CType-level).
+    pub(super) fn convert_decimal_scalar(
+        &mut self,
+        src: Operand,
+        src_ty: IrType,
+        src_ct: &CType,
+        target_ct: &CType,
+    ) -> Operand {
+        // Identity within the same decimal type: bit-exact move.
+        if Self::decimal_width(src_ct).is_some() && src_ct == target_ct {
+            return src;
+        }
+        if let Some(dw) = Self::decimal_width(target_ct) {
+            if Self::decimal_width(src_ct).is_none() && !src_ct.is_integer() && !src_ct.is_floating()
+            {
+                // Pointer/aggregate source: not a valid decimal conversion;
+                // fall through to the generic bit-cast machinery, which
+                // produces the appropriate diagnostic downstream.
+                let target_ty = IrType::from_ctype(target_ct);
+                return self.emit_implicit_cast(src, src_ty, target_ty);
+            }
+            return self.convert_to_decimal(src, src_ct, dw);
+        }
+        if let Some(sw) = Self::decimal_width(src_ct) {
+            return self.convert_from_decimal(src, sw, target_ct);
+        }
+        unreachable!("convert_decimal_scalar requires a decimal side")
+    }
+
+    /// Lower a decimal arithmetic/comparison binary operation. `lhs`/`rhs`
+    /// have already been checked to involve at least one decimal operand.
+    pub(super) fn lower_decimal_binop(
+        &mut self,
+        op: &ast::BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Operand {
+        let lhs_ct = self.expr_ctype(lhs);
+        let rhs_ct = self.expr_ctype(rhs);
+        // Common type per the C23 usual arithmetic conversions (decimal
+        // hierarchy; integers convert to the decimal operand's type).
+        let common_ct = CType::usual_arithmetic_conversion(&lhs_ct, &rhs_ct);
+        let Some(w) = Self::decimal_width(&common_ct) else {
+            // Decimal mixed with binary float: binary float wins per our UAC
+            // rule; fall back to the generic arithmetic lowering, which
+            // performs the binary-float conversions through convert_scalar_ctype.
+            return self.lower_arithmetic_binop(op, lhs, rhs);
+        };
+        let lval = self.lower_expr(lhs);
+        let rval = self.lower_expr(rhs);
+        let l = self.convert_decimal_scalar(lval, self.get_expr_type(lhs), &lhs_ct, &common_ct);
+        let r = self.convert_decimal_scalar(rval, self.get_expr_type(rhs), &rhs_ct, &common_ct);
+        let s = Self::dec_suffix(w);
+        let arg_l = (l.clone(), Self::dec_ty(w), w == 128);
+        let arg_r = (r, Self::dec_ty(w), w == 128);
+        match op {
+            ast::BinOp::Add => {
+                let v = self.emit_decimal_call(&format!("__bid_add{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                Operand::Value(v)
+            }
+            ast::BinOp::Sub => {
+                let v = self.emit_decimal_call(&format!("__bid_sub{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                Operand::Value(v)
+            }
+            ast::BinOp::Mul => {
+                let v = self.emit_decimal_call(&format!("__bid_mul{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                Operand::Value(v)
+            }
+            ast::BinOp::Div => {
+                let v = self.emit_decimal_call(&format!("__bid_div{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                Operand::Value(v)
+            }
+            ast::BinOp::Eq | ast::BinOp::Ne | ast::BinOp::Lt | ast::BinOp::Le | ast::BinOp::Gt | ast::BinOp::Ge => {
+                // libbid comparisons return a three-way int (-1/0/1); normalize
+                // against zero exactly like GCC's boolean lowering.
+                let name = match op {
+                    ast::BinOp::Eq => format!("__bid_eq{s}2"),
+                    ast::BinOp::Ne => format!("__bid_ne{s}2"),
+                    ast::BinOp::Lt => format!("__bid_lt{s}2"),
+                    ast::BinOp::Le => format!("__bid_le{s}2"),
+                    ast::BinOp::Gt => format!("__bid_gt{s}2"),
+                    _ => format!("__bid_ge{s}2"),
+                };
+                let v = self.emit_decimal_call(&name, vec![arg_l, arg_r], IrType::I32, false);
+                let cmp_op = match op {
+                    ast::BinOp::Eq => IrCmpOp::Eq,
+                    ast::BinOp::Ne => IrCmpOp::Ne,
+                    ast::BinOp::Lt => IrCmpOp::Slt,
+                    ast::BinOp::Le => IrCmpOp::Sle,
+                    ast::BinOp::Gt => IrCmpOp::Sgt,
+                    _ => IrCmpOp::Sge,
+                };
+                let z = self.emit_cmp_val(
+                    cmp_op,
+                    Operand::Value(v),
+                    Operand::Const(IrConst::I64(0)),
+                    IrType::I32,
+                );
+                Operand::Value(z)
+            }
+            _ => {
+                // Remainder/bitwise on decimals is invalid C; defer to the
+                // generic path so sema diagnostics surface unchanged.
+                self.lower_arithmetic_binop(op, lhs, rhs)
+            }
+        }
+    }
+
+    /// Truthiness test for a decimal operand (`x != 0` under decimal
+    /// semantics, where +0 == -0). Used by conditions and logical operators.
+    pub(super) fn lower_decimal_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+        let Some(w) = Self::decimal_width(ct) else {
+            return val;
+        };
+        let s = Self::dec_suffix(w);
+        let zero: Operand = match w {
+            32 => Operand::Const(IrConst::D32(Self::dec_zero32())),
+            64 => Operand::Const(IrConst::D64(Self::dec_zero64())),
+            _ => Operand::Const(IrConst::I128(Self::dec_zero128())),
+        };
+        let v = self.emit_decimal_call(
+            &format!("__bid_ne{s}2"),
+            vec![(val, Self::dec_ty(w), w == 128), (zero, Self::dec_ty(w), w == 128)],
+            IrType::I32,
+            false,
+        );
+        let z = self.emit_cmp_val(
+            IrCmpOp::Ne,
+            Operand::Value(v),
+            Operand::Const(IrConst::I64(0)),
+            IrType::I32,
+        );
+        Operand::Value(z)
+    }
+
+    /// Canonical +0 encodings (biased exponent, zero coefficient) — the
+    /// exact bit patterns GCC emits for `0.DF/0.DD/0.DL` literals.
+    fn dec_zero32() -> u32 {
+        (96u32) << 23 // bias 96
+    }
+    fn dec_zero64() -> u64 {
+        (398u64) << 53 // bias 398
+    }
+    fn dec_zero128() -> i128 {
+        ((6176u128) << 49) as i128 // bias 6176
+    }
 }

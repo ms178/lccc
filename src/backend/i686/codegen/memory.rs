@@ -210,7 +210,7 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 || ty == IrType::D64 {
             let mut addr = self.state.resolve_slot_addr(ptr.0);
             // Base homed in %eax/%edx dies when the VALUE pair is staged
             // into the accumulator below. Stash such a base into the %ecx
@@ -305,7 +305,7 @@ impl I686Codegen {
             }
             return;
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 || ty == IrType::D64 {
             let addr = self.state.resolve_slot_addr(ptr.0);
             if let Some(addr) = addr {
                 match addr {

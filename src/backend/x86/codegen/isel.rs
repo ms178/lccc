@@ -59,6 +59,8 @@ fn const_to_i64(c: &IrConst) -> i64 {
         // Float/i128/LongDouble constants: use bit representation
         IrConst::F32(v) => v.to_bits() as i64,
         IrConst::F64(v) => v.to_bits() as i64,
+        IrConst::D32(v) => *v as i64,
+        IrConst::D64(v) => *v as i64,
         IrConst::LongDouble(v, _) => v.to_bits() as i64,
         IrConst::I128(v) => *v as i64, // truncate to low 64 bits
     }
@@ -981,7 +983,6 @@ fn kind_name(inst: &Instruction) -> &'static str {
         Instruction::Select { .. } => "Select",
         Instruction::Call { .. } => "Call",
         Instruction::CallIndirect { .. } => "CallIndirect",
-        Instruction::Phi { .. } => "Phi",
         Instruction::Alloca { .. } => "Alloca",
         Instruction::Intrinsic { .. } => "Intrinsic",
         Instruction::InlineAsm { .. } => "InlineAsm",

@@ -1,6 +1,7 @@
 pub(crate) mod asm_constraints;
 pub(crate) mod const_arith;
 pub(crate) mod const_eval;
+pub(crate) mod decimal;
 pub(crate) mod encoding;
 pub(crate) mod error;
 pub(crate) mod fp_contract;

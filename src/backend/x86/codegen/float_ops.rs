@@ -24,7 +24,9 @@ impl X86Codegen {
     /// for constants and values without a home.
 
     pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
-        let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+        // Decimal carriers are bit containers: D64 moves exactly like a
+        // 64-bit double (movsd), D32 like a 32-bit float (movss).
+        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) { "movsd" } else { "movss" };
         if let Operand::Value(v) = op {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if is_xmm_reg(reg) {
@@ -64,9 +66,27 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
                 }
             }
+            Operand::Const(IrConst::D64(v)) => {
+                if *v == 0 {
+                    self.state.emit("    xorpd %xmm0, %xmm0");
+                } else {
+                    let label = self.state.get_fp_const_label(*v);
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %xmm0", label));
+                }
+            }
+            Operand::Const(IrConst::D32(v)) => {
+                if *v == 0 {
+                    self.state.emit("    xorps %xmm0, %xmm0");
+                } else {
+                    let label = self.state.get_fp_const_label(*v as u64);
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %xmm0", label));
+                }
+            }
             _ => {
                 self.operand_to_rax(op);
-                if ty == IrType::F32 {
+                if matches!(ty, IrType::F32 | IrType::D32) {
                     self.state.emit("    movd %eax, %xmm0");
                 } else {
                     self.state.emit("    movq %rax, %xmm0");
@@ -80,7 +100,7 @@ impl X86Codegen {
     /// home first (mirrors load_fp_to_xmm0; the result stays in the XMM domain).
 
     pub(super) fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
-        let mov_instr = if ty == IrType::F64 { "movsd" } else { "movss" };
+        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) { "movsd" } else { "movss" };
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name(reg);
@@ -99,7 +119,7 @@ impl X86Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
-        if ty == IrType::F32 {
+        if matches!(ty, IrType::F32 | IrType::D32) {
             self.state.emit("    movd %xmm0, %eax");
         } else {
             self.state.emit("    movq %xmm0, %rax");
@@ -976,6 +996,28 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    xorps %{}, %{}", xmm, xmm));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
+                    self.state
+                        .emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
+                }
+            }
+            // Decimal BID bit patterns: opaque bits through the same
+            // constant-pool / GPR-shuttle machinery as F64/F32.
+            Operand::Const(IrConst::D64(v)) => {
+                if *v == 0 {
+                    self.state
+                        .emit_fmt(format_args!("    xorpd %{}, %{}", xmm, xmm));
+                } else {
+                    let label = self.state.get_fp_const_label(*v);
+                    self.state
+                        .emit_fmt(format_args!("    movsd {}(%rip), %{}", label, xmm));
+                }
+            }
+            Operand::Const(IrConst::D32(v)) => {
+                if *v == 0 {
+                    self.state
+                        .emit_fmt(format_args!("    xorps %{}, %{}", xmm, xmm));
+                } else {
+                    let label = self.state.get_fp_const_label(*v as u64);
                     self.state
                         .emit_fmt(format_args!("    movss {}(%rip), %{}", label, xmm));
                 }
