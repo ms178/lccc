@@ -43,6 +43,8 @@ See [`LICENSING.md`](LICENSING.md) for the full breakdown and per-file guidance.
   [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md);
   decision & negative-results ledger:
   [`engineering/DECISIONS.md`](engineering/DECISIONS.md).
+- **Engineering backlog:** [`backlog.md`](backlog.md) — ranked by measured
+  impact, with reproducer and blocker per item
 - **Benchmarks:** [`docs/benchmarks.md`](docs/benchmarks.md) · canonical runner:
   `tests/benchmark/run_benchmarks.py`
 
@@ -61,16 +63,21 @@ Repo: https://github.com/ms178/lccc
 
 | Compiler | Revision | Notes |
 |---|---|---|
-| **LCCC (ms178)** | `main` @ `1b3994e7` | segment-aware regalloc + Tier-2 graph coloring, general complete unrolling, VEX 3-operand scalar-FP, widening + masked conditional-sum reduction vectorization, stencil/map vectorizers, FMA3 ISA gate + tri-state FP contraction, DSE, backedge PRE, opt-in loop rotation, peephole SP-displacement model, canonical-GEP vectorizer gate |
-| **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference |
+| **LCCC (ms178)** | `main` @ `be93d266` | previous report plus: order-preserving block layout, machine-level loop inversion, escaping-IV widening, the vectorized-loop-counter fix, register-copy folding at all four widths, `range_fold` boolean-widening repair, and MachInst instruction selection at 85.1% coverage |
+| **GCC** | 14.2.0 (Debian 14.2.0-19) | external reference, stock |
 
-`-O2`, identical sources, same machine, same run window (2026-08-28). Driver:
-`tests/benchmark/run_benchmarks.py` (canonical runner) — 15 paired timed
-rounds + 2 excluded warm-ups per kernel (`hash_table`: 8 + 1 for the VM
-window budget; realized CI ±0.5 %, CV 5.5 %, one MAD outlier retained — see
-evidence), randomized compiler order in every round. Frozen raw JSON +
-independently verified merge:
-[`engineering/evidence/benchmarks/2026-08-28-1b3994e7/`](engineering/evidence/benchmarks/2026-08-28-1b3994e7/README.md).
+`-O2`, identical sources, same machine, same run window (2026-09-01). Driver:
+`tests/benchmark/run_benchmarks.py` — 9 paired timed rounds + 1 excluded
+warm-up per kernel, randomized compiler order every round, MAD outliers
+**retained and reported, never silently discarded**. All 33 outputs are
+byte-identical to the GCC baseline; a checksum mismatch disqualifies the row
+before any timing is recorded. Frozen raw JSON with every per-round sample:
+[`engineering/evidence/benchmarks/2026-09-01-be93d266/`](engineering/evidence/benchmarks/2026-09-01-be93d266/README.md).
+
+> **Ratios are not comparable across reports.** A ratio is only stable when
+> both arms were measured in the same window; drift on a shared VM that hits
+> the two compilers unequally moves it. Attribution of any individual change
+> must come from a paired same-window A/B with kill switches.
 
 ## Results (33 kernels; ratio = LCCC/GCC, < 1 means LCCC faster)
 
@@ -87,86 +94,92 @@ byte-identical to GCC.
 
 | Kernel | What it stresses | LCCC (ms) | GCC (ms) | LCCC/GCC |
 |---|---|---:|---:|---:|
-| `fib` † | binary recursion → rec2iter | 1.2 | 129.7 | **0.010** (104.7× faster) |
-| `constant_recursion` † | constant recursive specialization | 1.0 | 61.3 | **0.016** (~61× faster) |
-| `ackermann` † | deep recursion | 1.1 | 61.6 | **0.018** (~56× faster) |
-| `libm_round_family` | libm round intrinsics | 202.4 | 490.8 | **0.413** (2.42× faster) |
-| `bitops` | integer selection, popcount idioms | 167.7 | 299.7 | **0.558** (1.79× faster) |
-| `gzip_crc32` | gzip CRC-32 table loop | 135.5 | 155.3 | **0.873** (1.15× faster) |
-| `matmul` | loop-nest FP + reduction FMA | 5.3 | 5.6 | **0.938** |
-| `double_reduction` | two independent FP reductions | 105.4 | 109.8 | **0.955** |
-| `qsort` | libc branches | 109.3 | 112.5 | **0.974** |
-| `switch_dispatch` | switch lowering | 466.6 | 477.9 | **0.975** |
-| `binary_search` † | branch-heavy lookup | 1.0 | 1.0 | **0.991** |
-| `tce_sum` † | tail-recursive accumulator | 0.8 | 0.8 | **1.003** |
-| `glibc_memcmp` | aligned-word memcmp path | 6.1 | 5.9 | **1.030** |
-| `ring_fifo` † | masked ring FIFO, dependent loads | 0.9 | 0.9 | **1.040** |
-| `strlen_bench` | string byte loops | 217.4 | 210.1 | **1.041** |
-| `histogram` † | indexed increment/reduction | 1.6 | 1.5 | **1.048** |
-| `binary_trees` | allocation + recursion | 2071.7 | 1953.6 | **1.057** |
-| `loop_patterns` | scalar loop transforms | 45.7 | 43.6 | **1.059** |
-| `ascii_case_fold` † | ASCII case-fold byte loop | 0.9 | 0.9 | **1.066** |
-| `hash_table` | pointer chasing | 21179.3 | 19549.1 | **1.090** |
-| `aarch64_select_patterns` | select/compare pressure | 123.7 | 106.3 | **1.165** |
-| `sqlite_varint` | varint decoder | 26.1 | 21.5 | **1.192** |
-| `sieve` | branchy int stores | 49.9 | 42.0 | **1.200** |
-| `arith_loop` | 32-variable register pressure | 114.0 | 92.6 | **1.227** |
-| `mandelbrot` | FP branch-heavy loop | 1102.7 | 894.4 | **1.232** |
-| `nbody` | N-body FP structs | 264.0 | 214.5 | **1.233** |
-| `fannkuch` | permutations | 2880.4 | 2259.6 | **1.274** |
-| `spectral_norm` | dense FP | 237.3 | 181.7 | **1.305** |
-| `struct_copy` | struct copy / ABI | 29.7 | 21.8 | **1.346** |
-| `zlib_ng_adler32` | Adler-32 DO8 kernel | 56.3 | 37.4 | **1.504** |
-| `linux_find_bit` | sparse bit search | 15.3 | 10.1 | **1.508** |
-| `expat_xml_scan` | XML name-token scan | 62.8 | 34.9 | **1.803** |
-| `tls_seg_access` | glibc TLS access shapes (`%fs`) | 19.6 | 9.1 | **2.146** |
+| `fib` | recursive Fibonacci / recurrence recognition | 2.5 | 176.5 | **0.014** (73.13× faster) |
+| `constant_recursion` | constant recursive specialization | 2.3 | 149.5 | **0.015** (64.59× faster) |
+| `ackermann` | Ackermann / deep recursion | 2.4 | 149.7 | **0.016** (63.39× faster) |
+| `libm_round_family` | glibc libm scalar rounding entry points (vroundsd inline) | 255.3 | 1116.0 | **0.230** (4.35× faster) |
+| `matmul` | dense matrix multiply / FP and cache | 5.4 | 7.3 | **0.747** (1.34× faster) |
+| `bitops` | bit manipulation / integer selection | 299.4 | 389.9 | **0.767** (1.30× faster) |
+| `double_reduction` | two independent accumulators per loop (multi-reduction) | 97.5 | 111.1 | **0.874** (1.14× faster) |
+| `gzip_crc32` | GNU gzip CRC-32 scalar table loop | 161.7 | 170.1 | **0.950** (1.05× faster) |
+| `binary_search` | sorted-table binary search / branch-heavy lookup | 2.2 | 2.2 | **0.994** |
+| `ring_fifo` | masked ring FIFO enqueue/dequeue / dependent loads | 2.1 | 2.1 | **1.001** |
+| `qsort` | quicksort via libc / branches | 128.7 | 126.6 | **1.011** |
+| `tce_sum` | tail-recursive accumulator / TCE | 2.2 | 2.3 | **1.013** |
+| `mandelbrot` | Mandelbrot / FP branch-heavy inner loop | 1564.2 | 1504.8 | **1.038** (1.04× slower) |
+| `strlen_bench` | string operations / byte loops | 241.3 | 237.9 | **1.041** (1.04× slower) |
+| `linux_find_bit` | Linux sparse find_next_andnot_bit | 15.4 | 14.8 | **1.045** (1.04× slower) |
+| `ascii_case_fold` | ASCII parser case-fold byte loop / branch selection | 2.4 | 2.3 | **1.049** (1.05× slower) |
+| `switch_dispatch` | switch lowering / dispatch | 539.8 | 510.9 | **1.051** (1.05× slower) |
+| `sieve` | sieve of Eratosthenes / stores | 40.1 | 37.9 | **1.052** (1.05× slower) |
+| `histogram` | 256-bin histogram / indexed increment and reduction | 2.6 | 2.5 | **1.065** (1.07× slower) |
+| `binary_trees` | binary trees / allocation and recursion | 1437.5 | 1317.0 | **1.087** (1.09× slower) |
+| `fannkuch` | Fannkuch-Redux / permutations | 2983.7 | 2561.7 | **1.166** (1.17× slower) |
+| `hash_table` | hash table / pointer chasing | 12035.6 | 10399.2 | **1.181** (1.18× slower) |
+| `loop_patterns` | scalar loop transforms | 85.4 | 71.4 | **1.195** (1.20× slower) |
+| `zlib_ng_adler32` | zlib-ng Adler-32 NMAX accumulator | 50.2 | 39.6 | **1.239** (1.24× slower) |
+| `sqlite_varint` | SQLite 1–9 byte varint decoder | 34.4 | 27.1 | **1.250** (1.25× slower) |
+| `nbody` | N-body simulation / FP structs | 396.8 | 306.6 | **1.281** (1.28× slower) |
+| `aarch64_select_patterns` | conditional increment, narrow compare, and select pressure | 170.5 | 129.7 | **1.310** (1.31× slower) |
+| `glibc_memcmp` | glibc aligned-word memcmp path | 12.2 | 9.2 | **1.330** (1.33× slower) |
+| `arith_loop` | 32-variable arithmetic loop / register pressure | 143.5 | 100.1 | **1.430** (1.43× slower) |
+| `struct_copy` | struct copy / ABI and memory | 39.4 | 27.4 | **1.439** (1.44× slower) |
+| `spectral_norm` | spectral norm / dense floating point | 298.7 | 200.4 | **1.491** (1.49× slower) |
+| `expat_xml_scan` | Expat UTF-8 XML name-token scan | 86.9 | 41.5 | **2.089** (2.09× slower) |
+| `tls_seg_access` | glibc TLS access shapes (THREAD_SELF/SETMEM, %fs segment) | 24.6 | 11.4 | **2.161** (2.16× slower) |
 
-**Aggregate.** Geometric mean **0.738** over all 33 pairs — dominated by the
+**Aggregate.** Geometric mean **0.7381** over all 33 pairs — dominated by the
 algorithmic recursion folds. Conventional code (30 pairs, recursion folds
-excluded): **1.096** — GCC is ~10% ahead on this corpus today. The
-workload-derived codec/parser subset sits at **1.22**. Correctness is
-enforced before speed is recorded: all 33 checksums byte-identical to GCC.
+excluded): **1.090**. The workload-derived codec/parser subset (7 pairs:
+zlib-ng, expat, SQLite, gzip, glibc, Linux, TLS) sits at **1.374** and is
+where the remaining gap concentrates. All 33 checksums byte-identical to GCC.
 
 ## Where LCCC wins
 
-- **Recursion folding**: `fib` 104.7× (TCE + rec2iter at runtime);
-  `ackermann` ~56× and `constant_recursion` ~61× fold entirely at compile
-  time — the shipped binaries contain zero recursive calls.
-- **Scalar-FP code quality**: libm round family 2.42× — VEX 3-operand
-  staging, FP compare-to-branch fusion, direct `xmm0` returns.
-- **Integer selection/idioms**: `bitops` 1.79×.
-- **gzip CRC-32 table loop** 1.15×.
-- **Reduction vectorization**: `matmul` at parity with AVX2 FMA confirmed in
-  the hot loop (`vfmadd231pd`); `double_reduction` slightly ahead. The
-  canonical-GEP vectorizer gate (PR #278) kept vectorization where it is
-  legal; sub-10 ms kernels give noisy cross-day ratios.
-- **PGO** (capability, not exercised in this run):
-  `-fprofile-generate`/`-fprofile-use` (inlining, unrolling, switch
-  lowering) with conservative layout that never perturbs RA.
+- **Recursion folding**: `fib` 73.1×, `constant_recursion` and `ackermann`
+  ~66× — TCE + rec2iter; the shipped binaries contain zero recursive calls.
+- **Scalar-FP code quality**: `libm_round_family` **4.4×**.
+- **Reduction vectorization**: `matmul` **1.36×** (AVX2 `vfmadd231pd`),
+  `double_reduction` **1.15×**.
+- **Integer selection/idioms**: `bitops` **1.31×**.
+- **Byte-scan loops** (measured against the Godbolt oracle at
+  `-O3 -march=x86-64-v3`, assembled with GAS 2.47): a byte-copy loop compiles
+  to **14 instructions against GCC 113, Clang 23.1 91, ICC 92 and ICX 41** —
+  best of all five; `memchr` runs **1.39× faster than GCC**.
 
 ## Root causes of the remaining gap (tracked, by magnitude)
 
-1. **TLS segment access 2.15×** — LCCC stages the thread pointer
-   (`mov %fs:0x0,%rax`) in each TLS-using function's prologue (two of three
-   loads are duplicate, non-CSE'd `&tls_slots` computations) where GCC uses
-   direct `%fs:offset` / `%fs:(%idx,scale)` operands; the
-   link-time-constant-offset path (`e290be59`) does not cover dynamic
-   offset forms. Not yet tracked — candidate IS task.
-2. **Hash-multiply `imul` chains** (expat 1.80×) and the branchy `__ffs`
-   tree (find_bit 1.51× → gcc `andn`+`cmov`).
-3. **RA-06 reload-at-use / arithmetic-chain copy webs** — adler32 1.50×,
-   struct_copy 1.35×; lifetime demotion spills whole ranges. TASK-RA-06A.
-4. **Non-reduction FP vectorization** — spectral 1.31×, fannkuch 1.27×,
-   nbody/mandelbrot 1.23× need multi-store scatter + computed-invariant dot
-   analysis (TASK-OP-05B); nbody additionally pays marching-pointer
-   slot-homing (151 of 159 stack refs; RA-01b).
-5. **Loop rotation default-off** — every inner loop pays a double-jump
-   preheader vs GCC's rotated test-and-branch: ~1 branch/iter suite-wide.
-   Opt-in (`CCC_LOOP_ROTATE=1`); hardening is TASK-PF-17.
-6. **Mid-band 1.17–1.23×** — arith_loop (register pressure; RA-06A),
-   aarch64_select_patterns, sqlite_varint, sieve (branch layout/ISel).
-7. **Near-parity tail**: hash_table 1.09×, binary_trees 1.06×,
-   strlen 1.04×, memcmp 1.03×.
+Ranked by this run. Full backlog with reproducer and blocker per item:
+[`backlog.md`](backlog.md).
+
+1. **TLS segment access 2.16×** — the thread pointer is staged in every
+   TLS-using function's prologue where GCC addresses `%fs:offset` directly.
+2. **Byte-classifier chains 2.09×** (`expat_xml_scan`) — `if (pred) n++` over
+   an `a || b || c` predicate emits an **eleven-branch chain per byte**. The
+   `if_convert` → `range_fold` → `set_membership` pipeline is starved at the
+   first link; the boolean-returning form of the same predicate gets the full
+   bit-mask treatment. Backlog **PF-CLS-1**.
+3. **Register pressure / copy webs 1.43–1.49×** — `arith_loop`,
+   `spectral_norm`, `struct_copy`: lifetime demotion spills whole ranges
+   instead of splitting them.
+4. **Non-reduction FP vectorization 1.27–1.49×** — `spectral_norm`, `nbody`.
+5. **Accumulator recurrences 1.24×** — `zlib_ng_adler32`'s DO8 chain; ICC
+   needs 76 instructions where lccc needs 119. Backlog **PF-ADLER-1**.
+6. **Near-parity tail** — `hash_table`, `binary_trees`, `switch_dispatch`,
+   `histogram`, `memcmp`, `mandelbrot` all ≤1.10×.
+
+## Instruction-selection coverage
+
+`CCC_ISEL_STATS=1` reports how much of code generation flows through the
+typed, register-allocated MachInst layer rather than direct text emission — a
+fallback that is otherwise **silent**.
+
+Corpus-wide (562 files, 9116 instructions): **85.1%**, up from 53.9%. The
+residual, ranked: `Call` 7.8% (**correct as-is** — MachInst has no clobber
+modelling, and the buffer flush at a call *is* what keeps caller-saved values
+sound), `Store(float)` 1.3% (no XMM register class), `ParamRef(needs-code)`
+1.1%, `Memcpy` 1.0%, `Store(other)` 0.9%. A coverage regression test fails if
+any class the layer owns drops back out.
 
 ## Kill switches (for bisection / soundness fallback)
 
