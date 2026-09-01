@@ -909,6 +909,21 @@ pub mod stats {
         *ON.get_or_init(|| std::env::var("CCC_ISEL_STATS").is_ok())
     }
 
+    /// Record a lowering that a caller handled outside `lower_instruction_typed`.
+    pub fn note_lowered() {
+        if enabled() {
+            LOWERED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a rejection with an explicit label, for callers that reject
+    /// before `lower_instruction_typed` is reached.
+    pub fn note_reject_named(kind: &'static str) {
+        if enabled() {
+            note_reject(kind);
+        }
+    }
+
     pub fn note_reject(kind: &'static str) {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut v) = BY_KIND.lock() {
@@ -1165,9 +1180,11 @@ fn lower_instruction_typed_inner(
             if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
                 return false;
             }
-            if matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
-                return false;
-            }
+            // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
+            // emitter's size tables have always handled both; refusing them
+            // only split contiguous MachInst runs and pushed byte traffic --
+            // the dominant operation in the gzip / zlib-ng / expat workloads --
+            // onto the untyped text path.
             if *seg_override != AddressSpace::Default {
                 return false;
             }
