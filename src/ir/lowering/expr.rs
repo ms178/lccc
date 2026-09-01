@@ -167,6 +167,12 @@ impl Lowerer {
     /// For complex types, tests (real != 0) || (imag != 0) per C11 6.3.1.2.
     pub(super) fn lower_condition_expr(&mut self, expr: &Expr) -> Operand {
         let expr_ct = self.expr_ctype(expr);
+        if expr_ct.is_decimal() {
+            // C23 decimal truthiness: `if (d)` is `(d != 0)` under decimal
+            // semantics (so -0 tests false like +0).
+            let val = self.lower_expr(expr);
+            return self.lower_decimal_truthiness(val, &expr_ct);
+        }
         if expr_ct.is_complex() {
             let val = self.lower_expr(expr);
             let ptr = self.operand_to_value(val);
@@ -251,6 +257,26 @@ impl Lowerer {
                 // the floating value to an integer).
                 let v = u128::from_le_bytes(*bytes);
                 Operand::Const(IrConst::I128(v as i128))
+            }
+            Expr::FloatLiteralDecimal(width, bytes, _) => {
+                // C23 decimal FP literal: the 16 bytes are the raw BID bit
+                // pattern (little-endian). D32/D64 use dedicated IR constant
+                // variants (SSE-class carriers); D128 rides the U128 carrier
+                // exactly like _Float128.
+                match *width {
+                    32 => {
+                        let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                        Operand::Const(IrConst::D32(v))
+                    }
+                    64 => {
+                        let v = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                        Operand::Const(IrConst::D64(v))
+                    }
+                    _ => {
+                        let v = u128::from_le_bytes(*bytes);
+                        Operand::Const(IrConst::I128(v as i128))
+                    }
+                }
             }
             Expr::CharLiteral(ch, _) => {
                 // A character constant has type int and the value the target's

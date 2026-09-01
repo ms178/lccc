@@ -915,6 +915,9 @@ impl Parser {
             | TokenKind::Int128
             | TokenKind::UInt128
             | TokenKind::Float128
+            | TokenKind::Decimal32
+            | TokenKind::Decimal64
+            | TokenKind::Decimal128
             | TokenKind::ThreadLocal
             | TokenKind::SegGs
             | TokenKind::SegFs => true,

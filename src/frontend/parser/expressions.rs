@@ -516,6 +516,13 @@ impl Parser {
                 self.advance();
                 Expr::FloatLiteralF128(val, bytes, span)
             }
+            TokenKind::FloatLiteralDecimal(width, bytes) => {
+                let width = *width;
+                let bytes = *bytes;
+                let span = self.peek_span();
+                self.advance();
+                Expr::FloatLiteralDecimal(width, bytes, span)
+            }
             TokenKind::ImaginaryLiteral(val) => {
                 let val = *val;
                 let span = self.peek_span();

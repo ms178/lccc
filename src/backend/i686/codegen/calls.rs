@@ -109,7 +109,9 @@ impl I686Codegen {
                 }
                 call_abi::CallArgClass::Stack => {
                     let ty = arg_types[i];
-                    if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 {
+                    // D64: BID bit container, moved as an integer pair (never
+                    // through x87 — that would reinterpret the bits).
+                    if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
                         self.emit_call_8byte_stack_arg(&args[i], ty, stack_offset);
                         stack_offset += 8;
                     } else {
@@ -325,7 +327,7 @@ impl I686Codegen {
         if return_type == IrType::Void {
             return;
         }
-        if return_type == IrType::I64 || return_type == IrType::U64 {
+        if return_type == IrType::I64 || return_type == IrType::U64 || return_type == IrType::D64 {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 let sr0 = self.slot_ref(slot);
                 let sr4 = self.slot_ref_offset(slot, 4);

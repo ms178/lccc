@@ -5944,8 +5944,27 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             &[i, j],
                         )
                     {
+                        // When the compare's other operand IS the copy
+                        // destination itself (`testl %D,%D` — the shape the
+                        // boolean-select lowering emits after reloading a
+                        // value through a staging copy), the rewrite must
+                        // push BOTH operands through the alias:
+                        // `testl %S,%S`.  Emitting `testl %D,%S` instead —
+                        // leaving op_dst as the surviving first operand —
+                        // keeps the compare reading a register that the
+                        // `infos[i] = Nop` below just orphaned: any later
+                        // redefinition of op_dst between the copy and the
+                        // compare (e.g. `incl %eax` in the loop-increment)
+                        // turns the condition into `defunct_dst & bool`.
+                        // That was the deterministic 20071030-1.c[-O2]
+                        // miscompile (CalcPing's count select observed the
+                        // loop-increment value, count stayed 0, and the
+                        // test aborted).  op_dst is a *name* string, so an
+                        // exact string compare against the parsed operand
+                        // text is the right equivalence test here.
+                        let o1 = if other == op_dst { op_src } else { other };
                         let new_cmp =
-                            format!("    {} {}, {}", mnem, other, op_src);
+                            format!("    {} {}, {}", mnem, o1, op_src);
                         store.replace(j, new_cmp);
                         infos[j] = classify_line(store.get(j));
                         infos[i].kind = LineKind::Nop;
@@ -7883,6 +7902,7 @@ fn else_hoist_diamonds(asm: String) -> String {
 /// Run peephole optimization on i686 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
+
     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
         return asm;
     }

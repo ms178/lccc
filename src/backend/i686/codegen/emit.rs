@@ -521,6 +521,15 @@ impl I686Codegen {
                     IrConst::F32(fval) => {
                         emit!(self.state, "    movl ${}, %eax", fval.to_bits() as i32)
                     }
+                    IrConst::D32(v) => {
+                        emit!(self.state, "    movl ${}, %eax", *v as i32)
+                    }
+                    IrConst::D64(v) => {
+                        // BID64 container: load low 32 bits (same convention
+                        // as the I64/F64 const arms in this 32-bit context).
+                        let low = *v as i32;
+                        emit!(self.state, "    movl ${}, %eax", low);
+                    }
                     IrConst::F64(fval) => {
                         // Store low 32 bits of the f64 bit pattern
                         let low = fval.to_bits() as i32;
@@ -629,6 +638,13 @@ impl I686Codegen {
                 }
                 IrConst::F32(fval) => {
                     emit!(self.state, "    movl ${}, %ecx", fval.to_bits() as i32)
+                }
+                IrConst::D32(v) => {
+                    emit!(self.state, "    movl ${}, %ecx", *v as i32)
+                }
+                IrConst::D64(v) => {
+                    let low = *v as i32;
+                    emit!(self.state, "    movl ${}, %ecx", low);
                 }
                 IrConst::F64(fval) => {
                     let low = fval.to_bits() as i32;
@@ -1706,6 +1722,17 @@ impl I686Codegen {
                 emit!(self.state, "    movl {}, %eax", sr4);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + 4);
                 self.state.reg_cache.invalidate_acc();
+            } else {
+                self.operand_to_eax(arg);
+                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+                emit!(self.state, "    movl $0, {}(%esp)", stack_offset + 4);
+            }
+        } else if ty == IrType::D64 {
+            if let Operand::Const(IrConst::D64(bits)) = arg {
+                let lo = (bits & 0xFFFF_FFFF) as u32;
+                let hi = (bits >> 32) as u32;
+                emit!(self.state, "    movl ${}, {}(%esp)", lo as i32, stack_offset);
+                emit!(self.state, "    movl ${}, {}(%esp)", hi as i32, stack_offset + 4);
             } else {
                 self.operand_to_eax(arg);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);

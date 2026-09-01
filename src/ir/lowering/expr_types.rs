@@ -686,6 +686,17 @@ impl Lowerer {
     pub(super) fn value_ir_type(&self, expr: &Expr) -> IrType {
         if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
             if !op.is_comparison() && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
+                // C23 decimal FP: decimal operands carry the result in the
+                // decimal carrier (the integer common_type logic below would
+                // misreport it as I32 and emit a bogus int->D64 cast).
+                let ldec = self.expr_ctype(lhs);
+                let rdec = self.expr_ctype(rhs);
+                if ldec.is_decimal() || rdec.is_decimal() {
+                    let ct = CType::usual_arithmetic_conversion(&ldec, &rdec);
+                    if ct.is_decimal() {
+                        return IrType::from_ctype(&ct);
+                    }
+                }
                 let lhs_ty = self.infer_expr_type(lhs);
                 let rhs_ty = self.infer_expr_type(rhs);
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
@@ -1040,6 +1051,11 @@ impl Lowerer {
             Expr::FloatLiteralF32(_, _) => IrType::F32,
             Expr::FloatLiteralLongDouble(_, _, _) => IrType::F128,
             Expr::FloatLiteralF128(_, _, _) => IrType::U128,
+            Expr::FloatLiteralDecimal(width, _, _) => match width {
+                32 => IrType::D32,
+                64 => IrType::D64,
+                _ => IrType::U128,
+            },
             Expr::ImaginaryLiteral(_, _)
             | Expr::ImaginaryLiteralF32(_, _)
             | Expr::ImaginaryLiteralLongDouble(_, _, _) => IrType::Ptr,
@@ -1625,6 +1641,11 @@ impl Lowerer {
             Expr::FloatLiteralF32(_, _) => Some(CType::Float),
             Expr::FloatLiteralLongDouble(_, _, _) => Some(CType::LongDouble),
             Expr::FloatLiteralF128(_, _, _) => Some(CType::Float128),
+            Expr::FloatLiteralDecimal(width, _, _) => match width {
+                32 => Some(CType::Decimal32),
+                64 => Some(CType::Decimal64),
+                _ => Some(CType::Decimal128),
+            },
             // Wide string literal L"..." has type wchar_t* (which is int* on all targets)
             Expr::WideStringLiteral(_, _) => {
                 Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
