@@ -1061,6 +1061,52 @@ pub fn lower_instruction_ctx(
     lower_instruction_typed(inst, reg_assignments, alloca_slots, None, out)
 }
 
+/// Lower an integer load into a register home, DEFINING the full 64-bit
+/// home for narrow (8/16-bit) types.
+///
+/// A plain `Mov` at S8/S16 renders as `movb mem, %r9b` / `movw mem, %r9w`:
+/// only the sub-register is written, bits [8:64) of the home stay undefined.
+/// The typed ISel accepts loads of every integer width, but the BinOp arm
+/// refuses sub-32-bit types, so narrow-homed values routinely cross into
+/// the mature text path, whose lowering reads operands at their promoted
+/// width (e.g. U8 division materializes `movq %r9, %rax; divq`) and at
+/// raw 64-bit homes (SIB-index construction). pr60960 (v4qi lane division)
+/// consumed exactly such a garbage-extended home and aborted.
+///
+/// Emit the extending 32-bit-destination forms instead — `movzbl`/`movzwl`
+/// for unsigned sources, `movsbl`/`movswl` for signed ones. Writing the
+/// 32-bit sub-register zeroes the upper half, so the whole home is defined:
+/// narrow readers see the unchanged low byte, wide readers see the
+/// canonical extension of the value. Same instruction length as the plain
+/// forms, no partial-register false dependency — identical to the mature
+/// text path's lowering and to GCC/Clang (see the Cast lowering's
+/// zlib-ng `zng_emit_dist` note for the same doctrine).
+fn narrow_defined_load(ty: IrType, size: OpSize, src: MachOperand, dst: MachReg) -> MachInst {
+    if size == OpSize::S8 || size == OpSize::S16 {
+        if ty.is_signed() {
+            MachInst::Movsx {
+                src,
+                dst,
+                from_size: size,
+                to_size: OpSize::S32,
+            }
+        } else {
+            MachInst::Movzx {
+                src,
+                dst,
+                from_size: size,
+                to_size: OpSize::S32,
+            }
+        }
+    } else {
+        MachInst::Mov {
+            src,
+            dst: MachOperand::Reg(dst),
+            size,
+        }
+    }
+}
+
 /// Lower with full context plus a value-type map for width-consistent
 /// Copy lowering. `value_types` may be None (tests); copies then keep the
 /// historical 64-bit width.
@@ -1135,23 +1181,25 @@ fn lower_instruction_typed_inner(
             let dst = value_to_reg(dest, ra);
             // Alloca: load directly from stack slot
             if let Some(&slot) = alloca_slots.get(&ptr.0) {
-                out.push(MachInst::Mov {
-                    src: MachOperand::StackSlot(slot),
-                    dst: MachOperand::Reg(dst),
+                out.push(narrow_defined_load(
+                    *ty,
                     size,
-                });
+                    MachOperand::StackSlot(slot),
+                    dst,
+                ));
                 return true;
             }
             // Pointer in register: load via memory operand
             if let Some(&phys) = ra.get(&ptr.0) {
-                out.push(MachInst::Mov {
-                    src: MachOperand::Mem {
+                out.push(narrow_defined_load(
+                    *ty,
+                    size,
+                    MachOperand::Mem {
                         base: MachReg::Phys(phys),
                         offset: 0,
                     },
-                    dst: MachOperand::Reg(dst),
-                    size,
-                });
+                    dst,
+                ));
                 return true;
             }
             // Pointer on stack: load ptr to rcx, then dereference
@@ -1161,14 +1209,15 @@ fn lower_instruction_typed_inner(
                 dst: MachOperand::Reg(MachReg::Phys(RCX)),
                 size: OpSize::S64,
             });
-            out.push(MachInst::Mov {
-                src: MachOperand::Mem {
+            out.push(narrow_defined_load(
+                *ty,
+                size,
+                MachOperand::Mem {
                     base: MachReg::Phys(RCX),
                     offset: 0,
                 },
-                dst: MachOperand::Reg(dst),
-                size,
-            });
+                dst,
+            ));
             true
         }
         Instruction::Store {
