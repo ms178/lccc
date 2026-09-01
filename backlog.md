@@ -19,7 +19,27 @@ was an improvement.
 
 ## Tier 1 — measured, reproducible, largest first
 
-### IV-DERIV-1 · Widen constant-offset derivatives of the induction variable
+### IV-DERIV-1 · Widen the induction variable's derived closure
+*Status:* designed, implemented, measured, **reverted for a miscompile**. Full
+record in `engineering/FOLLOWUP-2026-09-01l-iv-closure-attempt.md`.
+
+*Measured prize (same-window A/B, before revert):* `sieve` **−26.5%**,
+`loop_patterns` **−6.5%**, `tls_seg_access` **−5.7%** (the worst kernel in the
+corpus), `histogram` −2.8%; `nbody` +3.2%.
+
+*Why it failed:* the closure collector admitted ops whose operand was not in
+the closure -- widening phi `v119` pulled in `And(v81, 31)` and
+`Mul(v76, 104729)` -- so the interval proof was attached to values it did not
+describe. Two other soundness bugs were found and fixed on the way and are
+documented: the `Or` range bound `hi | c` is not an upper bound (counterexample
+`x ∈ [1,2]`, `c = 2`), and the trip bound must come from the comparison the
+loop HEADER branches on, not from any comparison mentioning the counter.
+
+**Done when:** membership records, for each admitted member, which closure
+value it derives from, with a `debug_assert!` that the operand really is that
+value; and `scripts/check_benchmark_outputs.sh` stays green.
+
+### IV-DERIV-2 · (superseded heading kept for reference)
 *Evidence:* `tls_seg_access` carries two `movslq` per iteration, one on the
 loop-carried path. Widening the counter itself now works for every element
 width (see closed items), but this loop's counter has genuine *arithmetic*
@@ -137,6 +157,13 @@ Six structural properties, 3372 configurations, six optimisation levels, zero
 violations — but none of them is dominance. That is how an SSA violation once
 shipped past every gate. `verify.rs` already computes reachability;
 Cooper-Harvey-Kennedy dominators over RPO is the next step.
+
+### INF-BENCHGATE-1 · Run the benchmark output gate in CI
+`scripts/check_benchmark_outputs.sh` (new) compiles, runs and oracle-diffs
+every `tests/benchmark/programs/*.c` at -O0/-O1/-O2/-O3 in ~4 minutes with no
+timing. It exists because a miscompile passed all 563 regression tests: those
+kernels were only ever built by the timing harness, so nobody ran them during
+development. It should be unconditional in CI.
 
 ### INF-FRESHCLONE-1 · CI must build from a fresh clone
 `main` @ `7a6eb81d` did not build: commit `9a2ef83a` declared
