@@ -2278,76 +2278,129 @@ pub fn escape_string(s: &str) -> String {
 /// `zstd_decompress_block.c:242`, `HUF_isError(hufSuccess)`).
 ///
 /// Seeded from each defining instruction's `result_type()`, then propagated
-/// along Copy/Phi edges, then completed with `ParamRef`'s declared type — the
-/// exact rule the emitters were already relying on.
+/// along Copy/Phi edges **to a fixed point**, then completed with
+/// `ParamRef`'s declared type — the exact rule the emitters rely on.
+///
+/// Why a fixed point (and why the widest type wins):
+/// * Phi destinations can be fed from a value **defined later** (forward
+///   reference) or on a **back edge** whose block precedes the header in a
+///   single forward walk (loop-carried `%p = phi [%init][%p_next]` with
+///   `%p_next` defined in the body). A single pass leaves such a dest
+///   untyped, so the slot classifier would give it a 4-byte slot while a
+///   wider consumer reloads it with `movq`.
+/// * The same SSA name can be defined on several paths (phi elimination
+///   lowers phis to per-predecessor Copies that reuse one dest id). The
+///   *widest* of those definitions is the materialisation width the emitters
+///   must honour, so a narrow late definition must never overwrite a wider
+///   earlier one.
+///
+/// Types are only ever added, never removed or narrowed, so the fixpoint
+/// terminates after at most `O(#values)` sweeps; the per-sweep work is one
+/// pass over the (already-dense) instruction list.
 pub(crate) fn compute_value_type_map(
     func: &crate::ir::reexports::IrFunction,
 ) -> crate::common::fx_hash::FxHashMap<u32, IrType> {
     use crate::common::fx_hash::FxHashMap;
-    use crate::ir::reexports::{Instruction, Operand};
+    use crate::ir::reexports::{Instruction, IrConst, Operand};
 
-    let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            // Map every producing instruction to its result type.
-            if let Some(ty) = inst.result_type() {
-                if let Some(dest) = inst.dest() {
-                    value_types.entry(dest.0).or_insert(ty);
-                }
-            }
-            // Copy/Phi: propagate the source type to the dest.
-            match inst {
-                Instruction::Copy { dest, src } => match src {
-                    Operand::Value(v) => {
-                        if let Some(&t) = value_types.get(&v.0) {
-                            value_types.insert(dest.0, t);
-                        }
-                    }
-                    Operand::Const(c) => {
-                        // A Copy from a constant is the def site of an
-                        // otherwise untyped SSA name. Without this seed,
-                        // consumers that must know the value's width (the SIB
-                        // index soundness gate, type-aware slot loads) guess.
-                        // `Zero` is context-typed and stays unknown on purpose.
-                        let t = match c {
-                            crate::ir::reexports::IrConst::I8(_) => Some(IrType::I8),
-                            crate::ir::reexports::IrConst::I16(_) => Some(IrType::I16),
-                            crate::ir::reexports::IrConst::I32(_) => Some(IrType::I32),
-                            crate::ir::reexports::IrConst::I64(_) => Some(IrType::I64),
-                            crate::ir::reexports::IrConst::I128(_) => Some(IrType::I128),
-                            crate::ir::reexports::IrConst::F32(_) => Some(IrType::F32),
-                            crate::ir::reexports::IrConst::F64(_) => Some(IrType::F64),
-                            crate::ir::reexports::IrConst::D32(_) => Some(IrType::D32),
-                            crate::ir::reexports::IrConst::D64(_) => Some(IrType::D64),
-                            crate::ir::reexports::IrConst::LongDouble(_, _) => Some(IrType::F128),
-                            crate::ir::reexports::IrConst::Zero => None,
-                        };
-                        if let Some(t) = t {
-                            value_types.insert(dest.0, t);
-                        }
-                    }
-                    _ => {}
-                },
-                Instruction::Phi { dest, incoming, .. } => {
-                    for (op, _) in incoming {
-                        if let Operand::Value(v) = op {
-                            if let Some(&t) = value_types.get(&v.0) {
-                                value_types.insert(dest.0, t);
-                                break;
-                            }
-                        }
-                    }
-                }
-                _ => {}
+    /// Merge `ty` into `map[dest]` keeping the WIDER of the two.
+    fn widen(map: &mut FxHashMap<u32, IrType>, dest: u32, ty: IrType) {
+        match map.get(&dest) {
+            Some(&old) if old.size() >= ty.size() => {}
+            _ => {
+                map.insert(dest, ty);
             }
         }
     }
-    // ParamRef carries the declared parameter type.
+
+    /// The semantic type of a constant operand (the def-site seed for
+    /// otherwise untyped Copy dests). `Zero` is context-typed and stays
+    /// unknown on purpose.
+    fn const_type(c: &IrConst) -> Option<IrType> {
+        Some(match c {
+            IrConst::I8(_) => IrType::I8,
+            IrConst::I16(_) => IrType::I16,
+            IrConst::I32(_) => IrType::I32,
+            IrConst::I64(_) => IrType::I64,
+            IrConst::I128(_) => IrType::I128,
+            IrConst::F32(_) => IrType::F32,
+            IrConst::F64(_) => IrType::F64,
+            IrConst::D32(_) => IrType::D32,
+            IrConst::D64(_) => IrType::D64,
+            IrConst::LongDouble(..) => IrType::F128,
+            IrConst::Zero => return None,
+        })
+    }
+
+    let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
+
+    // Seed: ParamRef carries the declared parameter type. Doing this up-front
+    // lets a Copy/Phi *in an earlier block* propagate a parameter type even
+    // though the ParamRef's own block may be visited later in program order.
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::ParamRef { dest, ty, .. } = inst {
-                value_types.entry(dest.0).or_insert(*ty);
+                widen(&mut value_types, dest.0, *ty);
             }
+        }
+    }
+
+    // Fixpoint: seed from defs, then propagate Copy/Phi source types until
+    // no new (or wider) type appears. Values reachable from a wide source
+    // through any path — including loop-carried phi cycles and forward
+    // references — are therefore typed wide before the classifier runs.
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                // Seed every producing instruction's result type (widest wins
+                // across multi-def webs).
+                if let Some(ty) = inst.result_type() {
+                    if let Some(dest) = inst.dest() {
+                        let old = value_types.get(&dest.0).copied();
+                        if old.map_or(true, |o| o.size() < ty.size()) {
+                            widen(&mut value_types, dest.0, ty);
+                            changed = true;
+                        }
+                    }
+                }
+                match inst {
+                    Instruction::Copy { dest, src } => {
+                        let t = match src {
+                            Operand::Value(v) => value_types.get(&v.0).copied(),
+                            Operand::Const(c) => const_type(c),
+                        };
+                        if let Some(t) = t {
+                            let old = value_types.get(&dest.0).copied();
+                            if old.map_or(true, |o| o.size() < t.size()) {
+                                widen(&mut value_types, dest.0, t);
+                                changed = true;
+                            }
+                        }
+                    }
+                    Instruction::Phi { dest, incoming, .. } => {
+                        // Every incoming edge is a def site candidate; keep the
+                        // widest type found on any edge.
+                        for (op, _) in incoming {
+                            let t = match op {
+                                Operand::Value(v) => value_types.get(&v.0).copied(),
+                                Operand::Const(c) => const_type(c),
+                            };
+                            if let Some(t) = t {
+                                let old = value_types.get(&dest.0).copied();
+                                if old.map_or(true, |o| o.size() < t.size()) {
+                                    widen(&mut value_types, dest.0, t);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
         }
     }
     value_types
@@ -2367,4 +2420,126 @@ pub(crate) fn wide_typed_values(
         .filter(|(_, ty)| ty.size() > 4)
         .map(|(v, _)| v)
         .collect()
+}
+
+#[cfg(test)]
+mod value_type_map_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, IrFunction, Instruction, Operand, Terminator, Value};
+
+    fn func_with_blocks(blocks: Vec<BasicBlock>, next_id: u32) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.blocks = blocks;
+        f.next_value_id = next_id;
+        f
+    }
+
+    fn i32_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: IrType::I32 }
+    }
+
+    fn i64_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: IrType::I64 }
+    }
+
+    fn block(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock { label: BlockId(id), instructions: insts, terminator: term, source_spans: Vec::new() }
+    }
+
+    /// A loop-carried phi whose incoming value is defined LATER in program
+    /// order (the loop body comes after the header in the block list). A
+    /// single forward pass leaves the phi dest untyped; the fixpoint must
+    /// type it I64 (so the slot classifier refuses a 4-byte slot).
+    #[test]
+    fn loop_phi_back_edge_reaches_fixpoint() {
+        // header: v0 = phi [v1(entry-const, I32)] [v2(back edge)]   -> v2 wide
+        // body:   v2 = v0 + 1 (I64)
+        let header = block(
+            0,
+            vec![Instruction::Phi {
+                dest: Value(0),
+                incoming: vec![
+                    (Operand::Const(IrConst::I32(0)), BlockId(99)), // preheader
+                    (Operand::Value(Value(2)), BlockId(1)),          // back edge
+                ],
+                ty: IrType::I64,
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let body = block(
+            1,
+            vec![i64_add(Value(2), Operand::Value(Value(0)), Operand::Const(IrConst::I64(1)))],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let f = func_with_blocks(vec![header, body], 3);
+
+        let map = compute_value_type_map(&f);
+        // v0 (the phi) must be typed wide: it is fed from wide v2 on the back
+        // edge even though the only *forward* constant seed was I32.
+        let t0 = map.get(&0).copied().expect("phi dest v0 typed");
+        assert_eq!(t0.size(), 8, "phi dest must inherit the wide back-edge type: {map:?}");
+        let t2 = map.get(&2).copied().expect("body value typed");
+        assert_eq!(t2.size(), 8);
+    }
+
+    /// The SAME dest id defined on several paths with different widths must
+    /// resolve to the WIDEST definition (phi elimination reuses dest ids
+    /// across predecessor copies).
+    #[test]
+    fn widest_def_wins_across_multi_def() {
+        let b = block(
+            0,
+            vec![
+                i64_add(Value(0), Operand::Const(IrConst::I64(1)), Operand::Const(IrConst::I64(2))),
+                // A later narrow redefinition of the same id must not narrow it.
+                i32_add(Value(0), Operand::Const(IrConst::I32(3)), Operand::Const(IrConst::I32(4))),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        );
+        let f = func_with_blocks(vec![b], 1);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(8));
+    }
+
+    /// Copy-from-parameter: the ParamRef lives in the LAST block but a Copy
+    /// in the FIRST block consumes it — the up-front ParamRef seed lets the
+    /// fixpoint type the Copy dest without a second whole-function pass
+    /// needing to revisit block order.
+    #[test]
+    fn param_seeded_before_copy_in_earlier_block() {
+        let b0 = block(
+            0,
+            vec![Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) }],
+            Terminator::Branch(BlockId(1)),
+        );
+        let b1 = block(
+            1,
+            vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I64 }],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![b0, b1], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(8));
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(8));
+    }
+
+    /// A genuinely narrow web stays narrow (no spurious widening).
+    #[test]
+    fn narrow_copy_web_stays_narrow() {
+        let b0 = block(
+            0,
+            vec![
+                i32_add(Value(0), Operand::Const(IrConst::I32(1)), Operand::Const(IrConst::I32(2))),
+                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let f = func_with_blocks(vec![b0], 2);
+        let map = compute_value_type_map(&f);
+        assert_eq!(map.get(&0).copied().map(|t| t.size()), Some(4));
+        assert_eq!(map.get(&1).copied().map(|t| t.size()), Some(4));
+        let wide = wide_typed_values(&f);
+        assert!(!wide.contains(&0) && !wide.contains(&1));
+    }
 }

@@ -206,6 +206,19 @@ for src in "$REG"/*.c; do
             echo "      nosmall : $(echo "$res_ab" | head -2)"
             fail=$((fail+1)); ab_fail=$((ab_fail+1)); FAILED+=("$name:ab"); continue
         fi
+
+        # 3b. A/B differential: Tier-2 slot sharing on (default) vs off.
+        # Sharing must be value-preserving: a slot that a neighbour is allowed
+        # to reuse must never hold a live value at the moment of reuse, so the
+        # two layouts must produce byte-identical program output. Divergence
+        # here is a coloring soundness bug (2026-09-02 preboot-ZSTD class).
+        res_t2=$(env ${env_vars[@]:-} CCC_NO_TIER2_GRAPH=1 bash -c "$(declare -f run_one is_elf32); LCCC_BIN='$LCCC_BIN' GCC_INC='$GCC_INC' WORK='$WORK' ELF32_MODE='$ELF32_MODE' RUNNER32='$RUNNER32'; run_one '$src'")
+        if [[ $res_t2 != "$res" ]]; then
+            echo "FAIL  $name (A/B Tier-2 sharing differential)"
+            echo "      default  : $(echo "$res" | head -2)"
+            echo "      notier2  : $(echo "$res_t2" | head -2)"
+            fail=$((fail+1)); ab_fail=$((ab_fail+1)); FAILED+=("$name:ab-tier2"); continue
+        fi
     fi
 
     pass=$((pass+1))

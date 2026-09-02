@@ -252,8 +252,17 @@ class Gen:
         a slot that another value reused while the frame was active."""
         self.emit(indent, "{")
         self.emit(indent + 1, "static jmp_buf jb;")
-        self.emit(indent + 1, "unsigned long long s1 = %s;" % self.val("u64", "s1"))
-        self.emit(indent + 1, "unsigned int s2 = %s;" % self.val("u32", "s2"))
+        # s1/s2 MUST be volatile: they are modified between setjmp and
+        # longjmp and read again after the resume, and C11 7.13.2.1 makes
+        # non-volatile automatic objects so modified *indeterminate* after a
+        # longjmp. gcc -O0 keeps such locals memory-backed and reads the
+        # modified value; a compiler that re-materialises them from a register
+        # copy (lccc -O0) reads the stale one — both conform, so a non-volatile
+        # oracle cannot demand exact equality. volatile forces every access to
+        # the stack home, which is exactly the slot-reuse-safety property this
+        # region exists to test.
+        self.emit(indent + 1, "volatile unsigned long long s1 = %s;" % self.val("u64", "s1"))
+        self.emit(indent + 1, "volatile unsigned int s2 = %s;" % self.val("u32", "s2"))
         self.emit(indent + 1, "if (setjmp(jb) == 0) {")
         self.emit(indent + 2, "s1 = %s;" % self.val("u64", "s1b"))
         self.emit(indent + 2, "s2 = %s;" % self.val("u32", "s2b"))
