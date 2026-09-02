@@ -17,6 +17,11 @@ impl I686Codegen {
         self.state.emit("    movl (%edx), %ecx");
 
         if is_i128_type(result_ty) {
+            // GCC i386: TFmode/16-byte-class varargs are 16-byte aligned in
+            // the arg area (the caller pads to 16 — see calls.rs
+            // stack_arg_align) — align the cursor up before the read.
+            self.state.emit("    addl $15, %ecx");
+            self.state.emit("    andl $-16, %ecx");
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
                 for i in (0..16).step_by(4) {
                     emit!(self.state, "    movl {}(%ecx), %eax", i);

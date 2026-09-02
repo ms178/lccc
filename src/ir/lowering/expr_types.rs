@@ -146,6 +146,21 @@ impl Lowerer {
                     | "__builtin_ia32_minps256"
                     | "__builtin_ia32_andps256"
                     | "__builtin_ia32_cmpps256" => return Some(32),
+                    // ILP32 has no I128 value representation: the 128-bit
+                    // raw builtins hand back a pointer to their 16-byte
+                    // result alloca (aggregate-as-pointer convention), so
+                    // the return/assign path MUST see a 16-byte aggregate
+                    // and memcpy it.
+                    "__builtin_ia32_maxps"
+                    | "__builtin_ia32_minps"
+                    | "__builtin_ia32_shufps"
+                    | "__builtin_shufflevector"
+                    | "__builtin_shuffle"
+                    | "__builtin_ia32_vextractf128_ps256"
+                        if self.target == crate::backend::Target::I686 =>
+                    {
+                        return Some(16)
+                    }
                     "__builtin_ia32_maxps"
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
@@ -356,8 +371,15 @@ impl Lowerer {
 
     /// Return the IR type for known builtins that return float or specific types.
     /// Returns None for builtins without special return type handling.
-    pub(super) fn builtin_return_type(name: &str) -> Option<IrType> {
+    pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
         match name {
+            // x86 vector scalar extractions with 64-bit results (long long /
+            // unsigned long long). Without these the call was typed with the
+            // target int (I32 on i686): every consumer sign-extended the low
+            // dword (cltd) and discarded the high half of the eax:edx pair
+            // (simd_insert_extract pextrq0/pextrq1).
+            "_mm_extract_epi64" | "_mm_cvtsi128_si64" | "_mm_cvtsi128_si64x"
+            | "__builtin_ia32_pextrq128" | "__builtin_ia32_cvtsi128si64" => Some(IrType::I64),
             // Float-returning builtins
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
@@ -522,6 +544,15 @@ impl Lowerer {
             // Without this the result defaulted to I64 and the RETURN path
             // sign-extended half the vector away (cqto), zeroing lanes 2-3
             // and corrupting lane 1 (kernel NAP governor v4sf clamp).
+            "__builtin_ia32_maxps"
+            | "__builtin_ia32_minps"
+            | "__builtin_ia32_shufps"
+            | "__builtin_shufflevector"
+            | "__builtin_ia32_vextractf128_ps256"
+                if self.target == crate::backend::Target::I686 =>
+            {
+                Some(IrType::Ptr)
+            }
             "__builtin_ia32_maxps"
             | "__builtin_ia32_minps"
             | "__builtin_ia32_shufps"
@@ -856,7 +887,7 @@ impl Lowerer {
                     return ret_ty;
                 }
             }
-            if let Some(ret_ty) = Self::builtin_return_type(name) {
+            if let Some(ret_ty) = self.builtin_return_type(name) {
                 return ret_ty;
             }
             // Fall back to sema's function signatures for IrType derivation

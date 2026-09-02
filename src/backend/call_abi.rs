@@ -1247,15 +1247,26 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 //  * x86-64 (GCC >= 4.6) honors the FULL natural alignment
                 //    of MEMORY-class stack arguments (uncapped; callers
                 //    realign %rsp for the >16 case).
-                //  * i686 cdecl NEVER aligns beyond the 4-byte slot
-                //    granularity (GCC 14.2 -m32 oracle) — the cap (4) makes
-                //    this a no-op so size rounding is the only effect.
-                let struct_align = func
-                    .params
-                    .get(i)
+                //  * i686 cdecl packs EVERYTHING at the 4-byte slot
+                //    granularity — doubles, 12-byte x87 long double, 8-byte-
+                //    aligned structs, even `aligned(16)` structs (GCC 14.2
+                //    -m32 oracles f1/f3/f7/f8) — with EXACTLY ONE exception:
+                //    TFmode 16-byte carriers (__float128/_Decimal128, the
+                //    is_f128_sse params) are 16-byte aligned (oracles f2/f6:
+                //    (int,__float128,int) puts q at offset 16; libgcc's
+                //    __addtf3 reads its by-value TF args at entry+20/+36).
+                //    The caller layout (i686 calls.rs stack_arg_align) uses
+                //    the identical rule so both sides agree.
+                let param = func.params.get(i);
+                let struct_align = param
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
-                if struct_align > slot_size as usize {
+                let tf_carrier_ia32 = slot_size == 4
+                    && param.is_some_and(|p| p.is_f128_sse)
+                    && struct_align >= 16;
+                if tf_carrier_ia32 {
+                    stack_offset = (stack_offset + 15) & !15;
+                } else if struct_align > slot_size as usize {
                     let a = (struct_align as i64)
                         .min(config.stack_arg_align_cap as i64)
                         .max(slot_size as i64);

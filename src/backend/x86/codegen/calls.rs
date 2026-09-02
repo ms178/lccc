@@ -204,6 +204,7 @@ impl X86Codegen {
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         // x86-64: uncapped per-arg alignment padding (GCC ≥ 4.6 honors the
         // full natural alignment of MEMORY-class stack arguments; the >16
@@ -221,6 +222,7 @@ impl X86Codegen {
         _fptr_spill: usize,
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         // Per-call-site transient state (defensive reset: the pipeline
         // always consumes the flag, but a stale value from an aborted

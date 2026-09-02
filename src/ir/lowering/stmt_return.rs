@@ -76,6 +76,49 @@ impl Lowerer {
     /// Try to handle return via sret (hidden pointer for large structs/complex).
     /// Returns Some(operand) if this is an sret return, None otherwise.
     fn try_sret_return(&mut self, e: &Expr, sret_alloca: Value) -> Option<Operand> {
+        // _Float128/_Decimal128 returns on i686 (TFmode/TDmode = class MEMORY):
+        // the caller receives the 16-byte carrier through the hidden pointer.
+        // Store the carrier value into the sret buffer and return the pointer
+        // (eax holds it for the caller, matching GCC's i386 convention).
+        let fname0 = self.func().name.clone();
+        let is_f128_sret = self
+            .func_meta
+            .sigs
+            .get(fname0.as_str())
+            .is_some_and(|s| s.ret_is_f128_sse && s.sret_size.is_some());
+        if is_f128_sret {
+            let val = self.lower_expr(e);
+            let expr_ty = self.value_ir_type(e);
+            let expr_ct = self.expr_ctype(e);
+            let ret_ct = self
+                .func_mut()
+                .return_ctype
+                .clone()
+                .unwrap_or(CType::Float128);
+            // Implicit conversions (e.g. `return 7;` / `return d;`) route
+            // through the same soft-float helper path the scalar return uses.
+            let val = if expr_ct != ret_ct {
+                self.convert_scalar_ctype(val, expr_ty, &expr_ct, &ret_ct)
+            } else {
+                val
+            };
+            let sret_ptr = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: sret_ptr,
+                ptr: sret_alloca,
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+            });
+            self.emit(Instruction::Store {
+                volatile: false,
+                val,
+                ptr: sret_ptr,
+                ty: IrType::U128,
+                seg_override: AddressSpace::Default,
+            });
+            return Some(Operand::Value(sret_ptr));
+        }
         // Large struct return via hidden pointer (sret).
         // Threshold is target-dependent: > 8 bytes on 32-bit, > 16 bytes on 64-bit.
         // struct_value_size may return Some(0) for FunctionCall/Conditional expressions

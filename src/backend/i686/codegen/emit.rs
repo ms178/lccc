@@ -1656,7 +1656,44 @@ impl I686Codegen {
         stack_offset: usize,
         size: usize,
     ) {
+        if let Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) = arg {
+            // 16-byte carrier constant (_Float128/_Decimal128 literal, i686
+            // TFmode by-value stack arg): four immediate stores into the
+            // outgoing window. The historic code only handled Operand::Value
+            // and SILENTLY EMITTED NOTHING for constants — the callee then
+            // read whatever the window happened to hold (ident(1.5F128)).
+            if size == 16 {
+                let words: [u32; 4] = match c {
+                    IrConst::I128(v) => {
+                        let b = v.to_le_bytes();
+                        [
+                            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                        ]
+                    }
+                    _ => [0; 4],
+                };
+                for (k, w) in words.iter().enumerate() {
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}(%esp)",
+                        w,
+                        stack_offset + 4 * k
+                    );
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
         if let Operand::Value(v) = arg {
+            let is_i128_carrier = self.state.i128_values.contains(&v.0)
+                || self
+                    .state
+                    .alloca_types
+                    .get(&v.0)
+                    .is_some_and(|t| crate::backend::generation::is_i128_type(*t));
             if self.state.is_alloca(v.0) {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     // Over-aligned (>16) alloca: the struct's bytes live at
@@ -1685,6 +1722,21 @@ impl I686Codegen {
                     } else {
                         self.emit_copy_slot_to_stack(slot, stack_offset, size);
                     }
+                }
+            } else if is_i128_carrier {
+                // 16-byte carrier value (U128 gp-view): the slot IS the data.
+                // Copy the payload words straight out of the slot — the
+                // pointer-deref path below would read the first dword as an
+                // address (state.rs resolve_slot_addr SEGV case).
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    let mut copied = 0usize;
+                    while copied + 4 <= size {
+                        let sr = self.slot_ref_offset(slot, copied as i64);
+                        emit!(self.state, "    movl {}, %eax", sr);
+                        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
+                        copied += 4;
+                    }
+                    self.state.reg_cache.invalidate_acc();
                 }
             } else {
                 // Non-alloca: value is a pointer to struct data.
@@ -2169,7 +2221,7 @@ impl ArchCodegen for I686Codegen {
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>],
-        _struct_arg_is_f128_sse: &[bool],
+        struct_arg_is_f128_sse: &[bool],
         is_sret: bool,
         is_fastcall: bool,
         ret_eightbyte_classes: &[crate::common::types::EightbyteClass],
@@ -2196,8 +2248,12 @@ impl ArchCodegen for I686Codegen {
         if indirect {
             self.emit_call_spill_fptr(func_ptr.expect("indirect call requires func_ptr"));
         }
-        let stack_arg_space =
-            self.emit_call_compute_stack_space(&arg_classes_vec, arg_types, struct_arg_aligns);
+        let stack_arg_space = self.emit_call_compute_stack_space(
+            &arg_classes_vec,
+            arg_types,
+            struct_arg_aligns,
+            struct_arg_is_f128_sse,
+        );
         let f128_temp_space =
             self.emit_call_f128_pre_convert(args, &arg_classes_vec, arg_types, stack_arg_space);
         self.state().reg_cache.invalidate_acc();
@@ -2213,6 +2269,7 @@ impl ArchCodegen for I686Codegen {
             },
             f128_temp_space,
             struct_arg_aligns,
+            struct_arg_is_f128_sse,
         );
         self.state().reg_cache.invalidate_acc();
         self.emit_call_reg_args(
@@ -2602,6 +2659,62 @@ impl ArchCodegen for I686Codegen {
 
     /// emit_copy_value: handles F128, wide (F64/I64/U64), and 32-bit copies.
     fn emit_copy_value(&mut self, dest: &Value, src: &Operand) {
+        // 128-bit integer container copies (IrType::I128/U128: the _Float128
+        // gp-view, _Decimal128): full 16-byte semantics.  The wide (8-byte)
+        // path below truncated the upper half (f128_softfloat: every
+        // _Float128 variable-to-variable copy lost the high qword).
+        // Only shapes this intercept fully handles return here; everything
+        // else (slot-less sources, x87 LongDouble consts, ...) falls through
+        // to the legacy paths — silently emitting NOTHING for a 16-byte dest
+        // would leave the slot holding whatever the previous owner left.
+        if self
+            .state
+            .alloca_types
+            .get(&dest.0)
+            .is_some_and(|t| crate::backend::generation::is_i128_type(*t))
+            || self.state.i128_values.contains(&dest.0)
+            || matches!(src, Operand::Const(IrConst::I128(_)))
+        {
+            if let Some(dslot) = self.state.get_slot(dest.0) {
+                match src {
+                    Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) => {
+                        let words: [u32; 4] = match c {
+                            IrConst::I128(v) => {
+                                let b = v.to_le_bytes();
+                                [
+                                    u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                                    u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                                    u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                                    u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                                ]
+                            }
+                            _ => [0; 4],
+                        };
+                        for (k, w) in words.iter().enumerate() {
+                            let dsr = self.slot_ref_offset(dslot, (4 * k) as i64);
+                            emit!(self.state, "    movl ${}, {}", w, dsr);
+                        }
+                        return;
+                    }
+                    Operand::Value(sv) => {
+                        if let Some(sslot) = self.state.get_slot(sv.0) {
+                            for k in 0..4i64 {
+                                let ssr = self.slot_ref_offset(sslot, 4 * k);
+                                let dsr = self.slot_ref_offset(dslot, 4 * k);
+                                emit!(self.state, "    movl {}, %eax", ssr);
+                                emit!(self.state, "    movl %eax, {}", dsr);
+                            }
+                            return;
+                        }
+                        // No source slot: fall through to the legacy paths.
+                    }
+                    _ => {
+                        // Non-container source: the legacy paths below own
+                        // those shapes.
+                    }
+                }
+            }
+        }
         if let Operand::Const(IrConst::LongDouble(..)) = src {
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
                 self.emit_f128_load_to_x87(src);
@@ -2809,6 +2922,7 @@ impl ArchCodegen for I686Codegen {
         // memory
         fn emit_store(&mut self, val: &Operand, ptr: &Value, ty: IrType) => emit_store_impl;
         fn emit_load(&mut self, dest: &Value, ptr: &Value, ty: IrType) => emit_load_impl;
+        fn emit_copy_i128(&mut self, dest: &Value, src: &Operand) => emit_copy_i128_impl;
         fn emit_store_with_const_offset(&mut self, val: &Operand, base: &Value, offset: i64, ty: IrType) => emit_store_with_const_offset_impl;
         fn emit_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType) => emit_load_with_const_offset_impl;
         fn emit_load_indexed(&mut self, dest: &Value, base: &Value, index: &Value, shift: u8, _disp: i64, ty: IrType) -> bool => emit_load_indexed_impl;
@@ -2855,8 +2969,8 @@ impl ArchCodegen for I686Codegen {
         // calls
         fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
-        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;
-        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>]) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>], _struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;

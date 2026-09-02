@@ -720,6 +720,13 @@ fn try_complete_unroll_general(
     let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
         return false;
     };
+    // The post-loop IV may exceed i64 even when the trip count is small
+    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
+    // 2^63): refuse before mutating rather than substitute a wrapped
+    // constant, or worse, return false after rewriting the CFG.
+    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
+        return false;
+    };
     if !(2..=16).contains(&trip) {
         return false;
     }
@@ -2937,27 +2944,6 @@ mod tests {
             }
             Terminator::Branch(_) => {
                 // Outer complete-unrolled: latch must feed the clone chain,
-                // and the exit block must remain a returning block.
-                let exit = func
-                    .blocks
-                    .iter()
-                    .find(|b| matches!(b.terminator, Terminator::Return(None)))
-                    .expect("outer exit must still exist and return");
-                let _ = exit;
-            }
-            other => panic!("outer latch terminator corrupted: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn substitution_covers_twenty_five_non_algebraic_use_positions() {
-        let mut instructions = vec![
-            Instruction::Memcpy {
-                dest: Value(1),
-                src: Value(2),
-                size: 8,
-            },
-            Instruction::Atofeed the clone chain,
                 // and the exit block must remain a returning block.
                 let exit = func
                     .blocks

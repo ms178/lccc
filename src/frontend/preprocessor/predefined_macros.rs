@@ -1148,6 +1148,27 @@ impl Preprocessor {
                     .collect();
                 let mapped_refs: Vec<&str> = mapped.iter().map(String::as_str).collect();
                 self.insert_arch_paths_after_bundled(&mapped_refs);
+                // GNU --sysroot remaps the *generic* C-library include dirs
+                // too, not only the arch-specific ones.  Without this the
+                // unprefixed host /usr/include still answers first for
+                // <stdio.h> & friends whenever the arch dirs don't carry the
+                // header themselves, so a rootless multilib sysroot on a host
+                // whose glibc headers are NOT single-tree i386-compatible
+                // (Debian multiarch layouts, cross-only CI images) resolves
+                // x86-64-flavored headers for i686 compiles and fails with
+                // missing bits/*.h.  Mapped generic dirs are appended after
+                // the arch dirs (still ahead of every unprefixed fallback);
+                // with no LCCC_SYSROOT nothing changes at all.
+                if std::env::var("LCCC_SYSROOT").map_or(false, |r| !r.is_empty()) {
+                    const GENERIC_LIB_DIRS: [&str; 2] = ["/usr/local/include", "/usr/include"];
+                    let mapped_generic: Vec<String> = GENERIC_LIB_DIRS
+                        .iter()
+                        .map(|p| sysroot_candidate(p).to_string_lossy().into_owned())
+                        .collect();
+                    let generic_refs: Vec<&str> =
+                        mapped_generic.iter().map(String::as_str).collect();
+                    self.insert_arch_paths_after_bundled(&generic_refs);
+                }
                 // Override width macros for ILP32 (pointer/long/size_t/ptrdiff are 32-bit)
                 self.define_simple_macro("__LONG_WIDTH__", "32");
                 self.define_simple_macro("__PTRDIFF_WIDTH__", "32");

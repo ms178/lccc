@@ -215,6 +215,14 @@ impl Lowerer {
                     ret_ty = IrType::F32;
                 }
             }
+            // i686: _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
+            // hidden-pointer return (sret); the IR return type becomes Ptr.
+            // x86-64 keeps the U128/xmm0:xmm1 return.
+            else if (matches!(ret_ctype, CType::Float128) || ret_ctype == CType::Decimal128)
+                && crate::common::types::target_is_32bit()
+            {
+                ret_ty = IrType::Ptr;
+            }
         }
 
         // Track CType for pointer-returning and struct-returning functions.
@@ -278,6 +286,13 @@ impl Lowerer {
             // On i686, _Complex double (16 bytes) exceeds 8-byte reg pair, needs sret.
             if matches!(ret_ct, CType::ComplexDouble) && !self.decomposes_complex_double() {
                 sret_size = Some(ret_ct.size());
+            }
+            // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
+            // hidden-pointer return, matching GCC's i386 convention.
+            if (matches!(ret_ct, CType::Float128) || ret_ct == CType::Decimal128)
+                && crate::common::types::target_is_32bit()
+            {
+                sret_size = Some(16);
             }
         }
 
