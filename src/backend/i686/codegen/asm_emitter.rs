@@ -22,6 +22,17 @@ impl InlineAsmEmitter for I686Codegen {
         &mut self.state
     }
 
+    /// Wrap user templates in `#APP`/`#NO_APP` markers, exactly like the
+    /// x86-64 emitter.  Without them the i686 text peephole cannot tell
+    /// user-authored instructions from compiler-generated ones and rewrites
+    /// them (store-to-load forwarding happily "optimizes" a template line);
+    /// user asm must reach the assembler byte-for-byte.  `#` starts a
+    /// comment in AT&T syntax, so the markers are invisible to GAS and to
+    /// lccc's integrated i686 assembler alike.
+    fn asm_block_markers(&self) -> Option<(&'static str, &'static str)> {
+        Some(("#APP", "#NO_APP"))
+    }
+
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint: {regname}

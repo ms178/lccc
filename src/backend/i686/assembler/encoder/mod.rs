@@ -582,9 +582,20 @@ impl InstructionEncoder {
             // 32-bit form, which in 16-bit mode needs the 0x66 override --
             // supplied by the `.code16` prefix inversion, so only the size
             // choice is recorded here.
-            "iret" | "iretw" => {
+            "iret" => {
                 if !ops.is_empty() {
                     return Err("iret takes no operands".to_string());
+                }
+                // 32-bit mode: the unsuffixed form is IRET32 (plain CF).
+                // Emitting 66 CF here selects IRET16, which pops a 16-bit
+                // frame — wrong for every 32-bit interrupt return.
+                self.sized_op = true;
+                self.bytes.push(0xCF);
+                Ok(())
+            }
+            "iretw" => {
+                if !ops.is_empty() {
+                    return Err("iretw takes no operands".to_string());
                 }
                 self.sized_op = true;
                 self.bytes.push(0x66); // "16-bit operand" in 32-bit terms
@@ -636,8 +647,25 @@ impl InstructionEncoder {
 
             // No-ops and misc
             "nop" => {
-                self.bytes.push(0x90);
-                Ok(())
+                if ops.is_empty() {
+                    self.bytes.push(0x90);
+                    return Ok(());
+                }
+                // `nop r/m32` is the multi-byte NOP (0F 1F /0) — a bare 0x90
+                // silently dropped the operand the caller asked to encode.
+                match &ops[0] {
+                    Operand::Register(reg) => {
+                        let num = reg_num(&reg.name).ok_or("bad register")?;
+                        self.bytes.extend_from_slice(&[0x0F, 0x1F]);
+                        self.bytes.push(self.modrm(3, 0, num));
+                        Ok(())
+                    }
+                    Operand::Memory(mem) => {
+                        self.bytes.extend_from_slice(&[0x0F, 0x1F]);
+                        self.encode_modrm_mem(0, mem)
+                    }
+                    _ => Err("unsupported nop operand".to_string()),
+                }
             }
             "ud2" => {
                 self.bytes.extend_from_slice(&[0x0F, 0x0B]);
@@ -888,7 +916,7 @@ impl InstructionEncoder {
             "minps" => self.encode_sse_op(ops, &[0x0F, 0x5D]),
             "maxpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5F]),
             "minpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5D]),
-            "cvttpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
+            "cvttpd2dq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE6]),
             "ucomisd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x2E]),
             "ucomiss" => self.encode_sse_op(ops, &[0x0F, 0x2E]),
             "comisd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x2F]),
@@ -1424,7 +1452,7 @@ impl InstructionEncoder {
             "blendps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0C]),
             "dpps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x40]),
             "dppd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x41]),
-            "insertps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x14]),
+            "insertps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x21]),
             "extractps" => self.encode_extractps(ops),
 
             // SSE4.1 test / min-max
@@ -1512,22 +1540,10 @@ impl InstructionEncoder {
 
             // Additional multiply/divide sizes
             "mulb" => self.encode_unary_rm(ops, 4, 1),
-            "mulw" => {
-                self.sized_op = true;
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 4, 2)
-            }
-            "divw" => {
-                self.sized_op = true;
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 6, 2)
-            }
+            "mulw" => self.encode_unary_rm(ops, 4, 2),
+            "divw" => self.encode_unary_rm(ops, 6, 2),
             "divb" => self.encode_unary_rm(ops, 6, 1),
-            "idivw" => {
-                self.sized_op = true;
-                self.bytes.push(0x66);
-                self.encode_unary_rm(ops, 7, 2)
-            }
+            "idivw" => self.encode_unary_rm(ops, 7, 2),
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "imulw" => self.encode_imul(ops, 2),
 
@@ -1622,7 +1638,13 @@ impl InstructionEncoder {
             "vblendps" => self.encode_avx_3op_3a_imm8(ops, 0x0C, true),
             "vblendpd" => self.encode_avx_3op_3a_imm8(ops, 0x0D, true),
             "vpshufb" => self.encode_avx_3op_38(ops, 0x00, true),
-            "vpshufd" => self.encode_avx_shuffle(ops, 0x70, true),
+            "vpshufd" => self.encode_avx_2op_0f_imm8(ops, 0x70, 1),
+            "vpshufhw" => self.encode_avx_2op_0f_imm8(ops, 0x70, 2),
+            "vpshuflw" => self.encode_avx_2op_0f_imm8(ops, 0x70, 3),
+            // Scalar VEX sqrt (VEX.LIG.F3/F2.0F.WIG 51), 3-operand NDS form
+            // only — gas rejects the 2-operand AT&T form for these.
+            "vsqrtsd" => self.encode_avx_3op_pp(ops, 0x51, 3),
+            "vsqrtss" => self.encode_avx_3op_pp(ops, 0x51, 2),
             "vpermilps" => self.encode_avx_3op_38(ops, 0x0C, true),
             "vpermilpd" => self.encode_avx_3op_38(ops, 0x0D, true),
             "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),

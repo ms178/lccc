@@ -431,6 +431,13 @@ impl super::InstructionEncoder {
                     Ok(())
                 }
             }
+            Operand::Memory(mem) => {
+                // popw m16 = 66 8F /0 (memory destination).
+                self.sized_op = true;
+                self.bytes.push(0x66);
+                self.bytes.push(0x8F);
+                self.encode_modrm_mem(0, mem)
+            }
             _ => Err("unsupported popw operand".to_string()),
         }
     }

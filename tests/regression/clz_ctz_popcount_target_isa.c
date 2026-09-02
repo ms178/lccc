@@ -36,7 +36,7 @@ int main(void)
         static const unsigned long long w64[] = {
                 0x0000000000000001ull, 0x0000000100000000ull, 0x00000000ffffffffull,
                 0xffffffff00000000ull, 0x8000000000000000ull, 0x7fffffffffffffffull,
-                0xaaaaaaaaaaaaaaaaull, 0x5555555555555555ull, 0xfffffffffffffffeul,
+                0xaaaaaaaaaaaaaaaaull, 0x5555555555555555ull, 0xfffffffffffffffeull,
                 0xffffffffffffffffull,
         };
 

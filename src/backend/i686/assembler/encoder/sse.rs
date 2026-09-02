@@ -424,8 +424,11 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x15]);
-                self.bytes.push(self.modrm(3, dst_num, src_num));
+                // EXTRACTPS is 66 0F 3A 17 (0x15 is PEXTRW — emitting it here
+                // silently extracted a word instead of a dword).  ModRM.reg
+                // holds the XMM source; ModRM.rm the r32 destination.
+                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x17]);
+                self.bytes.push(self.modrm(3, src_num, dst_num));
                 self.bytes.push(*imm as u8);
                 Ok(())
             }
@@ -435,7 +438,7 @@ impl super::InstructionEncoder {
                 Operand::Memory(mem),
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
-                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x15]);
+                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x17]);
                 self.encode_modrm_mem(src_num, mem)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
@@ -459,6 +462,19 @@ impl super::InstructionEncoder {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
                 self.bytes.extend_from_slice(&[0x66, 0x0F, 0xC5]);
                 self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                // SSE4.1 memory-destination form is 66 0F 3A 15 /r ib — the
+                // legacy 66 0F C5 encoding only accepts a register destination.
+                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x15]);
+                self.encode_modrm_mem(src_num, mem)?;
                 self.bytes.push(*imm as u8);
                 Ok(())
             }

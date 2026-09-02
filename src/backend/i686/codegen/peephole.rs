@@ -81,6 +81,14 @@ enum LineKind {
     Other {
         dest_reg: RegId,
     },
+    /// A line inside a `#APP`/`#NO_APP` inline-asm region.  User-authored
+    /// assembly is OPAQUE: it may hold deliberate no-op length templates,
+    /// runtime-patched sites, or any side effect.  No pass may remove,
+    /// rewrite, or reason about these lines; every conservative fallback
+    /// treats them as clobbering every register and all memory
+    /// (has_indirect_mem = true, ebp_offset = NONE, and they barrier every
+    /// forwarding window).
+    InlineAsm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +139,7 @@ impl LineInfo {
         matches!(
             self.kind,
             LineKind::Label | LineKind::Call | LineKind::Jmp | LineKind::JmpIndirect |
-            LineKind::CondJmp | LineKind::Ret | LineKind::Directive |
+            LineKind::CondJmp | LineKind::Ret | LineKind::Directive | LineKind::InlineAsm |
             // ESP changes renumber every (%esp) slot: push/pop and explicit
             // %esp arithmetic fence all slot windows now that ESP-relative
             // slots participate in the peepholes. Pushes/pops only appear
@@ -218,27 +226,50 @@ fn reg32_name(id: RegId) -> &'static str {
 }
 
 /// Byte/word register name for a family ID, matching the width of `size`
-/// (B => 8-bit low register, W => 16-bit register). Used by the
-/// widen-forwarding arm to synthesize `movzbl`/`movzwl`.
-fn narrow_reg_name(id: RegId, size: MoveSize) -> &'static str {
+/// (B => 8-bit low register, W => 16-bit register).
+///
+/// `None` when the encoding does not exist on this target: in 32-bit mode
+/// only %al/%cl/%dl/%bl have 8-bit forms — %spl/%bpl/%sil/%dil require a
+/// REX prefix and are 64-bit-only, so a caller asking for them must refuse
+/// the rewrite instead of emitting text the assembler would reject.
+fn narrow_reg_name(id: RegId, size: MoveSize) -> Option<&'static str> {
     match (id, size) {
-        (REG_EAX, MoveSize::B) => "%al",
-        (REG_ECX, MoveSize::B) => "%cl",
-        (REG_EDX, MoveSize::B) => "%dl",
-        (REG_EBX, MoveSize::B) => "%bl",
-        (REG_ESP, MoveSize::B) => "%spl",
-        (REG_EBP, MoveSize::B) => "%bpl",
-        (REG_ESI, MoveSize::B) => "%sil",
-        (REG_EDI, MoveSize::B) => "%dil",
-        (REG_EAX, MoveSize::W) => "%ax",
-        (REG_ECX, MoveSize::W) => "%cx",
-        (REG_EDX, MoveSize::W) => "%dx",
-        (REG_EBX, MoveSize::W) => "%bx",
-        (REG_ESP, MoveSize::W) => "%sp",
-        (REG_EBP, MoveSize::W) => "%bp",
-        (REG_ESI, MoveSize::W) => "%si",
-        (REG_EDI, MoveSize::W) => "%di",
-        _ => "%???",
+        (REG_EAX, MoveSize::B) => Some("%al"),
+        (REG_ECX, MoveSize::B) => Some("%cl"),
+        (REG_EDX, MoveSize::B) => Some("%dl"),
+        (REG_EBX, MoveSize::B) => Some("%bl"),
+        (REG_EAX, MoveSize::W) => Some("%ax"),
+        (REG_ECX, MoveSize::W) => Some("%cx"),
+        (REG_EDX, MoveSize::W) => Some("%dx"),
+        (REG_EBX, MoveSize::W) => Some("%bx"),
+        (REG_ESP, MoveSize::W) => Some("%sp"),
+        (REG_EBP, MoveSize::W) => Some("%bp"),
+        (REG_ESI, MoveSize::W) => Some("%si"),
+        (REG_EDI, MoveSize::W) => Some("%di"),
+        _ => None,
+    }
+}
+
+/// Parse a zero-extension into a 32-bit register: `movzbl %al, %eax` /
+/// `movzwl %ax, %eax`.  Returns (source width, source operand text, dest
+/// family).  The source TEXT is returned verbatim because `movzbl %ah` is
+/// a different byte than `movzbl %al` — callers must compare it against the
+/// expected low sub-register, not just the family.
+fn parse_zext32(s: &str) -> Option<(MoveSize, &str, RegId)> {
+    let (rest, w) = if let Some(r) = s.strip_prefix("movzbl ") {
+        (r, MoveSize::B)
+    } else if let Some(r) = s.strip_prefix("movzwl ") {
+        (r, MoveSize::W)
+    } else {
+        return None;
+    };
+    let (a, b) = rest.split_once(',')?;
+    let a = a.trim();
+    let dst = register_family(b.trim());
+    if a.starts_with('%') && dst <= REG_GP_MAX {
+        Some((w, a, dst))
+    } else {
+        None
     }
 }
 
@@ -2111,20 +2142,23 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                     }
                 }
                 LineKind::LoadEbp { offset, size, .. } => {
-                    // Only same-or-wider reloads of exactly the stored bytes
-                    // can be turned into the constant; a narrower or
-                    // partial-overlap read is left alone and stops tracking.
+                    // Only a SAME-WIDTH reload of exactly the stored bytes can
+                    // become the constant.  A wider `movl` reload reads slot
+                    // bytes the immediate store never wrote (adjacent locals
+                    // or raw stack garbage — this pass runs over real-mode
+                    // boot code where the stack is arbitrary); it is not a
+                    // zero-extension, so materializing the masked constant
+                    // would fabricate zero bits.  A narrower or partial-
+                    // overlap read is left alone and stops tracking.
                     if ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size())
                         && offset == slot
-                        && size.byte_size() >= store_size.byte_size()
+                        && size == store_size
                     {
                         // Rewrite as a direct immediate materialization into
-                        // the load's destination register. The constant is
-                        // re-masked to the STORE width: a byte store of $3
-                        // read as movl is value 3; no extension is needed for
-                        // a non-negative small constant, and a wider store
-                        // feeding a narrower load is masked by the register
-                        // name chosen (movw/movb write the low part).
+                        // the load's destination register, keeping the load's
+                        // exact width (a `movw slot,%ax` reload writes only
+                        // %ax — materializing through %eax would clobber the
+                        // high half).
                         if let LineKind::LoadEbp { reg: dst, .. } = infos[j].kind {
                             if dst <= REG_GP_MAX {
                                 let mn = match size {
@@ -2133,26 +2167,80 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                                     MoveSize::B => "movb",
                                 };
                                 let dstname = match size {
-                                    MoveSize::L => reg32_name(dst).to_string(),
-                                    MoveSize::W => narrow_reg_name(dst, MoveSize::W).to_string(),
-                                    MoveSize::B => narrow_reg_name(dst, MoveSize::B).to_string(),
+                                    MoveSize::L => Some(reg32_name(dst)),
+                                    MoveSize::W => narrow_reg_name(dst, MoveSize::W),
+                                    MoveSize::B => narrow_reg_name(dst, MoveSize::B),
                                 };
-                                // Mask the immediate to the STORED width so a
-                                // negative/wide constant stays correct when
-                                // the reload is wider than the store.
-                                let mask: i64 = match store_size {
-                                    MoveSize::L => 0xFFFF_FFFF,
-                                    MoveSize::W => 0xFFFF,
-                                    MoveSize::B => 0xFF,
-                                };
-                                let v = val & mask;
-                                store.replace(j, format!("    {mn} ${v}, {dstname}"));
-                                infos[j] = classify_line(store.get(j));
-                                changed = true;
-                                j += 1;
-                                count += 1;
-                                continue;
+                                if let Some(dstname) = dstname {
+                                    // Mask the immediate to the stored width
+                                    // so a negative/wide constant stays
+                                    // correct at this width.
+                                    let mask: i64 = match store_size {
+                                        MoveSize::L => 0xFFFF_FFFF,
+                                        MoveSize::W => 0xFFFF,
+                                        MoveSize::B => 0xFF,
+                                    };
+                                    let v = val & mask;
+                                    store.replace(j, format!("    {mn} ${v}, {dstname}"));
+                                    infos[j] = classify_line(store.get(j));
+                                    changed = true;
+                                    j += 1;
+                                    count += 1;
+                                    continue;
+                                }
                             }
+                        }
+                        killed = true;
+                    } else if offset == slot
+                        && size == MoveSize::L
+                        && store_size != MoveSize::L
+                        && ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size())
+                    {
+                        // A wider reload is materializable ONLY when a
+                        // zero-extension of exactly the stored width
+                        // immediately consumes it — the bytes above the
+                        // store are then dead on arrival:
+                        //   movb $7,S; movl S,%eax; movzbl %al,%eax
+                        //     -> movl $7,%eax
+                        // Without the zext the reload reads unwritten slot
+                        // bytes (adjacent locals or raw stack garbage) and
+                        // must stay a slot read.
+                        let mut fused = false;
+                        if let LineKind::LoadEbp { reg: dst, .. } = infos[j].kind {
+                            if dst <= REG_GP_MAX {
+                                let mut k = j + 1;
+                                while k < len && infos[k].is_nop() {
+                                    k += 1;
+                                }
+                                if let Some((zw, zsrc, zdst)) =
+                                    (k < len).then(|| parse_zext32(trimmed(store, &infos[k], k))).flatten()
+                                {
+                                    if zw == store_size
+                                        && zdst == dst
+                                        && Some(zsrc) == narrow_reg_name(dst, store_size)
+                                    {
+                                        let mask: i64 = match store_size {
+                                            MoveSize::W => 0xFFFF,
+                                            MoveSize::B => 0xFF,
+                                            MoveSize::L => unreachable!(),
+                                        };
+                                        let v = val & mask;
+                                        store.replace(
+                                            j,
+                                            format!("    movl ${v}, {}", reg32_name(dst)),
+                                        );
+                                        infos[j] = classify_line(store.get(j));
+                                        infos[k].kind = LineKind::Nop;
+                                        changed = true;
+                                        j = k + 1;
+                                        count += 1;
+                                        fused = true;
+                                    }
+                                }
+                            }
+                        }
+                        if fused {
+                            continue;
                         }
                         killed = true;
                     } else {
@@ -2236,14 +2324,47 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         count += 1;
                         continue;
                     } else if dst_reg <= REG_GP_MAX {
-                        let text =
-                            format!("    movl {}, {}", reg32_name(src_reg), reg32_name(dst_reg));
-                        store.replace(j, text);
-                        infos[j] = classify_line(store.get(j));
-                        changed = true;
-                        j += 1;
-                        count += 1;
-                        continue;
+                        // Width-preserving rewrite.  A word/byte reload
+                        // writes ONLY the low 16/8 bits of its destination
+                        // and the store only proved the low 16/8 bits of the
+                        // source; emitting a 32-bit `movl %src32, %dst32`
+                        // here would both clobber the destination's high
+                        // half and copy source bits that never went through
+                        // the slot.
+                        let text = match size {
+                            MoveSize::L => Some(format!(
+                                "    movl {}, {}",
+                                reg32_name(src_reg),
+                                reg32_name(dst_reg)
+                            )),
+                            MoveSize::W => {
+                                match (
+                                    narrow_reg_name(src_reg, MoveSize::W),
+                                    narrow_reg_name(dst_reg, MoveSize::W),
+                                ) {
+                                    (Some(s), Some(d)) => Some(format!("    movw {s}, {d}")),
+                                    _ => None,
+                                }
+                            }
+                            MoveSize::B => {
+                                match (
+                                    narrow_reg_name(src_reg, MoveSize::B),
+                                    narrow_reg_name(dst_reg, MoveSize::B),
+                                ) {
+                                    (Some(s), Some(d)) => Some(format!("    movb {s}, {d}")),
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(text) = text {
+                            store.replace(j, text);
+                            infos[j] = classify_line(store.get(j));
+                            changed = true;
+                            j += 1;
+                            count += 1;
+                            continue;
+                        }
+                        break;
                     } else {
                         break;
                     }
@@ -2274,35 +2395,57 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     offset,
                     size: lsize,
                 } if offset == slot && dst_reg <= REG_GP_MAX => {
-                    let fwd = match (size, lsize) {
-                        (MoveSize::L, MoveSize::L) => Some(("movl", reg32_name(src_reg))),
-                        (MoveSize::W, MoveSize::W) => {
-                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
+                    // Only width-MISMATCHED pairs reach this arm (the
+                    // same-width case is handled by the arm above).  Both
+                    // mismatch directions are refused at the text level:
+                    //  * narrower store, WIDER `movl` reload: the reload reads
+                    //    slot bytes the store never wrote (adjacent variables
+                    //    or raw stack garbage — this pass runs over real-mode
+                    //    boot code), it is NOT a zero-extension, so rewriting
+                    //    to movzbl/movzwl fabricates zero bits;
+                    //  * wider store, narrower reload: the register is not
+                    //    proven to hold the low bytes canonically.
+                    // The sole sound exception is a zero-extension of exactly
+                    // the stored width immediately consuming the reload —
+                    // handled below.
+                    // Width-mismatched (B/W store, 32-bit reload) pairs are
+                    // foldable ONLY when a zero-extension of exactly the
+                    // stored width immediately consumes the reload — then
+                    // the slot bytes above the store are dead on arrival and
+                    // the triple collapses without fabricating any bits:
+                    //   movb %al,S; movl S,%eax; movzbl %al,%eax
+                    //     -> movzbl %al,%eax
+                    if lsize == MoveSize::L && size != MoveSize::L {
+                        let mut k = j + 1;
+                        while k < len && infos[k].is_nop() {
+                            k += 1;
                         }
-                        (MoveSize::W, MoveSize::L) => {
-                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
+                        if let Some((zw, zsrc, zdst)) =
+                            (k < len).then(|| parse_zext32(trimmed(store, &infos[k], k))).flatten()
+                        {
+                            if zw == size
+                                && zdst == dst_reg
+                                && Some(zsrc) == narrow_reg_name(dst_reg, size)
+                            {
+                                if let Some(srcname) = narrow_reg_name(src_reg, size) {
+                                    let mn = if size == MoveSize::B {
+                                        "movzbl"
+                                    } else {
+                                        "movzwl"
+                                    };
+                                    store.replace(
+                                        j,
+                                        format!("    {mn} {srcname}, {}", reg32_name(dst_reg)),
+                                    );
+                                    infos[j] = classify_line(store.get(j));
+                                    infos[k].kind = LineKind::Nop;
+                                    changed = true;
+                                    j = k + 1;
+                                    count += 1;
+                                    continue;
+                                }
+                            }
                         }
-                        (MoveSize::B, MoveSize::L) => {
-                            Some(("movzbl", narrow_reg_name(src_reg, MoveSize::B)))
-                        }
-                        // A WIDER register store feeding a NARROWER UNSIGNED
-                        // reload is ONLY forwarded when the reload is itself
-                        // a zero-extension (movzbl/movzwl classify as LoadEbp
-                        // of size B/W but their text says movzXl, handled by
-                        // the widened-slot fold elsewhere). Plain same-width or
-                        // narrower-with-truncation (`movb slot,%al` from a
-                        // movl store) reads low bytes the register is NOT
-                        // proven to hold canonically, so it is left alone.
-                        _ => None,
-                    };
-                    if let Some((mnem, src)) = fwd {
-                        let dst = reg32_name(dst_reg);
-                        store.replace(j, format!("    {mnem} {src}, {dst}"));
-                        infos[j] = classify_line(store.get(j));
-                        changed = true;
-                        j += 1;
-                        count += 1;
-                        continue;
                     }
                     break;
                 }
@@ -5718,6 +5861,13 @@ fn census_reg_reads(
             k += 1;
             continue;
         }
+        // Inline asm may read (or clobber) any register without naming it
+        // in the template text — count it as a read of everything.
+        if infos[k].kind == LineKind::InlineAsm {
+            n += 1;
+            k += 1;
+            continue;
+        }
         let line = trimmed(store, &infos[k], k);
         if line_references_reg(line, reg) && !line_writes_reg_purely(line, reg) {
             n += 1;
@@ -7684,6 +7834,14 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             }
             let has_jmp_indirect =
                 (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
+            // Opaque user asm may compute slot addresses, call, or depend on
+            // the exact %esp geometry — never renumber a frame it can see.
+            let has_inline_asm =
+                (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::InlineAsm);
+            if has_inline_asm {
+                start = end.saturating_add(1);
+                continue;
+            }
             let mut envelope_ok = true;
             if let Some(ld) = last_dealloc {
                 // 1) Geometry: every %esp engagement must live strictly
@@ -8023,7 +8181,9 @@ fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]
             }
             let line = trimmed(store, &infos[i], i);
             match infos[i].kind {
-                LineKind::Call => has_call = true,
+                // Opaque user asm may itself call, push, or depend on the
+                // absolute %esp value/alignment — veto the elision.
+                LineKind::Call | LineKind::InlineAsm => has_call = true,
                 LineKind::Push { .. } | LineKind::Pop { .. } => has_push_or_pop = true,
                 _ => {
                     if let Some(v) = parse_esp_adjust(line, "subl") {
@@ -8499,6 +8659,35 @@ fn else_hoist_diamonds(asm: String) -> String {
 
 /// Run peephole optimization on i686 assembly text.
 /// Returns the optimized assembly string.
+/// Reclassify every line between `#APP` and `#NO_APP` as
+/// [`LineKind::InlineAsm`] so no pass rewrites user-authored assembly.
+/// Ported from the x86-64 peephole, where the missing quarantine deleted a
+/// deliberate `movq %rax, %rax` length template inside a kernel
+/// ALTERNATIVE() block (objtool: "empty alternative entry").  The markers
+/// themselves stay classified as comments and pass through untouched.
+fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
+    let mut in_asm = false;
+    for i in 0..store.len() {
+        let t = trimmed(store, &infos[i], i);
+        if t == "#APP" {
+            in_asm = true;
+            continue;
+        }
+        if t == "#NO_APP" {
+            in_asm = false;
+            continue;
+        }
+        if in_asm {
+            infos[i] = LineInfo {
+                kind: LineKind::InlineAsm,
+                trim_start: infos[i].trim_start,
+                has_indirect_mem: true,
+                ebp_offset: EBP_OFFSET_NONE,
+            };
+        }
+    }
+}
+
 pub fn peephole_optimize(asm: String) -> String {
     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
         return asm;
@@ -8508,6 +8697,7 @@ pub fn peephole_optimize(asm: String) -> String {
     let mut infos: Vec<LineInfo> = (0..line_count)
         .map(|i| classify_line(store.get(i)))
         .collect();
+    pin_inline_asm_regions(&store, &mut infos);
 
     // Phase 1: Iterative local passes
     let mut changed = true;
@@ -9537,10 +9727,12 @@ mod tests {
         )
         .to_string();
         let result = peephole_optimize(asm);
-        // The immediate byte store forwards straight into the widened reload:
-        // the constant 7 materializes directly (`movl $7,%eax`) and the
-        // movzbl of the already-byte constant is redundant — strictly better
-        // than folding the reload into a memory-source movzbl.
+        // The immediate byte store forwards straight into the widened
+        // reload BECAUSE the adjacent movzbl terminates the widening: the
+        // constant materializes directly (`movl $7,%eax`) and the zext of
+        // the already-byte constant dies with it — strictly better than
+        // folding the reload into a memory-source movzbl, and sound: the
+        // fabricated upper bits never existed without the zext either.
         assert!(
             result.contains("movl $7, %eax"),
             "immediate slot store must forward to the widened load:\n{result}"
@@ -12239,30 +12431,131 @@ mod tests {
     // zero-extension can be deleted.
 
     #[test]
-    fn test_widen_forward_byte_store_to_l_reload() {
-        // The `inb` asm-clobber idiom: byte result homed to the slot, then a
-        // 32-bit reload. Must forward to movzbl %al.
+    fn test_widen_forward_byte_store_to_l_reload_refused() {
+        // A byte store feeding a 32-bit reload must NOT be forwarded: the
+        // `movl` reload reads slot bytes 1..3 that the store never wrote
+        // (adjacent locals or raw stack garbage — this is real-mode boot
+        // code). Rewriting it to `movzbl %al, %eax` would fabricate zero
+        // bits the original program never had.
         let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n"
             .to_string();
         let result = peephole_optimize(asm);
         assert!(
-            !result.contains("0(%esp)"),
-            "slot round-trip must be eliminated:\n{result}"
+            result.contains("movl 0(%esp), %eax"),
+            "wider reload must keep reading the slot:\n{result}"
         );
         assert!(
-            result.contains("movzbl %al, %eax"),
-            "byte store must widen-forward to movzbl:\n{result}"
+            !result.contains("movzbl %al, %eax"),
+            "zero-fabricating widening is unsound and must not appear:\n{result}"
         );
     }
 
     #[test]
-    fn test_widen_forward_word_store_to_l_reload() {
+    fn test_widen_forward_word_store_to_l_reload_refused() {
         let asm = "f:\n    movw %cx, %ax\n    movw %ax, 0(%esp)\n    movl 0(%esp), %edx\n    ret\n"
             .to_string();
         let result = peephole_optimize(asm);
         assert!(
-            result.contains("movzwl %ax, %edx"),
-            "word store must widen-forward to movzwl:\n{result}"
+            result.contains("movl 0(%esp), %edx"),
+            "wider reload must keep reading the slot:\n{result}"
+        );
+        assert!(
+            !result.contains("movzwl %ax, %edx"),
+            "zero-fabricating widening is unsound and must not appear:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_same_width_word_forward_preserves_dest_width() {
+        // Unit-level contract for the (W,W) forward: the rewrite must keep
+        // the reload's 16-bit destination.  `movw 0(%esp), %dx` writes only
+        // %dx, so forwarding to `movzwl %ax, %edx` would clobber the high
+        // half of %edx.  Driven through forward_slot_loads directly because
+        // later pipeline passes deliberately fold under the backend's
+        // narrow-write contract (high halves of 16-bit-typed values are
+        // don't-care in backend-generated dataflow) and would mask the
+        // exact rewrite shape under test.
+        let asm = "f:\n    movw %ax, 0(%esp)\n    movw 0(%esp), %dx\n".to_string();
+        let mut store = LineStore::new(asm);
+        let n = store.len();
+        let mut infos: Vec<LineInfo> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = forward_slot_loads(&mut store, &mut infos);
+        assert!(changed, "same-width word pair must forward");
+        let out: Vec<&str> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim())
+            .collect();
+        assert!(
+            out.iter().any(|l| *l == "movw %ax, %dx"),
+            "word forward must stay 16-bit dest: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_widen_forward_with_zext_terminator_fuses() {
+        // The `inb` idiom IS foldable when a zero-extension of exactly the
+        // stored width immediately consumes the 32-bit reload — the bytes
+        // above the store are dead on arrival, so the triple collapses:
+        //   movb %al,S; movl S,%eax; movzbl %al,%eax  ->  movzbl %al,%eax
+        let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    movzbl %al, %eax\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movzbl %al, %eax"),
+            "zext-terminated widening must fuse:\n{result}"
+        );
+        assert!(
+            !result.contains("0(%esp)"),
+            "slot round-trip must be gone:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_immediate_forward_same_width_only() {
+        // Same-width immediate forward materializes the constant directly.
+        let asm = "f:\n    movl $3, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movl $3, %eax"),
+            "same-width immediate must forward:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_immediate_forward_wider_reload_refused() {
+        // A byte-sized immediate store feeding a 32-bit reload must stay a
+        // slot read: the upper three bytes are unwritten stack garbage, not
+        // zeros.
+        let asm = "f:\n    movb $3, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movl 0(%esp), %eax"),
+            "wider reload of a byte store must not materialize:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_inline_asm_region_is_never_rewritten() {
+        // User-authored asm between #APP/#NO_APP must survive byte-for-byte
+        // even when its text matches a foldable store/load shape, and it
+        // must barrier forwarding windows around it.
+        let asm = "f:\n    movl %eax, 0(%esp)\n#APP\n    movl 0(%esp), %ecx\n#NO_APP\n    movl 0(%esp), %edx\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("#APP") && result.contains("#NO_APP"),
+            "markers must survive:\n{result}"
+        );
+        let app = result.find("#APP").unwrap();
+        let noapp = result.find("#NO_APP").unwrap();
+        let region = &result[app..noapp];
+        assert!(
+            region.contains("movl 0(%esp), %ecx"),
+            "asm body must be untouched:\n{result}"
+        );
+        assert!(
+            !region.contains("movl %eax, %ecx"),
+            "asm line must not be forwarded:\n{result}"
         );
     }
 
