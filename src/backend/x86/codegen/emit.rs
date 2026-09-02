@@ -4690,11 +4690,12 @@ impl ArchCodegen for X86Codegen {
                 }
                 _ => {}
             }
-            let lowered = super::isel::lower_instruction_typed(
+            let lowered = super::isel::lower_instruction_typed_ss(
                 inst,
                 &self.reg_assignments,
                 &float_alloca_slots,
                 Some(&self.value_types),
+                Some(&self.state.small_slot_values),
                 &mut self.machinst_buf,
             );
             if lowered {
@@ -4893,11 +4894,12 @@ impl ArchCodegen for X86Codegen {
             _ => {}
         }
 
-        let lowered = super::isel::lower_instruction_typed(
+        let lowered = super::isel::lower_instruction_typed_ss(
             inst,
             &self.reg_assignments,
             &alloca_slots,
             Some(&self.value_types),
+            Some(&self.state.small_slot_values),
             &mut self.machinst_buf,
         );
         if lowered {
@@ -4908,6 +4910,18 @@ impl ArchCodegen for X86Codegen {
 
     fn flush_machinst(&mut self) {
         if self.machinst_buf.is_empty() {
+            // No machine instructions pending: nothing to emit. The IR shadow
+            // (`machinst_buf_ir`) may still hold entries from no-op lowerings
+            // — a coalesced Copy whose src and dest resolve to the same home
+            // (value_to_reg(src) == value_to_reg(dest)) emits zero MachInsts
+            // but is still recorded in the shadow. Drop the shadow too:
+            // leaving it behind lets a later flush — possibly in a *different
+            // function* after the boundary — replay stale IR whose values
+            // have no homes there, tripping the operand_to_rax hard gate
+            // (kernel drivers/tty/tty_io.c: tty_tiocmget replayed
+            // tty_get_tiocm's tail `Copy v19 = v12`). A no-op window needs no
+            // replay: the values are already at their destinations.
+            self.machinst_buf_ir.clear();
             return;
         }
 

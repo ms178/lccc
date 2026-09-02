@@ -1283,12 +1283,41 @@ impl X86Codegen {
                     .sum::<usize>()
             })
             .unwrap_or(0);
-        self.machinst_function_enabled = self.machinst_enabled
-            && (loop_insts <= max_loop_insts || std::env::var("CCC_MI_FORCE_LOOPS").is_ok());
+        // Diagnostic knob (2026-09-02, kernel-boot zstd hunt): comma-separated
+        // name substrings; functions matching any of them are forced onto the
+        // classic backend. Lets a miscompiled function be bisected without
+        // touching the source (source edits perturb layout and flip layout-
+        // sensitive miscompiles on/off).
+        let fn_disable = std::env::var("CCC_MI_FN_DISABLE").unwrap_or_default();
+        let fn_disabled = !fn_disable.is_empty()
+            && fn_disable
+                .split(',')
+                .any(|pat| !pat.is_empty() && func.name.contains(pat));
+        // Inverse diagnostic knob: force MachInst ON for matching functions
+        // even under CCC_NO_MACHINST=1. Combined with an otherwise-classic
+        // build, a FAIL introduced by forcing exactly one function proves that
+        // function's own MachInst codegen is the miscompile (layout
+        // coincidences cannot create a bug when only one function changes).
+        // CCC_MI_ALL_CLASSIC gives an all-classic baseline WITHOUT the
+        // CCC_NO_MACHINST side effects (it only zeroes the per-function gate,
+        // so a CCC_MI_FN_FORCE'd function still flows through the MachInst
+        // emitter, and the MachInst-incompatible peephole phase stays off).
+        let all_classic = std::env::var("CCC_MI_ALL_CLASSIC").is_ok();
+        let fn_force = std::env::var("CCC_MI_FN_FORCE").unwrap_or_default();
+        let fn_forced = !fn_force.is_empty()
+            && fn_force
+                .split(',')
+                .any(|pat| !pat.is_empty() && func.name.contains(pat));
+        self.machinst_function_enabled = (self.machinst_enabled
+            && !all_classic
+            && (loop_insts <= max_loop_insts || std::env::var("CCC_MI_FORCE_LOOPS").is_ok())
+            && !fn_disabled)
+            || fn_forced;
         if std::env::var("CCC_MI_DEBUG").is_ok() {
             eprintln!(
-                "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={}",
-                func.name, loop_insts, max_loop_insts, self.machinst_function_enabled
+                "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={} fn_disabled={} fn_forced={}",
+                func.name, loop_insts, max_loop_insts, self.machinst_function_enabled, fn_disabled,
+                fn_forced
             );
         }
 

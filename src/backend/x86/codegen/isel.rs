@@ -8,7 +8,7 @@
 
 use super::machinst::*;
 use crate::backend::regalloc::PhysReg;
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{
     BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Terminator, Value,
@@ -1354,7 +1354,36 @@ pub fn lower_instruction_typed(
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     out: &mut Vec<MachInst>,
 ) -> bool {
-    let lowered = lower_instruction_typed_inner(inst, reg_assignments, alloca_slots, value_types, out);
+    lower_instruction_typed_ss(
+        inst,
+        reg_assignments,
+        alloca_slots,
+        value_types,
+        None,
+        out,
+    )
+}
+
+/// Production entry point: additionally receives the certified-small-slot set
+/// so copy relays can choose the full-width S64 form for 8-byte homes (see
+/// the Copy arm in `lower_instruction_typed_inner`). Tests and the legacy
+/// ctx entry go through `lower_instruction_typed` with `None`.
+pub fn lower_instruction_typed_ss(
+    inst: &Instruction,
+    reg_assignments: &FxHashMap<u32, PhysReg>,
+    alloca_slots: &FxHashMap<u32, i64>,
+    value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
+    small_slots: Option<&FxHashSet<u32>>,
+    out: &mut Vec<MachInst>,
+) -> bool {
+    let lowered = lower_instruction_typed_inner(
+        inst,
+        reg_assignments,
+        alloca_slots,
+        value_types,
+        small_slots,
+        out,
+    );
     if stats::enabled() {
         if lowered {
             stats::LOWERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1370,6 +1399,7 @@ fn lower_instruction_typed_inner(
     reg_assignments: &FxHashMap<u32, PhysReg>,
     alloca_slots: &FxHashMap<u32, i64>,
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
+    small_slots: Option<&FxHashSet<u32>>,
     out: &mut Vec<MachInst>,
 ) -> bool {
     // For values that already have register allocations from the existing
@@ -1775,15 +1805,43 @@ fn lower_instruction_typed_inner(
             // type-polymorphic, so the width comes from the value-type map
             // (propagated Copy/producer types); unknown types keep S64,
             // which matches the 8-byte slots untyped values receive.
-            let copy_size = value_types.and_then(|vt| {
-                let ty = match src {
-                    Operand::Value(v) => vt.get(&v.0).copied(),
-                    _ => None,
-                };
-                let ty = ty.or_else(|| vt.get(&dest.0).copied());
+            //
+            // SMALL-SLOT CERTIFICATION GATE (2026-09-02, kernel-boot zstd
+            // ZSTD_decodeLiteralsBlock): the type width may only be trusted
+            // when the destination value is certified small (4-byte slot).
+            // MachInst register scheduling can leave a value with an 8-byte
+            // home slot whose later uses reload it at 64-bit (a
+            // CondBranch-on-value test re-materialized as
+            // `mov (%rsp+off),%rax; test %rax,%rax`); a type-width 32-bit
+            // copy relay then stores only the low half of that slot and the
+            // 64-bit reload observes stale upper bytes. The classic path is
+            // immune because it stores the u32 zero-extended in %rax at full
+            // width. So: certified-small destination -> value-type width
+            // (≤32-bit); anything else -> full-width S64 relay, whose
+            // destination upper half is always defined for 64-bit readers.
+            let dest_small = small_slots
+                .map(|ss| ss.contains(&dest.0))
+                .unwrap_or(false);
+            let src_small = match src {
+                Operand::Value(v) => small_slots
+                    .map(|ss| ss.contains(&v.0))
+                    .unwrap_or(false),
+                Operand::Const(_) => true,
+            };
+            let narrow = dest_small && src_small;
+            let copy_size = if narrow {
+                let ty = value_types.and_then(|vt| {
+                    let ty = match src {
+                        Operand::Value(v) => vt.get(&v.0).copied(),
+                        _ => None,
+                    };
+                    ty.or_else(|| vt.get(&dest.0).copied())
+                });
                 ty.map(crate::backend::x86::codegen::machinst::OpSize::from_ir_type)
-            });
-            let copy_size = copy_size.unwrap_or(crate::backend::x86::codegen::machinst::OpSize::S64);
+                    .unwrap_or(crate::backend::x86::codegen::machinst::OpSize::S64)
+            } else {
+                crate::backend::x86::codegen::machinst::OpSize::S64
+            };
             lower_copy(dest, src, copy_size, ra, out);
             true
         }
