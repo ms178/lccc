@@ -83,7 +83,11 @@ __attribute__((noinline)) static long countdown(const int *a, int n) {
     return s;
 }
 
-/* (5) derived addressing with a RUNTIME bound (signed: admissible). */
+/* (5) derived addressing with a RUNTIME bound (signed: admissible).
+ * In-bounds: the caller passes n <= N/3 so i*3 < N. (The original battery
+ * called this with N-1, reading `a[i*3]` up to index ~3(N-1) on an
+ * N-element array — a silent out-of-bounds read that made the GCC
+ * differential vacuous. Caught in the Agent B audit.) */
 __attribute__((noinline)) static long runtime_derived(const int *a, int n) {
     long s = 0;
     for (int i = 0; i < n; i++) {
@@ -129,7 +133,7 @@ __attribute__((noinline)) static unsigned umask_hi(const unsigned *a, unsigned n
 }
 
 int main(void) {
-    enum { N = 400 };
+    enum { N = 420 };
     static int a[N];
     static unsigned u[N];
     for (int i = 0; i < N; i++) {
@@ -142,7 +146,7 @@ int main(void) {
     r += plus1_hoisted_bound(a, N);
     r += minus1_hoisted_bound(a, N);
     r += countdown(a, N);
-    r += runtime_derived(a, N - 1);
+    r += runtime_derived(a, N / 3); /* in-bounds: 3*i <= 3*(N/3-1) < N */
     r += signed_iv_ult(a, N);
     r += unsigned_iv_slt(a, N);
     r += high_bit(a, N);

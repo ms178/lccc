@@ -56,8 +56,11 @@
 //!    unsigned IV may be widened only when the loop provably terminates
 //!    inside the type's range: an exit test `i < n` with a unit step (body
 //!    values `≤ n-1 ≤ 2^w-2`, latch result `≤ 2^w-1` — no wrap anywhere), or
-//!    `i > bound` with step `-1`. This is the same discipline SCEV-based
-//!    compilers apply.
+//!    `i > bound` with step `-1`. The bound may be a RUNTIME loop-invariant
+//!    value — the no-wrap argument is by construction (any seed `< n`,
+//!    unit steps, exit at `≥ n` — every executed value is `< 2^w`), not by
+//!    constant folding. This is the same discipline SCEV-based compilers
+//!    apply.
 //!
 //! # Provenance
 //!
@@ -81,6 +84,12 @@
 //! - Narrow constant-count shifts `a[i<<1]` (`Shl` both signednesses, `AShr`
 //!   signed, `LShr` unsigned): the shift count is a shift AMOUNT and is never
 //!   widened; only the member and the op's type are retyped.
+//! - Signedness-changing widening casts (`U32→I64` / `I32→U64`), which the
+//!   C frontend emits for unsigned index chains (`unsigned i; a[i>>1]`):
+//!   the cast value equals the widened member on every executed iteration,
+//!   so it is retained as a same-size reinterpretation of the wide value and
+//!   the chain below it is enqueued and classified normally (`CrossCast`) —
+//!   that is where the I64 scaling and the GEP live.
 //! - Same-width casts (C's `int < unsigned` promotion) are retained as
 //!   truncations rather than widened, keeping the mixed-signedness cmp exact.
 //! - Rotated self-loops (header == latch) are widenable when a preheader
@@ -93,9 +102,9 @@
 //! - `i8`/`i16` IVs: the C int-promotion latch is `trunc(add(phi, 1):I32)`,
 //!   not a narrow `add`, and widening it would change the DEFINED 8/16-bit
 //!   wrap of the truncation unless a no-wrap bound is proven (see
-//!   engineering/FOLLOWUP-2026-09-02-iv-widen-audit.md, §5). Candidacy is
-//!   therefore restricted to `I32`/`U32`; extending it requires a narrow-width
-//!   no-wrap bound proof first.
+//!   engineering/FOLLOWUP-2026-09-02-iv-widen-agentb-audit.md, §5). Candidacy
+//!   is therefore restricted to `I32`/`U32`; extending it requires a
+//!   narrow-width no-wrap bound proof first.
 //! - loop-variant latch steps (an invariant step is cast once in the
 //!   preheader; a variant step cannot be hoisted);
 //! - narrow shifts with a non-constant or out-of-range count, `AShr` on
@@ -313,6 +322,20 @@ enum MemberKind {
     /// retyped to a truncation of the wide value (`from_ty = wide`), so its
     /// consumers keep reading the exact narrow bits.
     NarrowCast { operand: Value },
+    /// A size-widening cast of a member that *changes* signedness
+    /// (`U32→I64` / `I32→U64` — the C frontend produces these when an
+    /// unsigned index feeds a signed-width GEP chain, e.g. `unsigned i;
+    /// a[i>>1]`, and for `(unsigned long)i` index expressions). The cast's
+    /// value equals the widened member on every executed iteration (the
+    /// extension semantics follow the 32-bit source's signedness, which is
+    /// exactly the member's `ext`; the no-wrap domain — signed-overflow-is-UB
+    /// for signed seeds, the counted bound for unsigned seeds — makes the
+    /// wide member bit-identical to the narrow one). The cast is therefore
+    /// retained and retyped to a same-size `wide_ty → to_ty` cast — a pure
+    /// reinterpretation the backend emits as a no-op — and its dest is
+    /// enqueued as a chain value so the wide chain below it (the I64 index
+    /// scaling and the GEP) is classified and can set `has_addressing`.
+    CrossCast { operand: Value },
     /// `y = copy(x)`.
     Copy { operand: Value },
     /// `y = select(cond, a, b)` where `a` is a member and `b` is a const or a
@@ -1067,6 +1090,31 @@ fn analyze_iv(
                         continue;
                     }
                     let same_sign = is_unsigned_ty(*to_ty) == is_unsigned_ty(*from_ty);
+                    // Cross-sign widening cast (U32→I64 / I32→U64). Members
+                    // are always 32-bit, so these two pairs are the complete
+                    // set of cross-sign widening integer casts. The cast's
+                    // value equals the widened member bit-for-bit on every
+                    // executed iteration (see MemberKind::CrossCast), so it
+                    // is retained as a same-size reinterpretation and the
+                    // chain below it is enqueued for classification — the
+                    // wide scaling ops and the GEP that set has_addressing
+                    // live BELOW the cast, so without the enqueue the whole
+                    // `unsigned i; a[i>>1]` family declines (verified on
+                    // main @ dcf673d: 32-bit counter survived at -O2).
+                    if matches!(
+                        (*from_ty, *to_ty),
+                        (IrType::U32, IrType::I64) | (IrType::I32, IrType::U64)
+                    ) {
+                        members.push(Member::of(
+                            *dest,
+                            MemberKind::CrossCast { operand: cur },
+                            *to_ty,
+                            ext,
+                            None,
+                        ));
+                        queue.push((*dest, false));
+                        continue;
+                    }
                     if to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
                         // Widening cast (i8→i32, i32→i64, ...): the dest
                         // becomes wide; drop it and alias its uses to the
@@ -1537,7 +1585,9 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                     return false;
                 }
             }
-            MemberKind::WidenCast { operand } | MemberKind::NarrowCast { operand } => {
+            MemberKind::WidenCast { operand }
+            | MemberKind::NarrowCast { operand }
+            | MemberKind::CrossCast { operand } => {
                 let Instruction::Cast { src, .. } = inst else {
                     return false;
                 };
@@ -1686,8 +1736,10 @@ fn apply_widen(
             | MemberKind::Copy { .. } => {
                 // Seed/latch handled above; casts/copies are dropped later.
             }
-            MemberKind::NarrowCast { operand } => {
-                // Retain the cast as a truncation of the wide value.
+            MemberKind::NarrowCast { operand } | MemberKind::CrossCast { operand } => {
+                // Retain the cast as a conversion of the wide value: a
+                // truncation for NarrowCast, a same-size reinterpretation for
+                // CrossCast (U64→I64 / I64→U64 emit as no-ops).
                 if let Some((bi, ii)) = find_def_mut(func, m.value) {
                     if let Instruction::Cast {
                         src, from_ty, ..
@@ -3469,5 +3521,338 @@ mod tests {
         assert!(func.blocks[2].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 5)
         ));
+    }
+
+    /// Cross-sign zext chain: `unsigned i; s += a[i >> 1]`. The frontend
+    /// emits `LShr(U32) → Cast(U32→I64) → Shl(I64) → GEP`, and the
+    /// signedness-changing cast used to stop the closure dead: the cast dest
+    /// was never enqueued, so the wide scaling op and the GEP below it were
+    /// never scanned, `has_addressing` stayed false, and the IV declined
+    /// (verified: the 32-bit counter survived at -O2 on main @ dcf673d). The
+    /// cast value is a zext, which equals the widened U64 member on every
+    /// executed iteration, so it is retained as a same-size U64→I64
+    /// reinterpretation (a no-op on x86) and the chain below it is
+    /// classified normally.
+    #[test]
+    fn test_cross_sign_zext_chain_widens() {
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(64)),
+            ty: IrType::U32,
+        };
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            },
+            Instruction::BinOp {
+                dest: Value(12),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(11)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::I64,
+            },
+            gep_inst(13, 12, IrType::I8),
+        ];
+        let mut func = counting_loop("xzext", IrType::U32, IrBinOp::Add, body, Some(cmp));
+        // The latch const must be U32-typed.
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::U32,
+        };
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        // The retained cast must read the wide member (U64 → I64 bitcast).
+        let cast = func.blocks[2]
+            .instructions
+            .iter()
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::Cast {
+                        dest: Value(11),
+                        ..
+                    }
+                )
+            })
+            .expect("cross-sign cast retained");
+        assert!(matches!(
+            cast,
+            Instruction::Cast {
+                from_ty: IrType::U64,
+                to_ty: IrType::I64,
+                ..
+            }
+        ));
+    }
+
+    /// Unsigned `Shl` whose range proof shows bits would be shifted out: the
+    /// member must be declined (wrapped narrow != wide shift), not widened.
+    #[test]
+    fn test_unsigned_shl_wrap_bails() {
+        // Bound 0xC0000000: the seed range [0, 0xC0000000) shifted left by 1
+        // reaches 0x180000000, outside u32 — the wrap proof must reject.
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(-0x4000_0000)), // u32 bits 0xC0000000
+            ty: IrType::U32,
+        };
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let mut func = counting_loop("ushlwrap", IrType::U32, IrBinOp::Add, body, Some(cmp));
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::U32,
+        };
+        check(&mut func, 0);
+    }
+
+    /// Unsigned `AShr` cannot arise from C and does not commute with zext:
+    /// declined. Signed `LShr` cannot arise from C: declined.
+    #[test]
+    fn test_shift_foreign_sign_bails() {
+        let body_u = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::AShr,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let cmp = Instruction::Cmp {
+            dest: Value(99),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(64)),
+            ty: IrType::U32,
+        };
+        let mut func = counting_loop("uashr", IrType::U32, IrBinOp::Add, body_u, Some(cmp));
+        func.blocks[3].instructions[0] = Instruction::BinOp {
+            dest: Value(5),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::U32,
+        };
+        check(&mut func, 0);
+
+        let body_s = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::LShr,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+            gep_inst(11, 10, IrType::I8),
+        ];
+        let mut func = counting_loop("slshr", IrType::I32, IrBinOp::Add, body_s, None);
+        check(&mut func, 0);
+    }
+
+    /// Unsigned IV with a RUNTIME trip bound and a full accumulate body
+    /// (`for (i = 0; i < n; i++) s += a[i>>1]`, all runtime): the counted
+    /// bound needs no constant fold — any seed < n with unit steps exits at
+    /// ≤ n, so no executed value wraps u32. The cross-sign zext chain widens
+    /// and the accumulator phi / exit conversion stay untouched.
+    #[test]
+    fn test_runtime_bound_cross_cast_accum() {
+        let mut func = IrFunction::new("rtb".to_string(), IrType::I64, vec![], false);
+        // B0 preheader: base ptr v2 = param 0, bound v3 = param 1 (U32),
+        // accumulator init v0, IV init v1.
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::ParamRef {
+                    dest: Value(3),
+                    param_idx: 1,
+                    ty: IrType::U32,
+                },
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(0)),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1 header: accumulator phi v27, IV phi v28, cmp Ult(v28, v3).
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(27),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(22)), BlockId(3)),
+                    ],
+                },
+                Instruction::Phi {
+                    dest: Value(28),
+                    ty: IrType::U32,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(0)),
+                        (Operand::Value(Value(24)), BlockId(3)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(28)),
+                    rhs: Operand::Value(Value(3)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(12)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+        // B2 body: LShr -> zext -> Shl -> GEP -> Load -> accum Add.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(15),
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(28)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cast {
+                    dest: Value(16),
+                    src: Operand::Value(Value(15)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(18),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(16)),
+                    rhs: Operand::Const(IrConst::I64(2)),
+                    ty: IrType::I64,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(19),
+                    base: Value(2),
+                    offset: Operand::Value(Value(18)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(20),
+                    ptr: Value(19),
+                    ty: IrType::U32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::BinOp {
+                    dest: Value(22),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(27)),
+                    rhs: Operand::Value(Value(20)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        // B3 latch.
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(24),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(28)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B4 exit: zext the accumulator for the return.
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::Cast {
+                dest: Value(30),
+                src: Operand::Value(Value(27)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(30)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 100;
+        check(&mut func, 1);
+        assert!(matches!(
+            &func.blocks[1].instructions[1],
+            Instruction::Phi {
+                ty: IrType::U64,
+                ..
+            }
+        ));
+        // The accumulator phi must stay U32 (it is not part of the closure).
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Phi {
+                ty: IrType::U32,
+                ..
+            }
+        ));
+        // The cross-sign cast survives as a same-size U64→I64 conversion.
+        assert!(func.blocks[2].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast {
+                from_ty: IrType::U64,
+                to_ty: IrType::I64,
+                ..
+            }
+        )));
     }
 }

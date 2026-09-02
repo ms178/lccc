@@ -554,6 +554,14 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("producer_retarget") {
             changed |= relay_and_lea::retarget_producer_into_copy(&mut store, &mut infos);
         }
+        // Loop-latch shape the two passes above decline: the copy dest is
+        // live across the back edge and the producer reg is read after the
+        // copy. Retargets `lea D(%rA), %rB; mov %rB, %rA` into
+        // `lea D(%rA), %rA` with a liveness-proved, rollback-guarded rename
+        // of the following %rB reads.
+        if !sk("lea_base_fold") {
+            changed |= relay_and_lea::fold_copy_into_lea_base(&mut store, &mut infos);
+        }
         if !sk("copy_add_lea") {
             changed |= flag_peepholes::fold_copy_add_into_lea(&mut store, &mut infos);
         }
