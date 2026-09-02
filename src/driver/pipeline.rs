@@ -377,27 +377,17 @@ impl Driver {
             optimize: false, // Only set to true when user explicitly passes -O1 or higher
             optimize_size: false,
             fp_reassoc: false,
-            // DEFAULT false (contract=on semantics without statement-level
-            // fusion): empirically verified against GCC 14.2 (Debian
-            // 14.2.0-19). At plain -O2 GCC emits scalar FMA ONLY for the
-            // leaf "c + a*b" tree (where GVN/SROA can prove the mul feeds
-            // ONLY the add AND the multiply has no observable side-effects
-            // other than the renamed SSA temporary). For loop-carried
-            // reductions and other contexts LCCC's SSA form does not carry
-            // enough source-level statement-boundary information to
-            // distinguish the safe single-expression pattern from the
-            // cross-statement pattern (`double m = a*b; s += m;`), so the
-            // conservative / correct choice is to NOT fuse mul+add unless
-            // the user explicitly opts in via -ffp-contract=fast or
-            // -ffast-math (which sets fp_contract_fast = true). The GCC
-            // 14 behavior in loops (vmulsd+vaddsd, no FMA) matches this
-            // default exactly for reductions; the leaf one-line function
-            // still benefits from the simple backend peephole in
-            // emit_float_binop_impl that can produce FMA when the result is
-            // returned directly (zero additional latency vs separate insns,
-            // and both forms round identically in that shape because no
-            // other consumer observes the intermediate mul result).
-            fp_contract: crate::common::fp_contract::FpContract::default(),
+            // Contraction default for C: FAST, matching GCC's C default
+            // (-ffp-contract=fast). The previous Off default claimed to match
+            // "GCC 14 behavior in loops" -- refuted by the godbolt oracles:
+            // on a cross-statement reduction at -O3 -march=x86-64-v3, gcc16.2
+            // and icx fuse to vfmadd by default (clang, whose default is
+            // `on`, does not). Off forfeited every scalar FMA against the
+            // reference compilers (dot8: lccc 46 insns vs gcc 21 / icx 10).
+            // Explicit -ffp-contract={on,off} wins; the backend additionally
+            // gates on FMA3 ISA availability, so baseline x86-64 builds are
+            // numerically unchanged.
+            fp_contract: crate::common::fp_contract::FpContract::c_language_default(),
             fp_contract_explicit: false,
             fast_math: false,
             verbose: false,

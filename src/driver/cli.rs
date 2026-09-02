@@ -1577,11 +1577,11 @@ impl Driver {
                 "-fno-fast-math" => {
                     self.fast_math = false;
                     self.fp_reassoc = false;
-                    // Restore the DEFAULT (contract=on, no statement-level
-                    // fusion in LCCC because SSA loses statement boundaries).
-                    // Explicit -ffp-contract={on,off,fast} flags always win.
+                    // Restore the language default. In GCC, -ffp-contract is
+                    // orthogonal to -fno-fast-math: the C default (fast)
+                    // stands. Explicit -ffp-contract={on,off,fast} wins.
                     if !self.fp_contract_explicit {
-                        self.fp_contract = FpContract::default();
+                        self.fp_contract = FpContract::c_language_default();
                     }
                 }
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
@@ -2072,23 +2072,19 @@ mod cli_tests {
         reen.parse_cli_args(&args).unwrap();
         assert!(reen.fp_contract == FpContract::Fast);
 
-        // GCC parity: default is -ffp-contract=on for gnu C. LCCC's
-        // SSA-level Mul/Add fusion can change rounding across what the C
-        // abstract machine sees as separate statements (e.g. the lowered
-        // form of `double m = a*b; s += m;` looks identical to that of
-        // `s += a*b;` after SROA/GVN), so fp_contract_fast defaults to
-        // false. Users who want FMA contraction must explicitly request
-        // it via -ffp-contract=fast or -ffast-math (which also enables
-        // reassociation). The backend peephole layer still recognises the
-        // leaf-return `c + a*b` tree where the mul result is consumed
-        // exactly once as an FMA, matching GCC's observed vfmadd output
-        // for that case without affecting loop reductions.
+        // GCC parity: the C default IS -ffp-contract=fast (GNU dialects,
+        // since 4.6). The old assertion here ("default must NOT fuse") was
+        // refuted by the godbolt oracles: on `t = a[i]*b[i]; s = s + t;`
+        // at -O3 -march=x86-64-v3, gcc16.2 and icx emit vfmadd by default
+        // -- only clang (default `on`) keeps the separate pair. The
+        // backend's FMA3 ISA gate keeps baseline x86-64 builds
+        // numerically identical regardless.
         let mut dflt = Driver::new();
         let args = vec!["lccc".to_string(), "x.c".to_string()];
         dflt.parse_cli_args(&args).unwrap();
         assert!(
-            dflt.fp_contract == FpContract::Off,
-            "gnu-C default must NOT fuse mul+add across SSA values without explicit -ffp-contract=fast"
+            dflt.fp_contract == FpContract::Fast,
+            "gnu-C default must match GCC: -ffp-contract=fast"
         );
 
         // Explicit contract flag is sticky against later -ffast-math
@@ -2106,8 +2102,8 @@ mod cli_tests {
             "explicit off survives -ffast-math"
         );
 
-        // -fno-fast-math restores the non-fast default (i.e. fp_contract_fast
-        // is NOT set). It does not itself enable contraction.
+        // -fno-fast-math is orthogonal to contraction in GCC: the language
+        // default (fast) stands after it.
         let mut nfm = Driver::new();
         let args = vec![
             "lccc".to_string(),
@@ -2116,9 +2112,20 @@ mod cli_tests {
         ];
         nfm.parse_cli_args(&args).unwrap();
         assert!(
-            nfm.fp_contract == FpContract::Off,
-            "-fno-fast-math must not silently turn contraction on"
+            nfm.fp_contract == FpContract::Fast,
+            "-fno-fast-math restores the language default (GCC orthogonality)"
         );
+
+        // ... and an explicit off still survives -fno-fast-math.
+        let mut nfm_off = Driver::new();
+        let args = vec![
+            "lccc".to_string(),
+            "-ffp-contract=off".to_string(),
+            "-fno-fast-math".to_string(),
+            "x.c".to_string(),
+        ];
+        nfm_off.parse_cli_args(&args).unwrap();
+        assert!(nfm_off.fp_contract == FpContract::Off);
     }
 
     #[test]
