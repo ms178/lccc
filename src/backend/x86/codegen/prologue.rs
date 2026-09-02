@@ -650,72 +650,13 @@ impl X86Codegen {
         // cannot bypass this pending-flags handshake.
         {
             let mut use_counts: FxHashMap<u32, u32> = FxHashMap::default();
-            let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    // Map every producing instruction to its result type.
-                    if let Some(ty) = inst.result_type() {
-                        if let Some(dest) = inst.dest() {
-                            value_types.entry(dest.0).or_insert(ty);
-                        }
-                    }
                     for_each_operand_in_instruction(inst, |op| {
                         if let Operand::Value(v) = op {
                             *use_counts.entry(v.0).or_insert(0) += 1;
                         }
                     });
-                    // Copy/Phi: propagate the source type to the dest.
-                    match inst {
-                        Instruction::Copy { dest, src } => {
-                            if let Operand::Value(v) = src {
-                                if let Some(&t) = value_types.get(&v.0) {
-                                    value_types.insert(dest.0, t);
-                                }
-                            } else if let Operand::Const(c) = src {
-                                // S11: a Copy from a constant is the
-                                // def site of an otherwise untyped SSA name.
-                                // Without this seed, `posGreatest = -1;` and
-                                // every downstream Copy of it has no
-                                // `value_types` entry, so consumers that must
-                                // know the value's width (the S11 SIB-index
-                                // soundness gate in memory.rs, type-aware slot
-                                // loads) refuse or guess. The constant's own
-                                // variant IS the semantic type; `Zero` is
-                                // context-typed and stays unknown on purpose.
-                                let t = match c {
-                                    crate::ir::reexports::IrConst::I8(_) => Some(IrType::I8),
-                                    crate::ir::reexports::IrConst::I16(_) => Some(IrType::I16),
-                                    crate::ir::reexports::IrConst::I32(_) => Some(IrType::I32),
-                                    crate::ir::reexports::IrConst::I64(_) => Some(IrType::I64),
-                                    crate::ir::reexports::IrConst::I128(_) => {
-                                        Some(IrType::I128)
-                                    }
-                                    crate::ir::reexports::IrConst::F32(_) => Some(IrType::F32),
-                                    crate::ir::reexports::IrConst::F64(_) => Some(IrType::F64),
-                                    crate::ir::reexports::IrConst::D32(_) => Some(IrType::D32),
-                                    crate::ir::reexports::IrConst::D64(_) => Some(IrType::D64),
-                                    crate::ir::reexports::IrConst::LongDouble(_, _) => {
-                                        Some(IrType::F128)
-                                    }
-                                    crate::ir::reexports::IrConst::Zero => None,
-                                };
-                                if let Some(t) = t {
-                                    value_types.insert(dest.0, t);
-                                }
-                            }
-                        }
-                        Instruction::Phi { dest, incoming, .. } => {
-                            for (op, _) in incoming {
-                                if let Operand::Value(v) = op {
-                                    if let Some(&t) = value_types.get(&v.0) {
-                                        value_types.insert(dest.0, t);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
                 }
                 for_each_operand_in_terminator(&block.terminator, |op| {
                     if let Operand::Value(v) = op {
@@ -723,15 +664,13 @@ impl X86Codegen {
                     }
                 });
             }
-            // ParamRef/Alloca/Load/… dest types come from result_type(); also
-            // map function parameters (their ParamRef carries the type).
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::ParamRef { dest, ty, .. } = inst {
-                        value_types.entry(dest.0).or_insert(*ty);
-                    }
-                }
-            }
+            // Spill/reload WIDTH comes from the shared type map, so the stack
+            // layout's slot sizing and the emitters' access width provably
+            // agree: a value whose Copy/Phi-propagated type is 64-bit must not
+            // be narrowed to a 4-byte slot that a `movq` reload would read
+            // past (the -O2 preboot-ZSTD "compressed data is corrupt"
+            // miscompile).  See `backend::common::compute_value_type_map`.
+            let value_types = crate::backend::common::compute_value_type_map(func);
 
             // Find fused Cmp → Select/CondBranch pairs: the consumer must be
             // the immediately-following instruction (or the block terminator)
