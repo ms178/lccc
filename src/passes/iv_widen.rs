@@ -72,21 +72,35 @@
 //!
 //! # Supported shapes (beyond the plain `Cast → GEP` chain)
 //!
-//! - `i8`/`i16`/`i32` IVs, signed and unsigned, incrementing and
-//!   decrementing (`Add`/`Sub` latches, both operand orders).
+//! - `I32`/`U32` IVs, signed and unsigned, incrementing and decrementing
+//!   (`Add`/`Sub` latches, both operand orders, and reversed `Sub(step, phi)`
+//!   rejected).
 //! - Const-offset addressing: `a[i+1]`, `a[i-1]`, `a[i*3]`, `a[i&7]`,
 //!   `a[(i&7)+1]`, `s[i-1] = s[i] + p` (the closure shapes that previously
 //!   kept `movslq` on the carried path).
+//! - Narrow constant-count shifts `a[i<<1]` (`Shl` both signednesses, `AShr`
+//!   signed, `LShr` unsigned): the shift count is a shift AMOUNT and is never
+//!   widened; only the member and the op's type are retyped.
 //! - Same-width casts (C's `int < unsigned` promotion) are retained as
 //!   truncations rather than widened, keeping the mixed-signedness cmp exact.
 //! - Rotated self-loops (header == latch) are widenable when a preheader
 //!   exists for the hoists.
+//! - Loop-exit comparisons that cannot be safely widened (incompatible
+//!   predicate or a loop-variant other operand) keep a narrow cmp fed by one
+//!   truncation, instead of aborting the whole widening.
 //!
 //! Out-of-scope (the pass declines the IV):
+//! - `i8`/`i16` IVs: the C int-promotion latch is `trunc(add(phi, 1):I32)`,
+//!   not a narrow `add`, and widening it would change the DEFINED 8/16-bit
+//!   wrap of the truncation unless a no-wrap bound is proven (see
+//!   engineering/FOLLOWUP-2026-09-02-iv-widen-audit.md, §5). Candidacy is
+//!   therefore restricted to `I32`/`U32`; extending it requires a narrow-width
+//!   no-wrap bound proof first.
 //! - loop-variant latch steps (an invariant step is cast once in the
 //!   preheader; a variant step cannot be hoisted);
-//! - narrow `Shl`/`AShr`/`LShr` (not extension-transparent — element scaling
-//!   is handled at wide type on the chain instead);
+//! - narrow shifts with a non-constant or out-of-range count, `AShr` on
+//!   unsigned IVs, and `LShr` on signed IVs (the mismatched cases are not
+//!   extension-transparent);
 //! - `Sub(step, phi)` latches (not an induction recurrence);
 //! - IVs used in `Select` *conditions* or other narrow in-loop arithmetic;
 //! - exit-merge phis (a phi operand is evaluated on the edge, so its
@@ -97,9 +111,7 @@
 //! widening candidates) and BEFORE loop_rotate (so the rotated form sees the
 //! widened phi and emits `addq` directly).
 
-use std::collections::HashMap;
-
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::{CfgAnalysis, FlatAdj};
 use crate::ir::constants::IrConst;
@@ -177,12 +189,7 @@ fn is_unsigned_ty(ty: IrType) -> bool {
     matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64)
 }
 
-fn is_narrow_int(ty: IrType) -> bool {
-    matches!(
-        ty,
-        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
-    )
-}
+
 
 fn ext_kind_for(ty: IrType) -> ExtKind {
     if is_unsigned_ty(ty) {
@@ -289,6 +296,15 @@ enum MemberKind {
     },
     /// `y = x op m` where `m` is another admitted member (signed IVs only).
     BinOpMember { op: IrBinOp, operand: Value },
+    /// `y = x op k` for `op ∈ {Shl, AShr, LShr}` with `k` a constant SHIFT
+    /// COUNT. The count is never widened (it is a shift amount, not a value);
+    /// only the member and the op's type are retyped to wide.
+    ///
+    /// Soundness: `AShr` is exact for sext (`sext(x >> k) == sext(x) >> k` for
+    /// every `x`), and `LShr` is exact for zext, unconditionally. `Shl` is
+    /// exact under the signed-overflow-is-UB theorem for signed IVs, and
+    /// requires a non-wrapping range proof for unsigned IVs.
+    ShiftConst { op: IrBinOp, operand: Value, count: IrConst },
     /// A widening cast of a member (`to_ty` ≥ 32 bits, same signedness).
     /// Dropped after its uses are redirected to the underlying member's wide
     /// value.
@@ -495,7 +511,7 @@ fn collect_widenable_phis(
         else {
             continue;
         };
-        if !is_narrow_int(*ty) {
+        if !matches!(*ty, IrType::I32 | IrType::U32) {
             continue;
         }
         if incoming.len() != 2 {
@@ -612,10 +628,10 @@ fn plan_step_operand(
 
 /// `value_id -> [(block_idx, instruction_idx)]`; a terminator use is recorded
 /// with `instruction_idx == usize::MAX`.
-type UseMap = HashMap<u32, Vec<(usize, usize)>>;
+type UseMap = FxHashMap<u32, Vec<(usize, usize)>>;
 
 fn build_use_map(func: &IrFunction) -> UseMap {
-    let mut map: UseMap = HashMap::new();
+    let mut map: UseMap = FxHashMap::default();
     for (bi, b) in func.blocks.iter().enumerate() {
         for (ii, inst) in b.instructions.iter().enumerate() {
             inst.for_each_used_value(|id| {
@@ -958,8 +974,84 @@ fn analyze_iv(
                             }
                             narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                         }
+                        IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
+                            // Narrow shift by a constant count. The count is a
+                            // shift amount — it is NOT widened; only the
+                            // member and the op's type are retyped.
+                            //
+                            //   AShr is exact under sext for every x (and only
+                            //   signed sources produce it);
+                            //   LShr is exact under zext for every x (and only
+                            //   unsigned sources produce it);
+                            //   Shl is exact for signed IVs by the
+                            //   signed-overflow-is-UB theorem, and for unsigned
+                            //   IVs needs a non-wrapping range proof.
+                            let shift_ok = cur_lhs
+                                && match op {
+                                    IrBinOp::Shl => true,
+                                    IrBinOp::AShr => cur_ext == ExtKind::Se,
+                                    IrBinOp::LShr => cur_ext == ExtKind::Ze,
+                                    _ => false,
+                                };
+                            let count = match rhs {
+                                Operand::Const(c) => *c,
+                                _ => IrConst::Zero,
+                            };
+                            if !shift_ok || !matches!(rhs, Operand::Const(_)) {
+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                                continue;
+                            }
+                            let count_val = count.to_i64().unwrap_or(i64::MAX);
+                            if count_val < 0 || count_val >= narrow_bit_width(*ty) as i64 {
+                                // Out-of-range shift count: UB in C, but the
+                                // conservatively correct choice is to decline.
+                                narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                                continue;
+                            }
+                            // Shl on an unsigned member needs a non-wrapping
+                            // range proof over the member's proven range.
+                            let nr = if *op == IrBinOp::Shl {
+                                if cur_is_unsigned {
+                                    let r = match member_range(&members, cur) {
+                                        Some(r) => r,
+                                        None => {
+                                            narrow_escape_or_bail(
+                                                lp, bi, cur, narrow, &mut escapes,
+                                            )?;
+                                            continue;
+                                        }
+                                    };
+                                    let shifted = Range {
+                                        lo: r.lo << count_val,
+                                        hi: r.hi << count_val,
+                                    };
+                                    if !shifted.within(*ty) {
+                                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                                        continue;
+                                    }
+                                    Some(shifted)
+                                } else {
+                                    // Signed: UB theorem — unconditional.
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            members.push(Member::of(
+                                *dest,
+                                MemberKind::ShiftConst {
+                                    op: *op,
+                                    operand: cur,
+                                    count,
+                                },
+                                *ty,
+                                ext,
+                                nr,
+                            ));
+                            queue.push((*dest, true));
+                        }
                         _ => {
-                            // Shl/AShr/LShr, division, BitTest: not
+                            // Division, remainder, BitTest: not
                             // extension-transparent.
                             narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                         }
@@ -1424,6 +1516,27 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                     return false;
                 }
             }
+            MemberKind::ShiftConst {
+                op,
+                operand,
+                count,
+            } => {
+                let Instruction::BinOp {
+                    op: aop, lhs, rhs, ..
+                } = inst
+                else {
+                    return false;
+                };
+                if aop != op {
+                    return false;
+                }
+                if !matches!(lhs, Operand::Value(v) if v.0 == operand.0) {
+                    return false;
+                }
+                if !matches!(rhs, Operand::Const(c) if c == count) {
+                    return false;
+                }
+            }
             MemberKind::WidenCast { operand } | MemberKind::NarrowCast { operand } => {
                 let Instruction::Cast { src, .. } = inst else {
                     return false;
@@ -1603,6 +1716,15 @@ fn apply_widen(
                 }
             }
             MemberKind::BinOpMember { .. } => {
+                if let Some((bi, ii)) = find_def_mut(func, m.value) {
+                    if let Instruction::BinOp { ty, .. } = &mut func.blocks[bi].instructions[ii] {
+                        *ty = wide_ty;
+                    }
+                }
+            }
+            MemberKind::ShiftConst { .. } => {
+                // Retype the shift to wide; the count is a shift amount and is
+                // deliberately left narrow (never widened).
                 if let Some((bi, ii)) = find_def_mut(func, m.value) {
                     if let Instruction::BinOp { ty, .. } = &mut func.blocks[bi].instructions[ii] {
                         *ty = wide_ty;
@@ -2043,7 +2165,10 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
             ty.size() < 8 && (reads(lhs) || reads(rhs))
         }
         Instruction::Cmp { .. } => false,
-        Instruction::Cast { .. } | Instruction::Copy { .. } => false,
+        Instruction::Cast { .. } => false,
+        // A Copy of a narrow member carries a narrow dest: it must read the
+        // truncation, not the wide value.
+        Instruction::Copy { .. } => true,
         Instruction::Select { ty, true_val, false_val, .. } => {
             ty.size() < 8 && (reads(true_val) || reads(false_val))
         }
@@ -2950,7 +3075,11 @@ mod tests {
         check(&mut func, 0);
     }
 
-    /// `i8` IVs widen like i32 (movsbl on the carried path is the target).
+    /// `i8`/`i16` IVs are DECLINED: widening would change the DEFINED 8/16-bit
+    /// wrap of the latch truncation (`trunc(add(phi, 1):I32)`), and the
+    /// signed-overflow-is-UB theorem does not cover promoted-narrow wrap.
+    /// (The C frontend never emits a direct narrow `Add` latch anyway; this
+    /// pins the decision on the synthetic shape.)
     #[test]
     fn test_i8_iv() {
         let body = vec![
@@ -2974,14 +3103,92 @@ mod tests {
             rhs: Operand::Const(IrConst::I8(1)),
             ty: IrType::I8,
         };
-        check(&mut func, 1);
+        check(&mut func, 0);
         assert!(matches!(
             &func.blocks[1].instructions[0],
             Instruction::Phi {
-                ty: IrType::I64,
+                ty: IrType::I8,
                 ..
             }
         ));
+    }
+
+    /// Narrow `Shl(phi, 1)` feeding a widening cast: the shift is retyped to
+    /// wide with its count left narrow, the cast is dropped, and the GEP reads
+    /// the shifted member directly.
+    #[test]
+    fn test_narrow_shift_closure() {
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I32),
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::I32(0)),
+                ptr: Value(12),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        let mut func = counting_loop("nshift", IrType::I32, IrBinOp::Add, body, None);
+        check(&mut func, 1);
+        let phi = &func.blocks[1].instructions[0];
+        assert!(matches!(phi, Instruction::Phi { ty: IrType::I64, .. }));
+        // The narrow shift is retyped to I64 with its count left as-is.
+        assert!(func.blocks[2].instructions.iter().any(
+            |i| matches!(i, Instruction::BinOp {
+                op: IrBinOp::Shl,
+                ty: IrType::I64,
+                lhs: Operand::Value(v),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ..
+            } if v.0 == 1)
+        ));
+        // The widening cast was dropped; the GEP reads the shifted member.
+        assert!(func.blocks[2].instructions.iter().any(
+            |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 10)
+        ));
+    }
+
+    /// A shift with an out-of-range count is declined (no widening).
+    #[test]
+    fn test_shift_bad_count_bails() {
+        let body = vec![
+            Instruction::BinOp {
+                dest: Value(10),
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(64)),
+                ty: IrType::I32,
+            },
+            Instruction::Cast {
+                dest: Value(11),
+                src: Operand::Value(Value(10)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+            gep_inst(12, 11, IrType::I32),
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::I32(0)),
+                ptr: Value(12),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        let mut func = counting_loop("badshift", IrType::I32, IrBinOp::Add, body, None);
+        check(&mut func, 0);
     }
 
     /// Unsigned constants must zero-extend (0xFFFFFFFF → 4294967295, not -1).
