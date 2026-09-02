@@ -43,6 +43,7 @@ bench_*
 # timing driver) shipped upstream while the script that runs them did not,
 # leaving a corpus nobody could execute.
 !scripts/bench_kernels.py
+!scripts/bench_iv_widen_ab.sh
 
 # Benchmark / test output
 /test-results/
