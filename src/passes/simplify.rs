@@ -1659,10 +1659,17 @@ fn simplify_binop(
             }
         }
         IrBinOp::BitTest => {
-            // `(base >> index) & 1`: a zero base or zero bit index always
-            // yields zero. Do *not* treat index 0 as a copy of base: only bit
-            // zero is returned, and preserving BitTest lets x86 select BT.
-            if rhs_zero || lhs_zero {
+            // `BitTest(base, index)` is `(base >> index) & 1` — see
+            // `fold_binop` in constant_fold.rs and `IrBinOp::eval` in
+            // ir/ops.rs. Only a zero *base* folds to zero.
+            //
+            // A zero *index* folds to NOTHING: `(base >> 0) & 1` is `base & 1`,
+            // i.e. bit zero of the base, which is 1 for every odd base.
+            // Folding it to zero was a miscompile (found by
+            // scripts/gen_slot_stress.py: an `if (((x >> 0) & 1) ^ 1)` was
+            // folded to a constant, taking the wrong arm of a diamond). Keep
+            // the BitTest so x86 can still select BT.
+            if lhs_zero {
                 return Some(Instruction::Copy {
                     dest,
                     src: Operand::Const(IrConst::zero(ty)),
@@ -4187,19 +4194,59 @@ mod tests {
         }
     }
 
+    /// `BitTest(0, index)` is `(0 >> index) & 1` == 0 for every index.
     #[test]
-    fn bit_test_zero_operand_is_zero() {
-        let inst = Instruction::BinOp {
-            dest: Value(4),
-            op: IrBinOp::BitTest,
-            lhs: Operand::Value(Value(1)),
-            rhs: Operand::Const(IrConst::I32(0)),
-            ty: IrType::I32,
-        };
+    fn bit_test_zero_base_is_zero() {
+        for index in [0i64, 1, 5, 63] {
+            let got = simplify_binop(
+                Value(4),
+                IrBinOp::BitTest,
+                &Operand::Const(IrConst::I32(0)),
+                &Operand::Const(IrConst::I32(index as i32)),
+                IrType::I32,
+                &[],
+                &[],
+                &[],
+                &[],
+            )
+            .unwrap();
+            assert!(
+                matches!(got, Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)),
+                "BitTest(0, {index}) must fold to zero, got {got:?}"
+            );
+        }
+    }
+
+    /// `BitTest(base, 0)` is `(base >> 0) & 1` == `base & 1` — bit zero of the
+    /// base. It is NOT zero: folding it that way miscompiled
+    /// `if (((x >> 0) & 1) ^ 1)` into a constant, taking the wrong arm of a
+    /// diamond (scripts/gen_slot_stress.py seed 1, -O2).
+    #[test]
+    fn bit_test_zero_index_is_bit_zero_of_base() {
         let got = simplify_binop(
             Value(4),
             IrBinOp::BitTest,
             &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I32(0)),
+            IrType::I32,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            got.is_none(),
+            "BitTest(base, 0) must not be folded away: it is base & 1, got {got:?}"
+        );
+    }
+
+    /// BitTest(0, 0) == 0: the zero base wins over the zero index.
+    #[test]
+    fn bit_test_zero_base_and_index_is_zero() {
+        let got = simplify_binop(
+            Value(4),
+            IrBinOp::BitTest,
+            &Operand::Const(IrConst::I32(0)),
             &Operand::Const(IrConst::I32(0)),
             IrType::I32,
             &[],
