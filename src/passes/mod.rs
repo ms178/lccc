@@ -1328,6 +1328,19 @@ pub(crate) fn run_passes(
                 total_changes += n;
                 total_changes_excl_dce += n;
             }
+
+            // Post-vectorize DCE. The vectorizer can bail out of a loop
+            // AFTER hoisting setup intrinsics into the preheader (a map
+            // loop over a global array left two dead VecBroadcastF64x4
+            // defs); no DCE ran again before codegen, and the x86
+            // intrinsic emitter ICEs storing a vector value that never
+            // received a register or slot home ("value 36 has no
+            // register, stack slot, Copy, or GlobalAddr definition" on
+            // `for (i...) gd[i] = gd[i]*k + c;` with a global `gd`).
+            // Pure intrinsics with an unused dest are DCE-eligible, so
+            // one sweep here removes every orphaned setup def regardless
+            // of which bailout path produced it.
+module.for_each_function(dce::eliminate_dead_code);
         }
 
         // Unroll/vectorize can clone loop bodies that still contained
@@ -1764,7 +1777,37 @@ pub(crate) fn run_passes(
                     }
                 }
             }
-            module.for_each_function(dce::eliminate_dead_code);
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
+                                    if let crate::ir::reexports::Operand::Value(v) = op {
+                                        if v.0 == *id { uses += 1; }
+                                    }
+                                });
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
         }
     }
 
@@ -1787,7 +1830,37 @@ pub(crate) fn run_passes(
                     }
                 }
             }
-            module.for_each_function(dce::eliminate_dead_code);
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
+                                    if let crate::ir::reexports::Operand::Value(v) = op {
+                                        if v.0 == *id { uses += 1; }
+                                    }
+                                });
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
         }
     }
 
@@ -1914,7 +1987,37 @@ pub(crate) fn run_passes(
             // arm computations behind; cfg_simplify removes the blocks and
             // DCE collects the dead def chains (compare feeds, arm values).
             module.for_each_function(cfg_simplify::simplify_cfg);
-            module.for_each_function(dce::eliminate_dead_code);
+            module.for_each_function(|f| {
+                let removed = dce::eliminate_dead_code(f);
+                if std::env::var("CCC_PROBE_DCE").is_ok() {
+                    // Count remaining VecBroadcast dests and their uses.
+                    let mut bcasts = Vec::new();
+                    for b in &f.blocks {
+                        for i in &b.instructions {
+                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                                if format!("{op:?}").starts_with("VecBroadcast") {
+                                    bcasts.push(d.0);
+                                }
+                            }
+                        }
+                    }
+                    for id in &bcasts {
+                        let mut uses = 0u32;
+                        for b in &f.blocks {
+                            for i in &b.instructions {
+                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
+                                    if let crate::ir::reexports::Operand::Value(v) = op {
+                                        if v.0 == *id { uses += 1; }
+                                    }
+                                });
+                            }
+                        }
+                        eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
+                    }
+                    eprintln!("[PROBE-DCE] fn={} removed={}", f.name, removed);
+                }
+                removed
+            });
         }
     }
 

@@ -1057,4 +1057,50 @@ mod tests {
         assert_eq!(first, 1);
         assert_eq!(second, 0);
     }
+
+    #[test]
+    fn dead_pure_vector_intrinsics_are_removed() {
+        // Regression: an orphaned VecBroadcastF64x4 (vectorizer bailout over
+        // a global-array map loop) used to be DCE-rooted as "side-effecting"
+        // because IntrinsicOp::is_pure() missed the modern Vec* families. It
+        // reached codegen with no register or slot home and ICEd the
+        // intrinsic emitter. Pure vector value producers with an unused
+        // dest must be swept.
+        let mut func = IrFunction::new("vb".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Intrinsic {
+                dest: Some(Value(10)),
+                op: crate::ir::intrinsics::IntrinsicOp::VecBroadcastF64x4,
+                dest_ptr: None,
+                args: vec![Operand::Const(IrConst::F64(2.0))],
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let removed = eliminate_dead_code(&mut func);
+        assert_eq!(removed, 1);
+        assert!(func.blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn vector_store_intrinsics_are_never_removed_by_purity() {
+        // The mirror image: a store-shaped vector intrinsic must survive DCE
+        // even when its (nonexistent) result is unused -- it writes memory.
+        let mut func = IrFunction::new("vs".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Intrinsic {
+                dest: None,
+                op: crate::ir::intrinsics::IntrinsicOp::VecStoreF64x4,
+                dest_ptr: Some(Value(3)),
+                args: vec![Operand::Value(Value(9))],
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let removed = eliminate_dead_code(&mut func);
+        assert_eq!(removed, 0);
+        assert_eq!(func.blocks[0].instructions.len(), 1);
+    }
 }

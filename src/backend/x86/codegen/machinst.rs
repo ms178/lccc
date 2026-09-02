@@ -45,6 +45,15 @@ pub enum AluOp {
     Imul, // 2-operand signed multiply (dst *= src)
 }
 
+/// Scalar SSE arithmetic operation (VEX three-operand form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FAluOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 /// Shift operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftOp {
@@ -107,6 +116,45 @@ pub enum MachInst {
     Mov {
         src: MachOperand,
         dst: MachOperand,
+        size: OpSize,
+    },
+
+    /// Scalar SSE move: `movss` (S32) / `movsd` (S64).
+    ///
+    /// Float values live in the XMM domain (`MachReg::Phys` with an id in
+    /// 20..=33, i.e. xmm2..xmm15); GPR<->XMM moves are NOT this instruction
+    /// (those are movd/movq and stay on the text path). At most one operand
+    /// may be a memory/slot form — x86 has no mem-to-mem SSE move, so the
+    /// lowering must not produce one (the slot-homed side needs an xmm
+    /// scratch relay, which the mature text path owns).
+    ///
+    /// Size semantics: S32 selects the single-precision mnemonic (movss),
+    /// S64 the double (movsd). Decimal carriers D32/D64 move through the
+    /// same bit-exact SSE instructions (mirrors emit_store_impl).
+    FMov {
+        src: MachOperand,
+        dst: MachOperand,
+        size: OpSize,
+    },
+
+    /// Scalar SSE arithmetic in the VEX three-operand form:
+    /// `v{add,sub,mul,div}s{s,d} src2, %src1, %dst` computing
+    /// dst = src1 OP src2.
+    ///
+    /// The three-operand form is the whole point: it has no destructive
+    /// destination, so dest-aliases-an-operand needs no staging copy (the
+    /// legacy two-address form forced `vmovsd` staging and, for sub/div
+    /// whose dest held the RHS, an xmm0 relay). `src1` must be an xmm
+    /// register; `src2` may be an xmm register or ONE memory/slot operand
+    /// (x86 allows at most one). Size S32 selects the `ss` suffix, S64 `sd`.
+    ///
+    /// Operand order is semantically load-bearing for Sub/Div (dst =
+    /// src1 - src2, src1 / src2): the lowering must keep lhs in src1.
+    FAlu {
+        op: FAluOp,
+        src2: MachOperand,
+        src1: MachReg,
+        dst: MachReg,
         size: OpSize,
     },
 

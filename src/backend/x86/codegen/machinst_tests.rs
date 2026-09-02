@@ -499,6 +499,64 @@ fn instruction_corpus() -> Vec<MachInst> {
     let mut v = Vec::new();
     let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
 
+    // FMov: every xmm allocator home at both scalar widths, plus every
+    // operand pairing the lowering can produce (reg/reg, reg/mem, mem/reg,
+    // reg/slot, slot/reg). The assembler differential proves the xmm8-15
+    // names encode (REX-prefixed) and that no shape is mem-to-mem.
+    for idx in 20u8..=33 {
+        let a = PhysReg(idx);
+        let b = PhysReg(if idx == 33 { 20 } else { idx + 1 });
+        for size in [OpSize::S32, OpSize::S64] {
+            v.push(MachInst::FMov {
+                src: reg(a),
+                dst: reg(b),
+                size,
+            });
+            for op in [FAluOp::Add, FAluOp::Sub, FAluOp::Mul, FAluOp::Div] {
+                v.push(MachInst::FAlu {
+                    op,
+                    src2: reg(b),
+                    src1: MachReg::Phys(a),
+                    dst: MachReg::Phys(a),
+                    size,
+                });
+                v.push(MachInst::FAlu {
+                    op,
+                    src2: MachOperand::StackSlot(-32),
+                    src1: MachReg::Phys(a),
+                    dst: MachReg::Phys(b),
+                    size,
+                });
+            }
+            v.push(MachInst::FMov {
+                src: reg(a),
+                dst: MachOperand::Mem {
+                    base: MachReg::Phys(PhysReg(14)),
+                    offset: -8,
+                },
+                size,
+            });
+            v.push(MachInst::FMov {
+                src: MachOperand::Mem {
+                    base: MachReg::Phys(PhysReg(15)),
+                    offset: 16,
+                },
+                dst: reg(a),
+                size,
+            });
+            v.push(MachInst::FMov {
+                src: reg(a),
+                dst: MachOperand::StackSlot(-24),
+                size,
+            });
+            v.push(MachInst::FMov {
+                src: MachOperand::StackSlot(-24),
+                dst: reg(a),
+                size,
+            });
+        }
+    }
+
     for size in SIZES {
         for (i, &a) in regs.iter().enumerate() {
             let b = regs[(i + 1) % regs.len()];
@@ -1338,9 +1396,14 @@ fn instruction_selection_covers_the_expected_instruction_classes() {
     use crate::common::types::IrType;
     use crate::common::fx_hash::FxHashMap;
 
-    let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
-        .into_iter()
-        .collect();
+    let ra: FxHashMap<u32, PhysReg> = [
+        (1u32, PhysReg(0)),
+        (2, PhysReg(7)),
+        (3, PhysReg(11)),
+        (4, PhysReg(20)), // xmm2-homed float value
+    ]
+    .into_iter()
+    .collect();
     let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
 
     // One representative of every class the layer claims to own. A `false`
@@ -1399,6 +1462,48 @@ fn instruction_selection_covers_the_expected_instruction_classes() {
                 ty: IrType::I16,
                 seg_override: Default::default(),
                 volatile: false,
+            },
+        ),
+        // Scalar float moves (FMov): value 4 is xmm-homed, 3 is a GPR ptr,
+        // 9 an alloca slot.
+        (
+            "Store(f64)",
+            Instruction::Store {
+                val: Operand::Value(Value(4)),
+                ptr: Value(3),
+                ty: IrType::F64,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        (
+            "Store(f32)",
+            Instruction::Store {
+                val: Operand::Value(Value(4)),
+                ptr: Value(9),
+                ty: IrType::F32,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        (
+            "Load(f64)",
+            Instruction::Load {
+                dest: Value(4),
+                ptr: Value(3),
+                ty: IrType::F64,
+                seg_override: Default::default(),
+                volatile: false,
+            },
+        ),
+        (
+            "BinOp(f64)",
+            Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(4)),
+                rhs: Operand::Value(Value(4)),
+                ty: IrType::F64,
             },
         ),
         (
@@ -1470,4 +1575,740 @@ fn global_addr_lowers_to_an_address_computation_not_a_load() {
         MachInst::LeaSym { sym, .. } => assert_eq!(sym, "the_symbol"),
         other => panic!("GlobalAddr must lower to LeaSym, got {other:?}"),
     }
+}
+
+// ── 5. FMov: scalar SSE moves ────────────────────────────────────────────
+//
+// Float values live in the XMM domain (PhysReg 20..=33 = xmm2..xmm15). The
+// golden tests pin the exact AT&T text; the trap tests pin the shapes the
+// lowering must never produce (they would emit unencodable instructions or
+// silently relay through a live register); the isel tests pin which IR
+// shapes reach the typed path at all.
+
+/// Canonical xmm names, written independently of the emitter's table.
+fn expected_xmm(idx: u8) -> &'static str {
+    match idx {
+        20 => "xmm2",
+        21 => "xmm3",
+        22 => "xmm4",
+        23 => "xmm5",
+        24 => "xmm6",
+        25 => "xmm7",
+        26 => "xmm8",
+        27 => "xmm9",
+        28 => "xmm10",
+        29 => "xmm11",
+        30 => "xmm12",
+        31 => "xmm13",
+        32 => "xmm14",
+        33 => "xmm15",
+        _ => panic!("PhysReg({idx}) is not an xmm allocator home"),
+    }
+}
+
+const XMM_REGS: &[u8] = &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33];
+
+#[test]
+fn fmov_names_every_xmm_home_at_both_scalar_widths() {
+    for (i, &a) in XMM_REGS.iter().enumerate() {
+        let b = XMM_REGS[(i + 1) % XMM_REGS.len()];
+        // Reg-to-reg uses the VEX 3-operand form (no merging-move false
+        // dependence -- see the emitter comment).
+        let line = emit1(&MachInst::FMov {
+            src: reg(PhysReg(a)),
+            dst: reg(PhysReg(b)),
+            size: OpSize::S64,
+        });
+        assert_eq!(
+            line,
+            format!(
+                "vmovsd %{}, %{}, %{}",
+                expected_xmm(a),
+                expected_xmm(a),
+                expected_xmm(b)
+            )
+        );
+        let line = emit1(&MachInst::FMov {
+            src: reg(PhysReg(a)),
+            dst: reg(PhysReg(b)),
+            size: OpSize::S32,
+        });
+        assert_eq!(
+            line,
+            format!(
+                "vmovss %{}, %{}, %{}",
+                expected_xmm(a),
+                expected_xmm(a),
+                expected_xmm(b)
+            )
+        );
+    }
+}
+
+#[test]
+fn fmov_memory_and_slot_shapes_are_exact() {
+    // reg -> mem with and without displacement
+    assert_eq!(
+        emit1(&MachInst::FMov {
+            src: reg(PhysReg(21)),
+            dst: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(14)),
+                offset: 0,
+            },
+            size: OpSize::S64,
+        }),
+        "movsd %xmm3, (%rdi)"
+    );
+    assert_eq!(
+        emit1(&MachInst::FMov {
+            src: reg(PhysReg(21)),
+            dst: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(15)),
+                offset: -16,
+            },
+            size: OpSize::S32,
+        }),
+        "movss %xmm3, -16(%rsi)"
+    );
+    // mem -> reg
+    assert_eq!(
+        emit1(&MachInst::FMov {
+            src: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(16)),
+                offset: 8,
+            },
+            dst: reg(PhysReg(26)),
+            size: OpSize::S64,
+        }),
+        "movsd 8(%rdx), %xmm8"
+    );
+    // reg <-> stack slot (rbp-relative by default)
+    assert_eq!(
+        emit1(&MachInst::FMov {
+            src: reg(PhysReg(20)),
+            dst: MachOperand::StackSlot(-8),
+            size: OpSize::S64,
+        }),
+        "movsd %xmm2, -8(%rbp)"
+    );
+    assert_eq!(
+        emit1(&MachInst::FMov {
+            src: MachOperand::StackSlot(-8),
+            dst: reg(PhysReg(20)),
+            size: OpSize::S32,
+        }),
+        "movss -8(%rbp), %xmm2"
+    );
+}
+
+#[test]
+fn fmov_stack_slot_honors_rsp_addressing() {
+    let mut out = AsmOutput::new();
+    out.use_rsp_addressing = true;
+    out.rsp_frame_size = 64;
+    emit_machinst(
+        &MachInst::FMov {
+            src: reg(PhysReg(20)),
+            dst: MachOperand::StackSlot(-8),
+            size: OpSize::S64,
+        },
+        &mut out,
+    );
+    assert_eq!(out.buf.trim(), "movsd %xmm2, 56(%rsp)");
+}
+
+#[test]
+fn fmov_self_move_emits_nothing() {
+    let lines = emit(&MachInst::FMov {
+        src: reg(PhysReg(23)),
+        dst: reg(PhysReg(23)),
+        size: OpSize::S64,
+    });
+    assert!(lines.is_empty(), "self-move emitted {lines:?}");
+}
+
+// Trap tests: these shapes are unencodable or would relay through a
+// possibly-live register. The emitter must refuse them loudly; the isel
+// gates are what keep them from ever being constructed in practice.
+
+#[test]
+#[should_panic(expected = "non-float size")]
+fn fmov_rejects_narrow_sizes() {
+    emit1(&MachInst::FMov {
+        src: reg(PhysReg(20)),
+        dst: reg(PhysReg(21)),
+        size: OpSize::S16,
+    });
+}
+
+#[test]
+#[should_panic(expected = "mem-to-mem")]
+fn fmov_rejects_mem_to_mem() {
+    emit1(&MachInst::FMov {
+        src: MachOperand::StackSlot(-8),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(14)),
+            offset: 0,
+        },
+        size: OpSize::S64,
+    });
+}
+
+#[test]
+#[should_panic(expected = "mem-to-mem")]
+fn fmov_rejects_slot_to_slot() {
+    emit1(&MachInst::FMov {
+        src: MachOperand::StackSlot(-8),
+        dst: MachOperand::StackSlot(-16),
+        size: OpSize::S64,
+    });
+}
+
+#[test]
+#[should_panic(expected = "immediate")]
+fn fmov_rejects_immediate_source() {
+    emit1(&MachInst::FMov {
+        src: MachOperand::Imm(0),
+        dst: reg(PhysReg(20)),
+        size: OpSize::S64,
+    });
+}
+
+#[test]
+#[should_panic(expected = "unallocated")]
+fn fmov_rejects_unallocated_vreg() {
+    emit1(&MachInst::FMov {
+        src: MachOperand::Reg(MachReg::Vreg(42)),
+        dst: reg(PhysReg(20)),
+        size: OpSize::S64,
+    });
+}
+
+// ── FMov isel admission ───────────────────────────────────────────────────
+//
+// The typed path must accept exactly the xmm-homed subset and decline
+// everything else: a `true` on a shape the emitter does not model is a
+// miscompile, a `false` on a modelled shape is lost coverage.
+
+#[test]
+fn float_moves_lower_through_machinst() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    // 4: xmm2-homed float value; 5: xmm3-homed; 3: GPR pointer (r10);
+    // 9: alloca slot at -8.
+    let ra: FxHashMap<u32, PhysReg> = [
+        (3u32, PhysReg(11)),
+        (4, PhysReg(20)),
+        (5, PhysReg(21)),
+    ]
+    .into_iter()
+    .collect();
+    let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+
+    let store = |val: u32, ptr: u32, ty: IrType| Instruction::Store {
+        val: Operand::Value(Value(val)),
+        ptr: Value(ptr),
+        ty,
+        seg_override: Default::default(),
+        volatile: false,
+    };
+    let load = |dest: u32, ptr: u32, ty: IrType| Instruction::Load {
+        dest: Value(dest),
+        ptr: Value(ptr),
+        ty,
+        seg_override: Default::default(),
+        volatile: false,
+    };
+
+    // Store F64 through the alloca slot.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &store(4, 9, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FMov {
+            src: MachOperand::Reg(MachReg::Phys(s)),
+            dst: MachOperand::StackSlot(off),
+            size,
+        }] => {
+            assert_eq!(*s, PhysReg(20));
+            assert_eq!(*off, -8);
+            assert_eq!(*size, OpSize::S64);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // Store F32 through the GPR pointer.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &store(4, 3, IrType::F32),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FMov {
+            dst: MachOperand::Mem { base, offset },
+            size,
+            ..
+        }] => {
+            assert_eq!(*base, MachReg::Phys(PhysReg(11)));
+            assert_eq!(*offset, 0);
+            assert_eq!(*size, OpSize::S32);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // Load F64 through the GPR pointer into an xmm home.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &load(5, 3, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FMov {
+            src: MachOperand::Mem { .. },
+            dst: MachOperand::Reg(MachReg::Phys(d)),
+            size,
+        }] => {
+            assert_eq!(*d, PhysReg(21));
+            assert_eq!(*size, OpSize::S64);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // Load F32 from the alloca slot.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &load(5, 9, IrType::F32),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FMov {
+            src: MachOperand::StackSlot(off),
+            size,
+            ..
+        }] => {
+            assert_eq!(*off, -8);
+            assert_eq!(*size, OpSize::S32);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // Float Copy between two xmm homes (type from the value-type map).
+    let mut vt: FxHashMap<u32, IrType> = FxHashMap::default();
+    vt.insert(4, IrType::F32);
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Copy {
+            dest: Value(5),
+            src: Operand::Value(Value(4)),
+        },
+        &ra,
+        &slots,
+        Some(&vt),
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FMov {
+            src: MachOperand::Reg(MachReg::Phys(s)),
+            dst: MachOperand::Reg(MachReg::Phys(d)),
+            size,
+        }] => {
+            assert_eq!(*s, PhysReg(20));
+            assert_eq!(*d, PhysReg(21));
+            assert_eq!(*size, OpSize::S32);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+}
+
+#[test]
+fn float_moves_outside_the_subset_stay_on_the_text_path() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+
+    let ra: FxHashMap<u32, PhysReg> = [
+        (3u32, PhysReg(11)),
+        (4, PhysReg(20)),
+        (6, PhysReg(22)), // xmm-based pointer
+    ]
+    .into_iter()
+    .collect();
+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
+    let store = |val: Operand, ptr: u32, ty: IrType| Instruction::Store {
+        val,
+        ptr: Value(ptr),
+        ty,
+        seg_override: Default::default(),
+        volatile: false,
+    };
+
+    // Value with no register home (slot-homed floats need the xmm scratch
+    // relay the text path owns).
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(77)), 3, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Constant source: no scalar-SSE immediate form.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Const(IrConst::F64(1.0)), 3, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // XMM-based pointer: x86 addressing has no xmm base.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(4)), 6, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Pointer with no home at all.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(4)), 88, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // F128 goes through x87 on the text path.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &store(Operand::Value(Value(4)), 3, IrType::F128),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Load with a GPR dest (mixed domain) stays on the text path.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &Instruction::Load {
+            dest: Value(3),
+            ptr: Value(3),
+            ty: IrType::F64,
+            seg_override: Default::default(),
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Float Copy where only one side is xmm-homed.
+    let mut vt: FxHashMap<u32, IrType> = FxHashMap::default();
+    vt.insert(4, IrType::F64);
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &Instruction::Copy {
+            dest: Value(3), // GPR dest
+            src: Operand::Value(Value(4)),
+        },
+        &ra,
+        &slots,
+        Some(&vt),
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Integer Copy of an untyped value must NOT be hijacked as a float
+    // move: no value-type entry means the integer width logic applies.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Value(Value(11)),
+        },
+        &ra,
+        &slots,
+        Some(&vt),
+        &mut out,
+    ));
+    assert!(
+        out.iter().all(|mi| !matches!(mi, MachInst::FMov { .. })),
+        "untyped copy produced FMov: {out:?}"
+    );
+}
+
+// ── 6. FAlu: scalar SSE arithmetic (VEX three-operand) ───────────────────
+
+#[test]
+fn falu_emits_vex_three_operand_forms() {
+    // dst = src1 OP src2; AT&T prints `vop src2, %src1, %dst`.
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: reg(PhysReg(21)),
+            src1: MachReg::Phys(PhysReg(20)),
+            dst: MachReg::Phys(PhysReg(22)),
+            size: OpSize::S64,
+        }),
+        "vaddsd %xmm3, %xmm2, %xmm4"
+    );
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Sub,
+            src2: reg(PhysReg(21)),
+            src1: MachReg::Phys(PhysReg(22)),
+            dst: MachReg::Phys(PhysReg(22)),
+            size: OpSize::S64,
+        }),
+        "vsubsd %xmm3, %xmm4, %xmm4"
+    );
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Mul,
+            src2: reg(PhysReg(33)),
+            src1: MachReg::Phys(PhysReg(26)),
+            dst: MachReg::Phys(PhysReg(27)),
+            size: OpSize::S32,
+        }),
+        "vmulss %xmm15, %xmm8, %xmm9"
+    );
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Div,
+            src2: reg(PhysReg(20)),
+            src1: MachReg::Phys(PhysReg(21)),
+            dst: MachReg::Phys(PhysReg(21)),
+            size: OpSize::S32,
+        }),
+        "vdivss %xmm2, %xmm3, %xmm3"
+    );
+    // Memory/slot src2 folds into the instruction (single memory operand).
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Add,
+            src2: MachOperand::StackSlot(-16),
+            src1: MachReg::Phys(PhysReg(20)),
+            dst: MachReg::Phys(PhysReg(21)),
+            size: OpSize::S64,
+        }),
+        "vaddsd -16(%rbp), %xmm2, %xmm3"
+    );
+    assert_eq!(
+        emit1(&MachInst::FAlu {
+            op: FAluOp::Mul,
+            src2: MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(14)),
+                offset: 8,
+            },
+            src1: MachReg::Phys(PhysReg(20)),
+            dst: MachReg::Phys(PhysReg(21)),
+            size: OpSize::S64,
+        }),
+        "vmulsd 8(%rdi), %xmm2, %xmm3"
+    );
+}
+
+#[test]
+#[should_panic(expected = "non-float size")]
+fn falu_rejects_narrow_sizes() {
+    emit1(&MachInst::FAlu {
+        op: FAluOp::Add,
+        src2: reg(PhysReg(21)),
+        src1: MachReg::Phys(PhysReg(20)),
+        dst: MachReg::Phys(PhysReg(22)),
+        size: OpSize::S16,
+    });
+}
+
+#[test]
+#[should_panic(expected = "immediate")]
+fn falu_rejects_immediate_src2() {
+    emit1(&MachInst::FAlu {
+        op: FAluOp::Add,
+        src2: MachOperand::Imm(1),
+        src1: MachReg::Phys(PhysReg(20)),
+        dst: MachReg::Phys(PhysReg(22)),
+        size: OpSize::S64,
+    });
+}
+
+#[test]
+#[should_panic(expected = "unallocated")]
+fn falu_rejects_unallocated_src1() {
+    emit1(&MachInst::FAlu {
+        op: FAluOp::Add,
+        src2: reg(PhysReg(21)),
+        src1: MachReg::Vreg(7),
+        dst: MachReg::Phys(PhysReg(22)),
+        size: OpSize::S64,
+    });
+}
+
+#[test]
+fn float_binops_lower_with_exact_operand_order() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, IrBinOp, Operand, Value};
+
+    // 4: xmm2 (lhs), 5: xmm3 (rhs), 6: xmm4 (dest), 7: slot-homed value.
+    let ra: FxHashMap<u32, PhysReg> = [
+        (4u32, PhysReg(20)),
+        (5, PhysReg(21)),
+        (6, PhysReg(22)),
+    ]
+    .into_iter()
+    .collect();
+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
+
+    let binop = |dest: u32, op: IrBinOp, l: u32, r: u32, ty: IrType| Instruction::BinOp {
+        dest: Value(dest),
+        op,
+        lhs: Operand::Value(Value(l)),
+        rhs: Operand::Value(Value(r)),
+        ty,
+    };
+
+    // Sub keeps lhs in src1: dst = src1 - src2.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &binop(6, IrBinOp::Sub, 4, 5, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FAlu {
+            op: FAluOp::Sub,
+            src2: MachOperand::Reg(MachReg::Phys(s2)),
+            src1: MachReg::Phys(s1),
+            dst: MachReg::Phys(d),
+            size,
+        }] => {
+            assert_eq!(*s1, PhysReg(20), "lhs must stay src1 for sub");
+            assert_eq!(*s2, PhysReg(21));
+            assert_eq!(*d, PhysReg(22));
+            assert_eq!(*size, OpSize::S64);
+        }
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // SDiv on floats is the division operator (no separate FDiv in the IR).
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &binop(6, IrBinOp::SDiv, 4, 5, IrType::F32),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(
+        matches!(&out[..], [MachInst::FAlu { op: FAluOp::Div, size: OpSize::S32, .. }]),
+        "unexpected: {out:?}"
+    );
+
+    // Commutative swap: lhs slot-homed (vreg), rhs xmm -> src1 = rhs.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &binop(6, IrBinOp::Mul, 7, 5, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FAlu {
+            op: FAluOp::Mul,
+            src2: MachOperand::Reg(MachReg::Vreg(7)),
+            src1: MachReg::Phys(s1),
+            ..
+        }] => assert_eq!(*s1, PhysReg(21), "rhs must become src1 in swapped form"),
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // Non-commutative with slot lhs is REJECTED (text path stages via xmm0).
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &binop(6, IrBinOp::Sub, 7, 5, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Slot rhs on a lhs-xmm op is admitted as a vreg (flush-time slot
+    // resolution folds it into the memory operand).
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &binop(6, IrBinOp::Add, 4, 7, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[..] {
+        [MachInst::FAlu {
+            src2: MachOperand::Reg(MachReg::Vreg(7)),
+            src1: MachReg::Phys(s1),
+            ..
+        }] => assert_eq!(*s1, PhysReg(20)),
+        other => panic!("unexpected lowering: {other:?}"),
+    }
+
+    // GPR dest: rejected.
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &binop(3, IrBinOp::Add, 4, 5, IrType::F64),
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+
+    // Integer Add is untouched by the float arm.
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &binop(3, IrBinOp::Add, 1, 2, IrType::I64),
+        &[(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
+            .into_iter()
+            .collect(),
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(
+        out.iter().all(|mi| !matches!(mi, MachInst::FAlu { .. })),
+        "integer add produced FAlu: {out:?}"
+    );
 }
