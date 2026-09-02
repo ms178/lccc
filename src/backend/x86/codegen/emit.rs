@@ -578,6 +578,10 @@ const MI_FLOAT_MOV: u32 = 1 << 15;
 /// Scalar float arithmetic (FAlu): float Add/Sub/Mul/Div lowered to the VEX
 /// three-operand vadd/vsub/vmul/vdiv forms.
 const MI_FLOAT_ALU: u32 = 1 << 16;
+/// Typed direct calls (CallTyped): SysV integer-register calls lowered as one
+/// atomic machine instruction (caller-save spills + argument moves + call +
+/// return home + restores), replacing the accumulator-staged text sequence.
+const MI_CALL_TYPED: u32 = 1 << 17;
 
 fn parse_machinst_disabled_kinds() -> u32 {
     std::env::var("CCC_MI_DISABLE_KINDS")
@@ -602,6 +606,7 @@ fn parse_machinst_disabled_kinds() -> u32 {
                 "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
                 "float-mov" => MI_FLOAT_MOV,
                 "float-alu" => MI_FLOAT_ALU,
+                "call-typed" => MI_CALL_TYPED,
                 "all" => u32::MAX,
                 _ => 0,
             }
@@ -621,6 +626,7 @@ fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
         Instruction::Select { .. } => MI_SELECT,
         Instruction::GetElementPtr { .. } => MI_GEP,
         Instruction::Alloca { .. } => MI_ALLOCA,
+        Instruction::Call { .. } => MI_CALL_TYPED,
         _ => 0,
     }
 }
@@ -4023,6 +4029,19 @@ impl X86Codegen {
                 && !self.state.is_i128_value(v)
                 && !self.state.vector_values.contains(&v)
         };
+        // Spill-slot-homed float value: relayed through the pre-colored xmm0
+        // scratch (PhysReg 18 — the allocator pool starts at xmm2, so the
+        // scratch can never collide with an allocated home). Same value-domain
+        // exclusions as xmm_homed: a vectorizer/i128/accumulator value that
+        // happens to be slot-homed is packed/wide in the mature path's eyes
+        // and must not be moved by a scalar relay.
+        let float_slot_homed = |v: u32| {
+            ra.get(&v).is_none()
+                && self.state.get_slot(v).is_some()
+                && !self.state.is_accumulator_location(v)
+                && !self.state.is_i128_value(v)
+                && !self.state.vector_values.contains(&v)
+        };
         // Pointer admission mirrors the integer Load/Store ptr gate exactly:
         // folded GEP/global addresses have NO materialized register (the
         // producer was skipped -- reading its home is a segfault), and
@@ -4048,7 +4067,7 @@ impl X86Codegen {
                 ..
             } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
                 *seg_override == AddressSpace::Default
-                    && matches!(val, Operand::Value(v) if xmm_homed(v.0))
+                    && matches!(val, Operand::Value(v) if xmm_homed(v.0) || float_slot_homed(v.0))
                     && gpr_ptr(ptr.0)
             }
             Instruction::Load {
@@ -4058,7 +4077,9 @@ impl X86Codegen {
                 seg_override,
                 ..
             } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
-                *seg_override == AddressSpace::Default && xmm_homed(dest.0) && gpr_ptr(ptr.0)
+                *seg_override == AddressSpace::Default
+                    && (xmm_homed(dest.0) || float_slot_homed(dest.0))
+                    && gpr_ptr(ptr.0)
             }
             Instruction::Copy { dest, src } => {
                 let Operand::Value(src_v) = src else {
@@ -4111,6 +4132,213 @@ impl X86Codegen {
             _ => false,
         }
     }
+    /// Typed direct-call lowering: the SysV integer-register subset as one
+    /// atomic [`MachInst::CallTyped`].
+    ///
+    /// Admission contract (everything else keeps the mature path):
+    /// - direct call to a named, non-empty symbol; not variadic, not sret;
+    /// - no struct/i128/F128/x87 arguments; at most six integer/pointer
+    ///   arguments of ABI width 4 or 8 (narrow C arguments are moved at
+    ///   their canonical 32-bit promotion width, per the same convention
+    ///   the load path's `narrow_defined_load` establishes);
+    /// - integer/pointer return (or void) whose destination home is a GPR
+    ///   or a spill slot; dead/accumulator/xmm destinations stay behind;
+    /// - inline-memcpy candidates keep their interception in the dispatch
+    ///   loop (an inlined fixed-size memcpy beats any call sequence);
+    /// - the pure builder must produce an acyclic move plan.
+    ///
+    /// Flushing discipline: the preceding run is drained first, the call is
+    /// buffered as its own run, and that run is flushed immediately. This
+    /// reproduces the mature path's program-point semantics exactly — the
+    /// caller-save interval check runs at the call's own point — and keeps
+    /// the pre-colored argument/return registers conflict-free, since no
+    /// allocated vreg can coexist with the call in the buffer. The flush's
+    /// tail (invalidate_all + pending-vec-store flush + vec-peephole
+    /// invalidation) is precisely `clobber_after_call_like`.
+    fn try_lower_call_typed(
+        &mut self,
+        inst: &crate::ir::reexports::Instruction,
+        func: &str,
+        info: &crate::ir::reexports::CallInfo,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        use super::isel::{build_typed_call, TypedCallSrc};
+        use super::machinst::{CallArgMove, MachInst, MachOperand, MachReg, OpSize};
+
+        let _ = folded_global_addrs; // subset needs no fold-map interaction
+
+        if self.machinst_disabled_kinds & MI_CALL_TYPED != 0 {
+            return false;
+        }
+        // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
+        // call sequence (dispatch-loop interception, mirrored gate).
+        if crate::backend::generation::inline_memcpy_len(func, &info.args, info.is_variadic)
+            .is_some()
+        {
+            return false;
+        }
+        // Direct named target, non-variadic, no sret.
+        if func.is_empty() || info.is_variadic || info.is_sret {
+            return false;
+        }
+        // No struct/by-value aggregates (the classification would leave the
+        // integer-register subset).
+        if info.struct_arg_sizes.iter().any(|s| s.is_some()) {
+            return false;
+        }
+        if info.args.len() > super::machinst::SYSCALL_ARG_REGS.len() {
+            return false;
+        }
+        // Integer/pointer domain for every argument and the return.
+        let width_ok = |ty: IrType| {
+            !ty.is_128bit() && !ty.is_float() && !ty.is_long_double() && ty.size() <= 8
+        };
+        if !width_ok(info.return_type) || info.arg_types.iter().any(|t| !width_ok(*t)) {
+            return false;
+        }
+
+        // Canonical move width: never narrower than 32 bits. Narrow C
+        // arguments are passed at their promoted width (the ABI reads the
+        // 32-bit register; a byte/word move would leave the upper bits of
+        // the argument register undefined).
+        let move_width = |ty: IrType| match OpSize::from_ir_type(ty) {
+            OpSize::S8 | OpSize::S16 => OpSize::S32,
+            s => s,
+        };
+
+        let ra = &self.reg_assignments;
+        let state = &self.state;
+        let value_types = &self.value_types;
+
+        // Resolve an argument operand to a typed source. None = the mature
+        // path stages it (accumulator/xmm/alloca-address/rbp homes, dead
+        // values, non-integer constants).
+        let arg_src = |op: &crate::ir::reexports::Operand| -> Option<TypedCallSrc> {
+            match op {
+                crate::ir::reexports::Operand::Const(c) => c.to_i64().map(TypedCallSrc::Imm),
+                crate::ir::reexports::Operand::Value(v) => {
+                    // Address-of-local arguments (`&x`): a separate pre-move
+                    // (Mov { AllocaAddr } → leaq by the resolver) places the
+                    // address into the ABI register before the call. The
+                    // slot must exist for the resolver to render the leaq.
+                    if state.is_alloca(v.0) {
+                        return state
+                            .get_slot(v.0)
+                            .map(|_| TypedCallSrc::AllocaAddr(v.0));
+                    }
+                    if is_mi_unsafe_value(v.0, ra, state, value_types) {
+                        return None;
+                    }
+                    if let Some(&r) = ra.get(&v.0) {
+                        if r.0 >= 20 || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+                            return None; // xmm / rax / rbp / rcx homes
+                        }
+                        return Some(TypedCallSrc::Reg(r));
+                    }
+                    state.get_slot(v.0).map(|slot| TypedCallSrc::Slot(slot.0))
+                }
+            }
+        };
+
+        let arg_srcs: Vec<Option<TypedCallSrc>> = info.args.iter().map(arg_src).collect();
+        let arg_sizes: Vec<OpSize> = info
+            .arg_types
+            .iter()
+            .map(|t| move_width(*t))
+            .collect();
+
+        // Return home (None = void call; a dead destination defers to the
+        // mature path rather than dropping the store).
+        let ret_plan = match &info.dest {
+            None => None,
+            Some(d) => {
+                if state.is_alloca(d.0) || is_mi_unsafe_value(d.0, ra, state, value_types) {
+                    return false;
+                }
+                let src = if let Some(&r) = ra.get(&d.0) {
+                    if r.0 >= 20 || r.0 == 0 || r.0 == 6 {
+                        return false;
+                    }
+                    TypedCallSrc::Reg(r)
+                } else if let Some(slot) = state.get_slot(d.0) {
+                    TypedCallSrc::Slot(slot.0)
+                } else {
+                    return false;
+                };
+                Some((Some(src), move_width(info.return_type)))
+            }
+        };
+
+        let plan = match build_typed_call(&arg_srcs, &arg_sizes, ret_plan) {
+            Ok(p) => p,
+            Err(reason) => {
+                super::isel::stats::note_reject_named(reason.label());
+                return false;
+            }
+        };
+
+        // Caller-save spills at the call's program point — the same data
+        // and the same point semantics as the mature path's Phase 2b.
+        let point = self.state.current_program_point;
+        let mut caller_saves: Vec<(PhysReg, i64)> = Vec::new();
+        for (&reg_id, &slot) in &self.caller_save_spill_slots {
+            if let Some(intervals) = self.caller_save_intervals.get(&reg_id) {
+                if intervals.iter().any(|&(start, end)| start <= point && point <= end) {
+                    caller_saves.push((PhysReg(reg_id), slot.0));
+                }
+            }
+        }
+
+        // Target naming mirrors emit_call_instruction_impl: versioned
+        // symbols use the base name in @PLT references (GAS 2.47 rejects
+        // `sym@ver@PLT`; the linker resolves the version).
+        let target = if self.state.needs_plt(func) {
+            let n = func.split('@').next().unwrap_or(func);
+            format!("{}@PLT", n)
+        } else {
+            func.to_string()
+        };
+
+        // Split alloca-address arguments into pre-moves. The pre-move
+        // writes the ABI register BEFORE the caller-save spills run, so a
+        // register in the save set would be spilled after being clobbered —
+        // reject that shape (the mature path orders saves before staging).
+        // The builder already guaranteed no other argument sources from the
+        // register, so hoisting all pre-moves to the front of the run is
+        // order-equivalent.
+        let mut pre_moves: Vec<MachInst> = Vec::new();
+        let mut typed_args: Vec<CallArgMove> = Vec::new();
+        for m in plan.args {
+            match &m.src {
+                MachOperand::AllocaAddr(id) => {
+                    if caller_saves.iter().any(|(r, _)| *r == m.dst_reg) {
+                        return false;
+                    }
+                    pre_moves.push(MachInst::Mov {
+                        src: MachOperand::AllocaAddr(*id),
+                        dst: MachOperand::Reg(MachReg::Phys(m.dst_reg)),
+                        size: OpSize::S64,
+                    });
+                }
+                _ => typed_args.push(m),
+            }
+        }
+
+        // Drain the preceding run, buffer the call as its own run, flush it.
+        self.flush_machinst();
+        self.machinst_buf.extend(pre_moves);
+        self.machinst_buf.push(MachInst::CallTyped {
+            caller_saves,
+            args: typed_args,
+            target,
+            ret: plan.ret,
+        });
+        self.machinst_buf_ir.push(inst.clone());
+        self.flush_machinst();
+        super::isel::stats::note_lowered();
+        true
+    }
+
 }
 
 impl ArchCodegen for X86Codegen {
@@ -4267,6 +4495,16 @@ impl ArchCodegen for X86Codegen {
             return false;
         }
 
+        // Typed direct calls (CallTyped): the SysV integer-register subset
+        // lowered as one atomic machine instruction. Everything else —
+        // variadic/sret/struct/i128/F128 calls, stack-overflow arguments,
+        // register-exchange hazard cycles, inline-memcpy candidates — keeps
+        // the mature path, which owns the general contract. See
+        // try_lower_call_typed for the full admission contract.
+        if let crate::ir::reexports::Instruction::Call { func, info } = inst {
+            return self.try_lower_call_typed(inst, func, info, folded_global_addrs);
+        }
+
         // Div/rem pair heads and tails must stay on the classic emitter path:
         // the fusion (emit_divrem_pair_head) lives there and the MachInst
         // lowering emits standalone divisions for each side, which would both
@@ -4418,14 +4656,39 @@ impl ArchCodegen for X86Codegen {
         // path takes over unchanged.
         if self.float_typed_candidate(inst, folded_global_addrs) {
             let mut float_alloca_slots = crate::common::fx_hash::FxHashMap::default();
-            if let crate::ir::reexports::Instruction::Load { ptr, .. }
-            | crate::ir::reexports::Instruction::Store { ptr, .. } = inst
-            {
-                if self.state.is_alloca(ptr.0) {
-                    if let Some(slot) = self.state.get_slot(ptr.0) {
-                        float_alloca_slots.insert(ptr.0, slot.0);
+            // The float arms read the VALUE's spill slot (relay source) and
+            // the DEST's spill slot (relay target) from the same map as the
+            // pointer slot — insert all three shapes the instruction has.
+            match inst {
+                crate::ir::reexports::Instruction::Load { dest, ptr, .. } => {
+                    for v in [ptr.0, dest.0] {
+                        if self.state.is_alloca(v) {
+                            if let Some(slot) = self.state.get_slot(v) {
+                                float_alloca_slots.insert(v, slot.0);
+                            }
+                        }
+                    }
+                    if !self.reg_assignments.contains_key(&dest.0) {
+                        if let Some(slot) = self.state.get_slot(dest.0) {
+                            float_alloca_slots.insert(dest.0, slot.0);
+                        }
                     }
                 }
+                crate::ir::reexports::Instruction::Store { val, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            float_alloca_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let crate::ir::reexports::Operand::Value(v) = val {
+                        if !self.reg_assignments.contains_key(&v.0) {
+                            if let Some(slot) = self.state.get_slot(v.0) {
+                                float_alloca_slots.insert(v.0, slot.0);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
             let lowered = super::isel::lower_instruction_typed(
                 inst,
