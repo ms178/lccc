@@ -524,6 +524,12 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed |= memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
             changed |= memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
         }
+        // Repeated RIP-relative loads of the same FP pool constant become a
+        // single register materialization (leaf functions only; harvested
+        // NOP slot must dominate all uses by fall-through).
+        if !sk("fp_const_hoist") {
+            changed |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+        }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.
@@ -755,6 +761,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
             if !sk("fp_reg_mem_fold") {
                 changed2 |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
+            }
+            if !sk("fp_const_hoist") {
+                changed2 |= memory_fold::hoist_repeated_fp_constant_loads(&mut store, &mut infos);
             }
             if std::env::var("CCC_PEEPHOLE_RELAY").is_ok() && !sk("load_copy_relay") {
                 changed2 |= memory_fold::fold_load_copy_relay(&mut store, &mut infos);
