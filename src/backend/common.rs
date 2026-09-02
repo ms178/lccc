@@ -2251,3 +2251,120 @@ pub fn escape_string(s: &str) -> String {
     }
     result
 }
+
+// ── Value type map (single source of truth for materialisation width) ────────
+
+/// The IR type the codegen will assume when it materialises a value.
+///
+/// The x86-64 emitters pick a value's spill/reload WIDTH from this map
+/// (`X86Codegen::value_types`): a value typed `I8..U32`/`F32` is stored with
+/// `movb`/`movw`/`movl` and reloaded with the matching extension, everything
+/// else — including values ABSENT from the map, which default to `IrType::I64`
+/// — is moved with `movq`.
+///
+/// The stack layout's small-slot (4-byte) narrowing must agree with it.
+/// Sizing a slot from the defining instruction's `result_type()` alone is not
+/// enough: `Copy`/`Phi` carry no result type, so their dest's type is
+/// PROPAGATED from an incoming/source value, and that propagated type can be
+/// wider than the dest's own declared type. When that happens the value got a
+/// 4-byte slot (narrow `result_type()`) while the emitters reload it with
+/// `movq` — reading four bytes of a neighbouring slot into the upper half.
+///
+/// That mismatch is the root cause of the lccc-built preboot ZSTD decompressor
+/// reporting "ZSTD-compressed data is corrupt" at -O2: `ZSTD_decodeLiteralsBlock`
+/// stored one CFG path's value with `movl %eax, 80(%rsp)` and the join block
+/// reloaded it with `movq 80(%rsp), %rax`, so the high half was whatever the
+/// frame happened to hold (`errcode=20` at
+/// `zstd_decompress_block.c:242`, `HUF_isError(hufSuccess)`).
+///
+/// Seeded from each defining instruction's `result_type()`, then propagated
+/// along Copy/Phi edges, then completed with `ParamRef`'s declared type — the
+/// exact rule the emitters were already relying on.
+pub(crate) fn compute_value_type_map(
+    func: &crate::ir::reexports::IrFunction,
+) -> crate::common::fx_hash::FxHashMap<u32, IrType> {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{Instruction, Operand};
+
+    let mut value_types: FxHashMap<u32, IrType> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            // Map every producing instruction to its result type.
+            if let Some(ty) = inst.result_type() {
+                if let Some(dest) = inst.dest() {
+                    value_types.entry(dest.0).or_insert(ty);
+                }
+            }
+            // Copy/Phi: propagate the source type to the dest.
+            match inst {
+                Instruction::Copy { dest, src } => match src {
+                    Operand::Value(v) => {
+                        if let Some(&t) = value_types.get(&v.0) {
+                            value_types.insert(dest.0, t);
+                        }
+                    }
+                    Operand::Const(c) => {
+                        // A Copy from a constant is the def site of an
+                        // otherwise untyped SSA name. Without this seed,
+                        // consumers that must know the value's width (the SIB
+                        // index soundness gate, type-aware slot loads) guess.
+                        // `Zero` is context-typed and stays unknown on purpose.
+                        let t = match c {
+                            crate::ir::reexports::IrConst::I8(_) => Some(IrType::I8),
+                            crate::ir::reexports::IrConst::I16(_) => Some(IrType::I16),
+                            crate::ir::reexports::IrConst::I32(_) => Some(IrType::I32),
+                            crate::ir::reexports::IrConst::I64(_) => Some(IrType::I64),
+                            crate::ir::reexports::IrConst::I128(_) => Some(IrType::I128),
+                            crate::ir::reexports::IrConst::F32(_) => Some(IrType::F32),
+                            crate::ir::reexports::IrConst::F64(_) => Some(IrType::F64),
+                            crate::ir::reexports::IrConst::D32(_) => Some(IrType::D32),
+                            crate::ir::reexports::IrConst::D64(_) => Some(IrType::D64),
+                            crate::ir::reexports::IrConst::LongDouble(_, _) => Some(IrType::F128),
+                            crate::ir::reexports::IrConst::Zero => None,
+                        };
+                        if let Some(t) = t {
+                            value_types.insert(dest.0, t);
+                        }
+                    }
+                    _ => {}
+                },
+                Instruction::Phi { dest, incoming, .. } => {
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            if let Some(&t) = value_types.get(&v.0) {
+                                value_types.insert(dest.0, t);
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // ParamRef carries the declared parameter type.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::ParamRef { dest, ty, .. } = inst {
+                value_types.entry(dest.0).or_insert(*ty);
+            }
+        }
+    }
+    value_types
+}
+
+/// Value ids whose codegen materialisation width exceeds four bytes.
+///
+/// Used by the stack layout to veto the 4-byte small-slot narrowing: a value
+/// in this set is moved with `movq`, so its slot must be at least eight bytes
+/// or the reload reads a neighbour's bytes (see
+/// [`compute_value_type_map`] for the miscompile this prevented).
+pub(crate) fn wide_typed_values(
+    func: &crate::ir::reexports::IrFunction,
+) -> crate::common::fx_hash::FxHashSet<u32> {
+    compute_value_type_map(func)
+        .into_iter()
+        .filter(|(_, ty)| ty.size() > 4)
+        .map(|(v, _)| v)
+        .collect()
+}

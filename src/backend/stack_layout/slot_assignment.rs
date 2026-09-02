@@ -112,6 +112,17 @@ pub(super) fn classify_instructions(
 ) {
     let mut collected_values: FxHashSet<u32> = FxHashSet::default();
 
+    // Values whose codegen materialisation width is >4 bytes: the emitters
+    // move these with `movq`, so a 4-byte small slot would make the reload
+    // read four bytes of the neighbouring slot (`ZSTD_decodeLiteralsBlock`
+    // in the -O2 preboot decompressor stored `movl %eax,80(%rsp)` on one CFG
+    // path and the join reloaded `movq 80(%rsp),%rax`). Sizing the slot from
+    // the defining instruction's `result_type()` alone is not enough because
+    // Copy/Phi dests inherit their type from an incoming value that may be
+    // wider. Refusing the narrow slot is strictly conservative: slots only
+    // ever get bigger, never smaller.
+    let wide_typed: FxHashSet<u32> = crate::backend::common::wide_typed_values(func);
+
     // Copy has no result type in the IR, but on i686 a copy of a value no
     // wider than one GPR is itself no wider than one GPR.  Infer that fact to
     // a fixed point before assigning slots.  Doing this during the allocation
@@ -459,6 +470,7 @@ pub(super) fn classify_instructions(
                     reg_assigned,
                     &compact_i686_values,
                     &f128_web_values,
+                    &wide_typed,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -472,6 +484,7 @@ pub(super) fn classify_instructions(
                     reg_assigned,
                     &compact_i686_values,
                     &f128_web_values,
+                    &wide_typed,
                     &mut collected_values,
                     multi_block_values,
                     block_local_values,
@@ -589,6 +602,7 @@ fn classify_value(
     reg_assigned: &FxHashMap<u32, PhysReg>,
     compact_i686_values: &FxHashSet<u32>,
     f128_web_values: &FxHashSet<u32>,
+    wide_typed: &FxHashSet<u32>,
     collected_values: &mut FxHashSet<u32>,
     multi_block_values: &mut Vec<MultiBlockValue>,
     block_local_values: &mut Vec<BlockLocalValue>,
@@ -632,7 +646,12 @@ fn classify_value(
     // structurally impossible rather than dependent on allocation order.
     let small_slots_enabled = crate::common::types::target_small_slots()
         && std::env::var_os("CCC_NO_SMALL_SLOTS").is_none();
+    // A narrow `result_type()` is necessary but NOT sufficient: Copy/Phi dests
+    // inherit their type from an incoming value, so a value the emitters will
+    // move with `movq` can still be defined here with a 32-bit result type.
+    // Such a value must keep an 8-byte slot (see `wide_typed` above).
     let is_small = small_slots_enabled
+        && !wide_typed.contains(&dest.0)
         && (compact_i686_values.contains(&dest.0)
             || matches!(
                 inst.result_type(),
@@ -1108,8 +1127,35 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // pointer's slot was reused by the alloca/loop else-branch, so after the
     // longjmp landed, strcmp compared against a clobbered pointer and the
     // test aborted.  Fall back to distinct permanent slots instead.
+    // TIER-2 SLOT SHARING IS OFF BY DEFAULT (opt in with CCC_TIER2_GRAPH=1).
+    //
+    // The liveness-packed colorer hands two multi-block values the same stack
+    // slot whenever their live segments do not overlap. That proof is unsound:
+    // at -O2 the lccc-built preboot ZSTD decompressor reported
+    // "ZSTD-compressed data is corrupt" — `errcode=20` (`corruption_detected`)
+    // at `lib/zstd/decompress/zstd_decompress_block.c:242`'s
+    // `RETURN_ERROR_IF(HUF_isError(hufSuccess), ...)` — because two values
+    // whose segments the colorer believed disjoint shared one slot and the
+    // join block read the wrong one.
+    //
+    // Evidence (all measured with the `zstd_preboot_oracle.sh` piggy case on
+    // the real 4,155,784-byte vmlinux.bin.zst payload, which round-trips at
+    // -O0/-O1 and fails at -O2/-O3):
+    //   * CCC_NO_TIER2_GRAPH=1 -> MATCH   (coloring is the trigger)
+    //   * CCC_NO_SMALL_SLOTS=1 -> MATCH   (only when slots are 8 bytes)
+    //   * convex-hull (fat) interference instead of per-segment holes: still
+    //     FAILS, so it is not merely the CFG-hole sharing
+    //   * no sharing of sub-8-byte slots: still FAILS
+    //   * disabling every IR pass individually (34 names) and in groups: no
+    //     change — the defect is in the layout, not in any optimization.
+    //
+    // Cost of the fallback (one permanent slot per multi-block value),
+    // measured: +6.4% stack on the 230-function zstd TU (20,888 vs 19,624
+    // bytes of `subq $N,%rsp`), -4 asm lines; +6 bytes of .text on the whole
+    // x86 boot corpus. Correctness before performance: keep it off until the
+    // segment proof is fixed.
     if !coalesce
-        || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some()
+        || std::env::var_os("CCC_TIER2_GRAPH").is_none()
         || has_builtin_setjmp(func)
     {
         for mbv in multi_block_values {

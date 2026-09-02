@@ -15,21 +15,36 @@ use crate::common::fx_hash::FxHashMap;
 use std::collections::BTreeMap;
 
 #[inline]
-fn segments_interfere(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
-    let (mut ai, mut bi) = (0usize, 0usize);
-    while ai < a.len() && bi < b.len() {
-        let (as_, ae) = a[ai];
-        let (bs, be) = b[bi];
-        if as_ <= be && bs <= ae {
-            return true;
-        }
-        if ae < bs {
-            ai += 1;
-        } else {
-            bi += 1;
-        }
+fn hull(a: &[(u32, u32)]) -> (u32, u32) {
+    let mut s = u32::MAX;
+    let mut e = 0u32;
+    for &(x, y) in a {
+        s = s.min(x);
+        e = e.max(y);
     }
-    false
+    if s == u32::MAX {
+        (0, 0)
+    } else {
+        (s, e)
+    }
+}
+
+/// Interference test for two slot lifetimes.
+///
+/// The shipped test compares the CONVEX HULL of each value's segments, not the
+/// segments individually. Per-segment ("CFG hole") sharing — letting two
+/// values whose segment lists do not overlap share one slot even though their
+/// hulls do — was the direct cause of the -O2 preboot-ZSTD miscompile
+/// ("ZSTD-compressed data is corrupt", `errcode=20` at
+/// `zstd_decompress_block.c:242`): a value live across a hole it did not
+/// record had its slot handed to a second value on a different CFG path, so
+/// the join block read the wrong bytes. The hull test can only ever make more
+/// values interfere, never fewer, so it cannot reintroduce a slot collision.
+#[inline]
+fn segments_interfere(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (as_, ae) = hull(a);
+    let (bs, be) = hull(b);
+    as_ <= be && bs <= ae
 }
 
 fn insert_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
@@ -128,7 +143,10 @@ pub(super) fn color_stack_slots(
                 .find(|(_, occupied)| !segments_interfere(live, occupied))
             {
                 state.value_locations.insert(value, StackSlot(*slot));
-                insert_union(occupied, live);
+                let (hs, he) = hull(live);
+                let (os, oe) = hull(occupied);
+                occupied.clear();
+                occupied.push((hs.min(os), he.max(oe)));
                 continue;
             }
 
@@ -145,10 +163,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn closed_boundaries_interfere_but_cfg_holes_do_not() {
+    fn closed_boundaries_and_overlapping_hulls_interfere() {
         assert!(segments_interfere(&[(1, 4)], &[(4, 8)]));
-        assert!(!segments_interfere(&[(1, 3), (9, 11)], &[(4, 8)]));
+        // CFG holes whose convex hulls overlap now interfere: a value live
+        // across an unrecorded hole must not share a slot with a neighbour.
+        assert!(segments_interfere(&[(1, 3), (9, 11)], &[(4, 8)]));
         assert!(segments_interfere(&[(1, 3), (9, 11)], &[(8, 9)]));
+        // Truly disjoint hulls still do not interfere.
+        assert!(!segments_interfere(&[(1, 3)], &[(5, 8)]));
     }
 
     #[test]
