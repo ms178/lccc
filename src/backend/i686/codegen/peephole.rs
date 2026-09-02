@@ -217,6 +217,31 @@ fn reg32_name(id: RegId) -> &'static str {
     }
 }
 
+/// Byte/word register name for a family ID, matching the width of `size`
+/// (B => 8-bit low register, W => 16-bit register). Used by the
+/// widen-forwarding arm to synthesize `movzbl`/`movzwl`.
+fn narrow_reg_name(id: RegId, size: MoveSize) -> &'static str {
+    match (id, size) {
+        (REG_EAX, MoveSize::B) => "%al",
+        (REG_ECX, MoveSize::B) => "%cl",
+        (REG_EDX, MoveSize::B) => "%dl",
+        (REG_EBX, MoveSize::B) => "%bl",
+        (REG_ESP, MoveSize::B) => "%spl",
+        (REG_EBP, MoveSize::B) => "%bpl",
+        (REG_ESI, MoveSize::B) => "%sil",
+        (REG_EDI, MoveSize::B) => "%dil",
+        (REG_EAX, MoveSize::W) => "%ax",
+        (REG_ECX, MoveSize::W) => "%cx",
+        (REG_EDX, MoveSize::W) => "%dx",
+        (REG_EBX, MoveSize::W) => "%bx",
+        (REG_ESP, MoveSize::W) => "%sp",
+        (REG_EBP, MoveSize::W) => "%bp",
+        (REG_ESI, MoveSize::W) => "%si",
+        (REG_EDI, MoveSize::W) => "%di",
+        _ => "%???",
+    }
+}
+
 /// Check if a register is caller-saved (clobbered by calls).
 fn is_caller_saved(reg: RegId) -> bool {
     matches!(reg, REG_EAX | REG_ECX | REG_EDX)
@@ -1562,7 +1587,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         let is_incdec = op_s == "incl %eax" || op_s == "decl %eax";
                         if is_imm_alu || is_incdec {
                             let mut k = j + 1;
-                            while k < len && (infos[k].is_nop() || is_debug_location(store, infos, k)) {
+                            while k < len
+                                && (infos[k].is_nop() || is_debug_location(store, infos, k))
+                            {
                                 k += 1;
                             }
                             if k < len {
@@ -1578,7 +1605,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                         let mut cnt = 0;
                                         let mut dead = false;
                                         while m < len && cnt < 24 {
-                                            if infos[m].is_nop() || is_debug_location(store, infos, m) {
+                                            if infos[m].is_nop()
+                                                || is_debug_location(store, infos, m)
+                                            {
                                                 m += 1;
                                                 continue;
                                             }
@@ -1975,6 +2004,178 @@ fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 // ── Pass: Dead store elimination ─────────────────────────────────────────────
 
 /// Remove stores to stack slots that are immediately overwritten.
+// ── Pass: immediate store-to-load forwarding ────────────────────────────────
+
+/// Parse `movX $imm, N(%esp|%ebp)` into (immediate value, biased slot, size).
+/// These immediate homes are emitted by the accumulator backend when it stages
+/// a constant argument or local initializer into a stack slot; unlike the
+/// register case (`StoreEbp`) they classify as plain `Other`, so the register
+/// forwarding pass never sees them.
+fn parse_immediate_store(s: &str) -> Option<(i64, i32, MoveSize)> {
+    let (rest, size) = if let Some(r) = s.strip_prefix("movl ") {
+        (r, MoveSize::L)
+    } else if let Some(r) = s.strip_prefix("movw ") {
+        (r, MoveSize::W)
+    } else if let Some(r) = s.strip_prefix("movb ") {
+        (r, MoveSize::B)
+    } else {
+        return None;
+    };
+    let rest = rest.trim();
+    if !rest.starts_with('$') {
+        return None;
+    }
+    let comma = rest.find(',')?;
+    let imm = rest[1..comma].trim();
+    let mem = rest[comma + 1..].trim();
+    // Plain offset(base) only — no indexed/SIB forms.
+    let paren = mem.find('(')?;
+    let base = &mem[paren..];
+    if base.contains(',') {
+        return None;
+    }
+    if !base.ends_with("(%ebp)") && !base.ends_with("(%esp)") {
+        return None;
+    }
+    let off_str = &mem[..paren];
+    let off = parse_offset(off_str);
+    if off == EBP_OFFSET_NONE {
+        return None;
+    }
+    let val: i64 = imm.parse().ok()?;
+    Some((val, off + slot_bias(mem), size))
+}
+
+/// Forward an immediate store to a stack slot into its later reads:
+/// `movl $3, slot` … `movzbl slot, %eax` becomes a direct materialization
+/// (`movl $3, %eax` / `movzbl`-free), mirroring what GCC emits for a constant
+/// that never needed a home. The register forwarding pass cannot do this:
+/// `movl $imm, slot` is not a `StoreEbp` (its source is an immediate, not a
+/// register), so it is invisible there.
+///
+/// Soundness is the same store-forwarding-window proof as
+/// [`forward_slot_loads`]: scan forward over instructions that cannot
+/// overwrite the slot or the destination register until the slot is overwritten
+/// or a barrier (call / label / indirect memory / control flow) is hit, and
+/// rewrite every plain reload of the slot in that window.
+fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = infos.len();
+    let mut changed = false;
+    const WINDOW: usize = 48;
+
+    for i in 0..len {
+        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Other { .. }) {
+            continue;
+        }
+        let line = trimmed(store, &infos[i], i);
+        let Some((val, slot, store_size)) = parse_immediate_store(line) else {
+            continue;
+        };
+
+        let mut j = i + 1;
+        let mut count = 0;
+        while j < len && count < WINDOW {
+            if infos[j].is_nop() || is_debug_location(store, infos, j) {
+                j += 1;
+                continue;
+            }
+            if infos[j].is_barrier() {
+                break;
+            }
+
+            // Another write (register OR immediate) to overlapping slot bytes
+            // ends the constant's validity.
+            let mut killed = false;
+            match infos[j].kind {
+                LineKind::StoreEbp { offset, size, .. } => {
+                    if ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size()) {
+                        killed = true;
+                    }
+                }
+                LineKind::Other { .. } => {
+                    let t = trimmed(store, &infos[j], j);
+                    if let Some((_, s2, sz2)) = parse_immediate_store(t) {
+                        if ranges_overlap(slot, store_size.byte_size(), s2, sz2.byte_size()) {
+                            killed = true;
+                        }
+                    } else if infos[j].has_indirect_mem || infos[j].ebp_offset != EBP_OFFSET_NONE {
+                        // An indexed/aliased slot access or an unparsed memory
+                        // operand that might touch the slot: stop.
+                        if infos[j].has_indirect_mem {
+                            killed = true;
+                        } else if infos[j].ebp_offset != EBP_OFFSET_NONE
+                            && ranges_overlap(slot, store_size.byte_size(), infos[j].ebp_offset, 16)
+                        {
+                            killed = true;
+                        }
+                    }
+                }
+                LineKind::LoadEbp { offset, size, .. } => {
+                    // Only same-or-wider reloads of exactly the stored bytes
+                    // can be turned into the constant; a narrower or
+                    // partial-overlap read is left alone and stops tracking.
+                    if ranges_overlap(slot, store_size.byte_size(), offset, size.byte_size())
+                        && offset == slot
+                        && size.byte_size() >= store_size.byte_size()
+                    {
+                        // Rewrite as a direct immediate materialization into
+                        // the load's destination register. The constant is
+                        // re-masked to the STORE width: a byte store of $3
+                        // read as movl is value 3; no extension is needed for
+                        // a non-negative small constant, and a wider store
+                        // feeding a narrower load is masked by the register
+                        // name chosen (movw/movb write the low part).
+                        if let LineKind::LoadEbp { reg: dst, .. } = infos[j].kind {
+                            if dst <= REG_GP_MAX {
+                                let mn = match size {
+                                    MoveSize::L => "movl",
+                                    MoveSize::W => "movw",
+                                    MoveSize::B => "movb",
+                                };
+                                let dstname = match size {
+                                    MoveSize::L => reg32_name(dst).to_string(),
+                                    MoveSize::W => narrow_reg_name(dst, MoveSize::W).to_string(),
+                                    MoveSize::B => narrow_reg_name(dst, MoveSize::B).to_string(),
+                                };
+                                // Mask the immediate to the STORED width so a
+                                // negative/wide constant stays correct when
+                                // the reload is wider than the store.
+                                let mask: i64 = match store_size {
+                                    MoveSize::L => 0xFFFF_FFFF,
+                                    MoveSize::W => 0xFFFF,
+                                    MoveSize::B => 0xFF,
+                                };
+                                let v = val & mask;
+                                store.replace(j, format!("    {mn} ${v}, {dstname}"));
+                                infos[j] = classify_line(store.get(j));
+                                changed = true;
+                                j += 1;
+                                count += 1;
+                                continue;
+                            }
+                        }
+                        killed = true;
+                    } else {
+                        killed = true;
+                    }
+                }
+                _ => {}
+            }
+            if killed {
+                break;
+            }
+            // Any generic indirect access we did not classify above breaks the
+            // window (it could write the slot through a pointer).
+            if infos[j].has_indirect_mem {
+                break;
+            }
+            j += 1;
+            count += 1;
+        }
+    }
+    changed
+}
+
 /// Store-to-load forwarding for stack slots: after `movl %R, N(%esp)`, a
 /// later `movl N(%esp), %R2` in the same window (slot and %R untouched)
 /// becomes `movl %R, %R2` -- 2 bytes instead of 4-7 -- and once every load
@@ -2046,6 +2247,64 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     } else {
                         break;
                     }
+                }
+                // Store->load value forwarding across a slot round-trip.
+                // The accumulator backend homes arguments and asm results in
+                // stack slots and immediately reads them back, even though
+                // the stored register still holds the value. Forward the
+                // value register-to-register and let the dead-store pass drop
+                // the home slot:
+                //
+                //  * SAME-WIDTH store/load (`movl %edx,slot` / `movl slot,%eax`,
+                //    or `movw %dx,slot`/`movzwl slot,%eax`, …): the reload is
+                //    a plain copy; emit movl (or movzwl for a word load, which
+                //    is exactly what the load already implied).
+                //  * NARROWER store feeding a WIDER unsigned reload
+                //    (`movb %al,slot` / `movl slot,%eax`): emit the matching
+                //    movzbl/movzwl so the zero-extension the slot round-trip
+                //    implied is explicit; the redundant-zext pass then deletes
+                //    it when the source is already narrow-canonical.
+                //
+                // The window proof below guarantees src_reg still holds the
+                // stored value and the slot bytes are untouched. Byte stores
+                // feeding WORD loads are not forwarded (the high byte of the
+                // target word is a DIFFERENT slot byte, not zero-extension).
+                LineKind::LoadEbp {
+                    reg: dst_reg,
+                    offset,
+                    size: lsize,
+                } if offset == slot && dst_reg <= REG_GP_MAX => {
+                    let fwd = match (size, lsize) {
+                        (MoveSize::L, MoveSize::L) => Some(("movl", reg32_name(src_reg))),
+                        (MoveSize::W, MoveSize::W) => {
+                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
+                        }
+                        (MoveSize::W, MoveSize::L) => {
+                            Some(("movzwl", narrow_reg_name(src_reg, MoveSize::W)))
+                        }
+                        (MoveSize::B, MoveSize::L) => {
+                            Some(("movzbl", narrow_reg_name(src_reg, MoveSize::B)))
+                        }
+                        // A WIDER register store feeding a NARROWER UNSIGNED
+                        // reload is ONLY forwarded when the reload is itself
+                        // a zero-extension (movzbl/movzwl classify as LoadEbp
+                        // of size B/W but their text says movzXl, handled by
+                        // the widened-slot fold elsewhere). Plain same-width or
+                        // narrower-with-truncation (`movb slot,%al` from a
+                        // movl store) reads low bytes the register is NOT
+                        // proven to hold canonically, so it is left alone.
+                        _ => None,
+                    };
+                    if let Some((mnem, src)) = fwd {
+                        let dst = reg32_name(dst_reg);
+                        store.replace(j, format!("    {mnem} {src}, {dst}"));
+                        infos[j] = classify_line(store.get(j));
+                        changed = true;
+                        j += 1;
+                        count += 1;
+                        continue;
+                    }
+                    break;
                 }
                 LineKind::LoadEbp {
                     offset,
@@ -3452,10 +3711,8 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
                 // can see.  Refuse the fallback for the return registers
                 // unless the function has no `ret` at all (noreturn tail).
                 let ret_observes = matches!(dst_reg, REG_EAX | REG_EDX)
-                    && (fs..fe)
-                        .any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
-                if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0
-                {
+                    && (fs..fe).any(|k| infos[k].kind == LineKind::Ret && !infos[k].is_nop());
+                if !ret_observes && census_reg_reads(store, &infos, fs, fe, dst_reg, &[i]) == 0 {
                     infos[i].kind = LineKind::Nop;
                     changed = true;
                 }
@@ -3726,19 +3983,45 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         let m = s.split_whitespace().next().unwrap_or("");
         matches!(
             m,
-            "addl" | "addw" | "addb"
-                | "subl" | "subw" | "subb"
-                | "adcl" | "sbbl"
-                | "andl" | "andw" | "andb"
-                | "orl" | "orw" | "orb"
-                | "xorl" | "xorw" | "xorb"
-                | "cmpl" | "cmpw" | "cmpb"
-                | "testl" | "testw" | "testb"
-                | "shll" | "shrl" | "sarl"
-                | "roll" | "rorl" | "rcll" | "rcrl"
-                | "imull" | "mull" | "idivl" | "divl"
-                | "incl" | "decl" | "negl"
-                | "negw" | "negb"
+            "addl"
+                | "addw"
+                | "addb"
+                | "subl"
+                | "subw"
+                | "subb"
+                | "adcl"
+                | "sbbl"
+                | "andl"
+                | "andw"
+                | "andb"
+                | "orl"
+                | "orw"
+                | "orb"
+                | "xorl"
+                | "xorw"
+                | "xorb"
+                | "cmpl"
+                | "cmpw"
+                | "cmpb"
+                | "testl"
+                | "testw"
+                | "testb"
+                | "shll"
+                | "shrl"
+                | "sarl"
+                | "roll"
+                | "rorl"
+                | "rcll"
+                | "rcrl"
+                | "imull"
+                | "mull"
+                | "idivl"
+                | "divl"
+                | "incl"
+                | "decl"
+                | "negl"
+                | "negw"
+                | "negb"
         )
     }
     /// Lines whose EXECUTION READS the flags (jcc/setcc/cmov).
@@ -3753,7 +4036,10 @@ fn fuse_setcc_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     fn is_flags_reader(kind: LineKind, s: &str) -> bool {
         matches!(kind, LineKind::CondJmp | LineKind::SetCC { .. })
             || is_cond_jcc(s)
-            || s.split_whitespace().next().unwrap_or("").starts_with("cmov")
+            || s.split_whitespace()
+                .next()
+                .unwrap_or("")
+                .starts_with("cmov")
     }
 
     let len = infos.len();
@@ -4391,10 +4677,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
                 LineKind::Other { dest_reg } => {
                     // `movl %src, %dst` style: recover the source register.
-                    let rest = text
-                        .strip_prefix("movl ")
-                        .map(|r| r.trim())
-                        .unwrap_or("");
+                    let rest = text.strip_prefix("movl ").map(|r| r.trim()).unwrap_or("");
                     if let Some(comma) = rest.find(',') {
                         let src_name = rest[..comma].trim();
                         if src_name.starts_with('%') && !src_name.contains('(') {
@@ -4524,8 +4807,7 @@ fn fuse_div_rem_pairs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 continue;
             }
             let text_a = trimmed(store, &infos[i], i);
-            let is_marker =
-                text_a == "xorl %edx, %edx" || text_a == "cltd" || text_a == "cdq";
+            let is_marker = text_a == "xorl %edx, %edx" || text_a == "cltd" || text_a == "cdq";
             if !is_marker {
                 i += 1;
                 continue;
@@ -5146,8 +5428,19 @@ fn is_order_cond_jcc(s: &str) -> bool {
     };
     matches!(
         m,
-        "je" | "jz" | "jne" | "jnz" | "jb" | "jc" | "jnae" | "jnb" | "jnc" | "jae" | "jbe"
-            | "jna" | "ja" | "jnbe"
+        "je" | "jz"
+            | "jne"
+            | "jnz"
+            | "jb"
+            | "jc"
+            | "jnae"
+            | "jnb"
+            | "jnc"
+            | "jae"
+            | "jbe"
+            | "jna"
+            | "ja"
+            | "jnbe"
     )
 }
 
@@ -5236,9 +5529,35 @@ fn is_cond_jcc(s: &str) -> bool {
     };
     matches!(
         m,
-        "jo" | "jno" | "js" | "jns" | "je" | "jz" | "jne" | "jnz" | "jb" | "jc" | "jnae"
-            | "jnb" | "jnc" | "jae" | "jbe" | "jna" | "ja" | "jnbe" | "jl" | "jnge" | "jge"
-            | "jnl" | "jle" | "jng" | "jg" | "jnle" | "jp" | "jpe" | "jnp" | "jpo"
+        "jo" | "jno"
+            | "js"
+            | "jns"
+            | "je"
+            | "jz"
+            | "jne"
+            | "jnz"
+            | "jb"
+            | "jc"
+            | "jnae"
+            | "jnb"
+            | "jnc"
+            | "jae"
+            | "jbe"
+            | "jna"
+            | "ja"
+            | "jnbe"
+            | "jl"
+            | "jnge"
+            | "jge"
+            | "jnl"
+            | "jle"
+            | "jng"
+            | "jg"
+            | "jnle"
+            | "jp"
+            | "jpe"
+            | "jnp"
+            | "jpo"
     )
 }
 
@@ -5253,8 +5572,7 @@ fn line_writes_reg_purely(line: &str, reg: RegId) -> bool {
     };
     let pure_write = matches!(
         mnem,
-        "movl" | "movw" | "movb" | "movzbl" | "movzwl" | "movsbl" | "movswl" | "leal"
-            | "call"
+        "movl" | "movw" | "movb" | "movzbl" | "movzwl" | "movsbl" | "movswl" | "leal" | "call"
     );
     if !pure_write {
         return false;
@@ -5282,10 +5600,7 @@ fn line_writes_reg_purely(line: &str, reg: RegId) -> bool {
 /// silently change the values a `rep movs`/`idivl` consumes.
 fn implicit_reads(line: &str) -> &'static [RegId] {
     let first = line.split_whitespace().next().unwrap_or("");
-    let second = line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("");
+    let second = line.split_whitespace().nth(1).unwrap_or("");
     match first {
         "rep" => match second {
             "movsb" | "movsl" => &[REG_ECX, REG_ESI, REG_EDI],
@@ -5411,7 +5726,6 @@ fn census_reg_reads(
     }
     n
 }
-
 
 /// Rewrite every branch in `[fstart, fend)` whose target is `from_name` to
 /// target `to_name` instead.  Returns the number of rewritten branches.
@@ -5557,8 +5871,7 @@ fn thread_trivial_blocks(store: &mut LineStore, infos: &mut [LineInfo]) -> bool 
         let fend = idx;
 
         // Label name -> line index, for target-existence checks.
-        let mut labels: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for i in fstart..fend {
             if infos[i].is_nop() || infos[i].kind != LineKind::Label {
                 continue;
@@ -5688,9 +6001,7 @@ fn delete_redundant_cond_jumps(store: &mut LineStore, infos: &mut [LineInfo]) ->
                     .split_whitespace()
                     .next_back()
                     .is_some_and(|t| t == target),
-                LineKind::Label => {
-                    trimmed(store, &infos[j], j) == format!("{}:", target)
-                }
+                LineKind::Label => trimmed(store, &infos[j], j) == format!("{}:", target),
                 _ => false,
             };
             if redundant {
@@ -5775,13 +6086,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 if (128..=65535).contains(&imm_text) {
                     let i1 = next_non_nop(infos, i + 1);
                     if i1 < fend && is_order_cond_jcc(trimmed(store, &infos[i1], i1)) {
-                        if let Some(def_idx) = canonical_16_def(
-                            store,
-                            infos,
-                            i,
-                            r,
-                            fstart,
-                        ) {
+                        if let Some(def_idx) = canonical_16_def(store, infos, i, r, fstart) {
                             let r16 = low_subreg_name(reg32_name(r), 2).unwrap_or("%ax");
                             let new_cmp = format!("    cmpw ${}, {}", imm_text, r16);
                             store.replace(i, new_cmp);
@@ -5971,8 +6276,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             &[i, j],
                         )
                     {
-                        let new_cmp =
-                            format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
+                        let new_cmp = format!("    {} ${}, {}", mnem, imm_of(&t), op_src);
                         store.replace(j, new_cmp);
                         infos[j] = classify_line(store.get(j));
                         infos[i].kind = LineKind::Nop;
@@ -6011,8 +6315,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         // exact string compare against the parsed operand
                         // text is the right equivalence test here.
                         let o1 = if other == op_dst { op_src } else { other };
-                        let new_cmp =
-                            format!("    {} {}, {}", mnem, o1, op_src);
+                        let new_cmp = format!("    {} {}, {}", mnem, o1, op_src);
                         store.replace(j, new_cmp);
                         infos[j] = classify_line(store.get(j));
                         infos[i].kind = LineKind::Nop;
@@ -6036,14 +6339,23 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // deleted under the dominance proof for %B.
             if let Some((op_src, op_dst)) = parse_mov_reg_reg(&s) {
                 let i1 = next_non_nop(infos, i + 1);
-                let i2 = if i1 < fend { next_non_nop(infos, i1 + 1) } else { fend };
-                let i3 = if i2 < fend { next_non_nop(infos, i2 + 1) } else { fend };
+                let i2 = if i1 < fend {
+                    next_non_nop(infos, i1 + 1)
+                } else {
+                    fend
+                };
+                let i3 = if i2 < fend {
+                    next_non_nop(infos, i2 + 1)
+                } else {
+                    fend
+                };
                 if i3 < fend {
                     let t1 = trimmed(store, &infos[i1], i1);
                     let t2 = trimmed(store, &infos[i2], i2);
-                    if let (Some(a), Some(b)) =
-                        (parse_subl_imm_reg(t1, op_dst), parse_cmpl_imm_reg(t2, op_dst))
-                    {
+                    if let (Some(a), Some(b)) = (
+                        parse_subl_imm_reg(t1, op_dst),
+                        parse_cmpl_imm_reg(t2, op_dst),
+                    ) {
                         let cond = trimmed(store, &infos[i3], i3);
                         if is_cond_jcc(cond) {
                             let fused = a.wrapping_add(b);
@@ -6057,8 +6369,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                                     &[i, i1, i2],
                                 )
                             {
-                                let new_cmp =
-                                    format!("    cmpl ${}, {}", fused, op_src);
+                                let new_cmp = format!("    cmpl ${}, {}", fused, op_src);
                                 store.replace(i2, new_cmp);
                                 infos[i2] = classify_line(store.get(i2));
                                 infos[i].kind = LineKind::Nop;
@@ -6102,8 +6413,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                             &[i, j],
                         )
                     {
-                        let new_test =
-                            format!("    testl ${}, {}", imm.unwrap(), op_src);
+                        let new_test = format!("    testl ${}, {}", imm.unwrap(), op_src);
                         store.replace(j, new_test);
                         infos[j] = classify_line(store.get(j));
                         infos[i].kind = LineKind::Nop;
@@ -6140,7 +6450,8 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             // proof.
             if let Some((x, y)) = parse_mov_reg_reg(&s) {
                 if let Some((add_src, add_dst)) = parse_addl_reg_reg(&t) {
-                    if add_src == y && add_dst == x
+                    if add_src == y
+                        && add_dst == x
                         && staging_reads_safe(
                             store,
                             infos,
@@ -6174,7 +6485,10 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
         {
             let mut i = fstart;
             while i < fend {
-                if infos[i].is_nop() || infos[i].kind != LineKind::Label || is_debug_location(store, infos, i) {
+                if infos[i].is_nop()
+                    || infos[i].kind != LineKind::Label
+                    || is_debug_location(store, infos, i)
+                {
                     i += 1;
                     continue;
                 }
@@ -6189,7 +6503,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     match infos[k].kind {
                         LineKind::Label => break,
                         // block terminators end the straight-line body
-                        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret
+                        LineKind::Jmp
+                        | LineKind::CondJmp
+                        | LineKind::Ret
                         | LineKind::JmpIndirect => break,
                         _ => {}
                     }
@@ -6200,10 +6516,7 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     i += 1;
                     continue;
                 }
-                let jmp_target = match trimmed(store, &infos[k], k)
-                    .split_whitespace()
-                    .next_back()
-                {
+                let jmp_target = match trimmed(store, &infos[k], k).split_whitespace().next_back() {
                     Some(t) => t.to_string(),
                     None => {
                         i += 1;
@@ -6230,7 +6543,9 @@ fn fold_reg_copy_idioms(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                     }
                     match infos[k2].kind {
                         LineKind::Label => break,
-                        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret
+                        LineKind::Jmp
+                        | LineKind::CondJmp
+                        | LineKind::Ret
                         | LineKind::JmpIndirect => break,
                         _ => {}
                     }
@@ -6442,9 +6757,7 @@ fn parse_mov_imm_value(s: &str) -> Option<(&str, &str)> {
     let dst = dst.trim();
     let imm = src.strip_prefix('$')?;
     if imm.is_empty()
-        || imm.contains(|ch: char| {
-            ch.is_whitespace() || matches!(ch, ',' | '(' | ')' | ':' | '+')
-        })
+        || imm.contains(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '(' | ')' | ':' | '+'))
         || !dst.starts_with("%e")
     {
         return None;
@@ -6474,9 +6787,7 @@ fn parse_mov_imm_reg(s: &str) -> Option<(&str, &str)> {
 
 /// Parse `ALU %A, %B` returning ((A, B), B-as-second).
 fn parse_alu_reg_reg(s: &str) -> Option<(&str, (&str, &str))> {
-    for mnem in [
-        "andl", "orl", "xorl", "addl", "subl", "cmpl", "testl",
-    ] {
+    for mnem in ["andl", "orl", "xorl", "addl", "subl", "cmpl", "testl"] {
         let rest = s.strip_prefix(mnem).and_then(|r| r.strip_prefix(' '));
         if let Some(rest) = rest {
             let (a, b) = rest.split_once(',')?;
@@ -7065,7 +7376,27 @@ fn eliminate_never_read_stores_range(
         return;
     }
 
-    // Remove stores to slots whose byte range is never overlapped by any load
+    // Remove stores to slots whose byte range is never overlapped by any load.
+    // Register stores classify as StoreEbp; immediate homes (`movl $N, slot`)
+    // classify as Other but are equally dead when the slot is never read —
+    // the accumulator backend stages a constant into an outgoing-argument or
+    // local slot that every use then re-materializes directly, leaving the
+    // store with no reader. Gather them here so the same liveness proof covers
+    // both shapes.
+    let imm_stores: Vec<(usize, i32, MoveSize)> = {
+        let mut v = Vec::new();
+        for i in start..end {
+            if infos[i].is_nop() {
+                continue;
+            }
+            if matches!(infos[i].kind, LineKind::Other { .. }) {
+                if let Some((_, slot, size)) = parse_immediate_store(trimmed(store, &infos[i], i)) {
+                    v.push((i, slot, size));
+                }
+            }
+        }
+        v
+    };
     for i in start..end {
         if infos[i].is_nop() {
             continue;
@@ -7118,6 +7449,55 @@ fn eliminate_never_read_stores_range(
             if !is_read {
                 infos[i].kind = LineKind::Nop;
             }
+        }
+    }
+
+    // Immediate homes: apply the identical function-scoped liveness proof.
+    // (%esp) immediate stores require the same walk/call discipline the
+    // register stores need; (%ebp) immediate stores are real frame slots only
+    // under a frame pointer (otherwise %ebp is a data register and the line
+    // could be a pointer write — never a dead home).
+    for (i, offset, size) in imm_stores {
+        let esp_store = is_esp_biased(offset);
+        if esp_store {
+            if !esp_walk_ok || has_call {
+                continue;
+            }
+        } else if !ebp_is_frame {
+            continue;
+        }
+        let store_bytes = size.byte_size();
+        let norm_off = if esp_store {
+            offset - norm[i - start]
+        } else {
+            offset
+        };
+        // Top-of-stack immediate store could feed a `ret`/pop architectural
+        // read, mirroring the register-store guard above.
+        if esp_store && offset == ESP_SLOT_BIAS && trimmed(store, &infos[i], i).ends_with("(%esp)")
+        {
+            let mut next = i + 1;
+            while next < end
+                && (infos[next].is_nop()
+                    || matches!(
+                        infos[next].kind,
+                        LineKind::Empty | LineKind::Directive | LineKind::Label
+                    ))
+            {
+                next += 1;
+            }
+            if next < end
+                && (matches!(infos[next].kind, LineKind::Pop { .. } | LineKind::Ret)
+                    || trimmed(store, &infos[next], next).starts_with("ret "))
+            {
+                continue;
+            }
+        }
+        let is_read = read_ranges
+            .iter()
+            .any(|&(r_off, r_sz)| ranges_overlap(norm_off, store_bytes, r_off, r_sz));
+        if !is_read {
+            infos[i].kind = LineKind::Nop;
         }
     }
 }
@@ -7302,8 +7682,8 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                     _ => {}
                 }
             }
-            let has_jmp_indirect = (start..end)
-                .any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
+            let has_jmp_indirect =
+                (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
             let mut envelope_ok = true;
             if let Some(ld) = last_dealloc {
                 // 1) Geometry: every %esp engagement must live strictly
@@ -7398,16 +7778,14 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                                 // no edges from the push run itself (only
                                 // directives/pushes there), so the edge-source
                                 // test below is the complete proof.
-                                let edge_sources_past_alloc = edges.iter().all(|&(src, name)| {
-                                    match label_pos.get(name) {
+                                let edge_sources_past_alloc =
+                                    edges.iter().all(|&(src, name)| match label_pos.get(name) {
                                         Some(&ti) if ti == k => src > alloc_idx,
                                         _ => true,
-                                    }
-                                });
+                                    });
                                 let interior_label_ok = (!has_jmp_indirect
                                     && edge_sources_past_alloc)
-                                    && (k > first_dealloc.unwrap_or(usize::MAX)
-                                        || k > alloc_idx);
+                                    && (k > first_dealloc.unwrap_or(usize::MAX) || k > alloc_idx);
                                 if !interior_label_ok {
                                     envelope_ok = false;
                                     break;
@@ -7440,9 +7818,8 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
         } else if subls.is_empty() && addls.is_empty() {
             // Any %esp engagement (slots or pointer copies) makes depth
             // shifting observable; frameless candidates must be pure.
-            let any_esp_text = (start..end).any(|i| {
-                !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp")
-            });
+            let any_esp_text = (start..end)
+                .any(|i| !infos[i].is_nop() && trimmed(store, &infos[i], i).contains("%esp"));
             if any_esp_text {
                 start = end.saturating_add(1);
                 continue;
@@ -7560,6 +7937,182 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
         start = end.saturating_add(1);
     }
 }
+/// Remove a function's stack-frame allocation/deallocation when the frame is
+/// never used. The i686 accumulator backend emits a `subl $N, %esp` prologue
+/// for almost every function and an `addl $N, %esp` before every return, even
+/// when the register allocator kept every SSA value in registers and the
+/// local-frame space is never touched (a typical `-m16 -Os` leaf helper is
+/// `subl $12, %esp; movzwl %ax,%eax; incl %eax; addl $12, %esp; ret`). Those
+/// two to four instructions are pure overhead — GCC emits none.
+///
+/// Soundness is deliberately conservative. A frame is only elided when ALL of:
+///   * a single alloc (`subl $K, %esp`, constant immediate) and one or more
+///     matching deallocs (`addl $K, %esp`, same K, every one at or after the
+///     alloc position);
+///   * no frame pointer in use (`movl %esp,%ebp` or any `(%ebp)` reference);
+///   * no prologue/epilogue callee-save push/pop (those are handled — and
+///     renumber the frame — by `eliminate_unused_callee_saves`; mixing the two
+///     transforms here would desync esp math, so functions with pushes are
+///     skipped and left to that pass);
+///   * no `call`: a call needs the stack 16-byte aligned (SysV i386) and may
+///     push/pop outgoing arguments, so a frame can legitimately exist for
+///     alignment/argument space even with no `(%esp)` data access;
+///   * no other %esp engagement anywhere — no `N(%esp)` slot access (the frame
+///     really holds no live data), no register-driven esp adjustment (dynamic
+///     alloca), no esp copies, no `ret $N` (sret/fastcall pop convention);
+///   * no jump enters the function at or before the alloc: every body path
+///     must cross the single alloc, otherwise one side runs with the frame
+///     open and the other without it.
+///
+/// Under those constraints no stack memory is observed while the frame is
+/// open, the ret pops the return address at the entry esp, and esp-relative
+/// addressing (prologue parameter captures, which a pure regparm leaf emits
+/// none of) is unaffected.
+fn eliminate_dead_frame_allocation(store: &mut LineStore, infos: &mut [LineInfo]) {
+    if std::env::var_os("CCC_NO_I686_DEAD_FRAME_ELISION").is_some() {
+        return;
+    }
+    let len = infos.len();
+    let mut start = 0usize;
+    while start < len {
+        // Find the next function: a non-local label (local basic blocks are
+        // `.L*`).
+        while start < len {
+            if infos[start].kind == LineKind::Label {
+                let line = trimmed(store, &infos[start], start);
+                if line.ends_with(':') && !line.starts_with('.') {
+                    break;
+                }
+            }
+            start += 1;
+        }
+        if start >= len {
+            break;
+        }
+        let mut end = start + 1;
+        while end < len {
+            let line = trimmed(store, &infos[end], end);
+            if line == ".cfi_endproc" || line.starts_with(".size ") {
+                break;
+            }
+            end += 1;
+        }
+
+        // Reject a frame-pointer function: esp-relative accounting differs.
+        let has_frame_pointer = (start..end).any(|i| {
+            if infos[i].is_nop() {
+                return false;
+            }
+            let line = trimmed(store, &infos[i], i);
+            line.contains("(%ebp)") || line == "movl %esp, %ebp"
+        });
+        if has_frame_pointer {
+            start = end.saturating_add(1);
+            continue;
+        }
+
+        // Census: frame adjusts, pushes/pops, calls, and other %esp uses.
+        let mut subls: Vec<(usize, u32)> = Vec::new();
+        let mut addls: Vec<(usize, u32)> = Vec::new();
+        let mut has_call = false;
+        let mut has_push_or_pop = false;
+        let mut other_esp = false;
+        for i in start..end {
+            if infos[i].is_nop() {
+                continue;
+            }
+            let line = trimmed(store, &infos[i], i);
+            match infos[i].kind {
+                LineKind::Call => has_call = true,
+                LineKind::Push { .. } | LineKind::Pop { .. } => has_push_or_pop = true,
+                _ => {
+                    if let Some(v) = parse_esp_adjust(line, "subl") {
+                        subls.push((i, v));
+                    } else if let Some(v) = parse_esp_adjust(line, "addl") {
+                        addls.push((i, v));
+                    } else if infos[i].kind != LineKind::Ret
+                        && infos[i].kind != LineKind::Label
+                        && infos[i].kind != LineKind::Directive
+                        && infos[i].kind != LineKind::Jmp
+                        && infos[i].kind != LineKind::CondJmp
+                        && infos[i].kind != LineKind::JmpIndirect
+                        && line.contains("%esp")
+                    {
+                        // Any remaining %esp reference (slot access, esp copy,
+                        // dynamic alloca, and-l alignment, …) means the frame
+                        // is observable.
+                        other_esp = true;
+                    }
+                }
+            }
+        }
+
+        // Exactly one alloc and ≥1 matching deallocs, no other esp traffic,
+        // no calls and no callee-save push/pop to renumber.
+        let shape_ok = subls.len() == 1
+            && !addls.is_empty()
+            && addls.iter().all(|&(_, v)| v == subls[0].1)
+            && addls.iter().all(|&(ai, _)| ai >= subls[0].0)
+            && !has_call
+            && !has_push_or_pop
+            && !other_esp;
+        if !shape_ok {
+            start = end.saturating_add(1);
+            continue;
+        }
+        let alloc_idx = subls[0].0;
+
+        // Control-flow soundness: every body path must cross the alloc. A
+        // direct jump whose target is a local label at or before the alloc
+        // enters the body without opening the frame; an indirect jump can
+        // target anywhere and is unprovable. External (non-`.L*`) jumps are
+        // tail calls leaving the function and need no label resolution.
+        let mut labels_after_alloc = std::collections::HashSet::new();
+        for i in start..end {
+            if infos[i].kind == LineKind::Label && i > alloc_idx {
+                let line = trimmed(store, &infos[i], i);
+                if let Some(name) = line.strip_suffix(':') {
+                    labels_after_alloc.insert(name.trim().to_string());
+                }
+            }
+        }
+        let mut flow_ok = true;
+        'scan: for i in start..end {
+            if infos[i].is_nop() {
+                continue;
+            }
+            match infos[i].kind {
+                LineKind::JmpIndirect => {
+                    flow_ok = false;
+                    break 'scan;
+                }
+                LineKind::Jmp | LineKind::CondJmp => {
+                    let line = trimmed(store, &infos[i], i);
+                    if let Some(target) = line.split_whitespace().next_back() {
+                        if target.starts_with('.') && !labels_after_alloc.contains(target) {
+                            flow_ok = false;
+                            break 'scan;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !flow_ok {
+            start = end.saturating_add(1);
+            continue;
+        }
+
+        // All guards passed: drop the alloc and every matching dealloc.
+        infos[alloc_idx].kind = LineKind::Nop;
+        for &(ai, _) in &addls {
+            infos[ai].kind = LineKind::Nop;
+        }
+
+        start = end.saturating_add(1);
+    }
+}
+
 #[allow(dead_code)]
 fn eliminate_push_pop_pairs(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
@@ -7725,11 +8278,10 @@ fn else_hoist_diamonds(asm: String) -> String {
     fn classify_body_line(l: &str) -> Option<bool> {
         let (mn, rest) = l.split_once(' ')?;
         const STORE_OK: &[&str] = &[
-            "movl", "movw", "movb", "movzbl", "movzwl", "movsbl", "movswl", "andl", "andw",
-            "andb", "orl", "orw", "orb", "xorl", "xorw", "xorb", "addl", "addw", "addb",
-            "subl", "subw", "subb", "testl", "testw", "testb", "incl", "incw", "incb",
-            "decl", "decw", "decb", "negl", "negw", "negb", "notl", "notw", "notb", "leal",
-            "leaw",
+            "movl", "movw", "movb", "movzbl", "movzwl", "movsbl", "movswl", "andl", "andw", "andb",
+            "orl", "orw", "orb", "xorl", "xorw", "xorb", "addl", "addw", "addb", "subl", "subw",
+            "subb", "testl", "testw", "testb", "incl", "incw", "incb", "decl", "decw", "decb",
+            "negl", "negw", "negb", "notl", "notw", "notb", "leal", "leaw",
         ];
         if !STORE_OK.contains(&mn) {
             return None;
@@ -7804,9 +8356,7 @@ fn else_hoist_diamonds(asm: String) -> String {
             }
             match classify_body_line(t) {
                 Some(true) => {
-                    then_slots.push(
-                        t.rsplit_once(',').unwrap().1.trim().to_string(),
-                    );
+                    then_slots.push(t.rsplit_once(',').unwrap().1.trim().to_string());
                     j += 1;
                 }
                 Some(false) => j += 1,
@@ -7876,8 +8426,7 @@ fn else_hoist_diamonds(asm: String) -> String {
         let span_est = |a: usize, b: usize| -> usize {
             (a..=b).map(|r| lines[r].trim().len() + 2).sum::<usize>() / 6
         };
-        if span_est(i + 1, j - 1) + 2 > 120 || span_est(k + 1, *else_stores.last().unwrap()) > 120
-        {
+        if span_est(i + 1, j - 1) + 2 > 120 || span_est(k + 1, *else_stores.last().unwrap()) > 120 {
             i += 1;
             continue;
         }
@@ -7909,11 +8458,12 @@ fn else_hoist_diamonds(asm: String) -> String {
             if t.ends_with(':') || t.is_empty() {
                 continue;
             }
-            let is_branch = t.starts_with("j")
-                || t.starts_with("call")
-                || t.starts_with("ret");
+            let is_branch = t.starts_with("j") || t.starts_with("call") || t.starts_with("ret");
             if is_branch
-                && t.split_whitespace().next_back().map(|x| x == else_target).unwrap_or(false)
+                && t.split_whitespace()
+                    .next_back()
+                    .map(|x| x == else_target)
+                    .unwrap_or(false)
             {
                 else_refs += 1;
             }
@@ -7950,7 +8500,6 @@ fn else_hoist_diamonds(asm: String) -> String {
 /// Run peephole optimization on i686 assembly text.
 /// Returns the optimized assembly string.
 pub fn peephole_optimize(asm: String) -> String {
-
     if std::env::var_os("CCC_NO_I686_PEEPHOLE").is_some() {
         return asm;
     }
@@ -7980,6 +8529,7 @@ pub fn peephole_optimize(asm: String) -> String {
     // so freshly exposed store/load pairs are folded in the same phase.
     let global_changed = propagate_reg_copies(&mut store, &mut infos);
     let global_changed = global_changed | forward_slot_loads(&mut store, &mut infos);
+    let global_changed = global_changed | forward_immediate_slot_loads(&mut store, &mut infos);
     let global_changed = global_changed | eliminate_dead_reg_moves(&store, &mut infos);
     let global_changed = global_changed | eliminate_dead_stores(&store, &mut infos);
     let global_changed = global_changed | fuse_compare_and_branch(&mut store, &mut infos);
@@ -7998,6 +8548,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= combined_local_pass(&mut store, &mut infos);
             changed2 |= propagate_reg_copies(&mut store, &mut infos);
             changed2 |= forward_slot_loads(&mut store, &mut infos);
+            changed2 |= forward_immediate_slot_loads(&mut store, &mut infos);
             changed2 |= eliminate_dead_reg_moves(&store, &mut infos);
             changed2 |= eliminate_dead_stores(&store, &mut infos);
             changed2 |= fuse_setcc_branch(&mut store, &mut infos);
@@ -8090,6 +8641,7 @@ pub fn peephole_optimize(asm: String) -> String {
     eliminate_never_read_stores(&store, &mut infos);
     optimize_cfg_register_liveness(&mut store, &mut infos, true);
     eliminate_unused_callee_saves(&mut store, &mut infos);
+    eliminate_dead_frame_allocation(&mut store, &mut infos);
 
     // Phase 5: tail-call conversion (after all epilogue-shape rewrites).
     optimize_tail_calls_i686(&mut store, &mut infos);
@@ -8243,7 +8795,12 @@ fn try_fold_sext_zext_at(
     // Fold: replace the sext with the zero-extending load, nop the zext.
     store.replace(
         sext_idx,
-        format!("    {} {}, {}", if byte_reg { "movzbl" } else { "movzwl" }, src, zdst),
+        format!(
+            "    {} {}, {}",
+            if byte_reg { "movzbl" } else { "movzwl" },
+            src,
+            zdst
+        ),
     );
     infos[sext_idx] = classify_line(store.get(sext_idx));
     infos[zext_idx].kind = LineKind::Nop;
@@ -8626,10 +9183,10 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
                 let t = trimmed(store, &infos[i], i);
                 if !t.starts_with(".L") {
                     suppress = false; // new function
-                    // Function boundary: known depth again. Any pending
-                    // outer depth is irrelevant here — a global label only
-                    // starts a new translation unit's function stream in
-                    // generated output.
+                                      // Function boundary: known depth again. Any pending
+                                      // outer depth is irrelevant here — a global label only
+                                      // starts a new translation unit's function stream in
+                                      // generated output.
                     depth = Some(0);
                 } else {
                     // Internal join point: fallthrough or branch target.
@@ -8670,8 +9227,7 @@ fn optimize_tail_calls_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bo
                 } else if let Some(d) = depth.as_mut() {
                     *d -= 4;
                 }
-            } else if (t.starts_with("subl $") || t.starts_with("addl $"))
-                && t.ends_with(", %esp")
+            } else if (t.starts_with("subl $") || t.starts_with("addl $")) && t.ends_with(", %esp")
             {
                 let num_part = &t["addl $".len()..t.len() - ", %esp".len()];
                 if let Ok(n) = num_part.parse::<i64>() {
@@ -8874,9 +9430,18 @@ mod tests {
         )
         .to_string();
         let result = peephole_optimize(asm);
-        assert!(result.contains(".loc 1 42 3"), "debug metadata lost:\n{result}");
-        assert!(result.contains("addl %eax, %ecx"), "load was not forwarded:\n{result}");
-        assert!(!result.contains("8(%esp)"), "dead spill survived:\n{result}");
+        assert!(
+            result.contains(".loc 1 42 3"),
+            "debug metadata lost:\n{result}"
+        );
+        assert!(
+            result.contains("addl %eax, %ecx"),
+            "load was not forwarded:\n{result}"
+        );
+        assert!(
+            !result.contains("8(%esp)"),
+            "dead spill survived:\n{result}"
+        );
     }
 
     #[test]
@@ -8903,7 +9468,6 @@ mod tests {
             "imul must stay a memory op when %eax is rewritten:\n{result}"
         );
     }
-
 
     #[test]
     fn fold_reg_copy_test_through_copy() {
@@ -8973,9 +9537,57 @@ mod tests {
         )
         .to_string();
         let result = peephole_optimize(asm);
+        // The immediate byte store forwards straight into the widened reload:
+        // the constant 7 materializes directly (`movl $7,%eax`) and the
+        // movzbl of the already-byte constant is redundant — strictly better
+        // than folding the reload into a memory-source movzbl.
         assert!(
-            result.contains("movzbl 4(%esp), %eax"),
-            "widened slot load must fold:\n{result}"
+            result.contains("movl $7, %eax"),
+            "immediate slot store must forward to the widened load:\n{result}"
+        );
+    }
+
+    #[test]
+    fn forward_immediate_constant_to_reload() {
+        // A constant staged to a slot and reloaded into a full-width result
+        // must materialize directly, with no memory reload.
+        let asm = "f:
+    subl $12, %esp
+    movl $3, 8(%esp)
+    movl 8(%esp), %eax
+    addl $12, %esp
+    ret
+"
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movl $3, %eax"),
+            "constant slot reload must fold to an immediate move:\n{result}"
+        );
+        // The reload is what mattered: it is gone, replaced by the immediate
+        // materialization. The now-dead immediate store to the slot is left
+        // for a dedicated dead-store pass (it writes memory conservatively).
+        assert!(
+            !result.contains("8(%esp), %eax"),
+            "no slot RELOAD may remain for a pure constant:\n{result}"
+        );
+    }
+
+    #[test]
+    fn forward_immediate_stopped_by_call_barrier() {
+        let asm = "f:
+    subl $12, %esp
+    movl $3, 8(%esp)
+    call g
+    movl 8(%esp), %eax
+    addl $12, %esp
+    ret
+"
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("8(%esp)"),
+            "a call can overwrite the slot; the reload must stay:\n{result}"
         );
     }
 
@@ -9148,7 +9760,10 @@ mod tests {
         // After the merge X's `jmp .LY` is a jump-to-next (the bodies and
         // the dead xors are reclaimed by the dead-move cleanup), so the
         // control flow collapses to `je .LY` falling straight through.
-        assert!(!result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"), "{result}");
+        assert!(
+            !result.contains("xorl %eax, %eax\n    xorl %edx, %edx\n    jmp"),
+            "{result}"
+        );
     }
 
     #[test]
@@ -10388,7 +11003,10 @@ mod tests {
             !result.contains("jmp inc@PLT"),
             "stack-arg forwarding must not convert:\n{result}"
         );
-        assert!(result.contains("call inc@PLT"), "call must survive:\n{result}");
+        assert!(
+            result.contains("call inc@PLT"),
+            "call must survive:\n{result}"
+        );
     }
 
     #[test]
@@ -10615,15 +11233,19 @@ mod tests {
             !result.contains("%ebp") && !result.contains("%ebx"),
             "both unused pairs must be removed:\n{result}"
         );
-        assert_eq!(
-            result.matches("subl $24, %esp").count(),
-            1,
-            "alloc grows by 8 in lockstep (two pairs):\n{result}"
+        // FINAL EVOLVED CONTRACT: after both callee-save pairs are removed and
+        // the never-read 0(%esp) store deleted, the grown frame is referenced
+        // by nothing. eliminate_dead_frame_allocation then elides it too; the
+        // guard admits this because the sole internal edge (.Lback -> .Lback)
+        // targets a label positioned AFTER the alloc, so every body path
+        // crosses the alloc. End state: no pushes/pops, no frame adjusts.
+        assert!(
+            !result.contains("subl") && !result.contains("addl"),
+            "grown dead frame is elided after pair removal:\n{result}"
         );
-        assert_eq!(
-            result.matches("addl $24, %esp").count(),
-            1,
-            "dealloc grows by 8 in lockstep:\n{result}"
+        assert!(
+            !result.contains("pushl") && !result.contains("popl"),
+            "no prologue/epilogue traffic may remain:\n{result}"
         );
     }
 
@@ -10663,8 +11285,13 @@ mod tests {
             !result.contains("%ebp") && !result.contains("%ebx"),
             "both unreferenced pairs must go:\n{result}"
         );
-        assert_eq!(result.matches("subl $24, %esp").count(), 1, "{result}");
-        assert_eq!(result.matches("addl $24, %esp").count(), 1, "{result}");
+        // FINAL EVOLVED CONTRACT: with the pairs removed and the fully-dead
+        // body erased, the grown frame is referenced by nothing, so
+        // eliminate_dead_frame_allocation elides the grown subl/addl too.
+        assert!(
+            !result.contains("subl") && !result.contains("addl"),
+            "grown dead frame is elided after pair removal:\n{result}"
+        );
         assert!(
             !result.contains("pushl") && !result.contains("popl"),
             "no prologue/epilogue traffic may remain:\n{result}"
@@ -10879,8 +11506,7 @@ mod tests {
         // reader, the census-gated dead-move pass correctly deletes the
         // load before forwarding can see it (nothing in a ret-free
         // snippet observes %ecx).
-        let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n"
-            .to_string();
+        let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n".to_string();
         let result = peephole_optimize(asm);
         assert!(
             result.contains("movl %eax, %ecx"),
@@ -11116,7 +11742,9 @@ mod tests {
         let asm = "    andl $1, %edx\n    je .LBB12\n.LBB11:\n    movl $48, 112(%esp)\n    jmp .LBB13\n.LBB12:\n    movl $32, 112(%esp)\n.LBB13:\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         let store = r.find("movl $32, 112(%esp)").expect("else store hoisted");
-        let br = r.find("je .LBB13").expect("branch to join, original polarity");
+        let br = r
+            .find("je .LBB13")
+            .expect("branch to join, original polarity");
         assert!(store < br, "hoisted store precedes branch: {}", r);
         assert!(!r.contains("jmp .LBB13"), "jmp deleted: {}", r);
         assert!(r.contains("movl $48, 112(%esp)"), "then store kept: {}", r);
@@ -11143,7 +11771,12 @@ mod tests {
             r
         );
         for reg in ["%edi", "%ebp", "%esi"] {
-            assert!(r.contains(&format!("xorl {}, {}", reg, reg)), "{} kept: {}", reg, r);
+            assert!(
+                r.contains(&format!("xorl {}, {}", reg, reg)),
+                "{} kept: {}",
+                reg,
+                r
+            );
         }
     }
 
@@ -11181,7 +11814,11 @@ mod tests {
         let asm = "f:\n    cmpl $1, %ebx\n    sete %al\n    movzbl %al, %eax\n    movl %eax, %edx\n    testl %eax, %edx\n    je .L1\n    movl $7, %eax\n    movl $8, %edx\n    xorl %ecx, %ecx\n.L1:\n    movl %ecx, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
         assert!(!r.contains("testl"), "test dropped: {}", r);
-        assert!(r.contains("jne .L1"), "je(sete) -> jne(producer inverted): {}", r);
+        assert!(
+            r.contains("jne .L1"),
+            "je(sete) -> jne(producer inverted): {}",
+            r
+        );
     }
 
     // REGRESSION (audit finding): setCC writes only the low BYTE of its
@@ -11265,7 +11902,11 @@ mod tests {
     fn const_staging_numeric_folded() {
         let asm = "f:\n    movl $77, %ebx\n    movl %ebx, %edx\n    pushl %edx\n    ret\n";
         let r = peephole_optimize(asm.to_string());
-        assert!(r.contains("movl $77, %edx"), "value folds into reader: {}", r);
+        assert!(
+            r.contains("movl $77, %edx"),
+            "value folds into reader: {}",
+            r
+        );
         assert_eq!(r.matches("movl").count(), 1, "staging gone: {}", r);
     }
 
@@ -11293,7 +11934,11 @@ mod tests {
     fn census_fallback_kills_label_crossing_dead_move() {
         let asm = "f:\n    movl %eax, %ebx\n    testl %eax, %eax\n    je .L1\n.L1:\n    movl $9, %eax\n    ret\n";
         let r = peephole_optimize(asm.to_string());
-        assert!(!r.contains("movl %eax, %ebx"), "dead staging deleted: {}", r);
+        assert!(
+            !r.contains("movl %eax, %ebx"),
+            "dead staging deleted: {}",
+            r
+        );
     }
 
     #[test]
@@ -11477,6 +12122,160 @@ mod tests {
             !result.contains("decl"),
             "must NOT convert to decl before sbbl: {}",
             result
+        );
+    }
+    // ── Dead frame allocation elision: a `subl $N,%esp`/`addl $N,%esp`
+    // frame that no instruction ever touches is pure overhead and must be
+    // removed (GCC emits none for register-only leaves).
+
+    #[test]
+    fn test_dead_frame_elided_plain_leaf() {
+        // The canonical `-m16 -Os` regparm leaf: the frame space is never
+        // touched, so both frame adjusts vanish and the body survives.
+        let asm = "plain:\n    subl $12, %esp\n    movzwl %ax, %eax\n    incl %eax\n    movzbl %al, %eax\n    addl $12, %esp\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("subl $12, %esp") && !result.contains("addl $12, %esp"),
+            "dead frame adjusts must be elided:\n{result}"
+        );
+        assert!(result.contains("incl %eax"), "body must survive:\n{result}");
+        assert!(result.contains("ret"), "ret must survive:\n{result}");
+    }
+
+    #[test]
+    fn test_dead_frame_elided_multiple_epilogues() {
+        // Two equal deallocs on two return paths are both dropped.
+        let asm = "f:\n    subl $8, %esp\n    testl %eax, %eax\n    je .Lbb1\n    movl $1, %eax\n    addl $8, %esp\n    ret\n.Lbb1:\n    xorl %eax, %eax\n    addl $8, %esp\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("subl $8, %esp") && result.matches("addl $8, %esp").count() == 0,
+            "alloc and both deallocs must be elided:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_dead_frame_kept_when_slot_accessed() {
+        // A value spilled to the local frame and reloaded at a DIFFERENT size
+        // makes the frame live: store-forwarding cannot rewrite a 32-bit
+        // store feeding a 16-bit load, so the (%esp) slot access survives and
+        // the frame must not be elided.
+        // The local slot holds %ecx on one path and %ebx on the other; a join
+        // load of the slot cannot be store-forwarded (which register? it
+        // depends on the branch), so the (%esp) memory traffic is genuine and
+        // the frame must be kept.
+        let asm = "f:\n    subl $12, %esp\n    testl %edx, %edx\n    je .L1\n    movl %ecx, -4(%esp)\n    jmp .L2\n.L1:\n    movl %ebx, -4(%esp)\n.L2:\n    movl -4(%esp), %eax\n    addl $12, %esp\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("-4(%esp)"),
+            "diamond slot access must not be forwarded:\n{result}"
+        );
+        assert!(
+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
+            "frame in use via (%esp) slot must be kept:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_dead_frame_kept_across_call() {
+        // A call requires the stack alignment/argument space the frame
+        // provides; never elide without proving the ABI unaffected.
+        let asm = "f:\n    subl $12, %esp\n    call g\n    addl $12, %esp\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
+            "frame across a call must be kept:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_dead_frame_kept_with_callee_save_push() {
+        // Functions with push/pop callee saves are owned by
+        // eliminate_unused_callee_saves; this pass must not renumber them.
+        let asm = "f:\n    pushl %ebx\n    subl $16, %esp\n    addl %ebx, %eax\n    addl $16, %esp\n    popl %ebx\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("pushl %ebx") && result.contains("popl %ebx"),
+            "callee-save pair must be left intact by this pass:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_dead_frame_kept_with_frame_pointer() {
+        // The frame-pointer prologue itself disqualifies elision: the
+        // (%ebp)-based slot is genuine frame memory read back into the return
+        // register.
+        let asm = "f:\n    pushl %ebp\n    movl %esp, %ebp\n    subl $8, %esp\n    movl %ecx, -4(%ebp)\n    movl -4(%ebp), %eax\n    leave\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        // The guarantee from THIS pass: a frame-pointer function's alloc is
+        // never elided (the (%ebp)/push disqualify it). Other passes may
+        // forward the slot traffic, so assert only the frame machinery.
+        assert!(
+            result.contains("subl $8, %esp") && result.contains("leave"),
+            "frame-pointer function's alloc/epilogue must be kept:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_dead_frame_kept_on_backward_jump_across_alloc() {
+        // A loop edge that branches backward to a label at/before the alloc
+        // would re-enter the body without reopening the frame; conservatively
+        // keep the frame.
+        let asm = "f:\n.Ltop:\n    subl $12, %esp\n    decl %ecx\n    jnz .Ltop\n    addl $12, %esp\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
+            "backward edge across alloc must keep the frame:\n{result}"
+        );
+    }
+
+    // ── Widen store-forwarding: a narrower slot store feeding a wider
+    // unsigned reload (`movb %al,slot` / `movl slot,%eax`) forwards to an
+    // explicit movzbl so the redundant slot round-trip and the (subsequent)
+    // zero-extension can be deleted.
+
+    #[test]
+    fn test_widen_forward_byte_store_to_l_reload() {
+        // The `inb` asm-clobber idiom: byte result homed to the slot, then a
+        // 32-bit reload. Must forward to movzbl %al.
+        let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("0(%esp)"),
+            "slot round-trip must be eliminated:\n{result}"
+        );
+        assert!(
+            result.contains("movzbl %al, %eax"),
+            "byte store must widen-forward to movzbl:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_widen_forward_word_store_to_l_reload() {
+        let asm = "f:\n    movw %cx, %ax\n    movw %ax, 0(%esp)\n    movl 0(%esp), %edx\n    ret\n"
+            .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("movzwl %ax, %edx"),
+            "word store must widen-forward to movzwl:\n{result}"
+        );
+    }
+
+    #[test]
+    fn test_widen_forward_blocked_when_source_clobbered() {
+        // A barrier (call) between store and reload clobbers %al, so the
+        // stored byte is not provably still in %al: the slot stays.
+        let asm =
+            "f:\n    movb %al, 0(%esp)\n    call g\n    movl 0(%esp), %eax\n    ret\n".to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("0(%esp)"),
+            "clobbered source must keep the slot reload:\n{result}"
         );
     }
 }
