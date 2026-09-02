@@ -8,13 +8,16 @@
 # then requires lccc to produce byte-identical output to GCC for every case in
 # every configuration:
 #
-#   default | CCC_NO_SMALL_SLOTS=1 | CCC_TIER2_GRAPH=1 | both
+#   default | CCC_NO_TIER2_GRAPH=1 | CCC_NO_SMALL_SLOTS=1 | both disabled
 #   x -O0 -O1 -O2 -O3 -Os
 #
-# The three-way A/B is the point: a stack layout that is only correct when
-# slot sharing is disabled is a miscompile waiting for the right TU. This is
-# the harness that must pass before Tier-2 (liveness-packed) slot sharing can
-# be on by default.
+# The four-way A/B is the point: a stack layout that is only correct when
+# slot sharing is disabled is a miscompile waiting for the right TU. Tier-2
+# (liveness-packed) slot sharing and 4-byte small slots are BOTH ON by
+# default; CCC_NO_TIER2_GRAPH=1 and CCC_NO_SMALL_SLOTS=1 each disable one
+# dimension, and setting both disables the two optimisations together.
+# (CCC_TIER2_GRAPH=1 is accepted but is a historical no-op alias — Tier-2 is
+# the default configuration now.)
 #
 # Usage: run_slot_stress.sh [first-seed] [last-seed] [opt-levels...]
 # ============================================================================
@@ -56,10 +59,10 @@ for seed in $(seq "$FIRST" "$LAST"); do
                 pass=$((pass+1))
             fi
         done <<'CFG'
-default|LCCC_NO_SMALL_SLOTS=0
+default|
+no-tier2|CCC_NO_TIER2_GRAPH=1
 no-small-slots|CCC_NO_SMALL_SLOTS=1
-tier2-on|CCC_TIER2_GRAPH=1
-tier2-on+no-small|CCC_TIER2_GRAPH=1 CCC_NO_SMALL_SLOTS=1
+no-tier2+no-small|CCC_NO_TIER2_GRAPH=1 CCC_NO_SMALL_SLOTS=1
 CFG
     done
 done

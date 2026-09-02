@@ -492,6 +492,35 @@ pub(super) fn classify_instructions(
             }
         }
     }
+
+    // Debug-only cross-check of the width invariant the whole small-slot
+    // scheme rests on: a value in `small_slot_values` (4-byte slot, accessed
+    // with ≤4-byte instructions on every path) must never be typed wider than
+    // 4 bytes by the *single source of truth* the emitters consult
+    // (`compute_value_type_map`, now a fixed point). Any violation here is a
+    // future `movl store + movq reload` corruption waiting to happen — catch
+    // it at compile time instead of as a kernel-boot miscompile.
+    if std::env::var_os("CCC_VERIFY_SLOT_WIDTHS").is_some()
+        && !state.small_slot_values.is_empty()
+    {
+        let map = crate::backend::common::compute_value_type_map(func);
+        let mut bad: Vec<u32> = state
+            .small_slot_values
+            .iter()
+            .copied()
+            .filter(|v| map.get(v).is_some_and(|t| t.size() > 4))
+            .collect();
+        bad.sort_unstable();
+        if !bad.is_empty() {
+            panic!(
+                "CCC_VERIFY_SLOT_WIDTHS: {} small-slot value(s) typed wider than \
+                 4 bytes by compute_value_type_map in '{}': {:?}",
+                bad.len(),
+                func.name,
+                bad
+            );
+        }
+    }
 }
 
 /// Classify a single Alloca instruction into Tier 1 (permanent) or Tier 3 (block-local).
@@ -1127,35 +1156,42 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // pointer's slot was reused by the alloca/loop else-branch, so after the
     // longjmp landed, strcmp compared against a clobbered pointer and the
     // test aborted.  Fall back to distinct permanent slots instead.
-    // TIER-2 SLOT SHARING IS OFF BY DEFAULT (opt in with CCC_TIER2_GRAPH=1).
     //
-    // The liveness-packed colorer hands two multi-block values the same stack
-    // slot whenever their live segments do not overlap. That proof is unsound:
-    // at -O2 the lccc-built preboot ZSTD decompressor reported
-    // "ZSTD-compressed data is corrupt" — `errcode=20` (`corruption_detected`)
-    // at `lib/zstd/decompress/zstd_decompress_block.c:242`'s
-    // `RETURN_ERROR_IF(HUF_isError(hufSuccess), ...)` — because two values
-    // whose segments the colorer believed disjoint shared one slot and the
-    // join block read the wrong one.
+    // TIER-2 SLOT SHARING IS ON BY DEFAULT (opt out with CCC_NO_TIER2_GRAPH=1;
+    // CCC_TIER2_GRAPH=1 is accepted as a historical no-op alias).
     //
-    // Evidence (all measured with the `zstd_preboot_oracle.sh` piggy case on
-    // the real 4,155,784-byte vmlinux.bin.zst payload, which round-trips at
-    // -O0/-O1 and fails at -O2/-O3):
-    //   * CCC_NO_TIER2_GRAPH=1 -> MATCH   (coloring is the trigger)
-    //   * CCC_NO_SMALL_SLOTS=1 -> MATCH   (only when slots are 8 bytes)
+    // Why this is sound after PR #358's width fix: the -O2 preboot-ZSTD
+    // corruption ("ZSTD-compressed data is corrupt", errcode=20 at
+    // zstd_decompress_block.c:242) was a *width* bug, not a coloring bug.
+    // ZSTD_decodeLiteralsBlock stored one CFG path's value with
+    // `movl %eax,80(%rsp)` (a 4-byte small slot) and the join reloaded it
+    // with `movq 80(%rsp),%rax`, so the high half was a neighbour's bytes.
+    // The layout's own evidence proves the coloring was never the trigger:
     //   * convex-hull (fat) interference instead of per-segment holes: still
-    //     FAILS, so it is not merely the CFG-hole sharing
-    //   * no sharing of sub-8-byte slots: still FAILS
-    //   * disabling every IR pass individually (34 names) and in groups: no
-    //     change — the defect is in the layout, not in any optimization.
+    //     FAILS  ->  even fat-interval-disjoint sharing could not help,
+    //     because the corrupting store/reload pair was a SINGLE value whose
+    //     slot was simply too narrow for one of its own accesses.
+    //   * CCC_NO_SMALL_SLOTS=1 (all 8-byte slots) -> MATCH  (the width veto)
+    //   * disabling every IR pass individually (34 names): no change.
+    // Once a value whose materialisation width exceeds 4 bytes is refused a
+    // 4-byte slot (backend::common::wide_typed_values + the fixpoint
+    // compute_value_type_map), every small slot is accessed ≤4 bytes wide on
+    // ALL paths, so sharing between width-partitioned slot classes cannot
+    // resurrect the stale-high-half read.
     //
-    // Cost of the fallback (one permanent slot per multi-block value),
-    // measured: +6.4% stack on the 230-function zstd TU (20,888 vs 19,624
-    // bytes of `subq $N,%rsp`), -4 asm lines; +6 bytes of .text on the whole
-    // x86 boot corpus. Correctness before performance: keep it off until the
-    // segment proof is fixed.
+    // The colorer itself (graph_coloring::color_stack_slots) compares the
+    // CONVEX HULL of each value's segments — i.e. it colours fat intervals,
+    // the same model the linear-scan register allocator uses. Two values
+    // share a slot only when their full live ranges are disjoint, so the
+    // CFG-hole under-recording that the old per-segment test was exposed to
+    // cannot hand a live slot to a neighbour (a value live across an
+    // unrecorded hole keeps its hull spanning that hole, and the neighbour's
+    // hull overlaps it -> no sharing). CCC_TIER2_SEGMENTS=1 opts back into
+    // the maximum per-segment sharing for A/B measurement only; it is the
+    // risky model (requires the liveness to record every hole exactly) and is
+    // therefore never the default.
     if !coalesce
-        || std::env::var_os("CCC_TIER2_GRAPH").is_none()
+        || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some()
         || has_builtin_setjmp(func)
     {
         for mbv in multi_block_values {
