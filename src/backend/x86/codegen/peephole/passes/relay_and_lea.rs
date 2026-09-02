@@ -781,6 +781,247 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
     changed
 }
 
+/// Fold the loop-latch increment / pointer-bump shape that neither relay
+/// pass can touch:
+///
+/// ```text
+///     leaq 1(%rbx), %r11        leaq 1(%rbx), %rbx
+///     movq %r11, %rbx      ->
+///     cmpq %rdx, %r11           cmpq %rdx, %rbx
+///     jb  .LBB2                 jb  .LBB2
+/// ```
+///
+/// Why the existing passes decline it:
+/// * `eliminate_move_relays` rewrites *uses of the copy destination* to the
+///   copy source — here `%rbx` is live across the back edge, so it is never
+///   dead and the rewrite cannot fire;
+/// * `retarget_producer_into_copy` requires the producer's register to be
+///   dead after the copy — here `%r11` feeds the loop-exit `cmp`.
+///
+/// The transform retargets the LEA's destination to the copy's destination
+/// (the LEA's own base) and renames reads of the producer register inside
+/// the following barrier-delimited region. Soundness:
+///
+/// 1. x86 `lea` reads all source operands before writing its destination, so
+///    aliasing the destination with the base (`leaq 1(%rbx), %rbx`) is a
+///    well-defined increment; neither `lea` nor `mov` touches flags.
+/// 2. From the copy's position up to the first write of either family,
+///    `%rA == %rB ==` the producer value at every point, so renaming reads
+///    of `%rB` to `%rA` inside that region is value-preserving — including
+///    lines whose destination is `%rA` (both operands hold the same value).
+///    Read-modify-writes of `%rB` would land their result in the wrong
+///    register and abort the candidate, as do memory-operand mentions of
+///    `%rB` (only plain-register mentions are renamed).
+/// 3. After the last rewrite, `%rB` must be provably dead
+///    (`provably_dead_lv`: the `FileLiveness` dataflow answer or one of the
+///    two syntactic proofs) — no path may read `%rB` again without an
+///    intervening write, back edges, `call` argument registers and `ret`
+///    included. If the proof fails, every rewrite is rolled back textually
+///    and the original pair stays.
+///
+/// Only copies whose destination family is referenced by the LEA's source
+/// are handled here; the unaliased producer+copy case belongs to
+/// `retarget_producer_into_copy`.
+pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        let li = i;
+        i += 1;
+        if infos[li].is_nop() || infos[li].pinned || infos[li].is_barrier() {
+            continue;
+        }
+        let lea = infos[li].trimmed(store.get(li)).to_string();
+        let (lea_rest, prod_w) = if let Some(r) = lea.strip_prefix("leaq ") {
+            (r, 64u8)
+        } else if let Some(r) = lea.strip_prefix("leal ") {
+            (r, 32u8)
+        } else {
+            continue;
+        };
+        if has_implicit_reg_usage(&lea) {
+            continue;
+        }
+        let Some((lea_src, lea_dst)) = split_two_operands(lea_rest) else {
+            continue;
+        };
+        if !lea_src.contains('(') {
+            continue;
+        }
+        let Some(b_fam) = plain_gp_operand(lea_dst) else {
+            continue;
+        };
+        if !is_relayable_family(b_fam) {
+            continue;
+        }
+        // The adjacent (NOPs apart) copy of the LEA result.
+        let mut j = li + 1;
+        while j < len && infos[j].is_nop() {
+            j += 1;
+        }
+        if j >= len || infos[j].pinned || infos[j].is_barrier() {
+            continue;
+        }
+        let copy = infos[j].trimmed(store.get(j)).to_string();
+        let (copy_w, copy_rest) = if let Some(r) = copy.strip_prefix("movq ") {
+            (64u8, r)
+        } else if let Some(r) = copy.strip_prefix("movl ") {
+            (32u8, r)
+        } else {
+            continue;
+        };
+        let Some((copy_src, copy_dst)) = split_two_operands(copy_rest) else {
+            continue;
+        };
+        // The copy must read exactly the LEA's destination family and write
+        // a different relayable family that the LEA's source references
+        // (the aliased case — unaliased retargeting is the other pass's job).
+        if register_family_fast(copy_src) != b_fam || plain_gp_operand(copy_src).is_none() {
+            continue;
+        }
+        let Some(a_fam) = plain_gp_operand(copy_dst) else {
+            continue;
+        };
+        if a_fam == b_fam || !is_relayable_family(a_fam) {
+            continue;
+        }
+        // A 64-bit LEA under a 32-bit copy would drop the copy's truncation:
+        // later 64-bit reads of %rB could not be renamed to the 32-bit
+        // (zero-extended) %rA.
+        if prod_w == 64 && copy_w == 32 {
+            continue;
+        }
+        if !line_refs_family(lea_src, a_fam) {
+            continue;
+        }
+        let new_dst_name = REG_NAMES[usize::from(prod_w == 32)][a_fam as usize];
+        let new_lea = format!(
+            "    {} {}, {}",
+            if prod_w == 64 { "leaq" } else { "leal" },
+            lea_src,
+            new_dst_name
+        );
+
+        // --- rename window: reads of %rB until the first write of either
+        // --- family or a barrier. Collect rewrites; abort on any shape we
+        // --- cannot rename (RMW of %rB, memory mention, implicit usage).
+        let b_mask = 1u16 << b_fam;
+        let mut rewrites: Vec<(usize, String, String)> = Vec::new(); // (idx, orig, new)
+        let mut abort = false;
+        let mut k = j + 1;
+        while k < len {
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || has_implicit_reg_usage(infos[k].trimmed(store.get(k))) {
+                abort = true;
+                break;
+            }
+            if infos[k].is_barrier() {
+                break; // downstream paths are the deadness proof's job
+            }
+            let t = infos[k].trimmed(store.get(k)).to_string();
+            if infos[k].reg_refs & b_mask == 0 {
+                // A write of %rA closes the window (its value diverges from
+                // %rB's); a later %rB read then fails the deadness proof and
+                // rolls the candidate back.
+                if get_dest_reg(&infos[k]) == a_fam {
+                    break;
+                }
+                k += 1;
+                continue;
+            }
+            // %rB redefined without reading itself: later reads see the new
+            // def, not our value — the window ends.
+            if is_full_write(&infos[k], &t, b_fam) {
+                break;
+            }
+            // A read-modify-write of %rB would leave its result in the wrong
+            // register after a rename.
+            if get_dest_reg(&infos[k]) == b_fam {
+                abort = true;
+                break;
+            }
+            let Some(new_t) = rename_plain_family_reads(&t, b_fam, a_fam) else {
+                abort = true;
+                break;
+            };
+            rewrites.push((k, t, new_t));
+            k += 1;
+        }
+        if abort {
+            continue;
+        }
+
+        // --- apply, prove, or roll back -----------------------------------
+        let orig_lea = store.get(li).to_string();
+        let orig_copy = store.get(j).to_string();
+        replace_line(store, &mut infos[li], li, new_lea);
+        mark_nop(&mut infos[j]);
+        for &(idx, _, ref new_t) in &rewrites {
+            replace_line(store, &mut infos[idx], idx, new_t.clone());
+        }
+        let lv2 = FileLiveness::new(store, infos);
+        // The deadness query is anchored at the LEA line, NOT at the copy:
+        // the copy is NOP-marked at this point and `FileLiveness` only marks
+        // real instructions as known, so a query at its index would answer
+        // `None` and silently degrade the proof to its syntactic fallbacks.
+        // Every line between `li` and `j` is a NOP, so "dead after the LEA"
+        // is exactly "dead after the (deleted) copy" on the rewritten text.
+        if provably_dead_lv(&lv2, store, infos, li, b_fam, &[li, j]) {
+            lv = lv2;
+            changed = true;
+            i = j + 1;
+        } else {
+            replace_line(store, &mut infos[li], li, orig_lea);
+            replace_line(store, &mut infos[j], j, orig_copy);
+            for (idx, orig, _) in rewrites {
+                replace_line(store, &mut infos[idx], idx, orig);
+            }
+            // `lv` still describes the restored text.
+        }
+    }
+    changed
+}
+
+/// Rename every PLAIN-REGISTER mention of family `from` to the same-width
+/// register of family `to` inside one instruction's text. Returns `None`
+/// when `from` appears anywhere this routine cannot rewrite (a memory
+/// operand base/index, or an unknown width spelling), so the caller can
+/// abort conservatively. Valid for read-only mentions and for `cmp`/`test`
+/// (whose "destination" is flags); callers must have excluded RMW and
+/// full-write lines before calling.
+fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> {
+    let trimmed = t.trim_start();
+    let sp = trimmed.find(' ')?;
+    let (mnemonic, rest) = trimmed.split_at(sp);
+    let rest = rest.trim_start();
+    let (s0, s1) = split_two_operands(rest)?;
+    let ren = |op: &str| -> Option<String> {
+        if let Some(f) = plain_gp_operand(op) {
+            if f != from {
+                return Some(op.to_string());
+            }
+            for row in REG_NAMES.iter() {
+                if row[from as usize] == op {
+                    return Some(row[to as usize].to_string());
+                }
+            }
+            return None; // unknown width spelling
+        }
+        if line_refs_family(op, from) {
+            return None; // memory mention — not renamable here
+        }
+        Some(op.to_string())
+    };
+    let n0 = ren(s0)?;
+    let n1 = ren(s1)?;
+    Some(format!("    {} {}, {}", mnemonic, n0, n1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
@@ -1025,5 +1266,159 @@ mod tests {
         ));
         assert!(out.contains("leaq 1(%rbx), %r10"), "{out}");
         assert!(out.contains("movzbl 8(%r10), %r14d"), "{out}");
+    }
+
+    /// The loop-latch increment: the copy dest is live across the back edge
+    /// and the producer reg feeds the exit cmp, so neither relay pass fires.
+    /// The LEA must be retargeted onto its own base and the cmp renamed.
+    #[test]
+    fn latch_increment_folds_into_lea_base() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movl %esi, %edx\n",
+            "    xorl %r8d, %r8d\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    cmpq %rdx, %rbx\n",
+            "    jae .LBB3\n",
+            ".LBB2:\n",
+            "    movslq (%rdi,%rbx,4), %r9\n",
+            "    leaq (%r8,%r9,1), %r8\n",
+            "    leaq 1(%rbx), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    cmpq %rdx, %r11\n",
+            "    jb .LBB2\n",
+            ".LBB3:\n",
+            "    movq %r8, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 1(%rbx), %rbx"), "{out}");
+        assert!(out.contains("cmpq %rdx, %rbx"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    /// The real `a[i>>1]` accumulate shape: the producer family `%r11` is
+    /// ALSO used by the shift copy at the top of the loop, so neither
+    /// syntactic proof applies and only the `FileLiveness` dataflow answer
+    /// can settle the fold. Pins the proof anchor at the LEA line: querying
+    /// the (NOP-marked) copy's index would answer `None` — FileLiveness only
+    /// marks real instructions as known — and silently decline the fold.
+    #[test]
+    fn latch_fold_settled_by_dataflow_when_family_reused_in_loop() {
+        let out = run(concat!(
+            "shift_half:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    movl %esi, %edx\n",
+            "    xorl %r8d, %r8d\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    cmpq %rdx, %rbx\n",
+            "jae .LBB3\n",
+            ".LBB2:\n",
+            "    movq %rbx, %r11\n",
+            "    shrq $1, %r11\n",
+            "    movslq (%rdi, %r11, 4), %r9\n",
+            "    leaq (%r8, %r9, 1), %r8\n",
+            "    leaq 1(%rbx), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    cmpq %rdx, %r11\n",
+            "jb .LBB2\n",
+            ".LBB3:\n",
+            "    movq %r8, %rax\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 1(%rbx), %rbx"), "{out}");
+        assert!(out.contains("cmpq %rdx, %rbx"), "{out}");
+        // The shift copy legitimately keeps %r11 (shr is destructive).
+        assert!(out.contains("movq %rbx, %r11"), "{out}");
+    }
+
+    /// 32-bit latch: same fold at `leal`/`movl` width.
+    #[test]
+    fn latch_increment_folds_at_32_bit_width() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    movslq (%rdi,%rbx,4), %r9d\n",
+            "    leal 1(%ebx), %r10d\n",
+            "    movl %r10d, %ebx\n",
+            "    cmpl %esi, %r10d\n",
+            "    jb .LBB1\n",
+            "    movl %ebx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal 1(%ebx), %ebx"), "{out}");
+        assert!(!out.contains("%r10d"), "{out}");
+    }
+
+    /// The producer register is read AFTER the loop: the rename window ends
+    /// at the conditional jump, the deadness proof must fail, and the whole
+    /// candidate must roll back (no partial rewrite may survive).
+    #[test]
+    fn lea_base_fold_rolls_back_when_producer_live_out() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    leaq 1(%rbx), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    cmpq %rdx, %r11\n",
+            "    jb .LBB1\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 1(%rbx), %r11"), "{out}");
+        assert!(out.contains("movq %r11, %rbx"), "{out}");
+        assert!(out.contains("movl %r11d, %eax"), "{out}");
+    }
+
+    /// A store of the producer register inside the window is renamed with
+    /// the same value-equivalence argument as the cmp.
+    #[test]
+    fn lea_base_fold_renames_store_of_producer() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq 8(%rbx), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    movq %r11, (%r13)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 8(%rbx), %rbx"), "{out}");
+        assert!(out.contains("movq %rbx, (%r13)"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    /// A read-modify-write of the producer register inside the window would
+    /// land its result in the wrong register after a rename: decline.
+    #[test]
+    fn lea_base_fold_declines_rmw_of_producer() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    leaq 1(%rbx), %r11\n",
+            "    movq %r11, %rbx\n",
+            "    addq %r11, %r11\n",
+            "    cmpq %rdx, %r11\n",
+            "    jb .LBB1\n",
+            "    movl %ebx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 1(%rbx), %r11"), "{out}");
     }
 }

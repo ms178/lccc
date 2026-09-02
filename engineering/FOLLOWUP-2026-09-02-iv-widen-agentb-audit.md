@@ -133,6 +133,17 @@ branch-bound so it stays at ratio 1.000.
 
 ## 5. Remaining follow-up (prioritized)
 
+> **Status update (later session, 2026-09-02b):** items 2 and 4 are DONE —
+> see `FOLLOWUP-2026-09-02b-agentb-rebase-and-lea-base-fold.md`. Item 2:
+> `prove_counted_bound` accepts runtime invariant bounds and the
+> `MemberKind::CrossCast` port unlocked the cross-sign shapes
+> (`unsigned i; a[i>>1]`), pinned by
+> `tests/regression/iv_widen_unsigned_runtime_bound.c`. Item 4: the
+> `fold_copy_into_lea_base` peephole coalesces `leaq D(%rA),%rB; mov %rB,%rA`
+> into `leaq D(%rA),%rA` (−16 static insns on 9 corpus kernels; GCC parity on
+> the `shift_half` oracle). Items 1 and 3 remain open (re-prioritized in the
+> newer doc's §7).
+
 1. **Real i8/i16 widening** needs a no-wrap proof at the narrow width: the
    promoted latch `trunc(Add(phi,1):I32)` wraps *defined* at 8/16 bits, so
    widening requires proving the IV provably stays in `[MIN, MAX]` (a counted

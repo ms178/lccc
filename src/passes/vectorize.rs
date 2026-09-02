@@ -269,6 +269,103 @@ fn vectorize_with_analysis_mode(
                 continue;
             }
 
+            // IV PRECONDITIONS — gate BOTH the SSE2 and the AVX2 reduction
+            // transform (both are called only from this dispatcher).
+            //
+            // (1) IV-WIDTH: only 32-bit-or-wider induction variables may
+            //     become the vector loop's counter. Both addressing schemes
+            //     rescale the counter's unit past a narrow domain:
+            //       - byte-offset IV: the IV steps `byte_stride`
+            //         (w * elem_size) per iteration and the limit is
+            //         multiplied by `byte_stride`, so an I8/U8/I16/U16
+            //         counter wraps once the byte range exceeds its width.
+            //         Reproduced on main @ dcf673d, -O2: `unsigned char i;
+            //         for (i = 0; i < n; i++) s += a[i];` with n = 120
+            //         vectorized into a U8 counter stepped by 16 against a
+            //         byte-limit of 480 — the counter wraps at 256 and the
+            //         loop spins forever (GCC terminates and prints 7140).
+            //       - element-index IV: the limit is divided by w, which
+            //         keeps the trip count small, but the transform selects
+            //         the byte-offset scheme whenever the GEP offset is
+            //         `iv * elem_size` (the common case), and the remainder
+            //         resumes at `iv_final >> log2(elem)` — a narrow counter
+            //         makes both the vector coverage and the remainder start
+            //         wrong once the scaled range exceeds its domain.
+            //     A narrow-IV reduction therefore stays scalar; its trip
+            //     counts are small and the scalar form is already tight.
+            //
+            // (2) IV-START: only constant-zero-init reductions may vectorize.
+            //     Both addressing schemes assume the IV starts at element 0:
+            //       - byte-offset IV: the limit is rescaled to
+            //         `(n / w) * byte_stride` but the IV keeps its original
+            //         preheader value, so with `for (i = c; i < n; i++)
+            //         s += a[i]`, c != 0, the vector loop walks byte offsets
+            //         [c, (n/w)*byte_stride) in `byte_stride` steps and the
+            //         remainder resumes at `iv_final >> log2(elem)` — a
+            //         misaligned, truncated run that silently drops
+            //         elements.
+            //       - element-index IV: the limit is divided to `n / w` but
+            //         the IV starts at c, so the vector loop exits after
+            //         covering only [c, c + w*floor(n/w)) and the remainder
+            //         resumes at `iv_final * w`, far past the loop's actual
+            //         range.
+            //     Reproduced on main @ dcf673d, -O2 (GCC 14.2 prints 1760):
+            //       `int`  accumulator, i = 5, n = 60 -> 31708938240 (AVX2)
+            //       `long` accumulator, i = 5, n = 60 -> 30702305280 (SSE2)
+            //     The SSE2 breakage is why this precondition lives in the
+            //     dispatcher and not only inside the AVX2 transform. A
+            //     DYNAMIC start (the preheader incoming is a Value) is
+            //     rejected by the same check — no const exists to inspect.
+            //     The Max reduction carries c-aware remainder math
+            //     (max_shift in insert_reduction_remainder_loop) but it only
+            //     reads CONST starts and no c != 0 Max shape the detector
+            //     accepts currently vectorizes; rejecting everything but
+            //     const-zero-init keeps every scheme provably correct and
+            //     costs nothing on the supported set.
+            {
+                let hdr = &func.blocks[red_pattern.header_idx];
+                let latch_label = func.blocks[red_pattern.latch_idx].label;
+                let mut narrow_iv = false;
+                let mut const_zero_init = false;
+                for inst in &hdr.instructions {
+                    if let Instruction::Phi {
+                        dest,
+                        ty,
+                        incoming,
+                        ..
+                    } = inst
+                    {
+                        if *dest != red_pattern.iv {
+                            continue;
+                        }
+                        narrow_iv = matches!(
+                            ty,
+                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
+                        );
+                        const_zero_init = incoming.iter().any(|(op, lbl)| {
+                            *lbl != latch_label
+                                && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
+                        });
+                    }
+                }
+                if narrow_iv {
+                    if debug {
+                        eprintln!(
+                            "[VEC] Skip reduction: induction variable is narrower than 32 bits (stays scalar)"
+                        );
+                    }
+                    continue;
+                }
+                if !const_zero_init {
+                    if debug {
+                        eprintln!(
+                            "[VEC] Skip reduction: induction variable does not start at a constant 0 (limit rescale + remainder math assume an element-0 start)"
+                        );
+                    }
+                    continue;
+                }
+            }
+
             // Try reduction pattern vectorization (sum += arr[i], sum += a[i] * b[i], etc.)
             let use_sse2 = force_two_wide || std::env::var("LCCC_FORCE_SSE2").is_ok();
             let vec_width: i64 = if use_sse2 { 2 } else { 4 };
