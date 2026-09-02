@@ -1186,4 +1186,61 @@ impl I686Codegen {
         self.state.reg_cache.invalidate_acc();
         self.store_eax_to(dest);
     }
+
+    /// 128-bit container copy (the i686 `emit_copy_i128` override).
+    ///
+    /// The trait default stages through the accumulator (`emit_load_operand`
+    /// + `emit_store_result`) and therefore moved only the low 4 bytes of a
+    /// 16-byte payload — every `_Float128`/`_Decimal128`/gp-view copy lost
+    /// its upper 12 bytes (f128_softfloat).  The x86-64 backend overrides
+    /// this with its rax:rdx pair move; the i686 equivalent is the 4-dword
+    /// %eax shuttle between the two 16-byte slots, with immediate stores for
+    /// container constants.  `generate_copy` marks the dest in `i128_values`
+    /// before this runs, so all later copy/store/load paths see a full
+    /// 128-bit carrier.
+    pub(super) fn emit_copy_i128_impl(&mut self, dest: &Value, src: &Operand) {
+        // Constant container: four immediate stores into the dest slot.
+        if let Operand::Const(c @ (IrConst::I128(_) | IrConst::Zero)) = src {
+            if let Some(dslot) = self.state.get_slot(dest.0) {
+                let words: [u32; 4] = match c {
+                    IrConst::I128(v) => {
+                        let b = v.to_le_bytes();
+                        [
+                            u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                            u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                            u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                            u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                        ]
+                    }
+                    _ => [0; 4],
+                };
+                for (k, w) in words.iter().enumerate() {
+                    let dsr = self.slot_ref_offset(dslot, (4 * k) as i64);
+                    emit!(self.state, "    movl ${}, {}", w, dsr);
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+        // Slot-to-slot: 4-dword %eax shuttle.
+        if let Operand::Value(sv) = src {
+            if let (Some(dslot), Some(sslot)) =
+                (self.state.get_slot(dest.0), self.state.get_slot(sv.0))
+            {
+                for k in 0..4i64 {
+                    let ssr = self.slot_ref_offset(sslot, 4 * k);
+                    let dsr = self.slot_ref_offset(dslot, 4 * k);
+                    emit!(self.state, "    movl {}, %eax", ssr);
+                    emit!(self.state, "    movl %eax, {}", dsr);
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+        }
+        // Shapes without two 16-byte slots (should not occur for marked
+        // i128 values): keep the trait-default staging rather than emitting
+        // nothing.
+        self.emit_load_operand(src);
+        self.emit_store_result(dest);
+    }
 }

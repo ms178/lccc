@@ -3,6 +3,7 @@
 use super::emit::{phys_reg_name, I686Codegen};
 use crate::backend::generation::is_i128_type;
 use crate::backend::regalloc::PhysReg;
+use crate::ir::reexports::IrConst;
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
@@ -187,6 +188,104 @@ impl I686Codegen {
     // ---- Store/Load overrides ----
 
     pub(super) fn emit_store_impl(&mut self, val: &Operand, ptr: &Value, ty: IrType) {
+        // 128-bit integer container stores (IrType::I128/U128: the _Float128
+        // gp-view, _Decimal128, vector pack results).  The historical
+        // "i128 == 64-bit eax:edx pair" model truncated these to 8 bytes,
+        // corrupting every _Float128 initialization (f128_softfloat: the
+        // 16-byte slot's upper half stayed garbage and fed __addtf3).
+        // Full 16-byte semantics; staging is caller-saved-only (%eax value
+        // shuttle, %edx src address, %ecx dst address) and never touches
+        // %esi/%edi (allocator-owned homes).
+        if is_i128_type(ty) {
+            let words: Option<[u32; 4]> = match val {
+                Operand::Const(IrConst::I128(v)) => {
+                    let b = v.to_le_bytes();
+                    Some([
+                        u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                        u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+                        u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+                    ])
+                }
+                Operand::Const(IrConst::Zero) => Some([0; 4]),
+                _ => None,
+            };
+            match (words, self.state.resolve_slot_addr(ptr.0)) {
+                // Constant: four immediate stores through the resolved dest.
+                (Some(words), addr) => {
+                    match addr {
+                        Some(SlotAddr::Direct(slot)) => {
+                            for (k, w) in words.iter().enumerate() {
+                                let dsr = self.slot_ref_offset(slot, (4 * k) as i64);
+                                emit!(self.state, "    movl ${}, {}", w, dsr);
+                            }
+                        }
+                        _ => {
+                            self.emit_i128_dest_addr(ptr);
+                            for (k, w) in words.iter().enumerate() {
+                                if k == 0 {
+                                    emit!(self.state, "    movl ${}, (%ecx)", w);
+                                } else {
+                                    emit!(self.state, "    movl ${}, {}(%ecx)", w, 4 * k);
+                                }
+                            }
+                        }
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // Value copy: both slots direct => eax shuttle, no address regs.
+                (None, Some(SlotAddr::Direct(dslot))) => {
+                    if let Operand::Value(sv) = val {
+                        if let Some(SlotAddr::Direct(sslot)) =
+                            self.state.resolve_slot_addr(sv.0)
+                        {
+                            for k in 0..4i64 {
+                                let ssr = self.slot_ref_offset(sslot, 4 * k);
+                                let dsr = self.slot_ref_offset(dslot, 4 * k);
+                                emit!(self.state, "    movl {}, %eax", ssr);
+                                emit!(self.state, "    movl %eax, {}", dsr);
+                            }
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                    // Fall through to the address-based copy below.
+                    self.emit_i128_dest_addr(ptr);
+                    self.emit_i128_src_addr(val);
+                    for k in 0..4 {
+                        if k == 0 {
+                            self.state.emit("    movl (%edx), %eax");
+                            self.state.emit("    movl %eax, (%ecx)");
+                        } else {
+                            emit!(self.state, "    movl {}(%edx), %eax", 4 * k);
+                            emit!(self.state, "    movl %eax, {}(%ecx)", 4 * k);
+                        }
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+                // Non-direct dest: build both addresses in %edx/%ecx.
+                (None, _) => {
+                    self.emit_i128_dest_addr(ptr);
+                    self.emit_i128_src_addr(val);
+                    for k in 0..4 {
+                        if k == 0 {
+                            self.state.emit("    movl (%edx), %eax");
+                            self.state.emit("    movl %eax, (%ecx)");
+                        } else {
+                            emit!(self.state, "    movl {}(%edx), %eax", 4 * k);
+                            emit!(self.state, "    movl %eax, {}(%ecx)", 4 * k);
+                        }
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.state.reg_cache.invalidate_sec();
+                    return;
+                }
+            }
+        }
         if ty == IrType::F128 {
             self.emit_f128_load_to_x87(val);
             let addr = self.state.resolve_slot_addr(ptr.0);
@@ -279,6 +378,42 @@ impl I686Codegen {
     }
 
     pub(super) fn emit_load_impl(&mut self, dest: &Value, ptr: &Value, ty: IrType) {
+        // 128-bit integer container load (IrType::I128/U128: _Float128
+        // gp-view, _Decimal128): full 16-byte semantics — the accumulator
+        // fallthrough only ever materialized the low 32 bits.
+        if is_i128_type(ty) {
+            if let (Some(dslot), Some(SlotAddr::Direct(sslot))) = (
+                self.state.get_slot(dest.0),
+                self.state.resolve_slot_addr(ptr.0),
+            ) {
+                for k in 0..4i64 {
+                    let ssr = self.slot_ref_offset(sslot, 4 * k);
+                    let dsr = self.slot_ref_offset(dslot, 4 * k);
+                    emit!(self.state, "    movl {}, %eax", ssr);
+                    emit!(self.state, "    movl %eax, {}", dsr);
+                }
+                self.state.reg_cache.invalidate_acc();
+                return;
+            }
+            // Non-direct source: build its address in %edx, dest slot direct.
+            if let Some(dslot) = self.state.get_slot(dest.0) {
+                self.emit_i128_src_addr(&Operand::Value(*ptr));
+                for k in 0..4 {
+                    if k == 0 {
+                        self.state.emit("    movl (%edx), %eax");
+                    } else {
+                        emit!(self.state, "    movl {}(%edx), %eax", 4 * k);
+                    }
+                    let dsr = self.slot_ref_offset(dslot, 4 * k as i64);
+                    emit!(self.state, "    movl %eax, {}", dsr);
+                }
+                self.state.reg_cache.invalidate_acc();
+                self.state.reg_cache.invalidate_sec();
+                return;
+            }
+            // Slot-less dest: fall through to the legacy path (the dest of a
+            // U128 load always has a 16-byte slot in the i686 frame model).
+        }
         if ty == IrType::F128 {
             let addr = self.state.resolve_slot_addr(ptr.0);
             if let Some(addr) = addr {
@@ -1316,6 +1451,135 @@ impl I686Codegen {
             let sr = self.slot_ref(slot);
             emit!(self.state, "    movl {}, %esi", sr);
         }
+    }
+
+    /// Materialize a 128-bit container's DESTINATION address into %ecx.
+    /// Handles Direct (leal), Indirect (pointer load), OverAligned (alloca
+    /// re-align) and Reg bases.
+    ///
+    /// SCRATCH DISCIPLINE (see emit_i128_src_addr): this runs FIRST in the
+    /// store sequence, while %edx still holds nothing the sequence needs, so
+    /// every arm may read register homes freely — the RA classifies 128-bit
+    /// Store/Copy/Intrinsic points as %ecx/%edx-dirty, meaning no LIVE value
+    /// is ever homed there across the point.
+    fn emit_i128_dest_addr(&mut self, ptr: &Value) {
+        match self.state.resolve_slot_addr(ptr.0) {
+            Some(SlotAddr::Direct(slot)) => {
+                let sr = self.slot_ref(slot);
+                emit!(self.state, "    leal {}, %ecx", sr);
+            }
+            Some(SlotAddr::Indirect(slot)) => {
+                self.emit_load_ptr_from_slot(slot, ptr.0);
+            }
+            Some(SlotAddr::OverAligned(slot, id)) => {
+                self.emit_alloca_aligned_addr(slot, id);
+            }
+            Some(SlotAddr::Reg(reg)) => {
+                let r = phys_reg_name(reg);
+                if r != "ecx" {
+                    emit!(self.state, "    movl %{}, %ecx", r);
+                }
+            }
+            None => {
+                self.emit_load_ptr_from_slot_generic(ptr.0);
+            }
+        }
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    /// Materialize a 128-bit container's SOURCE address into %edx.
+    ///
+    /// SCRATCH DISCIPLINE: %ecx already holds the DESTINATION address
+    /// (emit_i128_dest_addr ran first), so every arm here targets %edx
+    /// DIRECTLY — the historic form routed the Indirect/OverAligned pointer
+    /// through %ecx (`movl {slot}, %ecx; movl %ecx, %edx`), destroying the
+    /// destination and turning the 4-word copy loop into a self-copy through
+    /// an arbitrary stack value (SIGSEGV; the peephole's copy propagation
+    /// then faithfully amplified the wreckage).
+    fn emit_i128_src_addr(&mut self, val: &Operand) {
+        if let Operand::Value(sv) = val {
+            match self.state.resolve_slot_addr(sv.0) {
+                Some(SlotAddr::Direct(slot)) => {
+                    let sr = self.slot_ref(slot);
+                    emit!(self.state, "    leal {}, %edx", sr);
+                    return;
+                }
+                Some(SlotAddr::Indirect(slot)) => {
+                    // Load the pointer value straight into %edx: register
+                    // home when one exists (never %ecx/%edx for a live value
+                    // at this RA-dirty point), else the esp-relative slot.
+                    if let Some(phys) = self.reg_assignments.get(&sv.0).copied() {
+                        let r = phys_reg_name(phys);
+                        if r != "edx" {
+                            emit!(self.state, "    movl %{}, %edx", r);
+                        }
+                    } else {
+                        let sr = self.slot_ref(slot);
+                        emit!(self.state, "    movl {}, %edx", sr);
+                    }
+                    return;
+                }
+                Some(SlotAddr::OverAligned(slot, id)) => {
+                    // Inline the leal/addl/andl alignment ladder against %edx
+                    // (emit_alloca_aligned_addr targets %ecx = the dest).
+                    let align = self
+                        .state
+                        .alloca_over_align(sv.0)
+                        .expect("alloca must have over-alignment for aligned addr emission");
+                    let sr = self.slot_ref(slot);
+                    emit!(self.state, "    leal {}, %edx", sr);
+                    emit!(self.state, "    addl ${}, %edx", align - 1);
+                    emit!(self.state, "    andl ${}, %edx", -(align as i32));
+                    return;
+                }
+                Some(SlotAddr::Reg(reg)) => {
+                    let r = phys_reg_name(reg);
+                    if r != "edx" {
+                        emit!(self.state, "    movl %{}, %edx", r);
+                    }
+                    return;
+                }
+                None => {
+                    if let Some(phys) = self.reg_assignments.get(&sv.0).copied() {
+                        let r = phys_reg_name(phys);
+                        if r != "edx" {
+                            emit!(self.state, "    movl %{}, %edx", r);
+                        }
+                    } else {
+                        self.operand_to_eax(&Operand::Value(*sv));
+                        self.state.emit("    movl %eax, %edx");
+                        self.state.reg_cache.invalidate_acc();
+                    }
+                    return;
+                }
+            }
+        }
+        // Constants with no 16-byte word form (should not occur): stage via
+        // the accumulator.
+        self.emit_load_operand(val);
+        self.state.emit("    movl %eax, %edx");
+        self.state.reg_cache.invalidate_acc();
+        self.state.reg_cache.invalidate_sec();
+    }
+
+    /// Last-resort pointer materialization for values without a slot address
+    /// (stack spills of pointer values): stage through %ecx via the value's
+    /// register home or an accumulator load.
+    fn emit_load_ptr_from_slot_generic(&mut self, v: u32) {
+        if let Some(phys) = self.reg_assignments.get(&v).copied() {
+            let r = phys_reg_name(phys);
+            if r != "ecx" {
+                emit!(self.state, "    movl %{}, %ecx", r);
+            }
+            return;
+        }
+        // No slot address and no register home: the value was spilled.
+        // `value_to_reg` stages it through the accumulator (%eax); move it
+        // into the %ecx address scratch.
+        self.operand_to_eax(&Operand::Value(Value(v)));
+        self.state.emit("    movl %eax, %ecx");
+        self.state.reg_cache.invalidate_acc();
+        self.state.reg_cache.invalidate_sec();
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {

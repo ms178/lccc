@@ -653,6 +653,15 @@ impl Instruction {
                 IntrinsicOp::F128Fabs
                 | IntrinsicOp::F128Neg
                 | IntrinsicOp::F128Copysign => Some(IrType::F128),
+                // 64-bit scalar results: the intrinsic returns `long long` /
+                // `unsigned long long` — on i686 that is an eax:edx pair
+                // living in an 8-byte slot. A None here made the slot
+                // allocator reserve only 4 bytes, so the pair store
+                // (emit_store_acc_pair) spilled the high dword into the
+                // neighbouring slot and every 64-bit consumer read a
+                // sign-extended low dword (simd_insert_extract pextrq0/
+                // pextrq1).
+                IntrinsicOp::Pextrq128 | IntrinsicOp::Cvtsi128Si64 => Some(IrType::I64),
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),

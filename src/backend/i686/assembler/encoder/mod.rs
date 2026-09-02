@@ -9,11 +9,57 @@ mod gp_integer;
 mod registers;
 mod sse;
 mod system;
+mod vex;
 mod x87;
 
 pub(crate) use registers::*;
 
 use crate::backend::x86::assembler::parser::*;
+
+/// True for the FMA3 mnemonics that use the VEX 3-operand `0F38` encoding.
+/// (Ported from the x86-64 encoder's registers.rs.)
+fn is_fma3_vex(m: &str) -> bool {
+    fma3_opcode(m).is_some()
+}
+
+/// Decode an FMA3 mnemonic into its `0F38` opcode and VEX.W bit.
+/// The grid: base(op) + 0x10*(order/100 - 1) + is_scalar, prefix always 66.
+fn fma3_opcode(m: &str) -> Option<(u8, u8)> {
+    let rest = m
+        .strip_prefix("vfm")
+        .map(|r| (r, false))
+        .or_else(|| m.strip_prefix("vfnm").map(|r| (r, true)))?;
+    let (rest, negated) = rest;
+
+    let (rest, ty) = rest.split_at(rest.len().checked_sub(2)?);
+    let (w, scalar) = match ty {
+        "ps" => (0u8, false),
+        "pd" => (1, false),
+        "ss" => (0, true),
+        "sd" => (1, true),
+        _ => return None,
+    };
+
+    let (op, order) = rest.split_at(rest.len().checked_sub(3)?);
+    let order_step: u8 = match order {
+        "132" => 0,
+        "213" => 1,
+        "231" => 2,
+        _ => return None,
+    };
+
+    let base: u8 = match (op, negated) {
+        ("add", false) => 0x98,
+        ("sub", false) => 0x9A,
+        ("add", true) => 0x9C,
+        ("sub", true) => 0x9E,
+        ("addsub", false) if !scalar => 0x96,
+        ("subadd", false) if !scalar => 0x97,
+        _ => return None,
+    };
+
+    Some((base + 0x10 * order_step + u8::from(scalar), w))
+}
 
 /// Split a label string like `"pa_tr_efer + 4"` or `"symbol-8"` into (symbol, addend).
 /// Returns the original string with addend 0 if no offset is found.
@@ -838,6 +884,11 @@ impl InstructionEncoder {
             "maxss" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5F]),
             "minsd" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x5D]),
             "minss" => self.encode_sse_op(ops, &[0xF3, 0x0F, 0x5D]),
+            "maxps" => self.encode_sse_op(ops, &[0x0F, 0x5F]),
+            "minps" => self.encode_sse_op(ops, &[0x0F, 0x5D]),
+            "maxpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5F]),
+            "minpd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x5D]),
+            "cvttpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
             "ucomisd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x2E]),
             "ucomiss" => self.encode_sse_op(ops, &[0x0F, 0x2E]),
             "comisd" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x2F]),
@@ -867,6 +918,14 @@ impl InstructionEncoder {
             "aesenclast" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDD]),
             "aesdec" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDE]),
             "aesdeclast" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDF]),
+            // SSE4.2 CRC32 (F2 0F 38 F0/F1): dst = the accumulating CRC
+            // register (reg field), src = r/m. AT&T operand order matches the
+            // SSE convention used here: ops = [src, dst]. Byte form F0 takes
+            // r/m8; word form prefixes 66+F2; the 64-bit form (crc32q) needs
+            // REX.W and is unavailable on i686.
+            "crc32b" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF0]),
+            "crc32w" => self.encode_sse_op(ops, &[0x66, 0xF2, 0x0F, 0x38, 0xF1]),
+            "crc32l" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0x38, 0xF1]),
             "aesimc" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0xDB]),
             "aeskeygenassist" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xDF]),
 
@@ -922,6 +981,8 @@ impl InstructionEncoder {
             "pmulhw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE5]),
             "pmulhuw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xE4]),
             "pmuludq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xF4]),
+            "pmuldq" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x28]),
+            "pmaddubsw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x04]),
             "paddusb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xDC]),
             "paddusw" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xDD]),
             "psubusb" => self.encode_sse_op(ops, &[0x66, 0x0F, 0xD8]),
@@ -1363,6 +1424,8 @@ impl InstructionEncoder {
             "blendps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x0C]),
             "dpps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x40]),
             "dppd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x41]),
+            "insertps" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x14]),
+            "extractps" => self.encode_extractps(ops),
 
             // SSE4.1 test / min-max
             "ptest" => self.encode_sse_op(ops, &[0x66, 0x0F, 0x38, 0x17]),
@@ -1467,6 +1530,209 @@ impl InstructionEncoder {
             }
             "idivb" => self.encode_unary_rm(ops, 7, 1),
             "imulw" => self.encode_imul(ops, 2),
+
+            // ---- AVX/AVX2 (VEX-encoded) ----
+            "vzeroupper" => {
+                self.bytes.extend_from_slice(&[0xC5, 0xF8, 0x77]);
+                Ok(())
+            }
+            "vmovdqa" => self.encode_avx_mov(ops, 0x6F, 0x7F, true),
+            "vmovdqu" => self.encode_avx_mov(ops, 0x6F, 0x7F, false),
+            "vmovaps" => self.encode_avx_mov_np(ops, 0x28, 0x29, false),
+            "vmovapd" => self.encode_avx_mov_np(ops, 0x28, 0x29, true),
+            "vmovups" => self.encode_avx_mov_np(ops, 0x10, 0x11, false),
+            "vmovupd" => self.encode_avx_mov_np(ops, 0x10, 0x11, true),
+            "vmovss" => self.encode_avx_scalar_mov(ops, 0x10, 0x11, 2),
+            "vmovsd" => self.encode_avx_scalar_mov(ops, 0x10, 0x11, 3),
+            "vmovd" => self.encode_avx_movd(ops),
+            "vmovntps" => self.encode_avx_store(ops, 0x2B, false),
+            "vmovntpd" => self.encode_avx_store(ops, 0x2B, true),
+            "vmovntdq" => self.encode_avx_store(ops, 0xE7, true),
+            "vbroadcastss" => self.encode_avx_broadcast(ops, &[0x18]),
+            "vbroadcastsd" => self.encode_avx_broadcast(ops, &[0x19]),
+            "vbroadcastf128" => self.encode_avx_broadcast(ops, &[0x1A]),
+            "vbroadcasti128" => self.encode_avx_broadcast(ops, &[0x5A]),
+            "vpbroadcastb" => self.encode_vpbroadcast(ops, 0x78, 0x7A),
+            "vpbroadcastw" => self.encode_vpbroadcast(ops, 0x79, 0x7B),
+            "vpbroadcastd" => self.encode_vpbroadcast(ops, 0x58, 0x7C),
+            "vpbroadcastq" => self.encode_vpbroadcast(ops, 0x59, 0x7C),
+            "vpand" => self.encode_avx_3op_commutative(ops, 0xDB, true, true),
+            "vpandn" => self.encode_avx_3op(ops, 0xDF, true),
+            "vpor" => self.encode_avx_3op_commutative(ops, 0xEB, true, true),
+            "vpxor" => self.encode_avx_3op_commutative(ops, 0xEF, true, true),
+            "vpaddd" => self.encode_avx_3op_commutative(ops, 0xFE, true, true),
+            "vpaddb" => self.encode_avx_3op_commutative(ops, 0xFC, true, true),
+            "vpaddw" => self.encode_avx_3op_commutative(ops, 0xFD, true, true),
+            "vpaddq" => self.encode_avx_3op_commutative(ops, 0xD4, true, true),
+            "vpsubb" => self.encode_avx_3op(ops, 0xF8, true),
+            "vpsubw" => self.encode_avx_3op(ops, 0xF9, true),
+            "vpsubd" => self.encode_avx_3op(ops, 0xFA, true),
+            "vpsubq" => self.encode_avx_3op(ops, 0xFB, true),
+            "vpaddusb" => self.encode_avx_3op_commutative(ops, 0xDC, true, true),
+            "vpaddusw" => self.encode_avx_3op_commutative(ops, 0xDD, true, true),
+            "vpaddsb" => self.encode_avx_3op_commutative(ops, 0xEC, true, true),
+            "vpaddsw" => self.encode_avx_3op_commutative(ops, 0xED, true, true),
+            "vpsubusb" => self.encode_avx_3op(ops, 0xD8, true),
+            "vpsubusw" => self.encode_avx_3op(ops, 0xD9, true),
+            "vpsubsb" => self.encode_avx_3op(ops, 0xE8, true),
+            "vpsubsw" => self.encode_avx_3op(ops, 0xE9, true),
+            "vpcmpeqb" => self.encode_avx_3op_commutative(ops, 0x74, true, true),
+            "vpcmpeqw" => self.encode_avx_3op_commutative(ops, 0x75, true, true),
+            "vpcmpeqd" => self.encode_avx_3op_commutative(ops, 0x76, true, true),
+            "vpcmpeqq" => self.encode_avx_3op_38(ops, 0x29, true),
+            "vpcmpgtb" => self.encode_avx_3op(ops, 0x64, true),
+            "vpcmpgtw" => self.encode_avx_3op(ops, 0x65, true),
+            "vpcmpgtd" => self.encode_avx_3op(ops, 0x66, true),
+            "vpcmpgtq" => self.encode_avx_3op_38(ops, 0x37, true),
+            "vpmullw" => self.encode_avx_3op_commutative(ops, 0xD5, true, true),
+            "vpmulhw" => self.encode_avx_3op_commutative(ops, 0xE5, true, true),
+            "vpmulhuw" => self.encode_avx_3op_commutative(ops, 0xE4, true, true),
+            "vpmuludq" => self.encode_avx_3op(ops, 0xF4, true),
+            "vpmulld" => self.encode_avx_3op_38(ops, 0x40, true),
+            "vpavgb" => self.encode_avx_3op_commutative(ops, 0xE0, true, true),
+            "vpavgw" => self.encode_avx_3op_commutative(ops, 0xE3, true, true),
+            "vpsadbw" => self.encode_avx_3op(ops, 0xF6, true),
+            "vpmaddwd" => self.encode_avx_3op(ops, 0xF5, true),
+            "vpmaddubsw" => self.encode_avx_3op_38(ops, 0x04, true),
+            "vpackssdw" => self.encode_avx_3op(ops, 0x6B, true),
+            "vpacksswb" => self.encode_avx_3op(ops, 0x63, true),
+            "vpackuswb" => self.encode_avx_3op(ops, 0x67, true),
+            "vpackusdw" => self.encode_avx_3op_38(ops, 0x2B, true),
+            "vpminub" => self.encode_avx_3op_commutative(ops, 0xDA, true, true),
+            "vpmaxub" => self.encode_avx_3op_commutative(ops, 0xDE, true, true),
+            "vpminsw" => self.encode_avx_3op_commutative(ops, 0xEA, true, true),
+            "vpmaxsw" => self.encode_avx_3op_commutative(ops, 0xEE, true, true),
+            "vpminsd" => self.encode_avx_3op_38(ops, 0x39, true),
+            "vpmaxsd" => self.encode_avx_3op_38(ops, 0x3D, true),
+            "vpminuw" => self.encode_avx_3op_38(ops, 0x3A, true),
+            "vpmaxuw" => self.encode_avx_3op_38(ops, 0x3E, true),
+            "vpminud" => self.encode_avx_3op_38(ops, 0x3B, true),
+            "vpmaxud" => self.encode_avx_3op_38(ops, 0x3F, true),
+            "vphaddw" => self.encode_avx_3op_38(ops, 0x01, true),
+            "vphaddd" => self.encode_avx_3op_38(ops, 0x02, true),
+            "vphsubw" => self.encode_avx_3op_38(ops, 0x05, true),
+            "vphsubd" => self.encode_avx_3op_38(ops, 0x06, true),
+            "vpmulhrsw" => self.encode_avx_3op_38(ops, 0x0B, true),
+            "vpalignr" => self.encode_avx_3op_3a_imm8(ops, 0x0F, true),
+            "vpblendw" => self.encode_avx_3op_3a_imm8(ops, 0x0E, true),
+            "vpblendd" => self.encode_avx_3op_3a_imm8(ops, 0x02, true),
+            "vpblendvb" => self.encode_avx_4op_3a(ops, 0x4C, true),
+            "vblendvps" => self.encode_avx_4op_3a(ops, 0x4A, true),
+            "vblendvpd" => self.encode_avx_4op_3a(ops, 0x4B, true),
+            "vblendps" => self.encode_avx_3op_3a_imm8(ops, 0x0C, true),
+            "vblendpd" => self.encode_avx_3op_3a_imm8(ops, 0x0D, true),
+            "vpshufb" => self.encode_avx_3op_38(ops, 0x00, true),
+            "vpshufd" => self.encode_avx_shuffle(ops, 0x70, true),
+            "vpermilps" => self.encode_avx_3op_38(ops, 0x0C, true),
+            "vpermilpd" => self.encode_avx_3op_38(ops, 0x0D, true),
+            "vpermd" => self.encode_avx_3op_38(ops, 0x36, true),
+            "vpermps" => self.encode_avx_3op_38(ops, 0x16, true),
+            "vpermq" => self.encode_avx_shuffle_3a_w1(ops, 0x00, true),
+            "vpermpd" => self.encode_avx_shuffle_3a_w1(ops, 0x01, true),
+            "vperm2i128" => self.encode_avx_3op_3a_imm8(ops, 0x46, true),
+            "vperm2f128" => self.encode_avx_3op_3a_imm8(ops, 0x06, true),
+            "vinserti128" => self.encode_avx_3op_3a_imm8(ops, 0x38, true),
+            "vextracti128" => self.encode_avx_extract_imm8(ops, 0x39, true),
+            "vinsertf128" => self.encode_avx_3op_3a_imm8(ops, 0x18, true),
+            "vextractf128" => self.encode_avx_extract_imm8(ops, 0x19, true),
+            "vpabsb" => self.encode_avx_2op_38(ops, 0x1C, true),
+            "vpabsw" => self.encode_avx_2op_38(ops, 0x1D, true),
+            "vpabsd" => self.encode_avx_2op_38(ops, 0x1E, true),
+            "vpmovzxbw" => self.encode_avx_2op_38(ops, 0x30, true),
+            "vpmovzxbd" => self.encode_avx_2op_38(ops, 0x31, true),
+            "vpmovzxwq" => self.encode_avx_2op_38(ops, 0x34, true),
+            "vpmovzxdq" => self.encode_avx_2op_38(ops, 0x35, true),
+            "vpmovzxwd" => self.encode_avx_2op_38(ops, 0x33, true),
+            "vpmovzxbq" => self.encode_avx_2op_38(ops, 0x32, true),
+            "vpmovsxbw" => self.encode_avx_2op_38(ops, 0x20, true),
+            "vpmovsxbd" => self.encode_avx_2op_38(ops, 0x21, true),
+            "vpmovsxwd" => self.encode_avx_2op_38(ops, 0x23, true),
+            "vpmovsxdq" => self.encode_avx_2op_38(ops, 0x25, true),
+            "vpmovmskb" => self.encode_avx_extract_gp(ops, 0xD7, true),
+            "vtestps" => self.encode_avx_2op_38(ops, 0x0E, true),
+            "vtestpd" => self.encode_avx_2op_38(ops, 0x0F, true),
+            "vpsllw" => self.encode_avx_shift(ops, 0xF1, 6, 0x71, true),
+            "vpslld" => self.encode_avx_shift(ops, 0xF2, 6, 0x72, true),
+            "vpsllq" => self.encode_avx_shift(ops, 0xF3, 6, 0x73, true),
+            "vpsrlw" => self.encode_avx_shift(ops, 0xD1, 2, 0x71, true),
+            "vpsrld" => self.encode_avx_shift(ops, 0xD2, 2, 0x72, true),
+            "vpsrlq" => self.encode_avx_shift(ops, 0xD3, 2, 0x73, true),
+            "vpsraw" => self.encode_avx_shift(ops, 0xE1, 4, 0x71, true),
+            "vpsrad" => self.encode_avx_shift(ops, 0xE2, 4, 0x72, true),
+            "vpslldq" => self.encode_avx_3op_0f_imm8_shift(ops, 0x73, 7),
+            "vpsrldq" => self.encode_avx_3op_0f_imm8_shift(ops, 0x73, 3),
+            "vaddps" => self.encode_avx_3op_np(ops, 0x58),
+            "vsubps" => self.encode_avx_3op_np(ops, 0x5C),
+            "vmulps" => self.encode_avx_3op_np(ops, 0x59),
+            "vdivps" => self.encode_avx_3op_np(ops, 0x5E),
+            "vaddpd" => self.encode_avx_3op(ops, 0x58, true),
+            "vsubpd" => self.encode_avx_3op(ops, 0x5C, true),
+            "vmulpd" => self.encode_avx_3op(ops, 0x59, true),
+            "vdivpd" => self.encode_avx_3op(ops, 0x5E, true),
+            "vminps" => self.encode_avx_3op_np(ops, 0x5D),
+            "vmaxps" => self.encode_avx_3op_np(ops, 0x5F),
+            "vminpd" => self.encode_avx_3op(ops, 0x5D, true),
+            "vmaxpd" => self.encode_avx_3op(ops, 0x5F, true),
+            "vandps" => self.encode_avx_3op_commutative(ops, 0x54, false, true),
+            "vandpd" => self.encode_avx_3op_commutative(ops, 0x54, true, true),
+            "vandnps" => self.encode_avx_3op_np(ops, 0x55),
+            "vandnpd" => self.encode_avx_3op(ops, 0x55, true),
+            "vorps" => self.encode_avx_3op_commutative(ops, 0x56, false, true),
+            "vorpd" => self.encode_avx_3op_commutative(ops, 0x56, true, true),
+            "vxorps" => self.encode_avx_3op_commutative(ops, 0x57, false, true),
+            "vxorpd" => self.encode_avx_3op_commutative(ops, 0x57, true, true),
+            "vsqrtps" => self.encode_avx_2op_0f(ops, 0x51, 0),
+            "vsqrtpd" => self.encode_avx_2op_0f(ops, 0x51, 1),
+            "vrcpps" => self.encode_avx_2op_0f(ops, 0x53, 0),
+            "vrsqrtps" => self.encode_avx_2op_0f(ops, 0x52, 0),
+            "vmovddup" => self.encode_avx_2op_0f(ops, 0x12, 3),
+            "vmovshdup" => self.encode_avx_2op_0f(ops, 0x16, 2),
+            "vmovsldup" => self.encode_avx_2op_0f(ops, 0x12, 2),
+            "vcvtps2pd" => self.encode_avx_2op_0f(ops, 0x5A, 0),
+            "vcvtpd2ps" => self.encode_avx_2op_0f(ops, 0x5A, 1),
+            "vcvtdq2pd" => self.encode_avx_2op_0f(ops, 0xE6, 2),
+            "vcvtdq2ps" => self.encode_avx_2op_0f(ops, 0x5B, 0),
+            "vcvtpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 3),
+            "vcvttpd2dq" => self.encode_avx_2op_0f(ops, 0xE6, 1),
+            "vcvtps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 1),
+            "vcvttps2dq" => self.encode_avx_2op_0f(ops, 0x5B, 2),
+            "vhaddps" => self.encode_avx_3op_pp(ops, 0x7C, 3),
+            "vhaddpd" => self.encode_avx_3op_pp(ops, 0x7C, 1),
+            "vhsubps" => self.encode_avx_3op_pp(ops, 0x7D, 3),
+            "vhsubpd" => self.encode_avx_3op_pp(ops, 0x7D, 1),
+            "vaddsubps" => self.encode_avx_3op_pp(ops, 0xD0, 3),
+            "vaddsubpd" => self.encode_avx_3op_pp(ops, 0xD0, 1),
+            "vcmpps" => self.encode_avx_3op_0f_imm8(ops, 0xC2, false),
+            "vcmppd" => self.encode_avx_3op_0f_imm8(ops, 0xC2, true),
+            "vshufps" => self.encode_avx_3op_0f_imm8(ops, 0xC6, false),
+            "vshufpd" => self.encode_avx_3op_0f_imm8(ops, 0xC6, true),
+            "vunpcklps" => self.encode_avx_3op_np(ops, 0x14),
+            "vunpckhps" => self.encode_avx_3op_np(ops, 0x15),
+            "vunpcklpd" => self.encode_avx_3op(ops, 0x14, true),
+            "vunpckhpd" => self.encode_avx_3op(ops, 0x15, true),
+            "vcvtsd2ss" => self.encode_avx_scalar_3op(ops, 0x5A, 3),
+            "vcvtss2sd" => self.encode_avx_scalar_3op(ops, 0x5A, 2),
+            "vcvtsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 3),
+            "vcvtss2si" => self.encode_avx_cvt_to_gp(ops, 0x2D, 2),
+            "vcvttsd2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 3),
+            "vcvttss2si" => self.encode_avx_cvt_to_gp(ops, 0x2C, 2),
+            "vcvtsi2sdl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 3, 0),
+            "vcvtsi2ssl" => self.encode_avx_cvt_from_gp(ops, 0x2A, 2, 0),
+            "vmovmskps" => self.encode_avx_extract_gp(ops, 0x50, false),
+            "vmovmskpd" => self.encode_avx_extract_gp(ops, 0x50, true),
+            "vroundps" => self.encode_avx_2op_3a_pp_imm8(ops, 0x08, 1),
+            "vroundpd" => self.encode_avx_2op_3a_pp_imm8(ops, 0x09, 1),
+            "vdpps" => self.encode_avx_3op_3a_imm8(ops, 0x40, true),
+            "vdppd" => self.encode_avx_3op_3a_imm8(ops, 0x41, true),
+            "vinsertps" => self.encode_avx_3op_3a_imm8(ops, 0x21, true),
+            "vextractps" => self.encode_avx_extract_gpr_imm8(ops, 0x17, true),
+            "vaesenc" => self.encode_avx_3op_38(ops, 0xDC, true),
+            "vaesenclast" => self.encode_avx_3op_38(ops, 0xDD, true),
+            "vaesdec" => self.encode_avx_3op_38(ops, 0xDE, true),
+            "vaesdeclast" => self.encode_avx_3op_38(ops, 0xDF, true),
+            "vaesimc" => self.encode_avx_2op_38(ops, 0xDB, true),
+            "vpclmulqdq" => self.encode_avx_3op_3a_pp_imm8(ops, 0x44, 1),
+            m if is_fma3_vex(m) => self.encode_fma3_vex(ops, m),
 
             _ => Err(format!(
                 "unhandled i686 instruction: {} {:?}",

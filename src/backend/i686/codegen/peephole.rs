@@ -2654,10 +2654,25 @@ fn propagate_reg_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 // substituted like any source — this is what lets the
                 // dispatcher chain `cmpl $1,%eax` (alias of %edi) become
                 // `cmpl $1,%edi` so the staging move can die.
+                //
+                // NEVER substitute through an XCHG: its source operand is
+                // simultaneously a destination (the swap writes both).
+                // Rewriting `xchgl %eax,%ecx` to `xchgl %esi,%ecx` changes
+                // WHICH register receives the swapped value — %eax keeps
+                // the byte instead of the crc — and every later reader of
+                // the pair runs on the wrong operands (simd_crc_adler:
+                // crc32b staged (byte, byte) instead of (crc, byte) and the
+                // checksum collapsed to 0).
                 let dst_name = reg32_name(dst_reg);
                 let src_name = reg32_name(src_reg);
                 let is_flag_only_cmp = infos[j].kind == LineKind::Cmp;
-                let new_line = if is_flag_only_cmp {
+                let is_xchg = line
+                    .split_ascii_whitespace()
+                    .next()
+                    .is_some_and(|mn| mn.starts_with("xchg"));
+                let new_line = if is_xchg {
+                    None
+                } else if is_flag_only_cmp {
                     replace_att_operand_reg(store.get(j), dst_name, src_name, true)
                 } else {
                     replace_att_source_reg(store.get(j), dst_name, src_name)

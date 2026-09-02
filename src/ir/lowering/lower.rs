@@ -1058,6 +1058,17 @@ impl Lowerer {
             // i686: ComplexDouble (16 bytes) and ComplexLongDouble (24 bytes) keep
             // ret_ty = IrType::Ptr (the default from_ctype mapping for complex types).
             // They will be handled via sret below.
+            // i686: _Float128/_Decimal128 (TFmode/TDmode, 16 bytes) is class
+            // MEMORY — GCC returns it through a hidden pointer (first stack
+            // arg, callee-popped with `ret $4`). The IR return becomes Ptr and
+            // the body stores the 16-byte carrier through the sret buffer
+            // (try_sret_return). x86-64 keeps the U128/xmm0:xmm1 return.
+            else if (matches!(full_ret_ctype, CType::Float128)
+                || full_ret_ctype == CType::Decimal128)
+                && crate::common::types::target_is_32bit()
+            {
+                ret_ty = IrType::Ptr;
+            }
         }
 
         // Track CType for pointer-returning functions
@@ -1111,6 +1122,14 @@ impl Lowerer {
             if matches!(full_ret_ctype, CType::ComplexDouble) && !self.decomposes_complex_double() {
                 let size = full_ret_ctype.size();
                 sret_size = Some(size);
+            }
+            // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
+            // hidden-pointer return, matching GCC's i386 convention.
+            if (matches!(full_ret_ctype, CType::Float128)
+                || full_ret_ctype == CType::Decimal128)
+                && crate::common::types::target_is_32bit()
+            {
+                sret_size = Some(16);
             }
         }
 
@@ -1796,6 +1815,100 @@ impl Lowerer {
                 arg_types[i] = IrType::U128;
                 arg_is_f128[i] = true;
             }
+        }
+        // ILP32: TFmode/TDmode is class MEMORY — GCC i386 returns it through
+        // a HIDDEN POINTER passed as the first stack argument, and the callee
+        // writes the 16 bytes through it and pops the pointer with `ret $4`
+        // (verified against GCC 14.2 i386 output for
+        // `_Float128 f(_Float128,_Float128){return a+b;}` and libgcc's
+        // __addtf3 epilogue). Model exactly that: alloca a 16-byte result
+        // buffer, prepend its address as the leading Ptr argument, set
+        // is_sret so the backend accounts for the callee-popped 4 bytes, and
+        // load the result value out of the buffer afterwards.  Every
+        // remaining argument KEEPS its own struct size/alignment/class
+        // metadata (shifted by one) so 16-byte TFmode args continue to be
+        // staged by value — zeroing that metadata made the backend pass
+        // bare pointers instead and corrupted every soft-float call.
+        // (The x86-64 path below returns in xmm0:xmm1 and does not apply.)
+        if self.target == crate::backend::Target::I686
+            && ret == IrType::U128
+            && ret_is_f128
+        {
+            let buf = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: buf,
+                ty: IrType::Ptr,
+                size: 16,
+                align: 0,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            let dest = self.fresh_value();
+            let mut full_args = Vec::with_capacity(args.len() + 1);
+            let mut full_types = Vec::with_capacity(arg_types.len() + 1);
+            let mut full_sizes: Vec<Option<usize>> = Vec::with_capacity(args.len() + 1);
+            let mut full_aligns = Vec::with_capacity(args.len() + 1);
+            let mut full_classes: Vec<Vec<crate::common::types::EightbyteClass>> =
+                Vec::with_capacity(args.len() + 1);
+            let mut full_f128 = Vec::with_capacity(args.len() + 1);
+            // Hidden return-buffer pointer: first stack argument, not a
+            // struct arg, no eightbyte classes (same shape as the proven
+            // struct-sret path in expr_calls.rs).
+            full_args.push(Operand::Value(buf));
+            full_types.push(IrType::Ptr);
+            full_sizes.push(None);
+            full_aligns.push(None);
+            full_classes.push(Vec::new());
+            full_f128.push(false);
+            full_args.extend(args.iter().cloned());
+            full_types.extend(arg_types.iter().cloned());
+            // Preserve each original argument's own by-value staging info.
+            for (i, info) in struct_info.iter().enumerate() {
+                match info {
+                    Some((size, align, classes)) => {
+                        full_sizes.push(Some(*size));
+                        full_aligns.push(Some(*align));
+                        full_classes.push(classes.clone());
+                    }
+                    None => {
+                        full_sizes.push(None);
+                        full_aligns.push(None);
+                        full_classes.push(Vec::new());
+                    }
+                }
+                full_f128.push(arg_is_f128[i]);
+            }
+            let n_full = full_args.len();
+            self.emit(Instruction::Call {
+                func: name.to_string(),
+                info: CallInfo {
+                    dest: None,
+                    args: full_args,
+                    arg_types: full_types,
+                    return_type: IrType::Void,
+                    is_variadic: false,
+                    num_fixed_args: n_full,
+                    struct_arg_sizes: full_sizes,
+                    struct_arg_aligns: full_aligns,
+                    struct_arg_classes: full_classes,
+                    struct_arg_riscv_float_classes: Vec::new(),
+                    struct_arg_is_f128_sse: full_f128,
+                    is_sret: true,
+                    is_fastcall: false,
+                    ret_eightbyte_classes: Vec::new(),
+                    ret_is_f128_sse: false,
+                    is_const: false,
+                    is_pure: false,
+                },
+            });
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest,
+                ptr: buf,
+                ty: IrType::U128,
+                seg_override: crate::common::types::AddressSpace::Default,
+            });
+            return dest;
         }
         let dest = self.fresh_value();
         let n = args.len();

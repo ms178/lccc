@@ -156,6 +156,11 @@ impl Lowerer {
         }
 
         // Determine sret/two-reg return convention
+        // `f128_sret_ret`: the callee returns a _Float128/_Decimal128 through
+        // the i686 hidden-pointer convention — the call result is the sret
+        // buffer ADDRESS, and the 16-byte carrier value must be loaded out of
+        // it (see the sret result handling below).
+        let mut f128_sret_ret = false;
         let (sret_size, two_reg_size, call_ret_classes) =
             if let Expr::Identifier(name, _) = stripped_func {
                 if self.is_func_ptr_variable(name) {
@@ -172,6 +177,7 @@ impl Lowerer {
                 } else {
                     // Direct function call - look up by function name
                     let sig = self.func_meta.sigs.get(name.as_str());
+                    f128_sret_ret = sig.is_some_and(|s| s.ret_is_f128_sse && s.sret_size.is_some());
                     (
                         sig.and_then(|s| s.sret_size),
                         sig.and_then(|s| s.two_reg_ret_size),
@@ -382,6 +388,20 @@ impl Lowerer {
 
         // For sret calls, the struct data is now in the alloca - return its address
         if let Some(alloca) = sret_alloca {
+            if f128_sret_ret {
+                // _Float128/_Decimal128 (i686 TFmode sret): the value is the
+                // 16-byte carrier CONTENTS, not the buffer address — load the
+                // gp-view value out of the buffer.
+                let val = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: val,
+                    ptr: alloca,
+                    ty: IrType::U128,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                });
+                return Operand::Value(val);
+            }
             return Operand::Value(alloca);
         }
 
@@ -962,6 +982,10 @@ impl Lowerer {
                         Some(CType::ComplexFloat) if !decomposes_cf => {
                             Some(CType::ComplexFloat.size())
                         }
+                        // _Float128/_Decimal128: 16-byte TFmode carriers (the
+                        // i686 stack layout aligns them; x86-64 puts them in
+                        // an XMM register via the is_f128_sse class).
+                        Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
                         _ => None,
                     }
                 })
@@ -1007,6 +1031,7 @@ impl Lowerer {
                         Some(CType::ComplexFloat) if !decomposes_cf => {
                             Some(CType::ComplexFloat.size())
                         }
+                        Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
                         _ => None,
                     }
                 })
@@ -1026,6 +1051,11 @@ impl Lowerer {
                     Some(ref ct @ CType::Struct(_)) | Some(ref ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
                         .map(|layout| layout.align),
+                    // _Float128/_Decimal128 args are 16-byte TFmode carriers:
+                    // the i686 stack layout aligns them to 16 in the outgoing
+                    // area (GCC i386 psABI), mirroring the struct_align Some(16)
+                    // the parameter side registers (func_lowering).
+                    Some(CType::Float128) | Some(CType::Decimal128) => Some(16),
                     _ => None,
                 }
             })

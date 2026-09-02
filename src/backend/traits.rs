@@ -991,8 +991,12 @@ pub trait ArchCodegen {
         }
 
         // Compute stack space needed for overflow args.
-        let stack_arg_space =
-            self.emit_call_compute_stack_space(&arg_classes, arg_types, struct_arg_aligns);
+        let stack_arg_space = self.emit_call_compute_stack_space(
+            &arg_classes,
+            arg_types,
+            struct_arg_aligns,
+            struct_arg_is_f128_sse,
+        );
 
         // Phase 1: Pre-convert F128 values that need helper calls (before stack args clobber regs).
         let f128_temp_space =
@@ -1015,6 +1019,7 @@ pub trait ArchCodegen {
             },
             f128_temp_space,
             struct_arg_aligns,
+            struct_arg_is_f128_sse,
         );
 
         self.state().reg_cache.invalidate_acc();
@@ -1081,6 +1086,7 @@ pub trait ArchCodegen {
         arg_classes: &[super::call_abi::CallArgClass],
         arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_is_f128_sse: &[bool],
     ) -> usize;
 
     /// Spill an indirect function pointer to a safe location before stack manipulation.
@@ -1116,6 +1122,7 @@ pub trait ArchCodegen {
         fptr_spill: usize,
         f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_is_f128_sse: &[bool],
     ) -> i64;
 
     /// Load arguments into registers (GP, FP, i128, struct-by-val, F128).

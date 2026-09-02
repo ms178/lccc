@@ -33,19 +33,50 @@ impl I686Codegen {
         }
     }
 
+    /// Stack-argument alignment per the GCC i386 psABI (all offsets verified
+    /// against the GCC 14.2 -m32 oracle):
+    ///   * everything packs at 4-byte slot granularity — doubles (`f1(double,
+    ///     int, double)`: c at offset 12), 12-byte x87 long double (`f3`),
+    ///     8-byte-aligned structs (`f7(int, struct{double,double}, int)`: a at
+    ///     offset 4) and even `aligned(16)` structs (`f8`: a at offset 4);
+    ///   * EXCEPT TFmode 16-byte carriers (__float128/_Decimal128), which are
+    ///     16-byte aligned within the outgoing area (`f2(__float128, int,
+    ///     __float128)`: b at offset 16; `f6(int, __float128, int)`: q at
+    ///     offset 16 — libgcc's __addtf3 likewise reads its by-value TF args
+    ///     at entry_esp+20/+36, i.e. after the hidden ret pointer plus
+    ///     12 bytes of alignment pad).
+    fn stack_arg_align(
+        &self,
+        i: usize,
+        ac: &call_abi::CallArgClass,
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_is_f128_sse: &[bool],
+    ) -> usize {
+        let _ = ac;
+        let align = struct_arg_aligns.get(i).copied().flatten().unwrap_or(4);
+        if struct_arg_is_f128_sse.get(i).copied().unwrap_or(false) && align >= 16 {
+            16
+        } else {
+            4
+        }
+    }
+
     pub(super) fn emit_call_compute_stack_space_impl(
         &self,
         arg_classes: &[call_abi::CallArgClass],
         arg_types: &[IrType],
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_is_f128_sse: &[bool],
     ) -> usize {
-        let mut total = 0;
+        let mut total = 0usize;
         for (i, ac) in arg_classes.iter().enumerate() {
             let ty = if i < arg_types.len() {
                 arg_types[i]
             } else {
                 IrType::I32
             };
+            let align = self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+            total = (total + align - 1) & !(align - 1);
             match ac {
                 call_abi::CallArgClass::Stack => match ty {
                     IrType::F64 | IrType::I64 | IrType::U64 => total += 8,
@@ -83,7 +114,8 @@ impl I686Codegen {
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
-        _struct_arg_aligns: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
+        struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         if stack_arg_space > 0 {
             emit!(self.state, "    subl ${}, %esp", stack_arg_space);
@@ -92,6 +124,10 @@ impl I686Codegen {
 
         let mut stack_offset: usize = 0;
         for (i, ac) in arg_classes.iter().enumerate() {
+            // GCC i386: TFmode 16-byte carriers are 16-byte aligned in the
+            // outgoing area; everything else packs at slot granularity.
+            let align = self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+            stack_offset = (stack_offset + align - 1) & !(align - 1);
             match ac {
                 call_abi::CallArgClass::I128Stack => {
                     self.emit_call_i128_stack_arg(&args[i], stack_offset);

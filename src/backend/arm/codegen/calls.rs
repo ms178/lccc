@@ -39,6 +39,7 @@ impl ArmCodegen {
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         compute_stack_arg_space(arg_classes, struct_arg_aligns)
     }
@@ -63,6 +64,7 @@ impl ArmCodegen {
         fptr_spill: usize,
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         if stack_arg_space > 0 {
             self.emit_sub_sp(stack_arg_space as i64);

@@ -410,6 +410,40 @@ impl super::InstructionEncoder {
         }
     }
 
+    /// Encode SSE4.1 extractps: $imm8, xmm, r/m32 (extract float lane to GPR).
+    /// Operand order mirrors the other imm8-first SSE insert/extract helpers.
+    pub(super) fn encode_extractps(&mut self, ops: &[Operand]) -> Result<(), String> {
+        if ops.len() != 3 {
+            return Err("extractps requires 3 operands".to_string());
+        }
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x15]);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Memory(mem),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                self.bytes.extend_from_slice(&[0x66, 0x0F, 0x3A, 0x15]);
+                self.encode_modrm_mem(src_num, mem)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported extractps operands".to_string()),
+        }
+    }
+
     /// Encode pextrw (extract word from XMM).
     pub(super) fn encode_pextrw(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 3 {

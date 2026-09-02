@@ -844,6 +844,17 @@ pub(crate) fn run_passes(
     // (see vectorize::set_x86_fma_enabled). AArch64 fmla is baseline ISA and
     // ignores this.
     vectorize::set_x86_fma_enabled(x86_fma && target == crate::backend::Target::X86_64);
+    // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
+    // fused form is required for the C99 single-rounding semantics, so the
+    // fold must only fire when the backend can actually emit vfmadd*.
+    // x86-64's project baseline is x86-64-v3 (FMA3 always present); i686
+    // has it only under -mfma.
+    simplify::set_has_fma3(match target {
+        crate::backend::Target::X86_64 => true,
+        crate::backend::Target::I686 => x86_fma,
+        crate::backend::Target::Aarch64 => true,
+        _ => false,
+    });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     // Linux's `.code16gcc` setup image has a hard 32 KiB code+data+BSS limit
     // and only six generally usable GPRs.  On the real linux-cachymod setup

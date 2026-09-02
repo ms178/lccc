@@ -3181,9 +3181,9 @@ impl ArchCodegen for ArmCodegen {
         fn emit_nonlocal_goto(&mut self, chain: &Operand, up: usize, rbp_off: i64, rsp_off: i64, label: &str) => emit_nonlocal_goto_impl;
         // calls
         fn call_abi_config(&self) -> CallAbiConfig => call_abi_config_impl;
-        fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
-        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>]) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;

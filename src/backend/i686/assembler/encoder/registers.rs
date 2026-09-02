@@ -54,6 +54,11 @@ pub(crate) fn is_xmm(name: &str) -> bool {
     name.starts_with("xmm")
 }
 
+/// Is this an XMM or YMM register?
+pub(crate) fn is_xmm_or_ymm(name: &str) -> bool {
+    name.starts_with("xmm") || name.starts_with("ymm")
+}
+
 /// Is this an MM (MMX) register?
 pub(crate) fn is_mm(name: &str) -> bool {
     name.starts_with("mm") && !name.starts_with("mmx")

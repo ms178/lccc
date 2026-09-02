@@ -2299,6 +2299,21 @@ const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("copysignf", IntrinsicOp::CopysignF32),
 ];
 
+/// Whether the compilation target has FMA3 (set once by run_passes from the
+/// target + -mfma flags, same pattern as vectorize::set_x86_fma_enabled).
+/// The fma/fmaf libcall fold requires it: the fused form IS the C99
+/// single-rounding semantics, so folding without a fused lowering would
+/// silently miscompile (mul+add double-rounds).
+static HAS_FMA3: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_has_fma3(enabled: bool) {
+    HAS_FMA3.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn has_fma3() -> bool {
+    HAS_FMA3.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ternary math functions mapping to single-instruction intrinsics.
 /// fma/fmaf REQUIRE the fused form (single rounding, C99 F.10.10.1);
 /// converting the libcall is not just faster, it is what makes glibc's own
@@ -2350,8 +2365,15 @@ fn simplify_math_call(
     }
 
     // Ternary intrinsic table (fma/fmaf -> single vfmadd, single rounding).
+    // Gated on the TARGET having FMA3: without it the backend has no fused
+    // lowering, so the libcall must survive (fmaf/fma in libm provide the
+    // C99-mandated single rounding; mul+add does not).  x86-64's project
+    // baseline is v3 (always FMA3); i686 folds only under -mfma.
     for &(name, intrinsic_op) in TERNARY_INTRINSICS {
         if func == name {
+            if !has_fma3() {
+                return None;
+            }
             if args.len() != 3 {
                 return None;
             }

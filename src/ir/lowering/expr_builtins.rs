@@ -328,7 +328,7 @@ impl Lowerer {
                 } else {
                     arg_vals.len()
                 };
-                let return_type = Self::builtin_return_type(name)
+                let return_type = self.builtin_return_type(name)
                     .or_else(|| libc_sig.map(|s| s.return_type))
                     .unwrap_or(crate::common::types::target_int_ir_type());
                 let struct_arg_sizes = vec![None; arg_vals.len()];
@@ -1137,7 +1137,7 @@ impl Lowerer {
 
         let dest = self.fresh_value();
         let return_type =
-            Self::builtin_return_type(name).unwrap_or(crate::common::types::target_int_ir_type());
+            self.builtin_return_type(name).unwrap_or(crate::common::types::target_int_ir_type());
         let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
         let struct_arg_sizes = vec![None; arg_vals.len()];
         self.emit(Instruction::Call {
@@ -1988,6 +1988,16 @@ impl Lowerer {
                     ty: IrType::I64,
                     seg_override: crate::common::types::AddressSpace::Default,
                 });
+                // ILP32 targets have no I128 value representation (the i686
+                // backend's I128 arithmetic is a libgcc-helper shape for
+                // __int128, not a general 128-bit scalar), so the x86-64
+                // pack-into-I128 trick does not port. There the aggregate
+                // convention IS pointer-based: hand back the result alloca
+                // pointer and let the caller copy the 16 bytes like any other
+                // aggregate expression.
+                if self.target == crate::backend::Target::I686 {
+                    return Some(Operand::Value(result_alloca));
+                }
                 let lo128 = self.fresh_value();
                 self.emit(Instruction::Cast {
                     dest: lo128,
