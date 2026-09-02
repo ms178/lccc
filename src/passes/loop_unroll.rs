@@ -548,47 +548,53 @@ fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64)
     if iv_step == 0 {
         return None; // non-advancing IV: infinite or empty; not a trip count
     }
+    // All intermediates use checked arithmetic.  `limit - iv_init` wraps for
+    // extreme constant pairs (e.g. limit = i64::MAX, iv_init = -1) and
+    // `-iv_step` wraps for iv_step = i64::MIN; a wrapped span would yield a
+    // nonsensical trip count, so bail and leave the loop rolled.
     let ascending = iv_step > 0;
+    let step_abs = iv_step.checked_abs()?;
     let trip = match cmp_op {
         IrCmpOp::Slt | IrCmpOp::Ult => {
             if !ascending {
                 return None;
             }
-            let span = limit - iv_init;
+            let span = limit.checked_sub(iv_init)?;
             if span <= 0 {
                 return None;
             }
-            (span + iv_step - 1) / iv_step
+            // ceil(span / step), overflow-free for span >= 1
+            (span - 1) / step_abs + 1
         }
         IrCmpOp::Sle | IrCmpOp::Ule => {
             if !ascending {
                 return None;
             }
-            let span = limit - iv_init;
+            let span = limit.checked_sub(iv_init)?;
             if span < 0 {
                 return None;
             }
-            span / iv_step + 1
+            (span / step_abs).checked_add(1)?
         }
         IrCmpOp::Sgt | IrCmpOp::Ugt => {
             if ascending {
                 return None;
             }
-            let span = iv_init - limit;
+            let span = iv_init.checked_sub(limit)?;
             if span <= 0 {
                 return None;
             }
-            (span + (-iv_step) - 1) / -iv_step
+            (span - 1) / step_abs + 1
         }
         IrCmpOp::Sge | IrCmpOp::Uge => {
             if ascending {
                 return None;
             }
-            let span = iv_init - limit;
+            let span = iv_init.checked_sub(limit)?;
             if span < 0 {
                 return None;
             }
-            span / -iv_step + 1
+            (span / step_abs).checked_add(1)?
         }
         _ => return None,
     };
@@ -778,8 +784,8 @@ fn try_complete_unroll_general(
             // FP nested loops—the performance target of the general form—are
             // unaffected.
             Instruction::Cmp { lhs, rhs, .. }
-                if operand_has_pointer_origin(func, lhs, 0)
-                    || operand_has_pointer_origin(func, rhs, 0) =>
+                if operand_has_pointer_origin(func, lhs)
+                    || operand_has_pointer_origin(func, rhs) =>
             {
                 false
             }
@@ -1030,7 +1036,7 @@ fn try_complete_unroll_general(
     func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
 
     // Outside uses: IV → final constant; carried phis → final clone values.
-    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
+    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
             continue;
@@ -1189,6 +1195,13 @@ fn try_complete_unroll_two_block(
         _ => return false,
     };
     let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+        return false;
+    };
+    // The post-loop IV may exceed i64 even when the trip count is small
+    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
+    // 2^63): refuse before mutating rather than substitute a wrapped
+    // constant, or worse, return false after rewriting the CFG.
+    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
         return false;
     };
     // Trip bound 16 with a 512-expanded-instruction budget (levkropp
@@ -1375,7 +1388,13 @@ fn try_complete_unroll_two_block(
     func.blocks[latch].terminator = Terminator::Branch(exit_target);
     let _ = (body_entry, exit_cond_positive);
 
-    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
+    // The post-loop IV may exceed i64 even when the trip count is small
+    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
+    // 2^63): refuse to clone rather than substitute a wrapped constant.
+    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
+        return false;
+    };
+    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
             continue;
@@ -1519,46 +1538,65 @@ pub(crate) fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32
 /// Whether an operand is transitively an object address. Pointer comparisons
 /// are represented as I64 on x86, so checking only `Cmp.ty == Ptr` misses the
 /// common `p == &local` form used by pointer-state loops.
-fn operand_has_pointer_origin(func: &IrFunction, op: &Operand, depth: usize) -> bool {
-    if depth > 8 {
-        return true; // fail closed for cyclic/very deep value webs
-    }
-    let Operand::Value(value) = op else {
+fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
+    // Walk the def-web of `op` looking for a pointer-producing instruction.
+    // A visited set (rather than a recursion-depth cap) terminates the walk:
+    // induction-variable cycles (`phi <- Add(phi, step)` in the latch) are
+    // ordinary in every counted loop, and a depth cap would fail closed on
+    // them, rejecting the exact numeric loops this analysis is meant to
+    // admit.  Each distinct value is expanded once, so the walk stays linear
+    // in the size of the web; pointer definitions are found at any depth.
+    let Operand::Value(root) = op else {
         return false;
     };
-    let def = func
-        .blocks
-        .iter()
-        .flat_map(|block| block.instructions.iter())
-        .find(|inst| inst.dest() == Some(*value));
-    match def {
-        Some(
-            Instruction::Alloca { .. }
-            | Instruction::DynAlloca { .. }
-            | Instruction::GlobalAddr { .. }
-            | Instruction::LabelAddr { .. }
-            | Instruction::GetElementPtr { .. },
-        ) => true,
-        Some(Instruction::Copy { src, .. } | Instruction::Cast { src, .. }) => {
-            operand_has_pointer_origin(func, src, depth + 1)
+    let mut visited: FxHashSet<Value> = FxHashSet::default();
+    let mut stack: Vec<Value> = vec![*root];
+    while let Some(value) = stack.pop() {
+        if !visited.insert(value) {
+            continue;
         }
-        Some(Instruction::Select {
-            true_val,
-            false_val,
-            ..
-        }) => {
-            operand_has_pointer_origin(func, true_val, depth + 1)
-                || operand_has_pointer_origin(func, false_val, depth + 1)
-        }
-        Some(Instruction::Phi { incoming, .. }) => incoming
+        let def = func
+            .blocks
             .iter()
-            .any(|(incoming, _)| operand_has_pointer_origin(func, incoming, depth + 1)),
-        Some(Instruction::BinOp { lhs, rhs, .. }) => {
-            operand_has_pointer_origin(func, lhs, depth + 1)
-                || operand_has_pointer_origin(func, rhs, depth + 1)
+            .flat_map(|block| block.instructions.iter())
+            .find(|inst| inst.dest() == Some(value));
+        let mut push = |stack: &mut Vec<Value>, operand: &Operand| {
+            if let Operand::Value(v) = operand {
+                stack.push(*v);
+            }
+        };
+        match def {
+            Some(
+                Instruction::Alloca { .. }
+                | Instruction::DynAlloca { .. }
+                | Instruction::GlobalAddr { .. }
+                | Instruction::LabelAddr { .. }
+                | Instruction::GetElementPtr { .. },
+            ) => return true,
+            Some(Instruction::Copy { src, .. } | Instruction::Cast { src, .. }) => {
+                push(&mut stack, src);
+            }
+            Some(Instruction::Select {
+                true_val,
+                false_val,
+                ..
+            }) => {
+                push(&mut stack, true_val);
+                push(&mut stack, false_val);
+            }
+            Some(Instruction::Phi { incoming, .. }) => {
+                for (incoming, _) in incoming {
+                    push(&mut stack, incoming);
+                }
+            }
+            Some(Instruction::BinOp { lhs, rhs, .. }) => {
+                push(&mut stack, lhs);
+                push(&mut stack, rhs);
+            }
+            _ => {}
         }
-        _ => false,
     }
+    false
 }
 
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
@@ -2919,6 +2957,27 @@ mod tests {
                 src: Value(2),
                 size: 8,
             },
+            Instruction::Atofeed the clone chain,
+                // and the exit block must remain a returning block.
+                let exit = func
+                    .blocks
+                    .iter()
+                    .find(|b| matches!(b.terminator, Terminator::Return(None)))
+                    .expect("outer exit must still exist and return");
+                let _ = exit;
+            }
+            other => panic!("outer latch terminator corrupted: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn substitution_covers_twenty_five_non_algebraic_use_positions() {
+        let mut instructions = vec![
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(2),
+                size: 8,
+            },
             Instruction::AtomicCmpxchg {
                 dest: Value(100),
                 ptr: Operand::Value(Value(3)),
@@ -3141,6 +3200,32 @@ mod tests {
         assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
         // Equality-style comparisons carry no ordering: refused.
         assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
+    }
+
+    #[test]
+    fn unroll_trip_extremes_never_wrap() {
+        use crate::ir::reexports::IrCmpOp::*;
+        // `limit - iv_init` overflows i64 (MAX - (-1)); the checked span
+        // must refuse rather than produce a wrapped trip count.
+        assert_eq!(complete_unroll_trip(-1, i64::MAX, Slt, 1), None);
+        assert_eq!(complete_unroll_trip(i64::MIN, 0, Sgt, -1), None);
+        // `-iv_step` overflows for iv_step = i64::MIN; checked_abs refuses.
+        assert_eq!(complete_unroll_trip(0, i64::MIN, Sgt, i64::MIN), None);
+        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, i64::MIN), None);
+        // Representable but huge: 0, 2^62 < MAX → 2 trips.  (The cloner's
+        // checked final IV then refuses to substitute 2^63; see below.)
+        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, 1 << 62), Some(2));
+        // Sle at the top of the range: span/step + 1 would be MAX + 1.
+        assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
+        // Extremes that stay in range must still unroll.
+        assert_eq!(complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2), Some(4));
+        assert_eq!(complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3), Some(3));
+        assert_eq!(complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3), Some(3));
+        // The post-loop IV bound used by both cloners: final = init +
+        // trip * step must be computed with checked arithmetic (this mirrors
+        // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
+        let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
+        assert!((1i64 << 62).checked_mul(trip).and_then(|d| 0i64.checked_add(d)).is_none());
     }
 
     #[test]
