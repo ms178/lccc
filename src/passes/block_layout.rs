@@ -258,6 +258,43 @@ pub(crate) fn relayout_blocks_rpo(func: &mut IrFunction) -> usize {
 ///
 /// Returns 1 if the order changed, 0 otherwise.
 pub(crate) fn relayout_blocks_loop_aware(func: &mut IrFunction) -> usize {
+    relayout_blocks_loop_aware_impl(func, BlockLayoutStart::Existing)
+}
+
+/// RPO-start variant for size-optimized (`-Os`/`-Oz`) compilation.
+///
+/// The throughput pipeline starts from the function's existing block order
+/// (see the comment in [`relayout_blocks_loop_aware_impl`]): that preserves
+/// the fall-through topology earlier passes built, which keeps hot branches
+/// not-taken — a measured ~19 % runtime win on `zlib_ng_adler32`.
+///
+/// That same property costs code size, and the cost is severe on 16-bit
+/// real-mode boot images (`-m16 -Os`, the linux-cachymod setup code with its
+/// hard 32 KiB `_end` gate): starting from RPO instead keeps mutually
+/// branching blocks adjacent, which maximizes short rel8 branches. Measured
+/// on the real-mode setup corpus this is worth ~570 B of `.text` — the
+/// difference between passing the gate with headroom and overflowing it by
+/// 2.5 KiB after the 4 KiB `.pecompat` alignment cliff. `-Os` users have
+/// already chosen size over speed, so the RPO start is the right trade there.
+pub(crate) fn relayout_blocks_loop_aware_rpo(func: &mut IrFunction) -> usize {
+    relayout_blocks_loop_aware_impl(func, BlockLayoutStart::Rpo)
+}
+
+/// Which initial linearization [`relayout_blocks_loop_aware_impl`] compacts.
+#[derive(Clone, Copy)]
+enum BlockLayoutStart {
+    /// Keep the function's current block order (reachable first, unreachable
+    /// parked at the end) — the throughput default.
+    Existing,
+    /// Recompute reverse post-order from the entry — the size-optimized
+    /// default (`-Os`/`-Oz`).
+    Rpo,
+}
+
+fn relayout_blocks_loop_aware_impl(
+    func: &mut IrFunction,
+    start: BlockLayoutStart,
+) -> usize {
     let n = func.blocks.len();
     if n < 2 {
         return 0;
@@ -281,11 +318,17 @@ pub(crate) fn relayout_blocks_loop_aware(func: &mut IrFunction) -> usize {
     //
     // Unreachable blocks are still parked at the end, and the loop-contiguity
     // compaction below is unchanged; only the starting point differs.
-    let mut order: Vec<usize> = {
-        let reachable = reachable_set(func);
-        let mut v: Vec<usize> = (0..n).filter(|b| reachable.contains(b)).collect();
-        v.extend((0..n).filter(|b| !reachable.contains(b)));
-        v
+    //
+    // `-Os`/`-Oz` (and therefore the `-m16` real-mode setup code) selects the
+    // RPO start via the size policy; see [`relayout_blocks_loop_aware_rpo`].
+    let mut order: Vec<usize> = match start {
+        BlockLayoutStart::Existing => {
+            let reachable = reachable_set(func);
+            let mut v: Vec<usize> = (0..n).filter(|b| reachable.contains(b)).collect();
+            v.extend((0..n).filter(|b| !reachable.contains(b)));
+            v
+        }
+        BlockLayoutStart::Rpo => reverse_postorder(func),
     };
 
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
