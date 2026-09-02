@@ -32,10 +32,19 @@ fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg
 }
 
 /// True when a physical register is an XMM float home (xmm2..xmm15, the
-/// allocator's float bank; xmm0/xmm1 are text-path scratch and never appear
-/// as allocator homes). Mirrors `is_xmm_reg` in emit.rs.
+/// allocator's float bank; xmm0/xmm1 can only hold INCOMING float-parameter
+/// homes — see `xmm_scratch_unsafe`). Mirrors `is_xmm_reg` in emit.rs.
 fn is_xmm_phys(reg: PhysReg) -> bool {
     reg.0 >= 20 && reg.0 <= 33
+}
+
+/// True when the pre-colored xmm0/xmm1 scratch registers are unsafe to
+/// clobber: float parameters are pre-colored to their INCOMING SysV
+/// registers (xmm0 = PhysReg 18, xmm1 = PhysReg 19), below the allocator's
+/// xmm pool (20..=33). The allocator itself never assigns 18/19, so any
+/// entry there is a live incoming parameter home.
+fn xmm_scratch_unsafe(ra: &FxHashMap<u32, PhysReg>) -> bool {
+    ra.values().any(|r| r.0 == 18 || r.0 == 19)
 }
 
 /// Convert an IR Operand to a MachOperand, using physical registers for
@@ -1040,6 +1049,227 @@ pub fn can_lower(inst: &Instruction) -> bool {
     }
 }
 
+// ── Typed direct calls (MachInst::CallTyped) ─────────────────────────────
+//
+// The SysV integer-register call contract, lowered as one atomic machine
+// instruction. The builder below is pure — it consumes pre-resolved
+// argument homes and returns the execution-ordered move plan — so the
+// full admission/ordering matrix is unit-testable without codegen state.
+// The emit-side gate (try_lower_machinst) computes the homes from the
+// allocator + stack-slot state and owns everything the pure builder must
+// not see (caller-save intervals, PLT naming, inline-memcpy interception).
+
+/// A pre-resolved argument source for the typed-call builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedCallSrc {
+    /// imm32 immediate (sign-extended by `movq`; zero emits as `xorl`).
+    Imm(i64),
+    /// GPR home (never rax/rcx/rbp — the emit-side gate rejects those).
+    Reg(PhysReg),
+    /// Spill-slot / stack-slot read at the argument's width.
+    Slot(i64),
+    /// Address of a local alloca (`&x` passed by pointer). Lowered as a
+    /// separate `Mov { src: AllocaAddr, dst: Reg(argreg) }` placed before
+    /// the call (the resolver renders it as `leaq slot(%rbp), %reg` with
+    /// the frame's addressing mode); the argument's own move is elided.
+    /// Two guards make the pre-move sound: no other argument may source
+    /// from the same ABI register, and the register must not be in the
+    /// caller-save set (the pre-move precedes the saves).
+    AllocaAddr(u32),
+}
+
+/// Why a call was refused the typed path (census label + unit-test oracle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedCallReject {
+    /// An argument has no representable home (accumulator, xmm, alloca
+    /// address, rax/rcx/rbp home, …) — the mature path stages it.
+    ArgNotRepresentable(usize),
+    /// An immediate argument does not fit the imm32 `movq` form.
+    ImmTooWide(usize),
+    /// The argument moves form a register-exchange cycle (e.g. both
+    /// arguments homed in each other's ABI registers). The text path
+    /// owns the hazard-spill machinery for this shape.
+    MoveCycle,
+    /// The return home is not a register or slot home.
+    RetNotRepresentable,
+}
+
+impl TypedCallReject {
+    /// Census label for the rejection reason.
+    pub fn label(self) -> &'static str {
+        match self {
+            TypedCallReject::ArgNotRepresentable(_) => "Call(arg-unrepresentable)",
+            TypedCallReject::ImmTooWide(_) => "Call(imm-too-wide)",
+            TypedCallReject::MoveCycle => "Call(move-cycle)",
+            TypedCallReject::RetNotRepresentable => "Call(ret-unrepresentable)",
+        }
+    }
+}
+
+/// The lowering plan for one typed call.
+#[derive(Debug, Clone)]
+pub struct TypedCallPlan {
+    /// Argument moves in execution order (self-moves already elided).
+    pub args: Vec<CallArgMove>,
+    /// Return-value move, or None for void calls / rax-homed returns.
+    pub ret: Option<CallRetMove>,
+}
+
+/// Build the argument/return move plan for a typed call.
+///
+/// `args` holds one entry per IR argument (None = not representable);
+/// `arg_sizes` is the parallel ABI move width list; `ret` is the return
+/// home (None = void call) as `Some((dst_source, width))` — the dst is
+/// `Reg` or `Slot` only, `Imm` is meaningless for a destination.
+///
+/// Ordering contract: every move whose source is a register R is ordered
+/// before every move whose destination is R (Kahn topological order over
+/// the ≤6-node dependency graph). A cycle means two arguments live in each
+/// other's ABI registers — the text path's hazard-spill area handles that
+/// shape; the builder refuses it rather than emitting a swap on a register
+/// the ABI does not promise.
+pub fn build_typed_call(
+    args: &[Option<TypedCallSrc>],
+    arg_sizes: &[OpSize],
+    ret: Option<(Option<TypedCallSrc>, OpSize)>,
+) -> Result<TypedCallPlan, TypedCallReject> {
+    debug_assert_eq!(args.len(), arg_sizes.len());
+
+    // 1. Resolve sources; elide self-moves (value already in its ABI reg).
+    struct PendingMove {
+        src: MachOperand,
+        dst_reg: PhysReg,
+        size: OpSize,
+    }
+    let mut pending: Vec<PendingMove> = Vec::with_capacity(args.len());
+    for (i, src) in args.iter().enumerate() {
+        let size = arg_sizes[i];
+        let dst_reg = SYSCALL_ARG_REGS[i];
+        let src = match src {
+            None => return Err(TypedCallReject::ArgNotRepresentable(i)),
+            Some(TypedCallSrc::Imm(v)) => {
+                if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+                    return Err(TypedCallReject::ImmTooWide(i));
+                }
+                MachOperand::Imm(*v)
+            }
+            Some(TypedCallSrc::Reg(r)) => {
+                // Defensive re-check of the emit-side gate: rax is the
+                // accumulator (not a stable home in this model), rbp is the
+                // frame pointer in frame-based functions.
+                if r.0 == RAX.0 || r.0 == RBP.0 {
+                    return Err(TypedCallReject::ArgNotRepresentable(i));
+                }
+                if *r == dst_reg {
+                    continue; // self-move: value already in place
+                }
+                MachOperand::Reg(MachReg::Phys(*r))
+            }
+            Some(TypedCallSrc::Slot(off)) => MachOperand::StackSlot(*off),
+            Some(TypedCallSrc::AllocaAddr(id)) => {
+                // Guard: no other argument may source from this ABI
+                // register — the pre-move writes it before the call, and
+                // the builder's topological order cannot interleave with
+                // the CallTyped-internal moves.
+                let conflicts = args.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && matches!(other, Some(TypedCallSrc::Reg(r)) if *r == dst_reg)
+                });
+                if conflicts {
+                    return Err(TypedCallReject::ArgNotRepresentable(i));
+                }
+                MachOperand::AllocaAddr(*id)
+            }
+        };
+        pending.push(PendingMove {
+            src,
+            dst_reg,
+            size,
+        });
+    }
+
+    // 2. Topologically order the moves. Precedence rule: for every register
+    //    R, every move that READS R must execute before every move that
+    //    WRITES R (the write destroys the home's value). So a move is
+    //    executable exactly when no still-unexecuted move READS its
+    //    destination register — executing it later would destroy that
+    //    reader's source. (A pending *writer* of this move's source does
+    //    NOT block it: this move reads first, the writer clobbers after.)
+    //    A pass with no progress while unexecuted moves remain is a
+    //    register-exchange cycle — refuse it to the text path, which owns
+    //    the hazard-spill machinery.
+    let mut ordered: Vec<CallArgMove> = Vec::with_capacity(pending.len());
+    let mut executed = vec![false; pending.len()];
+    while executed.iter().any(|&e| !e) {
+        let mut progressed = false;
+        for i in 0..pending.len() {
+            if executed[i] {
+                continue;
+            }
+            let dst_writes = pending[i].dst_reg;
+            let blocked = pending.iter().enumerate().any(|(j, m)| {
+                if j == i || executed[j] {
+                    return false;
+                }
+                // AllocaAddr sources read no data register (the address is
+                // frame-relative), so only register sources create edges.
+                matches!(&m.src, MachOperand::Reg(MachReg::Phys(r)) if *r == dst_writes)
+            });
+            if !blocked {
+                let m = &pending[i];
+                ordered.push(CallArgMove {
+                    src: m.src.clone(),
+                    dst_reg: m.dst_reg,
+                    size: m.size,
+                });
+                executed[i] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            return Err(TypedCallReject::MoveCycle);
+        }
+    }
+
+    // 3. Return home.
+    let ret_move = match ret {
+        None => None,
+        Some((src, size)) => match src {
+            None | Some(TypedCallSrc::Imm(_)) | Some(TypedCallSrc::AllocaAddr(_)) => {
+                // A destination receives the return value; an immediate or
+                // an alloca address is not a value home (the emit-side gate
+                // rejects alloca destinations before the builder runs).
+                return Err(TypedCallReject::RetNotRepresentable)
+            }
+            Some(TypedCallSrc::Reg(r)) => {
+                // rax→rax is a no-op; anything else register-hosted is a
+                // legal `mov %rax, %r?` copy — but keep the conservative
+                // contract: only real homes (rbp excluded as for args).
+                if r.0 == RBP.0 {
+                    return Err(TypedCallReject::RetNotRepresentable);
+                }
+                if r.0 == RAX.0 {
+                    None
+                } else {
+                    Some(CallRetMove {
+                        dst: MachOperand::Reg(MachReg::Phys(r)),
+                        size,
+                    })
+                }
+            }
+            Some(TypedCallSrc::Slot(off)) => Some(CallRetMove {
+                dst: MachOperand::StackSlot(off),
+                size,
+            }),
+        },
+    };
+
+    Ok(TypedCallPlan {
+        args: ordered,
+        ret: ret_move,
+    })
+}
+
 /// Context for ISel: provides slot information for alloca-aware lowering.
 pub struct ISelContext<'a> {
     pub reg_assignments: &'a FxHashMap<u32, PhysReg>,
@@ -1242,17 +1472,11 @@ fn lower_instruction_typed_inner(
                 return false;
             }
             // Scalar float load: mirror of the float store subset. The dest
-            // must be xmm-homed (xmm2..xmm15); the address a direct alloca
-            // slot or a GPR-held pointer. Slot-homed dests, constants and
-            // exotic addressing stay on the mature text path.
+            // must be xmm-homed (direct) or spill-slot-homed (xmm0 scratch
+            // relay); the address a direct alloca slot or a GPR-held pointer.
+            // Constants and exotic addressing stay on the mature text path.
             if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
                 if *seg_override != AddressSpace::Default {
-                    return false;
-                }
-                let Some(&dst_reg) = ra.get(&dest.0) else {
-                    return false;
-                };
-                if !is_xmm_phys(dst_reg) {
                     return false;
                 }
                 let size = if matches!(ty, IrType::F32 | IrType::D32) {
@@ -1260,30 +1484,61 @@ fn lower_instruction_typed_inner(
                 } else {
                     OpSize::S64
                 };
-                let dst = MachOperand::Reg(MachReg::Phys(dst_reg));
-                if let Some(&slot) = alloca_slots.get(&ptr.0) {
-                    out.push(MachInst::FMov {
-                        src: MachOperand::StackSlot(slot),
-                        dst,
-                        size,
-                    });
-                    return true;
-                }
-                if let Some(&base) = ra.get(&ptr.0) {
+                // Destination home: xmm register (direct) or spill slot
+                // (store the loaded value from the xmm0 scratch relay).
+                let relay_dest: Option<i64> = match ra.get(&dest.0) {
+                    Some(&dst_reg) if is_xmm_phys(dst_reg) => None,
+                    Some(_) => return false,
+                    None => match alloca_slots.get(&dest.0) {
+                        Some(&dslot) => Some(dslot),
+                        None => return false,
+                    },
+                };
+                // Source address: direct alloca slot or GPR-held pointer.
+                let src = if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    MachOperand::StackSlot(slot)
+                } else if let Some(&base) = ra.get(&ptr.0) {
                     if is_xmm_phys(base) {
                         return false;
                     }
-                    out.push(MachInst::FMov {
-                        src: MachOperand::Mem {
-                            base: MachReg::Phys(base),
-                            offset: 0,
-                        },
-                        dst,
-                        size,
-                    });
-                    return true;
+                    MachOperand::Mem {
+                        base: MachReg::Phys(base),
+                        offset: 0,
+                    }
+                } else {
+                    return false;
+                };
+                match relay_dest {
+                    None => {
+                        let dst =
+                            MachOperand::Reg(MachReg::Phys(ra.get(&dest.0).copied().unwrap()));
+                        out.push(MachInst::FMov { src, dst, size });
+                    }
+                    Some(dslot) => {
+                        // The relay clobbers xmm0. Float parameters are
+                        // pre-colored to their INCOMING register — xmm0/xmm1
+                        // are PhysReg 18/19, below the allocator pool — so a
+                        // live home there makes the scratch unsafe. Exact
+                        // guard: the allocator never assigns 18/19, so an
+                        // entry means a live incoming-ABI float param.
+                        if xmm_scratch_unsafe(ra) {
+                            return false;
+                        }
+                        // Load into the pre-colored xmm0 scratch, then store
+                        // to the slot-homed destination.
+                        out.push(MachInst::FMov {
+                            src,
+                            dst: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
+                            size,
+                        });
+                        out.push(MachInst::FMov {
+                            src: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                    }
                 }
-                return false;
+                return true;
             }
             if *seg_override != AddressSpace::Default {
                 return false;
@@ -1344,10 +1599,11 @@ fn lower_instruction_typed_inner(
             // Scalar float store (F32/F64 and the D32/D64 bit-carriers).
             //
             // Typed subset, mirroring the SSE branch of emit_store_impl: the
-            // value must already be homed in an xmm allocator register
-            // (xmm2..xmm15) and the address must be a direct alloca slot or
-            // a GPR-held pointer. Everything else -- slot-homed values (the
-            // text path relays through an xmm scratch), constants, xmm-based
+            // value is homed in an xmm allocator register (direct single
+            // move) or in a spill slot (two-move relay through the
+            // pre-colored xmm0 scratch, which no allocator home can occupy),
+            // and the address is a direct alloca slot or a GPR-held pointer.
+            // Everything else -- GPR-homed values, constants, xmm-based
             // pointers, indexed/folded GEP addressing, F128/x87 -- keeps the
             // mature emitter.
             if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
@@ -1357,43 +1613,67 @@ fn lower_instruction_typed_inner(
                 let Operand::Value(val_v) = val else {
                     return false;
                 };
-                let Some(&src_reg) = ra.get(&val_v.0) else {
-                    return false;
-                };
-                if !is_xmm_phys(src_reg) {
-                    return false;
-                }
                 let size = if matches!(ty, IrType::F32 | IrType::D32) {
                     OpSize::S32
                 } else {
                     OpSize::S64
                 };
-                let src = MachOperand::Reg(MachReg::Phys(src_reg));
-                if let Some(&slot) = alloca_slots.get(&ptr.0) {
-                    out.push(MachInst::FMov {
-                        src,
-                        dst: MachOperand::StackSlot(slot),
-                        size,
-                    });
-                    return true;
-                }
-                if let Some(&base) = ra.get(&ptr.0) {
+                // Value home: an xmm allocator register (direct), or a spill
+                // slot (relayed through the pre-colored xmm0 scratch — x86
+                // has no mem-to-mem SSE move). Anything else stays behind.
+                let relay_slot: Option<i64> = match ra.get(&val_v.0) {
+                    Some(&src_reg) if is_xmm_phys(src_reg) => None,
+                    Some(_) => return false, // GPR-homed float: lowering defect class
+                    None => match alloca_slots.get(&val_v.0) {
+                        Some(&vslot) => Some(vslot),
+                        None => return false,
+                    },
+                };
+                // Destination address: direct alloca slot or GPR-held pointer.
+                let dst = if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    MachOperand::StackSlot(slot)
+                } else if let Some(&base) = ra.get(&ptr.0) {
                     // x86 addressing has no xmm base; the text path relays
                     // such pointers through rcx -- leave that shape there.
                     if is_xmm_phys(base) {
                         return false;
                     }
-                    out.push(MachInst::FMov {
-                        src,
-                        dst: MachOperand::Mem {
-                            base: MachReg::Phys(base),
-                            offset: 0,
-                        },
-                        size,
-                    });
-                    return true;
+                    MachOperand::Mem {
+                        base: MachReg::Phys(base),
+                        offset: 0,
+                    }
+                } else {
+                    return false;
+                };
+                match relay_slot {
+                    None => {
+                        let src = MachOperand::Reg(MachReg::Phys(ra.get(&val_v.0).copied().unwrap()));
+                        out.push(MachInst::FMov { src, dst, size });
+                    }
+                    Some(vslot) => {
+                        // The relay clobbers xmm0 — see the load arm's note:
+                        // a live incoming-ABI float param homed in xmm0/xmm1
+                        // (PhysReg 18/19) makes the scratch unsafe.
+                        if xmm_scratch_unsafe(ra) {
+                            return false;
+                        }
+                        // Load slot → xmm0 scratch, then store scratch → dst.
+                        // xmm0 is never an allocator home (pool starts at
+                        // xmm2), so the pre-colored scratch is conflict-free
+                        // unless a float param lives there.
+                        out.push(MachInst::FMov {
+                            src: MachOperand::StackSlot(vslot),
+                            dst: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
+                            size,
+                        });
+                        out.push(MachInst::FMov {
+                            src: MachOperand::Reg(MachReg::Phys(XMM0_SCRATCH)),
+                            dst,
+                            size,
+                        });
+                    }
                 }
-                return false;
+                return true;
             }
             // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
             // emitter's size tables have always handled both; refusing them

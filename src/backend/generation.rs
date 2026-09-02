@@ -3331,7 +3331,7 @@ fn clobber_is_frame_pointer(c: &str) -> bool {
 
 /// `__memcpy_chk(dest, src, n, destlen)` may only be inlined when the
 /// fortify destlen covers `n` (or is `(size_t)-1` / SIZE_MAX).
-fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
+pub(crate) fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
     match destlen.to_i64() {
         Some(-1) => true,
         Some(d) if d >= n => true,
@@ -3340,7 +3340,7 @@ fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
 }
 
 /// `Some(n)` if this call is a fixed-size memcpy we may expand inline.
-fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
     if is_variadic || args.len() < 3 {
         return None;
     }

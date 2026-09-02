@@ -499,6 +499,65 @@ fn instruction_corpus() -> Vec<MachInst> {
     let mut v = Vec::new();
     let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
 
+    // CallTyped: every stage and operand shape the lowering can produce —
+    // caller-save spill/restore pairs, zero/imm32/reg/slot arguments, the
+    // sized return home — so the real-assembler differential proves the
+    // whole sequence encodes, not just the call mnemonic.
+    {
+        let abi = [PhysReg(14), PhysReg(15), PhysReg(16), PhysReg(7), PhysReg(12), PhysReg(13)];
+        for (i, dst) in abi.iter().enumerate() {
+            v.push(MachInst::CallTyped {
+                caller_saves: vec![(PhysReg(10), -48), (PhysReg(11), -56)],
+                args: vec![
+                    CallArgMove {
+                        src: MachOperand::Imm(if i % 2 == 0 { 0 } else { 4096 + i as i64 }),
+                        dst_reg: *dst,
+                        size: OpSize::S64,
+                    },
+                    CallArgMove {
+                        src: reg(PhysReg(if i == 5 { 1 } else { 2 })),
+                        dst_reg: PhysReg(if i == 5 { 15 } else { 14 }),
+                        size: OpSize::S32,
+                    },
+                    CallArgMove {
+                        src: MachOperand::StackSlot(-24 - i as i64),
+                        dst_reg: PhysReg(if i == 5 { 16 } else { abi[(i + 1) % 6].0 }),
+                        size: OpSize::S64,
+                    },
+                ],
+                target: "machinst_probe_callee".into(),
+                ret: Some(CallRetMove {
+                    dst: reg(PhysReg((2 + (i % 4)) as u8)),
+                    size: if i % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
+                }),
+            });
+        }
+        // Void call, no saves, no ret.
+        v.push(MachInst::CallTyped {
+            caller_saves: vec![],
+            args: vec![CallArgMove {
+                src: reg(PhysReg(1)),
+                dst_reg: PhysReg(14),
+                size: OpSize::S64,
+            }],
+            target: "machinst_probe_void".into(),
+            ret: None,
+        });
+        // The xmm0/xmm1 pre-colored scratch pair participates in FMov shapes.
+        for (a, b) in [(18u8, 20u8), (20, 18), (19, 21), (21, 19)] {
+            v.push(MachInst::FMov {
+                src: reg(PhysReg(a)),
+                dst: reg(PhysReg(b)),
+                size: OpSize::S64,
+            });
+            v.push(MachInst::FMov {
+                src: reg(PhysReg(a)),
+                dst: MachOperand::StackSlot(-64),
+                size: OpSize::S32,
+            });
+        }
+    }
+
     // FMov: every xmm allocator home at both scalar widths, plus every
     // operand pairing the lowering can produce (reg/reg, reg/mem, mem/reg,
     // reg/slot, slot/reg). The assembler differential proves the xmm8-15
@@ -2311,4 +2370,456 @@ fn float_binops_lower_with_exact_operand_order() {
         out.iter().all(|mi| !matches!(mi, MachInst::FAlu { .. })),
         "integer add produced FAlu: {out:?}"
     );
+}
+
+// ── 9. CallTyped: the typed direct-call contract ────────────────────────────
+//
+// The call is the most ABI-exposed instruction in the layer. These tests
+// pin the three invariants that make the atomic form sound:
+//   (a) argument moves execute in an order where every reader of a
+//       register runs before every writer of it (the home is destroyed
+//       by the write);
+//   (b) register-exchange shapes never reach the variant (the text path
+//       owns the hazard-spill machinery);
+//   (c) the emitted sequence is exactly saves → args → call → ret →
+//       restores, with zero-immediate arguments rendered as `xorl`.
+
+mod call_builder {
+    use super::super::isel::{build_typed_call, TypedCallReject, TypedCallSrc};
+    use super::*;
+    use crate::common::types::IrType;
+
+    const RDI: PhysReg = PhysReg(14);
+    const RSI: PhysReg = PhysReg(15);
+    const RDX: PhysReg = PhysReg(16);
+    const RCX: PhysReg = PhysReg(7);
+    const R8: PhysReg = PhysReg(12);
+    const R9: PhysReg = PhysReg(13);
+
+    fn s64() -> OpSize {
+        OpSize::S64
+    }
+
+    /// arg0's source is r8 (arg4's destination): arg0 must execute BEFORE
+    /// arg4, or the write destroys the value it still needs to read.
+    #[test]
+    fn orders_readers_before_writers() {
+        let plan = build_typed_call(
+            &[
+                Some(TypedCallSrc::Reg(R8)),  // arg0: read r8 …
+                Some(TypedCallSrc::Reg(PhysReg(1))), // arg1: rbx → rsi
+                Some(TypedCallSrc::Imm(7)),   // arg2
+                Some(TypedCallSrc::Slot(-8)), // arg3
+                Some(TypedCallSrc::Reg(PhysReg(2))), // arg4: r12 → r8 (writes the arg0 source!)
+                Some(TypedCallSrc::Imm(0)),   // arg5
+            ],
+            &[s64(); 6],
+            None,
+        )
+        .expect("acyclic shape must be accepted");
+        let pos = |want: PhysReg| {
+            plan.args
+                .iter()
+                .position(|m| m.dst_reg == want)
+                .unwrap_or_else(|| panic!("no move writes {:?}", want))
+        };
+        assert!(
+            pos(RDI) < pos(R8),
+            "the r8 reader must be ordered before the r8 writer: {:?}",
+            plan.args
+        );
+    }
+
+    /// f(a, b) with a homed in rsi (arg1's register) and b homed in rdi
+    /// (arg0's register) is a register exchange: no serial order is sound.
+    /// The builder must refuse it so the text path's hazard-spill area
+    /// handles the shape.
+    #[test]
+    fn rejects_register_exchange_cycles() {
+        let err = build_typed_call(
+            &[
+                Some(TypedCallSrc::Reg(RSI)), // a: rsi → rdi
+                Some(TypedCallSrc::Reg(RDI)), // b: rdi → rsi
+            ],
+            &[s64(), s64()],
+            None,
+        )
+        .expect_err("a swap cannot be ordered serially");
+        assert_eq!(err, TypedCallReject::MoveCycle);
+    }
+
+    /// A value already homed in its own ABI register needs no move.
+    #[test]
+    fn elides_self_moves() {
+        let plan = build_typed_call(
+            &[
+                Some(TypedCallSrc::Reg(RDI)), // arg0 already in rdi
+                Some(TypedCallSrc::Reg(PhysReg(1))),
+            ],
+            &[s64(), s64()],
+            None,
+        )
+        .unwrap();
+        assert!(
+            plan.args.iter().all(|m| m.dst_reg != RDI),
+            "self-move must be elided: {:?}",
+            plan.args
+        );
+        assert_eq!(plan.args.len(), 1);
+    }
+
+    #[test]
+    fn rejects_immediates_that_do_not_fit_the_imm32_movq_form() {
+        let err = build_typed_call(
+            &[Some(TypedCallSrc::Imm(0x1_0000_0000))],
+            &[s64()],
+            None,
+        )
+        .expect_err("64-bit immediates need movabsq, which the subset does not model");
+        assert_eq!(err, TypedCallReject::ImmTooWide(0));
+        // The extremes of the imm32 window are fine (movq sign-extends).
+        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MIN as i64))], &[s64()], None).is_ok());
+        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MAX as i64))], &[s64()], None).is_ok());
+    }
+
+    /// `&local` arguments lower through a pre-move writing the ABI register.
+    /// Another argument sourcing from that same register would read it
+    /// after the pre-move clobbered it — the builder must refuse.
+    #[test]
+    fn alloca_address_args_conflict_checked() {
+        let ok = build_typed_call(
+            &[
+                Some(TypedCallSrc::AllocaAddr(9)),
+                Some(TypedCallSrc::Reg(PhysReg(1))), // rbx: fine
+            ],
+            &[s64(), s64()],
+            None,
+        )
+        .expect("no other arg reads rdi");
+        assert!(matches!(
+            ok.args.iter().find(|m| m.dst_reg == RDI).map(|m| &m.src),
+            Some(MachOperand::AllocaAddr(9))
+        ));
+
+        let err = build_typed_call(
+            &[
+                Some(TypedCallSrc::AllocaAddr(9)),
+                Some(TypedCallSrc::Reg(RDI)), // reads rdi: the pre-move's victim
+            ],
+            &[s64(), s64()],
+            None,
+        )
+        .expect_err("another argument sources the pre-move's destination");
+        assert_eq!(err, TypedCallReject::ArgNotRepresentable(0));
+    }
+
+    /// The builder's defensive re-check: rax (accumulator) and rbp (frame
+    /// pointer) are never stable homes in this model.
+    #[test]
+    fn rejects_rax_and_rbp_argument_homes() {
+        for bad in [PhysReg(0), PhysReg(6)] {
+            let err = build_typed_call(&[Some(TypedCallSrc::Reg(bad))], &[s64()], None)
+                .expect_err("scratch/frame-pointer homes must be refused");
+            assert_eq!(err, TypedCallReject::ArgNotRepresentable(0));
+        }
+    }
+
+    #[test]
+    fn return_homes() {
+        // Register return.
+        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(1))), s64())))
+            .unwrap();
+        match plan.ret {
+            Some(r) => assert_eq!(r.dst, reg(PhysReg(1))),
+            None => panic!("register return home required"),
+        }
+        // Slot return.
+        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Slot(-16)), s64()))).unwrap();
+        match plan.ret {
+            Some(r) => assert_eq!(r.dst, MachOperand::StackSlot(-16)),
+            None => panic!("slot return home required"),
+        }
+        // rax-homed return: the copy is a no-op.
+        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(0))), s64()))).unwrap();
+        assert!(plan.ret.is_none(), "rax → rax must be elided");
+        // rbp return home: refused.
+        let err = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(6))), s64())))
+            .expect_err("the frame pointer is not a value home");
+        assert_eq!(err, TypedCallReject::RetNotRepresentable);
+        // Void call.
+        assert!(build_typed_call(&[], &[], None).unwrap().ret.is_none());
+    }
+
+    /// Six heterogeneous arguments: the full plan in one assertion, so a
+    /// regression in any position breaks a single test instead of a
+    /// property silently holding for the others. Position in the plan is
+    /// the TOPOLOGICAL order, so assertions are keyed by destination
+    /// register: the plan may legitimately reorder (arg5 reads rdx and
+    /// must precede arg2, which writes it), but every source/dest/width
+    /// binding is fixed.
+    #[test]
+    fn full_six_argument_shape() {
+        let plan = build_typed_call(
+            &[
+                Some(TypedCallSrc::Imm(42)),
+                Some(TypedCallSrc::Slot(-24)),
+                Some(TypedCallSrc::Reg(RCX)), // reads rcx: written by arg3's move
+                Some(TypedCallSrc::Imm(0)),
+                Some(TypedCallSrc::Reg(PhysReg(3))),
+                Some(TypedCallSrc::Reg(RDX)), // reads rdx: written by arg2's move
+            ],
+            &[
+                OpSize::S32,
+                OpSize::S64,
+                OpSize::S64,
+                OpSize::S32,
+                OpSize::S64,
+                OpSize::S32,
+            ],
+            Some((Some(TypedCallSrc::Slot(-32)), OpSize::S32)),
+        )
+        .expect("mixed but conflict-free shape");
+        assert_eq!(plan.args.len(), 6);
+        let by_dst = |want: PhysReg| -> &CallArgMove {
+            plan.args
+                .iter()
+                .find(|m| m.dst_reg == want)
+                .unwrap_or_else(|| panic!("no move for dst {want:?} in {:?}", plan.args))
+        };
+        assert_eq!(by_dst(RDI).src, MachOperand::Imm(42));
+        assert_eq!(by_dst(RDI).size, OpSize::S32);
+        assert_eq!(by_dst(RSI).src, MachOperand::StackSlot(-24));
+        assert_eq!(by_dst(RDX).src, MachOperand::Reg(MachReg::Phys(RCX)));
+        assert_eq!(by_dst(RCX).src, MachOperand::Imm(0));
+        assert_eq!(by_dst(R8).src, MachOperand::Reg(MachReg::Phys(PhysReg(3))));
+        assert_eq!(by_dst(R9).src, MachOperand::Reg(MachReg::Phys(RDX)));
+        assert_eq!(by_dst(R9).size, OpSize::S32);
+        // Reader-before-writer constraints across the plan (a reader must
+        // observe the home's original value, so it precedes the writer):
+        //   rdx: arg5's move reads it, arg2's move writes it.
+        //   rcx: arg2's move reads it, arg3's move writes it.
+        let pos = |want: PhysReg| plan.args.iter().position(|m| m.dst_reg == want).unwrap();
+        assert!(pos(R9) < pos(RDX), "the rdx reader must precede the rdx writer");
+        assert!(pos(RDX) < pos(RCX), "the rcx reader must precede the rcx writer");
+        assert_eq!(plan.ret.as_ref().unwrap().dst, MachOperand::StackSlot(-32));
+        assert_eq!(plan.ret.as_ref().unwrap().size, OpSize::S32);
+    }
+}
+
+// ── 10. CallTyped: golden emission ──────────────────────────────────────────
+
+/// The full stage order is part of the instruction's contract: caller-save
+/// spills, argument moves, the call, the return home, and the restores —
+/// the mature path's Phase 2b → 3 → 4 → 6 → 2b tail, typed end to end.
+#[test]
+fn calltyped_emits_saves_args_call_ret_restores_in_order() {
+    let inst = MachInst::CallTyped {
+        caller_saves: vec![(PhysReg(10), -48), (PhysReg(11), -56)], // r11, r10
+        args: vec![
+            CallArgMove {
+                src: MachOperand::Imm(0),
+                dst_reg: PhysReg(14),
+                size: OpSize::S64,
+            },
+            CallArgMove {
+                src: reg(PhysReg(1)),
+                dst_reg: PhysReg(15),
+                size: OpSize::S32,
+            },
+            CallArgMove {
+                src: MachOperand::StackSlot(-24),
+                dst_reg: PhysReg(16),
+                size: OpSize::S64,
+            },
+        ],
+        target: "mix6@PLT".into(),
+        ret: Some(CallRetMove {
+            dst: reg(PhysReg(2)),
+            size: OpSize::S64,
+        }),
+    };
+    let lines = emit(&inst);
+    assert_eq!(
+        lines,
+        vec![
+            "movq %r11, -48(%rbp)", // save r11
+            "movq %r10, -56(%rbp)", // save r10
+            "xorl %edi, %edi",      // zero immediate: the 3-byte form
+            "movl %ebx, %esi",      // 32-bit arg at its canonical width
+            "movq -24(%rbp), %rdx", // slot-homed arg
+            "call mix6@PLT",
+            "movq %rax, %r12",      // return home
+            "movq -56(%rbp), %r10", // restores in reverse
+            "movq -48(%rbp), %r11",
+        ],
+        "stage order or rendering drifted: {lines:?}"
+    );
+}
+
+/// A 32-bit return home must name %eax (the sub-register), not %rax with
+/// a 32-bit mnemonic — the mismatch the very first smoke test caught.
+#[test]
+fn calltyped_return_home_names_the_sized_rax() {
+    let inst = MachInst::CallTyped {
+        caller_saves: vec![],
+        args: vec![],
+        target: "f".into(),
+        ret: Some(CallRetMove {
+            dst: MachOperand::StackSlot(-8),
+            size: OpSize::S32,
+        }),
+    };
+    let lines = emit(&inst);
+    assert_eq!(
+        lines,
+        vec!["call f", "movl %eax, -8(%rbp)"],
+        "{lines:?}"
+    );
+}
+
+/// The typed call's registers — argument registers, rax — must be covered
+/// by the assembler differential like every other variant: add them to the
+/// corpus.
+#[test]
+fn calltyped_is_in_the_assembler_corpus() {
+    let has_calltyped = instruction_corpus()
+        .iter()
+        .any(|i| matches!(i, MachInst::CallTyped { .. }));
+    assert!(
+        has_calltyped,
+        "CallTyped must be part of instruction_corpus so the real-assembler \
+         differential and the determinism test cover it"
+    );
+}
+
+// ── 11. xmm0/xmm1 scratch: names and the relay liveness guard ───────────────
+
+/// xmm0/xmm1 (PhysReg 18/19) are the pre-colored float scratch pair. The
+/// 64-bit name table must know them (the relay emits them), and the float
+/// name table must agree.
+#[test]
+fn xmm_scratch_registers_emit_their_canonical_names() {
+    for (id, want) in [(18u8, "xmm0"), (19, "xmm1")] {
+        let mut out = AsmOutput::new();
+        emit_machinst(
+            &MachInst::FMov {
+                src: reg(PhysReg(20)),
+                dst: reg(PhysReg(id)),
+                size: OpSize::S32,
+            },
+            &mut out,
+        );
+        assert!(
+            out.buf.contains(&format!("%{want}")),
+            "PhysReg({id}) must render as %{want}: {}",
+            out.buf
+        );
+    }
+}
+
+/// The float store relay moves through xmm0. That is only sound when no
+/// live value is homed there — and float PARAMETERS are pre-colored to
+/// their INCOMING registers (xmm0 = PhysReg 18). A parameter home in the
+/// scratch must refuse the relay to the text path.
+#[test]
+fn float_store_relay_refuses_when_xmm0_holds_a_live_param() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    // Value 5 lives in xmm0 (PhysReg 18): a float parameter's incoming home.
+    let ra: FxHashMap<u32, PhysReg> = [(5u32, PhysReg(18))].into_iter().collect();
+    // The stored value (7) is slot-homed; the pointer is an alloca (9).
+    let slots: FxHashMap<u32, i64> = [(7u32, -24i64), (9u32, -32i64)].into_iter().collect();
+    let inst = Instruction::Store {
+        val: Operand::Value(Value(7)),
+        ptr: Value(9),
+        ty: IrType::F32,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    };
+    let mut out = Vec::new();
+    assert!(
+        !super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out),
+        "the relay would clobber the live xmm0 parameter home"
+    );
+}
+
+/// The healthy relay: slot-homed value → xmm0 → destination, two moves.
+#[test]
+fn float_store_relay_lowers_to_two_fmovs_through_xmm0() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    // No float params: xmm0 is free. A value in xmm2 keeps the direct path
+    // distinct from the relay under test.
+    let ra: FxHashMap<u32, PhysReg> = [(3u32, PhysReg(20))].into_iter().collect();
+    let slots: FxHashMap<u32, i64> = [(7u32, -24i64), (9u32, -32i64)].into_iter().collect();
+    let inst = Instruction::Store {
+        val: Operand::Value(Value(7)), // slot-homed
+        ptr: Value(9),                 // alloca
+        ty: IrType::F64,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    };
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
+    assert_eq!(out.len(), 2, "{out:?}");
+    match (&out[0], &out[1]) {
+        (
+            MachInst::FMov {
+                src: MachOperand::StackSlot(-24),
+                dst: MachOperand::Reg(MachReg::Phys(scratch)),
+                ..
+            },
+            MachInst::FMov {
+                src: MachOperand::Reg(MachReg::Phys(s2)),
+                dst: MachOperand::StackSlot(-32),
+                ..
+            },
+        ) => {
+            assert_eq!(*scratch, PhysReg(18), "relay must use the pre-colored xmm0");
+            assert_eq!(*s2, PhysReg(18));
+        }
+        other => panic!("unexpected relay shape: {other:?}"),
+    }
+}
+
+/// Mirror shape for loads: a slot-homed DESTINATION is written from the
+/// xmm0 scratch after the address is loaded into it.
+#[test]
+fn float_load_to_slot_homed_dest_relays_through_xmm0() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{Instruction, Value};
+
+    let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
+    let slots: FxHashMap<u32, i64> = [(1u32, -40i64), (2u32, -48i64)].into_iter().collect();
+    let inst = Instruction::Load {
+        dest: Value(2), // slot-homed destination
+        ptr: Value(1),  // alloca
+        ty: IrType::F64,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    };
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert!(matches!(
+        &out[0],
+        MachInst::FMov {
+            src: MachOperand::StackSlot(-40),
+            dst: MachOperand::Reg(MachReg::Phys(PhysReg(18))),
+            ..
+        }
+    ));
+    assert!(matches!(
+        &out[1],
+        MachInst::FMov {
+            src: MachOperand::Reg(MachReg::Phys(PhysReg(18))),
+            dst: MachOperand::StackSlot(-48),
+            ..
+        }
+    ));
 }

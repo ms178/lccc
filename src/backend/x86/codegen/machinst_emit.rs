@@ -42,6 +42,8 @@ fn reg_name(reg: PhysReg) -> &'static str {
         15 => "rsi",
         16 => "rdx",
         // XMM registers for F64 allocation
+        18 => "xmm0",
+        19 => "xmm1",
         20 => "xmm2",
         21 => "xmm3",
         22 => "xmm4",
@@ -255,6 +257,8 @@ fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
 /// the wrong operand class.
 fn freg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
+        18 => "xmm0",
+        19 => "xmm1",
         20 => "xmm2",
         21 => "xmm3",
         22 => "xmm4",
@@ -809,6 +813,61 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
 
         MachInst::Call { target } => {
             out.emit_fmt(format_args!("    call {}", target));
+        }
+
+        MachInst::CallTyped {
+            caller_saves,
+            args,
+            target,
+            ret,
+        } => {
+            // Phase 1: caller-save spills (Phase 2b of the mature path,
+            // typed). Same slot addressing as every other MachOperand —
+            // the StackSlot formatter applies the rsp/rbp frame mode.
+            for (reg, slot) in caller_saves {
+                out.emit_fmt(format_args!(
+                    "    movq {}, {}",
+                    fmt_reg(&MachReg::Phys(*reg), OpSize::S64),
+                    fmt_operand(&MachOperand::StackSlot(*slot), OpSize::S64, out)
+                ));
+            }
+            // Phase 2: argument moves in the lowering's execution order.
+            for m in args {
+                match &m.src {
+                    // Zero immediate: `xorl` zeroes the full register
+                    // (32-bit destination zero-extends) in 3 bytes vs 7
+                    // for `movq $0` — the GCC/Clang/ICC form.
+                    MachOperand::Imm(0) => {
+                        let r = fmt_reg(&MachReg::Phys(m.dst_reg), OpSize::S32);
+                        out.emit_fmt(format_args!("    xorl {}, {}", r, r));
+                    }
+                    _ => out.emit_fmt(format_args!(
+                        "    mov{} {}, {}",
+                        m.size.suffix(),
+                        fmt_operand(&m.src, m.size, out),
+                        fmt_reg(&MachReg::Phys(m.dst_reg), m.size)
+                    )),
+                }
+            }
+            // Phase 3: the call itself.
+            out.emit_fmt(format_args!("    call {}", target));
+            // Phase 4: return home.
+            if let Some(r) = ret {
+                out.emit_fmt(format_args!(
+                    "    mov{} %{}, {}",
+                    r.size.suffix(),
+                    sized_reg_name(RAX, r.size),
+                    fmt_operand(&r.dst, r.size, out)
+                ));
+            }
+            // Phase 5: caller-save restores.
+            for (reg, slot) in caller_saves.iter().rev() {
+                out.emit_fmt(format_args!(
+                    "    movq {}, {}",
+                    fmt_operand(&MachOperand::StackSlot(*slot), OpSize::S64, out),
+                    fmt_reg(&MachReg::Phys(*reg), OpSize::S64)
+                ));
+            }
         }
 
         MachInst::CallIndirect { reg } => {

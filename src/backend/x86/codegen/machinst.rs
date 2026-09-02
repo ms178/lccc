@@ -54,6 +54,27 @@ pub enum FAluOp {
     Div,
 }
 
+/// One register-argument move of a [`MachInst::CallTyped`]: place `src`
+/// (a resolved GPR home, spill-slot read, or immediate) into the SysV
+/// integer argument register `dst_reg`. Self-moves (source already in the
+/// target register) are elided by the lowering, never constructed.
+#[derive(Debug, Clone)]
+pub struct CallArgMove {
+    pub src: MachOperand,
+    pub dst_reg: PhysReg,
+    pub size: OpSize,
+}
+
+/// The return-value move of a [`MachInst::CallTyped`]: copy rax to the
+/// return value's home (register or spill slot) after the call. Emitted
+/// at the return type's width; a width narrower than 8 bytes renders the
+/// 32-bit form (`movl %eax, ...`), matching the mature path and the ABI.
+#[derive(Debug, Clone)]
+pub struct CallRetMove {
+    pub dst: MachOperand,
+    pub size: OpSize,
+}
+
 /// Shift operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftOp {
@@ -78,7 +99,7 @@ pub enum CondCode {
 }
 
 /// An operand in a machine instruction.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachOperand {
     /// Register operand.
     Reg(MachReg),
@@ -305,6 +326,55 @@ pub enum MachInst {
         target: String,
     },
 
+    /// Fully typed direct call — the SysV integer-register-call contract as
+    /// ONE machine instruction, the way an MIR `CALL` or a Cranelift
+    /// `call` instruction models it: declared clobbers, declared uses,
+    /// atomic under the replay fallback.
+    ///
+    /// Emission order (all stages are part of this instruction):
+    ///   1. `caller_saves`: spill every caller-saved register that holds a
+    ///      value live across the call to its spill slot. Computed by the
+    ///      lowering from the same `caller_save_intervals` data the mature
+    ///      path's Phase 2b consumes, at the call's program point.
+    ///   2. `args`: one move per register argument, placing its (already
+    ///      resolved) source into the SysV integer argument register.
+    ///      Sources are GPR homes, spill-slot reads, or imm32 immediates;
+    ///      a zero immediate emits as `xorl reg, reg` (3 bytes vs 7, the
+    ///      GCC/Clang/ICC form). The moves are execution-ordered by the
+    ///      lowering so no source is clobbered by an earlier move's
+    ///      destination; register-exchange cycles never reach this
+    ///      variant (they are rejected to the text path, which owns the
+    ///      hazard-spill area machinery).
+    ///   3. `call target` — PLT/version decoration is baked into `target`.
+    ///   4. `ret`: copy rax to the return value's home (register or slot).
+    ///      None for void calls.
+    ///   5. `caller_saves` again, reversed direction: restore each spilled
+    ///      register from its slot (the mature path's Phase 2b tail).
+    ///
+    /// Declared clobbers: the six SysV integer argument registers, rax,
+    /// rdx, r8-r11 and every xmm — the full caller-clobber set. Declared
+    /// uses: the argument sources (all read before any clobber) and the
+    /// spill slots (memory, not registers). Because the lowering flushes
+    /// the buffer immediately around the call run, no allocated vreg can
+    /// coexist with this instruction — the pre-colored argument/return
+    /// registers are therefore conflict-free by construction.
+    ///
+    /// The subset that may reach this variant (enforced twice — emit-side
+    /// gate and builder): direct call to a named symbol, non-variadic, no
+    /// sret/struct/i128/F128/x87 arguments, at most six integer/pointer
+    /// arguments of width 4 or 8, integer or pointer return. Everything
+    /// else stays on the mature path, which owns the general contract.
+    CallTyped {
+        /// (register, spill slot offset) pairs saved before / restored after.
+        caller_saves: Vec<(PhysReg, i64)>,
+        /// Register-argument moves in execution order.
+        args: Vec<CallArgMove>,
+        /// Direct call target (PLT decoration already applied).
+        target: String,
+        /// Return-value home: rax is copied here after the call.
+        ret: Option<CallRetMove>,
+    },
+
     /// Indirect function call: `call *%reg`. Clobbers caller-saved regs.
     CallIndirect {
         reg: MachReg,
@@ -359,6 +429,28 @@ pub const MACHINST_ALLOCATABLE_GPRS: &[PhysReg] = &[
     // Caller-saved (destroyed by calls, only for non-call-spanning values):
     R11, R10, R8, R9, RDI, RSI, RDX,
 ];
+
+/// The six SysV AMD64 integer argument registers, in ABI order:
+/// arg0=rdi, arg1=rsi, arg2=rdx, arg3=rcx, arg4=r8, arg5=r9.
+/// IDs follow the codegen convention (calls.rs: rdi=14, rsi=15, rdx=16,
+/// rcx=7, r8=12, r9=13).
+pub const SYSCALL_ARG_REGS: [PhysReg; 6] = [
+    PhysReg(14), // rdi
+    PhysReg(15), // rsi
+    PhysReg(16), // rdx
+    PhysReg(7),  // rcx
+    PhysReg(12), // r8
+    PhysReg(13), // r9
+];
+
+/// xmm0 — pre-colored float scratch. The allocator's XMM pool starts at
+/// xmm2 (PhysReg 20), so xmm0/xmm1 are conflict-free by construction: no
+/// allocated float value can ever live there. Used by the lowering to
+/// relay between two memory operands (x86 has no mem-to-mem SSE move) —
+/// slot-homed float loads/stores and float compare staging.
+pub const XMM0_SCRATCH: PhysReg = PhysReg(18);
+/// xmm1 — second pre-colored float scratch (two-operand compares).
+pub const XMM1_SCRATCH: PhysReg = PhysReg(19);
 
 impl MachReg {
     /// Returns true if this is a virtual register (needs allocation).
