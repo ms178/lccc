@@ -161,8 +161,11 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 /// ```
 ///
 /// This deliberately uses a stronger-than-necessary liveness proof: the loaded
-/// XMM register must not be mentioned again before the function's `.size`.
-/// That misses registers which are overwritten later, but makes deleting the
+/// XMM register must not be READ again before the function's `.size` — the
+/// first later mention may also be a full overwrite of the register (see
+/// [`is_pure_xmm_overwrite`]), which kills the loaded value and unblocks the
+/// fold when the allocator reuses the register later.  That still misses
+/// registers read after an intervening redefinition, but keeps deleting the
 /// defining load safe without teaching the text peephole full XMM dataflow.
 /// The load and consumer must be adjacent, so no address register or memory
 /// state can change between them.  Source==destination is rejected because the
@@ -225,7 +228,11 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         }
 
         // The source value must have no later use. Stop at `.size`; crossing a
-        // label is harmless for this intentionally whole-function proof.
+        // label is harmless for this intentionally whole-function proof.  One
+        // refinement: when the next mention fully overwrites the register,
+        // the loaded value is dead at that point — every later mention refers
+        // to the new value — so the fold stays sound when the allocator
+        // reuses the register for an unrelated value later on.
         let mut later_mention = false;
         for k in (i + 2)..len {
             if infos[k].is_nop() {
@@ -236,7 +243,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
                 break;
             }
             if mentions_xmm(t, src_reg) {
-                later_mention = true;
+                later_mention = !is_pure_xmm_overwrite(t, src_reg);
                 break;
             }
         }
@@ -1375,9 +1382,12 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
 
-        // ── liveness: exactly two mentions from the load to the function
-        //    end, and no intervening call (variadic FP args are implicit
-        //    reads of xmm0-xmm7). ────────────────────────────────────────
+        // ── liveness: the load and the FMA consume exactly two mentions;
+        //    the first mention past them must fully overwrite the register
+        //    (killing the loaded value) or be absent.  No intervening call
+        //    for xmm0-xmm7 (variadic FP args are implicit reads of
+        //    xmm0-xmm7). ──────────────────────────────────────────────────
+        let reg_token = format!("%xmm{}", n);
         let mut total = 0;
         let mut vetoed = false;
         let mut k = i;
@@ -1391,7 +1401,15 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
                     vetoed = true;
                     break;
                 }
-                total += mentions_token(t, &format!("%xmm{}", n));
+                let m = mentions_token(t, &reg_token);
+                if m > 0 && total == 2 {
+                    // First mention past load+consumer: sound only when it
+                    // rewrites the whole register; everything after it uses
+                    // the new value.
+                    vetoed = !is_pure_xmm_overwrite(t, &reg_token);
+                    break;
+                }
+                total += m;
                 if total > 2 {
                     break;
                 }
@@ -1412,6 +1430,178 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
         );
         changed = true;
         i = j + 1;
+    }
+    changed
+}
+
+/// Extract exact `SYM(%rip)` constant-pool operand tokens (`.LCFP_` family)
+/// from one line.  Both operand boundaries are checked: the token must be
+/// preceded by whitespace/comma/line start and the `(%rip)` must be followed
+/// by comma/whitespace/line end.  Displaced forms (`8+.LCFP_0(%rip)`) have
+/// non-identifier characters in the symbol range and are rejected.
+fn fp_const_rip_tokens(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(".LCFP_") {
+        let at = from + rel;
+        from = at + 6;
+        let before_ok = at == 0 || matches!(bytes[at - 1], b' ' | b',' | b'\t');
+        if !before_ok {
+            continue;
+        }
+        let Some(paren_rel) = line[at..].find('(') else {
+            continue;
+        };
+        let sym = &line[at..at + paren_rel];
+        // Pure pool symbol: identifiers and dots only (no `+`, no whitespace).
+        if sym.is_empty()
+            || !sym
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+        {
+            continue;
+        }
+        if !line[at + paren_rel..].starts_with("(%rip)") {
+            continue;
+        }
+        let after = at + paren_rel + 6;
+        if after < line.len() && !matches!(bytes[after], b',' | b' ' | b'\t') {
+            continue;
+        }
+        out.push(sym.to_string());
+    }
+    out
+}
+
+/// Hoist a repeatedly-loaded RIP-relative FP constant-pool value into a
+/// single register materialization:
+///
+/// ```text
+///     movsd .LCFP_0(%rip), %xmm1   <- placed into a dead (NOP) slot
+///     ...
+///     vaddsd .LCFP_0(%rip), %xmm2, %xmm2     vaddsd %xmm1, %xmm2, %xmm2
+///     vaddsd .LCFP_0(%rip), %xmm4, %xmm4  -> vaddsd %xmm1, %xmm4, %xmm4
+/// ```
+///
+/// The mature emitter homes scalar FP constants in `.rodata` and re-reads
+/// the pool at every use.  In leaf hot kernels that multiplies the load
+/// count — dot8d's SSE2 kernel performed 12 loads per call (8 data plus 4
+/// reads of the SAME 8-byte constant) where gcc/clang materialize the
+/// constant once (gcc: a single `pxor`) — a measured ~18% runtime gap on
+/// the dot8bench2 driver.  The rewritten value bits are identical: the
+/// materialization copies the same pool bytes the folded operand read.
+///
+/// Soundness conditions (all function-wide and conservative):
+/// * no `call` anywhere — every xmm is caller-saved, so a materialization
+///   would be dead after any call;
+/// * no inline-asm region — opaque code may touch any xmm register;
+/// * no `blendv`-family line — those read `%xmm0` implicitly;
+/// * the chosen register has ZERO textual mentions in the whole store,
+///   NOP'd lines included, because later passes may revive a NOP slot with
+///   its original text;
+/// * the materialization lands in a NOP slot before the first rewritten use
+///   with no label between slot and last use, so every use is reached by
+///   fall-through from the materialization;
+/// * only exact `SYM(%rip)` operands of known scalar-FP mnemonics are
+///   rewritten; pinned lines and multi-line combined slots are skipped.
+///
+/// Needs a count of at least 2 rewritten uses of the same symbol: with one
+/// use the materialization would just add an instruction.
+pub(super) fn hoist_repeated_fp_constant_loads(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    const FP_OPS: &[&str] = &[
+        "addsd", "addss", "subsd", "subss", "mulsd", "mulss", "divsd", "divss", "vaddsd",
+        "vaddss", "vsubsd", "vsubss", "vmulsd", "vmulss", "vdivsd", "vdivss", "vfmadd132sd",
+        "vfmadd132ss", "vfmadd213sd", "vfmadd213ss", "vfmadd231sd", "vfmadd231ss", "vfmsub132sd",
+        "vfmsub132ss", "vfmsub213sd", "vfmsub213ss", "vfmsub231sd", "vfmsub231ss", "vfnmadd132sd",
+        "vfnmadd132ss", "vfnmadd213sd", "vfnmadd213ss", "vfnmadd231sd", "vfnmadd231ss",
+        "vfnmsub132sd", "vfnmsub132ss", "vfnmsub213sd", "vfnmsub213ss", "vfnmsub231sd",
+        "vfnmsub231ss",
+    ];
+
+    let len = store.len();
+    for k in 0..len {
+        if infos[k].is_nop() {
+            continue;
+        }
+        if infos[k].kind == LineKind::Call || infos[k].kind == LineKind::InlineAsm {
+            return false;
+        }
+        if infos[k].trimmed(store.get(k)).contains("blendv") {
+            return false;
+        }
+    }
+
+    // Collect rewritten-candidate uses per pool symbol.
+    let mut uses: Vec<(String, Vec<usize>)> = Vec::new();
+    for k in 0..len {
+        if infos[k].is_nop() || infos[k].pinned {
+            continue;
+        }
+        let t = store.get(k);
+        if t.contains('\n') {
+            continue; // combined multi-line slot: leave alone
+        }
+        let tt = infos[k].trimmed(t);
+        let Some((op, _)) = tt.split_once(' ') else {
+            continue;
+        };
+        if !FP_OPS.contains(&op) {
+            continue;
+        }
+        for sym in fp_const_rip_tokens(tt) {
+            match uses.iter_mut().find(|(s, _)| *s == sym) {
+                Some((_, sites)) => sites.push(k),
+                None => uses.push((sym, vec![k])),
+            }
+        }
+    }
+
+    let mut changed = false;
+    for (sym, sites) in uses.iter().filter(|(_, s)| s.len() >= 2) {
+        // Free-register scan over ALL lines (NOP'd text can be revived by
+        // later passes, so its mentions count too).
+        let mut mentioned = [false; 16];
+        for k in 0..len {
+            let t = store.get(k);
+            for n in 0..16 {
+                if !mentioned[n] && mentions_token(t, &format!("%xmm{}", n)) > 0 {
+                    mentioned[n] = true;
+                }
+            }
+        }
+        let Some(free) = (0..16).find(|n| !mentioned[*n]) else {
+            continue;
+        };
+        let reg = format!("%xmm{}", free);
+
+        // Materialization slot: the latest NOP before the first use, with
+        // no label between slot and last use (pure fall-through).
+        let first = sites[0];
+        let last = sites[sites.len() - 1];
+        let Some(slot) = (0..first).rev().find(|&p| infos[p].is_nop()) else {
+            continue;
+        };
+        if (slot + 1..=last).any(|k| infos[k].kind == LineKind::Label) {
+            continue;
+        }
+
+        replace_line(
+            store,
+            &mut infos[slot],
+            slot,
+            format!("    movsd {}(%rip), {}", sym, reg),
+        );
+        let tok = format!("{}(%rip)", sym);
+        for &k in sites {
+            let t = store.get(k).to_string();
+            let new = crate::backend::peephole_common::replace_whole_word(&t, &tok, &reg);
+            replace_line(store, &mut infos[k], k, new);
+        }
+        changed = true;
     }
     changed
 }
@@ -2045,6 +2235,72 @@ mod fma_mem_fold_tests {
         assert!(!changed, "later reader must veto the fold");
     }
 
+    /// A later FULL overwrite of the loaded register kills the loaded
+    /// value, so the fold is sound: everything past the overwrite uses
+    /// the new value.  This is the register-reuse shape real allocators
+    /// emit constantly (the dot8d SSE2 kernel reuses %xmm3 for the last
+    /// a-element load).
+    #[test]
+    fn folds_when_next_mention_fully_overwrites() {
+        let (changed, out) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movsd 40(%rdi), %xmm11\n",
+        );
+        assert!(changed, "pure overwrite kills the loaded value");
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+        assert_eq!(out[1], "movsd 40(%rdi), %xmm11");
+    }
+
+    /// SIB addressing has commas of its own; the destination check must
+    /// look past them to the final operand.
+    #[test]
+    fn folds_when_overwrite_uses_sib_addressing() {
+        let (changed, out) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vmovsd 32(%rdi,%rax,8), %xmm11\n",
+        );
+        assert!(changed, "SIB-addressed overwrite still kills the value");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+        assert_eq!(out.len(), 2, "{out:?}");
+    }
+
+    /// A self-zeroing xor is a full overwrite too.
+    #[test]
+    fn folds_when_next_mention_is_self_zeroing_xor() {
+        let (changed, _) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   pxor %xmm11, %xmm11\n",
+        );
+        assert!(changed, "pxor zeroes the whole register");
+    }
+
+    /// A STORE mentioning the register reads it — not an overwrite.
+    #[test]
+    fn refuses_when_next_mention_is_a_store() {
+        let (changed, _) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movsd %xmm11, (%rax)\n",
+        );
+        assert!(!changed, "a store reads the loaded value");
+    }
+
+    /// A partial write (movhpd keeps the low half) does not kill the
+    /// loaded value.
+    #[test]
+    fn refuses_when_next_mention_partially_writes() {
+        let (changed, _) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   movhpd (%rax), %xmm11\n",
+        );
+        assert!(!changed, "movhpd leaves the low lane untouched");
+    }
+
     /// dest == loaded register means the FMA line mentions it twice; the
     /// two-mention budget is exhausted, so the fold is refused (sound even
     /// though the rewrite would actually be valid).
@@ -2324,5 +2580,230 @@ mod fma132_reuse_tests {
              \x20   vaddsd %xmm1, %xmm3, %xmm3\n",
         );
         assert!(!changed, "rmw reads the loaded value");
+    }
+}
+
+#[cfg(test)]
+mod fp_reg_load_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_fp_register_loads;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_fp_register_loads(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The dot8d SSE2 shape: %xmm3 carries the b0 load, the consumer is
+    /// adjacent, and %xmm3 is later REUSED by a full-overwrite load of
+    /// the last a element.  The reuse kills the loaded value, so the
+    /// fold is sound.
+    #[test]
+    fn folds_when_register_reused_by_later_overwrite() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
+             \x20   movsd 0x38(%rdi), %xmm3\n",
+        );
+        assert!(changed, "later full overwrite kills the loaded value");
+        assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
+        assert_eq!(out.len(), 3, "{out:?}");
+    }
+
+    /// A later reader vetoes the fold even with the refinement.
+    #[test]
+    fn refuses_when_later_line_reads_register() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n",
+        );
+        assert!(!changed, "later reader must veto");
+    }
+
+    /// Register-token boundary: a later mention of %xmm11 is NOT a
+    /// mention of %xmm1 — the scan must run past it and fold.
+    #[test]
+    fn folds_when_later_line_mentions_wider_numbered_register() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm1\n\
+             \x20   vmulsd %xmm1, %xmm2, %xmm2\n\
+             \x20   movsd (%rdi), %xmm11\n",
+        );
+        assert!(changed, "%xmm11 does not mention %xmm1");
+        assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
+    }
+
+    /// A read-modify-write on the loaded register reads the old value —
+    /// not a pure overwrite.
+    #[test]
+    fn refuses_when_reuse_is_read_modify_write() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd %xmm5, %xmm3, %xmm3\n",
+        );
+        assert!(!changed, "rmw reads the loaded value before writing");
+    }
+}
+
+#[cfg(test)]
+mod fp_const_hoist_tests {
+    use super::super::super::types::{classify_line, mark_nop, LineInfo, LineKind};
+    use super::hoist_repeated_fp_constant_loads;
+    use crate::backend::peephole_common::LineStore;
+
+    /// Run the pass over `asm` after marking `nop_lines` dead and applying
+    /// `mutate` to the classification vector (for InlineAsm injection).
+    fn run_with(
+        asm: &str,
+        nop_lines: &[usize],
+        mutate: impl FnOnce(&mut [LineInfo]),
+    ) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        for &i in nop_lines {
+            mark_nop(&mut infos[i]);
+        }
+        mutate(&mut infos);
+        let changed = hoist_repeated_fp_constant_loads(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    fn run(asm: &str, nop_lines: &[usize]) -> (bool, Vec<String>) {
+        run_with(asm, nop_lines, |_| {})
+    }
+
+    /// The dot8d SSE2 shape: the constant zero is re-read at every use;
+    /// a dead slot before the first use hosts the single materialization.
+    #[test]
+    fn hoists_repeated_constant_into_free_register() {
+        let (changed, out) = run(
+            "    movsd (%rdi), %xmm2\n\
+             \x20   movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[1],
+        );
+        assert!(changed, "two constant reads must hoist");
+        assert_eq!(out[1], "movsd .LCFP_0(%rip), %xmm0", "slot hosts load: {out:?}");
+        assert_eq!(out[3], "vaddsd %xmm0, %xmm2, %xmm2");
+        assert_eq!(out[4], "vaddsd %xmm0, %xmm4, %xmm4");
+    }
+
+    /// Without a dead slot there is nowhere to materialize.
+    #[test]
+    fn refuses_without_a_dead_slot() {
+        let (changed, _) = run(
+            "    vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[],
+        );
+        assert!(!changed, "no NOP slot, no hoist");
+    }
+
+    /// A label between slot and uses breaks fall-through dominance.
+    #[test]
+    fn refuses_when_a_label_separates_slot_and_uses() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20L5:\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "jump could enter past the materialization");
+    }
+
+    /// Any call kills every caller-saved xmm after it.
+    #[test]
+    fn refuses_when_function_contains_a_call() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   call foo\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "calls clobber all xmm registers");
+    }
+
+    /// One use: the materialization would only add an instruction.
+    #[test]
+    fn refuses_when_only_one_use() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n",
+            &[0],
+        );
+        assert!(!changed, "single use must not hoist");
+    }
+
+    /// blendv-family instructions read %xmm0 implicitly.
+    #[test]
+    fn refuses_with_blendv_present() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   pblendvb %xmm7, %xmm6\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+        );
+        assert!(!changed, "implicit xmm0 reader vetoes");
+    }
+
+    /// Opaque inline asm may touch any register.
+    #[test]
+    fn refuses_with_inline_asm() {
+        let (changed, _) = run_with(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0],
+            |infos| infos[1].kind = LineKind::InlineAsm,
+        );
+        assert!(!changed, "inline asm vetoes");
+    }
+
+    /// Every xmm mentioned somewhere: no free materialization register.
+    #[test]
+    fn refuses_when_all_registers_mentioned() {
+        let mut asm = String::from("    movsd (%rsi), %xmm3\n");
+        for n in 0..16 {
+            asm.push_str(&format!("    vmovsd %xmm{}, (%rsp)\n", n));
+        }
+        asm.push_str("    vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n");
+        asm.push_str("    vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n");
+        let (changed, _) = run(&asm, &[0]);
+        assert!(!changed, "no free register, no hoist");
+    }
+
+    /// NOP'd lines' mentions still count: later passes may revive the slot
+    /// text, so a register mentioned only in dead lines is NOT free.
+    #[test]
+    fn dead_line_mentions_still_block_a_register() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   movsd (%rax), %xmm0\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[0, 1],
+        );
+        assert!(changed, "still hoists with another register");
+        assert_eq!(out[0], "movsd .LCFP_0(%rip), %xmm1", "xmm0 is claimed by the dead line: {out:?}");
     }
 }

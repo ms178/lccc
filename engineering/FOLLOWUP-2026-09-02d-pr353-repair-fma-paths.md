@@ -199,3 +199,104 @@ driver), outputs identical.  9 unit tests.  Kill switch:
 benchmark outputs 152/0/0, differential audit vs gas 2.44 827/827
 byte-exact on the rebased tree, i686 `#APP` round-trip verified
 through the integrated assembler.
+
+## 8. Session S21 — #356/#357 red-team + SSE2 constant-load pathology
+
+**Upstream moved:** #357 merged S13–S20 byte-faithfully (`git diff
+adebc72 5ec05cb` = only the 8 #356 files; all five S17–S20 markers
+grep-hit in the merged tree). #356 added the MachInst typed-call
+layer. Base for this session: `5ec05cb`.
+
+**#356 audit verdict — AGREE, no defects found.** Deep-dived
+`build_typed_call` (isel.rs), `try_lower_call_typed` (emit.rs), and
+the 5-phase emitter (machinst_emit.rs):
+- Kahn topological arg-move ordering (readers-before-writers per
+  register) with `MoveCycle` refusal to the mature text path — sound;
+- gate completeness: variadic/sret/struct/>6-args/any-float/128b and
+  xmm-homed/rax/rbp/rcx homes all rejected; AllocaAddr pre-moves
+  guarded against caller-save reuse;
+- phase order (spills → args → call → ret-home → reversed restores)
+  was initially suspected to let a phase-5 restore clobber the return
+  value — DISPROVEN: the mature text path orders identically
+  (traits.rs phases 6 then 2b), so ret-home ∈ caller-saves is an
+  allocator invariant shared by both paths, not a #356 regression;
+- xmm0/xmm1 scratch relays: pre-colored, allocator pool starts at
+  xmm2, and the live-incoming-float-param case is explicitly refused
+  (isel.rs:1518/1655, pinned by
+  `float_store_relay_refuses_when_xmm0_holds_a_live_param`);
+- measured: MachInst coverage 42.87% → 48.46% (571-file census),
+  Call rejects 500 → 19, Store(float) 218 → 123.
+
+**Fix 1 — pure-overwrite refinement for `fold_fp_register_loads` and
+`fold_fma_memory_src2`.** Both liveness proofs refused any fold when
+the loaded xmm register was mentioned again *anywhere* before
+function end — but the mention is often the allocator REUSING the
+register (`movsd 56(%rdi), %xmm3` for the last a-element in dot8d),
+which kills the loaded value. Reused S20's `is_pure_xmm_overwrite`
+(mov family / self-xor, full-width destination): first later mention
+a pure overwrite ⇒ fold. dot8d SSE2 29 → 28 insns + ret (= gcc's
+28 + ret). 9 new tests.
+
+**Fix 2 — `hoist_repeated_fp_constant_loads` (new pass).** The SSE2
+dot8d still ran ~18% slower than gcc despite instruction parity;
+cross-linked A/B (lccc-main+gcc-kernel vs gcc-main+lccc-kernel)
+localized 100% of the gap to lccc's kernel, and a hand-patched
+register-zero variant recovered all of it: the emitter re-read the
+SAME 8-byte `.LCFP_0` constant 4× per call (12 loads/call vs gcc's
+8 + one `pxor`). New text pass materializes a pool constant used ≥2×
+into a register with zero textual mentions anywhere in the store
+(NOP'd lines included — revival-safe), placed in a dead NOP slot
+before the first use with no intervening label (fall-through
+dominance), leaf functions only (no call — xmm are all caller-saved;
+no inline asm; no blendv implicit-xmm0). dot8d SSE2 → 29 insns + ret
+(gcc 28 + ret; the extra insn is the return `movsd`, measured
+runtime-irrelevant), runtime 365–375ms → 324–347ms vs gcc 307–332ms
+(parity).
+9 unit tests. Kill switch: `CCC_PEEPHOLE_SKIP=fp_const_hoist`.
+
+Note: the remaining `movsd %xmm2, %xmm0` return copy was measured
+(hand-patched xmm0-homed kernel): NO runtime effect — return
+placement regalloc stays cosmetic for this shape.
+
+**S21 evidence:** unit 1615/0, regression 571/0/15 (AB-diffs 0),
+benchmark outputs 152/0/0; FMA path byte-identical to S20
+(dot8k.s21 diff empty), FMA runtime parity 314–317ms vs gcc
+306–331ms; dot8 outputs identical (8.75e+08).
+
+**Backlog (updated after S21):** float gate audit (xmm-homed call
+args still text path), vectorizer global-array bailout, Memcpy
+(94)/Store-other (79) census, loop-gate ≤32, linker oracle,
+resident-zero-in-regalloc, width-aware narrow-write liveness i686.
+
+## 9. Session S22 — GAS 2.47 oracle + rebase onto #358
+
+**Maintainer direction: the assembler oracle is GAS 2.47, not 2.44.**
+Built binutils 2.47 (2.47.20260726) from the GNU tarball (gas-only,
+`--enable-targets=i686-linux-gnu,x86_64-linux-gnu`) and re-ran the
+full i686 differential audit against it:
+
+- **VEX sweep: 0 mismatches** (3 LCCC-REJECTs, the documented
+  EVEX-only shapes: vmovd xmm,xmm, vpermpd/vpermq reg forms);
+- **Legacy sweep: 0 mismatches** (20 LCCC-REJECTs, 59 SKIPs);
+- **reject/skip sets byte-identical between 2.44 and 2.47** — no
+  2.47-only syntax newly accepted that the encoder refuses, nothing
+  newly rejected that it emits;
+- x86-64 encoder spot-checks under 2.47 --64: CET family (rstorssp
+  F3 0F 01 /5, saveprevssp F3 0F 01 EA, setssbsy F3 0F 01 E8,
+  clrssbsy F3 0F AE /6, wrss{d,q}/wruss{d,q} 0F 38 F6/66 0F 38 F5
+  ± REX.W) and the XSAVE family (0F AE /4-/6, 0F C7 /4-/5, and the
+  binutils xrstors quirk 0F C7 /3) — all byte-identical to the
+  encodings the encoder emits.
+
+The i686 encoder comments now cite 2.47 (originally captured on
+2.44, re-audited identical). #356's PLT naming already anticipates
+2.47 (`sym@ver@PLT` rejection), and elf_writer_common's NOP-run
+layout already carries the 2.47 flip (`count/11 > 7`, vs `> 8` on
+2.44) — upstream is 2.47-aware where it matters.
+
+**Rebase onto `6fcbb1d2` (PR #358).** #358 = stack-layout soundness
+fixes (slot width from emitter width; Tier-2 hole-aware slot sharing
+disabled by default after a ZSTD-preboot corruption hunt) —
+orthogonal to the text peepholes; S21 cherry-picked clean
+(`3f8966e9`). Full battery on the rebased tree: lib 1615/0,
+regression 571/0/15 (AB-diffs 0), benchmark outputs 152/0/0.

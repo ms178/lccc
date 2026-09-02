@@ -1503,7 +1503,8 @@ mod tests {
     }
 
     /// Golden-byte lock for the VEX/FMA3/SSE4.2 encodings, verified against
-    /// GNU as 2.44 (`as --32`).  A new 1400-line encoder must not drift from
+    /// GNU as 2.47 (`as --32`; originally captured on 2.44, re-audited
+    /// byte-identical on 2.47).  A new 1400-line encoder must not drift from
     /// the ISA: every byte below is what binutils emits for the same source
     /// line, including the 2-byte (C5) vs 3-byte (C4) VEX decision, the W bit
     /// for pd/sd forms, and the inverted vvvv field.
@@ -1552,7 +1553,8 @@ mod tests {
     }
 
     /// Golden-byte lock for the legacy SSE/ISA encodings repaired by the
-    /// differential audit against GNU as 2.44: EXTRACTPS emitted PEXTRW's
+    /// differential audit against GNU as (2.44, re-audited byte-identical
+    /// on 2.47): EXTRACTPS emitted PEXTRW's
     /// opcode, INSERTPS emitted PEXTRB's, CVTTPD2DQ carried CVTPD2DQ's
     /// prefix (rounding instead of truncation), the 16-bit mul/div forms
     /// double-prefixed with 66 66, bare `iret` selected IRET16, `nop` with
