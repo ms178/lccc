@@ -448,8 +448,12 @@ const RMW_OPS: &[&str] = &[
 /// The accumulator is copied into a scratch register, updated, and copied back.
 /// Applying the operation in place removes both copies. Sound when the scratch
 /// register is dead after the copy-back, the accumulator is not read between
-/// the copies, and the operand of the RMW op is not the accumulator itself
-/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8, %r8`).
+/// the copies, and no source operand of the RMW op mentions the accumulator
+/// (`xorq %r8, %rax` with `%r8` as the accumulator would become `xorq %r8,
+/// %r8`). Source operands that mention the SCRATCH register — including
+/// registers embedded in compound sources like `imulq $imm, %rax` — are
+/// rewritten to the accumulator, which carries the same value once the
+/// staging copy is gone.
 pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -504,13 +508,43 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        // The operand must not be the accumulator (in-place would alias) and
-        // must not be the scratch register itself.
-        if let Some(src_fam) = plain_gp_operand(op_src) {
-            if src_fam == acc_fam || src_fam == tmp_fam {
-                i += 1;
-                continue;
+        // Scan EVERY operand token on the op's source side. Compound sources
+        // such as the 3-operand `imulq $imm, %rax` embed a register after the
+        // immediate; parsing only the whole source string as a bare register
+        // let those forms slip past the alias check, and the fold then
+        // deleted the staging `movq` while the op still read the scratch
+        // register — a stale-register miscompile (found via the dot8
+        // magic-division loop: `imulq $magic, %rax, %rsi` reading a dead
+        // `%rax` instead of the accumulator `%rsi`).
+        //
+        // * Source mentions the ACCUMULATOR anywhere -> reject. The in-place
+        //   form would alias source and destination (historical behaviour
+        //   for the bare-register case, kept conservatively).
+        // * Source mentions the SCRATCH register -> rewrite that token to
+        //   the accumulator: after the fold the staging copy is gone and the
+        //   accumulator carries exactly the value the scratch held. Only the
+        //   exact scratch text is rewritten (width-exact, mirroring the
+        //   move-relay pass); any width-variant alias rejects instead.
+        let mut src_tokens: Vec<&str> = op_src.split(',').map(str::trim).collect();
+        let mut reject = false;
+        for tok in src_tokens.iter_mut() {
+            if let Some(src_fam) = plain_gp_operand(tok) {
+                if src_fam == acc_fam {
+                    reject = true;
+                    break;
+                }
+                if src_fam == tmp_fam {
+                    if *tok != tmp {
+                        reject = true; // width-variant alias: not text-safe
+                        break;
+                    }
+                    *tok = acc; // scratch carried the accumulator's value
+                }
             }
+        }
+        if reject {
+            i += 1;
+            continue;
         }
         let Some(k) = next_real(j + 1) else {
             i += 1;
@@ -535,7 +569,8 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        let new_line = format!("    {}{}, {}", op, op_src, acc);
+        let new_src = src_tokens.join(", ");
+        let new_line = format!("    {}{}, {}", op, new_src, acc);
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_line);
         mark_nop(&mut infos[k]);
@@ -549,6 +584,7 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
+    use super::*;
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -893,4 +929,73 @@ mod tests {
         ));
         assert!(out.contains("movl %edx, %eax"), "{out}");
     }
+
+    // ── accumulator round-trip: compound-source alias guards ──────────────
+    //
+    // Regression for the dot8 magic-division miscompile: an earlier pass
+    // folded the staging copy into the imul source (`imulq $imm, %rax, %rax`
+    // after `movq %rsi, %rax`), then the round-trip fold deleted the staging
+    // copy while rewriting only the DESTINATION — emitting
+    // `imulq $imm, %rax, %rsi` reading the now-stale scratch register.
+
+    #[test]
+    fn acc_roundtrip_rewrites_compound_src_mentioning_scratch() {
+        // Direct drive of the pass (end-to-end runs may legitimately
+        // pre-rewrite the staging copy elsewhere): the 3-operand imul names
+        // the scratch register in its compound source; the fold must move
+        // that mention onto the accumulator together with the destination.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edi, %rsi\n",
+            "    movq %rsi, %r11\n",
+            "    imulq $1717986919, %r11, %r11\n",
+            "    movq %r11, %rsi\n",
+            "    sarq $33, %rsi\n",
+            "    movq %rsi, (%rdx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(fold_accumulator_roundtrip(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(
+            out.contains("imulq $1717986919, %rsi, %rsi"),
+            "expected in-place fold with rewritten src: {out}"
+        );
+        assert!(
+            !out.contains("imulq $1717986919, %r11, %rsi"),
+            "stale-scratch miscompile: {out}"
+        );
+        // The staging copies are gone.
+        assert!(!out.contains("movq %rsi, %r11"), "{out}");
+        assert!(!out.contains("movq %r11, %rsi"), "{out}");
+    }
+
+    #[test]
+    fn acc_roundtrip_never_reads_stale_scratch_when_src_mentions_acc() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %edi, %rsi\n",
+            "    movq %rsi, %rax\n",
+            "    imulq $1717986919, %rsi, %rax\n",
+            "    movq %rax, %rsi\n",
+            "    sarq $33, %rsi\n",
+            "    movq %rsi, (%rdx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // Whatever combination of folds fires, the imul must never end up
+        // reading %rax as its source with %rsi as destination: %rax does not
+        // hold the multiplicand once the staging copy is deleted.
+        assert!(
+            !out.contains("imulq $1717986919, %rax, %rsi"),
+            "stale-scratch miscompile: {out}"
+        );
+    }
+
 }

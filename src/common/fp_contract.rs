@@ -31,6 +31,22 @@ pub enum FpContract {
 }
 
 impl FpContract {
+    /// The contraction default for C compilation: [`FpContract::Fast`],
+    /// matching GCC's C default (`-ffp-contract=fast` in GNU dialects since
+    /// 4.6). Verified against the godbolt oracles on a cross-statement
+    /// reduction (`t = a[i]*b[i]; s = s + t;`, -O3 -march=x86-64-v3):
+    /// gcc16.2 and icx fuse to vfmadd by default; only clang (whose C
+    /// default is `on`) keeps the separate pair. The conservative
+    /// [`FpContract::Off`] default lost every scalar FMA opportunity
+    /// against the reference compiler (dot8: 46 instructions vs gcc's 21)
+    /// while changing numerics away from GCC's, not toward it.
+    /// Explicit `-ffp-contract={on,off}` flags always win; `Off` remains
+    /// the enum `Default` for internal/test callers that want the
+    /// fail-closed sentinel.
+    pub const fn c_language_default() -> Self {
+        FpContract::Fast
+    }
+
     /// Whether backend mul+add fusion is allowed for a candidate pair with
     /// the given expression tags (`None` = untagged: pass-generated or
     /// inlined value).

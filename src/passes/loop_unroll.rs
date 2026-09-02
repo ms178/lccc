@@ -528,6 +528,73 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   uses of carried phis with the last clone's corresponding value; the exit
 ///   block's phi edges from the header label are relabeled to the last
 ///   clone's latch (the block that now branches to the exit).
+/// Exact static trip count for a constant-stride IV loop, or `None` when the
+/// stride is degenerate (0) or its sign contradicts the exit comparison
+/// (e.g. a negative step against `i < limit`), which would mean the loop
+/// never terminates or never runs past the guard.
+///
+/// Complete unrolling needs the EXACT count up front — there is no cleanup
+/// loop — so every arm is closed-form:
+///   * `i <  limit`, step > 0: ceil((limit - init) / step)
+///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
+///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
+///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
+/// The ceil forms are exact for non-divisible spans because the exit test
+/// runs every stride; the floor+1 forms count the last in-range iteration.
+/// Non-positive spans (loop body never executes) yield `None`, matching the
+/// pre-existing step-1 guards. For step == 1 this reduces to the historical
+/// arithmetic verbatim.
+fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
+    if iv_step == 0 {
+        return None; // non-advancing IV: infinite or empty; not a trip count
+    }
+    let ascending = iv_step > 0;
+    let trip = match cmp_op {
+        IrCmpOp::Slt | IrCmpOp::Ult => {
+            if !ascending {
+                return None;
+            }
+            let span = limit - iv_init;
+            if span <= 0 {
+                return None;
+            }
+            (span + iv_step - 1) / iv_step
+        }
+        IrCmpOp::Sle | IrCmpOp::Ule => {
+            if !ascending {
+                return None;
+            }
+            let span = limit - iv_init;
+            if span < 0 {
+                return None;
+            }
+            span / iv_step + 1
+        }
+        IrCmpOp::Sgt | IrCmpOp::Ugt => {
+            if ascending {
+                return None;
+            }
+            let span = iv_init - limit;
+            if span <= 0 {
+                return None;
+            }
+            (span + (-iv_step) - 1) / -iv_step
+        }
+        IrCmpOp::Sge | IrCmpOp::Uge => {
+            if ascending {
+                return None;
+            }
+            let span = iv_init - limit;
+            if span < 0 {
+                return None;
+            }
+            span / -iv_step + 1
+        }
+        _ => return None,
+    };
+    Some(trip)
+}
+
 fn try_complete_unroll_general(
     func: &mut IrFunction,
     lp: &loop_analysis::NaturalLoop,
@@ -604,15 +671,14 @@ fn try_complete_unroll_general(
         return false;
     }
 
-    // Basic IV: phi in header, Add(phi, 1) in the latch.
+    // Basic IV: phi in header, Add(phi, step) in the latch. The stride may
+    // be any non-zero constant; complete_unroll_trip rejects degenerate
+    // stride/comparison combinations.
     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
         find_iv_in_loop(func, header, latch, latch_label)
     else {
         return false;
     };
-    if iv_step != 1 {
-        return false;
-    }
 
     // Exit from the header's CondBranch.
     let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
@@ -645,32 +711,8 @@ fn try_complete_unroll_general(
     };
 
     // Trip count (same arithmetic as the two-block unroller).
-    let trip: i64 = match cmp_op {
-        IrCmpOp::Slt | IrCmpOp::Ult => {
-            if limit_n <= iv_init {
-                return false;
-            }
-            limit_n - iv_init
-        }
-        IrCmpOp::Sle | IrCmpOp::Ule => {
-            if limit_n < iv_init {
-                return false;
-            }
-            limit_n - iv_init + 1
-        }
-        IrCmpOp::Sgt | IrCmpOp::Ugt => {
-            if iv_init <= limit_n {
-                return false;
-            }
-            iv_init - limit_n
-        }
-        IrCmpOp::Sge | IrCmpOp::Uge => {
-            if iv_init < limit_n {
-                return false;
-            }
-            iv_init - limit_n + 1
-        }
-        _ => return false,
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+        return false;
     };
     if !(2..=16).contains(&trip) {
         return false;
@@ -847,7 +889,11 @@ fn try_complete_unroll_general(
 
     for (ci, plan) in plans.iter().enumerate() {
         let t = (ci + 1) as i64; // iteration index this clone represents
-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t, iv_ty));
+        // Clone `t` observes the IV after `t` strides, not after `t` steps of
+        // 1: with the constant-stride trip count in place the stride may be
+        // any non-zero constant, so the substituted constant must be scaled
+        // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
+        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
 
         // label_map: original label → clone label (header + body).
         let mut label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
@@ -984,7 +1030,7 @@ fn try_complete_unroll_general(
     func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
 
     // Outside uses: IV → final constant; carried phis → final clone values.
-    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip, iv_ty));
+    let final_iv = Operand::Const(IrConst::from_i64(iv_init + trip * iv_step, iv_ty));
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
             continue;
@@ -1081,9 +1127,6 @@ fn try_complete_unroll_two_block(
     else {
         return false;
     };
-    if iv_step != 1 {
-        return false;
-    }
     let Some((
         exit_target,
         body_entry,
@@ -1145,32 +1188,8 @@ fn try_complete_unroll_two_block(
         },
         _ => return false,
     };
-    let trip: i64 = match cmp_op {
-        IrCmpOp::Slt | IrCmpOp::Ult => {
-            if limit_n <= iv_init {
-                return false;
-            }
-            limit_n - iv_init
-        }
-        IrCmpOp::Sle | IrCmpOp::Ule => {
-            if limit_n < iv_init {
-                return false;
-            }
-            limit_n - iv_init + 1
-        }
-        IrCmpOp::Sgt | IrCmpOp::Ugt => {
-            if iv_init <= limit_n {
-                return false;
-            }
-            iv_init - limit_n
-        }
-        IrCmpOp::Sge | IrCmpOp::Uge => {
-            if iv_init < limit_n {
-                return false;
-            }
-            iv_init - limit_n + 1
-        }
-        _ => return false,
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+        return false;
     };
     // Trip bound 16 with a 512-expanded-instruction budget (levkropp
     // 1b4bac8b's full-unroll limits, grafted onto our two-block complete
@@ -3054,6 +3073,148 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n")
             );
+        }
+    }
+
+
+    // ── complete_unroll_trip truth table ─────────────────────────────────
+    // Exhaustive closed-form coverage of the constant-stride trip count:
+    // the historical step-1 arithmetic must reduce verbatim, and every
+    // stride>1 / negative-stride arm must match a reference loop simulation.
+    #[test]
+    fn unroll_trip_step_one_matches_historical_arithmetic() {
+        use crate::ir::reexports::IrCmpOp::*;
+        // i < 8, step 1  → 8 trips (classic 0..8).
+        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
+        // i <= 7, step 1 → 8 trips.
+        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
+        // Non-zero init.
+        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
+        // Empty / inverted spans stay rejected (pre-existing guards).
+        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
+        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
+        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
+    }
+
+    #[test]
+    fn unroll_trip_positive_strides() {
+        use crate::ir::reexports::IrCmpOp::*;
+        // dot8's shape: i < 8, i += 4 → exactly 2 trips.
+        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
+        // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
+        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
+        // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
+        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
+        // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
+        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
+        // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
+        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
+        // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
+        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
+        // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
+        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
+    }
+
+    #[test]
+    fn unroll_trip_negative_strides_countdown() {
+        use crate::ir::reexports::IrCmpOp::*;
+        // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
+        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
+        // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
+        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
+        // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
+        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
+        // Empty countdown.
+        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
+    }
+
+    #[test]
+    fn unroll_trip_rejects_degenerate_shapes() {
+        use crate::ir::reexports::IrCmpOp::*;
+        // Zero stride: infinite loop, no trip count.
+        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
+        // Sign/stride contradictions: a negative stride against an
+        // ascending comparison diverges (or wraps); must be refused.
+        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
+        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
+        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
+        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
+        // Equality-style comparisons carry no ordering: refused.
+        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
+    }
+
+    #[test]
+    fn unroll_trip_matches_reference_simulation() {
+        // Cross-check the closed forms against a direct loop simulation
+        // over a dense grid of (init, limit, step) — the helper is the
+        // single source of truth for complete unrolling, so a mismatch
+        // here is a miscompile waiting to happen.
+        use crate::ir::reexports::IrCmpOp::*;
+        for init in -3i64..=6 {
+            for limit in -3i64..=12 {
+                for step in 1i64..=5 {
+                    for &(op, desc) in &[(Slt, "lt"), (Sle, "le")] {
+                        let simulated = (0..)
+                            .scan(init, |i, _| {
+                                let cont = match op {
+                                    Slt => *i < limit,
+                                    _ => *i <= limit,
+                                };
+                                if !cont {
+                                    return None;
+                                }
+                                let old = *i;
+                                *i += step;
+                                Some(old)
+                            })
+                            .count() as i64;
+                        let closed = complete_unroll_trip(init, limit, op, step);
+                        if simulated == 0 {
+                            assert!(
+                                closed.is_none(),
+                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
+                            );
+                        } else {
+                            assert_eq!(
+                                closed,
+                                Some(simulated),
+                                "{desc}: init={init} limit={limit} step={step}"
+                            );
+                        }
+                    }
+                }
+                for step in -5i64..=-1 {
+                    for &(op, desc) in &[(Sgt, "gt"), (Sge, "ge")] {
+                        let simulated = (0..)
+                            .scan(init, |i, _| {
+                                let cont = match op {
+                                    Sgt => *i > limit,
+                                    _ => *i >= limit,
+                                };
+                                if !cont {
+                                    return None;
+                                }
+                                let old = *i;
+                                *i += step;
+                                Some(old)
+                            })
+                            .count() as i64;
+                        let closed = complete_unroll_trip(init, limit, op, step);
+                        if simulated == 0 {
+                            assert!(
+                                closed.is_none(),
+                                "{desc}: init={init} limit={limit} step={step} empty loop must reject"
+                            );
+                        } else {
+                            assert_eq!(
+                                closed,
+                                Some(simulated),
+                                "{desc}: init={init} limit={limit} step={step}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
