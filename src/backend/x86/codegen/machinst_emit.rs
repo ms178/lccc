@@ -41,14 +41,24 @@ fn reg_name(reg: PhysReg) -> &'static str {
         14 => "rdi",
         15 => "rsi",
         16 => "rdx",
-        // XMM registers — shouldn't normally appear in GPR MachInst, but handle
-        // gracefully for values that got XMM allocation from the main allocator.
+        // XMM registers for F64 allocation
         20 => "xmm2",
         21 => "xmm3",
         22 => "xmm4",
         23 => "xmm5",
         24 => "xmm6",
         25 => "xmm7",
+        // xmm8-xmm15: additional caller-saved float homes (same convention
+        // as emit.rs phys_reg_name). Reachable now that FMov lowers float
+        // moves through MachInst.
+        26 => "xmm8",
+        27 => "xmm9",
+        28 => "xmm10",
+        29 => "xmm11",
+        30 => "xmm12",
+        31 => "xmm13",
+        32 => "xmm14",
+        33 => "xmm15",
         // NO SILENT FALLBACK. This arm used to return "rax", so an unexpected
         // register index produced a syntactically valid instruction naming the
         // WRONG register -- a silent miscompile, in the most frequently used
@@ -236,6 +246,33 @@ fn assert_scratch_free(imm: &MachOperand, other: &MachReg) {
     );
 }
 
+/// Map an XMM-allocated PhysReg to its scalar SSE register name.
+///
+/// FMov register operands live in the XMM domain by construction (the
+/// lowering only routes values whose allocator home is xmm2..xmm15). A GPR
+/// or unallocated register here is a lowering defect, not an input to paper
+/// over: name it loudly rather than emit an instruction that assembles with
+/// the wrong operand class.
+fn freg_name(reg: PhysReg) -> &'static str {
+    match reg.0 {
+        20 => "xmm2",
+        21 => "xmm3",
+        22 => "xmm4",
+        23 => "xmm5",
+        24 => "xmm6",
+        25 => "xmm7",
+        26 => "xmm8",
+        27 => "xmm9",
+        28 => "xmm10",
+        29 => "xmm11",
+        30 => "xmm12",
+        31 => "xmm13",
+        32 => "xmm14",
+        33 => "xmm15",
+        _ => unreachable!("invalid machinst XMM register index {}", reg.0),
+    }
+}
+
 /// ALU operation mnemonic.
 fn alu_mnemonic(op: AluOp) -> &'static str {
     match op {
@@ -365,6 +402,109 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 }
             }
             out.emit_fmt(format_args!("    mov{} {}, {}", suffix, src_str, dst_str));
+        }
+
+        MachInst::FMov { src, dst, size } => {
+            let mnem = match size {
+                OpSize::S32 => "movss",
+                OpSize::S64 => "movsd",
+                // 8/16-bit scalar SSE moves do not exist; the lowering only
+                // produces F32/F64 (and the D32/D64 bit-carriers).
+                _ => unreachable!("FMov with non-float size {size:?}"),
+            };
+            // Register operands format at their XMM name regardless of the
+            // size suffix; memory operands reuse the S64 GPR formatting.
+            let fmt = |op: &MachOperand| -> String {
+                match op {
+                    MachOperand::Reg(MachReg::Phys(r)) => format!("%{}", freg_name(*r)),
+                    // A Vreg reaching emission means allocation was skipped
+                    // (reg_name_pub traps on the same invariant).
+                    MachOperand::Reg(MachReg::Vreg(id)) => {
+                        unreachable!("vreg{id} reached FMov emission unallocated")
+                    }
+                    // Mem/Slot/RipRel bases are GPRs named at 64-bit width.
+                    other => fmt_operand(other, OpSize::S64, out),
+                }
+            };
+            match (src, dst) {
+                // Self-move: nothing to do (same xmm home).
+                (MachOperand::Reg(a), MachOperand::Reg(b)) if a == b => return,
+                // Register-to-register copies use the VEX 3-operand form,
+                // exactly like the text path's load_fp_to_reg: the legacy
+                // 2-operand `movsd %src, %dst` is a MERGING move that reads
+                // the destination's upper lane, creating a false dependence
+                // on whatever last wrote it (nbody's sqrt loop serialised
+                // 3.1x vs GCC from this before the text path switched).
+                (MachOperand::Reg(_), MachOperand::Reg(_)) => {
+                    let src_str = fmt(src);
+                    let dst_str = fmt(dst);
+                    out.emit_fmt(format_args!(
+                        "    v{mnem} {src_str}, {src_str}, {dst_str}"
+                    ));
+                    return;
+                }
+                // x86 has no mem-to-mem SSE move; the lowering gate refuses
+                // those shapes (the relay needs an xmm scratch the text path
+                // owns). Trap rather than emit a broken relay through a
+                // possibly-live register.
+                (MachOperand::Mem { .. } | MachOperand::StackSlot(_), MachOperand::Mem { .. } | MachOperand::StackSlot(_)) => {
+                    unreachable!("FMov mem-to-mem is unencodable; the lowering must reject it")
+                }
+                // Immediates have no scalar-SSE form (constants materialize
+                // through .rodata on the text path).
+                (MachOperand::Imm(v), _) => {
+                    unreachable!("FMov from immediate {v} is unencodable")
+                }
+                _ => {}
+            }
+            let src_str = fmt(src);
+            let dst_str = fmt(dst);
+            out.emit_fmt(format_args!("    {mnem} {src_str}, {dst_str}"));
+        }
+
+        MachInst::FAlu {
+            op,
+            src2,
+            src1,
+            dst,
+            size,
+        } => {
+            let base = match op {
+                FAluOp::Add => "vadd",
+                FAluOp::Sub => "vsub",
+                FAluOp::Mul => "vmul",
+                FAluOp::Div => "vdiv",
+            };
+            let mnem = match size {
+                OpSize::S32 => format!("{base}ss"),
+                OpSize::S64 => format!("{base}sd"),
+                _ => unreachable!("FAlu with non-float size {size:?}"),
+            };
+            let src2_str = match src2 {
+                MachOperand::Reg(MachReg::Phys(r)) => format!("%{}", freg_name(*r)),
+                MachOperand::Reg(MachReg::Vreg(id)) => {
+                    unreachable!("vreg{id} reached FAlu emission unallocated")
+                }
+                MachOperand::Imm(v) => {
+                    unreachable!("FAlu from immediate {v} is unencodable; constants materialize via .rodata on the text path")
+                }
+                other => fmt_operand(other, OpSize::S64, out),
+            };
+            let src1_str = match src1 {
+                MachReg::Phys(r) => freg_name(*r),
+                MachReg::Vreg(id) => {
+                    unreachable!("vreg{id} reached FAlu emission unallocated (src1)")
+                }
+            };
+            let dst_str = match dst {
+                MachReg::Phys(r) => freg_name(*r),
+                MachReg::Vreg(id) => {
+                    unreachable!("vreg{id} reached FAlu emission unallocated (dst)")
+                }
+            };
+            out.emit_fmt(format_args!(
+                "    {mnem} {src2_str}, %{src1_str}, %{dst_str}"
+            ));
         }
 
         MachInst::Alu { op, src, dst, size } => {

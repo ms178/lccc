@@ -1261,7 +1261,17 @@ impl IntrinsicOp {
             IntrinsicOp::HorizontalAddI32x8 | IntrinsicOp::HorizontalAddI32x4
             | IntrinsicOp::VecMaxI32x8
             | IntrinsicOp::VecHorizontalMaxI32x8
-        )
+        ) ||
+        // The modern vectorizer's value-producing families (splats, zeros,
+        // non-volatile vector loads, packed arithmetic) are pure: they read
+        // no state beyond their operands. Without this, an orphaned
+        // VecBroadcast left behind by a vectorizer bailout was DCE-rooted
+        // as "side-effecting", reached codegen with no register or slot
+        // home, and ICEd the intrinsic emitter (`gd[i] = gd[i]*k + c` over
+        // a global array). VecStoreI64x2 is the one memory-writing op that
+        // produces_vector_value() also lists (kept there for slot sizing);
+        // it is excluded here -- stores are never pure.
+        (self.produces_vector_value() && !matches!(self, IntrinsicOp::VecStoreI64x2))
     }
 
     /// Returns true if this intrinsic produces a 128/256-bit vector value

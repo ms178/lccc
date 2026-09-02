@@ -553,26 +553,33 @@ pub struct X86Codegen {
     pub(super) machinst_function_enabled: bool,
     /// Diagnostic/profitability mask from CCC_MI_DISABLE_KINDS. Each bit
     /// disables one IR instruction family without disabling whole functions.
-    pub(super) machinst_disabled_kinds: u16,
+    pub(super) machinst_disabled_kinds: u32,
 }
 
-const MI_BINOP: u16 = 1 << 0;
-const MI_LOAD: u16 = 1 << 1;
-const MI_STORE: u16 = 1 << 2;
-const MI_COPY: u16 = 1 << 3;
-const MI_CMP: u16 = 1 << 4;
-const MI_CAST: u16 = 1 << 5;
-const MI_UNARY: u16 = 1 << 6;
-const MI_SELECT: u16 = 1 << 7;
-const MI_GEP: u16 = 1 << 8;
-const MI_ALLOCA: u16 = 1 << 9;
-const MI_CAST_WIDEN: u16 = 1 << 10;
-const MI_CAST_NARROW: u16 = 1 << 11;
-const MI_CAST_SAME: u16 = 1 << 12;
-const MI_CAST_SIGNED_SOURCE: u16 = 1 << 13;
-const MI_CAST_UNSIGNED_SOURCE: u16 = 1 << 14;
+const MI_BINOP: u32 = 1 << 0;
+const MI_LOAD: u32 = 1 << 1;
+const MI_STORE: u32 = 1 << 2;
+const MI_COPY: u32 = 1 << 3;
+const MI_CMP: u32 = 1 << 4;
+const MI_CAST: u32 = 1 << 5;
+const MI_UNARY: u32 = 1 << 6;
+const MI_SELECT: u32 = 1 << 7;
+const MI_GEP: u32 = 1 << 8;
+const MI_ALLOCA: u32 = 1 << 9;
+const MI_CAST_WIDEN: u32 = 1 << 10;
+const MI_CAST_NARROW: u32 = 1 << 11;
+const MI_CAST_SAME: u32 = 1 << 12;
+const MI_CAST_SIGNED_SOURCE: u32 = 1 << 13;
+const MI_CAST_UNSIGNED_SOURCE: u32 = 1 << 14;
+/// Scalar float moves (FMov): float Store/Load/Copy lowered to movss/movsd.
+/// Separate bit so float lowering can be bisected without losing integer
+/// coverage of the same instruction kinds.
+const MI_FLOAT_MOV: u32 = 1 << 15;
+/// Scalar float arithmetic (FAlu): float Add/Sub/Mul/Div lowered to the VEX
+/// three-operand vadd/vsub/vmul/vdiv forms.
+const MI_FLOAT_ALU: u32 = 1 << 16;
 
-fn parse_machinst_disabled_kinds() -> u16 {
+fn parse_machinst_disabled_kinds() -> u32 {
     std::env::var("CCC_MI_DISABLE_KINDS")
         .unwrap_or_default()
         .split(',')
@@ -593,13 +600,15 @@ fn parse_machinst_disabled_kinds() -> u16 {
                 "cast-same" => MI_CAST_SAME,
                 "cast-signed-source" => MI_CAST_SIGNED_SOURCE,
                 "cast-unsigned-source" => MI_CAST_UNSIGNED_SOURCE,
-                "all" => u16::MAX,
+                "float-mov" => MI_FLOAT_MOV,
+                "float-alu" => MI_FLOAT_ALU,
+                "all" => u32::MAX,
                 _ => 0,
             }
         })
 }
 
-fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u16 {
+fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
     use crate::ir::reexports::Instruction;
     match inst {
         Instruction::BinOp { .. } => MI_BINOP,
@@ -3749,6 +3758,30 @@ fn resolve_stack_vregs(
             dst: resolve_op(dst, *size),
             size: *size,
         },
+        // FMov never carries vregs: the lowering admits only xmm-homed
+        // values and GPR/slot addressing, all pre-colored. Resolve an FMov
+        // to itself; should a Vreg ever slip in, has_unresolvable_vreg
+        // rejects the window and the default path replays it. (Resolving to
+        // StackSlot here could create the mem-to-mem shape the SSE encoder
+        // cannot express.)
+        MachInst::FMov { .. } => inst.clone(),
+        // FAlu's src2 may legitimately be a slot-homed Vreg: resolve it to
+        // the StackSlot memory operand (the VEX form folds one memory
+        // source). src1/dst are xmm homes by construction; a Vreg there
+        // survives and trips the fallback.
+        MachInst::FAlu {
+            op,
+            src2,
+            src1,
+            dst,
+            size,
+        } => MachInst::FAlu {
+            op: *op,
+            src2: resolve_op(src2, *size),
+            src1: *src1,
+            dst: *dst,
+            size: *size,
+        },
         MachInst::Alu { op, src, dst, size } => {
             if let MachReg::Vreg(id) = dst {
                 if !ra.contains_key(id) {
@@ -3894,6 +3927,10 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
     };
     match inst {
         MachInst::Mov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::FMov { src, dst, .. } => check_op(src) || check_op(dst),
+        MachInst::FAlu {
+            src2, src1, dst, ..
+        } => check_op(src2) || check_reg(src1) || check_reg(dst),
         MachInst::Alu { src, dst, .. } => check_op(src) || check_reg(dst),
         MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
@@ -3948,6 +3985,132 @@ fn is_mi_unsafe_value(
         }
     }
     false
+}
+
+impl X86Codegen {
+    /// Validate the scalar-float typed subsets: FMov (Store/Load/Copy on
+    /// F32/F64/D32/D64 whose values are all xmm-homed (xmm2..xmm15) and
+    /// whose addressing is a direct alloca slot or a GPR-held pointer) and
+    /// FAlu (Add/Sub/Mul/Div with an xmm-homed dest and xmm/slot-homed
+    /// sources in the shapes the VEX three-operand form accepts).
+    ///
+    /// This is the emit-side twin of the isel float arms; both sides check
+    /// the same subset so the typed lowering can never see a shape it does
+    /// not model. Everything else (slot-homed floats needing the xmm scratch
+    /// relay, constants, xmm-based pointers, folded GEP/global addressing,
+    /// F128/x87) returns false and keeps the mature text path.
+    fn float_typed_candidate(
+        &self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        use crate::common::types::{AddressSpace, IrType};
+        use crate::ir::reexports::{Instruction, Operand};
+
+        if self.machinst_disabled_kinds & MI_FLOAT_MOV != 0 {
+            return false;
+        }
+        let ra = &self.reg_assignments;
+        // Same value-domain exclusions as is_mi_unsafe_value minus the float
+        // type check: accumulator locations, i128 carriers, and vectorizer
+        // values may all be xmm-homed and F32/F64-typed in the IR while the
+        // mature path treats them as packed/wide -- a scalar movsd would
+        // truncate or stale their upper lanes.
+        let xmm_homed = |v: u32| {
+            ra.get(&v)
+                .is_some_and(|r| r.0 >= 20 && r.0 <= 33)
+                && !self.state.is_accumulator_location(v)
+                && !self.state.is_i128_value(v)
+                && !self.state.vector_values.contains(&v)
+        };
+        // Pointer admission mirrors the integer Load/Store ptr gate exactly:
+        // folded GEP/global addresses have NO materialized register (the
+        // producer was skipped -- reading its home is a segfault), and
+        // over-aligned alloca slots need the aligned address the default
+        // path computes.
+        let gpr_ptr = |v: u32| {
+            if folded_global_addrs.contains(&v) || self.state.folded_gep_values.contains(&v) {
+                return false;
+            }
+            if let Some(crate::backend::state::SlotAddr::OverAligned(_, _)) =
+                self.state.resolve_slot_addr(v)
+            {
+                return false;
+            }
+            self.state.is_alloca(v) || ra.get(&v).is_some_and(|r| r.0 < 20)
+        };
+        match inst {
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+                *seg_override == AddressSpace::Default
+                    && matches!(val, Operand::Value(v) if xmm_homed(v.0))
+                    && gpr_ptr(ptr.0)
+            }
+            Instruction::Load {
+                dest,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) => {
+                *seg_override == AddressSpace::Default && xmm_homed(dest.0) && gpr_ptr(ptr.0)
+            }
+            Instruction::Copy { dest, src } => {
+                let Operand::Value(src_v) = src else {
+                    return false;
+                };
+                let ty_is_scalar_float = self
+                    .value_types
+                    .get(&src_v.0)
+                    .or_else(|| self.value_types.get(&dest.0))
+                    .is_some_and(|ty| {
+                        matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
+                    });
+                ty_is_scalar_float && xmm_homed(src_v.0) && xmm_homed(dest.0)
+            }
+            Instruction::BinOp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } if self.machinst_disabled_kinds & MI_FLOAT_ALU == 0
+                && matches!(ty, IrType::F32 | IrType::F64)
+                && matches!(
+                    op,
+                    crate::ir::reexports::IrBinOp::Add
+                        | crate::ir::reexports::IrBinOp::Sub
+                        | crate::ir::reexports::IrBinOp::Mul
+                        | crate::ir::reexports::IrBinOp::SDiv
+                ) =>
+            {
+                // Dest must be xmm-homed; then either lhs is xmm-homed (rhs
+                // xmm or slot), or -- commutative ops only -- rhs is
+                // xmm-homed and lhs slot-homed. Mirrors the isel arm.
+                let (Operand::Value(l), Operand::Value(r)) = (lhs, rhs) else {
+                    return false;
+                };
+                if !xmm_homed(dest.0) {
+                    return false;
+                }
+                let has_slot = |v: u32| self.state.get_slot(v).is_some();
+                if xmm_homed(l.0) {
+                    return xmm_homed(r.0) || has_slot(r.0);
+                }
+                let commutative = matches!(
+                    op,
+                    crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Mul
+                );
+                commutative && xmm_homed(r.0) && has_slot(l.0)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl ArchCodegen for X86Codegen {
@@ -4245,6 +4408,36 @@ impl ArchCodegen for X86Codegen {
             {
                 return false;
             }
+        }
+
+        // Scalar float FMov bypass. The generic operand scan below rejects
+        // every XMM-domain value (is_mi_unsafe_value), so the validated
+        // float subset routes straight to the typed lowering. The candidate
+        // check is the exact admission predicate for the isel float arms;
+        // if the lowering still declines (belt and suspenders), the text
+        // path takes over unchanged.
+        if self.float_typed_candidate(inst, folded_global_addrs) {
+            let mut float_alloca_slots = crate::common::fx_hash::FxHashMap::default();
+            if let crate::ir::reexports::Instruction::Load { ptr, .. }
+            | crate::ir::reexports::Instruction::Store { ptr, .. } = inst
+            {
+                if self.state.is_alloca(ptr.0) {
+                    if let Some(slot) = self.state.get_slot(ptr.0) {
+                        float_alloca_slots.insert(ptr.0, slot.0);
+                    }
+                }
+            }
+            let lowered = super::isel::lower_instruction_typed(
+                inst,
+                &self.reg_assignments,
+                &float_alloca_slots,
+                Some(&self.value_types),
+                &mut self.machinst_buf,
+            );
+            if lowered {
+                self.machinst_buf_ir.push(inst.clone());
+            }
+            return lowered;
         }
 
         // Reject instructions involving values we can't handle.

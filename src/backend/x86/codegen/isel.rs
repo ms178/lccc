@@ -31,6 +31,13 @@ fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg
     }
 }
 
+/// True when a physical register is an XMM float home (xmm2..xmm15, the
+/// allocator's float bank; xmm0/xmm1 are text-path scratch and never appear
+/// as allocator homes). Mirrors `is_xmm_reg` in emit.rs.
+fn is_xmm_phys(reg: PhysReg) -> bool {
+    reg.0 >= 20 && reg.0 <= 33
+}
+
 /// Convert an IR Operand to a MachOperand, using physical registers for
 /// values that already have register assignments from the main allocator.
 fn lower_operand_with_regs(op: &Operand, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachOperand {
@@ -1148,8 +1155,68 @@ fn lower_instruction_typed_inner(
             rhs,
             ty,
         } => {
-            if ty.is_float() || ty.is_128bit() {
+            if ty.is_128bit() {
                 return false;
+            }
+            // Scalar float arithmetic (F32/F64) in the VEX three-operand
+            // form. Subset: dest xmm-homed; lhs xmm-homed with rhs xmm- or
+            // slot-homed; or (commutative ops only) rhs xmm-homed with lhs
+            // slot-homed. Slot-homed operands become Vregs here and resolve
+            // to StackSlot memory operands at flush time (resolve_stack_vregs);
+            // an operand that resolves to nothing trips the fallback replay.
+            // Constants and the sub/div-with-slot-lhs staging case (needs the
+            // xmm0 scratch) stay on the mature text path.
+            if matches!(ty, IrType::F32 | IrType::F64) {
+                // Float division arrives as SDiv with a float type (the IR
+                // has no separate FDiv); UDiv/Rem with float types do not
+                // occur and stay on the text path.
+                let fop = match op {
+                    IrBinOp::Add => FAluOp::Add,
+                    IrBinOp::Sub => FAluOp::Sub,
+                    IrBinOp::Mul => FAluOp::Mul,
+                    IrBinOp::SDiv => FAluOp::Div,
+                    _ => return false,
+                };
+                let size = OpSize::from_ir_type(*ty);
+                let Some(&dst_reg) = ra.get(&dest.0) else {
+                    return false;
+                };
+                if !is_xmm_phys(dst_reg) {
+                    return false;
+                }
+                let (Operand::Value(lhs_v), Operand::Value(rhs_v)) = (lhs, rhs) else {
+                    return false;
+                };
+                let lhs_xmm = ra.get(&lhs_v.0).copied().filter(|r| is_xmm_phys(*r));
+                let rhs_xmm = ra.get(&rhs_v.0).copied().filter(|r| is_xmm_phys(*r));
+                let commutative = matches!(fop, FAluOp::Add | FAluOp::Mul);
+                // NOTE: value_to_reg is NOT usable for the xmm side -- it
+                // deliberately maps XMM homes to Vregs for the integer
+                // path. Build the operands explicitly: xmm home -> Phys,
+                // anything else -> Vreg (flush-time slot resolution).
+                let reg_or_vreg = |vid: u32, xmm: Option<PhysReg>| match xmm {
+                    Some(r) => MachOperand::Reg(MachReg::Phys(r)),
+                    None => MachOperand::Reg(MachReg::Vreg(vid)),
+                };
+                let (src1, src2) = if let Some(l) = lhs_xmm {
+                    // src1 = lhs; src2 = rhs (xmm register, or a vreg that
+                    // flush-time resolution turns into a slot operand).
+                    (l, reg_or_vreg(rhs_v.0, rhs_xmm))
+                } else if commutative && rhs_xmm.is_some() {
+                    // Swapped form, valid for add/mul only. This mirrors the
+                    // text path's own swap when only the rhs is xmm-homed.
+                    (rhs_xmm.unwrap(), reg_or_vreg(lhs_v.0, None))
+                } else {
+                    return false;
+                };
+                out.push(MachInst::FAlu {
+                    op: fop,
+                    src2,
+                    src1: MachReg::Phys(src1),
+                    dst: MachReg::Phys(dst_reg),
+                    size,
+                });
+                return true;
             }
             // BitTest is lowered by the text path, which uses BT plus
             // register/stack-aware SETCC materialization and keeps the i32
@@ -1171,7 +1238,51 @@ fn lower_instruction_typed_inner(
             seg_override,
             ..
         } => {
-            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
+            if ty.is_128bit() || ty.is_long_double() {
+                return false;
+            }
+            // Scalar float load: mirror of the float store subset. The dest
+            // must be xmm-homed (xmm2..xmm15); the address a direct alloca
+            // slot or a GPR-held pointer. Slot-homed dests, constants and
+            // exotic addressing stay on the mature text path.
+            if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+                if *seg_override != AddressSpace::Default {
+                    return false;
+                }
+                let Some(&dst_reg) = ra.get(&dest.0) else {
+                    return false;
+                };
+                if !is_xmm_phys(dst_reg) {
+                    return false;
+                }
+                let size = if matches!(ty, IrType::F32 | IrType::D32) {
+                    OpSize::S32
+                } else {
+                    OpSize::S64
+                };
+                let dst = MachOperand::Reg(MachReg::Phys(dst_reg));
+                if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    out.push(MachInst::FMov {
+                        src: MachOperand::StackSlot(slot),
+                        dst,
+                        size,
+                    });
+                    return true;
+                }
+                if let Some(&base) = ra.get(&ptr.0) {
+                    if is_xmm_phys(base) {
+                        return false;
+                    }
+                    out.push(MachInst::FMov {
+                        src: MachOperand::Mem {
+                            base: MachReg::Phys(base),
+                            offset: 0,
+                        },
+                        dst,
+                        size,
+                    });
+                    return true;
+                }
                 return false;
             }
             if *seg_override != AddressSpace::Default {
@@ -1227,7 +1338,61 @@ fn lower_instruction_typed_inner(
             seg_override,
             ..
         } => {
-            if ty.is_float() || ty.is_128bit() || ty.is_long_double() {
+            if ty.is_128bit() || ty.is_long_double() {
+                return false;
+            }
+            // Scalar float store (F32/F64 and the D32/D64 bit-carriers).
+            //
+            // Typed subset, mirroring the SSE branch of emit_store_impl: the
+            // value must already be homed in an xmm allocator register
+            // (xmm2..xmm15) and the address must be a direct alloca slot or
+            // a GPR-held pointer. Everything else -- slot-homed values (the
+            // text path relays through an xmm scratch), constants, xmm-based
+            // pointers, indexed/folded GEP addressing, F128/x87 -- keeps the
+            // mature emitter.
+            if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+                if *seg_override != AddressSpace::Default {
+                    return false;
+                }
+                let Operand::Value(val_v) = val else {
+                    return false;
+                };
+                let Some(&src_reg) = ra.get(&val_v.0) else {
+                    return false;
+                };
+                if !is_xmm_phys(src_reg) {
+                    return false;
+                }
+                let size = if matches!(ty, IrType::F32 | IrType::D32) {
+                    OpSize::S32
+                } else {
+                    OpSize::S64
+                };
+                let src = MachOperand::Reg(MachReg::Phys(src_reg));
+                if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    out.push(MachInst::FMov {
+                        src,
+                        dst: MachOperand::StackSlot(slot),
+                        size,
+                    });
+                    return true;
+                }
+                if let Some(&base) = ra.get(&ptr.0) {
+                    // x86 addressing has no xmm base; the text path relays
+                    // such pointers through rcx -- leave that shape there.
+                    if is_xmm_phys(base) {
+                        return false;
+                    }
+                    out.push(MachInst::FMov {
+                        src,
+                        dst: MachOperand::Mem {
+                            base: MachReg::Phys(base),
+                            offset: 0,
+                        },
+                        size,
+                    });
+                    return true;
+                }
                 return false;
             }
             // Narrow stores are ordinary `Mov`s at OpSize::S8/S16 and the
@@ -1279,6 +1444,48 @@ fn lower_instruction_typed_inner(
             true
         }
         Instruction::Copy { dest, src } => {
+            // Scalar float copy: both sides must be xmm-homed (xmm2..xmm15),
+            // which makes it a single register-to-register movss/movsd. Any
+            // mixed or slot-homed shape needs the xmm scratch relay the text
+            // path owns, so it stays there.
+            let src_vid = match src {
+                Operand::Value(v) => Some(v.0),
+                Operand::Const(_) => None,
+            };
+            let float_ty = value_types.and_then(|vt| {
+                src_vid
+                    .and_then(|s| vt.get(&s).copied())
+                    .or_else(|| vt.get(&dest.0).copied())
+            });
+            if let Some(ty) = float_ty {
+                if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+                    let (Some(src_v), Some(&src_reg)) = (src_vid, src_vid.and_then(|s| ra.get(&s)))
+                    else {
+                        return false;
+                    };
+                    let Some(&dst_reg) = ra.get(&dest.0) else {
+                        return false;
+                    };
+                    if !is_xmm_phys(src_reg) || !is_xmm_phys(dst_reg) {
+                        return false;
+                    }
+                    let size = if matches!(ty, IrType::F32 | IrType::D32) {
+                        OpSize::S32
+                    } else {
+                        OpSize::S64
+                    };
+                    out.push(MachInst::FMov {
+                        src: MachOperand::Reg(MachReg::Phys(src_reg)),
+                        dst: MachOperand::Reg(MachReg::Phys(dst_reg)),
+                        size,
+                    });
+                    return true;
+                }
+                // F128/long double and 128-bit copies: text path.
+                if ty.is_long_double() || ty.is_128bit() {
+                    return false;
+                }
+            }
             // Width-consistent copy: a ≤32-bit value spilled to a 4-byte small
             // slot must be moved with a 32-bit mov. The historical
             // unconditional S64 relay (`movq slot,%rax; movq %rax,slot`)
