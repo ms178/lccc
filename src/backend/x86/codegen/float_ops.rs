@@ -1276,16 +1276,99 @@ impl X86Codegen {
             }
         }
 
+        // Path 3 — constant accumulator, lhs and destination share an XMM
+        // home (the shape path 2 must refuse: its accumulator preload would
+        // clobber the lhs sitting in that home).  Use the 213 form instead:
+        // dest = src1 * dest + src2, i.e. home = rhs * lhs + acc, with the
+        // constant accumulator materialised in the xmm0 scratch.  Two
+        // instructions, result lands in the destination home directly — no
+        // xmm0 store-back.  Requires the rhs in a distinct XMM home.
+        if matches!(acc, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_))) {
+            if let (Some(dest_reg), Operand::Value(rv)) = (self.dest_reg(add_dest), mul_rhs) {
+                if is_xmm_reg(dest_reg) {
+                    let dest_name = phys_reg_name(dest_reg);
+                    let lhs_home = match mul_lhs {
+                        Operand::Value(v) => self
+                            .reg_assignments
+                            .get(&v.0)
+                            .copied()
+                            .filter(|r| is_xmm_reg(*r))
+                            .map(phys_reg_name),
+                        _ => None,
+                    };
+                    let rhs_home = self
+                        .reg_assignments
+                        .get(&rv.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(phys_reg_name);
+                    if lhs_home == Some(dest_name) {
+                        if let Some(rhs_name) = rhs_home.filter(|n| *n != dest_name) {
+                            self.load_fp_to_xmm0(acc, ty);
+                            let fma213 = fma.replace("231", "213");
+                            // AT&T operand order is reversed: this encodes
+                            // dest = src1 * dest + src2, i.e.
+                            // home = rhs * lhs + acc (acc in xmm0 = src2,
+                            // rhs = src1, lhs lives in the dest home).
+                            self.state.emit_fmt(format_args!(
+                                "    {} %xmm0, %{}, %{}",
+                                fma213, rhs_name, dest_name
+                            ));
+                            self.state.reg_cache.invalidate_acc();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         self.load_fp_to_xmm0(acc, ty);
-        self.load_fp_to_reg(mul_lhs, ty, "xmm1");
+        // src1 for the scratch path: use the lhs's existing XMM home when it
+        // has one instead of staging through xmm1 (a `vmovsd home, xmm1` per
+        // FMA).  xmm0 is pure scratch — linear scan never assigns it as a
+        // home — so a home-sourced src1 cannot alias the FMA destination.
+        // One exception: the rhs arms below stage unsupported sources through
+        // xmm2, which IS a possible home; keep the xmm1 staging when the lhs
+        // lives in xmm2 and such a staging may occur.
+        let lhs_home_name: Option<&'static str> = match mul_lhs {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r))
+                .map(phys_reg_name),
+            _ => None,
+        };
+        let rhs_may_stage_xmm2 = match mul_rhs {
+            Operand::Value(v) => {
+                let has_home = self
+                    .reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .map(is_xmm_reg)
+                    .unwrap_or(false);
+                !has_home && self.state.get_slot(v.0).is_none()
+            }
+            Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_)) => false,
+            _ => true,
+        };
+        let lhs_src: String = match lhs_home_name {
+            Some(name) if name != "xmm2" || !rhs_may_stage_xmm2 => format!("%{}", name),
+            _ => {
+                self.load_fp_to_reg(mul_lhs, ty, "xmm1");
+                "%xmm1".to_string()
+            }
+        };
         match mul_rhs {
             Operand::Value(v) => {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if is_xmm_reg(reg) {
                         let n = phys_reg_name(reg);
                         // reg form: src2=n, src1=xmm1, dest=xmm0
-                        self.state
-                            .emit_fmt(format_args!("    {} %{}, %xmm1, %xmm0", fma, n));
+                        self.state.emit_fmt(format_args!(
+                            "    {} %{}, {}, %xmm0",
+                            fma, n, lhs_src
+                        ));
                         self.store_xmm0_fp_dest(add_dest, ty);
                         return;
                     }
@@ -1293,21 +1376,27 @@ impl X86Codegen {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
                     // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
-                    self.state
-                        .emit_fmt(format_args!("    {} {}, %xmm1, %xmm0", fma, sr));
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, {}, %xmm0",
+                        fma, sr, lhs_src
+                    ));
                     self.store_xmm0_fp_dest(add_dest, ty);
                     return;
                 }
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state
-                    .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                self.state.emit_fmt(format_args!(
+                    "    {} %xmm2, {}, %xmm0",
+                    fma, lhs_src
+                ));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
                 if bits != 0 {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state
-                        .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}(%rip), {}, %xmm0",
+                        fma, label, lhs_src
+                    ));
                 } else {
                     // +0.0 multiplier: the FMA must still execute. Skipping
                     // it silently returned `acc` unchanged, which is wrong
@@ -1316,27 +1405,35 @@ impl X86Codegen {
                     // (-0.0 + 0.0 = +0.0, not -0.0). Materialise +0.0 in
                     // xmm2 (VEX xor keeps the unified AVX domain) and fuse.
                     self.state.emit("    vxorpd %xmm2, %xmm2, %xmm2");
-                    self.state
-                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %xmm2, {}, %xmm0",
+                        fma, lhs_src
+                    ));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
                 let bits = v.to_bits() as u64;
                 if bits != 0 {
                     let label = self.state.get_fp_const_label(bits);
-                    self.state
-                        .emit_fmt(format_args!("    {} {}(%rip), %xmm1, %xmm0", fma, label));
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}(%rip), {}, %xmm0",
+                        fma, label, lhs_src
+                    ));
                 } else {
                     // Same +0.0 rule as the F64 arm above.
                     self.state.emit("    vxorps %xmm2, %xmm2, %xmm2");
-                    self.state
-                        .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                    self.state.emit_fmt(format_args!(
+                        "    {} %xmm2, {}, %xmm0",
+                        fma, lhs_src
+                    ));
                 }
             }
             _ => {
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state
-                    .emit_fmt(format_args!("    {} %xmm2, %xmm1, %xmm0", fma));
+                self.state.emit_fmt(format_args!(
+                    "    {} %xmm2, {}, %xmm0",
+                    fma, lhs_src
+                ));
             }
         }
         self.store_xmm0_fp_dest(add_dest, ty);

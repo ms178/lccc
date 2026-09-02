@@ -814,13 +814,54 @@ impl super::InstructionEncoder {
     }
 
     /// vpshufd (66 0F 70): (imm, src, dst).
-    pub(crate) fn encode_avx_shuffle(
+    /// 0F-map VEX imm8 shuffles with no NDS operand (vpshufd/vpshufhw/
+    /// vpshuflw): ($imm, src, dst), VEX.vvvv reserved (encoded 0).  NOT the
+    /// 0F3A map — VPSHUFD is VEX.128.66.0F.WIG 70 /r ib, and routing it
+    /// through the 0F3A helpers emitted a C4 prefix with mm=3, decoding to
+    /// a different (unrelated) instruction.
+    pub(crate) fn encode_avx_2op_0f_imm8(
         &mut self,
         ops: &[Operand],
         opcode: u8,
-        has_66: bool,
+        pp: u8,
     ) -> Result<(), String> {
-        self.encode_avx_shuffle_3a(ops, opcode, has_66)
+        if ops.len() != 3 {
+            return Err("AVX 2-op+imm8 requires 3 operands".to_string());
+        }
+        let l = self.vex_l_from_ops(ops);
+        match (&ops[0], &ops[1], &ops[2]) {
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Register(src),
+                Operand::Register(dst),
+            ) => {
+                let src_num = reg_num(&src.name).ok_or("bad register")?;
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b = needs_vex_ext(&src.name);
+                self.emit_vex(r, false, b, 1, 0, 0, l, pp);
+                self.bytes.push(opcode);
+                self.bytes.push(self.modrm(3, dst_num, src_num));
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            (
+                Operand::Immediate(ImmediateValue::Integer(imm)),
+                Operand::Memory(mem),
+                Operand::Register(dst),
+            ) => {
+                let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let r = needs_vex_ext(&dst.name);
+                let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                self.emit_vex(r, x, b_ext, 1, 0, 0, l, pp);
+                self.bytes.push(opcode);
+                self.encode_modrm_mem(dst_num, mem)?;
+                self.bytes.push(*imm as u8);
+                Ok(())
+            }
+            _ => Err("unsupported AVX 2-op+imm8 operands".to_string()),
+        }
     }
 
     /// vextracti128/vextractf128: ($imm, %ymm_src, %xmm_or_mem_dst), L=1.
@@ -1412,5 +1453,141 @@ impl super::InstructionEncoder {
             }
             _ => Err("unsupported FMA3 operands".to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::assemble;
+
+    /// Assemble `asm` with the i686 integrated assembler and return the raw
+    /// `.text` bytes (minimal ELF32 section walk).
+    fn assemble_text(asm: &str) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!(
+            "lccc_i686_vex_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("vex_golden.o");
+        assemble(asm, out.to_str().unwrap()).expect("i686 assemble failed");
+        let bytes = std::fs::read(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir(&dir);
+
+        assert_eq!(&bytes[0..4], &[0x7f, b'E', b'L', b'F']);
+        assert_eq!(bytes[4], 1, "ELFCLASS32 expected");
+        let rd16 = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]) as usize;
+        let rd32 = |o: usize| {
+            u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]) as usize
+        };
+        let e_shoff = rd32(0x20);
+        let e_shentsize = rd16(0x2e);
+        let e_shnum = rd16(0x30);
+        let e_shstrndx = rd16(0x32);
+        let sh = |i: usize| e_shoff + i * e_shentsize;
+        let strtab = rd32(sh(e_shstrndx) + 0x10);
+        for i in 0..e_shnum {
+            let mut end = strtab + rd32(sh(i));
+            while bytes[end] != 0 {
+                end += 1;
+            }
+            let name = std::str::from_utf8(&bytes[strtab + rd32(sh(i))..end]).unwrap();
+            if name == ".text" {
+                let off = rd32(sh(i) + 0x10);
+                let size = rd32(sh(i) + 0x14);
+                return bytes[off..off + size].to_vec();
+            }
+        }
+        panic!("no .text section");
+    }
+
+    /// Golden-byte lock for the VEX/FMA3/SSE4.2 encodings, verified against
+    /// GNU as 2.44 (`as --32`).  A new 1400-line encoder must not drift from
+    /// the ISA: every byte below is what binutils emits for the same source
+    /// line, including the 2-byte (C5) vs 3-byte (C4) VEX decision, the W bit
+    /// for pd/sd forms, and the inverted vvvv field.
+    #[test]
+    fn vex_encodings_match_gas_golden_bytes() {
+        let asm = concat!(
+            ".text\n",
+            "vfmadd231sd %xmm3, %xmm2, %xmm0\n",
+            "vfmadd132ss %xmm1, %xmm0, %xmm2\n",
+            "vmovaps %xmm1, %xmm2\n",
+            "vaddps %xmm1, %xmm0, %xmm0\n",
+            "vfnmsub213pd %xmm3, %xmm2, %xmm1\n",
+            "vfmaddsub231ps %xmm3, %xmm2, %xmm1\n",
+            "vzeroupper\n",
+            "vfmadd231sd (%eax), %xmm2, %xmm0\n",
+            "crc32l (%eax), %ebx\n",
+            "extractps $1, %xmm2, (%eax)\n",
+            "vmovsd %xmm1, %xmm2, %xmm0\n",
+            "vsqrtsd %xmm1, %xmm2, %xmm0\n",
+            "vpshufd $1, %xmm2, %xmm0\n",
+            "vpshufhw $1, %xmm2, %xmm0\n",
+            "vpshuflw $1, %xmm2, %xmm0\n",
+            "vpshufd $1, (%eax), %xmm0\n",
+            "vsqrtss %xmm1, %xmm2, %xmm0\n",
+        );
+        let golden: &[u8] = &[
+            0xc4, 0xe2, 0xe9, 0xb9, 0xc3, // vfmadd231sd %xmm3,%xmm2,%xmm0
+            0xc4, 0xe2, 0x79, 0x99, 0xd1, // vfmadd132ss %xmm1,%xmm0,%xmm2
+            0xc5, 0xf8, 0x28, 0xd1,       // vmovaps %xmm1,%xmm2
+            0xc5, 0xf8, 0x58, 0xc1,       // vaddps %xmm1,%xmm0,%xmm0
+            0xc4, 0xe2, 0xe9, 0xae, 0xcb, // vfnmsub213pd %xmm3,%xmm2,%xmm1
+            0xc4, 0xe2, 0x69, 0xb6, 0xcb, // vfmaddsub231ps %xmm3,%xmm2,%xmm1
+            0xc5, 0xf8, 0x77,             // vzeroupper
+            0xc4, 0xe2, 0xe9, 0xb9, 0x00, // vfmadd231sd (%eax),%xmm2,%xmm0
+            0xf2, 0x0f, 0x38, 0xf1, 0x18, // crc32l (%eax),%ebx
+            0x66, 0x0f, 0x3a, 0x17, 0x10, 0x01, // extractps $1,%xmm2,(%eax)
+            0xc5, 0xeb, 0x10, 0xc1,       // vmovsd %xmm1,%xmm2,%xmm0
+            0xc5, 0xeb, 0x51, 0xc1,       // vsqrtsd %xmm1,%xmm2,%xmm0
+            0xc5, 0xf9, 0x70, 0xc2, 0x01, // vpshufd $1,%xmm2,%xmm0
+            0xc5, 0xfa, 0x70, 0xc2, 0x01, // vpshufhw $1,%xmm2,%xmm0
+            0xc5, 0xfb, 0x70, 0xc2, 0x01, // vpshuflw $1,%xmm2,%xmm0
+            0xc5, 0xf9, 0x70, 0x00, 0x01, // vpshufd $1,(%eax),%xmm0
+            0xc5, 0xea, 0x51, 0xc1,       // vsqrtss %xmm1,%xmm2,%xmm0
+        ];
+        assert_eq!(assemble_text(asm), golden);
+    }
+
+    /// Golden-byte lock for the legacy SSE/ISA encodings repaired by the
+    /// differential audit against GNU as 2.44: EXTRACTPS emitted PEXTRW's
+    /// opcode, INSERTPS emitted PEXTRB's, CVTTPD2DQ carried CVTPD2DQ's
+    /// prefix (rounding instead of truncation), the 16-bit mul/div forms
+    /// double-prefixed with 66 66, bare `iret` selected IRET16, `nop` with
+    /// a memory operand dropped it, and popw/pextrw lacked memory forms.
+    #[test]
+    fn legacy_sse_encodings_match_gas_golden_bytes() {
+        let asm = concat!(
+            ".text\n",
+            "extractps $1, %xmm2, %eax\n",
+            "insertps $1, %xmm2, %xmm0\n",
+            "cvttpd2dq %xmm1, %xmm0\n",
+            "iret\n",
+            "iretw\n",
+            "nop (%eax)\n",
+            "popw (%eax)\n",
+            "pextrw $1, %xmm2, (%eax)\n",
+            "mulw (%eax)\n",
+            "divw (%eax)\n",
+            "idivw (%eax)\n",
+            "mulw %ax\n",
+        );
+        let golden: &[u8] = &[
+            0x66, 0x0f, 0x3a, 0x17, 0xd0, 0x01, // extractps $1,%xmm2,%eax
+            0x66, 0x0f, 0x3a, 0x21, 0xc2, 0x01, // insertps $1,%xmm2,%xmm0
+            0x66, 0x0f, 0xe6, 0xc1,       // cvttpd2dq %xmm1,%xmm0
+            0xcf,                   // iret (IRET32)
+            0x66, 0xcf,             // iretw (IRET16)
+            0x0f, 0x1f, 0x00,       // nop (%eax) — 0F 1F /0
+            0x66, 0x8f, 0x00,       // popw (%eax)
+            0x66, 0x0f, 0x3a, 0x15, 0x10, 0x01, // pextrw $1,%xmm2,(%eax)
+            0x66, 0xf7, 0x20,       // mulw (%eax)
+            0x66, 0xf7, 0x30,       // divw (%eax)
+            0x66, 0xf7, 0x38,       // idivw (%eax)
+            0x66, 0xf7, 0xe0,       // mulw %ax
+        ];
+        assert_eq!(assemble_text(asm), golden);
     }
 }

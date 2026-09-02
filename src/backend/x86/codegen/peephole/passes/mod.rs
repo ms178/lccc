@@ -512,6 +512,18 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("fp_reg_mem_fold") {
             changed |= memory_fold::fold_fp_register_loads(&mut store, &mut infos);
         }
+        // Fold a single-use scalar FP load into an adjacent FMA3-231 memory
+        // src2 slot (dot-product inner shape; function-wide liveness proof).
+        if !sk("fma_mem_fold") {
+            changed |= memory_fold::fold_fma_memory_src2(&mut store, &mut infos);
+        }
+        // Constant-accumulator FMA shaping: 213-form with a just-loaded
+        // multiplier becomes the 132 form with the load folded into the
+        // memory slot, and repeated %xmm0 zeroings die block-locally.
+        if !sk("fma132_zero") {
+            changed |= memory_fold::fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+            changed |= memory_fold::eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+        }
         // Opt-in (CCC_PEEPHOLE_RELAY=1): fuses load+dead-copy relays; known
         // masked interaction with expat test_multichar_cdata_utf16 under the
         // full pass mix — root cause still open, so keep it off by default.

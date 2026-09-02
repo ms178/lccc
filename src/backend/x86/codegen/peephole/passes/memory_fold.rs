@@ -1271,6 +1271,408 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
 /// Soundness: the copy must be the load's ONLY consumer — the loaded register
 /// is proven dead before any read/redispatch; the rewrite never changes the
 /// load's width or extension semantics (width-narrowing copies are refused).
+/// Fold a single-use scalar FP load into the memory-src2 slot of an adjacent
+/// FMA3 231-form instruction:
+///
+/// ```text
+///   movsd 32(%rsi), %xmm11                vfmadd231sd 32(%rsi), %xmm10, %xmm2
+///   vfmadd231sd %xmm11, %xmm10, %xmm2  =>
+/// ```
+///
+/// The first AT&T operand (Intel src2) is the only FMA3 slot that may read
+/// memory.  When the loaded register is never read or written again, the
+/// staging `movsd` is pure overhead — the dominant shape in the second and
+/// later iterations of unrolled dot products, where each `b` element is
+/// loaded exactly once.
+///
+/// Liveness proof, deliberately stronger than the block-local scan used by
+/// `fold_scalar_fp_memory_into_vex_op`: from the load line to the end of the
+/// function the register must be mentioned in EXACTLY those two lines (token-
+/// bounded, so `%xmm1` never matches inside `%xmm11`), and no `call` may
+/// intervene — a call can read `%xmm0`-`%xmm7` as variadic FP arguments
+/// without naming them in the text.  Mentions BEFORE the load are irrelevant
+/// (the load redefines the register), so a home reused across loop iterations
+/// stays foldable for the later load.  Being function-wide, the proof is
+/// immune to cross-block reads that a block-local scan cannot see.
+pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// FMA3 231 forms: dest = dest OP (src2 * src1); src2 is the rm slot and
+    /// therefore the only memory-legal operand position.
+    const FMA231: &[&str] = &["vfmadd231", "vfmsub231", "vfnmadd231", "vfnmsub231"];
+
+    /// Parse an exact `%xmmN` operand token into N.
+    fn xmm_num(op: &str) -> Option<u32> {
+        let d = op.strip_prefix("%xmm")?;
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        d.parse().ok()
+    }
+
+
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i + 1 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        // ── load side: [v]movs{d,s} <mem>, %xmmN ─────────────────────────
+        let li = infos[i].trimmed(store.get(i));
+        let (width, rest) = if let Some(r) = li.strip_prefix("movsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("movss ") {
+            ("ss", r)
+        } else if let Some(r) = li.strip_prefix("vmovsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("vmovss ") {
+            ("ss", r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // Split on the LAST comma: SIB addresses contain commas of their own
+        // (`32(%rdi,%rax,8)`), and only the final operand is the destination.
+        let Some((addr, dst)) = rest.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let addr = addr.trim();
+        let Some(n) = xmm_num(dst.trim()) else {
+            i += 1;
+            continue;
+        };
+        // The source must be a plain memory reference (a register source has
+        // no paren; an XMM-form source would make this a reg-reg move).
+        if !addr.contains('(') || addr.contains("%xmm") {
+            i += 1;
+            continue;
+        }
+
+        // ── FMA side: adjacent (NOPs in between are dropped lines) ──────
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let lj = infos[j].trimmed(store.get(j));
+        let Some((fop, body)) = FMA231
+            .iter()
+            .find_map(|m| lj.strip_prefix(&format!("{}{} ", m, width)).map(|b| (*m, b)))
+        else {
+            i += 1;
+            continue;
+        };
+        // The pre-fold line has three plain register operands; anything with
+        // a memory operand already (or an immediate) is not our shape.
+        let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+        if ops.len() != 3 || ops.iter().any(|o| xmm_num(o).is_none()) {
+            i += 1;
+            continue;
+        }
+        if xmm_num(ops[0]) != Some(n) {
+            i += 1;
+            continue;
+        }
+
+        // ── liveness: exactly two mentions from the load to the function
+        //    end, and no intervening call (variadic FP args are implicit
+        //    reads of xmm0-xmm7). ────────────────────────────────────────
+        let mut total = 0;
+        let mut vetoed = false;
+        let mut k = i;
+        while k < len {
+            let t = infos[k].trimmed(store.get(k));
+            if t == ".cfi_endproc" {
+                break;
+            }
+            if !infos[k].is_nop() {
+                if n <= 7 && k != i && k != j && infos[k].kind == LineKind::Call {
+                    vetoed = true;
+                    break;
+                }
+                total += mentions_token(t, &format!("%xmm{}", n));
+                if total > 2 {
+                    break;
+                }
+            }
+            k += 1;
+        }
+        if vetoed || total != 2 {
+            i += 1;
+            continue;
+        }
+
+        mark_nop(&mut infos[i]);
+        replace_line(
+            store,
+            &mut infos[j],
+            j,
+            format!("    {}{} {}, {}, {}", fop, width, addr, ops[1], ops[2]),
+        );
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Count occurrences of a register token (e.g. `%xmm3`) in `text` with
+/// operand-boundary checks on both sides: `%xmm1` must not match inside
+/// `%xmm11`, and `%ax` must not match inside `%rax`.
+fn mentions_token(text: &str, token: &str) -> usize {
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(token) {
+        let at = from + rel;
+        let after = at + token.len();
+        let ok_before = at == 0
+            || !text[..at]
+                .chars()
+                .next_back()
+                .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_' || c == '%');
+        let ok_after = !text[after..]
+            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        if ok_before && ok_after {
+            count += 1;
+        }
+        from = at + 1;
+    }
+    count
+}
+
+/// True for the canonical zero materializations of %xmm0.
+fn is_xmm0_zeroing(t: &str) -> bool {
+    let t = t.trim();
+    t == "xorpd %xmm0, %xmm0"
+        || t == "xorps %xmm0, %xmm0"
+        || t == "pxor %xmm0, %xmm0"
+        || t == "vxorpd %xmm0, %xmm0, %xmm0"
+        || t == "vxorps %xmm0, %xmm0, %xmm0"
+        || t == "vpxor %xmm0, %xmm0, %xmm0"
+}
+
+/// True when `t` unconditionally overwrites `reg` (its last operand) from
+/// sources that do not include `reg`: the scalar/vector mov families and
+/// the self-xor zeroings.  Anything else (ALU/FMA/cvt forms) READS the
+/// register even when it also writes it, so it does not redefine it.
+fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
+    let t = t.trim();
+    for z in ["xorpd", "xorps", "pxor", "vxorpd", "vxorps", "vpxor"] {
+        if let Some(rest) = t.strip_prefix(z) {
+            if rest.trim_start() == format!("{}, {}", reg, reg) {
+                return true;
+            }
+        }
+    }
+    const MOVS: &[&str] = &[
+        "vmovsd ", "vmovss ", "movsd ", "movss ", "vmovapd ", "vmovaps ", "movapd ", "movaps ",
+        "vmovdqa ", "vmovdqu ", "movdqa ", "movdqu ", "vmovd ", "vmovq ", "movd ", "movq ",
+    ];
+    for m in MOVS {
+        if let Some(rest) = t.strip_prefix(m) {
+            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
+                if dst.trim() == reg && mentions_token(srcs, reg) == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Fold a zero-addend 213-form FMA whose multiplier was JUST loaded into
+/// the 132 form with the load folded into the memory SRC3 slot:
+///
+/// ```text
+///   movsd 8(%rsi), %xmm3              xorpd %xmm0, %xmm0
+///   xorpd %xmm0, %xmm0          ->    vfmadd132sd 8(%rsi), %xmm0, %xmm2
+///   vfmadd213sd %xmm0, %xmm3, %xmm2
+/// ```
+///
+/// 213 computes dst = vvvv*dst + src2 with src2 = the zero; 132 computes
+/// dst = dst*mem + vvvv with the zero moved to vvvv and the multiplier
+/// moved to the memory-legal rm slot.  FP multiplication is commutative
+/// (IEEE 754 requires x*y == y*x bitwise), and both forms read the same
+/// two values in the same roles, so the rewrite is value-identical — this
+/// is the exact form GCC picks for constant-accumulator dot products.
+///
+/// Soundness: the loaded register must be mentioned exactly twice between
+/// the load and the end of the function (the load itself and the FMA), the
+/// same last-mention proof as [`fold_fma_memory_src2`]; the three lines
+/// must be adjacent (NOPs aside) so no label makes the FMA reachable
+/// without the zeroing; and neither the zero nor the destination may be
+/// the loaded register.  The zeroing itself is preserved — %xmm0 is
+/// general scratch, so its zero state is not provable here;
+/// [`eliminate_redundant_xmm0_zeroing`] removes the repeats block-locally.
+pub(super) fn fold_zero_addend_fma213_to_132(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    /// Parse `%xmmN` -> N.
+    fn xmm_num(op: &str) -> Option<u32> {
+        let d = op.strip_prefix("%xmm")?;
+        if d.is_empty() || !d.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        d.parse().ok()
+    }
+
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i + 2 < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        // ── load side: [v]movs{d,s} <mem>, %xmmB ─────────────────────────
+        let li = infos[i].trimmed(store.get(i));
+        let (width, rest) = if let Some(r) = li.strip_prefix("movsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("movss ") {
+            ("ss", r)
+        } else if let Some(r) = li.strip_prefix("vmovsd ") {
+            ("sd", r)
+        } else if let Some(r) = li.strip_prefix("vmovss ") {
+            ("ss", r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((addr, dst)) = rest.rsplit_once(',') else {
+            i += 1;
+            continue;
+        };
+        let addr = addr.trim();
+        let Some(b) = xmm_num(dst.trim()) else {
+            i += 1;
+            continue;
+        };
+        if b == 0 || !addr.contains('(') || addr.contains("%xmm") {
+            i += 1;
+            continue;
+        }
+        let b_tok = format!("%xmm{}", b);
+
+        // ── zeroing line ──────────────────────────────────────────────────
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].pinned || !is_xmm0_zeroing(infos[j].trimmed(store.get(j))) {
+            i += 1;
+            continue;
+        }
+
+        // ── FMA side: vfmadd213s{d,s} %xmm0, %xmmB, %dstA ────────────────
+        let k = next_non_nop(infos, j + 1, len);
+        if k >= len || infos[k].pinned {
+            i += 1;
+            continue;
+        }
+        let lk = infos[k].trimmed(store.get(k));
+        let Some(body) = lk.strip_prefix(&format!("vfmadd213{} ", width)) else {
+            i += 1;
+            continue;
+        };
+        let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+        let ok = ops.len() == 3
+            && ops[0] == "%xmm0"
+            && ops[1] == b_tok
+            && xmm_num(ops[2]) != Some(b);
+        if !ok {
+            i += 1;
+            continue;
+        }
+
+        // ── liveness: the FMA must be the LAST reader of the loaded value.
+        //    The load/FMA adjacency already proves nothing reads %xmmB in
+        //    between; after the FMA, the first mention of %xmmB must be a
+        //    pure full-width overwrite (the register reused for another
+        //    value — the later definition is what any subsequent reader
+        //    sees) or absent entirely.  Any read — including a read-
+        //    modify-write whose destination merely happens to be %xmmB —
+        //    vetoes the fold. ─────────────────────────────────────────────
+        let mut ok_after = true;
+        let mut m = k + 1;
+        while m < len {
+            let t = infos[m].trimmed(store.get(m));
+            if t == ".cfi_endproc" {
+                break;
+            }
+            if !infos[m].is_nop() && mentions_token(t, &b_tok) > 0 {
+                ok_after = is_pure_xmm_overwrite(t, &b_tok);
+                break;
+            }
+            m += 1;
+        }
+        if !ok_after {
+            i += 1;
+            continue;
+        }
+
+        mark_nop(&mut infos[i]);
+        replace_line(
+            store,
+            &mut infos[k],
+            k,
+            format!("    vfmadd132{} {}, %xmm0, {}", width, addr, ops[2]),
+        );
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+/// Delete `xorpd %xmm0, %xmm0` (and pxor/vxorpd/vxorps forms) whose zero is
+/// still live from an earlier zeroing in the same basic block.  Forward
+/// state machine: the zero state is set by a zeroing, and cleared by any
+/// line whose LAST operand is %xmm0 (the AT&T destination — writes only;
+/// reads of %xmm0 such as `vfmadd213sd %xmm0, ...` preserve it), by any
+/// call/label/branch/ret (control flow merges unknown states; calls
+/// clobber), and by opaque inline asm.  This is what turns the per-
+/// accumulator zero materialization of a constant-accumulator loop into
+/// GCC's single resident zero.
+pub(super) fn eliminate_redundant_xmm0_zeroing(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut zero_live = false;
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        if is_xmm0_zeroing(t) {
+            if zero_live && !infos[i].pinned {
+                mark_nop(&mut infos[i]);
+                changed = true;
+            } else {
+                zero_live = true;
+            }
+            continue;
+        }
+        match infos[i].kind {
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::JmpIndirect
+            | LineKind::CondJmp
+            | LineKind::Call
+            | LineKind::Ret
+            | LineKind::InlineAsm => zero_live = false,
+            _ => {
+                // Writes %xmm0 exactly when the last AT&T operand is %xmm0.
+                if t.rsplit_once(',')
+                    .map(|(_, last)| last.trim() == "%xmm0")
+                    .unwrap_or(false)
+                {
+                    zero_live = false;
+                }
+            }
+        }
+    }
+    changed
+}
+
 pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     use super::super::types::register_family_fast;
     let len = store.len();
@@ -1597,5 +1999,330 @@ mod fold_load_copy_relay_tests {
 ";
         let (changed, _) = run(asm);
         assert!(!changed, "shld reads %cl implicitly; fuse must be refused");
+    }
+}
+
+#[cfg(test)]
+mod fma_mem_fold_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_fma_memory_src2;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_fma_memory_src2(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The canonical dot-product shape: single-use b-element load folded
+    /// into the FMA's memory src2 slot.
+    #[test]
+    fn folds_single_use_load_into_fma_src2() {
+        let (changed, out) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n",
+        );
+        assert!(changed, "single-use load should fold");
+        assert_eq!(out.len(), 1, "load must be gone: {out:?}");
+        assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
+    }
+
+    /// A later mention of the loaded register vetoes the fold — the value
+    /// is still needed after the FMA.
+    #[test]
+    fn refuses_when_register_mentioned_later() {
+        let (changed, _) = run(
+            "    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vaddsd %xmm11, %xmm0, %xmm0\n",
+        );
+        assert!(!changed, "later reader must veto the fold");
+    }
+
+    /// dest == loaded register means the FMA line mentions it twice; the
+    /// two-mention budget is exhausted, so the fold is refused (sound even
+    /// though the rewrite would actually be valid).
+    #[test]
+    fn refuses_when_dest_equals_loaded_reg() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm2\n\
+             \x20   vfmadd231sd %xmm2, %xmm3, %xmm2\n",
+        );
+        assert!(!changed, "dest==src2 shape must be refused");
+    }
+
+    /// Mentions BEFORE the load are irrelevant (the load redefines the
+    /// register), so a home reused across iterations stays foldable.
+    #[test]
+    fn folds_reused_home_when_later_use_is_last() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd213sd %xmm0, %xmm5, %xmm2\n\
+             \x20   movsd 56(%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   ret\n",
+        );
+        assert!(changed, "second (last-def) load should fold");
+        assert!(
+            out.iter().any(|l| l == "vfmadd231sd 56(%rsi), %xmm3, %xmm8"),
+            "expected folded second pair: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "movsd (%rsi), %xmm5"),
+            "first pair must stay untouched: {out:?}"
+        );
+    }
+
+    /// A call after the pair can implicitly read %xmm0-%xmm7 (variadic FP
+    /// arguments) — veto for registers in the argument range.
+    #[test]
+    fn refuses_when_call_intervenes_for_arg_reg() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
+             \x20   call printf\n",
+        );
+        assert!(!changed, "call may read %xmm5 as variadic arg");
+    }
+
+    /// Same shape with a register outside the argument range: xmm11 is
+    /// never an implicit call operand, so the fold is safe.
+    #[test]
+    fn folds_past_call_for_non_arg_reg() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n\
+             \x20   call printf\n",
+        );
+        assert!(changed, "xmm11 cannot be a variadic arg");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
+    }
+
+    /// Token-bounded matching: a later `%xmm11` mention is NOT a mention
+    /// of `%xmm1` and must not veto the fold.
+    #[test]
+    fn token_boundary_distinguishes_xmm1_from_xmm11() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm1\n\
+             \x20   vfmadd231sd %xmm1, %xmm3, %xmm8\n\
+             \x20   movsd (%rdi), %xmm11\n",
+        );
+        assert!(changed, "%xmm11 must not count as %xmm1");
+        assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
+    }
+
+    /// Width mismatch (movss load feeding an -sd FMA) is not our pattern.
+    #[test]
+    fn refuses_width_mismatch() {
+        let (changed, _) = run(
+            "    movss (%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n",
+        );
+        assert!(!changed, "ss load must not fold into sd fma");
+    }
+
+    /// Only 231 forms have a memory-legal src2; a 213 form's first operand
+    /// is the addend register, not the rm slot — must not fold.
+    #[test]
+    fn refuses_non_231_form() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd213sd %xmm11, %xmm3, %xmm8\n",
+        );
+        assert!(!changed, "213 form has no memory src2 slot");
+    }
+
+    /// A label between the load and the FMA means the FMA is reachable
+    /// without the load — adjacency (NOPs aside) is mandatory.
+    #[test]
+    fn refuses_when_label_between() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm11\n\
+             .L5:\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n",
+        );
+        assert!(!changed, "label breaks adjacency");
+    }
+}
+
+#[cfg(test)]
+mod fma132_zero_tests {
+    use super::super::super::types::classify_line;
+    use super::{eliminate_redundant_xmm0_zeroing, fold_zero_addend_fma213_to_132};
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let mut changed = fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+        changed |= eliminate_redundant_xmm0_zeroing(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The canonical dot-product first-iteration shape: the b load folds
+    /// into the 132-form memory slot, the zeroing stays for the FMA.
+    #[test]
+    fn folds_zero_addend_triple_to_132() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
+        );
+        assert!(changed, "triple must fold");
+        assert_eq!(out.len(), 2, "b load must be gone: {out:?}");
+        assert_eq!(out[0], "xorpd %xmm0, %xmm0");
+        assert_eq!(out[1], "vfmadd132sd (%rsi), %xmm0, %xmm2");
+    }
+
+    /// A later use of the loaded register vetoes the fold.
+    #[test]
+    fn refuses_when_multiplier_used_later() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   vaddsd %xmm3, %xmm2, %xmm2\n",
+        );
+        assert!(!changed, "later reader must veto");
+    }
+
+    /// Without the zeroing line between, the 132 rewrite would read an
+    /// unproven %xmm0 — refuse.
+    #[test]
+    fn refuses_without_zeroing_line() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
+        );
+        assert!(!changed, "missing zeroing must veto");
+    }
+
+    /// A label between load and zeroing breaks adjacency (the FMA could be
+    /// entered without the load).
+    #[test]
+    fn refuses_when_label_between() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             .L5:\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
+        );
+        assert!(!changed, "label breaks adjacency");
+    }
+
+    /// The dot8 first-iteration shape: four triples collapse to ONE zeroing
+    /// plus four 132-form FMAs (the b loads all fold, the repeated xorpds
+    /// die block-locally).
+    #[test]
+    fn dot8_first_iteration_collapses_to_one_zero() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   movsd 8(%rsi), %xmm5\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm5, %xmm4\n\
+             \x20   movsd 16(%rsi), %xmm7\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm7, %xmm6\n\
+             \x20   movsd 24(%rsi), %xmm9\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm9, %xmm8\n",
+        );
+        assert!(changed);
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        assert_eq!(zeros, 1, "exactly one resident zero: {out:?}");
+        let fma132 = out.iter().filter(|l| l.starts_with("vfmadd132sd")).count();
+        assert_eq!(fma132, 4, "all four must be 132-form: {out:?}");
+    }
+
+    /// The zero state dies at a call: the zeroing after it must stay.
+    #[test]
+    fn zero_state_dies_at_call() {
+        let (_, out) = run(
+            "    xorpd %xmm0, %xmm0\n\
+             \x20   call foo\n\
+             \x20   xorpd %xmm0, %xmm0\n",
+        );
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        assert_eq!(zeros, 2, "call clobbers the zero: {out:?}");
+    }
+
+    /// Reads of %xmm0 (as an FMA addend) preserve the zero state; a write
+    /// (last operand) kills it.
+    #[test]
+    fn zero_state_survives_reads_dies_on_writes() {
+        let (_, out) = run(
+            "    xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vaddsd %xmm1, %xmm0\n\
+             \x20   xorpd %xmm0, %xmm0\n",
+        );
+        let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
+        // first stays; second dies (still zero after the read); third stays
+        // (the 2-operand vaddsd wrote %xmm0).
+        assert_eq!(zeros, 2, "read preserves, write kills: {out:?}");
+    }
+}
+
+#[cfg(test)]
+mod fma132_reuse_tests {
+    use super::super::super::types::classify_line;
+    use super::fold_zero_addend_fma213_to_132;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(asm.to_string());
+        let n = store.len();
+        let mut infos: Vec<_> = (0..n).map(|i| classify_line(store.get(i))).collect();
+        let changed = fold_zero_addend_fma213_to_132(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len())
+            .filter(|i| !infos[*i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, out)
+    }
+
+    /// The dot8 iteration-2 register-reuse shape: %xmm3 is later redefined
+    /// by a pure load, so the first-iteration fold is still sound.
+    #[test]
+    fn folds_when_multiplier_redefined_later() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   movsd 56(%rdi), %xmm3\n\
+             \x20   vfmadd231sd 56(%rsi), %xmm3, %xmm8\n",
+        );
+        assert!(changed, "pure later redefinition must allow the fold");
+        assert!(
+            out.iter().any(|l| l == "vfmadd132sd (%rsi), %xmm0, %xmm2"),
+            "expected 132 form: {out:?}"
+        );
+    }
+
+    /// A later read-modify-write whose DEST is the multiplier still reads
+    /// the loaded value — must veto.
+    #[test]
+    fn refuses_rmw_on_multiplier() {
+        let (changed, _) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   vaddsd %xmm1, %xmm3, %xmm3\n",
+        );
+        assert!(!changed, "rmw reads the loaded value");
     }
 }

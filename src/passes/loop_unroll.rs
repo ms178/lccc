@@ -1395,12 +1395,9 @@ fn try_complete_unroll_two_block(
     func.blocks[latch].terminator = Terminator::Branch(exit_target);
     let _ = (body_entry, exit_cond_positive);
 
-    // The post-loop IV may exceed i64 even when the trip count is small
-    // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
-    // 2^63): refuse to clone rather than substitute a wrapped constant.
-    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
-        return false;
-    };
+    // `final_iv_n` was already computed and overflow-checked above, before
+    // any CFG mutation — a second check here would bail with the header and
+    // latch already retargeted (the exact bug the hoisted check fixed).
     let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
@@ -3212,6 +3209,143 @@ mod tests {
         // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
         let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
         assert!((1i64 << 62).checked_mul(trip).and_then(|d| 0i64.checked_add(d)).is_none());
+    }
+
+    // The trip count above is representable (2), but the post-loop IV
+    // (0 + 2 * 2^62 = 2^63) is not.  The general cloner must refuse BEFORE
+    // mutating anything — with the checked bail placed after the header/
+    // latch retargeting, the CFG would be left half-rewritten.  Diamond
+    // body so the loop routes to the general (multi-block) cloner:
+    //   B0 preheader -> B1 header(phi, cmp < MAX) -> B2 split -> B3|B4 arms
+    //   -> B5 latch(+2^62) -> B1;   exit B6 Return.
+    #[test]
+    fn general_cloner_overflow_bail_leaves_cfg_untouched() {
+        let mut func = IrFunction::new("overflow_bail".to_string(), IrType::Void, vec![], false);
+
+        // B0: preheader — %0 = 0
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I64(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+
+        // B1: header — %1 = phi(%0, %5); %2 = %1 < i64::MAX
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Value(Value(0)), BlockId(0)),
+                        (Operand::Value(Value(5)), BlockId(5)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(i64::MAX)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(6),
+            },
+            source_spans: Vec::new(),
+        });
+
+        // B2: split — %3 = %1 >= 0; diamond to B3/B4
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Cmp {
+                dest: Value(3),
+                op: IrCmpOp::Sge,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I64,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+            source_spans: Vec::new(),
+        });
+
+        // B3/B4: arms
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(4),
+                src: Operand::Value(Value(1)),
+            }],
+            terminator: Terminator::Branch(BlockId(5)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![Instruction::Copy {
+                dest: Value(6),
+                src: Operand::Value(Value(1)),
+            }],
+            terminator: Terminator::Branch(BlockId(5)),
+            source_spans: Vec::new(),
+        });
+
+        // B5: latch — %5 = %1 + 2^62; back to header
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I64(1 << 62)),
+                ty: IrType::I64,
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+
+        // B6: exit
+        func.blocks.push(BasicBlock {
+            label: BlockId(6),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+
+        func.next_value_id = 7;
+
+        let n = unroll_loops(&mut func);
+
+        // trip = 2 passes the 2..=16 gate, so only the checked final-IV
+        // computation stands between this loop and a clone: it must bail
+        // with the CFG byte-for-byte intact.
+        assert_eq!(n, 0, "overflowing final IV must refuse the unroll");
+        assert_eq!(func.blocks.len(), 7, "no clone blocks may be appended");
+        let latch = func.blocks.iter().find(|b| b.label == BlockId(5)).unwrap();
+        assert!(
+            matches!(latch.terminator, Terminator::Branch(lbl) if lbl == BlockId(1)),
+            "latch back-edge must be untouched, got {:?}",
+            latch.terminator
+        );
+        let header = func.blocks.iter().find(|b| b.label == BlockId(1)).unwrap();
+        assert!(
+            matches!(
+                header.terminator,
+                Terminator::CondBranch { true_label, false_label, .. }
+                    if true_label == BlockId(2) && false_label == BlockId(6)
+            ),
+            "header exit branch must be untouched, got {:?}",
+            header.terminator
+        );
     }
 
     #[test]
