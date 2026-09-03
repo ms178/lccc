@@ -2078,8 +2078,8 @@ fn parse_data_values(s: &str) -> Result<Vec<DataValue>, String> {
                     // digit (numeric labels like `770b`), but a digit-only
                     // string is a constant expression, not a label —
                     // `a - (1 + 2)` must not become a diff against "1".
-                    let is_real_label = is_label_like(&rhs_sym)
-                        && !rhs_sym.bytes().all(|c| c.is_ascii_digit());
+                    let is_real_label =
+                        is_label_like(&rhs_sym) && !rhs_sym.bytes().all(|c| c.is_ascii_digit());
                     if is_real_label {
                         vals.push(DataValue::SymbolDiffAddend(
                             lhs,

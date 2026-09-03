@@ -871,7 +871,11 @@ fn link_with_script_machine(
                 }
                 for (oi, obj) in objects.iter().enumerate() {
                     for (si, sec) in obj.sections.iter().enumerate() {
-                        if spec.patterns.iter().any(|pattern| glob_match(pattern, &sec.name)) {
+                        if spec
+                            .patterns
+                            .iter()
+                            .any(|pattern| glob_match(pattern, &sec.name))
+                        {
                             kept.insert((oi, si));
                         }
                     }

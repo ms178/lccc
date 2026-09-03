@@ -831,7 +831,9 @@ fn extend_gep_base_liveness(
                         hard_bad.insert(ptr.0);
                     }
                 }
-                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                Instruction::GetElementPtr {
+                    dest, base, offset, ..
+                } => {
                     if gep_info.contains_key(&base.0) {
                         link_users.entry(base.0).or_default().push(dest.0);
                     }

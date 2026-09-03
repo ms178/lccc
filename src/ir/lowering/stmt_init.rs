@@ -1022,7 +1022,8 @@ impl Lowerer {
                         // unwrap them so scalar fields aren't lost (Regehr yarpgen
                         // *_singleton_inner_dim_* tests).
                         let elem_base = self.emit_gep_offset(alloca, base_byte_offset, IrType::I8);
-                        let elem_items = self.normalize_leaf_struct_element_items(sub_items, s_layout);
+                        let elem_items =
+                            self.normalize_leaf_struct_element_items(sub_items, s_layout);
                         self.lower_local_struct_init(elem_items, elem_base, s_layout);
                     }
                 }
@@ -1077,14 +1078,11 @@ impl Lowerer {
         sub_items: &'a [InitializerItem],
         s_layout: &crate::common::types::StructLayout,
     ) -> &'a [InitializerItem] {
-        let first_field_idx = match s_layout.resolve_init_field(
-            None,
-            0,
-            &*self.types.borrow_struct_layouts(),
-        ) {
-            Some(crate::common::types::InitFieldResolution::Direct(idx)) => idx,
-            _ => return sub_items,
-        };
+        let first_field_idx =
+            match s_layout.resolve_init_field(None, 0, &*self.types.borrow_struct_layouts()) {
+                Some(crate::common::types::InitFieldResolution::Direct(idx)) => idx,
+                _ => return sub_items,
+            };
         let first_ty = &s_layout.fields[first_field_idx].ty;
         let first_field_needs_nested_braces = matches!(
             first_ty,

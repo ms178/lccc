@@ -110,11 +110,14 @@ impl Lowerer {
     /// Lower struct/union assignment using memcpy.
     fn lower_struct_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
         let struct_size = self.struct_value_size(lhs).unwrap_or(8);
-        let dynamic_size = self.dynamic_struct_value_size(lhs).or_else(|| self.dynamic_struct_value_size(rhs));
+        let dynamic_size = self
+            .dynamic_struct_value_size(lhs)
+            .or_else(|| self.dynamic_struct_value_size(rhs));
 
         // For expressions producing packed struct data (small struct function
         // call returns, ternaries over them, etc.), store directly
-        if dynamic_size.is_none() && self.expr_produces_packed_struct_data(rhs) && struct_size <= 8 {
+        if dynamic_size.is_none() && self.expr_produces_packed_struct_data(rhs) && struct_size <= 8
+        {
             let rhs_val = self.lower_expr(rhs);
             if let Some(lv) = self.lower_lvalue(lhs) {
                 let dest_addr = self.lvalue_addr(&lv);
@@ -218,7 +221,11 @@ impl Lowerer {
         // Widths above int precision use the declared 64-bit extended
         // bit-field type; narrower fields use ordinary integer promotion.
         let op_ty = if bit_width > 32 {
-            if is_signed { IrType::I64 } else { IrType::U64 }
+            if is_signed {
+                IrType::I64
+            } else {
+                IrType::U64
+            }
         } else {
             widened_op_type(IrType::I32)
         };
@@ -279,7 +286,12 @@ impl Lowerer {
             self.expr_access_is_volatile(lhs),
             sso,
         );
-        Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
+        Some(self.truncate_to_bitfield_value(
+            store_val,
+            storage_ty,
+            bit_width,
+            storage_ty.is_signed(),
+        ))
     }
 
     /// Try to lower compound assignment to a bitfield member (e.g., s.bf += val).
@@ -328,7 +340,12 @@ impl Lowerer {
             self.expr_access_is_volatile(lhs),
             sso,
         );
-        Some(self.truncate_to_bitfield_value(store_val, storage_ty, bit_width, storage_ty.is_signed()))
+        Some(self.truncate_to_bitfield_value(
+            store_val,
+            storage_ty,
+            bit_width,
+            storage_ty.is_signed(),
+        ))
     }
 
     /// Store a value into a bitfield: load storage unit, clear field bits, OR in new value, store back.
@@ -726,7 +743,10 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
             let low_fixed = self.emit_sso_load_fixup(Operand::Value(low_loaded), storage_ty, sso);
-            let low_fixed_v = match &low_fixed { Operand::Value(v) => *v, Operand::Const(_) => unreachable!() };
+            let low_fixed_v = match &low_fixed {
+                Operand::Value(v) => *v,
+                Operand::Const(_) => unreachable!(),
+            };
             let low_val = if bit_offset > 0 {
                 self.emit_binop_val(
                     IrBinOp::LShr,
@@ -1518,10 +1538,7 @@ impl Lowerer {
         let elem_size = elem_ct.size();
         let total_size = match vec_ct {
             CType::Vector(_, ts) => *ts,
-            _ => unreachable!(
-                "lower_vector_cmp called with non-vector type: {:?}",
-                vec_ct
-            ),
+            _ => unreachable!("lower_vector_cmp called with non-vector type: {:?}", vec_ct),
         };
         let is_unsigned = elem_ct.is_unsigned();
         let cmp_op = Self::binop_to_cmp(op, is_unsigned);
@@ -1625,7 +1642,8 @@ impl Lowerer {
             let cond = self.emit_cmp_val(cmp_op, lhs_elem_op, rhs_elem_op, elem_ir_ty);
             let cond_ext = self.emit_cast_val(Operand::Value(cond), IrType::I32, elem_ir_ty);
             let zero = Operand::Const(Self::ir_zero_const(elem_ir_ty));
-            let mask = self.emit_binop_val(IrBinOp::Sub, zero, Operand::Value(cond_ext), elem_ir_ty);
+            let mask =
+                self.emit_binop_val(IrBinOp::Sub, zero, Operand::Value(cond_ext), elem_ir_ty);
             self.emit(Instruction::Store {
                 volatile: false,
                 val: Operand::Value(mask),

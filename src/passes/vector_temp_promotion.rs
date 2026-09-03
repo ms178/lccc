@@ -677,11 +677,9 @@ fn remove_instructions(block: &mut BasicBlock, removed: &mut Vec<usize>) {
     }
     removed.sort_unstable();
     removed.dedup();
-    debug_assert!(
-        removed
-            .last()
-            .is_none_or(|&index| index < block.instructions.len())
-    );
+    debug_assert!(removed
+        .last()
+        .is_none_or(|&index| index < block.instructions.len()));
 
     let instruction_count = block.instructions.len();
     let spans_in_lockstep = block.source_spans.len() == instruction_count;

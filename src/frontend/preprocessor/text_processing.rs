@@ -48,7 +48,6 @@ impl LineSegments {
             }
         }
     }
-
 }
 
 /// Per-output-line breakpoints produced by block-comment stripping.
@@ -117,9 +116,7 @@ impl LineResolver {
             }
         }
     }
-
 }
-
 
 /// Quick check for presence of comment markers (`/*` or `//`) in source bytes.
 /// Scans for `/` bytes first, then checks the following byte. Since `/` is
@@ -254,11 +251,7 @@ impl Preprocessor {
                         if b == b'\n' {
                             src_line += 1;
                             if has_multiline_block_comment {
-                                close_line(
-                                    &mut line_map,
-                                    &mut cur_points,
-                                    current_output_line_src,
-                                );
+                                close_line(&mut line_map, &mut cur_points, current_output_line_src);
                                 // New output line starts right after the
                                 // literal's newline: absolute stripped
                                 // offset = result.len(), absolute joined
@@ -349,7 +342,6 @@ impl Preprocessor {
         }
     }
 
-
     /// Join lines that end with backslash (line continuation).
     /// Also handles backslash followed by trailing whitespace before newline,
     /// matching GCC/Clang behavior (GCC warns: "backslash and newline separated by space").
@@ -438,7 +430,6 @@ impl Preprocessor {
             (std::borrow::Cow::Owned(result), None)
         }
     }
-
 
     /// Check if a line ends with a continuation backslash (optionally followed by whitespace).
     /// Returns the byte position of the backslash if found, None otherwise.

@@ -16,18 +16,17 @@ pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
-pub(crate) mod bool_thread;
 pub(crate) mod block_layout;
-pub(crate) mod loop_invert;
+pub(crate) mod bool_thread;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
 pub(crate) mod dce;
-pub(crate) mod dse;
 mod dead_statics;
 pub(crate) mod div_by_const;
-pub(crate) mod fp_const_hoist;
+pub(crate) mod dse;
 pub(crate) mod fortify_fold;
+pub(crate) mod fp_const_hoist;
 pub(crate) mod global_addr_cse;
 pub(crate) mod gvn;
 pub(crate) mod if_convert;
@@ -41,6 +40,7 @@ pub(crate) mod iv_widen;
 pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
+pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
@@ -52,19 +52,19 @@ pub(crate) mod reassoc_accum;
 pub(crate) mod recursion_to_iter;
 pub(crate) mod redundant_loads;
 mod resolve_asm;
+pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
-pub(crate) mod sccp;
 pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
-pub(crate) mod verify;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
+pub(crate) mod verify;
 
-use crate::common::fx_hash::FxHashSet;
 use crate::common::fp_contract::FpContract;
+use crate::common::fx_hash::FxHashSet;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operand};
 
@@ -85,7 +85,8 @@ use crate::ir::reexports::{BasicBlock, Instruction, IrFunction, IrModule, Operan
 /// home is legally assigned by one `Copy` per predecessor edge — so
 /// duplicates are tolerated iff every def of that id is a `Copy`.
 pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
-    let strict = !tag.starts_with("backend:eliminate_phis") && !tag.starts_with("backend:post-phi")
+    let strict = !tag.starts_with("backend:eliminate_phis")
+        && !tag.starts_with("backend:post-phi")
         && !tag.starts_with("backend:pre-codegen");
     for func in &module.functions {
         if func.is_declaration {
@@ -592,12 +593,8 @@ pub(crate) fn restore_phi_prefix(block: &mut BasicBlock) -> bool {
 
     let n = block.instructions.len();
     let mut order: Vec<usize> = Vec::with_capacity(n);
-    order.extend(
-        (0..n).filter(|&i| matches!(block.instructions[i], Instruction::Phi { .. })),
-    );
-    order.extend(
-        (0..n).filter(|&i| !matches!(block.instructions[i], Instruction::Phi { .. })),
-    );
+    order.extend((0..n).filter(|&i| matches!(block.instructions[i], Instruction::Phi { .. })));
+    order.extend((0..n).filter(|&i| !matches!(block.instructions[i], Instruction::Phi { .. })));
 
     let mut old_insts = std::mem::take(&mut block.instructions);
     let mut taken: Vec<Option<Instruction>> = old_insts.drain(..).map(Some).collect();
@@ -623,8 +620,8 @@ pub(crate) fn restore_phi_prefix_in_function(func: &mut IrFunction) -> usize {
 
 /// Run Phase 0: function inlining and post-inline optimization passes.
 fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, size_profile: bool) {
-    let dump_pre = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
-        || std::env::var("CCC_VALIDATE_SSA").is_ok();
+    let dump_pre =
+        std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
     macro_rules! iphase_dump {
         ($name:expr) => {
             if dump_pre {
@@ -793,13 +790,10 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
 /// helper inlining matters most), and "univsr" likewise disabled "ivsr".
 /// Tokens are compared trimmed and exactly; "all" keeps its global meaning.
 fn pass_disabled(disabled: impl AsRef<str>, pass: &str) -> bool {
-    disabled
-        .as_ref()
-        .split(',')
-        .any(|tok| {
-            let tok = tok.trim();
-            tok == "all" || tok == pass
-        })
+    disabled.as_ref().split(',').any(|tok| {
+        let tok = tok.trim();
+        tok == "all" || tok == pass
+    })
 }
 
 fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32) {
@@ -877,8 +871,8 @@ pub(crate) fn run_passes(
 
     let time_passes = std::env::var("CCC_TIME_PASSES").is_ok();
     // -fdump-tree-all equivalent: dump the module after every pass.
-    let dump_each_pass = std::env::var("CCC_DUMP_EACH_PASS").is_ok()
-        || std::env::var("CCC_VALIDATE_SSA").is_ok();
+    let dump_each_pass =
+        std::env::var("CCC_DUMP_EACH_PASS").is_ok() || std::env::var("CCC_VALIDATE_SSA").is_ok();
 
     // -O0: preserve the alloca-based IR and skip the optimizer completely.
     // Inline asm symbol resolution is not an optimization; it is required for
@@ -993,9 +987,7 @@ pub(crate) fn run_passes(
         module.for_each_function(dce::eliminate_dead_code);
         // Bool-phi merge-diamond branch threading (same call as the -O2+
         // tier's late phase; see there for the rationale).
-        if !pass_disabled(&disabled, "boolthread")
-            && std::env::var("CCC_NO_BOOL_THREAD").is_err()
-        {
+        if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
             let n = module.for_each_function(bool_thread::run);
             if n > 0 {
                 module.for_each_function(cfg_simplify::simplify_cfg);
@@ -1313,9 +1305,15 @@ pub(crate) fn run_passes(
                     vectorize::vectorize_function_two_wide
                 }
                 (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,
-                (_, true, FpContract::Fast, false) => vectorize::vectorize_function_fast_math_without_fixed_slp,
-                (_, true, FpContract::Off | FpContract::OnExpr, true) => vectorize::vectorize_function_reassoc,
-                (_, true, FpContract::Off | FpContract::OnExpr, false) => vectorize::vectorize_function_reassoc_without_fixed_slp,
+                (_, true, FpContract::Fast, false) => {
+                    vectorize::vectorize_function_fast_math_without_fixed_slp
+                }
+                (_, true, FpContract::Off | FpContract::OnExpr, true) => {
+                    vectorize::vectorize_function_reassoc
+                }
+                (_, true, FpContract::Off | FpContract::OnExpr, false) => {
+                    vectorize::vectorize_function_reassoc_without_fixed_slp
+                }
                 // contract=fast without reassoc: reductions stay order-locked,
                 // map trees may fuse (GCC-parity for -ffp-contract=fast).
                 (_, false, FpContract::Fast, _) => vectorize::vectorize_function_contract,
@@ -1351,7 +1349,7 @@ pub(crate) fn run_passes(
             // Pure intrinsics with an unused dest are DCE-eligible, so
             // one sweep here removes every orphaned setup def regardless
             // of which bailout path produced it.
-module.for_each_function(dce::eliminate_dead_code);
+            module.for_each_function(dce::eliminate_dead_code);
         }
 
         // Unroll/vectorize can clone loop bodies that still contained
@@ -1510,8 +1508,9 @@ module.for_each_function(dce::eliminate_dead_code);
             let gvn_enabled = true;
             let run_gvn = gvn_enabled && !dis.gvn && should_run!(5, 0, 1, 3);
             let run_licm = !dis.licm && should_run!(6, 0, 1, 5);
-            let run_ivsr =
-                iter == 0 && std::env::var("CCC_NO_IVSR").is_err() && !pass_disabled(&disabled, "ivsr");
+            let run_ivsr = iter == 0
+                && std::env::var("CCC_NO_IVSR").is_err()
+                && !pass_disabled(&disabled, "ivsr");
             // Un-IVSR only pays off on targets with scaled-index addressing
             // (x86-64 SIB). Gated for diagnostics like the other loop passes.
             let run_univsr = run_ivsr
@@ -1817,7 +1816,12 @@ module.for_each_function(dce::eliminate_dead_code);
                     let mut bcasts = Vec::new();
                     for b in &f.blocks {
                         for i in &b.instructions {
-                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
                                 if format!("{op:?}").starts_with("VecBroadcast") {
                                     bcasts.push(d.0);
                                 }
@@ -1828,11 +1832,16 @@ module.for_each_function(dce::eliminate_dead_code);
                         let mut uses = 0u32;
                         for b in &f.blocks {
                             for i in &b.instructions {
-                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-                                    if let crate::ir::reexports::Operand::Value(v) = op {
-                                        if v.0 == *id { uses += 1; }
-                                    }
-                                });
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
                             }
                         }
                         eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
@@ -1870,7 +1879,12 @@ module.for_each_function(dce::eliminate_dead_code);
                     let mut bcasts = Vec::new();
                     for b in &f.blocks {
                         for i in &b.instructions {
-                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
                                 if format!("{op:?}").starts_with("VecBroadcast") {
                                     bcasts.push(d.0);
                                 }
@@ -1881,11 +1895,16 @@ module.for_each_function(dce::eliminate_dead_code);
                         let mut uses = 0u32;
                         for b in &f.blocks {
                             for i in &b.instructions {
-                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-                                    if let crate::ir::reexports::Operand::Value(v) = op {
-                                        if v.0 == *id { uses += 1; }
-                                    }
-                                });
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
                             }
                         }
                         eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
@@ -1992,7 +2011,9 @@ module.for_each_function(dce::eliminate_dead_code);
 
     if !pass_disabled(&disabled, "bepre") {
         let n = module.for_each_function(backedge_pre::run);
-        if n > 0 { module.for_each_function(dce::eliminate_dead_code); }
+        if n > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
     }
 
     // Phase 10.9: Bool-phi merge-diamond branch threading.
@@ -2011,9 +2032,7 @@ module.for_each_function(dce::eliminate_dead_code);
     // Fail-closed soundness rules in the pass header; nothing is ever
     // duplicated. Kill switches: CCC_NO_BOOL_THREAD=1,
     // CCC_DISABLE_PASSES=boolthread.
-    if !pass_disabled(&disabled, "boolthread")
-        && std::env::var("CCC_NO_BOOL_THREAD").is_err()
-    {
+    if !pass_disabled(&disabled, "boolthread") && std::env::var("CCC_NO_BOOL_THREAD").is_err() {
         let n = module.for_each_function(bool_thread::run);
         if n > 0 {
             // Threaded merges leave unreachable phi-only blocks and dead
@@ -2027,7 +2046,12 @@ module.for_each_function(dce::eliminate_dead_code);
                     let mut bcasts = Vec::new();
                     for b in &f.blocks {
                         for i in &b.instructions {
-                            if let crate::ir::reexports::Instruction::Intrinsic { dest: Some(d), op, .. } = i {
+                            if let crate::ir::reexports::Instruction::Intrinsic {
+                                dest: Some(d),
+                                op,
+                                ..
+                            } = i
+                            {
                                 if format!("{op:?}").starts_with("VecBroadcast") {
                                     bcasts.push(d.0);
                                 }
@@ -2038,11 +2062,16 @@ module.for_each_function(dce::eliminate_dead_code);
                         let mut uses = 0u32;
                         for b in &f.blocks {
                             for i in &b.instructions {
-                                crate::backend::liveness::for_each_operand_in_instruction(i, |op| {
-                                    if let crate::ir::reexports::Operand::Value(v) = op {
-                                        if v.0 == *id { uses += 1; }
-                                    }
-                                });
+                                crate::backend::liveness::for_each_operand_in_instruction(
+                                    i,
+                                    |op| {
+                                        if let crate::ir::reexports::Operand::Value(v) = op {
+                                            if v.0 == *id {
+                                                uses += 1;
+                                            }
+                                        }
+                                    },
+                                );
                             }
                         }
                         eprintln!("[PROBE-DCE] fn={} bcast v{} uses={}", f.name, id, uses);
@@ -2110,10 +2139,7 @@ mod m16_size_policy_tests {
 
         let mut disabled = "vectorize".to_string();
         apply_m16_size_policy(&mut disabled, true, 4);
-        assert_eq!(
-            disabled,
-            "vectorize,postinline,ifconv,gaddrcse,licm"
-        );
+        assert_eq!(disabled, "vectorize,postinline,ifconv,gaddrcse,licm");
     }
 
     // ── restore_phi_prefix ──────────────────────────────────────────────────
@@ -2186,10 +2212,7 @@ mod m16_size_policy_tests {
             // is rewritten into a Copy in place, stranding those after it.
             let mut b = block(vec![phi(1), copy(9), phi(2), phi(3)]);
             assert!(restore_phi_prefix(&mut b));
-            assert_eq!(
-                shape(&b),
-                vec![(true, 1), (true, 2), (true, 3), (false, 9)]
-            );
+            assert_eq!(shape(&b), vec![(true, 1), (true, 2), (true, 3), (false, 9)]);
         }
 
         #[test]

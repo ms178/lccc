@@ -486,12 +486,7 @@ fn fold_phi_diamonds(
         }
         let (phi_dest, phi_ty, const_arm, val_arm) = {
             let merge = &func.blocks[cand.merge_idx];
-            let Instruction::Phi {
-                dest,
-                incoming,
-                ty,
-            } = &merge.instructions[cand.phi_pos]
-            else {
+            let Instruction::Phi { dest, incoming, ty } = &merge.instructions[cand.phi_pos] else {
                 continue;
             };
             let a = &incoming[0];
@@ -501,7 +496,12 @@ fn fold_phi_diamonds(
                 (Operand::Value(_), Operand::Const(_)) => (b, a),
                 _ => continue,
             };
-            (*dest, *ty, (const_arm.0, const_arm.1), (val_arm.0, val_arm.1))
+            (
+                *dest,
+                *ty,
+                (const_arm.0, const_arm.1),
+                (val_arm.0, val_arm.1),
+            )
         };
         // Constant arm must be 0 (&&) or 1 (||).
         let and_form = match const_arm.0 {
@@ -510,11 +510,11 @@ fn fold_phi_diamonds(
             _ => continue,
         };
 
-        let bcond_idx = match idx_of.get(&const_arm.1.0) {
+        let bcond_idx = match idx_of.get(&const_arm.1 .0) {
             Some(&i) => i,
             None => continue,
         };
-        let bcheck_idx = match idx_of.get(&val_arm.1.0) {
+        let bcheck_idx = match idx_of.get(&val_arm.1 .0) {
             Some(&i) => i,
             None => continue,
         };
@@ -574,7 +574,11 @@ fn fold_phi_diamonds(
         // the contributing sense is the branch edge to Bcheck; when Bmerge
         // is the TRUE target the comparison is inverted. For `||` (constant
         // 1 on the merge edge) it is the opposite.
-        let negate = if and_form { merge_on_true } else { !merge_on_true };
+        let negate = if and_form {
+            merge_on_true
+        } else {
+            !merge_on_true
+        };
         let c1_op = if negate {
             match c1.0 {
                 IrCmpOp::Slt => IrCmpOp::Sge,
@@ -651,10 +655,9 @@ fn fold_phi_diamonds(
                     if dest.0 == phi_dest.0 {
                         continue;
                     }
-                    if incoming
-                        .iter()
-                        .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == val_id || v.0 == c2_id))
-                    {
+                    if incoming.iter().any(
+                        |(op, _)| matches!(op, Operand::Value(v) if v.0 == val_id || v.0 == c2_id),
+                    ) {
                         arm_ok = false;
                         break 'outer;
                     }

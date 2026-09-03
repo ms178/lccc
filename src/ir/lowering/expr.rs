@@ -103,11 +103,9 @@ impl Lowerer {
         false_label: BlockId,
     ) {
         if let Expr::BinaryOp(op @ (BinOp::LogicalAnd | BinOp::LogicalOr), lhs, rhs, _) = expr {
-            if let Some(value) = super::expr_ops::fold_comparison_pair(
-                lhs,
-                rhs,
-                *op == BinOp::LogicalAnd,
-            ) {
+            if let Some(value) =
+                super::expr_ops::fold_comparison_pair(lhs, rhs, *op == BinOp::LogicalAnd)
+            {
                 self.terminate(Terminator::Branch(if value {
                     true_label
                 } else {
@@ -366,10 +364,7 @@ impl Lowerer {
                 let alias = self.func().addr_label_aliases.get(label_name).cloned();
                 if let Some(alias) = alias {
                     let dest = self.fresh_value();
-                    self.emit(Instruction::GlobalAddr {
-                        dest,
-                        name: alias,
-                    });
+                    self.emit(Instruction::GlobalAddr { dest, name: alias });
                     return Operand::Value(dest);
                 }
                 let scoped_label = self.get_or_create_user_label(label_name);

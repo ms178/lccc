@@ -239,12 +239,9 @@ impl Lowerer {
         let mut ginfo = GlobalInfo::from_analysis(&da);
         ginfo.asm_register = Some(reg_name.clone());
         ginfo.var.address_space = decl.address_space;
-            if let Some(ref mut ct) = ginfo.var.c_type {
-                crate::common::type_builder::apply_declaration_address_space(
-                    ct,
-                    decl.address_space,
-                );
-            }
+        if let Some(ref mut ct) = ginfo.var.c_type {
+            crate::common::type_builder::apply_declaration_address_space(ct, decl.address_space);
+        }
         self.globals.insert(declarator.name.clone(), ginfo);
         true
     }

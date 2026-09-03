@@ -179,7 +179,8 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
             } else {
-                self.state.emit_fmt(format_args!("    movq %fs:0, %{}", reg));
+                self.state
+                    .emit_fmt(format_args!("    movq %fs:0, %{}", reg));
                 self.state
                     .emit_fmt(format_args!("    leaq {}@TPOFF(%{}), %{}", name, reg, reg));
             }
@@ -188,9 +189,7 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    movq {}@GOTPCREL(%rip), %{}", n, reg));
         } else if self.state.absolute_symbols.contains(name) {
-            self.state
-                .out
-                .emit_instr_sym_imm_reg("    movq", name, reg);
+            self.state.out.emit_instr_sym_imm_reg("    movq", name, reg);
         } else {
             self.state
                 .out

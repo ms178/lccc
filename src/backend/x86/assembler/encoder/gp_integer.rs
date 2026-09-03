@@ -586,10 +586,7 @@ impl super::InstructionEncoder {
     /// dst size from dst reg. For mem-reg, src size defaults to 1 when dst
     /// is 32/64-bit and the mnemonic is ambiguous — the twofish pattern is
     /// always reg-reg, so mem-reg falls back to byte source.
-    pub(crate) fn encode_movzx_infer_both(
-        &mut self,
-        ops: &[Operand],
-    ) -> Result<(), String> {
+    pub(crate) fn encode_movzx_infer_both(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movzx requires 2 operands".to_string());
         }
@@ -599,16 +596,16 @@ impl super::InstructionEncoder {
             _ => return Err("movzx source must be register or memory".to_string()),
         };
         if src_size != 1 && src_size != 2 {
-            return Err(format!("movzx source must be 8 or 16-bit, got {} bytes", src_size));
+            return Err(format!(
+                "movzx source must be 8 or 16-bit, got {} bytes",
+                src_size
+            ));
         }
         let dst_size = infer_movext_dst_size(ops)?;
         self.encode_movzx(ops, src_size, dst_size)
     }
 
-    pub(crate) fn encode_movsx_infer_both(
-        &mut self,
-        ops: &[Operand],
-    ) -> Result<(), String> {
+    pub(crate) fn encode_movsx_infer_both(&mut self, ops: &[Operand]) -> Result<(), String> {
         if ops.len() != 2 {
             return Err("movsx requires 2 operands".to_string());
         }
@@ -618,7 +615,10 @@ impl super::InstructionEncoder {
             _ => return Err("movsx source must be register or memory".to_string()),
         };
         if src_size != 1 && src_size != 2 && src_size != 4 {
-            return Err(format!("movsx source must be 8/16/32-bit, got {} bytes", src_size));
+            return Err(format!(
+                "movsx source must be 8/16/32-bit, got {} bytes",
+                src_size
+            ));
         }
         let dst_size = infer_movext_dst_size(ops)?;
         // movsx with 32->64 is movslq (0x63), handled by encode_movsx

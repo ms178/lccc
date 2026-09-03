@@ -244,7 +244,11 @@ fn a_self_move_emits_nothing() {
         dst: reg(PhysReg(0)),
         size: OpSize::S64,
     });
-    assert!(lines.is_empty(), "self-move must be elided, got {:?}", lines);
+    assert!(
+        lines.is_empty(),
+        "self-move must be elided, got {:?}",
+        lines
+    );
 }
 
 #[test]
@@ -280,7 +284,12 @@ fn indexed_memory_emits_every_legal_scale() {
             line
         );
         if scale != 1 {
-            assert!(line.contains(&scale.to_string()), "scale {}: {}", scale, line);
+            assert!(
+                line.contains(&scale.to_string()),
+                "scale {}: {}",
+                scale,
+                line
+            );
         }
     }
 }
@@ -340,7 +349,10 @@ fn a_32bit_memory_store_of_a_large_immediate_uses_movl_not_movq() {
         },
         size: OpSize::S32,
     });
-    assert_eq!(line, "movl $3041712678, (%rcx)", "narrow store must stay narrow");
+    assert_eq!(
+        line, "movl $3041712678, (%rcx)",
+        "narrow store must stay narrow"
+    );
 }
 
 #[test]
@@ -392,7 +404,10 @@ fn a_64bit_memory_store_of_a_large_immediate_still_relays_through_rax() {
         },
         size: OpSize::S64,
     });
-    assert_eq!(lines, vec!["movabsq $1234605616436508552, %rax", "movq %rax, (%rcx)"]);
+    assert_eq!(
+        lines,
+        vec!["movabsq $1234605616436508552, %rax", "movq %rax, (%rcx)"]
+    );
 }
 
 #[test]
@@ -448,7 +463,11 @@ fn every_alu_operation_emits_its_mnemonic() {
 
 #[test]
 fn every_shift_operation_emits_its_mnemonic() {
-    for (op, mnem) in [(ShiftOp::Shl, "shl"), (ShiftOp::Shr, "shr"), (ShiftOp::Sar, "sar")] {
+    for (op, mnem) in [
+        (ShiftOp::Shl, "shl"),
+        (ShiftOp::Shr, "shr"),
+        (ShiftOp::Sar, "sar"),
+    ] {
         let line = emit1(&MachInst::Shift {
             op,
             amount: MachOperand::Imm(3),
@@ -503,7 +522,11 @@ fn setcc_writes_a_byte_register() {
         cc: CondCode::E,
         dst: MachReg::Phys(PhysReg(15)),
     });
-    assert!(line.contains("%sil"), "setcc must use the byte name: {}", line);
+    assert!(
+        line.contains("%sil"),
+        "setcc must use the byte name: {}",
+        line
+    );
 }
 
 #[test]
@@ -639,7 +662,14 @@ fn instruction_corpus() -> Vec<MachInst> {
     // sized return home — so the real-assembler differential proves the
     // whole sequence encodes, not just the call mnemonic.
     {
-        let abi = [PhysReg(14), PhysReg(15), PhysReg(16), PhysReg(7), PhysReg(12), PhysReg(13)];
+        let abi = [
+            PhysReg(14),
+            PhysReg(15),
+            PhysReg(16),
+            PhysReg(7),
+            PhysReg(12),
+            PhysReg(13),
+        ];
         for (i, dst) in abi.iter().enumerate() {
             v.push(MachInst::CallTyped {
                 caller_saves: vec![(PhysReg(10), -48), (PhysReg(11), -56)],
@@ -938,7 +968,11 @@ fn find_assembler() -> Option<(String, String)> {
             .filter_map(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
                 n.starts_with("gas-2.47-").then(|| {
-                    e.path().join("bin").join("as").to_string_lossy().to_string()
+                    e.path()
+                        .join("bin")
+                        .join("as")
+                        .to_string_lossy()
+                        .to_string()
                 })
             })
             .filter(|p| std::path::Path::new(p).exists())
@@ -1118,11 +1152,26 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
     let mut rng = Rng(0x5EED_1CCC_0000_0001);
     let regs: Vec<PhysReg> = KNOWN_REGS.iter().map(|&i| PhysReg(i)).collect();
     let sizes = SIZES;
-    let alus = [AluOp::Add, AluOp::Sub, AluOp::And, AluOp::Or, AluOp::Xor, AluOp::Imul];
+    let alus = [
+        AluOp::Add,
+        AluOp::Sub,
+        AluOp::And,
+        AluOp::Or,
+        AluOp::Xor,
+        AluOp::Imul,
+    ];
     let shifts = [ShiftOp::Shl, ShiftOp::Shr, ShiftOp::Sar];
     let ccs = [
-        CondCode::E, CondCode::Ne, CondCode::L, CondCode::Le, CondCode::G,
-        CondCode::Ge, CondCode::B, CondCode::Be, CondCode::A, CondCode::Ae,
+        CondCode::E,
+        CondCode::Ne,
+        CondCode::L,
+        CondCode::Le,
+        CondCode::G,
+        CondCode::Ge,
+        CondCode::B,
+        CondCode::Be,
+        CondCode::A,
+        CondCode::Ae,
     ];
     let offsets: [i64; 5] = [0, 8, -8, 4096, -4096];
     let scales: [u8; 4] = [1, 2, 4, 8];
@@ -1210,8 +1259,16 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
             _ => MachInst::Movzx {
                 src: MachOperand::Reg(MachReg::Phys(a)),
                 dst: MachReg::Phys(b),
-                from_size: if rng.next() % 2 == 0 { OpSize::S8 } else { OpSize::S16 },
-                to_size: if rng.next() % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
+                from_size: if rng.next() % 2 == 0 {
+                    OpSize::S8
+                } else {
+                    OpSize::S16
+                },
+                to_size: if rng.next() % 2 == 0 {
+                    OpSize::S32
+                } else {
+                    OpSize::S64
+                },
             },
         });
     }
@@ -1227,10 +1284,12 @@ fn a_large_randomized_corpus_is_accepted_by_the_real_assembler() {
     announce_assembler(&asm, &ver);
     let corpus = random_corpus(4000);
 
-    let mut src = String::from(".text
+    let mut src = String::from(
+        ".text
 .globl _machinst_fuzz
 _machinst_fuzz:
-");
+",
+    );
     let mut kept = 0usize;
     for inst in &corpus {
         let mut out = AsmOutput::new();
@@ -1246,9 +1305,14 @@ _machinst_fuzz:
             kept += 1;
         }
     }
-    src.push_str("    ret
-");
-    assert!(kept > 3000, "expected a substantial corpus, got {kept} lines");
+    src.push_str(
+        "    ret
+",
+    );
+    assert!(
+        kept > 3000,
+        "expected a substantial corpus, got {kept} lines"
+    );
 
     let dir = std::env::temp_dir().join(format!("lccc-machinst-fuzz-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1262,7 +1326,12 @@ _machinst_fuzz:
     } else {
         cmd.arg("-c");
     }
-    let output = cmd.arg(&s_path).arg("-o").arg(&o_path).output().expect("run assembler");
+    let output = cmd
+        .arg(&s_path)
+        .arg("-o")
+        .arg(&o_path)
+        .output()
+        .expect("run assembler");
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -1306,7 +1375,8 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
         emit_machinst(&inst, &mut out);
         assert!(
             !out.buf.contains("vreg") && !out.buf.contains("VREG"),
-            "unresolved vreg for {:?}", inst
+            "unresolved vreg for {:?}",
+            inst
         );
         // Every instruction must emit SOMETHING, except the self-move the
         // emitter deliberately elides.
@@ -1315,7 +1385,8 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
         if !elided {
             assert!(
                 out.buf.trim().lines().any(|l| !l.trim().is_empty()),
-                "empty emission for {:?}", inst
+                "empty emission for {:?}",
+                inst
             );
         }
     }
@@ -1339,7 +1410,11 @@ fn no_randomized_instruction_emits_an_unresolved_register_or_empty_text() {
 fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
     let (asm, _ver) = find_assembler()?;
     // Executing needs a compiler+linker for the harness, not just `as`.
-    if std::process::Command::new("cc").arg("--version").output().is_err() {
+    if std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return None;
     }
 
@@ -1359,9 +1434,8 @@ fn run_emitted(body: &str, inputs: &[(i64, i64)]) -> Option<Vec<i64>> {
     )
     .ok()?;
 
-    let mut main_src = String::from(
-        "#include <stdio.h>\nlong probe_fn(long,long);\nint main(void){\n",
-    );
+    let mut main_src =
+        String::from("#include <stdio.h>\nlong probe_fn(long,long);\nint main(void){\n");
     for (a, b) in inputs {
         main_src.push_str(&format!(
             "    printf(\"%lld\\n\", (long long)probe_fn({}L, {}L));\n",
@@ -1566,7 +1640,11 @@ fn a_symbol_address_is_the_real_address_when_executed() {
         eprintln!("SKIP: no assembler; LeaSym execution check cannot run");
         return;
     };
-    if std::process::Command::new("cc").arg("--version").output().is_err() {
+    if std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return;
     }
     let dir = std::env::temp_dir().join(format!("lccc-leasym-{}", std::process::id()));
@@ -1648,9 +1726,9 @@ fn a_symbol_address_is_the_real_address_when_executed() {
 /// the no-code `ParamRef` subset were lowered.
 #[test]
 fn instruction_selection_covers_the_expected_instruction_classes() {
-    use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
-    use crate::common::types::IrType;
     use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
     let ra: FxHashMap<u32, PhysReg> = [
         (1u32, PhysReg(0)),
@@ -1810,8 +1888,8 @@ fn instruction_selection_covers_the_expected_instruction_classes() {
 /// variant (or execution) tells them apart.
 #[test]
 fn global_addr_lowers_to_an_address_computation_not_a_load() {
-    use crate::ir::reexports::{Instruction, Value};
     use crate::common::fx_hash::FxHashMap;
+    use crate::ir::reexports::{Instruction, Value};
 
     let ra: FxHashMap<u32, PhysReg> = [(1u32, PhysReg(0))].into_iter().collect();
     let slots: FxHashMap<u32, i64> = FxHashMap::default();
@@ -2054,13 +2132,9 @@ fn float_moves_lower_through_machinst() {
 
     // 4: xmm2-homed float value; 5: xmm3-homed; 3: GPR pointer (r10);
     // 9: alloca slot at -8.
-    let ra: FxHashMap<u32, PhysReg> = [
-        (3u32, PhysReg(11)),
-        (4, PhysReg(20)),
-        (5, PhysReg(21)),
-    ]
-    .into_iter()
-    .collect();
+    let ra: FxHashMap<u32, PhysReg> = [(3u32, PhysReg(11)), (4, PhysReg(20)), (5, PhysReg(21))]
+        .into_iter()
+        .collect();
     let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
 
     let store = |val: u32, ptr: u32, ty: IrType| Instruction::Store {
@@ -2440,13 +2514,9 @@ fn float_binops_lower_with_exact_operand_order() {
     use crate::ir::reexports::{Instruction, IrBinOp, Operand, Value};
 
     // 4: xmm2 (lhs), 5: xmm3 (rhs), 6: xmm4 (dest), 7: slot-homed value.
-    let ra: FxHashMap<u32, PhysReg> = [
-        (4u32, PhysReg(20)),
-        (5, PhysReg(21)),
-        (6, PhysReg(22)),
-    ]
-    .into_iter()
-    .collect();
+    let ra: FxHashMap<u32, PhysReg> = [(4u32, PhysReg(20)), (5, PhysReg(21)), (6, PhysReg(22))]
+        .into_iter()
+        .collect();
     let slots: FxHashMap<u32, i64> = FxHashMap::default();
 
     let binop = |dest: u32, op: IrBinOp, l: u32, r: u32, ty: IrType| Instruction::BinOp {
@@ -2492,7 +2562,14 @@ fn float_binops_lower_with_exact_operand_order() {
         &mut out,
     ));
     assert!(
-        matches!(&out[..], [MachInst::FAlu { op: FAluOp::Div, size: OpSize::S32, .. }]),
+        matches!(
+            &out[..],
+            [MachInst::FAlu {
+                op: FAluOp::Div,
+                size: OpSize::S32,
+                ..
+            }]
+        ),
         "unexpected: {out:?}"
     );
 
@@ -2586,7 +2663,9 @@ fn float_binops_lower_with_exact_operand_order() {
 //       restores, with zero-immediate arguments rendered as `xorl`.
 
 mod call_builder {
-    use super::super::isel::{build_typed_call, build_typed_call_ex, TypedCallReject, TypedCallSrc};
+    use super::super::isel::{
+        build_typed_call, build_typed_call_ex, TypedCallReject, TypedCallSrc,
+    };
     use super::*;
     use crate::common::types::IrType;
 
@@ -2607,12 +2686,12 @@ mod call_builder {
     fn orders_readers_before_writers() {
         let plan = build_typed_call(
             &[
-                Some(TypedCallSrc::Reg(R8)),  // arg0: read r8 …
+                Some(TypedCallSrc::Reg(R8)),         // arg0: read r8 …
                 Some(TypedCallSrc::Reg(PhysReg(1))), // arg1: rbx → rsi
-                Some(TypedCallSrc::Imm(7)),   // arg2
-                Some(TypedCallSrc::Slot(-8)), // arg3
+                Some(TypedCallSrc::Imm(7)),          // arg2
+                Some(TypedCallSrc::Slot(-8)),        // arg3
                 Some(TypedCallSrc::Reg(PhysReg(2))), // arg4: r12 → r8 (writes the arg0 source!)
-                Some(TypedCallSrc::Imm(0)),   // arg5
+                Some(TypedCallSrc::Imm(0)),          // arg5
             ],
             &[s64(); 6],
             None,
@@ -2681,8 +2760,12 @@ mod call_builder {
         assert_eq!(plan.args.len(), 1);
         assert_eq!(plan.args[0].src, MachOperand::Imm(0x1_0000_0000));
         // The extremes: i32::MIN/MAX stay in the sign-extended movq window.
-        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MIN as i64))], &[s64()], None).is_ok());
-        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MAX as i64))], &[s64()], None).is_ok());
+        assert!(
+            build_typed_call(&[Some(TypedCallSrc::Imm(i32::MIN as i64))], &[s64()], None).is_ok()
+        );
+        assert!(
+            build_typed_call(&[Some(TypedCallSrc::Imm(i32::MAX as i64))], &[s64()], None).is_ok()
+        );
         assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i64::MIN))], &[s64()], None).is_ok());
         assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i64::MAX))], &[s64()], None).is_ok());
     }
@@ -2732,20 +2815,22 @@ mod call_builder {
     #[test]
     fn return_homes() {
         // Register return.
-        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(1))), s64())))
-            .unwrap();
+        let plan =
+            build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(1))), s64()))).unwrap();
         match plan.ret {
             Some(r) => assert_eq!(r.dst, reg(PhysReg(1))),
             None => panic!("register return home required"),
         }
         // Slot return.
-        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Slot(-16)), s64()))).unwrap();
+        let plan =
+            build_typed_call(&[], &[], Some((Some(TypedCallSrc::Slot(-16)), s64()))).unwrap();
         match plan.ret {
             Some(r) => assert_eq!(r.dst, MachOperand::StackSlot(-16)),
             None => panic!("slot return home required"),
         }
         // rax-homed return: the copy is a no-op.
-        let plan = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(0))), s64()))).unwrap();
+        let plan =
+            build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(0))), s64()))).unwrap();
         assert!(plan.ret.is_none(), "rax → rax must be elided");
         // rbp return home: refused.
         let err = build_typed_call(&[], &[], Some((Some(TypedCallSrc::Reg(PhysReg(6))), s64())))
@@ -2804,8 +2889,14 @@ mod call_builder {
         //   rdx: arg5's move reads it, arg2's move writes it.
         //   rcx: arg2's move reads it, arg3's move writes it.
         let pos = |want: PhysReg| plan.args.iter().position(|m| m.dst_reg == want).unwrap();
-        assert!(pos(R9) < pos(RDX), "the rdx reader must precede the rdx writer");
-        assert!(pos(RDX) < pos(RCX), "the rcx reader must precede the rcx writer");
+        assert!(
+            pos(R9) < pos(RDX),
+            "the rdx reader must precede the rdx writer"
+        );
+        assert!(
+            pos(RDX) < pos(RCX),
+            "the rcx reader must precede the rcx writer"
+        );
         assert_eq!(plan.ret.as_ref().unwrap().dst, MachOperand::StackSlot(-32));
         assert_eq!(plan.ret.as_ref().unwrap().size, OpSize::S32);
     }
@@ -2875,11 +2966,7 @@ fn calltyped_return_home_names_the_sized_rax() {
         }),
     };
     let lines = emit(&inst);
-    assert_eq!(
-        lines,
-        vec!["call f", "movl %eax, -8(%rbp)"],
-        "{lines:?}"
-    );
+    assert_eq!(lines, vec!["call f", "movl %eax, -8(%rbp)"], "{lines:?}");
 }
 
 /// The typed call's registers — argument registers, rax — must be covered
@@ -2969,7 +3056,9 @@ fn float_store_relay_lowers_to_two_fmovs_through_xmm0() {
         volatile: false,
     };
     let mut out = Vec::new();
-    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
+    assert!(super::isel::lower_instruction_typed(
+        &inst, &ra, &slots, None, &mut out
+    ));
     assert_eq!(out.len(), 2, "{out:?}");
     match (&out[0], &out[1]) {
         (
@@ -3009,7 +3098,9 @@ fn float_load_to_slot_homed_dest_relays_through_xmm0() {
         volatile: false,
     };
     let mut out = Vec::new();
-    assert!(super::isel::lower_instruction_typed(&inst, &ra, &slots, None, &mut out));
+    assert!(super::isel::lower_instruction_typed(
+        &inst, &ra, &slots, None, &mut out
+    ));
     assert_eq!(out.len(), 2, "{out:?}");
     assert!(matches!(
         &out[0],
@@ -3091,10 +3182,7 @@ mod float_const_stores {
             None,
             &mut out,
         );
-        assert!(
-            !lowered,
-            "volatile 8-byte store must not be split: {out:?}"
-        );
+        assert!(!lowered, "volatile 8-byte store must not be split: {out:?}");
     }
 
     /// A volatile F32/D32 store is a single 4-byte access and MAY take the
@@ -3128,11 +3216,19 @@ mod float_const_stores {
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(1), size: OpSize::S64, .. }
+            MachInst::Mov {
+                src: MachOperand::Imm(1),
+                size: OpSize::S64,
+                ..
+            }
         ));
     }
 
-    fn lower(inst: &Instruction, ra: &FxHashMap<u32, PhysReg>, slots: &FxHashMap<u32, i64>) -> Vec<MachInst> {
+    fn lower(
+        inst: &Instruction,
+        ra: &FxHashMap<u32, PhysReg>,
+        slots: &FxHashMap<u32, i64>,
+    ) -> Vec<MachInst> {
         let mut out = Vec::new();
         assert!(
             super::super::isel::lower_instruction_typed(inst, ra, slots, None, &mut out),
@@ -3199,7 +3295,11 @@ mod float_const_stores {
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S64 }
+            MachInst::Mov {
+                src: MachOperand::Imm(0),
+                dst: MachOperand::StackSlot(-8),
+                size: OpSize::S64
+            }
         ));
         assert_eq!(emit(&out[0]), vec!["movq $0, -8(%rbp)"]);
 
@@ -3209,7 +3309,11 @@ mod float_const_stores {
             &FxHashMap::default(),
             &slots,
         );
-        assert_eq!(out.len(), 2, "-0.0 must NOT take the single movq form: {out:?}");
+        assert_eq!(
+            out.len(),
+            2,
+            "-0.0 must NOT take the single movq form: {out:?}"
+        );
     }
 
     /// f64 whose full bit pattern fits the sign-extended imm32 window —
@@ -3243,7 +3347,11 @@ mod float_const_stores {
         assert_eq!(out.len(), 1, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(1), size: OpSize::S64, .. }
+            MachInst::Mov {
+                src: MachOperand::Imm(1),
+                size: OpSize::S64,
+                ..
+            }
         ));
     }
 
@@ -3261,7 +3369,11 @@ mod float_const_stores {
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S32 }
+            MachInst::Mov {
+                src: MachOperand::Imm(0),
+                dst: MachOperand::StackSlot(-8),
+                size: OpSize::S32
+            }
         ));
         assert!(matches!(
             &out[1],
@@ -3287,7 +3399,14 @@ mod float_const_stores {
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::Mem { base: MachReg::Phys(PhysReg(11)), offset: 0 }, size: OpSize::S32 }
+            MachInst::Mov {
+                src: MachOperand::Imm(0),
+                dst: MachOperand::Mem {
+                    base: MachReg::Phys(PhysReg(11)),
+                    offset: 0
+                },
+                size: OpSize::S32
+            }
         ));
         assert!(matches!(
             &out[1],
@@ -3313,7 +3432,11 @@ mod float_const_stores {
         assert_eq!(out.len(), 2, "{out:?}");
         assert!(matches!(
             &out[0],
-            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S32 }
+            MachInst::Mov {
+                src: MachOperand::Imm(0),
+                dst: MachOperand::StackSlot(-8),
+                size: OpSize::S32
+            }
         ));
         assert!(matches!(
             &out[1],
@@ -3345,7 +3468,11 @@ mod float_const_stores {
         ));
 
         let out = lower(
-            &store(Operand::Const(IrConst::D64(0x1122_3344_5566_7788)), 9, IrType::D64),
+            &store(
+                Operand::Const(IrConst::D64(0x1122_3344_5566_7788)),
+                9,
+                IrType::D64,
+            ),
             &FxHashMap::default(),
             &slots,
         );
@@ -3404,14 +3531,18 @@ mod float_const_stores {
             // (slot offset, immediate, size) — emission order matters: the
             // sign-bit-hi pattern is stored BEFORE the f32 1.5 whose bytes
             // a buggy 8-byte hi-half relay would clobber.
-            (-40, 0, OpSize::S32),                                        // pat lo
-            (-36, 0xE000_0000u32 as i32 as i64, OpSize::S32),             // pat hi
-            (-32, f32::to_bits(1.5) as i32 as i64, OpSize::S32),          // f32 1.5
-            (-28, f32::to_bits(-1.5) as i32 as i64, OpSize::S32),         // f32 -1.5
-            (-24, f64::to_bits(1.5) as u32 as i32 as i64, OpSize::S32),   // f64 1.5 lo
-            (-20, ((f64::to_bits(1.5) >> 32) as u32) as i32 as i64, OpSize::S32), // hi
-            (-16, 0, OpSize::S32),                                        // -0.0 lo
-            (-12, 0x8000_0000u32 as i32 as i64, OpSize::S32),             // -0.0 hi
+            (-40, 0, OpSize::S32),                                // pat lo
+            (-36, 0xE000_0000u32 as i32 as i64, OpSize::S32),     // pat hi
+            (-32, f32::to_bits(1.5) as i32 as i64, OpSize::S32),  // f32 1.5
+            (-28, f32::to_bits(-1.5) as i32 as i64, OpSize::S32), // f32 -1.5
+            (-24, f64::to_bits(1.5) as u32 as i32 as i64, OpSize::S32), // f64 1.5 lo
+            (
+                -20,
+                ((f64::to_bits(1.5) >> 32) as u32) as i32 as i64,
+                OpSize::S32,
+            ), // hi
+            (-16, 0, OpSize::S32),                                // -0.0 lo
+            (-12, 0x8000_0000u32 as i32 as i64, OpSize::S32),     // -0.0 hi
         ];
         let mut out = AsmOutput::new();
         out.use_rsp_addressing = false;
@@ -3419,7 +3550,7 @@ mod float_const_stores {
         out.emit("    .globl _start");
         out.emit("_start:");
         out.emit("    mov %rsp, %rbp"); // rbp = original rsp; slots are rbp-40..rbp-8, below the current rsp? No: push a frame first.
-        out.emit("    sub $64, %rsp");  // carve the scratch frame below the initial rsp
+        out.emit("    sub $64, %rsp"); // carve the scratch frame below the initial rsp
         for (slot, imm, size) in stores {
             emit_machinst(
                 &MachInst::Mov {
@@ -3463,7 +3594,13 @@ mod float_const_stores {
         out.emit("    syscall");
         std::fs::write(&s_path, out.buf.as_bytes()).unwrap();
 
-        let a = std::process::Command::new(&asm).arg("-c").arg(&s_path).arg("-o").arg(&o_path).output().unwrap();
+        let a = std::process::Command::new(&asm)
+            .arg("-c")
+            .arg(&s_path)
+            .arg("-o")
+            .arg(&o_path)
+            .output()
+            .unwrap();
         assert!(
             a.status.success(),
             "assembler rejected float-const immediates:\n{}\n{}",
@@ -3477,11 +3614,27 @@ mod float_const_stores {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        let l = std::process::Command::new(&ld).arg(&o_path).arg("-o").arg(&bin).arg("-e").arg("_start").output().unwrap();
-        assert!(l.status.success(), "link failed:\n{}", String::from_utf8_lossy(&l.stderr));
+        let l = std::process::Command::new(&ld)
+            .arg(&o_path)
+            .arg("-o")
+            .arg(&bin)
+            .arg("-e")
+            .arg("_start")
+            .output()
+            .unwrap();
+        assert!(
+            l.status.success(),
+            "link failed:\n{}",
+            String::from_utf8_lossy(&l.stderr)
+        );
         let r = std::process::Command::new(&bin).output().unwrap();
         let got = r.stdout;
-        assert_eq!(got.len(), 32, "probe must write 32 bytes, got {}", got.len());
+        assert_eq!(
+            got.len(),
+            32,
+            "probe must write 32 bytes, got {}",
+            got.len()
+        );
         let regions: [(usize, usize, Vec<u8>); 5] = [
             (0, 8, 0xE000_0000_0000_0000u64.to_le_bytes().to_vec()),
             (8, 4, f32::to_bits(1.5).to_le_bytes().to_vec()),
@@ -3518,9 +3671,7 @@ mod float_const_stores {
             return p.exists();
         }
         std::env::var_os("PATH")
-            .map(|paths| {
-                std::env::split_paths(&paths).any(|dir| dir.join(p).is_file())
-            })
+            .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(p).is_file()))
             .unwrap_or(false)
     }
 }
@@ -3654,8 +3805,9 @@ mod typed_indirect_calls {
                 .is_err(),
             "r10 staging must deadlock on this shape"
         );
-        let plan = super::super::isel::build_typed_call_ex(&args, &[s64()], None, Some((callee, R11)))
-            .expect("r11 staging resolves it");
+        let plan =
+            super::super::isel::build_typed_call_ex(&args, &[s64()], None, Some((callee, R11)))
+                .expect("r11 staging resolves it");
         // arg0 (rdi writer) must follow the staging (rdi reader).
         let stage_pos = plan
             .args
@@ -3718,13 +3870,13 @@ mod typed_indirect_calls {
         assert_eq!(
             lines,
             vec![
-                "movq %r10, -48(%rbp)",           // save r10 (the staging target)
-                "movq -40(%rbp), %r10",           // stage the callee pointer
-                "xorl %edi, %edi",                // zero arg
+                "movq %r10, -48(%rbp)",               // save r10 (the staging target)
+                "movq -40(%rbp), %r10",               // stage the callee pointer
+                "xorl %edi, %edi",                    // zero arg
                 "movabsq $1311768467463790320, %rsi", // wide imm: movabsq, never truncation
-                "call *%r10",                     // the indirect call itself
-                "movq %rax, -16(%rbp)",           // return home
-                "movq -48(%rbp), %r10",           // restore
+                "call *%r10",                         // the indirect call itself
+                "movq %rax, -16(%rbp)",               // return home
+                "movq -48(%rbp), %r10",               // restore
             ],
             "{lines:?}"
         );
@@ -3738,9 +3890,9 @@ mod typed_indirect_calls {
     fn ir_callindirect_lowers_through_the_typed_path() {
         use super::super::isel::{lower_instruction_typed, TypedCallSrc};
         let _ = TypedCallSrc::Imm(0); // keep the import honest for doc builds
-        // The isel-side dispatch lives in emit.rs (needs codegen state), so
-        // the builder-level contract is what the unit layer pins; the
-        // emitted form above plus the corpus differential cover the rest.
+                                      // The isel-side dispatch lives in emit.rs (needs codegen state), so
+                                      // the builder-level contract is what the unit layer pins; the
+                                      // emitted form above plus the corpus differential cover the rest.
         let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
         let slots: FxHashMap<u32, i64> = [(2u32, -40i64)].into_iter().collect();
         let inst = Instruction::CallIndirect {
@@ -3780,9 +3932,15 @@ mod typed_indirect_calls {
     #[test]
     fn indirect_calltyped_is_in_the_assembler_corpus() {
         let corpus = instruction_corpus();
-        let has_indirect = corpus
-            .iter()
-            .any(|i| matches!(i, MachInst::CallTyped { target: CallTarget::Indirect(_), .. }));
+        let has_indirect = corpus.iter().any(|i| {
+            matches!(
+                i,
+                MachInst::CallTyped {
+                    target: CallTarget::Indirect(_),
+                    ..
+                }
+            )
+        });
         assert!(
             has_indirect,
             "CallTarget::Indirect must be part of instruction_corpus so the \
@@ -3835,15 +3993,14 @@ fn mov128_renders_the_sse_scratch_pair() {
     );
 }
 
-
 /// Const i128 store: two S64 Movs at the destination halves. The halves
 /// are the value's own 64-bit words; each is either an imm32-window movq
 /// or the emitter's hardened wide relay (which stores exactly 8 bytes).
 #[test]
 fn isel_const_i128_store_lowers_to_two_s64_movs() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 
     let v: i128 = (0x1122334455667788i128 << 64) | 3;
@@ -3891,8 +4048,8 @@ fn isel_const_i128_store_lowers_to_two_s64_movs() {
 #[test]
 fn isel_value_i128_store_lowers_to_mov128() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, Operand, Value};
 
     let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect(); // rdi-held ptr
@@ -3931,12 +4088,13 @@ fn isel_value_i128_store_lowers_to_mov128() {
 #[test]
 fn isel_value_i128_store_falls_back_to_ordered_gpr_relay_when_scratch_unsafe() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, Operand, Value};
 
-    let ra: FxHashMap<u32, PhysReg> =
-        [(2u32, PhysReg(14)), (9u32, PhysReg(18))].into_iter().collect(); // 18 = live xmm0 home
+    let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14)), (9u32, PhysReg(18))]
+        .into_iter()
+        .collect(); // 18 = live xmm0 home
     let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
     let mut out = Vec::new();
     assert!(super::isel::lower_instruction_typed(
@@ -3952,7 +4110,11 @@ fn isel_value_i128_store_falls_back_to_ordered_gpr_relay_when_scratch_unsafe() {
         None,
         &mut out,
     ));
-    assert_eq!(out.len(), 4, "load lo, load hi, store lo, store hi: {out:?}");
+    assert_eq!(
+        out.len(),
+        4,
+        "load lo, load hi, store lo, store hi: {out:?}"
+    );
     let shape: Vec<(&str, &str)> = out
         .iter()
         .map(|inst| match inst {
@@ -3981,7 +4143,12 @@ fn isel_value_i128_store_falls_back_to_ordered_gpr_relay_when_scratch_unsafe() {
         .collect();
     assert_eq!(
         shape,
-        vec![("load", "lo"), ("load", "hi"), ("store", "lo"), ("store", "hi")],
+        vec![
+            ("load", "lo"),
+            ("load", "hi"),
+            ("store", "lo"),
+            ("store", "hi")
+        ],
         "reads strictly before writes"
     );
 }
@@ -3990,8 +4157,8 @@ fn isel_value_i128_store_falls_back_to_ordered_gpr_relay_when_scratch_unsafe() {
 #[test]
 fn isel_i128_load_lowers_to_mov128() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, Value};
 
     let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect();
@@ -4029,8 +4196,8 @@ fn isel_i128_load_lowers_to_mov128() {
 #[test]
 fn isel_refuses_volatile_i128_store_and_load() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, Operand, Value};
 
     let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect();
@@ -4072,12 +4239,13 @@ fn isel_refuses_volatile_i128_store_and_load() {
 #[test]
 fn isel_refuses_register_homed_store_value() {
     use crate::common::fx_hash::FxHashMap;
-    use crate::common::types::IrType;
     use crate::common::types::AddressSpace;
+    use crate::common::types::IrType;
     use crate::ir::reexports::{Instruction, Operand, Value};
 
-    let ra: FxHashMap<u32, PhysReg> =
-        [(2u32, PhysReg(14)), (1u32, PhysReg(1))].into_iter().collect();
+    let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14)), (1u32, PhysReg(1))]
+        .into_iter()
+        .collect();
     let slots: FxHashMap<u32, i64> = FxHashMap::default();
     let mut out = Vec::new();
     assert!(!super::isel::lower_instruction_typed(

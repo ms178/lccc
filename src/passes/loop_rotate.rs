@@ -65,10 +65,12 @@
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
 use crate::ir::analysis::CfgAnalysis;
+use crate::ir::reexports::{BlockId, Instruction, IrConst, IrFunction, Operand, Terminator, Value};
 use crate::passes::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
-use crate::passes::loop_unroll::{rename_inst_dest, subst_value_in_terminator, subst_value_with_operand};
+use crate::passes::loop_unroll::{
+    rename_inst_dest, subst_value_in_terminator, subst_value_with_operand,
+};
 use crate::passes::tail_call_elim::replace_values_in_inst;
 
 /// Per-function entry point for the dirty-tracking pipeline.
@@ -168,9 +170,9 @@ pub(crate) fn rotate_loops(func: &mut IrFunction) -> usize {
             // sequential (non-nested) loops still rotate. A tighter
             // "cond uses outer-header phi" check is not enough: after
             // copy-prop `sz` is no longer the phi dest.
-            let nested = loops.iter().any(|outer| {
-                outer.header != lp.header && outer.body.contains(&lp.header)
-            });
+            let nested = loops
+                .iter()
+                .any(|outer| outer.header != lp.header && outer.body.contains(&lp.header));
             if nested {
                 if std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok() {
                     eprintln!("[ROT] nested loop header={} — bail (Guard E)", lp.header);
@@ -200,14 +202,33 @@ fn try_rotate_loop(
     let debug = std::env::var("CCC_DEBUG_LOOP_ROTATE").is_ok();
     // 1. Single latch that is NOT the header (a self-loop is already rotated).
     let Some(latch_idx) = lp.single_latch(&cfg.preds) else {
-        if debug { eprintln!("[ROT] no single latch (header={}, body_len={})", lp.header, lp.body.len()); }
+        if debug {
+            eprintln!(
+                "[ROT] no single latch (header={}, body_len={})",
+                lp.header,
+                lp.body.len()
+            );
+        }
         return false;
     };
     if latch_idx == lp.header {
-        if debug { eprintln!("[ROT] self-loop (latch==header={}, body_len={})", lp.header, lp.body.len()); }
+        if debug {
+            eprintln!(
+                "[ROT] self-loop (latch==header={}, body_len={})",
+                lp.header,
+                lp.body.len()
+            );
+        }
         return false;
     }
-    if debug { eprintln!("[ROT] candidate: header={}, latch={}, body_len={}", lp.header, latch_idx, lp.body.len()); }
+    if debug {
+        eprintln!(
+            "[ROT] candidate: header={}, latch={}, body_len={}",
+            lp.header,
+            latch_idx,
+            lp.body.len()
+        );
+    }
 
     // 2. Latch terminator must be a pure backedge `Branch(header)`.
     let header_label = func.blocks[lp.header].label;
@@ -216,7 +237,9 @@ fn try_rotate_loop(
         &func.blocks[latch_idx].terminator,
         Terminator::Branch(t) if *t == header_label
     ) {
-        if debug { eprintln!("[ROT] latch not Branch(header)"); }
+        if debug {
+            eprintln!("[ROT] latch not Branch(header)");
+        }
         return false;
     }
 
@@ -238,7 +261,9 @@ fn try_rotate_loop(
             let t_in = is_in_loop(*true_label, &label_to_idx, lp);
             let f_in = is_in_loop(*false_label, &label_to_idx, lp);
             if t_in == f_in {
-                if debug { eprintln!("[ROT] CondBranch both-in or both-out"); }
+                if debug {
+                    eprintln!("[ROT] CondBranch both-in or both-out");
+                }
                 return false; // both in (infinite) or both out (no body)
             }
             let c = *cond;
@@ -249,11 +274,21 @@ fn try_rotate_loop(
             }
         }
         _ => {
-            if debug { eprintln!("[ROT] header not CondBranch: {:?}", func.blocks[lp.header].terminator); }
+            if debug {
+                eprintln!(
+                    "[ROT] header not CondBranch: {:?}",
+                    func.blocks[lp.header].terminator
+                );
+            }
             return false;
         }
     };
-    if debug { eprintln!("[ROT] CondBranch OK, continue={:?} exit={:?}", continue_label, exit_label); }
+    if debug {
+        eprintln!(
+            "[ROT] CondBranch OK, continue={:?} exit={:?}",
+            continue_label, exit_label
+        );
+    }
 
     // 4. The guard cond must be a Value (not a constant — those are folded
     //    by cfg_simplify and would not reach here, but fail closed).
@@ -291,7 +326,12 @@ fn try_rotate_loop(
             continue;
         }
         if !is_cloneable_pure(inst) {
-            if debug { eprintln!("[ROT] closure: inst not cloneable-pure: idx={} {:?}", idx, inst); }
+            if debug {
+                eprintln!(
+                    "[ROT] closure: inst not cloneable-pure: idx={} {:?}",
+                    idx, inst
+                );
+            }
             return false; // cond setup touches memory/calls — bail
         }
         closure.push(idx);
@@ -386,12 +426,7 @@ fn try_rotate_loop(
     // bailing keeps rotation sound (same policy as Guard A/B).
     let mut multi_pre_header = false;
     for inst in header_insts {
-        if let Instruction::Phi {
-            dest,
-            incoming,
-            ty,
-        } = inst
-        {
+        if let Instruction::Phi { dest, incoming, ty } = inst {
             let mut pre: Option<(BlockId, Operand)> = None;
             let mut lat = None;
             for (op, lbl) in incoming {
@@ -478,7 +513,13 @@ fn try_rotate_loop(
     //     replacement — left to a future enhancement.
     let single_block_body = lp.body.len() == 2 && continue_label == latch_label;
     if !single_block_body {
-        if debug { eprintln!("[ROT] not single-block body (body_len={}, continue==latch={})", lp.body.len(), continue_label == latch_label); }
+        if debug {
+            eprintln!(
+                "[ROT] not single-block body (body_len={}, continue==latch={})",
+                lp.body.len(),
+                continue_label == latch_label
+            );
+        }
         return false;
     }
 
@@ -495,11 +536,18 @@ fn try_rotate_loop(
     for inst in &body_block.instructions {
         match inst {
             Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
-                if debug { eprintln!("[ROT] body has Call/CallIndirect — bail (call clobbers exit-merge values)"); }
+                if debug {
+                    eprintln!(
+                        "[ROT] body has Call/CallIndirect — bail (call clobbers exit-merge values)"
+                    );
+                }
                 return false;
             }
-            Instruction::Load { volatile: true, .. } | Instruction::Store { volatile: true, .. } => {
-                if debug { eprintln!("[ROT] body has volatile mem op — bail (ordering)"); }
+            Instruction::Load { volatile: true, .. }
+            | Instruction::Store { volatile: true, .. } => {
+                if debug {
+                    eprintln!("[ROT] body has volatile mem op — bail (ordering)");
+                }
                 return false;
             }
             // Intrinsics (Vec*/SSE/AVX) are also rejected: the rotated
@@ -507,7 +555,11 @@ fn try_rotate_loop(
             // vector-register home assignment, and the vectorizer has already
             // had a chance to run (rotation is post-vectorize).
             Instruction::Intrinsic { .. } => {
-                if debug { eprintln!("[ROT] body has Intrinsic — bail (XMM phi / vector-reg home mismatch)"); }
+                if debug {
+                    eprintln!(
+                        "[ROT] body has Intrinsic — bail (XMM phi / vector-reg home mismatch)"
+                    );
+                }
                 return false;
             }
             _ => {}
@@ -566,10 +618,7 @@ fn try_rotate_loop(
             // in the preheader, which dominates the guard and hence the body.
             // This matches the exit-phi construction below, which already
             // labels the guard-exit incoming with `header_label`.
-            incoming: vec![
-                (pre_op, header_label),
-                (latch_op, latch_label),
-            ],
+            incoming: vec![(pre_op, header_label), (latch_op, latch_label)],
         });
     }
     // Insert the new phis at the TOP of body_latch (phis must precede all
@@ -653,10 +702,7 @@ fn try_rotate_loop(
     //    test-exit edge. So for each header phi with external uses, we
     //    create a merge phi in the exit block: `s_final = phi[header:
     //    v_pre, body_latch: s_loop]` and rewrite external uses to it.
-    let exit_idx = label_to_idx
-        .get(&exit_label)
-        .copied()
-        .unwrap_or(usize::MAX);
+    let exit_idx = label_to_idx.get(&exit_label).copied().unwrap_or(usize::MAX);
     // v16 Guard A: the exit block must have exactly ONE predecessor (the
     // header's guard-exit edge). After rotation the latch's test-exit edge
     // adds a SECOND predecessor, so the exit-merge-phi (which has exactly 2
@@ -775,9 +821,7 @@ fn try_rotate_loop(
                 }
                 if used_here {
                     // v16 Guard B: external use must be dominated by exit.
-                    if exit_idx != usize::MAX
-                        && !is_dominated_by(bi, exit_idx, cfg)
-                    {
+                    if exit_idx != usize::MAX && !is_dominated_by(bi, exit_idx, cfg) {
                         if debug {
                             eprintln!(
                                 "[ROT] header phi {} has external use in block {} \
@@ -847,8 +891,8 @@ fn try_rotate_loop(
                 dest: nd,
                 ty,
                 incoming: vec![
-                    (pre_op, header_label),          // guard-exit path: preheader value (0-trip)
-                    (latch_for_exit, latch_label),   // test-exit path: post-iteration value
+                    (pre_op, header_label),        // guard-exit path: preheader value (0-trip)
+                    (latch_for_exit, latch_label), // test-exit path: post-iteration value
                 ],
             });
         }
@@ -969,7 +1013,12 @@ fn try_rotate_loop(
     // 11. Advance the watermark so subsequent passes see the new IDs.
     func.next_value_id = next_val;
 
-    if debug { eprintln!("[ROT] SUCCESS: rotated header={} latch={}", lp.header, latch_idx); }
+    if debug {
+        eprintln!(
+            "[ROT] SUCCESS: rotated header={} latch={}",
+            lp.header, latch_idx
+        );
+    }
     true
 }
 

@@ -412,7 +412,9 @@ impl Lowerer {
     pub(super) fn get_vla_stride_for_subscript(&self, base: &Expr) -> Option<Value> {
         let depth = self.count_subscript_depth(base);
 
-        if let Some((root_expr, field_name, sub_depth)) = self.get_member_access_root_and_depth(base) {
+        if let Some((root_expr, field_name, sub_depth)) =
+            self.get_member_access_root_and_depth(base)
+        {
             if let Some(fs) = self.func_state.as_ref() {
                 if let Some(ctype) = self.get_expr_ctype(&root_expr) {
                     let mut struct_key = None;
@@ -635,7 +637,9 @@ impl Lowerer {
                         match &ctype {
                             CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
                             CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
-                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                CType::Struct(k) | CType::Union(k) => {
+                                    struct_key = Some(k.to_string())
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -646,10 +650,11 @@ impl Lowerer {
                         })
                     })
                 });
-                let field_is_array = field_is_vla_array || self
-                    .resolve_field_ctype(base_expr, field_name, false)
-                    .map(|ct| matches!(ct, CType::Array(_, _)))
-                    .unwrap_or(false);
+                let field_is_array = field_is_vla_array
+                    || self
+                        .resolve_field_ctype(base_expr, field_name, false)
+                        .map(|ct| matches!(ct, CType::Array(_, _)))
+                        .unwrap_or(false);
                 if field_is_array {
                     // Return address of the array field (array decays to pointer)
                     let (field_offset, _) = self.resolve_member_access(base_expr, field_name);
@@ -680,7 +685,9 @@ impl Lowerer {
                         match &ctype {
                             CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
                             CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
-                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                CType::Struct(k) | CType::Union(k) => {
+                                    struct_key = Some(k.to_string())
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -691,10 +698,11 @@ impl Lowerer {
                         })
                     })
                 });
-                let field_is_array = field_is_vla_array || self
-                    .resolve_field_ctype(base_expr, field_name, true)
-                    .map(|ct| matches!(ct, CType::Array(_, _)))
-                    .unwrap_or(false);
+                let field_is_array = field_is_vla_array
+                    || self
+                        .resolve_field_ctype(base_expr, field_name, true)
+                        .map(|ct| matches!(ct, CType::Array(_, _)))
+                        .unwrap_or(false);
                 if field_is_array {
                     // Return address of the array field (array decays to pointer)
                     let ptr_val = self.lower_expr(base_expr);
@@ -928,7 +936,9 @@ impl Lowerer {
                         match &ctype {
                             CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
                             CType::Pointer(inner, _) | CType::Array(inner, _) => match &**inner {
-                                CType::Struct(k) | CType::Union(k) => struct_key = Some(k.to_string()),
+                                CType::Struct(k) | CType::Union(k) => {
+                                    struct_key = Some(k.to_string())
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -960,7 +970,10 @@ impl Lowerer {
     /// For ArraySubscript(Identifier, _): depth = 1
     /// For ArraySubscript(ArraySubscript(Identifier, _), _): depth = 2
     /// For Deref(Identifier): depth = 1 (deref peels one array dimension)
-    pub(super) fn get_member_access_root_and_depth(&self, expr: &Expr) -> Option<(Expr, String, usize)> {
+    pub(super) fn get_member_access_root_and_depth(
+        &self,
+        expr: &Expr,
+    ) -> Option<(Expr, String, usize)> {
         let mut curr = expr;
         let mut depth = 0;
         loop {

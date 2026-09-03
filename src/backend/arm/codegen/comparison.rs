@@ -1,8 +1,8 @@
 //! ArmCodegen: comparison operations.
 
 use super::emit::{
-    ArmCodegen, arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
-    is_arm_fp_phys,
+    arm_int_cond_code, arm_invert_cond_code, callee_saved_name, callee_saved_name_32,
+    is_arm_fp_phys, ArmCodegen,
 };
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrCmpOp, Operand, Value};

@@ -110,7 +110,11 @@ fn a_self_loop_phi_naming_its_own_block_is_clean() {
     // A rotated loop body is its own predecessor; that must not be flagged.
     let f = func_of(vec![
         blk(0, vec![], br(1)),
-        blk(1, vec![phi(10, vec![(c0(), 0), (v(11), 1)])], condbr(9, 1, 2)),
+        blk(
+            1,
+            vec![phi(10, vec![(c0(), 0), (v(11), 1)])],
+            condbr(9, 1, 2),
+        ),
         blk(2, vec![], ret()),
     ]);
     assert_clean(&f);

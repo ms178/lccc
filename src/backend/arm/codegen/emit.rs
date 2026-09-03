@@ -1456,7 +1456,8 @@ impl ArmCodegen {
                         }
                     }
                     IrConst::D32(v) => {
-                        self.state.emit_fmt(format_args!("    mov x0, #{}", *v as i64));
+                        self.state
+                            .emit_fmt(format_args!("    mov x0, #{}", *v as i64));
                     }
                     IrConst::D64(v) => {
                         self.emit_load_imm64("x0", *v as i64);
@@ -2001,10 +2002,7 @@ impl ArmCodegen {
                 // the tracker). Load directly instead of taking the
                 // __extenddftf2 fallback, which would fabricate the value
                 // from the low qword reinterpreted as a double.
-                if !loaded_full
-                    && arg_i < arg_types.len()
-                    && arg_types[arg_i] == IrType::U128
-                {
+                if !loaded_full && arg_i < arg_types.len() && arg_types[arg_i] == IrType::U128 {
                     if let Some(slot) = self.state.get_slot(v.0) {
                         let adj = slot.0 + slot_adjust + extra_sp_adj;
                         self.emit_load_from_sp("q0", adj, "ldr");

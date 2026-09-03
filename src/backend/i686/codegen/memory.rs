@@ -3,11 +3,11 @@
 use super::emit::{phys_reg_name, I686Codegen};
 use crate::backend::generation::is_i128_type;
 use crate::backend::regalloc::PhysReg;
-use crate::ir::reexports::IrConst;
 use crate::backend::state::{SlotAddr, StackSlot};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
+use crate::ir::reexports::IrConst;
 use crate::ir::reexports::{Operand, Value};
 
 impl I686Codegen {
@@ -238,9 +238,7 @@ impl I686Codegen {
                 // Value copy: both slots direct => eax shuttle, no address regs.
                 (None, Some(SlotAddr::Direct(dslot))) => {
                     if let Operand::Value(sv) = val {
-                        if let Some(SlotAddr::Direct(sslot)) =
-                            self.state.resolve_slot_addr(sv.0)
-                        {
+                        if let Some(SlotAddr::Direct(sslot)) = self.state.resolve_slot_addr(sv.0) {
                             for k in 0..4i64 {
                                 let ssr = self.slot_ref_offset(sslot, 4 * k);
                                 let dsr = self.slot_ref_offset(dslot, 4 * k);
@@ -1053,7 +1051,10 @@ impl I686Codegen {
             return None;
         };
         let (frame, off) = if self.omit_frame_pointer {
-            ("esp", slot.0 + self.frame_base_offset + self.esp_adjust + disp)
+            (
+                "esp",
+                slot.0 + self.frame_base_offset + self.esp_adjust + disp,
+            )
         } else {
             ("ebp", slot.0 + disp)
         };

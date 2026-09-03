@@ -28,12 +28,8 @@ use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 /// pruned post-RA by the prologue; slot-homed operands never needed the
 /// extension (the slot is written at every definition).
 pub(crate) struct CmpReplayScan {
-    pub replay: crate::common::fx_hash::FxHashMap<
-        u32,
-        (IrCmpOp, Operand, Operand, IrType),
-    >,
-    pub operand_links:
-        crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    pub replay: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
+    pub operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
 }
 
 pub(crate) fn compute_cmp_replay_scan(
@@ -330,10 +326,7 @@ impl X86Codegen {
 
         // Register-direct: movzbl %al, %dest_reg_32 — skip %rax relay.
         // Safe because %al is part of %rax, never overlaps callee-saved registers.
-        if let Some(d_reg) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+        if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name_32(d_reg);
                 self.state
@@ -775,12 +768,7 @@ impl X86Codegen {
         // recorded type keep the historical full-width test.
         if let Some(ty) = self.value_types.get(&val_id).copied() {
             match ty {
-                IrType::I8
-                | IrType::U8
-                | IrType::I16
-                | IrType::U16
-                | IrType::I32
-                | IrType::U32 => {
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32 => {
                     let (_, test_mnem, _) = super::emit::cmp_width_info(ty);
                     let name = super::emit::typed_phys_reg_name(reg, ty);
                     self.state
@@ -1012,7 +1000,10 @@ impl X86Codegen {
             if c.is_zero() {
                 // PF-16: movl $0 writes the same canonical value (zero-extend)
                 // two bytes shorter; neither form touches flags.
-                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
+                self.state.emit_fmt(format_args!(
+                    "    movl $0, %{}",
+                    super::emit::reg_name_to_32(&reg64)
+                ));
                 return;
             }
             match c {
@@ -1074,8 +1065,11 @@ impl X86Codegen {
                 }
                 IrConst::Zero => {
                     // PF-16: movl $0 writes the same canonical value (zero-extend)
-                // two bytes shorter; neither form touches flags.
-                self.state.emit_fmt(format_args!("    movl $0, %{}", super::emit::reg_name_to_32(&reg64)));
+                    // two bytes shorter; neither form touches flags.
+                    self.state.emit_fmt(format_args!(
+                        "    movl $0, %{}",
+                        super::emit::reg_name_to_32(&reg64)
+                    ));
                 }
             }
             let _ = reg32;
@@ -1143,10 +1137,7 @@ impl X86Codegen {
     ) {
         // legacy-compat path (debugging): the legacy emission order.
         if std::env::var("CCC_V9_SELECT").is_ok() {
-            if let Some(d_reg) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+            if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
                 if !is_xmm_reg(d_reg) {
                     let d_name = phys_reg_name(d_reg);
                     self.emit_legacy_cond_test(cond);
@@ -1188,10 +1179,7 @@ impl X86Codegen {
         // the chosen one needs to be loaded — no test/cmov/branch at all.
         if let Operand::Const(c) = cond {
             let chosen = if c.is_zero() { false_val } else { true_val };
-            if let Some(d_reg) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+            if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
                 if !is_xmm_reg(d_reg) {
                     self.operand_to_callee_reg(chosen, d_reg);
                     self.state.reg_cache.invalidate_acc();
@@ -1235,10 +1223,7 @@ impl X86Codegen {
         };
 
         // Register-direct: when dest has a register, operate directly on it.
-        if let Some(d_reg) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+        if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
             if !is_xmm_reg(d_reg) {
                 let d_name = phys_reg_name(d_reg);
                 if tested_in_place {

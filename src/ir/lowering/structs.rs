@@ -99,12 +99,7 @@ impl Lowerer {
     /// Store packed small-struct data to a destination pointer without clobbering
     /// adjacent bytes for odd non-power-of-two sizes (e.g. a 5-byte packed struct
     /// must not overwrite the 3 bytes that follow it when stored as an I64).
-    pub(super) fn store_packed_data_exact(
-        &mut self,
-        dest: Value,
-        val: Operand,
-        size: usize,
-    ) {
+    pub(super) fn store_packed_data_exact(&mut self, dest: Value, val: Operand, size: usize) {
         if size == 0 {
             return;
         }
@@ -378,42 +373,42 @@ impl Lowerer {
     /// Re-compute a struct/union layout if any of its fields use vector typedefs.
     /// Updates the existing layout entry in the map using the key from sema.
     fn recompute_layout_if_vector_fields(&mut self, ts: &TypeSpecifier) {
-        let (tag, fields, is_union, is_packed, pragma_pack, struct_aligned, reverse_sso) =
-            match ts {
-                TypeSpecifier::Struct(
-                    tag,
-                    Some(fields),
-                    is_packed,
-                    pragma_pack,
-                    struct_aligned,
-                    reverse_sso,
-                ) => (
-                    tag,
-                    fields,
-                    false,
-                    *is_packed,
-                    *pragma_pack,
-                    *struct_aligned,
-                    reverse_sso.is_some_and(|v| v),
-                ),
-                TypeSpecifier::Union(
-                    tag,
-                    Some(fields),
-                    is_packed,
-                    pragma_pack,
-                    struct_aligned,
-                    reverse_sso,
-                ) => (
-                    tag,
-                    fields,
-                    true,
-                    *is_packed,
-                    *pragma_pack,
-                    *struct_aligned,
-                    reverse_sso.is_some_and(|v| v),
-                ),
-                _ => return,
-            };
+        let (tag, fields, is_union, is_packed, pragma_pack, struct_aligned, reverse_sso) = match ts
+        {
+            TypeSpecifier::Struct(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => (
+                tag,
+                fields,
+                false,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            TypeSpecifier::Union(
+                tag,
+                Some(fields),
+                is_packed,
+                pragma_pack,
+                struct_aligned,
+                reverse_sso,
+            ) => (
+                tag,
+                fields,
+                true,
+                *is_packed,
+                *pragma_pack,
+                *struct_aligned,
+                reverse_sso.is_some_and(|v| v),
+            ),
+            _ => return,
+        };
         // Check if any field uses a vector typedef
         let has_vector_field = fields.iter().any(|f| {
             let ctype = self.struct_field_ctype(f);
@@ -451,13 +446,12 @@ impl Lowerer {
 
         if let Some(key) = existing_key {
             let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-            let mut layout =
-                self.compute_struct_union_layout_packed(
-                    fields,
-                    is_union,
-                    max_field_align,
-                    reverse_sso,
-                );
+            let mut layout = self.compute_struct_union_layout_packed(
+                fields,
+                is_union,
+                max_field_align,
+                reverse_sso,
+            );
             if let Some(a) = struct_aligned {
                 if a > layout.align {
                     layout.align = a;
@@ -589,14 +583,7 @@ impl Lowerer {
         }
         let ts = self.resolve_type_spec(ts);
         match ts {
-            TypeSpecifier::Struct(
-                tag,
-                Some(fields),
-                is_packed,
-                pragma_pack,
-                _,
-                reverse_sso,
-            ) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -625,14 +612,7 @@ impl Lowerer {
                         layouts.get(tag.as_str()).cloned()
                     })
             }
-            TypeSpecifier::Union(
-                tag,
-                Some(fields),
-                is_packed,
-                pragma_pack,
-                _,
-                reverse_sso,
-            ) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
                 if let Some(tag) = tag {
                     let layouts = self.types.borrow_struct_layouts();
                     if let Some(layout) = layouts
@@ -813,8 +793,7 @@ impl Lowerer {
                 let inner_offset = match self.get_vla_field_offset(inner_base, inner_field, true) {
                     Some(vo) => vo,
                     None => {
-                        let (off, _) =
-                            self.resolve_pointer_member_access(inner_base, inner_field);
+                        let (off, _) = self.resolve_pointer_member_access(inner_base, inner_field);
                         let inner_addr = self.fresh_value();
                         self.emit(Instruction::GetElementPtr {
                             dest: inner_addr,
@@ -1117,7 +1096,8 @@ impl Lowerer {
         is_pointer_access: bool,
         field_name: &str,
     ) -> SsoMode {
-        self.sso_storage_of_member(base_expr, is_pointer_access, field_name).0
+        self.sso_storage_of_member(base_expr, is_pointer_access, field_name)
+            .0
     }
 
     /// Look up the reverse-SSO mode AND the unit-wide access storage type
@@ -1663,7 +1643,9 @@ impl Lowerer {
         use crate::ir::ops::IrBinOp;
         let ptr_int_ty = crate::common::types::target_int_ir_type();
         for f in fields {
-            let Some(ref field_name) = f.name else { continue };
+            let Some(ref field_name) = f.name else {
+                continue;
+            };
             let mut dims: Vec<Option<Expr>> = Vec::new();
             let mut curr_ts = &f.type_spec;
             while let TypeSpecifier::Array(inner, dim) = curr_ts {
@@ -1716,17 +1698,9 @@ impl Lowerer {
                 };
                 for dv in dim_ops.iter().skip(dim_idx + 1) {
                     if let Some(d) = dv {
-                        let extended = self.emit_implicit_cast(
-                            d.clone(),
-                            IrType::I32,
-                            ptr_int_ty,
-                        );
-                        let mul = self.emit_binop_val(
-                            IrBinOp::Mul,
-                            stride_op,
-                            extended,
-                            ptr_int_ty,
-                        );
+                        let extended = self.emit_implicit_cast(d.clone(), IrType::I32, ptr_int_ty);
+                        let mul =
+                            self.emit_binop_val(IrBinOp::Mul, stride_op, extended, ptr_int_ty);
                         stride_op = Operand::Value(mul);
                     }
                 }
@@ -1936,19 +1910,16 @@ impl Lowerer {
                     .as_ref()
                     .is_some_and(|fs| fs.vla_typedef_sizes.contains_key(&key))
             }
-            TypeSpecifier::Struct(_, Some(fields), ..) | TypeSpecifier::Union(_, Some(fields), ..) => {
-                fields.iter().any(|f| {
-                    if f.bit_width.is_some() {
-                        return false;
-                    }
-                    if !f.derived.is_empty()
-                        && self.probe_vla_runtime_size(&f.type_spec, &f.derived)
-                    {
-                        return true;
-                    }
-                    self.probe_vla_size_from_type_spec(&f.type_spec)
-                })
-            }
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => fields.iter().any(|f| {
+                if f.bit_width.is_some() {
+                    return false;
+                }
+                if !f.derived.is_empty() && self.probe_vla_runtime_size(&f.type_spec, &f.derived) {
+                    return true;
+                }
+                self.probe_vla_size_from_type_spec(&f.type_spec)
+            }),
             TypeSpecifier::Typeof(expr) => {
                 // Mirror compute_vla_size_from_type_spec: typeof(vla_local)
                 // is dynamic iff the local is a VLA with a runtime size.
@@ -1960,7 +1931,9 @@ impl Lowerer {
                 }
                 false
             }
-            TypeSpecifier::Array(_, Some(size_expr)) => self.expr_as_array_size(size_expr).is_none(),
+            TypeSpecifier::Array(_, Some(size_expr)) => {
+                self.expr_as_array_size(size_expr).is_none()
+            }
             TypeSpecifier::Array(_, None) => true,
             _ => false,
         }
@@ -2016,7 +1989,12 @@ impl Lowerer {
     /// must fit inside one `unit_size`-byte storage unit; a straddling field
     /// starts a fresh unit. Requires cursor ≡ 0 (mod unit_size) at run start
     /// (guaranteed by the caller checking `unit_size <= cursor.guarantee`).
-    pub(super) fn vla_cursor_bitfield_unit(&mut self, cursor: &mut VlaDynCursor, bw: u32, unit_size: usize) {
+    pub(super) fn vla_cursor_bitfield_unit(
+        &mut self,
+        cursor: &mut VlaDynCursor,
+        bw: u32,
+        unit_size: usize,
+    ) {
         if !cursor.run_open {
             cursor.run_open = true;
             cursor.run_bits = 0;
@@ -2048,7 +2026,11 @@ impl Lowerer {
     /// to the end of the last storage unit (GCC: `struct {unsigned b:1;}` is
     /// 4 bytes, not 1). `last_unit` is the last bitfield's storage size;
     /// packed structs round to a byte instead.
-    pub(super) fn vla_cursor_close_run_for_size(&mut self, cursor: &mut VlaDynCursor, last_unit: usize) {
+    pub(super) fn vla_cursor_close_run_for_size(
+        &mut self,
+        cursor: &mut VlaDynCursor,
+        last_unit: usize,
+    ) {
         if !cursor.run_open {
             return;
         }

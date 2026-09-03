@@ -422,9 +422,7 @@ mod map_arg_tests {
             vec!["-Wl,--dynamic-linker,/tmp/ld.so"],
         ] {
             assert_eq!(
-                parse_linker_args(&args(&argv))
-                    .dynamic_linker
-                    .as_deref(),
+                parse_linker_args(&args(&argv)).dynamic_linker.as_deref(),
                 Some("/tmp/ld.so"),
                 "argv={argv:?}"
             );

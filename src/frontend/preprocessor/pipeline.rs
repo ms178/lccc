@@ -304,11 +304,8 @@ impl Preprocessor {
             );
             let source_line_num = line_resolver.line_at(stripped_line_start);
             last_source_line_num = source_line_num;
-            self.macros.set_line_resolver(
-                line_resolver,
-                self.line_override,
-                stripped_line_start,
-            );
+            self.macros
+                .set_line_resolver(line_resolver, self.line_override, stripped_line_start);
             stripped_line_start += line.len() + 1;
 
             // Directive handling: #if/#ifdef/#ifndef/#elif/#else/#endif must always

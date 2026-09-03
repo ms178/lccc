@@ -482,8 +482,7 @@ fn visit_instruction_uses(inst: &Instruction, mut f: impl FnMut(Value, IrType)) 
         | Instruction::SetReturnF128Second { src } => {
             vop!(src, IrType::F64);
         }
-        Instruction::GetStaticChain { .. }
-        | Instruction::NonlocalGotoSave { .. } => {}
+        Instruction::GetStaticChain { .. } | Instruction::NonlocalGotoSave { .. } => {}
         Instruction::SetStaticChain { src } => {
             vop!(src, IrType::Ptr);
         }
@@ -1260,9 +1259,7 @@ fn remap_instruction(
             Instruction::SetReturnF128Second { src: remap_op(src) }
         }
         Instruction::GetStaticChain { dest } => Instruction::GetStaticChain { dest: *dest },
-        Instruction::SetStaticChain { src } => {
-            Instruction::SetStaticChain { src: remap_op(src) }
-        }
+        Instruction::SetStaticChain { src } => Instruction::SetStaticChain { src: remap_op(src) },
         Instruction::InitTrampoline {
             buffer,
             chain,

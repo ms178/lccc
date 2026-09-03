@@ -562,8 +562,7 @@ impl<'a> SemaConstEval<'a> {
         match (t1, t2) {
             (CType::Pointer(a, _), CType::Pointer(b, _)) => self.ctypes_compatible(a, b),
             (CType::Array(a, sa), CType::Array(b, sb)) => {
-                self.ctypes_compatible(a, b)
-                    && (sa == sb || sa.is_none() || sb.is_none())
+                self.ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
             }
             _ => t1 == t2,
         }
@@ -1277,7 +1276,11 @@ impl<'a> SemaConstEval<'a> {
                 // violations GCC ignores entirely; drop from layout + init.
                 if f.name.is_none()
                     && bit_width.is_none()
-                    && !matches!(ty, crate::common::types::CType::Struct(_) | crate::common::types::CType::Union(_))
+                    && !matches!(
+                        ty,
+                        crate::common::types::CType::Struct(_)
+                            | crate::common::types::CType::Union(_)
+                    )
                 {
                     return None;
                 }

@@ -1836,7 +1836,6 @@ impl Driver {
                     }
                 }
 
-
                 // Renumber all terminator targets
                 for block in &mut func.blocks {
                     use crate::ir::reexports::Terminator;

@@ -554,7 +554,6 @@ fn eliminate_adjacent_store_load(lines: &mut [String], kinds: &mut [LineKind], n
     changed
 }
 
-
 // ── Pass 6: far-jump → near-jump rewrite (auipc;jr → jal) ───────────────────
 //
 // Codegen emits every unconditional transition as `jump .Lxxx, t6`, which the
@@ -575,7 +574,8 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
     let mut start = 0;
     while start < n {
         let mut end = start + 1;
-        while end < n && !(lines[end].starts_with(char::is_alphabetic) && kinds[end] != LineKind::Nop)
+        while end < n
+            && !(lines[end].starts_with(char::is_alphabetic) && kinds[end] != LineKind::Nop)
         {
             end += 1;
         }
@@ -611,9 +611,8 @@ fn rewrite_far_jumps_to_near(lines: &mut [String], kinds: &mut [LineKind], n: us
                 if !target.starts_with(".L") {
                     continue;
                 }
-                let found = (start..end).any(|m| {
-                    kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target)
-                });
+                let found = (start..end)
+                    .any(|m| kinds[m] == LineKind::Label && label_name(&lines[m]) == Some(target));
                 if !found {
                     continue;
                 }
@@ -665,8 +664,18 @@ fn sext_producing_def(line: &str, kind: LineKind) -> Option<(u8, bool)> {
             // following `sext.w rX,rX` is real code, never a no-op.
             let wide = matches!(
                 mnem,
-                "addw" | "subw" | "mulw" | "divw" | "divuw" | "remw" | "remuw"
-                    | "sllw" | "srlw" | "sraw" | "addiw" | "srai"
+                "addw"
+                    | "subw"
+                    | "mulw"
+                    | "divw"
+                    | "divuw"
+                    | "remw"
+                    | "remuw"
+                    | "sllw"
+                    | "srlw"
+                    | "sraw"
+                    | "addiw"
+                    | "srai"
             ) || mnem == "lui";
             Some((dst, wide))
         }

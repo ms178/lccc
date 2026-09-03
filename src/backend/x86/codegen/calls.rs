@@ -1,7 +1,7 @@
 //! X86Codegen: function call operations.
 
-use super::emit::{X86_ARG_REGS, X86Codegen};
-use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
+use super::emit::{X86Codegen, X86_ARG_REGS};
+use crate::backend::call_abi::{compute_stack_push_bytes, CallAbiConfig, CallArgClass};
 use crate::backend::generation::is_i128_type;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
@@ -155,7 +155,10 @@ impl X86Codegen {
     /// (load the pointer, call through it) is correct for every binding, so
     /// rejecting the fold is strictly safe — and versioned function-pointer
     /// slots are glibc-internal compat shapes, so the cost is nil.
-    pub(super) fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<ResolvedIndirectCall> {
+    pub(super) fn try_resolve_indirect_call_global(
+        &self,
+        op: &Operand,
+    ) -> Option<ResolvedIndirectCall> {
         let v = match op {
             Operand::Value(v) => v,
             _ => return None,
@@ -277,7 +280,8 @@ impl X86Codegen {
             self.state.emit("    movq %rcx, %rax");
             self.state
                 .emit_fmt(format_args!("    subq ${}, %rax", total));
-            self.state.emit_fmt(format_args!("    andq ${}, %rax", a - 1));
+            self.state
+                .emit_fmt(format_args!("    andq ${}, %rax", a - 1));
             self.state.emit("    subq %rax, %rsp");
             // (2) save the pre-realignment %rsp above every argument
             self.state.emit("    subq $16, %rsp");
@@ -1081,8 +1085,7 @@ impl X86Codegen {
                     // value-based call, which preserves the .symver binding.)
                     ResolvedIndirectCall::Direct(..) => {
                         if off == 0 && self.state.needs_plt(&sym) {
-                            self.state
-                                .emit_fmt(format_args!("    call {}@PLT", sym));
+                            self.state.emit_fmt(format_args!("    call {}@PLT", sym));
                         } else {
                             self.state.out.emit_call(&sym_str);
                         }

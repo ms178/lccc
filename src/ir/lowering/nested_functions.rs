@@ -96,7 +96,13 @@ impl Lowerer {
                 }
             }
         }
-        self.capture_compound(&nf.body, visible, enclosing_labels, &mut scopes, &mut result);
+        self.capture_compound(
+            &nf.body,
+            visible,
+            enclosing_labels,
+            &mut scopes,
+            &mut result,
+        );
         result
     }
 
@@ -269,7 +275,12 @@ impl Lowerer {
             Stmt::Label(name, inner, _) => {
                 local_labels.insert(name.clone());
                 self.capture_stmt(
-                    inner, visible, enclosing_labels, scopes, local_labels, result,
+                    inner,
+                    visible,
+                    enclosing_labels,
+                    scopes,
+                    local_labels,
+                    result,
                 );
             }
             Stmt::Declaration(decl) => {
@@ -333,8 +344,7 @@ impl Lowerer {
     ) {
         match expr {
             Expr::Identifier(name, _) => {
-                if visible.contains(name) && !Self::capture_name_visible_in_subtree(scopes, name)
-                {
+                if visible.contains(name) && !Self::capture_name_visible_in_subtree(scopes, name) {
                     result.vars.insert(name.clone());
                 }
             }
@@ -574,15 +584,13 @@ impl Lowerer {
                     }
                 });
             }
-            block
-                .terminator
-                .for_each_operand_mut(|op| {
-                    if let Operand::Value(v) = op {
-                        if v.0 == old {
-                            *op = Operand::Value(new);
-                        }
+            block.terminator.for_each_operand_mut(|op| {
+                if let Operand::Value(v) = op {
+                    if v.0 == old {
+                        *op = Operand::Value(new);
                     }
-                });
+                }
+            });
         }
     }
 
@@ -619,12 +627,14 @@ impl Lowerer {
     /// list, which finalize splices into the entry block).
     fn frame_member_gep(&mut self, frame_alloca: Value, off: i64) -> Value {
         let dest = self.fresh_value();
-        self.func_mut().entry_allocas.push(Instruction::GetElementPtr {
-            dest,
-            base: frame_alloca,
-            offset: Operand::Const(IrConst::ptr_int(off)),
-            ty: IrType::Ptr,
-        });
+        self.func_mut()
+            .entry_allocas
+            .push(Instruction::GetElementPtr {
+                dest,
+                base: frame_alloca,
+                offset: Operand::Const(IrConst::ptr_int(off)),
+                ty: IrType::Ptr,
+            });
         dest
     }
 
@@ -713,8 +723,7 @@ impl Lowerer {
             // (recorded in chain_locals). The child must NOT copy it into
             // the current frame — it reaches the same ancestor storage by
             // walking one more frame link from its own chain.
-            if let Some(&(parent_hops, ancestor_off)) =
-                self.func().chain_locals.get(&info.alloca.0)
+            if let Some(&(parent_hops, ancestor_off)) = self.func().chain_locals.get(&info.alloca.0)
             {
                 let hops = parent_hops + 1;
                 // Access path in the child: chain -> `hops` link loads ->
@@ -902,9 +911,9 @@ impl Lowerer {
         // function gets one; unused chains are dead code the backend
         // removes when no GEP reads them).
         let chain_val = self.fresh_value();
-        self.func_mut().entry_allocas.push(Instruction::GetStaticChain {
-            dest: chain_val,
-        });
+        self.func_mut()
+            .entry_allocas
+            .push(Instruction::GetStaticChain { dest: chain_val });
         self.func_mut().chain_value = Some(chain_val);
         // The nested function's OWN frame, created EAGERLY with an
         // initialized link word: any descendant may capture variables from
@@ -915,12 +924,14 @@ impl Lowerer {
         {
             let frame = self.ensure_frame(true);
             let link_ptr = self.fresh_value();
-            self.func_mut().entry_allocas.push(Instruction::GetElementPtr {
-                dest: link_ptr,
-                base: frame.alloca,
-                offset: Operand::Const(IrConst::ptr_int(0)),
-                ty: IrType::Ptr,
-            });
+            self.func_mut()
+                .entry_allocas
+                .push(Instruction::GetElementPtr {
+                    dest: link_ptr,
+                    base: frame.alloca,
+                    offset: Operand::Const(IrConst::ptr_int(0)),
+                    ty: IrType::Ptr,
+                });
             self.func_mut().entry_allocas.push(Instruction::Store {
                 val: Operand::Value(chain_val),
                 ptr: link_ptr,
@@ -987,12 +998,14 @@ impl Lowerer {
             let mut cur = chain_val;
             for _ in 0..hops {
                 let link_gep = self.fresh_value();
-                self.func_mut().entry_allocas.push(Instruction::GetElementPtr {
-                    dest: link_gep,
-                    base: cur,
-                    offset: Operand::Const(IrConst::ptr_int(0)),
-                    ty: IrType::Ptr,
-                });
+                self.func_mut()
+                    .entry_allocas
+                    .push(Instruction::GetElementPtr {
+                        dest: link_gep,
+                        base: cur,
+                        offset: Operand::Const(IrConst::ptr_int(0)),
+                        ty: IrType::Ptr,
+                    });
                 let next = self.fresh_value();
                 self.func_mut().entry_allocas.push(Instruction::Load {
                     volatile: false,
@@ -1028,13 +1041,14 @@ impl Lowerer {
         self.evaluate_vla_param_side_effects(&nf_clone);
         self.handle_kr_float_promotion(&nf_clone);
 
-
         // 3f. Non-local goto targets for the nested function, keyed by the
         // scope-qualified name that lower_goto_stmt resolves through the
         // (inherited) label scopes.
         for (name, target) in &nlgoto_targets {
             let resolved = self.resolve_local_label(name);
-            self.func_mut().nonlocal_labels.insert(resolved, target.clone());
+            self.func_mut()
+                .nonlocal_labels
+                .insert(resolved, target.clone());
         }
         // &&label of enclosing labels: GlobalAddr of the named alias. The
         // alias map is consulted by the LabelAddr lowering hook.
@@ -1121,7 +1135,9 @@ impl Lowerer {
                     .splice(insert_pos..insert_pos, entry_allocas);
                 if !entry_block.source_spans.is_empty() {
                     let dummy = vec![crate::common::source::Span::dummy(); n];
-                    entry_block.source_spans.splice(insert_pos..insert_pos, dummy);
+                    entry_block
+                        .source_spans
+                        .splice(insert_pos..insert_pos, dummy);
                 }
             }
         }

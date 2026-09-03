@@ -1055,7 +1055,8 @@ mod tests {
         // `//` table: "kernel/sysctl.o/" (16 B) at 0, newline at 16;
         // "arch/x86/entry/syscall_64.o/" (28 B) at 17;
         // "another/name.o/" (15 B) at 46; "objtool.o/" (10 B) at 62.
-        let table = b"kernel/sysctl.o/\narch/x86/entry/syscall_64.o/\nanother/name.o/\nobjtool.o/\n";
+        let table =
+            b"kernel/sysctl.o/\narch/x86/entry/syscall_64.o/\nanother/name.o/\nobjtool.o/\n";
 
         // Reference shapes as they appear in the 16-byte name fields of
         // real GNU-ar thin archives (vmlinux.a mix). Built as exactly
@@ -1104,7 +1105,6 @@ mod tests {
             ]
         );
     }
-
 
     #[test]
     fn thin_archive_with_symbol_table() {

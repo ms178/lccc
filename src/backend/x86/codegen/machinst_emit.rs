@@ -15,10 +15,7 @@ pub fn reg_name_pub(r: MachReg) -> &'static str {
         // behind. Emitting a placeholder would hand the assembler
         // `%VREG_UNRESOLVED` and blame it on the wrong component; fail here,
         // where the invariant actually broke.
-        MachReg::Vreg(id) => unreachable!(
-            "vreg{} reached assembly emission unallocated",
-            id
-        ),
+        MachReg::Vreg(id) => unreachable!("vreg{} reached assembly emission unallocated", id),
     }
 }
 
@@ -445,16 +442,10 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                             // and the instruction count stays at one.
                             MachOperand::Reg(MachReg::Phys(r)) => {
                                 let reg = sized_reg_name(*r, *size);
-                                out.emit_fmt(format_args!(
-                                    "    mov{} ${}, %{}",
-                                    suffix, t, reg
-                                ));
+                                out.emit_fmt(format_args!("    mov{} ${}, %{}", suffix, t, reg));
                             }
                             _ => {
-                                out.emit_fmt(format_args!(
-                                    "    mov{} ${}, {}",
-                                    suffix, t, dst_str
-                                ));
+                                out.emit_fmt(format_args!("    mov{} ${}, {}", suffix, t, dst_str));
                             }
                         }
                         return;
@@ -464,12 +455,7 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     } else {
                         out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
                         let rax = sized_reg_name(RAX, *size);
-                        out.emit_fmt(format_args!(
-                            "    mov{} %{}, {}",
-                            suffix,
-                            rax,
-                            dst_str
-                        ));
+                        out.emit_fmt(format_args!("    mov{} %{}, {}", suffix, rax, dst_str));
                     }
                     return;
                 }
@@ -511,16 +497,17 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 (MachOperand::Reg(_), MachOperand::Reg(_)) => {
                     let src_str = fmt(src);
                     let dst_str = fmt(dst);
-                    out.emit_fmt(format_args!(
-                        "    v{mnem} {src_str}, {src_str}, {dst_str}"
-                    ));
+                    out.emit_fmt(format_args!("    v{mnem} {src_str}, {src_str}, {dst_str}"));
                     return;
                 }
                 // x86 has no mem-to-mem SSE move; the lowering gate refuses
                 // those shapes (the relay needs an xmm scratch the text path
                 // owns). Trap rather than emit a broken relay through a
                 // possibly-live register.
-                (MachOperand::Mem { .. } | MachOperand::StackSlot(_), MachOperand::Mem { .. } | MachOperand::StackSlot(_)) => {
+                (
+                    MachOperand::Mem { .. } | MachOperand::StackSlot(_),
+                    MachOperand::Mem { .. } | MachOperand::StackSlot(_),
+                ) => {
                     unreachable!("FMov mem-to-mem is unencodable; the lowering must reject it")
                 }
                 // Immediates have no scalar-SSE form (constants materialize
@@ -932,14 +919,8 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                         let r = fmt_reg(&MachReg::Phys(m.dst_reg), OpSize::S32);
                         out.emit_fmt(format_args!("    xorl {}, {}", r, r));
                     }
-                    MachOperand::Imm(v)
-                        if *v < i32::MIN as i64 || *v > i32::MAX as i64 =>
-                    {
-                        out.emit_fmt(format_args!(
-                            "    movabsq ${}, %{}",
-                            v,
-                            reg_name(m.dst_reg)
-                        ));
+                    MachOperand::Imm(v) if *v < i32::MIN as i64 || *v > i32::MAX as i64 => {
+                        out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(m.dst_reg)));
                     }
                     _ => out.emit_fmt(format_args!(
                         "    mov{} {}, {}",
@@ -952,10 +933,9 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             // Phase 3: the call itself.
             match target {
                 CallTarget::Direct(sym) => out.emit_fmt(format_args!("    call {}", sym)),
-                CallTarget::Indirect(reg) => out.emit_fmt(format_args!(
-                    "    call *%{}",
-                    reg_name(*reg)
-                )),
+                CallTarget::Indirect(reg) => {
+                    out.emit_fmt(format_args!("    call *%{}", reg_name(*reg)))
+                }
             }
             // Phase 4: return home.
             if let Some(r) = ret {

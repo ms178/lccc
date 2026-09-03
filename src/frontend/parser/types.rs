@@ -1249,8 +1249,7 @@ impl Parser {
 
         let mut result_type = type_spec;
         let mut qualifiers = vec![
-            u8::from(self.attrs.parsing_const())
-                | (u8::from(self.attrs.parsing_volatile()) << 1),
+            u8::from(self.attrs.parsing_const()) | (u8::from(self.attrs.parsing_volatile()) << 1),
         ];
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);

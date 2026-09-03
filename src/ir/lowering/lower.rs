@@ -25,8 +25,8 @@ use crate::frontend::parser::ast::{
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
 use crate::ir::reexports::{
-    BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrCmpOp, IrConst, IrModule, Operand,
-    Terminator, Value, IrUnaryOp,
+    BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrCmpOp, IrConst, IrModule, IrUnaryOp,
+    Operand, Terminator, Value,
 };
 use std::cell::RefCell;
 use std::mem::Discriminant;
@@ -1125,8 +1125,7 @@ impl Lowerer {
             }
             // On i686, _Float128/_Decimal128 (TFmode/TDmode) is class MEMORY —
             // hidden-pointer return, matching GCC's i386 convention.
-            if (matches!(full_ret_ctype, CType::Float128)
-                || full_ret_ctype == CType::Decimal128)
+            if (matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128)
                 && crate::common::types::target_is_32bit()
             {
                 sret_size = Some(16);
@@ -1137,25 +1136,26 @@ impl Lowerer {
         // _Float128 returns are 16-byte SSE-class values (SysV psABI): ONE XMM
         // register (xmm0).
         let mut ret_is_f128_sse = false;
-        let ret_eightbyte_classes = if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
-            ret_is_f128_sse = true;
-            vec![
-                crate::common::types::EightbyteClass::Sse,
-                crate::common::types::EightbyteClass::Sse,
-            ]
-        } else if two_reg_ret_size.is_some() && ptr_count == 0 {
-            if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
-                if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
-                    layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+        let ret_eightbyte_classes =
+            if matches!(full_ret_ctype, CType::Float128) || full_ret_ctype == CType::Decimal128 {
+                ret_is_f128_sse = true;
+                vec![
+                    crate::common::types::EightbyteClass::Sse,
+                    crate::common::types::EightbyteClass::Sse,
+                ]
+            } else if two_reg_ret_size.is_some() && ptr_count == 0 {
+                if full_ret_ctype.is_struct_or_union() || full_ret_ctype.is_vector() {
+                    if let Some(layout) = self.get_struct_layout_for_type(ret_type_spec) {
+                        layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
                 }
             } else {
                 Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+            };
 
         // Collect parameter types, with K&R default argument promotions.
         // Use sema's param CTypes when available to avoid re-computing from AST.
@@ -1277,7 +1277,10 @@ impl Lowerer {
         // _Float128 params: ONE 16-byte XMM register per arg (SysV psABI).
         let param_is_f128_sse: Vec<bool> = params
             .iter()
-            .map(|p| matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128) || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128)
+            .map(|p| {
+                matches!(self.type_spec_to_ctype(&p.type_spec), CType::Float128)
+                    || self.type_spec_to_ctype(&p.type_spec) == CType::Decimal128
+            })
             .collect();
 
         // Compute RISC-V LP64D float field classification for struct params
@@ -1530,7 +1533,12 @@ impl Lowerer {
     /// Bit-reinterpret `val` between two same-size types via a temporary
     /// alloca (no value conversion — IR Cast between int/float is a VALUE
     /// conversion, so raw reinterpretation must go through memory).
-    pub(super) fn emit_bit_reinterpret(&mut self, val: Operand, from: IrType, to: IrType) -> Operand {
+    pub(super) fn emit_bit_reinterpret(
+        &mut self,
+        val: Operand,
+        from: IrType,
+        to: IrType,
+    ) -> Operand {
         debug_assert_eq!(from.size(), to.size(), "bit reinterpret requires same size");
         let tmp = self.fresh_value();
         self.emit(Instruction::Alloca {
@@ -1594,30 +1602,71 @@ impl Lowerer {
             };
             // 3-step bit-reverse of the isolated byte.
             let b = |s: &mut Self, x: Value, op: IrBinOp, k: i64, m: i64| -> (Value, Value) {
-                let a = s.emit_binop_val(op, Operand::Value(x), Operand::Const(IrConst::I64(k)), uty);
-                let b = s.emit_binop_val(IrBinOp::And, Operand::Value(a), Operand::Const(IrConst::I64(m)), uty);
+                let a =
+                    s.emit_binop_val(op, Operand::Value(x), Operand::Const(IrConst::I64(k)), uty);
+                let b = s.emit_binop_val(
+                    IrBinOp::And,
+                    Operand::Value(a),
+                    Operand::Const(IrConst::I64(m)),
+                    uty,
+                );
                 (a, b)
             };
             // rev = ((byte & 0x55) << 1) | ((byte >> 1) & 0x55)
             let (a1, m1) = b(self, byte, IrBinOp::And, 1, 0x55);
             let (t1, m2) = b(self, m1, IrBinOp::LShr, 1, 0x55);
             let _ = t1;
-            let mut rev = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m1), Operand::Const(IrConst::I64(1)), uty);
+            let mut rev = self.emit_binop_val(
+                IrBinOp::Shl,
+                Operand::Value(m1),
+                Operand::Const(IrConst::I64(1)),
+                uty,
+            );
             rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(rev), Operand::Value(m2), uty);
             let _ = a1;
             // rev = ((rev & 0x33) << 2) | ((rev >> 2) & 0x33)
             let (t2, m3) = b(self, rev, IrBinOp::And, 2, 0x33);
             let _ = t2;
-            let sh2 = self.emit_binop_val(IrBinOp::LShr, Operand::Value(m3), Operand::Const(IrConst::I64(2)), uty);
-            let m4 = self.emit_binop_val(IrBinOp::And, Operand::Value(sh2), Operand::Const(IrConst::I64(0x33)), uty);
-            let sh2b = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m3), Operand::Const(IrConst::I64(2)), uty);
+            let sh2 = self.emit_binop_val(
+                IrBinOp::LShr,
+                Operand::Value(m3),
+                Operand::Const(IrConst::I64(2)),
+                uty,
+            );
+            let m4 = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(sh2),
+                Operand::Const(IrConst::I64(0x33)),
+                uty,
+            );
+            let sh2b = self.emit_binop_val(
+                IrBinOp::Shl,
+                Operand::Value(m3),
+                Operand::Const(IrConst::I64(2)),
+                uty,
+            );
             rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(sh2b), Operand::Value(m4), uty);
             // rev = ((rev & 0x0F) << 4) | ((rev >> 4) & 0x0F)
             let (t3, m5) = b(self, rev, IrBinOp::And, 4, 0x0F);
             let _ = t3;
-            let sh3 = self.emit_binop_val(IrBinOp::LShr, Operand::Value(m5), Operand::Const(IrConst::I64(4)), uty);
-            let m6 = self.emit_binop_val(IrBinOp::And, Operand::Value(sh3), Operand::Const(IrConst::I64(0x0F)), uty);
-            let sh3b = self.emit_binop_val(IrBinOp::Shl, Operand::Value(m5), Operand::Const(IrConst::I64(4)), uty);
+            let sh3 = self.emit_binop_val(
+                IrBinOp::LShr,
+                Operand::Value(m5),
+                Operand::Const(IrConst::I64(4)),
+                uty,
+            );
+            let m6 = self.emit_binop_val(
+                IrBinOp::And,
+                Operand::Value(sh3),
+                Operand::Const(IrConst::I64(0x0F)),
+                uty,
+            );
+            let sh3b = self.emit_binop_val(
+                IrBinOp::Shl,
+                Operand::Value(m5),
+                Operand::Const(IrConst::I64(4)),
+                uty,
+            );
             rev = self.emit_binop_val(IrBinOp::Or, Operand::Value(sh3b), Operand::Value(m6), uty);
             // Re-insert at byte i.
             if shift > 0 {
@@ -1633,7 +1682,12 @@ impl Lowerer {
                     Operand::Const(IrConst::I64(!(0xFFi64 << shift))),
                     uty,
                 );
-                cur = self.emit_binop_val(IrBinOp::Or, Operand::Value(clear), Operand::Value(rev_shifted), uty);
+                cur = self.emit_binop_val(
+                    IrBinOp::Or,
+                    Operand::Value(clear),
+                    Operand::Value(rev_shifted),
+                    uty,
+                );
             } else {
                 cur = rev;
             }
@@ -1644,7 +1698,12 @@ impl Lowerer {
     /// Apply the reverse-SSO storage transformation to a whole storage-unit
     /// value: byteswap (and, for 16-byte units, half-swap) the raw bits.
     /// Float types go through a bit-exact reinterpret first.
-    pub(super) fn emit_sso_swap_unit(&mut self, val: Operand, ty: IrType, unit_bytes: u32) -> Operand {
+    pub(super) fn emit_sso_swap_unit(
+        &mut self,
+        val: Operand,
+        ty: IrType,
+        unit_bytes: u32,
+    ) -> Operand {
         let (int_ty, val_int) = if ty.is_integer() {
             (ty.to_unsigned(), val.clone())
         } else {
@@ -1750,7 +1809,12 @@ impl Lowerer {
 
     /// Fix up a loaded storage unit according to the field's SsoMode before
     /// bit extraction / value use.
-    pub(super) fn emit_sso_load_fixup(&mut self, loaded: Operand, ty: IrType, sso: SsoMode) -> Operand {
+    pub(super) fn emit_sso_load_fixup(
+        &mut self,
+        loaded: Operand,
+        ty: IrType,
+        sso: SsoMode,
+    ) -> Operand {
         match sso {
             SsoMode::None => loaded,
             SsoMode::ByteSwapUnit(u) => self.emit_sso_swap_unit(loaded, ty, u),
@@ -1760,7 +1824,12 @@ impl Lowerer {
 
     /// Inverse fixup on a unit value about to be stored (same transform —
     /// bswap and per-byte bit-reverse are involutions).
-    pub(super) fn emit_sso_store_fixup(&mut self, val: Operand, ty: IrType, sso: SsoMode) -> Operand {
+    pub(super) fn emit_sso_store_fixup(
+        &mut self,
+        val: Operand,
+        ty: IrType,
+        sso: SsoMode,
+    ) -> Operand {
         self.emit_sso_load_fixup(val, ty, sso)
     }
 
@@ -1830,10 +1899,7 @@ impl Lowerer {
         // staged by value — zeroing that metadata made the backend pass
         // bare pointers instead and corrupted every soft-float call.
         // (The x86-64 path below returns in xmm0:xmm1 and does not apply.)
-        if self.target == crate::backend::Target::I686
-            && ret == IrType::U128
-            && ret_is_f128
-        {
+        if self.target == crate::backend::Target::I686 && ret == IrType::U128 && ret_is_f128 {
             let buf = self.fresh_value();
             self.emit(Instruction::Alloca {
                 dest: buf,
@@ -2271,7 +2337,11 @@ impl Lowerer {
             func: "memcpy".to_string(),
             info: CallInfo {
                 dest: Some(ret),
-                args: vec![Operand::Value(dest), Operand::Value(src), Operand::Value(size)],
+                args: vec![
+                    Operand::Value(dest),
+                    Operand::Value(src),
+                    Operand::Value(size),
+                ],
                 arg_types: vec![ptr_ty, ptr_ty, size_ty],
                 return_type: ptr_ty,
                 is_variadic: false,
@@ -2746,7 +2816,15 @@ impl Lowerer {
         } else {
             Vec::new()
         };
-        self.emit_softfloat_call(helper, vals, tys, infos, ret, ret_classes, ret_is_decimal128)
+        self.emit_softfloat_call(
+            helper,
+            vals,
+            tys,
+            infos,
+            ret,
+            ret_classes,
+            ret_is_decimal128,
+        )
     }
 
     /// Convert an operand of C type `src_ct` into decimal type `dst_ct`
@@ -2773,12 +2851,8 @@ impl Lowerer {
             let s = Self::int_suffix(eff_ty);
             let uns = if src_ct.is_unsigned() { "uns" } else { "" };
             let helper = format!("__bid_float{uns}{s}{d}");
-            let v = self.emit_decimal_call(
-                &helper,
-                vec![(src, eff_ty, false)],
-                dst_ty,
-                dst_w == 128,
-            );
+            let v =
+                self.emit_decimal_call(&helper, vec![(src, eff_ty, false)], dst_ty, dst_w == 128);
             return Operand::Value(v);
         }
         // Decimal source (different width): extend/trunc family.
@@ -2831,7 +2905,12 @@ impl Lowerer {
         };
         // xf (x87 long double) args/rets use the F128 memory class.
         let arg_is_128 = src_ty == IrType::U128;
-        let v = self.emit_decimal_call(&helper, vec![(src, src_ty, arg_is_128)], dst_ty, dst_w == 128);
+        let v = self.emit_decimal_call(
+            &helper,
+            vec![(src, src_ty, arg_is_128)],
+            dst_ty,
+            dst_w == 128,
+        );
         let _ = target_ptr_size();
         Operand::Value(v)
     }
@@ -2847,12 +2926,8 @@ impl Lowerer {
             let uns = if target_ct.is_unsigned() { "uns" } else { "" };
             let helper = format!("__bid_fix{uns}{s}{d}");
             let ret128 = matches!(dst_ty, IrType::I128 | IrType::U128);
-            let v = self.emit_decimal_call(
-                &helper,
-                vec![(src, src_ty, src_w == 128)],
-                dst_ty,
-                false,
-            );
+            let v =
+                self.emit_decimal_call(&helper, vec![(src, src_ty, src_w == 128)], dst_ty, false);
             return Operand::Value(v);
         }
         // Decimal -> binary float: {sd,dd,td} -> sf/df/xf/tf.
@@ -2908,7 +2983,9 @@ impl Lowerer {
             return src;
         }
         if let Some(dw) = Self::decimal_width(target_ct) {
-            if Self::decimal_width(src_ct).is_none() && !src_ct.is_integer() && !src_ct.is_floating()
+            if Self::decimal_width(src_ct).is_none()
+                && !src_ct.is_integer()
+                && !src_ct.is_floating()
             {
                 // Pointer/aggregate source: not a valid decimal conversion;
                 // fall through to the generic bit-cast machinery, which
@@ -2952,22 +3029,47 @@ impl Lowerer {
         let arg_r = (r, Self::dec_ty(w), w == 128);
         match op {
             ast::BinOp::Add => {
-                let v = self.emit_decimal_call(&format!("__bid_add{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                let v = self.emit_decimal_call(
+                    &format!("__bid_add{s}3"),
+                    vec![arg_l, arg_r],
+                    Self::dec_ty(w),
+                    w == 128,
+                );
                 Operand::Value(v)
             }
             ast::BinOp::Sub => {
-                let v = self.emit_decimal_call(&format!("__bid_sub{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                let v = self.emit_decimal_call(
+                    &format!("__bid_sub{s}3"),
+                    vec![arg_l, arg_r],
+                    Self::dec_ty(w),
+                    w == 128,
+                );
                 Operand::Value(v)
             }
             ast::BinOp::Mul => {
-                let v = self.emit_decimal_call(&format!("__bid_mul{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                let v = self.emit_decimal_call(
+                    &format!("__bid_mul{s}3"),
+                    vec![arg_l, arg_r],
+                    Self::dec_ty(w),
+                    w == 128,
+                );
                 Operand::Value(v)
             }
             ast::BinOp::Div => {
-                let v = self.emit_decimal_call(&format!("__bid_div{s}3"), vec![arg_l, arg_r], Self::dec_ty(w), w == 128);
+                let v = self.emit_decimal_call(
+                    &format!("__bid_div{s}3"),
+                    vec![arg_l, arg_r],
+                    Self::dec_ty(w),
+                    w == 128,
+                );
                 Operand::Value(v)
             }
-            ast::BinOp::Eq | ast::BinOp::Ne | ast::BinOp::Lt | ast::BinOp::Le | ast::BinOp::Gt | ast::BinOp::Ge => {
+            ast::BinOp::Eq
+            | ast::BinOp::Ne
+            | ast::BinOp::Lt
+            | ast::BinOp::Le
+            | ast::BinOp::Gt
+            | ast::BinOp::Ge => {
                 // libbid comparisons return a three-way int (-1/0/1); normalize
                 // against zero exactly like GCC's boolean lowering.
                 let name = match op {
@@ -3017,7 +3119,10 @@ impl Lowerer {
         };
         let v = self.emit_decimal_call(
             &format!("__bid_ne{s}2"),
-            vec![(val, Self::dec_ty(w), w == 128), (zero, Self::dec_ty(w), w == 128)],
+            vec![
+                (val, Self::dec_ty(w), w == 128),
+                (zero, Self::dec_ty(w), w == 128),
+            ],
             IrType::I32,
             false,
         );

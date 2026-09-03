@@ -2212,8 +2212,9 @@ fn forward_immediate_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -
                                 while k < len && infos[k].is_nop() {
                                     k += 1;
                                 }
-                                if let Some((zw, zsrc, zdst)) =
-                                    (k < len).then(|| parse_zext32(trimmed(store, &infos[k], k))).flatten()
+                                if let Some((zw, zsrc, zdst)) = (k < len)
+                                    .then(|| parse_zext32(trimmed(store, &infos[k], k)))
+                                    .flatten()
                                 {
                                     if zw == store_size
                                         && zdst == dst
@@ -2420,8 +2421,9 @@ fn forward_slot_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                         while k < len && infos[k].is_nop() {
                             k += 1;
                         }
-                        if let Some((zw, zsrc, zdst)) =
-                            (k < len).then(|| parse_zext32(trimmed(store, &infos[k], k))).flatten()
+                        if let Some((zw, zsrc, zdst)) = (k < len)
+                            .then(|| parse_zext32(trimmed(store, &infos[k], k)))
+                            .flatten()
                         {
                             if zw == size
                                 && zdst == dst_reg

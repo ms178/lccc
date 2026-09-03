@@ -54,9 +54,10 @@ impl Lowerer {
                 .get(&func.name)
                 .cloned()
                 .unwrap_or_else(|| func.name.clone());
-            let husk_idx = self.module.functions.iter().position(|f| {
-                f.name == emitted_name && f.is_gnu_inline_def && !f.is_declaration
-            });
+            let husk_idx =
+                self.module.functions.iter().position(|f| {
+                    f.name == emitted_name && f.is_gnu_inline_def && !f.is_declaration
+                });
             match husk_idx {
                 Some(i) if new_is_extern_def => {
                     self.module.functions.remove(i);
@@ -356,7 +357,11 @@ impl Lowerer {
     }
 
     /// Allocate function parameters as local variables (3-phase process).
-    pub(super) fn allocate_function_params(&mut self, func: &FunctionDef, info: &IrParamBuildResult) {
+    pub(super) fn allocate_function_params(
+        &mut self,
+        func: &FunctionDef,
+        info: &IrParamBuildResult,
+    ) {
         // Phase 1: Emit allocas for all IR params
         let mut ir_allocas: Vec<Value> = Vec::new();
         for param in &info.params {
@@ -1206,13 +1211,10 @@ impl Lowerer {
         // Match the lowering behavior: only push a scope (increment depth) when the
         // compound statement contains declarations. Declaration-free compound statements
         // don't push a scope in lower_compound_stmt, so we must not increment depth here.
-        let has_declarations = compound
-            .items
-            .iter()
-            .any(|item| {
-                matches!(item, BlockItem::Declaration(_))
-                    || matches!(item, BlockItem::NestedFunction(_))
-            });
+        let has_declarations = compound.items.iter().any(|item| {
+            matches!(item, BlockItem::Declaration(_))
+                || matches!(item, BlockItem::NestedFunction(_))
+        });
         let inner_depth = if has_declarations { depth + 1 } else { depth };
         for item in &compound.items {
             match item {

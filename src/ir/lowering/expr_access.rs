@@ -195,11 +195,8 @@ impl Lowerer {
 
         // C23 decimal floating point casts: route through the libbid
         // (__bid_*) conversion helpers, exactly like GCC.
-        if (inner_ctype.is_decimal() || target_ctype.is_decimal())
-            && target_ctype != CType::Bool
-        {
-            if target_ctype.is_decimal() && inner_ctype.is_decimal()
-                && inner_ctype == target_ctype
+        if (inner_ctype.is_decimal() || target_ctype.is_decimal()) && target_ctype != CType::Bool {
+            if target_ctype.is_decimal() && inner_ctype.is_decimal() && inner_ctype == target_ctype
             {
                 // same-type decimal cast: identity (handled below by the
                 // generic same-type path) — fall through with nothing.
@@ -1240,7 +1237,8 @@ impl Lowerer {
         // For bitfields, use extract_bitfield_from_addr which handles split loads
         // (packed bitfields that span storage unit boundaries).
         if let Some((bit_offset, bit_width)) = bitfield {
-            return self.extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
+            return self
+                .extract_bitfield_from_addr(field_addr, storage_ty, bit_offset, bit_width, sso);
         }
 
         let dest = self.fresh_value();
@@ -1313,17 +1311,14 @@ impl Lowerer {
         // expressions that re-declare the same variable name (extremely common in
         // kernel macros like READ_ONCE, per-CPU accessors, container_of) permanently
         // overwrite the outer binding, producing wrong code.
-        let has_declarations = compound
-            .items
-            .iter()
-            .any(|item| {
-                matches!(item, BlockItem::Declaration(_)) || {
-                    // Nested definitions contribute a scope entry exactly
-                    // like declarations do (the nested function name is
-                    // declared in this block).
-                    matches!(item, BlockItem::NestedFunction(_))
-                }
-            });
+        let has_declarations = compound.items.iter().any(|item| {
+            matches!(item, BlockItem::Declaration(_)) || {
+                // Nested definitions contribute a scope entry exactly
+                // like declarations do (the nested function name is
+                // declared in this block).
+                matches!(item, BlockItem::NestedFunction(_))
+            }
+        });
         if has_declarations {
             self.push_scope();
         }

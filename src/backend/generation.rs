@@ -3646,14 +3646,11 @@ fn generate_function(
     // over-aligned structs force it too): the shape is ABI-exotic either
     // way and the frame pointer costs nothing semantically.
     let has_overaligned_call_args = func.blocks.iter().any(|block| {
-        block.instructions.iter().any(|inst| {
-            match inst {
-                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info
-                    .struct_arg_aligns
-                    .iter()
-                    .any(|a| a.unwrap_or(0) > 16),
-                _ => false,
+        block.instructions.iter().any(|inst| match inst {
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16)
             }
+            _ => false,
         })
     });
     cg.state().omit_frame_pointer = cg.state().fpo_requested
@@ -4722,14 +4719,17 @@ fn rematerialize_skipped_indexed(cg: &mut dyn ArchCodegen, ptr: &Value, info: &I
 /// the residency afterwards so the pending store can still read its value.
 /// push/pop are flag-neutral, so a fused-Cmp handshake cannot be disturbed,
 /// and the stack stays balanced regardless of what the remat emits.
-fn remat_indexed_acc_safe(cg: &mut dyn ArchCodegen, val: &Operand, remat: impl FnOnce(&mut dyn ArchCodegen)) {
+fn remat_indexed_acc_safe(
+    cg: &mut dyn ArchCodegen,
+    val: &Operand,
+    remat: impl FnOnce(&mut dyn ArchCodegen),
+) {
     let protected = match val {
         Operand::Value(v) => {
             let st = cg.state_ref();
             !cg.is_value_reg_assigned(v.0)
                 && st.get_slot(v.0).is_none()
-                && (st.reg_cache.acc_has(v.0, st.is_alloca(v.0))
-                    || st.is_accumulator_location(v.0))
+                && (st.reg_cache.acc_has(v.0, st.is_alloca(v.0)) || st.is_accumulator_location(v.0))
         }
         Operand::Const(_) => false,
     };

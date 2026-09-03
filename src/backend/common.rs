@@ -314,9 +314,8 @@ pub fn link_with_args(
                         map.push_str(&obj.source_name);
                         map.push('\n');
                     }
-                    std::fs::write(&map_path, map).map_err(|e| {
-                        format!("cannot write link map '{}': {}", map_path, e)
-                    })?;
+                    std::fs::write(&map_path, map)
+                        .map_err(|e| format!("cannot write link map '{}': {}", map_path, e))?;
                 }
                 return Ok(());
             }
@@ -654,8 +653,7 @@ pub(crate) fn with_sysroot_prefix(path: &str) -> String {
 /// Existence probe honouring LCCC_SYSROOT (prefixed path first, host fallback).
 #[cfg(not(feature = "gcc_linker"))]
 pub(crate) fn exists_with_sysroot(path: &str) -> bool {
-    std::path::Path::new(&with_sysroot_prefix(path)).exists()
-        || std::path::Path::new(path).exists()
+    std::path::Path::new(&with_sysroot_prefix(path)).exists() || std::path::Path::new(path).exists()
 }
 
 /// Resolve a discovery candidate to an existing directory.
@@ -2444,7 +2442,9 @@ pub(crate) fn wide_typed_values(
 mod value_type_map_tests {
     use super::*;
     use crate::common::types::IrType;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, IrFunction, Instruction, Operand, Terminator, Value};
+    use crate::ir::reexports::{
+        BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
+    };
 
     fn func_with_blocks(blocks: Vec<BasicBlock>, next_id: u32) -> IrFunction {
         let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
@@ -2454,15 +2454,32 @@ mod value_type_map_tests {
     }
 
     fn i32_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
-        Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: IrType::I32 }
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        }
     }
 
     fn i64_add(dest: Value, lhs: Operand, rhs: Operand) -> Instruction {
-        Instruction::BinOp { dest, op: IrBinOp::Add, lhs, rhs, ty: IrType::I64 }
+        Instruction::BinOp {
+            dest,
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        }
     }
 
     fn block(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
-        BasicBlock { label: BlockId(id), instructions: insts, terminator: term, source_spans: Vec::new() }
+        BasicBlock {
+            label: BlockId(id),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
     }
 
     /// A loop-carried phi whose incoming value is defined LATER in program
@@ -2479,7 +2496,7 @@ mod value_type_map_tests {
                 dest: Value(0),
                 incoming: vec![
                     (Operand::Const(IrConst::I32(0)), BlockId(99)), // preheader
-                    (Operand::Value(Value(2)), BlockId(1)),          // back edge
+                    (Operand::Value(Value(2)), BlockId(1)),         // back edge
                 ],
                 ty: IrType::I64,
             }],
@@ -2487,7 +2504,11 @@ mod value_type_map_tests {
         );
         let body = block(
             1,
-            vec![i64_add(Value(2), Operand::Value(Value(0)), Operand::Const(IrConst::I64(1)))],
+            vec![i64_add(
+                Value(2),
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I64(1)),
+            )],
             Terminator::Return(Some(Operand::Value(Value(2)))),
         );
         let f = func_with_blocks(vec![header, body], 3);
@@ -2496,7 +2517,11 @@ mod value_type_map_tests {
         // v0 (the phi) must be typed wide: it is fed from wide v2 on the back
         // edge even though the only *forward* constant seed was I32.
         let t0 = map.get(&0).copied().expect("phi dest v0 typed");
-        assert_eq!(t0.size(), 8, "phi dest must inherit the wide back-edge type: {map:?}");
+        assert_eq!(
+            t0.size(),
+            8,
+            "phi dest must inherit the wide back-edge type: {map:?}"
+        );
         let t2 = map.get(&2).copied().expect("body value typed");
         assert_eq!(t2.size(), 8);
     }
@@ -2509,9 +2534,17 @@ mod value_type_map_tests {
         let b = block(
             0,
             vec![
-                i64_add(Value(0), Operand::Const(IrConst::I64(1)), Operand::Const(IrConst::I64(2))),
+                i64_add(
+                    Value(0),
+                    Operand::Const(IrConst::I64(1)),
+                    Operand::Const(IrConst::I64(2)),
+                ),
                 // A later narrow redefinition of the same id must not narrow it.
-                i32_add(Value(0), Operand::Const(IrConst::I32(3)), Operand::Const(IrConst::I32(4))),
+                i32_add(
+                    Value(0),
+                    Operand::Const(IrConst::I32(3)),
+                    Operand::Const(IrConst::I32(4)),
+                ),
             ],
             Terminator::Return(Some(Operand::Value(Value(0)))),
         );
@@ -2528,12 +2561,19 @@ mod value_type_map_tests {
     fn param_seeded_before_copy_in_earlier_block() {
         let b0 = block(
             0,
-            vec![Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) }],
+            vec![Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Value(Value(0)),
+            }],
             Terminator::Branch(BlockId(1)),
         );
         let b1 = block(
             1,
-            vec![Instruction::ParamRef { dest: Value(0), param_idx: 0, ty: IrType::I64 }],
+            vec![Instruction::ParamRef {
+                dest: Value(0),
+                param_idx: 0,
+                ty: IrType::I64,
+            }],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         );
         let f = func_with_blocks(vec![b0, b1], 2);
@@ -2548,8 +2588,15 @@ mod value_type_map_tests {
         let b0 = block(
             0,
             vec![
-                i32_add(Value(0), Operand::Const(IrConst::I32(1)), Operand::Const(IrConst::I32(2))),
-                Instruction::Copy { dest: Value(1), src: Operand::Value(Value(0)) },
+                i32_add(
+                    Value(0),
+                    Operand::Const(IrConst::I32(1)),
+                    Operand::Const(IrConst::I32(2)),
+                ),
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
             ],
             Terminator::Return(Some(Operand::Value(Value(1)))),
         );

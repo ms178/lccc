@@ -632,16 +632,12 @@ impl Instruction {
                 | IntrinsicOp::FabsF32
                 | IntrinsicOp::FmaScalarF32
                 | IntrinsicOp::RoundScalarF32(_)
-                | IntrinsicOp::CopysignF32 => {
-                    Some(IrType::F32)
-                }
+                | IntrinsicOp::CopysignF32 => Some(IrType::F32),
                 IntrinsicOp::SqrtF64
                 | IntrinsicOp::FabsF64
                 | IntrinsicOp::FmaScalarF64
                 | IntrinsicOp::RoundScalarF64(_)
-                | IntrinsicOp::CopysignF64 => {
-                    Some(IrType::F64)
-                }
+                | IntrinsicOp::CopysignF64 => Some(IrType::F64),
                 // The bit-op F128 builtins produce a full _Float128. Their
                 // codegen stores 16 bytes (movdqu) to the dest's home; a
                 // None here made the slot allocator reserve only 8 bytes,
@@ -650,9 +646,9 @@ impl Instruction {
                 // copysign's result temp at 0x18 overwrote the operand's
                 // slot at 0x20, mis-decoding every later operation that
                 // read the operand).
-                IntrinsicOp::F128Fabs
-                | IntrinsicOp::F128Neg
-                | IntrinsicOp::F128Copysign => Some(IrType::F128),
+                IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign => {
+                    Some(IrType::F128)
+                }
                 // 64-bit scalar results: the intrinsic returns `long long` /
                 // `unsigned long long` — on i686 that is an eax:edx pair
                 // living in an 8-byte slot. A None here made the slot

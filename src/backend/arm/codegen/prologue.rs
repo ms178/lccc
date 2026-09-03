@@ -1,9 +1,9 @@
 //! ArmCodegen: prologue/epilogue and stack frame operations.
 
 use super::emit::{
-    ARM_ARG_REGS, ARM_CALLEE_SAVED, ARM_CALLER_SAVED, ArmCodegen, callee_saved_name,
+    callee_saved_name, ArmCodegen, ARM_ARG_REGS, ARM_CALLEE_SAVED, ARM_CALLER_SAVED,
 };
-use crate::backend::call_abi::{ParamClass, classify_params};
+use crate::backend::call_abi::{classify_params, ParamClass};
 use crate::backend::generation::{calculate_stack_space_common, find_param_alloca};
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Terminator, Value};
@@ -188,7 +188,9 @@ impl ArmCodegen {
                             crate::ir::reexports::IrUnaryOp::Clz
                                 | crate::ir::reexports::IrUnaryOp::Ctz
                                 | crate::ir::reexports::IrUnaryOp::Popcount
-                        ) && !ty.is_float() && ty.size() <= 4 {
+                        ) && !ty.is_float()
+                            && ty.size() <= 4
+                        {
                             nonneg.insert(dest.0);
                         }
                     }

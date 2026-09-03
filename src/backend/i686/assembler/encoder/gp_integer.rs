@@ -156,14 +156,12 @@ impl super::InstructionEncoder {
                     // exactly like the `movl $sym,%reg` register form above;
                     // 8/16-bit stores keep the historical integer-only
                     // restriction.
-                    ImmediateValue::Symbol(sym)
-                    | ImmediateValue::SymbolPlusOffset(sym, _) => {
-                        let addend =
-                            if let ImmediateValue::SymbolPlusOffset(_, a) = imm {
-                                *a
-                            } else {
-                                0
-                            };
+                    ImmediateValue::Symbol(sym) | ImmediateValue::SymbolPlusOffset(sym, _) => {
+                        let addend = if let ImmediateValue::SymbolPlusOffset(_, a) = imm {
+                            *a
+                        } else {
+                            0
+                        };
                         if size != 4 {
                             return Err(
                                 "symbol immediate to label address only supported for 32-bit mov"

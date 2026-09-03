@@ -385,7 +385,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // torture memcpy-ax corpus: ~486k asm lines) make per-pass cost visible;
     // this is the measurement hook for keeping the pass mix linear-ish.
     let time_peephole = std::env::var("CCC_TIME_PEEPHOLE").is_ok();
-    let peephole_total = if time_peephole { Some(std::time::Instant::now()) } else { None };
+    let peephole_total = if time_peephole {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     // Pin parameter pre-store instructions: `movq %arg_reg, %callee_saved_reg`
     // that appear in the prologue area (before the first function call).
@@ -479,7 +483,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
     let mut changed = true;
     let mut pass_count = 0;
     while changed && pass_count < max_phase1_iters && !skip_phase1 {
-        let iter_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
+        let iter_start = if time_peephole {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         changed = false;
         let local_changed = if sk("combined") {
             false
@@ -682,7 +690,11 @@ pub fn peephole_optimize(mut asm: String) -> String {
     }
 
     // Phase 2: Expensive global passes (run once)
-    let phase2_start = if time_peephole { Some(std::time::Instant::now()) } else { None };
+    let phase2_start = if time_peephole {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let global_changed = if skip_phase2 {
         false
     } else {
@@ -734,7 +746,10 @@ pub fn peephole_optimize(mut asm: String) -> String {
         global_changed
     };
     if let Some(s) = phase2_start {
-        eprintln!("[PEEPHOLE-TIME] phase2: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "[PEEPHOLE-TIME] phase2: {:.1} ms",
+            s.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     // Phase 3: One more local cleanup if global passes made changes.
@@ -926,7 +941,10 @@ pub fn peephole_optimize(mut asm: String) -> String {
     }
 
     if let Some(s) = peephole_total {
-        eprintln!("[PEEPHOLE-TIME] total: {:.1} ms", s.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "[PEEPHOLE-TIME] total: {:.1} ms",
+            s.elapsed().as_secs_f64() * 1e3
+        );
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early

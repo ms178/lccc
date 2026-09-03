@@ -212,53 +212,55 @@ pub(super) fn color_stack_slots(
         });
 
         let mut colors: Vec<(i64, Vec<(u32, u32)>)> = Vec::new();
-    let mut reused = 0usize;
-    let mut assigned = 0usize;
-    for &value in values.iter() {
-        let live = &segments[&value];
-        let interferes = |occupied: &[(u32, u32)]| {
-            if per_segment {
-                segments_interfere(live, occupied)
-            } else {
-                hulls_interfere(live, occupied)
+        let mut reused = 0usize;
+        let mut assigned = 0usize;
+        for &value in values.iter() {
+            let live = &segments[&value];
+            let interferes = |occupied: &[(u32, u32)]| {
+                if per_segment {
+                    segments_interfere(live, occupied)
+                } else {
+                    hulls_interfere(live, occupied)
+                }
+            };
+            if let Some((slot, occupied)) = colors
+                .iter_mut()
+                .find(|(_, occupied)| !interferes(occupied))
+            {
+                state.value_locations.insert(value, StackSlot(*slot));
+                reused += 1;
+                if per_segment {
+                    // Preserve the per-segment structure of the union so later
+                    // CFG-arm candidates can still use the holes inside it.
+                    let live_clone = live.clone();
+                    insert_union(occupied, &live_clone);
+                } else {
+                    // Hull model: the colour's occupancy is its merged hull —
+                    // the only information the hull test can ever consult.
+                    let (hs, he) = hull(live);
+                    let (os, oe) = hull(occupied);
+                    occupied.clear();
+                    occupied.push((hs.min(os), he.max(oe)));
+                }
+                continue;
             }
-        };
-        if let Some((slot, occupied)) = colors.iter_mut().find(|(_, occupied)| !interferes(occupied))
-        {
-            state.value_locations.insert(value, StackSlot(*slot));
-            reused += 1;
-            if per_segment {
-                // Preserve the per-segment structure of the union so later
-                // CFG-arm candidates can still use the holes inside it.
-                let live_clone = live.clone();
-                insert_union(occupied, &live_clone);
-            } else {
-                // Hull model: the colour's occupancy is its merged hull —
-                // the only information the hull test can ever consult.
-                let (hs, he) = hull(live);
-                let (os, oe) = hull(occupied);
-                occupied.clear();
-                occupied.push((hs.min(os), he.max(oe)));
-            }
-            continue;
-        }
 
-        let (slot, new_space) = assign_slot(*non_local_space, *size, 0);
-        *non_local_space = new_space;
-        state.value_locations.insert(value, StackSlot(slot));
-        colors.push((slot, live.clone()));
-        assigned += 1;
+            let (slot, new_space) = assign_slot(*non_local_space, *size, 0);
+            *non_local_space = new_space;
+            state.value_locations.insert(value, StackSlot(slot));
+            colors.push((slot, live.clone()));
+            assigned += 1;
+        }
+        if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
+            eprintln!(
+                "[SLOTS]   color_stack_slots: {} distinct slots for {} values (reused {}; {} new)",
+                colors.len(),
+                multi_block_values.len(),
+                reused,
+                assigned
+            );
+        }
     }
-    if std::env::var("CCC_DEBUG_SLOTS").is_ok() {
-        eprintln!(
-            "[SLOTS]   color_stack_slots: {} distinct slots for {} values (reused {}; {} new)",
-            colors.len(),
-            multi_block_values.len(),
-            reused,
-            assigned
-        );
-    }
-}
 }
 
 #[cfg(test)]
@@ -400,9 +402,7 @@ mod tests {
             let mut colors: Vec<Vec<(u32, u32)>> = Vec::new();
             let mut slot_of: Vec<usize> = vec![0; nvals];
             for (i, live) in segs.iter().enumerate() {
-                let c = colors
-                    .iter()
-                    .position(|occ| !hulls_interfere(live, occ));
+                let c = colors.iter().position(|occ| !hulls_interfere(live, occ));
                 let ci = match c {
                     Some(ci) => ci,
                     None => {

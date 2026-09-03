@@ -887,11 +887,9 @@ mod tests {
         // Simulate sorted asc processing: inner first, then outer, then separate
         let mut kept: Vec<FxHashSet<usize>> = Vec::new();
         // inner does not overlap kept (empty) -> keep
-        assert!(
-            !kept
-                .iter()
-                .any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body))
-        );
+        assert!(!kept
+            .iter()
+            .any(|b: &FxHashSet<usize>| !b.is_disjoint(&inner.body)));
         kept.push(inner.body.clone());
         // outer overlaps kept inner -> should be skipped
         assert!(kept.iter().any(|b| !b.is_disjoint(&outer.body)));

@@ -48,7 +48,9 @@ fn byte_and_word_self_moves_are_always_dead() {
 #[test]
 fn a_32_bit_self_move_is_dead_when_the_upper_half_is_already_zero() {
     // `movl %ebx,%ebx` after a 32-bit write: the zero-extension is redundant.
-    let out = run(&f("    movl %edi, %ebx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret"));
+    let out = run(&f(
+        "    movl %edi, %ebx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret",
+    ));
     assert_eq!(count(&out, "movl %ebx, %ebx"), 0, "{}", out);
 }
 
@@ -57,8 +59,15 @@ fn a_32_bit_self_move_SURVIVES_when_the_upper_half_is_unknown() {
     // SOUNDNESS: `movl %ebx,%ebx` is the idiomatic 64->32 truncation. With a
     // 64-bit value in %rbx it is load-bearing, and the following 64-bit read
     // must see the truncated value.
-    let out = run(&f("    movq (%rdi), %rbx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret"));
-    assert_eq!(count(&out, "movl %ebx, %ebx"), 1, "must not be removed:\n{}", out);
+    let out = run(&f(
+        "    movq (%rdi), %rbx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret",
+    ));
+    assert_eq!(
+        count(&out, "movl %ebx, %ebx"),
+        1,
+        "must not be removed:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -71,7 +80,12 @@ fn a_32_bit_self_move_SURVIVES_across_a_label() {
         "    movq %rbx, %rax\n",
         "    ret"
     )));
-    assert_eq!(count(&out, "movl %ebx, %ebx"), 1, "must not be removed:\n{}", out);
+    assert_eq!(
+        count(&out, "movl %ebx, %ebx"),
+        1,
+        "must not be removed:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -84,7 +98,12 @@ fn a_32_bit_self_move_SURVIVES_across_a_call() {
         "    movq %rcx, %rax\n",
         "    ret"
     )));
-    assert_eq!(count(&out, "movl %ecx, %ecx"), 1, "must not be removed:\n{}", out);
+    assert_eq!(
+        count(&out, "movl %ecx, %ecx"),
+        1,
+        "must not be removed:\n{}",
+        out
+    );
 }
 
 // ── B. copy folding: positives, one per width class ─────────────────────────
@@ -103,7 +122,11 @@ fn a_32_bit_copy_folds_into_a_32_bit_compare() {
         "    ret"
     )));
     assert_eq!(count(&out, "movl %eax, %esi"), 0, "copy must go:\n{}", out);
-    assert!(out.contains("cmpl %r8d, %eax"), "use must retarget:\n{}", out);
+    assert!(
+        out.contains("cmpl %r8d, %eax"),
+        "use must retarget:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -118,7 +141,11 @@ fn a_64_bit_copy_folds_into_an_ADDRESS_operand() {
         "    ret"
     )));
     assert_eq!(count(&out, "movq %rdi, %r11"), 0, "copy must go:\n{}", out);
-    assert!(out.contains("movl (%rdi), %eax"), "address must retarget:\n{}", out);
+    assert!(
+        out.contains("movl (%rdi), %eax"),
+        "address must retarget:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -340,7 +367,12 @@ fn the_extended_registers_are_not_blocked_by_prefix_matching() {
         "    xorl %eax, %eax\n",
         "    ret"
     )));
-    assert_eq!(count(&out, "movl %r9d, %r10d"), 0, "the copy must go:\n{}", out);
+    assert_eq!(
+        count(&out, "movl %r9d, %r10d"),
+        0,
+        "the copy must go:\n{}",
+        out
+    );
     assert!(
         out.contains("cmpl %r8d, %r9d") || out.contains("cmpl %r8d, %r10d"),
         "the compare must read a register the load defines:\n{}",

@@ -1,6 +1,6 @@
 //! ArmCodegen: floating-point binary operations.
 
-use super::emit::{ArmCodegen, arm_fp_name, is_arm_fp_phys};
+use super::emit::{arm_fp_name, is_arm_fp_phys, ArmCodegen};
 use crate::backend::cast::FloatOp;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;

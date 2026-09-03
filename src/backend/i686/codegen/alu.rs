@@ -188,21 +188,21 @@ impl I686Codegen {
         // live values there. Preserve it with a push/pop pair; the sequence
         // contains no call, so the transient stack excursion is safe.
         self.state.emit("    pushl %ecx");
-        self.state.emit("    movl %eax, %ecx");   // c = x
+        self.state.emit("    movl %eax, %ecx"); // c = x
         self.state.emit("    shrl $1, %eax");
         self.state.emit("    andl $0x55555555, %eax"); // (x>>1)&0x55..
-        self.state.emit("    subl %eax, %ecx");   // c = x - pairs
+        self.state.emit("    subl %eax, %ecx"); // c = x - pairs
         self.state.emit("    movl %ecx, %eax");
         self.state.emit("    shrl $2, %eax");
         self.state.emit("    andl $0x33333333, %eax");
         self.state.emit("    andl $0x33333333, %ecx");
-        self.state.emit("    addl %eax, %ecx");   // c = nibble counts
+        self.state.emit("    addl %eax, %ecx"); // c = nibble counts
         self.state.emit("    movl %ecx, %eax");
         self.state.emit("    shrl $4, %eax");
         self.state.emit("    addl %ecx, %eax");
         self.state.emit("    andl $0x0f0f0f0f, %eax"); // byte counts
         self.state.emit("    imull $0x01010101, %eax, %eax"); // *0x01010101
-        self.state.emit("    shrl $24, %eax");    // top byte = popcount
+        self.state.emit("    shrl $24, %eax"); // top byte = popcount
         self.state.emit("    popl %ecx");
     }
 
@@ -650,7 +650,10 @@ impl I686Codegen {
         // TAIL of a pair emits nothing — its result was stored by the HEAD's
         // dual-store emission further up in this block. The HEAD emits one
         // divl/idivl and stores its own result AND the partner's.
-        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+        if matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        ) {
             if self.divrem_tail_dests.contains(&dest.0)
                 && !self.divrem_broken_tails.contains(&dest.0)
             {
@@ -677,9 +680,8 @@ impl I686Codegen {
                         dest.0, op, partner_dest, partner_from_eax
                     );
                 }
-                let fused = self.emit_divrem_pair_head(
-                    dest, op, lhs, rhs, partner_dest, partner_from_eax,
-                );
+                let fused =
+                    self.emit_divrem_pair_head(dest, op, lhs, rhs, partner_dest, partner_from_eax);
                 if fused {
                     return;
                 }
@@ -970,10 +972,8 @@ impl I686Codegen {
         // no-home fallback). The pair tail can never be one (the accumulator
         // analysis excludes tails), so at most the HEAD's own dest is
         // slotless — it must be materialised into %eax with a cache entry.
-        let rem_slotless =
-            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
-        let div_slotless =
-            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
+        let rem_slotless = rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
+        let div_slotless = div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
         // store_edx(rem) writes %eax iff rem is HOMED in %eax (PhysReg 6);
         // store_eax(div) writes %edx iff div is HOMED in %edx (PhysReg 5).
         let edx_side_writes_eax = rem_home == Some(6);

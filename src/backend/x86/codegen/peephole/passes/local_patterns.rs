@@ -1443,9 +1443,10 @@ fn line_refs_gp_family(line: &str, fam: u8) -> bool {
         while let Some(pos) = line[start..].find(pat) {
             let abs = start + pos;
             let end = abs + pat.len();
-            let boundary = line.as_bytes().get(end).map_or(true, |&c| {
-                !(c as char).is_ascii_alphanumeric()
-            });
+            let boundary = line
+                .as_bytes()
+                .get(end)
+                .map_or(true, |&c| !(c as char).is_ascii_alphanumeric());
             if boundary {
                 return true;
             }
@@ -3218,22 +3219,15 @@ pub(super) fn eliminate_rcx_address_copy(store: &mut LineStore, infos: &mut [Lin
                                 i += 1;
                                 continue;
                             };
-                            if destination.trim() == "(%rcx)"
-                                && !source.contains("%rcx")
-                            {
+                            if destination.trim() == "(%rcx)" && !source.contains("%rcx") {
                                 let mut k = j + 1;
                                 while k < len && infos[k].is_nop() {
                                     k += 1;
                                 }
                                 if !rcx_is_live_at(store, infos, k, len) {
-                                    let replacement = line_j.replacen(
-                                        "(%rcx)",
-                                        &format!("(%{})", src_reg),
-                                        1,
-                                    );
-                                    if replacement != line_j
-                                        && !replacement.contains("%rcx")
-                                    {
+                                    let replacement =
+                                        line_j.replacen("(%rcx)", &format!("(%{})", src_reg), 1);
+                                    if replacement != line_j && !replacement.contains("%rcx") {
                                         mark_nop(&mut infos[i]);
                                         replace_line(
                                             store,
@@ -6021,7 +6015,6 @@ mod lea_scan_debug {
     }
 }
 
-
 /// Fuse `movsd %A, %D` + `vOP %S, %D, %D` into `vOP %S, %A, %D`.
 ///
 /// The scalar-FP emitters stage the first operand into the destination with
@@ -6324,8 +6317,8 @@ fn dst_d_full(dst: &str) -> String {
 fn binary_vex_scalar_mnemonic<'a>(line: &'a str, width: &str) -> Option<(&'static str, &'a str)> {
     let _ = width;
     const MNEMONICS: [&str; 12] = [
-        "vmulsd", "vaddsd", "vsubsd", "vdivsd", "vminsd", "vmaxsd", "vmulss", "vaddss",
-        "vsubss", "vdivss", "vminss", "vmaxss",
+        "vmulsd", "vaddsd", "vsubsd", "vdivsd", "vminsd", "vmaxsd", "vmulss", "vaddss", "vsubss",
+        "vdivss", "vminss", "vmaxss",
     ];
     for m in MNEMONICS {
         if line.starts_with(m) && line[m.len()..].starts_with(' ') {

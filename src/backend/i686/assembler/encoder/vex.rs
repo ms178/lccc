@@ -218,11 +218,7 @@ impl super::InstructionEncoder {
     }
 
     /// VEX.NDS 3-operand, no mandatory prefix (vaddps family).
-    pub(crate) fn encode_avx_3op_np(
-        &mut self,
-        ops: &[Operand],
-        opcode: u8,
-    ) -> Result<(), String> {
+    pub(crate) fn encode_avx_3op_np(&mut self, ops: &[Operand], opcode: u8) -> Result<(), String> {
         self.encode_avx_3op(ops, opcode, false)
     }
 
@@ -1246,41 +1242,39 @@ impl super::InstructionEncoder {
         pp: u8,
     ) -> Result<(), String> {
         match ops.len() {
-            2 => {
-                match (&ops[0], &ops[1]) {
-                    (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        let r = needs_vex_ext(&dst.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                        self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
-                        self.bytes.push(load_op);
-                        self.encode_modrm_mem(dst_num, mem)
-                    }
-                    (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
-                        let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let r = needs_vex_ext(&src.name);
-                        let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
-                        let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
-                        self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
-                        self.bytes.push(store_op);
-                        self.encode_modrm_mem(src_num, mem)
-                    }
-                    (Operand::Register(src), Operand::Register(dst))
-                        if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
-                    {
-                        let src_num = reg_num(&src.name).ok_or("bad register")?;
-                        let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                        let r = needs_vex_ext(&dst.name);
-                        let b = needs_vex_ext(&src.name);
-                        self.emit_vex(r, false, b, 1, 0, 0, 0, pp);
-                        self.bytes.push(load_op);
-                        self.bytes.push(self.modrm(3, dst_num, src_num));
-                        Ok(())
-                    }
-                    _ => Err("unsupported AVX scalar mov 2-op operands".to_string()),
+            2 => match (&ops[0], &ops[1]) {
+                (Operand::Memory(mem), Operand::Register(dst)) if is_xmm_or_ymm(&dst.name) => {
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    let r = needs_vex_ext(&dst.name);
+                    let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                    let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                    self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
+                    self.bytes.push(load_op);
+                    self.encode_modrm_mem(dst_num, mem)
                 }
-            }
+                (Operand::Register(src), Operand::Memory(mem)) if is_xmm_or_ymm(&src.name) => {
+                    let src_num = reg_num(&src.name).ok_or("bad register")?;
+                    let r = needs_vex_ext(&src.name);
+                    let b_ext = mem.base.as_ref().is_some_and(|b| needs_vex_ext(&b.name));
+                    let x = mem.index.as_ref().is_some_and(|i| needs_vex_ext(&i.name));
+                    self.emit_vex(r, x, b_ext, 1, 0, 0, 0, pp);
+                    self.bytes.push(store_op);
+                    self.encode_modrm_mem(src_num, mem)
+                }
+                (Operand::Register(src), Operand::Register(dst))
+                    if is_xmm_or_ymm(&src.name) && is_xmm_or_ymm(&dst.name) =>
+                {
+                    let src_num = reg_num(&src.name).ok_or("bad register")?;
+                    let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                    let r = needs_vex_ext(&dst.name);
+                    let b = needs_vex_ext(&src.name);
+                    self.emit_vex(r, false, b, 1, 0, 0, 0, pp);
+                    self.bytes.push(load_op);
+                    self.bytes.push(self.modrm(3, dst_num, src_num));
+                    Ok(())
+                }
+                _ => Err("unsupported AVX scalar mov 2-op operands".to_string()),
+            },
             3 => self.encode_avx_scalar_3op(ops, load_op, pp),
             _ => Err("AVX scalar mov requires 2 or 3 operands".to_string()),
         }
@@ -1533,21 +1527,21 @@ mod tests {
         let golden: &[u8] = &[
             0xc4, 0xe2, 0xe9, 0xb9, 0xc3, // vfmadd231sd %xmm3,%xmm2,%xmm0
             0xc4, 0xe2, 0x79, 0x99, 0xd1, // vfmadd132ss %xmm1,%xmm0,%xmm2
-            0xc5, 0xf8, 0x28, 0xd1,       // vmovaps %xmm1,%xmm2
-            0xc5, 0xf8, 0x58, 0xc1,       // vaddps %xmm1,%xmm0,%xmm0
+            0xc5, 0xf8, 0x28, 0xd1, // vmovaps %xmm1,%xmm2
+            0xc5, 0xf8, 0x58, 0xc1, // vaddps %xmm1,%xmm0,%xmm0
             0xc4, 0xe2, 0xe9, 0xae, 0xcb, // vfnmsub213pd %xmm3,%xmm2,%xmm1
             0xc4, 0xe2, 0x69, 0xb6, 0xcb, // vfmaddsub231ps %xmm3,%xmm2,%xmm1
-            0xc5, 0xf8, 0x77,             // vzeroupper
+            0xc5, 0xf8, 0x77, // vzeroupper
             0xc4, 0xe2, 0xe9, 0xb9, 0x00, // vfmadd231sd (%eax),%xmm2,%xmm0
             0xf2, 0x0f, 0x38, 0xf1, 0x18, // crc32l (%eax),%ebx
             0x66, 0x0f, 0x3a, 0x17, 0x10, 0x01, // extractps $1,%xmm2,(%eax)
-            0xc5, 0xeb, 0x10, 0xc1,       // vmovsd %xmm1,%xmm2,%xmm0
-            0xc5, 0xeb, 0x51, 0xc1,       // vsqrtsd %xmm1,%xmm2,%xmm0
+            0xc5, 0xeb, 0x10, 0xc1, // vmovsd %xmm1,%xmm2,%xmm0
+            0xc5, 0xeb, 0x51, 0xc1, // vsqrtsd %xmm1,%xmm2,%xmm0
             0xc5, 0xf9, 0x70, 0xc2, 0x01, // vpshufd $1,%xmm2,%xmm0
             0xc5, 0xfa, 0x70, 0xc2, 0x01, // vpshufhw $1,%xmm2,%xmm0
             0xc5, 0xfb, 0x70, 0xc2, 0x01, // vpshuflw $1,%xmm2,%xmm0
             0xc5, 0xf9, 0x70, 0x00, 0x01, // vpshufd $1,(%eax),%xmm0
-            0xc5, 0xea, 0x51, 0xc1,       // vsqrtss %xmm1,%xmm2,%xmm0
+            0xc5, 0xea, 0x51, 0xc1, // vsqrtss %xmm1,%xmm2,%xmm0
         ];
         assert_eq!(assemble_text(asm), golden);
     }
@@ -1579,16 +1573,16 @@ mod tests {
         let golden: &[u8] = &[
             0x66, 0x0f, 0x3a, 0x17, 0xd0, 0x01, // extractps $1,%xmm2,%eax
             0x66, 0x0f, 0x3a, 0x21, 0xc2, 0x01, // insertps $1,%xmm2,%xmm0
-            0x66, 0x0f, 0xe6, 0xc1,       // cvttpd2dq %xmm1,%xmm0
-            0xcf,                   // iret (IRET32)
-            0x66, 0xcf,             // iretw (IRET16)
-            0x0f, 0x1f, 0x00,       // nop (%eax) — 0F 1F /0
-            0x66, 0x8f, 0x00,       // popw (%eax)
+            0x66, 0x0f, 0xe6, 0xc1, // cvttpd2dq %xmm1,%xmm0
+            0xcf, // iret (IRET32)
+            0x66, 0xcf, // iretw (IRET16)
+            0x0f, 0x1f, 0x00, // nop (%eax) — 0F 1F /0
+            0x66, 0x8f, 0x00, // popw (%eax)
             0x66, 0x0f, 0x3a, 0x15, 0x10, 0x01, // pextrw $1,%xmm2,(%eax)
-            0x66, 0xf7, 0x20,       // mulw (%eax)
-            0x66, 0xf7, 0x30,       // divw (%eax)
-            0x66, 0xf7, 0x38,       // idivw (%eax)
-            0x66, 0xf7, 0xe0,       // mulw %ax
+            0x66, 0xf7, 0x20, // mulw (%eax)
+            0x66, 0xf7, 0x30, // divw (%eax)
+            0x66, 0xf7, 0x38, // idivw (%eax)
+            0x66, 0xf7, 0xe0, // mulw %ax
         ];
         assert_eq!(assemble_text(asm), golden);
     }

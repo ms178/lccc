@@ -1257,12 +1257,10 @@ mod tests {
         });
 
         assert_eq!(forward_store_only_temporaries(&mut func), 0);
-        assert!(
-            func.blocks[0]
-                .instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::Memcpy { .. }))
-        );
+        assert!(func.blocks[0]
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Memcpy { .. })));
     }
 
     #[test]

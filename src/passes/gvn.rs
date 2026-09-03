@@ -21,7 +21,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
 use crate::ir::reexports::{
-    CallInfo, ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp, Operand, Value,
+    CallInfo, ConstHashKey, Instruction, IrBinOp, IrCmpOp, IrFunction, IrModule, IrUnaryOp,
+    Operand, Value,
 };
 
 /// A value number expression key. Two instructions with the same ExprKey
@@ -461,15 +462,16 @@ impl GvnState {
                 }
             }
             Instruction::ParamRef {
-                dest, param_idx, ty, ..
+                dest,
+                param_idx,
+                ty,
+                ..
             } => {
                 if *ty == IrType::Ptr && self.noalias_params.contains(param_idx) {
                     let idx = dest.0 as usize;
                     if idx < self.value_numbers.len() && self.value_numbers[idx] != u32::MAX {
-                        self.ptr_base.insert(
-                            self.value_numbers[idx],
-                            PtrBase::NoAliasParam(*param_idx),
-                        );
+                        self.ptr_base
+                            .insert(self.value_numbers[idx], PtrBase::NoAliasParam(*param_idx));
                     }
                 }
             }
@@ -505,9 +507,7 @@ impl GvnState {
                 };
                 if let Some(base) = base {
                     let d_idx = dest.0 as usize;
-                    if d_idx < self.value_numbers.len()
-                        && self.value_numbers[d_idx] != u32::MAX
-                    {
+                    if d_idx < self.value_numbers.len() && self.value_numbers[d_idx] != u32::MAX {
                         self.ptr_base.insert(self.value_numbers[d_idx], base);
                     }
                 }
@@ -523,9 +523,7 @@ impl GvnState {
                 // and `offset - ptr` (invalid C) do not.
                 if let (Some(base), None) = (self.base_of(lhs), self.base_of(rhs)) {
                     let d_idx = dest.0 as usize;
-                    if d_idx < self.value_numbers.len()
-                        && self.value_numbers[d_idx] != u32::MAX
-                    {
+                    if d_idx < self.value_numbers.len() && self.value_numbers[d_idx] != u32::MAX {
                         self.ptr_base.insert(self.value_numbers[d_idx], base);
                     }
                 }
@@ -1054,11 +1052,7 @@ fn find_nonescaping_allocas(func: &IrFunction) -> FxHashSet<u32> {
     }
 
     let mut escaped: FxHashSet<u32> = FxHashSet::default();
-    fn mark_value(
-        v: u32,
-        owners: &FxHashMap<u32, FxHashSet<u32>>,
-        escaped: &mut FxHashSet<u32>,
-    ) {
+    fn mark_value(v: u32, owners: &FxHashMap<u32, FxHashSet<u32>>, escaped: &mut FxHashSet<u32>) {
         if let Some(o) = owners.get(&v) {
             escaped.extend(o.iter().copied());
         }
@@ -1076,8 +1070,9 @@ fn find_nonescaping_allocas(func: &IrFunction) -> FxHashSet<u32> {
         for inst in &block.instructions {
             match inst {
                 Instruction::Store { val, .. } => mark_operand(val, &owners, &mut escaped),
-                Instruction::AtomicStore { val, .. }
-                | Instruction::AtomicRmw { val, .. } => mark_operand(val, &owners, &mut escaped),
+                Instruction::AtomicStore { val, .. } | Instruction::AtomicRmw { val, .. } => {
+                    mark_operand(val, &owners, &mut escaped)
+                }
                 Instruction::AtomicCmpxchg {
                     expected, desired, ..
                 } => {
@@ -1265,21 +1260,20 @@ fn clobbers_memory(inst: &Instruction) -> bool {
             ..
         } => *is_sret,
         Instruction::Store { .. }
-            | Instruction::Call { .. }
-            | Instruction::CallIndirect { .. }
-            | Instruction::Memcpy { .. }
-            | Instruction::AtomicRmw { .. }
-            | Instruction::AtomicInc { .. }
-            | Instruction::AtomicCmpxchg { .. }
-            | Instruction::AtomicStore { .. }
-            | Instruction::Fence { .. }
-            | Instruction::InlineAsm { .. }
-            | Instruction::VaStart { .. }
-            | Instruction::VaEnd { .. }
-            | Instruction::VaCopy { .. } => true,
+        | Instruction::Call { .. }
+        | Instruction::CallIndirect { .. }
+        | Instruction::Memcpy { .. }
+        | Instruction::AtomicRmw { .. }
+        | Instruction::AtomicInc { .. }
+        | Instruction::AtomicCmpxchg { .. }
+        | Instruction::AtomicStore { .. }
+        | Instruction::Fence { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaEnd { .. }
+        | Instruction::VaCopy { .. } => true,
         Instruction::Intrinsic {
-            dest_ptr: Some(_),
-            ..
+            dest_ptr: Some(_), ..
         } => true,
         _ => false,
     }

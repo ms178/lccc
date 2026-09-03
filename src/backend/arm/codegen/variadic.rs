@@ -58,8 +58,7 @@ impl ArmCodegen {
             self.state.emit("    ldr q0, [x3]");
             self.state.emit("    add w2, w2, #16");
             self.state.emit("    str w2, [x1, #24]");
-            self.state
-                .emit_fmt(format_args!("    b {}", label_done));
+            self.state.emit_fmt(format_args!("    b {}", label_done));
 
             self.state.emit_fmt(format_args!("{}:", label_stack));
             // Overflow path: round __stack up to 16 first (per AAPCS64),

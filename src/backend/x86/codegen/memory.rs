@@ -97,11 +97,7 @@ impl X86Codegen {
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8 => {
                 let r64 = phys_reg_name(reg);
                 let instr = match ty {
-                    IrType::I32 => format!(
-                        "    movslq %{}, %{}",
-                        phys_reg_name_32(reg),
-                        r64
-                    ),
+                    IrType::I32 => format!("    movslq %{}, %{}", phys_reg_name_32(reg), r64),
                     IrType::U32 => format!(
                         "    movl %{}, %{}",
                         phys_reg_name_32(reg),
@@ -1010,7 +1006,15 @@ impl X86Codegen {
                     }
 
                     // Dest is on stack — load to rax as before (no fold target).
-                    let dest_reg = if use_32bit_dest { "%eax" } else if use_16bit_dest { "%ax" } else if use_8bit_dest { "%al" } else { "%rax" };
+                    let dest_reg = if use_32bit_dest {
+                        "%eax"
+                    } else if use_16bit_dest {
+                        "%ax"
+                    } else if use_8bit_dest {
+                        "%al"
+                    } else {
+                        "%rax"
+                    };
                     self.state.emit_fmt(format_args!(
                         "    {} (%{}), {}",
                         load_instr, p_name, dest_reg
@@ -1038,8 +1042,8 @@ impl X86Codegen {
         {
             let load_instr = self.mov_load_for_value(ty, dest.0);
             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
-                    let use_16bit_dest = load_instr == "movw";
-                    let use_8bit_dest = load_instr == "movb";
+            let use_16bit_dest = load_instr == "movw";
+            let use_8bit_dest = load_instr == "movb";
             // W2 Load->Cast fold target takes precedence over dest's own home.
             let fold_reg = fold_target.map(|(r, _)| r);
             let d_reg_opt = fold_reg.or_else(|| self.reg_assignments.get(&dest.0).copied());
@@ -1060,7 +1064,15 @@ impl X86Codegen {
                     return;
                 }
             }
-            let dest_reg = if use_32bit_dest { "%eax" } else if use_16bit_dest { "%ax" } else if use_8bit_dest { "%al" } else { "%rax" };
+            let dest_reg = if use_32bit_dest {
+                "%eax"
+            } else if use_16bit_dest {
+                "%ax"
+            } else if use_8bit_dest {
+                "%al"
+            } else {
+                "%rax"
+            };
             self.state
                 .emit_fmt(format_args!("    {} (%rax), {}", load_instr, dest_reg));
             self.state.reg_cache.set_acc(dest.0, false);
@@ -1812,8 +1824,8 @@ impl X86Codegen {
                     if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
                         if !is_xmm_reg(d_reg) {
                             let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
-                    let use_16bit_dest = load_instr == "movw";
-                    let use_8bit_dest = load_instr == "movb";
+                            let use_16bit_dest = load_instr == "movw";
+                            let use_8bit_dest = load_instr == "movb";
                             let d_name = if use_32bit_dest {
                                 phys_reg_name_32(d_reg)
                             } else if use_16bit_dest || use_8bit_dest {
@@ -1955,8 +1967,8 @@ impl X86Codegen {
         if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
             if !is_xmm_reg(d_reg) {
                 let use_32bit_dest = matches!(load_instr, "movl" | "movzbl" | "movzwl");
-                    let use_16bit_dest = load_instr == "movw";
-                    let use_8bit_dest = load_instr == "movb";
+                let use_16bit_dest = load_instr == "movw";
+                let use_8bit_dest = load_instr == "movb";
                 let d_name = if use_32bit_dest {
                     phys_reg_name_32(d_reg)
                 } else if use_16bit_dest || use_8bit_dest {
@@ -2521,8 +2533,7 @@ impl X86Codegen {
                 return true;
             }
         }
-        self.state
-            .emit_fmt(format_args!("    leaq {}, %rax", mem));
+        self.state.emit_fmt(format_args!("    leaq {}, %rax", mem));
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
         true

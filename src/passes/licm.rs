@@ -62,7 +62,8 @@ pub(crate) fn licm_with_analysis(func: &mut IrFunction, cfg: &analysis::CfgAnaly
     sorted_loops.sort_by_key(|l| l.body.len());
 
     for natural_loop in &sorted_loops {
-        total_hoisted += hoist_loop_invariants(func, natural_loop, &cfg.preds, &cfg.idom, &alloca_info);
+        total_hoisted +=
+            hoist_loop_invariants(func, natural_loop, &cfg.preds, &cfg.idom, &alloca_info);
     }
 
     total_hoisted
@@ -145,7 +146,7 @@ fn analyze_allocas(func: &IrFunction) -> AllocaAnalysis {
                 // (as the stored data) means its address escapes.
                 Instruction::Store { val, ptr, .. } => {
                     let _ = ptr; // Storing to alloca is fine.
-                    // If the stored VALUE is an alloca pointer, it's address-taken.
+                                 // If the stored VALUE is an alloca pointer, it's address-taken.
                     if let Operand::Value(v) = val {
                         if alloca_values.contains(&v.0) {
                             address_taken.insert(v.0);

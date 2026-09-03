@@ -171,7 +171,13 @@ impl Parser {
         if derived.is_empty() {
             return None;
         }
-        if !matches!(derived.last(), Some(crate::frontend::parser::ast::DerivedDeclarator::Function(_, _))) {
+        if !matches!(
+            derived.last(),
+            Some(crate::frontend::parser::ast::DerivedDeclarator::Function(
+                _,
+                _
+            ))
+        ) {
             return None;
         }
         // The Function derivation must be the OUTERMOST one (last in the

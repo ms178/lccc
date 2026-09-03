@@ -11,9 +11,9 @@
 //! which is critical for build system compatibility.
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
-use crate::common::fp_contract::FpContract;
 use crate::backend::Target;
 use crate::common::error::ColorMode;
+use crate::common::fp_contract::FpContract;
 
 /// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
 ///
