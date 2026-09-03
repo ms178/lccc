@@ -33,9 +33,14 @@ int main(void) {
     const unsigned long long alo = 0x1234567890ABCDEFULL;
     const unsigned long long ahi = 0xDEADBEEFCAFEBABEULL;
 
-    /* const store (immediate halves) */
+    /* const store (immediate halves)
+     * c = ((u128)3 << 100) | 3: low half 3, high half 3 << (100-64) =
+     * 3 << 36 = 206158430208. The high-half expectation must be the
+     * literal C-semantics value (GCC-verified): an earlier revision wrote
+     * `1 << 4` here — the value of a DIFFERENT shift (1<<68) — so the
+     * self-check failed against a correct compiler. */
     unsigned __int128 c = ((unsigned __int128)3 << 100) | 3;
-    check("const", (unsigned long long)c, (unsigned long long)(c >> 64), 3, 1 << 4);
+    check("const", (unsigned long long)c, (unsigned long long)(c >> 64), 3, 206158430208ULL);
 
     /* zero store */
     unsigned __int128 z = 0;
