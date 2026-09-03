@@ -1124,3 +1124,305 @@ fn resolves_a_chain_of_dependent_conditionals() {
     ));
     assert_eq!(stats.unreachable_blocks, 2, "b2 and b5 are dead");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Red-team audit round 2: absorption, reflexive folds, invariant 5, asm defs
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// `BinOp` constructor with an explicit opcode (the `add` helper hardcodes one).
+fn binop(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
+    Instruction::BinOp {
+        dest: Value(dest),
+        op,
+        lhs,
+        rhs,
+        ty,
+    }
+}
+
+fn param(dest: u32, ty: IrType) -> Instruction {
+    Instruction::ParamRef {
+        dest: Value(dest),
+        param_idx: 0,
+        ty,
+    }
+}
+
+#[test]
+fn absorbing_and_with_zero_beats_an_overdefined_operand() {
+    // %0 is a parameter (⊥); `%1 = and %0, 0` is nevertheless exactly 0, so the
+    // return operand substitutes to a constant. GCC's CCP and LLVM's SCCP both
+    // fold this; without the rule the whole tail of the function stays live.
+    let (stats, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::I32),
+            binop(
+                1,
+                IrBinOp::And,
+                val(0),
+                Operand::Const(IrConst::I32(0)),
+                IrType::I32,
+            ),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert!(stats.total() > 0);
+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(0)));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Return(Some(Operand::Const(IrConst::I32(0))))
+    ));
+}
+
+#[test]
+fn absorbing_mul_zero_covers_the_i128_width() {
+    // 128-bit arithmetic is a first-class BinOp type in this IR; the zero rule
+    // must not silently apply only to 32/64-bit constants.
+    let (stats, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::I128),
+            binop(
+                1,
+                IrBinOp::Mul,
+                val(0),
+                Operand::Const(IrConst::I128(0)),
+                IrType::I128,
+            ),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert!(stats.total() > 0);
+    assert_eq!(materialised(&f, 1), Some(IrConst::I128(0)));
+}
+
+#[test]
+fn the_type_agnostic_zero_const_is_absorbed_for_integer_tys() {
+    // `IrConst::Zero` also appears as an integer BinOp operand; the oracle
+    // normalises it through the BinOp's type.
+    let (_, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::I32),
+            binop(
+                1,
+                IrBinOp::And,
+                val(0),
+                Operand::Const(IrConst::Zero),
+                IrType::I32,
+            ),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(0)));
+}
+
+#[test]
+fn float_mul_zero_is_never_absorbed() {
+    // `NaN * 0.0` is NaN and `-x * 0.0` is `-0.0`: the absorbing rule must not
+    // fire for float types, not even for a zero-looking operand.
+    let (stats, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::F64),
+            binop(
+                1,
+                IrBinOp::Mul,
+                val(0),
+                Operand::Const(IrConst::F64(0.0)),
+                IrType::F64,
+            ),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert_eq!(stats.total(), 0, "nothing may fold: the operand is opaque");
+    assert_eq!(materialised(&f, 1), None);
+}
+
+#[test]
+fn absorbing_or_with_all_ones_beats_an_overdefined_operand() {
+    // `x | -1 == -1` for any x: the mirror image of the zero rule for Or.
+    let (stats, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::I64),
+            binop(
+                1,
+                IrBinOp::Or,
+                val(0),
+                Operand::Const(IrConst::I64(-1)),
+                IrType::I64,
+            ),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert!(stats.total() > 0);
+    assert_eq!(materialised(&f, 1), Some(IrConst::I64(-1)));
+}
+
+#[test]
+fn same_value_xor_and_sub_are_zero() {
+    // Both operands are the *same* SSA value, so `x ^ x` and `x - x` are 0 in
+    // every integer width regardless of what x is.
+    let (_, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::I64),
+            binop(1, IrBinOp::Xor, val(0), val(0), IrType::I64),
+            binop(2, IrBinOp::Sub, val(0), val(0), IrType::I64),
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert_eq!(materialised(&f, 1), Some(IrConst::I64(0)));
+    assert_eq!(materialised(&f, 2), Some(IrConst::I64(0)));
+}
+
+#[test]
+fn reflexive_integer_comparison_folds_and_kills_the_dead_arm() {
+    // %1 = cmp eq %p, %p is exactly 1, so the branch folds to the true arm and
+    // the false arm becomes unreachable.
+    let (stats, f) = sccp(func_of(vec![
+        blk(
+            0,
+            vec![
+                param(0, IrType::I64),
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Eq,
+                    lhs: val(0),
+                    rhs: val(0),
+                    ty: IrType::I64,
+                },
+            ],
+            cond_br(val(1), 1, 2),
+        ),
+        blk(1, vec![], ret(Some(Operand::Const(IrConst::I32(10))))),
+        blk(2, vec![], ret(Some(Operand::Const(IrConst::I32(20))))),
+    ]));
+
+    assert_eq!(materialised(&f, 1), Some(IrConst::I32(1)));
+    assert_eq!(stats.branches_folded, 1);
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(1))
+    ));
+    assert_eq!(stats.unreachable_blocks, 1, "the false arm is dead");
+}
+
+#[test]
+fn reflexive_float_comparison_is_never_folded() {
+    // `x == x` is false exactly when x is NaN: for float types the same-value
+    // rule must not fire.
+    let (_, f) = sccp(func_of(vec![blk(
+        0,
+        vec![
+            param(0, IrType::F64),
+            Instruction::Cmp {
+                dest: Value(1),
+                op: IrCmpOp::Eq,
+                lhs: val(0),
+                rhs: val(0),
+                ty: IrType::F64,
+            },
+        ],
+        ret(Some(val(1))),
+    )]));
+
+    assert_eq!(materialised(&f, 1), None);
+}
+
+#[test]
+fn an_unresolved_top_condition_keeps_both_successors_executable() {
+    // Invariant 5, the shape that miscompiled before the safety net existed:
+    //
+    //   b0: cond_br %p -> b1, b3          %p is a parameter (⊥): both arms live
+    //   b1: %1 = phi [7 from b2]          only incoming edge is b2->b1, which
+    //       cond_br %1 -> b2, b3          never executes => %1 survives as ⊤
+    //   b2: br b1
+    //   b3: %2 = phi [%p from b0, 77 from b1] ; ret %2
+    //
+    // Without the forcing round, b1's terminator marks neither successor, so
+    // the b1->b3 edge is "dead" and b3's phi loses the `77` operand — while at
+    // runtime b1 still branches (to whichever arm), reaching b3 with no copy
+    // for the pruned edge. The safety net lowers %1 to ⊥ instead, both
+    // successors stay executable, and nothing is pruned.
+    let (_, f) = sccp(func_of(vec![
+        blk(0, vec![param(0, IrType::I64)], cond_br(val(0), 1, 3)),
+        blk(
+            1,
+            vec![phi(
+                1,
+                vec![(Operand::Const(IrConst::I64(7)), 2)],
+                IrType::I64,
+            )],
+            cond_br(val(1), 2, 3),
+        ),
+        blk(2, vec![], br(1)),
+        blk(
+            3,
+            vec![phi(
+                2,
+                vec![(val(0), 0), (Operand::Const(IrConst::I64(77)), 1)],
+                IrType::I64,
+            )],
+            ret(Some(val(2))),
+        ),
+    ]));
+
+    let incoming = phi_incoming(&f, 3);
+    assert_eq!(incoming.len(), 2, "both b3 phi operands must survive");
+    assert!(incoming
+        .iter()
+        .any(|(op, _)| matches!(op, Operand::Value(_))));
+    assert!(
+        incoming
+            .iter()
+            .any(|(op, _)| matches!(op, Operand::Const(IrConst::I64(77)))),
+        "the operand arriving over the recovered edge must survive"
+    );
+}
+
+#[test]
+fn inline_asm_outputs_are_overdefined_not_fabricated() {
+    // An `InlineAsm` output is a definition `dest()` does not cover. If it
+    // ever stayed ⊤, the phi below would absorb the ⊤ arm and fabricate the
+    // constant `5` as the value of an opaque asm result.
+    let asm = Instruction::InlineAsm {
+        template: "mov $1, %l0".to_string(),
+        outputs: vec![("=r".to_string(), Value(1), None)],
+        inputs: vec![],
+        clobbers: vec![],
+        operand_types: vec![IrType::I32],
+        goto_labels: vec![],
+        input_symbols: vec![],
+        seg_overrides: vec![],
+    };
+
+    let (_, f) = sccp(func_of(vec![
+        blk(
+            0,
+            vec![param(0, IrType::I32), i32c(10, 5)],
+            cond_br(val(0), 1, 2),
+        ),
+        blk(1, vec![asm], br(3)),
+        blk(2, vec![], br(3)),
+        blk(
+            3,
+            vec![phi(2, vec![(val(1), 1), (val(10), 2)], IrType::I32)],
+            ret(Some(val(2))),
+        ),
+    ]));
+
+    assert_eq!(
+        materialised(&f, 2),
+        None,
+        "an asm result must never be fabricated into a constant"
+    );
+}
