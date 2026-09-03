@@ -1,4 +1,5 @@
-use crate::backend::call_abi::{CallAbiConfig, CallArgClass};
+use crate::backend::call_abi::{CallAbiConfig, CallArgClass, ParamClass};
+use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
 use crate::common::fp_contract::FpContract;
 use crate::backend::cast::FloatOp;
 use crate::backend::common::PtrDirective;
@@ -3967,6 +3968,30 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
 /// lower_copy/lower_cast assume 64-bit GPR moves; touching such values
 /// there miscompiles (float bit-copies read stale slots, i128 copies drop
 /// the high half, vector slots get GPR-clobbered).
+/// Destination home resolved for a [`Instruction::ParamRef`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamDst {
+    /// Register-allocated GPR home (never rax/rcx/rbp/xmm — the
+    /// umbrella guard plus the explicit id check reject those).
+    Reg(PhysReg),
+    /// Stack-slot home (spill or dedicated value slot).
+    Slot(i64),
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamRefLoad {
+    /// `movzbl`/`movzwl` — zero-extending load (8/16-bit sources).
+    Zext(OpSize),
+    /// `movsbq`/`movswq`/`movslq` — sign-extending load.
+    Sext(OpSize),
+    /// `movl` — raw 32-bit move (implicit zero-extend into the reg).
+    Raw32,
+    /// `movq` — raw 64-bit move.
+    Raw64,
+}
+
+
 fn is_mi_unsafe_value(
     v: u32,
     reg_assignments: &FxHashMap<u32, PhysReg>,
@@ -4506,6 +4531,292 @@ impl X86Codegen {
         true
     }
 
+    // ── Typed ParamRef materialization ───────────────────────────────
+    //
+    // The census's `ParamRef(needs-code)` class: parameters whose body-side
+    // materialization the text path performs at the price of flushing the
+    // buffered MachInst run around them. Three of the four
+    // `emit_param_ref_impl` cases are single moves, which MachInst expresses
+    // exactly — the admission below mirrors the text path instruction for
+    // instruction, so the final machine state (destination register or slot
+    // contents) is byte-identical in every admitted shape while the run
+    // stays unsplit.
+
+    /// The single-instruction load form that materializes a value of type
+    /// `load_ty` into a 64-bit GPR with a final register state byte-identical
+    /// to the text path's `mov_load_for_type(load_ty)` + `store_rax_to` pair.
+    ///
+    /// The text path loads into %rax at the mnemonic's width and then
+    /// `movq`s the FULL 64-bit register into the destination (see
+    /// `store_rax_to`: "movl zero-extends the upper 32 bits, which corrupts
+    /// negative I32 values"), so the admitted forms must reproduce the same
+    /// 64-bit destination state in one instruction:
+    ///   * signed narrow loads sign-extend all the way (`movsbq/movswq/movslq`);
+    ///   * unsigned 8/16-bit loads zero-extend (`movzbl/movzwl` — the
+    ///     MachInst emitter renders them with a 32-bit dest name, which
+    ///     zero-extends into the full register implicitly);
+    ///   * U32 loads are plain `movl` (zero-extends into the full register);
+    ///   * 64-bit loads are plain `movq`.
+    /// `None` = no admitted form (float/decimal/F128/wide — those stay on
+    /// the text path, which owns the SSE and x87 domains).
+    fn paramref_reg_load_form(load_ty: IrType) -> Option<ParamRefLoad> {
+        Some(match load_ty {
+            IrType::U8 => ParamRefLoad::Zext(OpSize::S8),
+            IrType::U16 => ParamRefLoad::Zext(OpSize::S16),
+            IrType::I8 => ParamRefLoad::Sext(OpSize::S8),
+            IrType::I16 => ParamRefLoad::Sext(OpSize::S16),
+            IrType::I32 => ParamRefLoad::Sext(OpSize::S32),
+            IrType::U32 => ParamRefLoad::Raw32,
+            IrType::I64 | IrType::U64 | IrType::Ptr => ParamRefLoad::Raw64,
+            _ => return None,
+        })
+    }
+
+    /// Push the extending/plain load `mov {src} → {MachReg}` for a form.
+    fn push_paramref_reg_load(
+        &mut self,
+        form: ParamRefLoad,
+        src: MachOperand,
+        dst: MachReg,
+    ) {
+        let inst = match form {
+            ParamRefLoad::Zext(from) => MachInst::Movzx {
+                src,
+                dst,
+                from_size: from,
+                to_size: OpSize::S64,
+            },
+            ParamRefLoad::Sext(from) => MachInst::Movsx {
+                src,
+                dst,
+                from_size: from,
+                to_size: OpSize::S64,
+            },
+            ParamRefLoad::Raw32 => MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(dst),
+                size: OpSize::S32,
+            },
+            ParamRefLoad::Raw64 => MachInst::Mov {
+                src,
+                dst: MachOperand::Reg(dst),
+                size: OpSize::S64,
+            },
+        };
+        self.machinst_buf.push(inst);
+    }
+
+    /// Admit a slot-homed destination for a slot-sourced load: ONLY the
+    /// shapes whose stored bytes are byte-identical to the text path's
+    /// relay (`mov_load_for_type` into %rax, then `store_rax_to`).
+    ///
+    /// The emitter lowers a Mov with two memory operands as an %rax relay at
+    /// the instruction's width, so the admitted widths are exactly the ones
+    /// where the text relay's width equals the MachInst relay's width:
+    ///   * 64-bit types into an 8-byte slot: `movq`/`movq` both ways;
+    ///   * I32/U32 into a 4-byte (small) slot: the text path stores the low
+    ///     4 bytes either way (`movl %eax, slot` after movslq/movl staging)
+    ///     — the relay's raw 4-byte copy writes the identical bytes.
+    /// Everything else (narrow types whose relay would store fewer bytes
+    /// than the text path's full-width store, I32 into an 8-byte slot whose
+    /// sign extension the text path materializes) stays on the text path.
+    fn paramref_slot_relay_ok(load_ty: IrType, small_dest: bool) -> Option<OpSize> {
+        match load_ty {
+            IrType::I64 | IrType::U64 | IrType::Ptr if !small_dest => Some(OpSize::S64),
+            IrType::I32 | IrType::U32 if small_dest => Some(OpSize::S32),
+            _ => None,
+        }
+    }
+
+    /// Lower one ParamRef materialization into the MachInst buffer.
+    ///
+    /// `Ok(())` = lowered (possibly zero instructions: dead destination,
+    /// pre-stored parameter, already-in-place register, or a class the text
+    /// path emits nothing for). `Err(label)` = reject; the label feeds the
+    /// census so the residual classes stay individually counted.
+    ///
+    /// Admission mirrors `emit_param_ref_impl` (prologue.rs) case for case:
+    /// pre-stored parameters win over the alloca slot; the alloca slot wins
+    /// over the ABI class; the pinned `# LCCC_PARAM_ABI_READ` marker
+    /// accompanies every incoming-register read (the text peephole's
+    /// `pin_param_abi_reads` runs on the final text, where MachInst output
+    /// is already flushed, so the marker reaches it unchanged).
+    fn try_lower_paramref_typed(
+        &mut self,
+        dest: &Value,
+        param_idx: usize,
+        ty: IrType,
+    ) -> Result<(), &'static str> {
+        use super::machinst::{MachOperand, MachReg, SYSCALL_ARG_REGS};
+
+        // A dead destination gets no code on the text path either
+        // (`store_rax_to` early-outs on zero use counts); lowering it as a
+        // no-op keeps the run unsplit at zero cost.
+        if self
+            .state
+            .value_use_counts
+            .get(dest.0 as usize)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return Ok(());
+        }
+        // Pre-stored parameters are already in their destination register;
+        // `emit_store_params` placed them during the prologue. This takes
+        // priority over the alloca slot exactly as on the text path.
+        if self.state.param_pre_stored.contains(&param_idx) {
+            return Ok(());
+        }
+        // Umbrella home-safety guard — the same one the typed calls use:
+        // accumulator/i128/vector/xmm-homed destinations and float/decimal/
+        // F128/wide destination types keep the mature path.
+        if is_mi_unsafe_value(dest.0, &self.reg_assignments, &self.state, &self.value_types) {
+            return Err("ParamRef(unsafe-home)");
+        }
+        // Resolve the destination home.
+        let dst = if let Some(&r) = self.reg_assignments.get(&dest.0) {
+            if r.0 >= 20 || r.0 == 0 || r.0 == 6 || r.0 == 7 {
+                return Err("ParamRef(unsafe-home)"); // xmm / rax / rbp / rcx
+            }
+            ParamDst::Reg(r)
+        } else if let Some(slot) = self.state.get_slot(dest.0) {
+            ParamDst::Slot(slot.0)
+        } else {
+            return Err("ParamRef(unsafe-home)"); // no home: text path owns
+        };
+        let small_dest = self.state.is_small_slot(dest.0);
+
+        // Case 1 (text path's first materializing case): the parameter's
+        // alloca slot holds the staged value — one load.
+        if param_idx < self.state.param_alloca_slots.len() {
+            if let Some((slot, alloca_ty)) = self.state.param_alloca_slots[param_idx] {
+                return match dst {
+                    ParamDst::Reg(r) => {
+                        let form = Self::paramref_reg_load_form(alloca_ty)
+                            .ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(
+                            form,
+                            MachOperand::StackSlot(slot.0),
+                            MachReg::Phys(r),
+                        );
+                        Ok(())
+                    }
+                    ParamDst::Slot(dslot) => {
+                        let size = Self::paramref_slot_relay_ok(alloca_ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::StackSlot(slot.0),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                        Ok(())
+                    }
+                };
+            }
+        }
+        if param_idx >= self.state.param_classes.len() {
+            // Unreachable through the gate (which no-codes out-of-bounds
+            // indices first), but the match below indexes the vector.
+            return Err("ParamRef(unsafe-home)");
+        }
+        let class = self.state.param_classes[param_idx];
+        match class {
+            // Case 2: the parameter arrived in an ABI register and must be
+            // copied to its (different) home. Every emitted read carries the
+            // pinned-ABI-read marker; the pin pass on the final text pins
+            // the very next instruction line, which is exactly the move
+            // pushed here (single-line forms only: reg→reg and reg→slot
+            // render as one line each).
+            ParamClass::IntReg { reg_idx } => {
+                if reg_idx >= SYSCALL_ARG_REGS.len() {
+                    return Err("ParamRef(unsafe-home)");
+                }
+                let abi = SYSCALL_ARG_REGS[reg_idx];
+                if let ParamDst::Reg(r) = dst {
+                    if r == abi {
+                        // The destination IS the incoming register: the
+                        // value is already in place. Only a 64-bit type is
+                        // truly in place — a narrower type needs the
+                        // extending move, and the emitter's size-blind
+                        // self-move elision would drop it, so those stay on
+                        // the text path (whose round trip materializes the
+                        // extension).
+                        if OpSize::from_ir_type(ty) == OpSize::S64 {
+                            return Ok(());
+                        }
+                        return Err("ParamRef(narrow-self)");
+                    }
+                }
+                // The marker names the sized incoming register, spelled
+                // exactly as the text path spells it (`reg_for_type`).
+                let src_name = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
+                self.machinst_buf.push(MachInst::Raw(format!(
+                    "    # LCCC_PARAM_ABI_READ {}",
+                    src_name
+                )));
+                match dst {
+                    ParamDst::Reg(r) => {
+                        let form = Self::paramref_reg_load_form(ty)
+                            .ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(form, MachOperand::Reg(MachReg::Phys(abi)), MachReg::Phys(r));
+                    }
+                    ParamDst::Slot(dslot) => {
+                        // reg→slot is a single encodable store; admit the
+                        // same byte-identical widths as the relay case.
+                        let size = Self::paramref_slot_relay_ok(ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::Reg(MachReg::Phys(abi)),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                    }
+                }
+                Ok(())
+            }
+            // Case 3: stack-passed scalar. The incoming-argument area is
+            // addressed through the same slot-offset formula the text path
+            // uses (`slot_ref(stack_base + offset)`), and the MachOperand::
+            // StackSlot formatter applies the identical rbp/rsp-mode rule —
+            // the rendered operand is byte-identical.
+            ParamClass::StackScalar { offset } => {
+                let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
+                let src_off = stack_base + offset;
+                match dst {
+                    ParamDst::Reg(r) => {
+                        let form = Self::paramref_reg_load_form(ty)
+                            .ok_or("ParamRef(float-domain)")?;
+                        self.push_paramref_reg_load(
+                            form,
+                            MachOperand::StackSlot(src_off),
+                            MachReg::Phys(r),
+                        );
+                        Ok(())
+                    }
+                    ParamDst::Slot(dslot) => {
+                        let size = Self::paramref_slot_relay_ok(ty, small_dest)
+                            .ok_or("ParamRef(slot-width)")?;
+                        self.machinst_buf.push(MachInst::Mov {
+                            src: MachOperand::StackSlot(src_off),
+                            dst: MachOperand::StackSlot(dslot),
+                            size,
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            // GPR↔XMM relays stay on the text path by design (the MachInst
+            // float layer is xmm-domain only).
+            ParamClass::FloatReg { .. } => Err("ParamRef(float-domain)"),
+            // i128 pairs, by-value structs, F128, stack structs, …: the
+            // text path's default arm emits NOTHING for these (their
+            // prologue staging is the whole story), so a no-op lowering is
+            // semantically identical — and keeps the run unsplit.
+            _ => Ok(()),
+        }
+    }
+
 }
 
 impl ArchCodegen for X86Codegen {
@@ -4624,14 +4935,18 @@ impl ArchCodegen for X86Codegen {
         {
             return false;
         }
-        // ParamRef: lower ONLY the subset that provably emits no code.
+        // ParamRef: lower the no-code subset AND the single-move
+        // materializations through MachInst.
         //
         // A ParamRef is not a no-op in general -- `emit_param_ref_impl` has
         // four cases: pre-stored (nothing to do), a parameter homed in an
         // alloca slot (a load), an incoming ABI register that must be copied
         // to a different home, and a stack-passed argument loaded from
         // `16(%rbp)`/`8(%rsp)`. A previous attempt returned `true` for all of
-        // them and broke four corpus tests, every one parameter-related.
+        // them and broke four corpus tests, every one parameter-related --
+        // those cases genuinely materialize, so the typed path below lowers
+        // them as moves (mirroring the text path instruction for
+        // instruction) instead of no-opping them.
         //
         // The pre-stored subset is different in kind: `emit_store_params`
         // already placed the value in the destination's register during the
@@ -4641,10 +4956,12 @@ impl ArchCodegen for X86Codegen {
         // instructions used to split them onto separate paths. Parameters are
         // 10.8% of all instructions in the corpus.
         //
-        // The remaining cases keep the text path, where the ABI contract
-        // (including the pinned "read the *incoming* register even if another
-        // pre-store aliased that name" rule) is already implemented.
-        if let crate::ir::reexports::Instruction::ParamRef { param_idx, .. } = inst {
+        // Whatever the typed path refuses keeps the text path, where the ABI
+        // contract (including the pinned "read the *incoming* register even
+        // if another pre-store aliased that name" rule) is already
+        // implemented; the typed path emits that same marker for its own
+        // incoming-register reads.
+        if let crate::ir::reexports::Instruction::ParamRef { dest, param_idx, ty } = inst {
             let no_code = *param_idx >= self.state.param_classes.len()
                 || (self.state.param_pre_stored.contains(param_idx)
                     && self
@@ -4658,8 +4975,16 @@ impl ArchCodegen for X86Codegen {
                 super::isel::stats::note_lowered();
                 return true;
             }
-            super::isel::stats::note_reject_named("ParamRef(needs-code)");
-            return false;
+            match self.try_lower_paramref_typed(dest, *param_idx, *ty) {
+                Ok(()) => {
+                    super::isel::stats::note_lowered();
+                    return true;
+                }
+                Err(label) => {
+                    super::isel::stats::note_reject_named(label);
+                    return false;
+                }
+            }
         }
 
         // Typed calls (CallTyped): the SysV integer-register subset — direct
