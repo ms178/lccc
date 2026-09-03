@@ -477,7 +477,24 @@ impl Lowerer {
                                 IrType::U32 => ival as u32 as i64,
                                 _ => ival, // I64/U64 already full-width
                             };
-                            self.insert_const_local_scoped(declarator.name.clone(), coerced);
+                            // A 128-bit initializer cannot, in general, live in the
+                            // i64 const-local cache: the cache is read back as
+                            // `IrConst::I64(cached)` and widened by the consumer's own
+                            // context, so anything but an exact round trip folds every
+                            // read of the variable to ONE HALF of the value
+                            // (`const unsigned __int128 c = (u128)3<<100 | 3` cached
+                            // low=3; a later `c >> 64` folded to
+                            // 3i64.wrapping_shr(64 & 63 = 0) = 3 — the high half read
+                            // the LOW value and the shift masked away). Cache only
+                            // values that survive both widenings bit-exactly:
+                            // non-negative and equal to the full 128-bit constant.
+                            // Everything else stays uncached and reads take the
+                            // (correct) alloca path — a missed fold, never a wrong one.
+                            let cacheable = !matches!(da.var_ty, IrType::I128 | IrType::U128)
+                                || (ival >= 0 && const_val.to_i128() == Some(ival as i128));
+                            if cacheable {
+                                self.insert_const_local_scoped(declarator.name.clone(), coerced);
+                            }
                         }
                     }
                 }
