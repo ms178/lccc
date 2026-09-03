@@ -1180,6 +1180,7 @@ fn reduction_pattern_is_sound(
     accumulator_phis: &[Value],
     accumulator_derived: &FxHashSet<Value>,
     allowed_loads: &[Value],
+    iv_phi: Value,
 ) -> bool {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let is_add = |block_idx: usize, inst_idx: usize, dest: Value| {
@@ -1188,6 +1189,11 @@ fn reduction_pattern_is_sound(
                 .iter()
                 .any(|&(add_idx, add_result)| add_idx == inst_idx && add_result == dest)
     };
+    // Labels of every loop block, to detect a phi's back-edge incoming.
+    let loop_block_labels: FxHashSet<u32> = loop_blocks
+        .iter()
+        .map(|&bi| func.blocks[bi].label.0)
+        .collect();
 
     // (4) terminators: only the header may branch (its exit condition);
     //     every other loop block must end in an unconditional branch.
@@ -1209,13 +1215,38 @@ fn reduction_pattern_is_sound(
         let block = &func.blocks[block_idx];
         for (inst_idx, inst) in block.instructions.iter().enumerate() {
             match inst {
-                Instruction::Phi { dest, .. } => {
-                    // The header's own IV phi (and any other non-accumulator
-                    // phi) is fine; only phis writing an accumulator-derived
-                    // value are forbidden (the vector transform rewires the
-                    // accumulator phi to a vector value).  With multiple
-                    // accumulators, each accumulator's own header phi is
-                    // allowed; any other accumulator-derived phi is not.
+                Instruction::Phi { dest, incoming, .. } => {
+                    // The transform rewires ONLY the IV phi and the recognized
+                    // accumulator phis. Any OTHER loop-carried phi (a value
+                    // whose back-edge incoming is a non-constant Value from a
+                    // loop block) changes once per scalar iteration but is left
+                    // untouched, so after vectorization it would be updated
+                    // with the scaled induction variable and be silently wrong
+                    // (reproducer: `s += a[i]; last = a[i];` — `last` ended up
+                    // reading A[0], A[8], ... instead of A[i]). Reject the
+                    // whole loop (fail-closed; the scalar form is correct).
+                    let is_iv_or_accum = *dest == iv_phi
+                        || accumulator_phis.iter().any(|phi| *phi == *dest);
+                    if !is_iv_or_accum {
+                        let loop_carried = incoming.iter().any(|(op, lbl)| {
+                            loop_block_labels.contains(&lbl.0) && matches!(op, Operand::Value(_))
+                        });
+                        if loop_carried {
+                            if debug {
+                                eprintln!(
+                                    "[VEC-RED]   Rejecting: unhandled loop-carried phi {} in block {}",
+                                    dest.0, block_idx
+                                );
+                            }
+                            set_reject("loop has an unhandled loop-carried value");
+                            return false;
+                        }
+                    }
+                    // Phis writing an accumulator-derived value are forbidden
+                    // (the vector transform rewires the accumulator phi to a
+                    // vector value).  With multiple accumulators, each
+                    // accumulator's own header phi is allowed; any other
+                    // accumulator-derived phi is not.
                     if accumulator_derived.contains(dest)
                         && (block_idx != header_idx
                             || !accumulator_phis.iter().any(|phi| *phi == *dest))
@@ -1780,9 +1811,16 @@ fn analyze_reduction_pattern(
     let mut add_result = None;
     // Conditional-sum guard (if_convert output): the Select wrapping the
     // accumulator update. `s' = Select(cond, s + x, s)` — the guard Cmp's
-    // value id; validated after the added-value chain resolves.
+    // value id; validated after the added-value chain resolves.  The
+    // operator may ALSO be written the other way round,
+    // `s' = Select(cond, s, s + x)` (the `if (a[i] & 1) continue; s +=
+    // a[i];` shape, where the kept value is on the TRUE arm).  Both denote
+    // a guarded update; only the add-on-TRUE arm is expressible by the
+    // masked widening intrinsic, so a swapped guard is recorded and later
+    // rejected.
     let mut guard_select_cond: Option<Value> = None;
     let mut guard_rhs: Option<Operand> = None;
+    let mut guard_swapped = false;
     for &block_idx in &loop_info.body {
         if block_idx == header_idx {
             continue;
@@ -1857,9 +1895,31 @@ fn analyze_reduction_pattern(
                                 false_val,
                                 Operand::Value(v) if v.0 == accumulator_phi.0
                             );
+                            // Swapped form: `Select(cond, s, s + x)` (the
+                            // `if (a[i] & 1) continue; s += a[i]` shape). The
+                            // kept value is the phi, the guarded add is on the
+                            // FALSE arm. Still a guarded update; record the
+                            // cond and mark it swapped so the validator
+                            // rejects the unexpressible form instead of
+                            // silently dropping the guard.
+                            let fv_is_add = matches!(
+                                false_val,
+                                Operand::Value(v) if v.0 == dest.0
+                            );
+                            let tv_is_phi = matches!(
+                                true_val,
+                                Operand::Value(v) if v.0 == accumulator_phi.0
+                            );
                             if tv_is_add && fv_is_phi {
                                 if let Operand::Value(cv) = cond {
                                     guard_select_cond = Some(*cv);
+                                }
+                                break;
+                            }
+                            if fv_is_add && tv_is_phi {
+                                if let Operand::Value(cv) = cond {
+                                    guard_select_cond = Some(*cv);
+                                    guard_swapped = true;
                                 }
                                 break;
                             }
@@ -2137,6 +2197,21 @@ fn analyze_reduction_pattern(
     // scalar — the unguarded vector form would silently drop the guard.
     let mut select_guard_cond: Option<Value> = None;
     if let Some(gcv) = guard_select_cond {
+        // Swapped form (`Select(cond, s, s + x)`): the kept value is on the
+        // TRUE arm, so the guarded add is conditional on the NOT-taken path.
+        // The masked widening intrinsic only encodes add-when-cond-true, so
+        // this shape must stay scalar. Reject before the loader-root check
+        // (which would otherwise reject it anyway, but with a misleading
+        // message about `loaded > rhs`).
+        if guard_swapped {
+            if debug {
+                eprintln!(
+                    "[VEC-RED]   Rejecting: conditional-sum guard has the add on the FALSE arm (staying scalar)"
+                );
+            }
+            set_reject("conditional-sum guard has the add on the false arm (not expressible)");
+            return None;
+        }
         // Resolve the chain root: the loaded I32 element.
         let chain_root = match added_inst {
             Instruction::Load { dest, .. } => Some(*dest),
@@ -2556,6 +2631,7 @@ fn analyze_reduction_pattern(
             &phis,
             &derived,
             &loads,
+            iv,
         ) {
             if debug {
                 eprintln!("[VEC-RED]   Rejecting unsound reduction");

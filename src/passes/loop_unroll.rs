@@ -139,6 +139,16 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
                 did = true;
                 break;
             }
+            // The linear flattener needs trip ≥ 2; a single-trip tiny loop
+            // (the last row of a triangular nest once the outer loop is
+            // straightened, or `for (i = n-1; i < n; i++)` after inlining)
+            // is deleted by the general cloner instead of surviving as a
+            // rolled loop with a compare, two phis and a back-edge.
+            if try_complete_unroll_general(func, lp, &cfg, 1..=1) {
+                count += 1;
+                did = true;
+                break;
+            }
         }
         if !did {
             // General shape: prefer SMALL bodies (innermost-first), but any
@@ -156,7 +166,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
                     .sum::<usize>()
             });
             for lp in &general {
-                if try_complete_unroll_general(func, lp, &cfg) {
+                if try_complete_unroll_general(func, lp, &cfg, 1..=16) {
                     count += 1;
                     did = true;
                     break;
@@ -502,8 +512,12 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   header's CondBranch; every body block's successors stay inside
 ///   body ∪ {header}; body terminators are Branch/CondBranch/Switch only.
 /// - constant IV init (after const-chain resolution) and constant limit,
-///   trip in 2..=16, and (header non-phi + body) instructions × trip within
-///   the expansion budget.
+///   trip inside `trip_range` (callers pass `1..=16`; a trip of exactly 1
+///   deletes the loop — header phis become copies of their init values, the
+///   latch falls through to the exit — with zero code growth, which is what
+///   the last row of a triangular nest `for (j = i+1; j < n; …)` becomes
+///   after the outer loop is straightened), and (header non-phi + body)
+///   instructions × trip within the expansion budget.
 /// - no calls / inline asm / dynamic allocas in body or header; intrinsics
 ///   only when pure (sqrt/FMA-class loop bodies stay eligible — the nbody
 ///   `advance`/`energy` shapes).
@@ -527,59 +541,189 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   uses of carried phis with the last clone's corresponding value; the exit
 ///   block's phi edges from the header label are relabeled to the last
 ///   clone's latch (the block that now branches to the exit).
-/// Exact static trip count for a constant-stride IV loop, or `None` when the
-/// stride is degenerate (0) or its sign contradicts the exit comparison
-/// (e.g. a negative step against `i < limit`), which would mean the loop
-/// never terminates or never runs past the guard.
+/// Fixed-width integer types whose constants the unroller can reason about
+/// exactly.  `Ptr`, the 128-bit types and non-integers are excluded: their
+/// canonical `IrConst` representation is target- or width-dependent and the
+/// closed-form trip arithmetic below would silently lose bits.
+fn is_fixed_width_int(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+    )
+}
+
+/// Bring an i64 into the canonical `IrConst::to_i64()` representation of a
+/// value of type `ty` — sign-extended for signed types, zero-extended for
+/// unsigned ones.  This is exactly the convention the frontend and constant
+/// folder use (`IrConst::from_i64(v, ty).to_i64()`), so every value the
+/// unroller derives by folding is bit-for-bit what the rest of the pipeline
+/// would have produced.  Any other narrowing (e.g. `x as i32 as i64` for a
+/// U32) turns `0xFFFFFFF9` into `-7`, and a trip count computed from `-7`
+/// unrolls a loop that never executes.
+fn normalize_to_type(v: i64, ty: IrType) -> Option<i64> {
+    if !is_fixed_width_int(ty) {
+        return None;
+    }
+    IrConst::from_i64(v, ty).to_i64()
+}
+
+/// Ordering comparisons that read their operands as unsigned.
+fn cmp_is_unsigned(op: IrCmpOp) -> bool {
+    matches!(op, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge)
+}
+
+/// `a OP b`  ⇔  `b MIRROR(OP) a`.
+fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Slt,
+        IrCmpOp::Sle => IrCmpOp::Sge,
+        IrCmpOp::Sge => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ult,
+        IrCmpOp::Ule => IrCmpOp::Uge,
+        IrCmpOp::Uge => IrCmpOp::Ule,
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+    }
+}
+
+/// `!(a OP b)`  ⇔  `a NEGATE(OP) b`  (total order on integers).
+fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt => IrCmpOp::Sge,
+        IrCmpOp::Sge => IrCmpOp::Slt,
+        IrCmpOp::Sle => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Uge,
+        IrCmpOp::Uge => IrCmpOp::Ult,
+        IrCmpOp::Ule => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ule,
+        IrCmpOp::Eq => IrCmpOp::Ne,
+        IrCmpOp::Ne => IrCmpOp::Eq,
+    }
+}
+
+/// Rewrite the header's exit compare into the canonical "continue while
+/// `iv OP limit`" form that the trip-count arithmetic assumes.
 ///
-/// Complete unrolling needs the EXACT count up front — there is no cleanup
-/// loop — so every arm is closed-form:
-///   * `i <  limit`, step > 0: ceil((limit - init) / step)
-///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
-///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
-///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
-/// The ceil forms are exact for non-divisible spans because the exit test
-/// runs every stride; the floor+1 forms count the last in-range iteration.
-/// Non-positive spans (loop body never executes) yield `None`, matching the
-/// pre-existing step-1 guards. For step == 1 this reduces to the historical
-/// arithmetic verbatim.
-fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
+/// [`find_exit_condition`] reports the compare exactly as written: the IV may
+/// be the RIGHT operand (`limit > i`) and the CondBranch may send `true` to
+/// the EXIT (`for (;;) { if (i >= n) break; … }` or `!(i >= n)` guards).
+/// Feeding the raw operator into the closed form in either case computes the
+/// trip count of a different loop.  Both call sites of
+/// [`complete_unroll_trip`] go through this normalisation.
+fn canonical_continue_cmp(op: IrCmpOp, iv_is_lhs: bool, exit_cond_positive: bool) -> IrCmpOp {
+    let op = if iv_is_lhs { op } else { mirror_cmp(op) };
+    if exit_cond_positive {
+        negate_cmp(op)
+    } else {
+        op
+    }
+}
+
+/// Exact static trip count of a constant-stride counted loop
+/// `for (iv = init; iv OP limit; iv += step)` whose IV has type `iv_ty`, or
+/// `None` whenever the count cannot be established EXACTLY.  Complete
+/// unrolling has no cleanup loop, so an off-by-anything here is a miscompile,
+/// and every arm is closed-form and checked:
+///
+///   * `iv <  limit`, step > 0: ceil((limit - init) / step)
+///   * `iv <= limit`, step > 0: floor((limit - init) / step) + 1
+///   * `iv >  limit`, step < 0: ceil((init - limit) / -step)
+///   * `iv >= limit`, step < 0: floor((init - limit) / -step) + 1
+///   * `iv != limit`          : (limit - init) / step when step divides the
+///                              span exactly and the walk moves TOWARDS the
+///                              limit; anything else wraps around the type
+///                              first and is refused.
+///
+/// The arithmetic is done in i128 in the comparison's own value domain:
+/// `init` and `limit` are first normalised to `iv_ty`'s canonical constant
+/// representation and then read as unsigned (for `Ult`/`Ule`/`Ugt`/`Uge`) or
+/// signed values.  A U64 constant such as `0xFFFF_FFFF_FFFF_FFF9` is stored as
+/// a negative i64 by `IrConst`; read as signed it is "less than 4" and a
+/// signed-only closed form unrolls ten iterations of a loop that never runs.
+///
+/// Finally every IV value the unrolled iterations will observe —
+/// `init + k*step` for `k = 0..=trip`, including the value the last exit test
+/// sees — must be representable in `iv_ty` without wrapping.  Narrow IVs
+/// with strides > 1 (`unsigned char i = 250; i < 255; i += 3`) wrap past the
+/// limit and keep looping; the closed form would report 2 trips for a loop
+/// that executes 87.  A wrap is refused, not modelled: such loops are never
+/// worth unrolling.
+///
+/// Mismatched signedness between the operator and the IV type is refused
+/// outright (the frontend never emits it; anything that does is not a shape
+/// this pass has evidence for).
+fn complete_unroll_trip(
+    iv_init: i64,
+    limit: i64,
+    cmp_op: IrCmpOp,
+    iv_step: i64,
+    iv_ty: IrType,
+) -> Option<i64> {
     if iv_step == 0 {
         return None; // non-advancing IV: infinite or empty; not a trip count
     }
-    // All intermediates use checked arithmetic.  `limit - iv_init` wraps for
-    // extreme constant pairs (e.g. limit = i64::MAX, iv_init = -1) and
-    // `-iv_step` wraps for iv_step = i64::MIN; a wrapped span would yield a
-    // nonsensical trip count, so bail and leave the loop rolled.
-    let ascending = iv_step > 0;
-    let step_abs = iv_step.checked_abs()?;
-    let trip = match cmp_op {
+    let init = normalize_to_type(iv_init, iv_ty)?;
+    let limit = normalize_to_type(limit, iv_ty)?;
+
+    // Value domain of the comparison.
+    let unsigned = match cmp_op {
+        IrCmpOp::Eq | IrCmpOp::Ne => iv_ty.is_unsigned(),
+        op => {
+            let u = cmp_is_unsigned(op);
+            if u != iv_ty.is_unsigned() {
+                return None;
+            }
+            u
+        }
+    };
+    let to_domain = |v: i64| -> i128 {
+        if unsigned {
+            (v as u64) as i128
+        } else {
+            v as i128
+        }
+    };
+    let (init_d, limit_d) = (to_domain(init), to_domain(limit));
+    let step = iv_step as i128;
+    let ascending = step > 0;
+    let step_abs = step.abs();
+
+    let trip: i128 = match cmp_op {
         IrCmpOp::Slt | IrCmpOp::Ult => {
             if !ascending {
                 return None;
             }
-            let span = limit.checked_sub(iv_init)?;
+            let span = limit_d - init_d;
             if span <= 0 {
                 return None;
             }
-            // ceil(span / step), overflow-free for span >= 1
-            (span - 1) / step_abs + 1
+            (span - 1) / step_abs + 1 // ceil(span / step)
         }
         IrCmpOp::Sle | IrCmpOp::Ule => {
             if !ascending {
                 return None;
             }
-            let span = limit.checked_sub(iv_init)?;
+            let span = limit_d - init_d;
             if span < 0 {
                 return None;
             }
-            (span / step_abs).checked_add(1)?
+            span / step_abs + 1
         }
         IrCmpOp::Sgt | IrCmpOp::Ugt => {
             if ascending {
                 return None;
             }
-            let span = iv_init.checked_sub(limit)?;
+            let span = init_d - limit_d;
             if span <= 0 {
                 return None;
             }
@@ -589,21 +733,396 @@ fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64)
             if ascending {
                 return None;
             }
-            let span = iv_init.checked_sub(limit)?;
+            let span = init_d - limit_d;
             if span < 0 {
                 return None;
             }
-            (span / step_abs).checked_add(1)?
+            span / step_abs + 1
         }
-        _ => return None,
+        IrCmpOp::Ne => {
+            let span = limit_d - init_d;
+            if span == 0 || (span > 0) != ascending || span % step != 0 {
+                return None;
+            }
+            span / step
+        }
+        IrCmpOp::Eq => return None,
     };
-    Some(trip)
+
+    // Every observed IV value — including the one the final exit test sees —
+    // must stay inside `iv_ty` in this domain.
+    let bits = (iv_ty.size() * 8) as u32;
+    let (lo, hi): (i128, i128) = if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    };
+    let final_iv = init_d + trip * step;
+    if final_iv < lo || final_iv > hi {
+        return None;
+    }
+    i64::try_from(trip).ok()
+}
+
+/// True when `op` denotes a value that depends only on integer constants and
+/// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
+/// per-clone constant, so once such an operand is used in an inner loop's own
+/// IV/bound, that inner loop becomes constant-trip after the outer unroll.
+/// Intended for the persisting-inner-loop gate; a dependency on anything else
+/// (a function parameter, a memory load, a non-IV-dependent phi) means the
+/// inner loop's trip stays dynamic.
+fn depends_only_on_const_and_iv(func: &IrFunction, op: &Operand, iv: Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    // `Operand` is closed over {Const, Value}; both handled above.  The
+    // `Value` arm falls through to a def-chain walk; a def that is a memory /
+    // opaque instruction returns false (never constant after substitution).
+    let value = match op {
+        Operand::Const(_) => return true,
+        Operand::Value(v) => v,
+    };
+    if value.0 == iv.0 {
+        return true;
+    }
+    let mut def: Option<&Instruction> = None;
+    for block in &func.blocks {
+        if let Some(inst) = block.instructions.iter().find(|i| i.dest() == Some(*value)) {
+            def = Some(inst);
+            break;
+        }
+    }
+    let Some(inst) = def else { return false };
+    match inst {
+        Instruction::Copy { src, .. } | Instruction::Cast { src, .. } => {
+            depends_only_on_const_and_iv(func, src, iv, depth + 1)
+        }
+        Instruction::BinOp { lhs, rhs, .. } => {
+            depends_only_on_const_and_iv(func, lhs, iv, depth + 1)
+                && depends_only_on_const_and_iv(func, rhs, iv, depth + 1)
+        }
+        Instruction::Phi { incoming, .. } => incoming
+            .iter()
+            .all(|(op, _)| depends_only_on_const_and_iv(func, op, iv, depth + 1)),
+        _ => false,
+    }
+}
+
+/// True when completely unrolling the outer loop `outer` would leave an inner
+/// natural loop alive as a runtime loop in every clone.  That happens when a
+/// properly-nested inner loop's IV/bound depends on a runtime value (anything
+/// other than constants and the outer loop's IV).  The clones then become
+/// sibling runtime reductions sharing one accumulator, a shape the downstream
+/// late vectorizer miscompiles (reproducer: `for (i = 0; i < 4; i++)
+/// for (j = 0; j < n; j++) s += a[i*n+j]` — the outer trip-4 is unrolled, the
+/// runtime-`n` inner survives as four chained reductions, and lccc sums the
+/// wrong elements while GCC returns the correct value).  A CONSTANT-trip inner
+/// loop is fine: the fixpoint fully unrolls it too.  Refusing keeps the outer
+/// loop rolled, which is correct and matches GCC.
+fn body_contains_persisting_inner_loop(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    outer: &loop_analysis::NaturalLoop,
+    outer_iv: Value,
+) -> bool {
+    let all = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+    for inner in &all {
+        if inner.header == outer.header {
+            continue;
+        }
+        if !outer.body.contains(&inner.header) {
+            continue;
+        }
+        let latches = inner.latches(&cfg.preds);
+        if latches.len() != 1 {
+            // Multi-latch inner loops aren't handled by name here; the general
+            // cloner treats other shapes separately and they are not the
+            // chained-reduction miscompile this gate guards.
+            continue;
+        }
+        let latch = latches[0];
+        let latch_label = func.blocks[latch].label;
+        if !matches!(
+            &func.blocks[latch].terminator,
+            Terminator::Branch(l) if *l == func.blocks[inner.header].label
+        ) {
+            continue;
+        }
+        // Clean counted inner loop: IV, exit condition, and its initial value.
+        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop(func, inner.header, latch, latch_label)
+        else {
+            continue;
+        };
+        let Some((_et, _be, _cmp, _cty, limit, _islhs, _pos)) =
+            find_exit_condition(func, inner.header, &inner.body, iv_phi)
+        else {
+            continue;
+        };
+        let mut init_op = None;
+        for inst in &func.blocks[inner.header].instructions {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if dest.0 == iv_phi.0 {
+                    for (op, lbl) in incoming {
+                        if *lbl != latch_label {
+                            init_op = Some(op.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let Some(init_op) = init_op else { continue };
+        // If the inner IV's initial value or its bound depends on a runtime
+        // value (not a constant and not the OUTER IV), the inner loop persists
+        // after the outer unroll -> unsafe to unroll the outer loop.
+        if !depends_only_on_const_and_iv(func, &init_op, outer_iv, 0)
+            || !depends_only_on_const_and_iv(func, &limit, outer_iv, 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+// ── Header-phi iteration model ───────────────────────────────────────────────
+/// One header phi of a natural loop with a unique preheader and a single
+/// latch: `dest = phi [init, preheader], [back, latch]`.
+#[derive(Clone, Debug)]
+struct HeaderPhi {
+    id: u32,
+    ty: IrType,
+    init: Operand,
+    back: Operand,
+}
+
+/// Collect EVERY phi of the loop header (IV included).  `None` when a phi
+/// is not in the two-incoming preheader/latch form the cloners rely on.
+fn collect_header_phis(
+    func: &IrFunction,
+    header: usize,
+    latch_label: BlockId,
+) -> Option<Vec<HeaderPhi>> {
+    let mut out = Vec::new();
+    for inst in &func.blocks[header].instructions {
+        let Instruction::Phi { dest, ty, incoming } = inst else {
+            continue;
+        };
+        if incoming.len() != 2 {
+            return None;
+        }
+        let back: Operand = incoming.iter().find(|(_, l)| *l == latch_label)?.0.clone();
+        let init: Operand = incoming.iter().find(|(_, l)| *l != latch_label)?.0.clone();
+        out.push(HeaderPhi {
+            id: dest.0,
+            ty: *ty,
+            init,
+            back,
+        });
+    }
+    Some(out)
+}
+
+/// The value every header phi holds at the entry of a given iteration.
+///
+/// Both complete unrollers used to thread only the phis whose back-edge value
+/// was defined in the cloned region and substituted nothing for the rest; the
+/// remaining shapes silently read the phi's INITIAL value in every iteration:
+///   * `first = 0` at the end of the body (constant back value);
+///   * `cur = param` (loop-invariant back value);
+///   * `x = y; y = t` (the back value is ANOTHER header phi).
+/// This model closes all of them: the value of phi `P` at the entry of
+/// iteration `t` (t ≥ 1) is `P.back` evaluated in iteration `t-1`:
+///   * a constant is itself;
+///   * the latch IV increment is the IV's value in iteration `t`;
+///   * another header phi `Q` is `Q`'s value at iteration `t-1`;
+///   * a value defined inside the loop is iteration `t-1`'s copy of it;
+///   * anything else is loop-invariant and used verbatim.
+/// Iteration 0 sees the preheader `init` operands.  Because the results are
+/// never header-phi ids themselves, substituting one phi at a time is
+/// order-independent.
+struct LoopPhiModel {
+    phis: Vec<HeaderPhi>,
+    iv_id: u32,
+    iv_incr_dest: Option<u32>,
+    iv_ty: IrType,
+    iv_init: i64,
+    iv_step: i64,
+    /// Every SSA id defined by an instruction inside the loop (header non-phi
+    /// instructions and all body blocks).
+    loop_defs: FxHashSet<u32>,
+}
+
+impl LoopPhiModel {
+    fn iv_const(&self, t: i64) -> Operand {
+        Operand::Const(IrConst::from_i64(
+            self.iv_init.wrapping_add(self.iv_step.wrapping_mul(t)),
+            self.iv_ty,
+        ))
+    }
+
+    fn is_header_phi(&self, id: u32) -> bool {
+        self.phis.iter().any(|p| p.id == id)
+    }
+
+    /// Environment of iteration 0: every phi holds its preheader value; the
+    /// IV holds its (already constant-resolved) init.
+    fn env_entry(&self) -> FxHashMap<u32, Operand> {
+        let mut env = FxHashMap::default();
+        for p in &self.phis {
+            let v = if p.id == self.iv_id {
+                self.iv_const(0)
+            } else {
+                p.init
+            };
+            env.insert(p.id, v);
+        }
+        env
+    }
+
+    /// Environment of iteration `t ≥ 1`, given iteration `t-1`'s environment
+    /// and the rename map of iteration `t-1`'s copy of the loop (an absent
+    /// entry means the original, un-renamed instruction executes there).
+    fn env_next(
+        &self,
+        t: i64,
+        env_prev: &FxHashMap<u32, Operand>,
+        rename_prev: &FxHashMap<u32, u32>,
+    ) -> FxHashMap<u32, Operand> {
+        let mut env = FxHashMap::default();
+        for p in &self.phis {
+            let v = if p.id == self.iv_id {
+                self.iv_const(t)
+            } else {
+                self.resolve_back(&p.back, t, env_prev, rename_prev)
+            };
+            env.insert(p.id, v);
+        }
+        env
+    }
+
+    fn resolve_back(
+        &self,
+        back: &Operand,
+        t: i64,
+        env_prev: &FxHashMap<u32, Operand>,
+        rename_prev: &FxHashMap<u32, u32>,
+    ) -> Operand {
+        match back {
+            Operand::Const(_) => *back,
+            Operand::Value(v) => {
+                if Some(v.0) == self.iv_incr_dest {
+                    self.iv_const(t)
+                } else if self.is_header_phi(v.0) {
+                    *env_prev
+                        .get(&v.0)
+                        .expect("iteration environment covers every header phi")
+                } else if self.loop_defs.contains(&v.0) {
+                    Operand::Value(Value(*rename_prev.get(&v.0).unwrap_or(&v.0)))
+                } else {
+                    *back
+                }
+            }
+        }
+    }
+}
+
+/// Substitute every header phi of `env` in one instruction / terminator.
+fn apply_env_inst(inst: &mut Instruction, env: &FxHashMap<u32, Operand>) {
+    for (&id, repl) in env {
+        subst_value_with_operand(inst, id, repl);
+    }
+}
+
+fn apply_env_term(term: &mut Terminator, env: &FxHashMap<u32, Operand>) {
+    for (&id, repl) in env {
+        subst_value_in_terminator(term, id, repl);
+    }
+}
+
+/// Header non-phi instructions that are NOT part of the exit-test chain (the
+/// Cmp and an optional Cast feeding the CondBranch).  These carry the loop
+/// condition's side effects and extra values (`for (...; cnt++, i < 4; ...)`),
+/// execute once per guard evaluation — `trip + 1` times — and must therefore
+/// be replicated per iteration AND once more after the last one.
+fn header_extra_indices(func: &IrFunction, header: usize) -> Vec<usize> {
+    let block = &func.blocks[header];
+    let mut chain: FxHashSet<u32> = FxHashSet::default();
+    if let Terminator::CondBranch {
+        cond: Operand::Value(c),
+        ..
+    } = &block.terminator
+    {
+        chain.insert(c.0);
+        if let Some(Instruction::Cast {
+            src: Operand::Value(s),
+            ..
+        }) = block.instructions.iter().find(|i| i.dest() == Some(*c))
+        {
+            chain.insert(s.0);
+        }
+    }
+    block
+        .instructions
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| {
+            !matches!(inst, Instruction::Phi { .. })
+                && !inst.dest().is_some_and(|d| chain.contains(&d.0))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Rewrite every use of `env`'s phis (and the `extra` header values) in the
+/// blocks OUTSIDE the loop to their post-loop values.
+fn rewrite_outside_uses(
+    func: &mut IrFunction,
+    loop_body: &FxHashSet<usize>,
+    final_env: &FxHashMap<u32, Operand>,
+    extra_final: &FxHashMap<u32, u32>,
+) {
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if loop_body.contains(&bi) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            apply_env_inst(inst, final_env);
+            for (&old, &new) in extra_final {
+                subst_value_with_operand(inst, old, &Operand::Value(Value(new)));
+            }
+        }
+        apply_env_term(&mut block.terminator, final_env);
+        for (&old, &new) in extra_final {
+            subst_value_in_terminator(&mut block.terminator, old, &Operand::Value(Value(new)));
+        }
+    }
+}
+
+/// Relabel the exit block's phi edges that named `old_pred` (the header,
+/// which no longer branches to the exit) to `new_pred`.
+fn relabel_exit_phis(
+    func: &mut IrFunction,
+    exit_target: BlockId,
+    old_pred: BlockId,
+    new_pred: BlockId,
+) {
+    if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+        for inst in &mut func.blocks[exit_bi].instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, lbl) in incoming.iter_mut() {
+                    if *lbl == old_pred {
+                        *lbl = new_pred;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn try_complete_unroll_general(
     func: &mut IrFunction,
     lp: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    trip_range: std::ops::RangeInclusive<i64>,
 ) -> bool {
     let header = lp.header;
     let header_label = func.blocks[header].label;
@@ -680,12 +1199,28 @@ fn try_complete_unroll_general(
         return false;
     };
 
+    // Fail closed (correctness, see `body_contains_persisting_inner_loop`):
+    // refuse to unroll when the body contains a nested inner loop whose trip
+    // count depends on a runtime value (so it survives as a runtime loop in
+    // every clone).  The surviving sibling runtime reductions reuse one
+    // accumulator, which the downstream late vectorizer miscompiles; staying
+    // rolled is correct and matches GCC for these shapes.
+    if body_contains_persisting_inner_loop(func, cfg, lp, iv_phi) {
+        return false;
+    }
+
     // Exit from the header's CondBranch.
-    let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
+    let Some((exit_target, body_entry, raw_cmp_op, cmp_ty, exit_limit, iv_is_lhs, exit_pos)) =
         find_exit_condition(func, header, &lp.body, iv_phi)
     else {
         return false;
     };
+    // The compare must be in the IV's own type, and its operator is put into
+    // the canonical "continue while iv OP limit" form before any arithmetic.
+    if cmp_ty != iv_ty {
+        return false;
+    }
+    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_pos);
 
     // Constant init (through const chains) and constant limit.
     let mut iv_init_op: Option<Operand> = None;
@@ -711,7 +1246,7 @@ fn try_complete_unroll_general(
     };
 
     // Trip count (same arithmetic as the two-block unroller).
-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
         return false;
     };
     // The post-loop IV may exceed i64 even when the trip count is small
@@ -724,7 +1259,7 @@ fn try_complete_unroll_general(
     else {
         return false;
     };
-    if !(2..=16).contains(&trip) {
+    if !trip_range.contains(&trip) {
         return false;
     }
 
@@ -812,32 +1347,63 @@ fn try_complete_unroll_general(
         return false;
     }
 
-    // Loop-carried phis (skip the IV): init from the preheader edge, back
-    // value defined somewhere in the body.
-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
-    for inst in &func.blocks[header].instructions {
-        let Instruction::Phi { dest, incoming, .. } = inst else {
-            continue;
-        };
-        if dest.0 == iv_phi.0 {
-            continue;
+    // ── Per-iteration SSA environment (header-phi model) ────────────────────
+    let Some(phis) = collect_header_phis(func, header, latch_label) else {
+        return false;
+    };
+    let iv_id = iv_phi.0;
+    let iv_incr_dest = phis
+        .iter()
+        .find(|p| p.id == iv_id)
+        .and_then(|p| match p.back {
+            Operand::Value(v) => Some(v.0),
+            _ => None,
+        });
+    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
+    for &hi in &header_nonphi {
+        if let Some(d) = func.blocks[header].instructions[hi].dest() {
+            loop_defs.insert(d.0);
         }
-        let mut init: Option<Operand> = None;
-        let mut back: Option<u32> = None;
-        for (op, lbl) in incoming {
-            if *lbl == latch_label {
-                if let Operand::Value(v) = op {
-                    back = Some(v.0);
-                }
-            } else {
-                init = Some(op.clone());
+    }
+    for &bi in &body_blocks {
+        for inst in &func.blocks[bi].instructions {
+            if let Some(d) = inst.dest() {
+                loop_defs.insert(d.0);
             }
         }
-        if let (Some(init_op), Some(back_id)) = (init, back) {
-            if is_defined_in_body(back_id, &lp.body, func) {
-                carried.push((dest.0, init_op, back_id));
-            }
-        }
+    }
+    let model = LoopPhiModel {
+        phis,
+        iv_id,
+        iv_incr_dest,
+        iv_ty,
+        iv_init,
+        iv_step,
+        loop_defs,
+    };
+    // Header instructions beyond the (pure) exit-test chain: they execute on
+    // every evaluation of the loop condition, i.e. `trip + 1` times. The last
+    // evaluation is the failing one, which must run exactly once more after
+    // the final cloned iteration.
+    let header_extra: Vec<usize> = header_extra_indices(func, header);
+    let has_header_extra = !header_extra.is_empty();
+    // A header instruction with a real observable side effect (volatile read,
+    // store, call, asm) that we do not model: leave the loop rolled rather
+    // than drop the extra failing evaluation. Pure arithmetic (a `cnt++`
+    // counter, an address computation) is safe to model.
+    if has_header_extra
+        && header_extra.iter().any(|&hi| {
+            matches!(
+                &func.blocks[header].instructions[hi],
+                Instruction::Store { .. }
+                    | Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+                    | Instruction::Load { volatile: true, .. }
+            )
+        })
+    {
+        return false;
     }
 
     // ── Build clones for iterations 1..trip ─────────────────────────────────
@@ -845,14 +1411,22 @@ fn try_complete_unroll_general(
     let mut next_val = func.next_value_id;
     let num_clones = (trip - 1) as usize;
 
-    // Per-clone: header-copy label, per-body-block labels, vmap.
     struct ClonePlan {
         header_copy: BlockId,
         block_labels: Vec<BlockId>, // parallel to body_blocks
         vmap: FxHashMap<u32, u32>,
+        env: FxHashMap<u32, Operand>,
     }
     let mut plans: Vec<ClonePlan> = Vec::with_capacity(num_clones);
-    for _ in 0..num_clones {
+
+    // Iteration 0's environment is the preheader init; iteration 0 uses the
+    // ORIGINAL (un-renamed) body so its "rename map" is empty.
+    let mut env_prev = model.env_entry();
+    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
+
+    for ci in 0..num_clones {
+        let t = (ci + 1) as i64; // clone `t` = iteration index after `t` strides
+        let env = model.env_next(t, &env_prev, &rename_prev);
         let header_copy = BlockId(next_label);
         next_label += 1;
         let block_labels = body_blocks
@@ -871,7 +1445,7 @@ fn try_complete_unroll_general(
                 next_val += 1;
             }
         }
-        // Body defs (skip the latch IV increment — it is dead per iteration).
+        // Body defs (skip the dead latch IV increment).
         for &bi in &body_blocks {
             for (idx, inst) in func.blocks[bi].instructions.iter().enumerate() {
                 if bi == latch && idx == latch_iv_incr_idx {
@@ -883,73 +1457,101 @@ fn try_complete_unroll_general(
                 }
             }
         }
+        env_prev = env.clone();
+        rename_prev = vmap.clone();
         plans.push(ClonePlan {
             header_copy,
             block_labels,
             vmap,
+            env,
         });
     }
 
     let mut new_blocks: Vec<BasicBlock> = Vec::new();
-    // prev_back[c]: value id delivering carried phi c entering this clone
-    // (clone 1 uses the ORIGINAL body's back value; clone t>1 uses
-    // clone t-1's renamed back value).
-    let mut prev_back: Vec<u32> = carried.iter().map(|&(_, _, back)| back).collect();
-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
 
+    // ── Final guard (the failing trip-th evaluation) ────────────────────────
+    // Runs the header_extra instructions once more with the last clone's
+    // values, then falls to the exit. Its fresh outputs are the post-loop
+    // live-out values of those header instructions (e.g. `cnt` after a
+    // `for (i=0; cnt++, i<N; i++)` is N+1, not the value at the last clone's
+    // entry).
+    // The failing evaluation's environment: after the LAST clone (or, for a
+    // single-trip loop, after iteration 0's original body).  `plans` is empty
+    // when `trip == 1` (the single-trip deletion path), in which case there are
+    // no renamed values and the original body's defs are used verbatim.
+    let last: Option<&ClonePlan> = plans.last();
+    let last_vmap: FxHashMap<u32, u32> = last.map(|l| l.vmap.clone()).unwrap_or_default();
+    let env_fg = model.env_next(
+        trip,
+        last.map(|l| &l.env).unwrap_or(&env_prev),
+        last.map(|l| &l.vmap).unwrap_or(&rename_prev),
+    );
+    let mut extra_final: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut final_guard: Option<BlockId> = None;
+    if has_header_extra {
+        let fg_label = BlockId(next_label);
+        next_label += 1;
+        let mut fg_vmap: FxHashMap<u32, u32> = FxHashMap::default();
+        for &hi in &header_extra {
+            if let Some(d) = func.blocks[header].instructions[hi].dest() {
+                fg_vmap.insert(d.0, next_val);
+                next_val += 1;
+            }
+        }
+        let mut fg_insts: Vec<Instruction> = Vec::new();
+        for &hi in &header_extra {
+            let mut cloned = func.blocks[header].instructions[hi].clone();
+            // header_extra → this guard's own fresh outputs first, then the
+            // last clone's values, then substitute the header phis with the
+            // failing-entry environment.
+            replace_values_in_inst(&mut cloned, &fg_vmap);
+            replace_values_in_inst(&mut cloned, &last_vmap);
+            rename_inst_dest(&mut cloned, &fg_vmap);
+            apply_env_inst(&mut cloned, &env_fg);
+            fg_insts.push(cloned);
+        }
+        for &hi in &header_extra {
+            if let Some(d) = func.blocks[header].instructions[hi].dest() {
+                extra_final.insert(d.0, fg_vmap[&d.0]);
+            }
+        }
+        new_blocks.push(BasicBlock {
+            label: fg_label,
+            instructions: fg_insts,
+            terminator: Terminator::Branch(exit_target),
+            source_spans: Vec::new(),
+        });
+        final_guard = Some(fg_label);
+    }
+
+    // ── Emit the clone blocks ───────────────────────────────────────────────
     for (ci, plan) in plans.iter().enumerate() {
-        let t = (ci + 1) as i64; // iteration index this clone represents
-                                 // Clone `t` observes the IV after `t` strides, not after `t` steps of
-                                 // 1: with the constant-stride trip count in place the stride may be
-                                 // any non-zero constant, so the substituted constant must be scaled
-                                 // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
-
-        // label_map: original label → clone label (header + body).
+        // Original label → clone label (header + body).
         let mut label_map: FxHashMap<BlockId, BlockId> = FxHashMap::default();
         label_map.insert(header_label, plan.header_copy);
         for (i, &bi) in body_blocks.iter().enumerate() {
             label_map.insert(func.blocks[bi].label, plan.block_labels[i]);
         }
-
-        // Where this clone's latch back-edge goes: next clone's header-copy,
-        // or the exit target for the last clone.
         let back_redirect = if ci + 1 < num_clones {
             plans[ci + 1].header_copy
         } else {
-            exit_target
-        };
-
-        // Operand substitution: iv → const, carried → previous value.
-        let substitute = |inst: &mut Instruction| {
-            subst_value_with_operand(inst, iv_phi.0, &iv_const);
-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
-                let repl = Operand::Value(Value(prev_back[c]));
-                subst_value_with_operand(inst, phi_id, &repl);
-            }
-        };
-        let substitute_term = |term: &mut Terminator| {
-            subst_value_in_terminator(term, iv_phi.0, &iv_const);
-            for (c, &(phi_id, _, _)) in carried.iter().enumerate() {
-                let repl = Operand::Value(Value(prev_back[c]));
-                subst_value_in_terminator(term, phi_id, &repl);
-            }
+            final_guard.unwrap_or(exit_target)
         };
 
         // Header copy: non-phi instructions, unconditional Branch into the
-        // body entry (trip ≥ 2 ⇒ every cloned iteration executes).
+        // body entry (trip ≥ 2 ⇒ every cloned iteration executes). Pure
+        // exit-test chain instructions are cloned too and DCE'd away.
         {
             let mut insts: Vec<Instruction> = Vec::new();
             for &hi in &header_nonphi {
                 let mut cloned = func.blocks[header].instructions[hi].clone();
-                // ORDER: rename FIRST, substitute header-phi references
-                // AFTER. Clone 1's carried back values are ORIGINAL body
-                // ids that are also in this clone's vmap — substituting
-                // first would let the rename rewrite them into this
-                // clone's own definitions (self-referential phi).
+                // ORDER: rename first, substitute header-phi references after.
+                // Clone 1's env values are ORIGINAL body ids also present in
+                // this clone's vmap; substituting first would let the rename
+                // rewrite them into this clone's own definitions.
                 replace_values_in_inst(&mut cloned, &plan.vmap);
                 rename_inst_dest(&mut cloned, &plan.vmap);
-                substitute(&mut cloned);
+                apply_env_inst(&mut cloned, &plan.env);
                 insts.push(cloned);
             }
             new_blocks.push(BasicBlock {
@@ -973,16 +1575,9 @@ fn try_complete_unroll_general(
                     continue; // dead IV increment
                 }
                 let mut cloned = inst.clone();
-                // Rename first, substitute after (see the header-copy note:
-                // clone 1's carried values are original body ids present in
-                // this clone's vmap).
                 replace_values_in_inst(&mut cloned, &plan.vmap);
                 rename_inst_dest(&mut cloned, &plan.vmap);
-                substitute(&mut cloned);
-                // Phi incoming labels: remap through the label map (inner
-                // loop headers cloned inside this iteration). Labels equal
-                // to the OUTER header label now arrive from this clone's
-                // header copy — the actual predecessor.
+                apply_env_inst(&mut cloned, &plan.env);
                 if let Instruction::Phi { incoming, .. } = &mut cloned {
                     for (op, lbl) in incoming.iter_mut() {
                         if *lbl == header_label {
@@ -995,11 +1590,7 @@ fn try_complete_unroll_general(
                 insts.push(cloned);
             }
             let mut term = orig.terminator.clone();
-            // Rename value uses (e.g. an inner loop header's exit compare)
-            // first — then substitute header-phi references (see the
-            // header-copy ordering note).
             replace_values_in_terminator(&mut term, &plan.vmap);
-            // Back-edge (latch → header) redirects to the next iteration.
             if bi == latch {
                 if let Terminator::Branch(lbl) = &mut term {
                     if *lbl == header_label {
@@ -1007,26 +1598,14 @@ fn try_complete_unroll_general(
                     }
                 }
             }
-            // General label remap for internal branches.
             replace_block_ids(&mut term, &label_map);
-            substitute_term(&mut term);
+            apply_env_term(&mut term, &plan.env);
             new_blocks.push(BasicBlock {
                 label: plan.block_labels[i],
                 instructions: insts,
                 terminator: term,
                 source_spans: Vec::new(),
             });
-        }
-
-        // Update prev_back for the NEXT clone: this clone's renamed back
-        // values. The LAST clone's values feed outside uses.
-        for (c, &(_, _, back_id)) in carried.iter().enumerate() {
-            if let Some(&new_id) = plan.vmap.get(&back_id) {
-                prev_back[c] = new_id;
-                if ci + 1 == num_clones {
-                    final_carried.push((carried[c].0, new_id));
-                }
-            }
         }
     }
 
@@ -1036,47 +1615,66 @@ fn try_complete_unroll_general(
     // Iteration 0 keeps the original header + body. The header's terminator
     // becomes an unconditional Branch into the body entry.
     func.blocks[header].terminator = Terminator::Branch(body_entry);
-    // The original latch's back-edge flows into clone 1's header copy.
-    func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
-
-    // Outside uses: IV → final constant; carried phis → final clone values.
-    let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
+    // The original latch's back-edge flows into clone 1's header copy — or
+    // straight to the exit when the loop runs exactly once (no clones).
+    func.blocks[latch].terminator = Terminator::Branch(match plans.first() {
+        Some(first) => first.header_copy,
+        None => exit_target,
+    });
+    // ── Post-loop substitution for blocks outside the loop ──────────────────
+    // The failing-entry environment holds the live-out value of every ordinary
+    // carried value (an accumulator `sum` is its value after the last body).
+    // A header-extra-backed phi (e.g. `cnt` whose back value is `cnt + 1` in
+    // the header) instead takes the final guard's fresh output: that captures
+    // the one-extra failing evaluation.
+    let extra_out_ids: FxHashSet<u32> = extra_final.keys().copied().collect();
+    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
+    final_subst.insert(
+        iv_id,
+        Operand::Const(IrConst::from_i64(final_iv_n, iv_ty)),
+    );
+    for (&e, &fg) in &extra_final {
+        final_subst.insert(e, Operand::Value(Value(fg)));
+    }
+    for p in &model.phis {
+        if p.id == iv_id {
+            continue;
+        }
+        if let Operand::Value(v) = &p.back {
+            if extra_out_ids.contains(&v.0) {
+                final_subst.insert(p.id, final_subst[&v.0]);
+                continue;
+            }
+        }
+        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
+    }
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
             continue;
         }
         for instruction in &mut block.instructions {
-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
-            for &(phi_id, final_id) in &final_carried {
-                let repl = Operand::Value(Value(final_id));
-                subst_value_with_operand(instruction, phi_id, &repl);
-            }
+            apply_env_inst(instruction, &final_subst);
         }
-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
-        for &(phi_id, final_id) in &final_carried {
-            let repl = Operand::Value(Value(final_id));
-            subst_value_in_terminator(&mut block.terminator, phi_id, &repl);
-        }
+        apply_env_term(&mut block.terminator, &final_subst);
     }
 
-    // Exit-block phi edges: the edge that arrived from the header now
-    // arrives from the last clone's latch (the block that branches to the
-    // exit target).
+    // Exit-block phi edges: the edge that arrived from the header now arrives
+    // from the last clone's latch (or the final guard, when the guard is the
+    // block that branches to the exit).
     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
         if exit_bi != header && !lp.body.contains(&exit_bi) {
-            let last_latch_label = plans[num_clones - 1].block_labels[body_blocks
-                .iter()
-                .position(|&b| b == latch)
-                .expect("latch is a body block")];
-            for inst in &mut func.blocks[exit_bi].instructions {
-                if let Instruction::Phi { incoming, .. } = inst {
-                    for (_, lbl) in incoming.iter_mut() {
-                        if *lbl == header_label {
-                            *lbl = last_latch_label;
-                        }
-                    }
+            let new_pred = final_guard.unwrap_or_else(|| {
+                match plans.last() {
+                    Some(last) => last.block_labels[body_blocks
+                        .iter()
+                        .position(|&b| b == latch)
+                        .expect("latch is a body block")],
+                    // Single-trip deletion: the original latch now branches
+                    // straight to the exit, so it IS the predecessor.
+                    None => latch_label,
                 }
-            }
+            });
+            relabel_exit_phis(func, exit_target, header_label, new_pred);
         }
     }
 
@@ -1140,15 +1738,19 @@ fn try_complete_unroll_two_block(
     let Some((
         exit_target,
         body_entry,
-        cmp_op,
-        _cmp_ty,
+        raw_cmp_op,
+        cmp_ty,
         exit_limit,
-        _iv_is_lhs,
+        iv_is_lhs,
         exit_cond_positive,
     )) = find_exit_condition(func, header, &lp.body, iv_phi)
     else {
         return false;
     };
+    if cmp_ty != iv_ty {
+        return false;
+    }
+    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_cond_positive);
     // work_blocks: instructions to clone each iteration (excluding IV increment).
     // 2-block: work lives in the latch (body_entry == latch).
     // 3-block: header -> body_entry (one work block) -> latch (IV incr only) -> header.
@@ -1172,33 +1774,33 @@ fn try_complete_unroll_two_block(
         }
         vec![bi, latch]
     };
-    // Constant IV init from preheader.
-    let mut iv_init: Option<i64> = None;
+    // Constant IV init from the preheader edge.  Resolved through the same
+    // const-chain evaluator as the general cloner so that a 2–3 block inner
+    // loop whose init became `Add(const, const)` after an outer complete
+    // unroll is handled in the SAME fixpoint round instead of waiting for a
+    // later folding pass (or never, when unroll is the last loop pass).
+    let mut iv_init_op: Option<Operand> = None;
     for inst in &func.blocks[header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
             if dest.0 == iv_phi.0 {
                 for (op, lbl) in incoming {
                     if *lbl != latch_label {
-                        iv_init = match op {
-                            Operand::Const(c) => c.to_i64(),
-                            _ => None,
-                        };
+                        iv_init_op = Some(op.clone());
                     }
                 }
             }
         }
     }
-    let Some(iv_init) = iv_init else {
+    let Some(iv_init_op) = iv_init_op else {
         return false;
     };
-    let limit_n: i64 = match &exit_limit {
-        Operand::Const(c) => match c.to_i64() {
-            Some(n) => n,
-            None => return false,
-        },
-        _ => return false,
+    let Some(iv_init) = resolve_const_operand(func, &iv_init_op, 0) else {
+        return false;
     };
-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+    let Some(limit_n) = resolve_const_operand(func, &exit_limit, 0) else {
+        return false;
+    };
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
         return false;
     };
     // The post-loop IV may exceed i64 even when the trip count is small
@@ -1287,35 +1889,55 @@ fn try_complete_unroll_two_block(
         return false;
     }
 
-    // Loop-carried phis (phi_id, init_op, back_value_id in latch). Skip IV phi.
-    let mut carried: Vec<(u32, Operand, u32)> = Vec::new();
+    // ── Header-phi environment model ─────────────────────────────────────────
+    // The final value of every header phi (a counter, a "last" element, a
+    // loop-invariant-then-set value, or a cross-phi swap) depends on where its
+    // back value is computed. The old code carried back values defined in the
+    // latch and silently left everything else at its INIT value, which is why
+    // `cur = p` observed `cur == 1` forever and `x = y; y = t` observed the
+    // initial `x`. Model every header phi explicitly.
+    let Some(phis) = collect_header_phis(func, header, latch_label) else {
+        return false;
+    };
+    let iv_id = iv_phi.0;
+    let iv_incr_dest = phis
+        .iter()
+        .find(|p| p.id == iv_id)
+        .and_then(|p| match p.back {
+            Operand::Value(v) => Some(v.0),
+            _ => None,
+        });
+    let mut loop_defs: FxHashSet<u32> = FxHashSet::default();
+    for &wbi in &work_blocks {
+        for inst in &func.blocks[wbi].instructions {
+            if let Some(d) = inst.dest() {
+                loop_defs.insert(d.0);
+            }
+        }
+    }
     for inst in &func.blocks[header].instructions {
-        let Instruction::Phi { dest, incoming, .. } = inst else {
-            continue;
-        };
-        if dest.0 == iv_phi.0 {
-            continue;
-        }
-        let mut init: Option<Operand> = None;
-        let mut back: Option<u32> = None;
-        for (op, lbl) in incoming {
-            if *lbl == latch_label {
-                if let Operand::Value(v) = op {
-                    back = Some(v.0);
-                }
-            } else {
-                init = Some(op.clone());
+        if !matches!(inst, Instruction::Phi { .. }) {
+            if let Some(d) = inst.dest() {
+                loop_defs.insert(d.0);
             }
         }
-        if let (Some(init_op), Some(back_id)) = (init, back) {
-            let defined_in_latch = func.blocks[latch]
-                .instructions
-                .iter()
-                .any(|li| li.dest().map(|d| d.0 == back_id).unwrap_or(false));
-            if defined_in_latch {
-                carried.push((dest.0, init_op, back_id));
-            }
-        }
+    }
+    let model = LoopPhiModel {
+        phis,
+        iv_id,
+        iv_incr_dest,
+        iv_ty,
+        iv_init,
+        iv_step,
+        loop_defs,
+    };
+    // A header instruction beyond the (pure) exit-test chain must run on every
+    // evaluation of the condition, i.e. `trip + 1` times (the failing
+    // evaluation included). The two-block cloner clones only the work blocks,
+    // never the header, so it cannot reproduce that; leaving the loop rolled
+    // is correct.
+    if !header_extra_indices(func, header).is_empty() {
+        return false;
     }
 
     let mut next_label = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0) + 1;
@@ -1328,12 +1950,24 @@ fn try_complete_unroll_two_block(
         })
         .collect();
 
-    let mut prev_back: Vec<Option<u32>> = vec![None; carried.len()];
-    let mut final_carried: Vec<(u32, u32)> = Vec::new();
     let mut new_blocks: Vec<BasicBlock> = Vec::with_capacity(trip as usize);
 
+    // Per-iteration environments. env[0] = preheader init; env[t] for t ≥ 1 is
+    // derived from the previous clone's environment and rename map. The last
+    // clone's env + rename map feed the failing (`trip`-th) evaluation used
+    // for live-out substitution.
+    let mut env_prev = model.env_entry();
+    let mut rename_prev: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut final_carried: Vec<(u32, u32)> = Vec::new();
+
     for t_idx in 0..trip {
-        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t_idx * iv_step, iv_ty));
+        let t = t_idx as i64;
+        let env = if t == 0 {
+            model.env_entry()
+        } else {
+            model.env_next(t, &env_prev, &rename_prev)
+        };
+        let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
         let mut vmap: FxHashMap<u32, u32> = FxHashMap::default();
         for &wbi in &work_blocks {
             for (idx, inst) in func.blocks[wbi].instructions.iter().enumerate() {
@@ -1353,30 +1987,31 @@ fn try_complete_unroll_two_block(
                     continue;
                 }
                 let mut cloned = inst.clone();
-                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
-                for (ci, (phi_id, init_op, _)) in carried.iter().enumerate() {
-                    match prev_back[ci] {
-                        None => subst_value_with_operand(&mut cloned, *phi_id, init_op),
-                        Some(prev_id) => subst_value_with_operand(
-                            &mut cloned,
-                            *phi_id,
-                            &Operand::Value(Value(prev_id)),
-                        ),
-                    }
-                }
+                // Rename first, then substitute the header-phi environment.
+                // The env values are consts / invariants / previous-clone ids,
+                // none of which are keys in this clone's rename map.
                 replace_values_in_inst(&mut cloned, &vmap);
                 rename_inst_dest(&mut cloned, &vmap);
+                subst_value_with_operand(&mut cloned, iv_phi.0, &iv_const);
+                apply_env_inst(&mut cloned, &env);
                 new_insts.push(cloned);
             }
         }
-        for (ci, (_, _, back_id)) in carried.iter().enumerate() {
-            if let Some(&new_id) = vmap.get(back_id) {
-                prev_back[ci] = Some(new_id);
-                if t_idx + 1 == trip {
-                    final_carried.push((carried[ci].0, new_id));
+        if t_idx + 1 == trip {
+            // Clone-defined back values (for the copy-before-def guard below).
+            for p in &model.phis {
+                if p.id == iv_id {
+                    continue;
+                }
+                if let Operand::Value(v) = &p.back {
+                    if let Some(&new_id) = vmap.get(&v.0) {
+                        final_carried.push((p.id, new_id));
+                    }
                 }
             }
         }
+        env_prev = env;
+        rename_prev = vmap;
         let term = if t_idx + 1 < trip {
             Terminator::Branch(labels[(t_idx + 1) as usize])
         } else {
@@ -1417,21 +2052,6 @@ fn try_complete_unroll_two_block(
     func.blocks[latch].terminator = Terminator::Unreachable;
     let _ = (body_entry, exit_cond_positive);
 
-    // Repair the exit block's phis.  The `header -> exit_target` edge is gone
-    // (the header now branches into the clone chain); the block that reaches
-    // the exit is the LAST CLONE, `labels[trip - 1]`.  Every phi incoming
-    // still labelled `header_label` must therefore be relabelled to that
-    // clone, otherwise it names a non-predecessor and the real predecessor
-    // has no incoming at all.
-    //
-    // Only the LABEL changes, never the operand: the substitution sweep below
-    // visits every block outside `lp.body` -- the exit block included -- and
-    // rewrites the IV to `final_iv` and each carried phi to its final clone
-    // value, which are precisely the values live on that edge.
-    //
-    // A phi incoming labelled `latch_label` cannot exist here (the latch's
-    // terminator was verified to be `Branch(header_label)`), but drop any such
-    // entry defensively rather than leave a dangling predecessor behind.
     {
         let last_clone = labels[(trip - 1) as usize];
         if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
@@ -1448,31 +2068,29 @@ fn try_complete_unroll_two_block(
             }
         }
     }
-
-    // `final_iv_n` was already computed and overflow-checked above, before
-    // any CFG mutation — a second check here would bail with the header and
-    // latch already retargeted (the exact bug the hoisted check fixed).
+    // Live-out substitution. The failing (`trip`-th) environment holds the
+    // value each carried phi has after the final cloned iteration: a body
+    // accumulator's computed total, a constant back value, a loop-invariant
+    // operand, or a cross-phi value — all bound to the last clone's defs.
     let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
+    let env_fg = model.env_next(trip, &env_prev, &rename_prev);
+    let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
+    final_subst.insert(iv_id, final_iv);
+    for p in &model.phis {
+        if p.id == iv_id {
+            continue;
+        }
+        final_subst.insert(p.id, *env_fg.get(&p.id).expect("env covers every phi"));
+    }
     for (block_index, block) in func.blocks.iter_mut().enumerate() {
         if lp.body.contains(&block_index) {
             continue;
         }
         for instruction in &mut block.instructions {
-            subst_value_with_operand(instruction, iv_phi.0, &final_iv);
-            for &(phi_id, final_id) in &final_carried {
-                subst_value_with_operand(instruction, phi_id, &Operand::Value(Value(final_id)));
-            }
+            apply_env_inst(instruction, &final_subst);
         }
-        subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
-        for &(phi_id, final_id) in &final_carried {
-            subst_value_in_terminator(
-                &mut block.terminator,
-                phi_id,
-                &Operand::Value(Value(final_id)),
-            );
-        }
+        apply_env_term(&mut block.terminator, &final_subst);
     }
-
     func.blocks.extend(new_blocks);
 
     // Resolve EVERY phi in the header. The loop is now straight-line -- the
@@ -1656,6 +2274,18 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
     false
 }
 
+/// Evaluate `op` to a constant when it is a constant or a short chain of
+/// `Copy` / integer `Cast` / `Add` / `Sub` / `Mul` over constants — the shape
+/// an inner loop's `j = i + 1` init takes once the outer loop has been
+/// completely unrolled and `i` substituted by a per-clone constant.
+///
+/// Every intermediate result is normalised to the canonical `IrConst`
+/// representation of the instruction's result type via
+/// [`normalize_to_type`], so unsigned arithmetic zero-extends and narrowing
+/// casts truncate exactly as the constant folder would.  Values are only ever
+/// compared by [`complete_unroll_trip`] after a second normalisation to the
+/// IV type, which makes the whole chain representation-stable regardless of
+/// which pass produced the constants.
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
     if depth > 6 {
         return None;
@@ -1682,34 +2312,48 @@ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Optio
                     from_ty,
                     to_ty,
                     ..
-                } if from_ty.is_integer()
-                    && to_ty.is_integer()
-                    && from_ty.size() <= to_ty.size() =>
-                {
-                    resolve_const_operand(func, src, depth + 1)
+                } if is_fixed_width_int(*from_ty) && is_fixed_width_int(*to_ty) => {
+                    // The source value is already in `from_ty`'s canonical
+                    // form (sign- or zero-extended to i64 per its own
+                    // signedness), so widening is the identity and narrowing
+                    // is a truncation into `to_ty` — both are exactly
+                    // `normalize_to_type`.
+                    let v = resolve_const_operand(func, src, depth + 1)?;
+                    let v = normalize_to_type(v, *from_ty)?;
+                    normalize_to_type(v, *to_ty)
                 }
                 Instruction::BinOp {
                     op, lhs, rhs, ty, ..
-                } if ty.is_integer() => {
+                } if is_fixed_width_int(*ty) => {
                     let l = resolve_const_operand(func, lhs, depth + 1)?;
                     let r = resolve_const_operand(func, rhs, depth + 1)?;
-                    let narrow = |x: i64| -> i64 {
-                        if ty.size() <= 4 {
-                            x as i32 as i64
-                        } else {
-                            x
-                        }
+                    let raw = match op {
+                        IrBinOp::Add => l.wrapping_add(r),
+                        IrBinOp::Sub => l.wrapping_sub(r),
+                        IrBinOp::Mul => l.wrapping_mul(r),
+                        _ => return None,
                     };
-                    match op {
-                        IrBinOp::Add => Some(narrow(l.wrapping_add(r))),
-                        IrBinOp::Sub => Some(narrow(l.wrapping_sub(r))),
-                        IrBinOp::Mul => Some(narrow(l.wrapping_mul(r))),
-                        _ => None,
-                    }
+                    normalize_to_type(raw, *ty)
                 }
                 _ => None,
             }
         }
+    }
+}
+
+/// Read a step constant of IV type `ty` as a SIGNED stride.  Unsigned IR
+/// constants are stored zero-extended (`IrConst::I64(0xFFFFFFFE)` for a U32
+/// `-2`); sign-extending them at the IV's width recovers the arithmetic
+/// stride so that `for (unsigned i = n; i != 0; i += -2)` and `i -= 2` are
+/// recognised as the same countdown.
+fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
+    let raw = c.to_i64()?;
+    match ty {
+        IrType::I8 | IrType::U8 => Some(raw as u8 as i8 as i64),
+        IrType::I16 | IrType::U16 => Some(raw as u16 as i16 as i64),
+        IrType::I32 | IrType::U32 => Some(raw as u32 as i32 as i64),
+        IrType::I64 | IrType::U64 => Some(raw),
+        _ => None,
     }
 }
 
@@ -1736,31 +2380,50 @@ fn find_iv_in_loop(
                     None
                 }
             });
-        let back_val = back_val?;
+        // A phi whose back-edge value is a constant (a first-iteration flag
+        // such as `first = 0`) is simply not the IV. It used to abort the
+        // whole search (`?`), which silently disabled unrolling for every
+        // loop whose FIRST header phi happened to be such a flag.
+        let Some(back_val) = back_val else {
+            continue;
+        };
 
-        // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
-        // in the latch that produces `back_val`.
+        // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
+        // or `Sub(phi_dest, const_step)` in the latch that produces
+        // `back_val`.  `i -= k` lowers to a `Sub` — the countdown-loop
+        // idiom of every decompressor and hash routine — and is the same
+        // basic IV with step `-k`.  The step is expressed as a signed i64 of
+        // the IV's width: `Sub(phi, 2)` on a U32 is the additive step
+        // `0xFFFFFFFE`, i.e. `-2`, and every consumer (the closed-form trip
+        // count, the per-clone `init + t*step` constants and the partial
+        // unroller's `Add(iv, step)` checks) re-materialises it through
+        // `IrConst::from_i64(step, iv_ty)`, so the two-complement identity
+        // `x - k == x + (-k)` holds bit-exactly for every fixed-width type.
         let phi_id = phi_dest.0;
         for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
-            if let Instruction::BinOp {
-                dest,
-                op: IrBinOp::Add,
-                lhs,
-                rhs,
-                ..
+            let Instruction::BinOp {
+                dest, op, lhs, rhs, ..
             } = latch_inst
-            {
-                if *dest != back_val {
-                    continue;
+            else {
+                continue;
+            };
+            if *dest != back_val {
+                continue;
+            }
+            let step = match (op, lhs, rhs) {
+                (IrBinOp::Add, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
+                    signed_step(*c, *ty)
                 }
-                let step = match (lhs, rhs) {
-                    (Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),
-                    (Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),
-                    _ => None,
-                };
-                if let Some(step) = step {
-                    return Some((*phi_dest, *ty, step, idx));
+                (IrBinOp::Add, Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => {
+                    signed_step(*c, *ty)
                 }
+                (IrBinOp::Sub, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
+                    signed_step(*c, *ty).and_then(i64::checked_neg)
+                }
+                _ => None,
+            };
+            if let Some(step) = step {
+                return Some((*phi_dest, *ty, step, idx));
             }
         }
     }
@@ -2610,6 +3273,12 @@ mod tests {
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, BasicBlock, BlockId, IrConst, Value};
 
+    /// Historical truth table entry point: the closed form on a signed
+    /// 64-bit IV (the domain the pre-typed arithmetic implicitly assumed).
+    fn trip_i64(init: i64, limit: i64, op: IrCmpOp, step: i64) -> Option<i64> {
+        complete_unroll_trip(init, limit, op, step, IrType::I64)
+    }
+
     /// Build a simple counting loop:
     ///   preheader → header → body → latch → (back to header) / exit
     ///
@@ -3444,62 +4113,62 @@ mod tests {
     fn unroll_trip_step_one_matches_historical_arithmetic() {
         use crate::ir::reexports::IrCmpOp::*;
         // i < 8, step 1  → 8 trips (classic 0..8).
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
+        assert_eq!(trip_i64(0, 8, Slt, 1), Some(8));
         // i <= 7, step 1 → 8 trips.
-        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
+        assert_eq!(trip_i64(0, 7, Sle, 1), Some(8));
         // Non-zero init.
-        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
+        assert_eq!(trip_i64(3, 8, Slt, 1), Some(5));
         // Empty / inverted spans stay rejected (pre-existing guards).
-        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
+        assert_eq!(trip_i64(8, 8, Slt, 1), None);
+        assert_eq!(trip_i64(9, 8, Slt, 1), None);
+        assert_eq!(trip_i64(8, 7, Sle, 1), None);
     }
 
     #[test]
     fn unroll_trip_positive_strides() {
         use crate::ir::reexports::IrCmpOp::*;
         // dot8's shape: i < 8, i += 4 → exactly 2 trips.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
+        assert_eq!(trip_i64(0, 8, Slt, 4), Some(2));
         // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
+        assert_eq!(trip_i64(0, 10, Slt, 3), Some(4));
         // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
+        assert_eq!(trip_i64(0, 7, Slt, 2), Some(4));
         // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
+        assert_eq!(trip_i64(0, 9, Sle, 3), Some(4));
         // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
+        assert_eq!(trip_i64(0, 10, Sle, 3), Some(4));
         // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
-        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
+        assert_eq!(trip_i64(0, 5, Slt, 5), Some(1));
         // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
-        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
+        assert_eq!(trip_i64(2, 11, Slt, 3), Some(3));
     }
 
     #[test]
     fn unroll_trip_negative_strides_countdown() {
         use crate::ir::reexports::IrCmpOp::*;
         // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
+        assert_eq!(trip_i64(10, 0, Sgt, -2), Some(5));
         // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
+        assert_eq!(trip_i64(10, 0, Sgt, -3), Some(4));
         // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
-        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
+        assert_eq!(trip_i64(9, 0, Sge, -3), Some(4));
         // Empty countdown.
-        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
+        assert_eq!(trip_i64(0, 0, Sgt, -1), None);
     }
 
     #[test]
     fn unroll_trip_rejects_degenerate_shapes() {
         use crate::ir::reexports::IrCmpOp::*;
         // Zero stride: infinite loop, no trip count.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
+        assert_eq!(trip_i64(0, 8, Slt, 0), None);
         // Sign/stride contradictions: a negative stride against an
         // ascending comparison diverges (or wraps); must be refused.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
-        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
-        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
-        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
+        assert_eq!(trip_i64(0, 8, Slt, -1), None);
+        assert_eq!(trip_i64(0, 8, Sle, -4), None);
+        assert_eq!(trip_i64(8, 0, Sgt, 1), None);
+        assert_eq!(trip_i64(8, 0, Sge, 2), None);
         // Equality-style comparisons carry no ordering: refused.
-        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
+        assert_eq!(trip_i64(0, 8, Eq, 1), None);
     }
 
     #[test]
@@ -3507,37 +4176,40 @@ mod tests {
         use crate::ir::reexports::IrCmpOp::*;
         // `limit - iv_init` overflows i64 (MAX - (-1)); the checked span
         // must refuse rather than produce a wrapped trip count.
-        assert_eq!(complete_unroll_trip(-1, i64::MAX, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(i64::MIN, 0, Sgt, -1), None);
-        // `-iv_step` overflows for iv_step = i64::MIN; checked_abs refuses.
-        assert_eq!(complete_unroll_trip(0, i64::MIN, Sgt, i64::MIN), None);
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, i64::MIN), None);
-        // Representable but huge: 0, 2^62 < MAX → 2 trips.  (The cloner's
-        // checked final IV then refuses to substitute 2^63; see below.)
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, 1 << 62), Some(2));
+        assert_eq!(trip_i64(-1, i64::MAX, Slt, 1), None);
+        assert_eq!(trip_i64(i64::MIN, 0, Sgt, -1), None);
+        // `i > i64::MIN` with step i64::MIN: the loop runs exactly once
+        // (0 -> i64::MIN -> exit test fails).  The typed closed form computes
+        // step_abs in i128, which does NOT overflow for i64::MIN, so it returns
+        // Some(1) instead of the old checked_abs-based None.  (Some(1) is the
+        // correct count; the old None rejected a shape the loop genuinely
+        // executes once.)
+        assert_eq!(trip_i64(0, i64::MIN, Sgt, i64::MIN), Some(1));
+        assert_eq!(trip_i64(0, i64::MAX, Slt, i64::MIN), None);
+        // Huge stride: 0, 2^62 are < MAX (2 body executions) but the exit
+        // test would then observe 2^63, which is not an i64.  The typed
+        // closed form refuses up front — previously the cloner's checked
+        // final-IV guard was the only thing standing between this shape and
+        // a wrapped substituted constant.
+        assert_eq!(trip_i64(0, i64::MAX, Slt, 1 << 62), None);
         // Sle at the top of the range: span/step + 1 would be MAX + 1.
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
+        assert_eq!(trip_i64(0, i64::MAX, Sle, 1), None);
         // Extremes that stay in range must still unroll.
         assert_eq!(
-            complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2),
+            trip_i64(i64::MIN, i64::MIN + 8, Slt, 2),
             Some(4)
         );
         assert_eq!(
-            complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3),
+            trip_i64(i64::MAX, i64::MAX - 9, Sgt, -3),
             Some(3)
         );
-        assert_eq!(
-            complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3),
-            Some(3)
-        );
-        // The post-loop IV bound used by both cloners: final = init +
-        // trip * step must be computed with checked arithmetic (this mirrors
-        // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
-        let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
-        assert!((1i64 << 62)
-            .checked_mul(trip)
-            .and_then(|d| 0i64.checked_add(d))
-            .is_none());
+        // `i <= MAX` with stride 3 from MAX-6 executes for MAX-6, MAX-3,
+        // MAX and then increments PAST the type: the exit test never sees
+        // an in-range value, so the loop has no static trip (UB in C, an
+        // infinite loop on hardware).  Refused.
+        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX, Sle, 3), None);
+        // One stride shorter it is a well-defined 2-trip loop again.
+        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX - 3, Sle, 3), Some(2));
     }
 
     // The trip count above is representable (2), but the post-loop IV
@@ -3702,7 +4374,7 @@ mod tests {
                                 Some(old)
                             })
                             .count() as i64;
-                        let closed = complete_unroll_trip(init, limit, op, step);
+                        let closed = trip_i64(init, limit, op, step);
                         if simulated == 0 {
                             assert!(
                                 closed.is_none(),
@@ -3733,7 +4405,7 @@ mod tests {
                                 Some(old)
                             })
                             .count() as i64;
-                        let closed = complete_unroll_trip(init, limit, op, step);
+                        let closed = trip_i64(init, limit, op, step);
                         if simulated == 0 {
                             assert!(
                                 closed.is_none(),
