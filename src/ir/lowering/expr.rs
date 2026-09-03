@@ -854,6 +854,30 @@ impl Lowerer {
         src_ty: IrType,
         target_ty: IrType,
     ) -> Operand {
+        // Integer constants are lowered at the target-int (I64 on LP64)
+        // representation even when their C type is narrower (e.g. `int`
+        // literals). If the declared source type is narrower than the
+        // constant's storage width (as happens when ternary arms are typed by
+        // C semantics, see Lowerer::ternary_arm_type), narrow the constant to
+        // its declared type first so the value, any subsequent cast, and any
+        // store all use the natural width.
+        let src = match src {
+            Operand::Const(c) if src_ty.is_integer() => {
+                let width = match &c {
+                    IrConst::I8(_) => 1,
+                    IrConst::I16(_) => 2,
+                    IrConst::I32(_) => 4,
+                    IrConst::I64(_) => 8,
+                    _ => 0,
+                };
+                if width > src_ty.size() {
+                    Operand::Const(c.narrowed_to(src_ty))
+                } else {
+                    Operand::Const(c)
+                }
+            }
+            other => other,
+        };
         if src_ty == target_ty {
             return src;
         }

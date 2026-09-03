@@ -1128,15 +1128,17 @@ impl Lowerer {
             Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_type(op, lhs, rhs),
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => self.get_expr_type(lhs),
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                let then_ty = self.get_expr_type(then_expr);
-                let else_ty = self.get_expr_type(else_expr);
-                Self::common_type(then_ty, else_ty)
+                // The conditional's result is a value of its C common type —
+                // not a storage type — so type the arms by C semantics. Using
+                // raw storage types here makes an int conditional with a
+                // constant arm (born I64) report I64 and forces a spurious
+                // widen/narrow cast pair around the (now natural-width) merge.
+                Self::common_type(self.ternary_arm_type(then_expr), self.ternary_arm_type(else_expr))
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
-                let cond_ty = self.get_expr_type(cond);
-                let else_ty = self.get_expr_type(else_expr);
-                Self::common_type(cond_ty, else_ty)
-            }
+            Expr::GnuConditional(cond, else_expr, _) => Self::common_type(
+                self.ternary_arm_type(cond),
+                self.ternary_arm_type(else_expr),
+            ),
             Expr::Comma(_, rhs, _) => self.get_expr_type(rhs),
             Expr::PostfixOp(_, inner, _) => self.get_expr_type(inner),
             Expr::AddressOf(_, _) => IrType::Ptr,

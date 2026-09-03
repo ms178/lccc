@@ -915,7 +915,11 @@ impl X86Codegen {
     /// would drop the sign of a negative I32 that a later 64-bit signed use
     /// (without an explicit `movslq`) would read.
     fn emit_cmov_typed(&mut self, cc: &str, src64: &str, dst64: &str, ty: IrType) {
-        if ty.size() <= 4 && ty.is_unsigned() {
+        if ty.size() <= 4 {
+            // 32-bit cmov: only the low 32 bits of each operand are selected
+            // and written, which is exactly the semantics of an I32/U32 select
+            // regardless of signedness. (64-bit cmovs on 32-bit data would
+            // additionally require every arm to be sign-extended to 64 bits.)
             self.state.emit_fmt(format_args!(
                 "    cmov{}l %{}, %{}",
                 cc,
