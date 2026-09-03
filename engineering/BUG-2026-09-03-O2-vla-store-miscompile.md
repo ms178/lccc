@@ -74,3 +74,28 @@ CCC_NO_BIT_IDIOMS / CCC_NO_IF_CONVERT.
 3. Do not add the failing cases to tests/regression until fixed (they are
    intentionally absent). Keep the run_slot_stress default range at 1..20
    (upstream's committed gate), which passes 400/400.
+
+## RESOLUTION (2026-09-03, red-team audit session)
+
+FIXED — and the root cause is NOT in the layout, contrary to the "candidate
+defects" above. A/B builds of the exact upstream commits isolate it:
+
+- `c8683317` (PR #362) still reproduces both failures at -O2/-O3.
+- upstream + the S26 MachInst commit (wide-imm memory-relay operand-size
+  hardening) passes both, matching gcc.
+
+Root cause: a 32-bit constant outside the signed imm32 window (b[3] =
+3041712681) is staged with `movabsq $imm, %rax` and stored by the wide-imm
+memory relay at its DEFAULT S64 width (`movq`), writing 4 bytes past the
+16-byte VLA — exactly a[0]'s low half on the shipped stack ordering. The
+checksum chain amplifies the erased 32 bits by 33^3, matching the observed
+delta (75045033622640 / 33^3 = 2.088e9 = a[0]'s lost low half). This is the
+integer twin of the S26 float-relay defect; the shared-relay hardening fixes
+both. Layout knobs could never mask it (over-wide STORE, not a sharing
+collision); no IR pass knob can mask it (the wrong instruction is emitted for
+-O2-unrolled straight-line VLA stores).
+
+Closed: tests/regression/vla_narrow_const_store_family.c (verified failing on
+c8683317, passing on the fixed tree), slot-stress default range extended to
+1..45 (720/720 four-way). Full analysis:
+engineering/AUDIT-2026-09-03-pr359-362-redteam.md.

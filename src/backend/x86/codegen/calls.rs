@@ -7,7 +7,7 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 /// How a resolved global call target must be emitted.
-enum ResolvedIndirectCall {
+pub(super) enum ResolvedIndirectCall {
     /// func_ptr was `Load(ptr)` with ptr = GlobalAddr(sym)+off: the loaded
     /// VALUE is the target, so fold load+call into the patchable
     /// memory-indirect form `call *sym+off(%rip)` (ff 15).
@@ -155,7 +155,7 @@ impl X86Codegen {
     /// (load the pointer, call through it) is correct for every binding, so
     /// rejecting the fold is strictly safe — and versioned function-pointer
     /// slots are glibc-internal compat shapes, so the cost is nil.
-    fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<ResolvedIndirectCall> {
+    pub(super) fn try_resolve_indirect_call_global(&self, op: &Operand) -> Option<ResolvedIndirectCall> {
         let v = match op {
             Operand::Value(v) => v,
             _ => return None,
