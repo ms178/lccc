@@ -77,11 +77,7 @@ fn push_verdef_entry_with_parent(
 /// provider-side `.gnu.version_d`. Omitting this table makes glibc's internal
 /// `*_rtld_global*@GLIBC_PRIVATE` references look unversioned at load time and
 /// fails before `main` with a misleading undefined-symbol diagnostic.
-fn push_verneed_entry(
-    buf: &mut Vec<u8>,
-    soname_off: usize,
-    versions: &[(String, u16, usize)],
-) {
+fn push_verneed_entry(buf: &mut Vec<u8>, soname_off: usize, versions: &[(String, u16, usize)]) {
     let start = buf.len();
     buf.resize(start + 16, 0);
     w16(buf, start, 1); // vn_version
@@ -96,7 +92,11 @@ fn push_verneed_entry(
         w16(buf, aux + 4, 0); // vna_flags
         w16(buf, aux + 6, *other);
         w32(buf, aux + 8, *name_off as u32);
-        w32(buf, aux + 12, if idx + 1 == versions.len() { 0 } else { 16 });
+        w32(
+            buf,
+            aux + 12,
+            if idx + 1 == versions.len() { 0 } else { 16 },
+        );
     }
 }
 
@@ -253,8 +253,7 @@ pub(super) fn emit_shared_library(
                             // exported), version-script-locals, or -Bsymbolic.
                             let hidden = sym.visibility() != 0; // STV_HIDDEN/PROTECTED/INTERNAL
                             let version_local = version_script.as_ref().is_some_and(|vs| {
-                                vs.any_local_star()
-                                    && !vs.matches_global(&sym_base(&sym.name))
+                                vs.any_local_star() && !vs.matches_global(&sym_base(&sym.name))
                             }) || excluded_syms.contains(sym.name.as_str());
                             let is_func = (gsym.info & 0xf) == STT_FUNC
                                 || sym.sym_type() == STT_FUNC
@@ -738,13 +737,13 @@ pub(super) fn emit_shared_library(
         // The base node (1) carries the SONAME.
         let mut versym = Vec::with_capacity(dynsym_count as usize * 2);
         versym.extend_from_slice(&0u16.to_le_bytes()); // dynsym[0]
-        // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
-        // before the undef-first reorder and the .gnu.hash bucket sort;
-        // iterating it here assigned version indices to the WRONG symbols
-        // once any reordering happened (glibc libc.so: every .symver export
-        // landed on versym 1 "*global*", so versioned references like
-        // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
-        // version from its (still composed) name.
+                                                       // Emit versym in dyn_sym_names' FINAL order. sym_versions was built
+                                                       // before the undef-first reorder and the .gnu.hash bucket sort;
+                                                       // iterating it here assigned version indices to the WRONG symbols
+                                                       // once any reordering happened (glibc libc.so: every .symver export
+                                                       // landed on versym 1 "*global*", so versioned references like
+                                                       // fdopen@GLIBC_2.2.5 failed at load time). Re-derive each entry's
+                                                       // version from its (still composed) name.
         for name in &dyn_sym_names {
             let (ver, hidden): (Option<&str>, bool) = if let Some(pos) = name.find("@@") {
                 (Some(&name[pos + 2..]), false)
@@ -780,27 +779,25 @@ pub(super) fn emit_shared_library(
                     } else {
                         let defined = globals
                             .get(name)
-                        .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
-                    let from_script = if defined {
-                        version_script.as_ref().and_then(|vs| {
-                            vs.nodes.iter().find_map(|node| {
-                                node.global_patterns
-                                    .iter()
-                                    .any(|pat| {
-                                        linker_common::wildcard_match_pattern(pat, name)
-                                    })
-                                    .then(|| {
-                                        version_set
-                                            .iter()
-                                            .position(|x| x == &node.name)
-                                            .map(|p| (2 + p) as u16)
-                                    })
-                                    .flatten()
+                            .is_some_and(|g| g.defined_in.is_some() && g.section_idx != SHN_UNDEF);
+                        let from_script = if defined {
+                            version_script.as_ref().and_then(|vs| {
+                                vs.nodes.iter().find_map(|node| {
+                                    node.global_patterns
+                                        .iter()
+                                        .any(|pat| linker_common::wildcard_match_pattern(pat, name))
+                                        .then(|| {
+                                            version_set
+                                                .iter()
+                                                .position(|x| x == &node.name)
+                                                .map(|p| (2 + p) as u16)
+                                        })
+                                        .flatten()
+                                })
                             })
-                        })
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
                         from_script.unwrap_or(1)
                     }
                 }

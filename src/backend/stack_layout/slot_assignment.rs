@@ -149,10 +149,7 @@ pub(super) fn classify_instructions(
                     dest,
                     src:
                         Operand::Const(
-                            IrConst::I8(_)
-                            | IrConst::I16(_)
-                            | IrConst::I32(_)
-                            | IrConst::F32(_),
+                            IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::F32(_),
                         ),
                 } = inst
                 {
@@ -453,7 +450,10 @@ pub(super) fn classify_instructions(
                                 state.i128_values.insert(dest.0);
                             }
                             if crate::common::types::target_is_32bit()
-                                && matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64)
+                                && matches!(
+                                    ty,
+                                    IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64
+                                )
                             {
                                 state.wide_values.insert(dest.0);
                             }
@@ -500,9 +500,7 @@ pub(super) fn classify_instructions(
     // (`compute_value_type_map`, now a fixed point). Any violation here is a
     // future `movl store + movq reload` corruption waiting to happen — catch
     // it at compile time instead of as a kernel-boot miscompile.
-    if std::env::var_os("CCC_VERIFY_SLOT_WIDTHS").is_some()
-        && !state.small_slot_values.is_empty()
-    {
+    if std::env::var_os("CCC_VERIFY_SLOT_WIDTHS").is_some() && !state.small_slot_values.is_empty() {
         let map = crate::backend::common::compute_value_type_map(func);
         let mut bad: Vec<u32> = state
             .small_slot_values
@@ -1190,10 +1188,7 @@ pub(super) fn assign_tier2_liveness_packed_slots(
     // the maximum per-segment sharing for A/B measurement only; it is the
     // risky model (requires the liveness to record every hole exactly) and is
     // therefore never the default.
-    if !coalesce
-        || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some()
-        || has_builtin_setjmp(func)
-    {
+    if !coalesce || std::env::var_os("CCC_NO_TIER2_GRAPH").is_some() || has_builtin_setjmp(func) {
         for mbv in multi_block_values {
             let (slot, new_space) = assign_slot(*non_local_space, mbv.slot_size, 0);
             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
@@ -1356,8 +1351,7 @@ pub(super) fn resolve_copy_aliases(
         // 8-byte movq store into a 4-byte slot corrupts the slot's neighbour.
         // Copy/phi webs carry one type, so a mismatch here can only come from
         // a Cast-fed copy web — keep both values in their own slots instead.
-        if state.small_slot_values.contains(&dest_id)
-            != state.small_slot_values.contains(&root_id)
+        if state.small_slot_values.contains(&dest_id) != state.small_slot_values.contains(&root_id)
         {
             blocked_width_mismatch_count += 1;
             continue;
@@ -1431,7 +1425,8 @@ pub(super) fn propagate_wide_values(
         return;
     }
 
-    let is_wide_ty = |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64);
+    let is_wide_ty =
+        |ty: IrType| matches!(ty, IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64);
 
     for block in &func.blocks {
         for inst in &block.instructions {
@@ -1459,11 +1454,18 @@ pub(super) fn propagate_wide_values(
                         }
                     }
                 }
-                Instruction::BinOp { op, lhs, rhs, ty, .. } if is_wide_ty(*ty) => {
+                Instruction::BinOp {
+                    op, lhs, rhs, ty, ..
+                } if is_wide_ty(*ty) => {
                     if let Operand::Value(v) = lhs {
                         state.wide_values.insert(v.0);
                     }
-                    if !matches!(op, crate::ir::ops::IrBinOp::Shl | crate::ir::ops::IrBinOp::LShr | crate::ir::ops::IrBinOp::AShr) {
+                    if !matches!(
+                        op,
+                        crate::ir::ops::IrBinOp::Shl
+                            | crate::ir::ops::IrBinOp::LShr
+                            | crate::ir::ops::IrBinOp::AShr
+                    ) {
                         if let Operand::Value(v) = rhs {
                             state.wide_values.insert(v.0);
                         }

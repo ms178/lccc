@@ -253,7 +253,11 @@ impl I686Codegen {
                 // Copy the caller's stack argument area.
                 self.state.emit("    leal 8(%ebp), %esi");
                 self.state.emit("    addl $16, %edi");
-                emit!(self.state, "    movl ${}, %ecx", self.incoming_stack_arg_bytes);
+                emit!(
+                    self.state,
+                    "    movl ${}, %ecx",
+                    self.incoming_stack_arg_bytes
+                );
                 self.state.emit("    cld");
                 self.state.emit("    rep movsb");
                 self.state.emit("    popl %edi");
@@ -1864,9 +1868,7 @@ impl I686Codegen {
             }
 
             // GPR-result 256-bit ops.
-            IntrinsicOp::Pmovmskb256
-            | IntrinsicOp::MovemaskPs256
-            | IntrinsicOp::MovemaskPd256 => {
+            IntrinsicOp::Pmovmskb256 | IntrinsicOp::MovemaskPs256 | IntrinsicOp::MovemaskPd256 => {
                 let inst = match op {
                     IntrinsicOp::Pmovmskb256 => "vpmovmskb",
                     IntrinsicOp::MovemaskPs256 => "vmovmskps",
@@ -2127,18 +2129,17 @@ impl I686Codegen {
         match imm {
             8 | 9 | 10 | 11 => {
                 let rc: u16 = match imm {
-                    8 => 0x0000, // nearest-even
-                    9 => 0x0400, // down (floor)
+                    8 => 0x0000,  // nearest-even
+                    9 => 0x0400,  // down (floor)
                     10 => 0x0800, // up (ceil)
-                    _ => 0x0c00, // chop (trunc)
+                    _ => 0x0c00,  // chop (trunc)
                 };
                 self.state.emit("    subl $4, %esp");
                 self.state.emit("    fnstcw (%esp)");
                 self.state.emit("    movw (%esp), %ax");
                 self.state.emit("    movw %ax, %dx");
                 self.state.emit("    andw $0xf3ff, %dx");
-                self.state
-                    .emit_fmt(format_args!("    orw ${}, %dx", rc));
+                self.state.emit_fmt(format_args!("    orw ${}, %dx", rc));
                 self.state.emit("    movw %dx, (%esp)");
                 self.state.emit("    fldcw (%esp)");
                 self.state.emit("    frndint");
@@ -2169,8 +2170,7 @@ impl I686Codegen {
                     return;
                 }
                 self.operand_to_eax(arg);
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", xmm));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
             }
             Operand::Const(IrConst::F32(f)) => {
                 emit!(self.state, "    pushl ${}", f.to_bits() as i32);
@@ -2188,8 +2188,7 @@ impl I686Codegen {
             }
             _ => {
                 self.operand_to_eax(arg);
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", xmm));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
             }
         }
     }
@@ -2205,8 +2204,7 @@ impl I686Codegen {
                     return;
                 }
                 self.operand_to_eax(arg);
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", xmm));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
             }
             Operand::Const(IrConst::F64(f)) => {
                 let bits = f.to_bits();
@@ -2224,8 +2222,7 @@ impl I686Codegen {
             }
             _ => {
                 self.operand_to_eax(arg);
-                self.state
-                    .emit_fmt(format_args!("    movd %eax, %{}", xmm));
+                self.state.emit_fmt(format_args!("    movd %eax, %{}", xmm));
             }
         }
     }
@@ -2346,7 +2343,9 @@ impl I686Codegen {
     /// Emit copysign for 64-bit float (F64): magnitude of x, sign of y.
     fn emit_f64_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         let dsr0 = self.slot_ref(dest_slot);
         let dsr4 = self.slot_ref_offset(dest_slot, 4);
 
@@ -2414,7 +2413,9 @@ impl I686Codegen {
     /// Emit copysign for 32-bit float (F32): magnitude of x, sign of y.
     fn emit_f32_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         let dsr = self.slot_ref(dest_slot);
 
         match x {
@@ -2462,7 +2463,9 @@ impl I686Codegen {
     /// Emit copysign for 80-bit x87 float: magnitude of x, sign of y.
     fn emit_ld_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         let dsr0 = self.slot_ref(dest_slot);
         let dsr4 = self.slot_ref_offset(dest_slot, 4);
         let dsr8 = self.slot_ref_offset(dest_slot, 8);
@@ -2539,7 +2542,9 @@ impl I686Codegen {
     /// sign bit, exactly like the x86-64 btcq contract).
     fn emit_f128_signop(&mut self, dest: &Option<Value>, x: &Operand, abs: bool) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         let mnem = if abs { "btrl" } else { "btcl" };
         if let Some(mut words) = Self::f128_const_words(x) {
             if abs {
@@ -2549,7 +2554,9 @@ impl I686Codegen {
             }
             self.emit_f128_store_words(&words, dest_slot);
         } else if let Operand::Value(xv) = x {
-            let Some(x_slot) = self.state.get_slot(xv.0) else { return };
+            let Some(x_slot) = self.state.get_slot(xv.0) else {
+                return;
+            };
             // Copy the three low dwords, then transform the sign dword.
             for k in 0..3i64 {
                 let sr = self.slot_ref_offset(x_slot, 4 * k);
@@ -2557,10 +2564,8 @@ impl I686Codegen {
                 emit!(self.state, "    movl {}, %eax", sr);
                 emit!(self.state, "    movl %eax, {}", dsr);
             }
-            let xsr = self
-                .slot_ref_offset(x_slot, Self::F128_SIGN_DWORD_OFF);
-            let dsr = self
-                .slot_ref_offset(dest_slot, Self::F128_SIGN_DWORD_OFF);
+            let xsr = self.slot_ref_offset(x_slot, Self::F128_SIGN_DWORD_OFF);
+            let dsr = self.slot_ref_offset(dest_slot, Self::F128_SIGN_DWORD_OFF);
             emit!(self.state, "    movl {}, %eax", xsr);
             emit!(self.state, "    {} $31, %eax", mnem);
             emit!(self.state, "    movl %eax, {}", dsr);
@@ -2575,7 +2580,9 @@ impl I686Codegen {
     /// bytes = x. Pure GPR; `shll $31` isolates y's sign bit.
     fn emit_f128_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         let xw = Self::f128_const_words(x);
         let yw = Self::f128_const_words(y);
         if let (Some(xw_v), Some(yw_v)) = (&xw, &yw) {
@@ -2586,7 +2593,9 @@ impl I686Codegen {
         } else {
             // Low 12 bytes: copy from x (constant x stores immediates).
             match (&xw, x) {
-                (Some(words), _) => self.emit_f128_store_words(&[words[0], words[1], words[2], 0], dest_slot),
+                (Some(words), _) => {
+                    self.emit_f128_store_words(&[words[0], words[1], words[2], 0], dest_slot)
+                }
                 _ => {
                     if let Operand::Value(xv) = x {
                         if let Some(x_slot) = self.state.get_slot(xv.0) {
@@ -2601,8 +2610,7 @@ impl I686Codegen {
                 }
             }
             // Sign dword: magnitude from x, sign from y.
-            let dsr = self
-                .slot_ref_offset(dest_slot, Self::F128_SIGN_DWORD_OFF);
+            let dsr = self.slot_ref_offset(dest_slot, Self::F128_SIGN_DWORD_OFF);
             match (&xw, x) {
                 (Some(words), _) => {
                     emit!(self.state, "    movl ${}, %eax", words[3] & 0x7FFF_FFFF);
@@ -2644,7 +2652,9 @@ impl I686Codegen {
     /// 79 — byte 9 bit 7. Pure GPR, no x87 round-trip (x86-64 contract).
     fn emit_ld_fabs(&mut self, dest: &Option<Value>, x: &Operand) {
         let Some(d) = dest else { return };
-        let Some(dest_slot) = self.state.get_slot(d.0) else { return };
+        let Some(dest_slot) = self.state.get_slot(d.0) else {
+            return;
+        };
         if let Operand::Const(IrConst::LongDouble(_, bytes)) = x {
             let mut b = *bytes;
             b[9] &= 0x7f;
@@ -2652,13 +2662,30 @@ impl I686Codegen {
                 u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
                 u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
             ];
-            emit!(self.state, "    movl ${}, {}", words[0], self.slot_ref_offset(dest_slot, 0));
-            emit!(self.state, "    movl ${}, {}", words[1], self.slot_ref_offset(dest_slot, 4));
+            emit!(
+                self.state,
+                "    movl ${}, {}",
+                words[0],
+                self.slot_ref_offset(dest_slot, 0)
+            );
+            emit!(
+                self.state,
+                "    movl ${}, {}",
+                words[1],
+                self.slot_ref_offset(dest_slot, 4)
+            );
             let b8 = i32::from(b[8]);
             let b9 = i32::from(b[9]);
-            emit!(self.state, "    movl ${}, {}", b8 | (b9 << 8), self.slot_ref_offset(dest_slot, 8));
+            emit!(
+                self.state,
+                "    movl ${}, {}",
+                b8 | (b9 << 8),
+                self.slot_ref_offset(dest_slot, 8)
+            );
         } else if let Operand::Value(xv) = x {
-            let Some(x_slot) = self.state.get_slot(xv.0) else { return };
+            let Some(x_slot) = self.state.get_slot(xv.0) else {
+                return;
+            };
             let xsr0 = self.slot_ref_offset(x_slot, 0);
             let xsr4 = self.slot_ref_offset(x_slot, 4);
             let xsr8 = self.slot_ref_offset(x_slot, 8);

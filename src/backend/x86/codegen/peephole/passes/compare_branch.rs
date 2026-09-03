@@ -37,8 +37,7 @@ fn flags_reader(t: &str) -> bool {
     const READERS: &[&str] = &[
         "cmov", "set", "adc", "sbb", "rcl", "rcr", "pushfq", "popfq", "sahf", "lahf",
     ];
-    READERS.iter().any(|p| t.starts_with(p))
-        || (t.starts_with('j') && !t.starts_with("jmp"))
+    READERS.iter().any(|p| t.starts_with(p)) || (t.starts_with('j') && !t.starts_with("jmp"))
 }
 
 /// True when the instruction ends the flags-observation window: it rewrites
@@ -48,9 +47,9 @@ fn flags_reader(t: &str) -> bool {
 /// producer's vs. the fused cmp's carry).
 fn flags_full_writer(t: &str) -> bool {
     const WRITERS: &[&str] = &[
-        "cmp", "test", "add", "sub", "and", "or", "xor", "neg", "mul", "imul", "div",
-        "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc",
-        "popfq", "clc", "stc", "cmc", "call", "ret", "jmp",
+        "cmp", "test", "add", "sub", "and", "or", "xor", "neg", "mul", "imul", "div", "idiv",
+        "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bts", "btr", "btc", "popfq", "clc", "stc",
+        "cmc", "call", "ret", "jmp",
     ];
     WRITERS.iter().any(|p| t.starts_with(p))
 }
@@ -191,9 +190,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             // relay intervenes — a rax test after `movzbl %al, %r12d` tests
             // a DIFFERENT value), or a test of the relay's destination
             // register.
-            if relay_reg.is_none()
-                && (line == "testq %rax, %rax" || line == "testl %eax, %eax")
-            {
+            if relay_reg.is_none() && (line == "testq %rax, %rax" || line == "testl %eax, %eax") {
                 test_idx = Some(scan);
                 break;
             }
@@ -311,8 +308,7 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         let guard_end = (seq_indices[test_scan + 1] + 64).min(len);
         let mut flags_hazard = false;
         for g in (seq_indices[test_scan + 1] + 1)..guard_end {
-            if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty)
-            {
+            if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty) {
                 continue;
             }
             let gt = infos[g].trimmed(store.get(g)).to_string();

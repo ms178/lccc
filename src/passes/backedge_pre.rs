@@ -259,17 +259,40 @@ struct Parts {
 impl Parts {
     fn of(inst: &Instruction) -> Option<Parts> {
         match inst {
-            Instruction::BinOp { dest, op, lhs, rhs, ty } => {
+            Instruction::BinOp {
+                dest,
+                op,
+                lhs,
+                rhs,
+                ty,
+            } => {
                 if op.can_trap() || !pre_type_ok(*ty) {
                     return None;
                 }
-                Some(Parts { dest: *dest, op: ExprOp::Bin(*op), ty: *ty, lhs: *lhs, rhs: Some(*rhs) })
+                Some(Parts {
+                    dest: *dest,
+                    op: ExprOp::Bin(*op),
+                    ty: *ty,
+                    lhs: *lhs,
+                    rhs: Some(*rhs),
+                })
             }
-            Instruction::Cast { dest, src, from_ty, to_ty } => {
+            Instruction::Cast {
+                dest,
+                src,
+                from_ty,
+                to_ty,
+            } => {
                 if !cast_ok(*from_ty, *to_ty) {
                     return None;
                 }
-                Some(Parts { dest: *dest, op: ExprOp::Cast(*from_ty), ty: *to_ty, lhs: *src, rhs: None })
+                Some(Parts {
+                    dest: *dest,
+                    op: ExprOp::Cast(*from_ty),
+                    ty: *to_ty,
+                    lhs: *src,
+                    rhs: None,
+                })
             }
             _ => None,
         }
@@ -288,12 +311,35 @@ impl Parts {
         Self::key_of(self.op, self.ty, &self.lhs, self.rhs.as_ref())
     }
 
-    fn build(op: ExprOp, ty: IrType, dest: Value, lhs: Operand, rhs: Option<Operand>) -> Instruction {
+    fn build(
+        op: ExprOp,
+        ty: IrType,
+        dest: Value,
+        lhs: Operand,
+        rhs: Option<Operand>,
+    ) -> Instruction {
         match (op, rhs) {
-            (ExprOp::Bin(b), Some(rhs)) => Instruction::BinOp { dest, op: b, lhs, rhs, ty },
-            (ExprOp::Cast(from), _) => Instruction::Cast { dest, src: lhs, from_ty: from, to_ty: ty },
+            (ExprOp::Bin(b), Some(rhs)) => Instruction::BinOp {
+                dest,
+                op: b,
+                lhs,
+                rhs,
+                ty,
+            },
+            (ExprOp::Cast(from), _) => Instruction::Cast {
+                dest,
+                src: lhs,
+                from_ty: from,
+                to_ty: ty,
+            },
             // A binary op without a right operand cannot come out of `of`.
-            (ExprOp::Bin(b), None) => Instruction::BinOp { dest, op: b, lhs, rhs: lhs, ty },
+            (ExprOp::Bin(b), None) => Instruction::BinOp {
+                dest,
+                op: b,
+                lhs,
+                rhs: lhs,
+                ty,
+            },
         }
     }
 }
@@ -317,8 +363,16 @@ fn cast_is_free(from: IrType, to: IrType) -> bool {
 fn fold_const_cast(c: &IrConst, from: IrType, to: IrType) -> Option<IrConst> {
     let (fb, tb) = (int_bits(from)?, int_bits(to)?);
     let v = c.to_i128()?;
-    let v = if from.is_unsigned() || from == IrType::Ptr { zext_to(v, fb) } else { sext_to(v, fb) };
-    Some(if tb == 128 { IrConst::I128(v) } else { IrConst::from_i64(v as i64, to) })
+    let v = if from.is_unsigned() || from == IrType::Ptr {
+        zext_to(v, fb)
+    } else {
+        sext_to(v, fb)
+    };
+    Some(if tb == 128 {
+        IrConst::I128(v)
+    } else {
+        IrConst::from_i64(v as i64, to)
+    })
 }
 
 /// Types this pass carries across the backedge. Decimal and x87 long-double
@@ -475,12 +529,20 @@ fn fold_const_binop(op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Op
                     if y < 0 || y >= i128::from(bits) {
                         return None;
                     }
-                    let xn = if op == IrBinOp::LShr { zext_to(x, bits) } else { sext_to(x, bits) };
+                    let xn = if op == IrBinOp::LShr {
+                        zext_to(x, bits)
+                    } else {
+                        sext_to(x, bits)
+                    };
                     op.eval_i128(xn, y)?
                 }
                 _ => return None,
             };
-            Some(if bits == 128 { IrConst::I128(r) } else { IrConst::from_i64(r as i64, ty) })
+            Some(if bits == 128 {
+                IrConst::I128(r)
+            } else {
+                IrConst::from_i64(r as i64, ty)
+            })
         }
     }
 }
@@ -600,10 +662,16 @@ fn absorbed_by_consumer(func: &IrFunction, defs: &Defs, value: u32, tm: &TargetM
     if defs.uses(value) != 1 {
         return false;
     }
-    let Instruction::BinOp { op, ty, lhs, rhs, .. } = &insts[i] else {
+    let Instruction::BinOp {
+        op, ty, lhs, rhs, ..
+    } = &insts[i]
+    else {
         return false;
     };
-    if matches!(ty, IrType::F128 | IrType::I128 | IrType::U128 | IrType::D32 | IrType::D64) {
+    if matches!(
+        ty,
+        IrType::F128 | IrType::I128 | IrType::U128 | IrType::D32 | IrType::D64
+    ) {
         return false;
     }
     let is_float = ty.is_float();
@@ -625,7 +693,8 @@ fn absorbed_by_consumer(func: &IrFunction, defs: &Defs, value: u32, tm: &TargetM
         }
         IrBinOp::Shl if !is_float => match rhs {
             Operand::Const(c)
-                if c.to_i128().is_some_and(|k| k >= 0 && k <= i128::from(tm.max_scale_shift)) =>
+                if c.to_i128()
+                    .is_some_and(|k| k >= 0 && k <= i128::from(tm.max_scale_shift)) =>
             {
                 Producer::Scale
             }
@@ -633,7 +702,11 @@ fn absorbed_by_consumer(func: &IrFunction, defs: &Defs, value: u32, tm: &TargetM
         },
         _ => return false,
     };
-    for inst in insts.iter().take(usize::min(i + 4, insts.len())).skip(i + 1) {
+    for inst in insts
+        .iter()
+        .take(usize::min(i + 4, insts.len()))
+        .skip(i + 1)
+    {
         match inst {
             Instruction::GetElementPtr { offset, .. } => {
                 if operand_is(offset, value) {
@@ -641,9 +714,13 @@ fn absorbed_by_consumer(func: &IrFunction, defs: &Defs, value: u32, tm: &TargetM
                 }
             }
             Instruction::Load { .. } => {}
-            Instruction::BinOp { op: cop, lhs: cl, rhs: cr, ty: cty, .. }
-                if matches!(cop, IrBinOp::Add | IrBinOp::Sub) && cty == ty =>
-            {
+            Instruction::BinOp {
+                op: cop,
+                lhs: cl,
+                rhs: cr,
+                ty: cty,
+                ..
+            } if matches!(cop, IrBinOp::Add | IrBinOp::Sub) && cty == ty => {
                 let lhs_is = operand_is(cl, value);
                 let rhs_is = operand_is(cr, value);
                 if !lhs_is && !rhs_is {
@@ -810,7 +887,8 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
         let Operand::Value(next) = next else {
             continue;
         };
-        if next == *dest || cx.defs.tainted(dest.0) || cx.defs.tainted(next.0) || !available(&init) {
+        if next == *dest || cx.defs.tainted(dest.0) || cx.defs.tainted(next.0) || !available(&init)
+        {
             continue;
         }
         phis.insert(dest.0, PhiInfo { init, next });
@@ -872,7 +950,9 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
             if cx.defs.tainted(e.0) {
                 continue;
             }
-            let Some((bl, il, pl)) = classify(&p.lhs) else { continue };
+            let Some((bl, il, pl)) = classify(&p.lhs) else {
+                continue;
+            };
             let (br, ir, pr) = match p.rhs.as_ref() {
                 Some(r) => match classify(r) {
                     Some((b, i, is_phi)) => (Some(b), Some(i), is_phi),
@@ -899,11 +979,17 @@ fn plan_loop(cx: &Ctx<'_>, lp: &NaturalLoop, out: &mut Vec<Rewrite>) {
                 continue;
             }
             if absorbed_by_consumer(func, cx.defs, e.0, cx.tm) {
-                explain(e, "top expression is absorbed by its consumer (no instruction saved)");
+                explain(
+                    e,
+                    "top expression is absorbed by its consumer (no instruction saved)",
+                );
                 continue;
             }
             if absorbed_by_consumer(func, cx.defs, e2.0, cx.tm) {
-                explain(e, "bottom expression would lose its fusion by gaining the phi use");
+                explain(
+                    e,
+                    "bottom expression would lose its fusion by gaining the phi use",
+                );
                 continue;
             }
             let (fp, w) = class_weight(ty);
@@ -1001,13 +1087,23 @@ fn fusion_partner_after(insts: &[Instruction], at: usize, limit: usize) -> Optio
     if at == 0 {
         return None;
     }
-    let Instruction::BinOp { dest, op: IrBinOp::Mul | IrBinOp::Shl, ty, .. } = &insts[at - 1] else {
+    let Instruction::BinOp {
+        dest,
+        op: IrBinOp::Mul | IrBinOp::Shl,
+        ty,
+        ..
+    } = &insts[at - 1]
+    else {
         return None;
     };
     (at..usize::min(at + 3, limit)).find(|&j| match &insts[j] {
-        Instruction::BinOp { op: IrBinOp::Add | IrBinOp::Sub, lhs, rhs, ty: cty, .. } => {
-            cty == ty && (operand_is(lhs, dest.0) || operand_is(rhs, dest.0))
-        }
+        Instruction::BinOp {
+            op: IrBinOp::Add | IrBinOp::Sub,
+            lhs,
+            rhs,
+            ty: cty,
+            ..
+        } => cty == ty && (operand_is(lhs, dest.0) || operand_is(rhs, dest.0)),
         Instruction::GetElementPtr { offset, .. } => operand_is(offset, dest.0),
         _ => false,
     })
@@ -1069,7 +1165,13 @@ fn alloc_value(func: &mut IrFunction) -> Value {
     v
 }
 
-fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Defs, env: &EnvConfig) -> usize {
+fn apply(
+    func: &mut IrFunction,
+    rewrites: &[Rewrite],
+    idom: &[usize],
+    defs: &Defs,
+    env: &EnvConfig,
+) -> usize {
     let mut rename: FxHashMap<u32, Value> = FxHashMap::default();
     let mut carried: Vec<Value> = Vec::with_capacity(rewrites.len());
     // Two top expressions in non-dominating blocks (so GVN could not merge
@@ -1089,7 +1191,10 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
             func.fp_expr_tags.remove(&rw.e_dest.0);
             carried.push(q);
             if env.debug {
-                eprintln!("[BEPRE] func={} v{} -> shared v{}", func.name, rw.e_dest.0, q.0);
+                eprintln!(
+                    "[BEPRE] func={} v{} -> shared v{}",
+                    func.name, rw.e_dest.0, q.0
+                );
             }
             continue;
         }
@@ -1217,7 +1322,10 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
     for rw in rewrites {
         if leaked.contains(&rw.e_dest.0) {
             if env.debug {
-                eprintln!("[BEPRE] func={} v{} kept: uses remain after rename", func.name, rw.e_dest.0);
+                eprintln!(
+                    "[BEPRE] func={} v{} kept: uses remain after rename",
+                    func.name, rw.e_dest.0
+                );
             }
             continue;
         }
@@ -1259,7 +1367,14 @@ fn run_round(func: &mut IrFunction, env: &EnvConfig, tm: &TargetModel) -> usize 
 
     let mut rewrites: Vec<Rewrite> = Vec::new();
     {
-        let cx = Ctx { func: &*func, cfg: &cfg, dom: &dom, defs: &defs, tm, env };
+        let cx = Ctx {
+            func: &*func,
+            cfg: &cfg,
+            dom: &dom,
+            defs: &defs,
+            tm,
+            env,
+        };
         for lp in &loops {
             plan_loop(&cx, lp, &mut rewrites);
         }
@@ -1359,11 +1474,22 @@ mod tests {
     }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
-        BasicBlock { label: BlockId(label), instructions, terminator, source_spans: Vec::new() }
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
     }
 
     fn binop(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand, ty: IrType) -> Instruction {
-        Instruction::BinOp { dest: Value(dest), op, lhs, rhs, ty }
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty,
+        }
     }
 
     fn val(v: u32) -> Operand {
@@ -1378,7 +1504,8 @@ mod tests {
     ///   x = phi(1, x'); y = x*x; x' = x+3; z = x'*x'; acc' = acc + (y ^ (z >> 17))
     fn int_recurrence() -> IrFunction {
         let mut f = IrFunction::new("run".into(), IrType::U64, Vec::new(), false);
-        f.blocks.push(block(0, vec![], Terminator::Branch(BlockId(1))));
+        f.blocks
+            .push(block(0, vec![], Terminator::Branch(BlockId(1))));
         f.blocks.push(block(
             1,
             vec![
@@ -1412,7 +1539,11 @@ mod tests {
                     ty: IrType::U64,
                 },
             ],
-            Terminator::CondBranch { cond: val(12), true_label: BlockId(1), false_label: BlockId(2) },
+            Terminator::CondBranch {
+                cond: val(12),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
         ));
         f.blocks.push(block(
             2,
@@ -1427,7 +1558,15 @@ mod tests {
         f.blocks
             .iter()
             .flat_map(|b| b.instructions.iter())
-            .filter(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Mul, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Mul,
+                        ..
+                    }
+                )
+            })
             .count()
     }
 
@@ -1453,17 +1592,28 @@ mod tests {
                 _ => None,
             })
             .expect("carried phi q = phi(1, z)");
-        let q_phi = header.instructions.iter().find(|i| i.dest() == Some(q)).unwrap();
-        let Instruction::Phi { incoming, .. } = q_phi else { unreachable!() };
+        let q_phi = header
+            .instructions
+            .iter()
+            .find(|i| i.dest() == Some(q))
+            .unwrap();
+        let Instruction::Phi { incoming, .. } = q_phi else {
+            unreachable!()
+        };
         assert!(incoming.contains(&(Operand::Const(IrConst::I64(1)), BlockId(0))));
         // v4 is gone and every former use reads q.
-        assert!(header.instructions.iter().all(|i| i.dest() != Some(Value(4))));
+        assert!(header
+            .instructions
+            .iter()
+            .all(|i| i.dest() != Some(Value(4))));
         let xor = header
             .instructions
             .iter()
             .find(|i| i.dest() == Some(Value(7)))
             .unwrap();
-        let Instruction::BinOp { lhs, .. } = xor else { unreachable!() };
+        let Instruction::BinOp { lhs, .. } = xor else {
+            unreachable!()
+        };
         assert_eq!(*lhs, Operand::Value(q));
         // Phis stay a prefix and ids are fresh.
         assert!(first_non_phi(header) == 4);
@@ -1503,6 +1653,9 @@ mod tests {
         let defs = Defs::build(&f, 16);
         let tm = TargetModel::detect();
         assert!(absorbed_by_consumer(&f, &defs, 1, &tm));
-        assert!(!absorbed_by_consumer(&f, &defs, 3, &tm), "x*7 is a real multiply on x86");
+        assert!(
+            !absorbed_by_consumer(&f, &defs, 3, &tm),
+            "x*7 is a real multiply on x86"
+        );
     }
 }

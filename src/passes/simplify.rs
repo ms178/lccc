@@ -62,11 +62,11 @@
 //! - select Const(nonzero), a, b => a (constant true condition)
 
 use crate::common::types::IrType;
+use crate::ir::instruction::Terminator;
 use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrFunction, IrModule, IrUnaryOp, Operand,
     Value,
 };
-use crate::ir::instruction::Terminator;
 
 /// Run algebraic simplification on the module.
 /// Returns the number of instructions simplified.
@@ -475,7 +475,11 @@ struct UnaryDef {
 /// Peel integer->integer Cast chains (optionally only same-carrier-size
 /// casts — used on the condition/clz-operand side, where only a same-size
 /// cast is guaranteed to preserve zero-ness) off an operand.
-fn peel_int_cast_chain(mut op: Operand, cast_defs: &[Option<CastDef>], same_size_only: bool) -> Operand {
+fn peel_int_cast_chain(
+    mut op: Operand,
+    cast_defs: &[Option<CastDef>],
+    same_size_only: bool,
+) -> Operand {
     for _ in 0..32 {
         let Operand::Value(v) = op else { break };
         match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
@@ -484,8 +488,9 @@ fn peel_int_cast_chain(mut op: Operand, cast_defs: &[Option<CastDef>], same_size
                 from_ty,
                 to_ty,
                 ..
-            }) if from_ty.is_integer() && to_ty.is_integer() && (!same_size_only
-                || from_ty.size() == to_ty.size()) =>
+            }) if from_ty.is_integer()
+                && to_ty.is_integer()
+                && (!same_size_only || from_ty.size() == to_ty.size()) =>
             {
                 op = *src;
             }
@@ -583,15 +588,13 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     src,
                     from_ty,
                     to_ty,
-                }
-                    if from_ty.is_integer()
-                        && to_ty.is_integer()
-                        && from_ty.size() > to_ty.size() =>
+                } if from_ty.is_integer()
+                    && to_ty.is_integer()
+                    && from_ty.size() > to_ty.size() =>
                 {
                     if let Operand::Value(s) = src {
                         if let Some(Some(inner)) = cast_defs.get(s.0 as usize) {
-                            let is_round_trip = inner.to_ty == *from_ty
-                                && inner.from_ty == *to_ty;
+                            let is_round_trip = inner.to_ty == *from_ty && inner.from_ty == *to_ty;
                             let root = peel_int_cast_chain(inner.src, &cast_defs, true);
                             let bitop_root = match root {
                                 Operand::Value(rv) => matches!(
@@ -669,9 +672,7 @@ fn clz_ctz_zero_guard_replacement(
     }
     // The condition must select the intrinsic arm exactly when its operand is
     // nonzero (same value up to zero-ness-preserving casts).
-    if peel_int_cast_chain(*cond, cast_defs, true)
-        != peel_int_cast_chain(src, cast_defs, true)
-    {
+    if peel_int_cast_chain(*cond, cast_defs, true) != peel_int_cast_chain(src, cast_defs, true) {
         return None;
     }
     Some(*true_val)
@@ -821,14 +822,13 @@ fn try_simplify_with_types(
             // select(cond != 0 -> clz/ctz(x), else W) => clz/ctz(x): the IR
             // defines Clz(0)/Ctz(0) == width, so the intrinsic arm already
             // produces W for zero and the guarded ternary is redundant.
-            if let Some(t) = clz_ctz_zero_guard_replacement(
-                cond,
-                true_val,
-                false_val,
-                cast_defs,
-                unary_defs,
-            ) {
-                return Some(Instruction::Copy { dest: *dest, src: t });
+            if let Some(t) =
+                clz_ctz_zero_guard_replacement(cond, true_val, false_val, cast_defs, unary_defs)
+            {
+                return Some(Instruction::Copy {
+                    dest: *dest,
+                    src: t,
+                });
             }
             None
         }
@@ -1593,7 +1593,8 @@ fn simplify_binop(
                     return Some(Instruction::Copy { dest, src: *rhs });
                 }
                 // Reassociation: (x + C1) + C2 => x + (C1 + C2)
-                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                if let Some(inst) = try_reassociate_add(dest, lhs, rhs, ty, binop_defs, use_counts)
+                {
                     return Some(inst);
                 }
             }
@@ -1613,7 +1614,8 @@ fn simplify_binop(
             if !is_float {
                 // Reassociation: (x + C1) - C2 => x + (C1 - C2)
                 // Also: (x - C1) - C2 => x - (C1 + C2)
-                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                if let Some(inst) = try_reassociate_sub(dest, lhs, rhs, ty, binop_defs, use_counts)
+                {
                     return Some(inst);
                 }
                 // x - (neg y) => x + y (eliminate negation)
@@ -1675,7 +1677,8 @@ fn simplify_binop(
             }
             // Reassociation: (x * C1) * C2 => x * (C1 * C2) (integers only)
             if !is_float {
-                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs, use_counts) {
+                if let Some(inst) = try_reassociate_mul(dest, lhs, rhs, ty, binop_defs, use_counts)
+                {
                     return Some(inst);
                 }
             }
@@ -1844,7 +1847,8 @@ fn simplify_binop(
                 return Some(Instruction::Copy { dest, src: *lhs });
             }
             // Reassociation: (x | C1) | C2 => x | (C1 | C2)
-            if let Some(inst) = try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs, use_counts)
+            if let Some(inst) =
+                try_reassociate_bitwise(dest, IrBinOp::Or, lhs, rhs, ty, binop_defs, use_counts)
             {
                 return Some(inst);
             }
@@ -1894,7 +1898,9 @@ fn simplify_binop(
             }
             // Reassociation: (x << C1) << C2 => x << (C1 + C2)
             // Also for >>: (x >> C1) >> C2 => x >> (C1 + C2)
-            if let Some(inst) = try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs, use_counts) {
+            if let Some(inst) =
+                try_reassociate_shift(dest, op, lhs, rhs, ty, binop_defs, use_counts)
+            {
                 return Some(inst);
             }
         }

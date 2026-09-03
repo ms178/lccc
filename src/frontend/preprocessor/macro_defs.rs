@@ -155,9 +155,7 @@ impl MacroTable {
         Self {
             macros: FxHashMap::default(),
             counter: Cell::new(0),
-            line_resolver: std::cell::RefCell::new(
-                super::text_processing::LineResolver::Flat(1),
-            ),
+            line_resolver: std::cell::RefCell::new(super::text_processing::LineResolver::Flat(1)),
             line_offset_base: Cell::new(0),
             line_override: Cell::new(None),
             line_pinned: Cell::new(None),
@@ -651,7 +649,7 @@ impl MacroTable {
         }
     }
 
-        /// Handle a `_Pragma("...")` operator: queue the de-escaped string
+    /// Handle a `_Pragma("...")` operator: queue the de-escaped string
     /// literal content as a pending pragma (C99 §6.10.9.1 — `\\"` becomes
     /// `"`, `\\\\` becomes `\\`), removing the operator from the token
     /// stream. Returns the index just past the closing `)`. On any parse
@@ -725,9 +723,7 @@ impl MacroTable {
         let et = expanded.trim();
         // Optional encoding prefix (L, u, U, u8) before the string literal.
         let mut p = 0;
-        while p < et.len()
-            && (et.as_bytes()[p].is_ascii_alphabetic() || et.as_bytes()[p] == b'8')
-        {
+        while p < et.len() && (et.as_bytes()[p].is_ascii_alphabetic() || et.as_bytes()[p] == b'8') {
             p += 1;
         }
         let et = et[p..].trim_start();

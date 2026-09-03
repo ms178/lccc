@@ -80,9 +80,14 @@ enum PtrDef {
     Alloca,
     Global(Box<str>),
     /// Constant-offset GEP: address = base + delta bytes.
-    GepConst { base: u32, delta: i64 },
+    GepConst {
+        base: u32,
+        delta: i64,
+    },
     /// Variable-offset GEP: address = base + unknown.
-    GepVar { base: u32 },
+    GepVar {
+        base: u32,
+    },
     CopyOf(u32),
     /// Param, phi, or anything computed: opaque root by value id.
     Opaque,
@@ -128,10 +133,7 @@ impl DseContext {
                         defs.insert(dest.0, PtrDef::Global(name.as_str().into()));
                     }
                     Instruction::GetElementPtr {
-                        dest,
-                        base,
-                        offset,
-                        ..
+                        dest, base, offset, ..
                     } => {
                         let d = match offset {
                             Operand::Const(c) => PtrDef::GepConst {
@@ -254,9 +256,7 @@ fn compute_closed_allocas(func: &IrFunction, defs: &FxHashMap<u32, PtrDef>) -> F
             }
         }
     }
-    let open = |v: u32,
-                derived: &FxHashMap<u32, u32>,
-                closed: &mut FxHashSet<u32>| {
+    let open = |v: u32, derived: &FxHashMap<u32, u32>, closed: &mut FxHashSet<u32>| {
         if let Some(&root) = derived.get(&v) {
             closed.remove(&root);
         }
@@ -278,10 +278,7 @@ fn compute_closed_allocas(func: &IrFunction, defs: &FxHashMap<u32, PtrDef>) -> F
                 // Deriving positions (already in `derived`).
                 Instruction::Copy { .. } | Instruction::Alloca { .. } => {}
                 Instruction::GetElementPtr {
-                    base,
-                    offset,
-                    dest,
-                    ..
+                    base, offset, dest, ..
                 } => {
                     if !matches!(offset, Operand::Const(_)) {
                         // Variable-offset GEP on an alloca chain: the result
@@ -330,8 +327,9 @@ fn roots_may_alias(a: &CellRoot, b: &CellRoot) -> bool {
         (CellRoot::Alloca(x), CellRoot::Alloca(y)) => x == y,
         (CellRoot::Global(x), CellRoot::Global(y)) => x == y,
         // Distinct allocas / distinct globals are provably disjoint.
-        (CellRoot::Alloca(_), CellRoot::Global(_))
-        | (CellRoot::Global(_), CellRoot::Alloca(_)) => false,
+        (CellRoot::Alloca(_), CellRoot::Global(_)) | (CellRoot::Global(_), CellRoot::Alloca(_)) => {
+            false
+        }
         // An arbitrary pointer can name any open object.
         (CellRoot::Other(_), _) | (_, CellRoot::Other(_)) => true,
     }
@@ -366,10 +364,7 @@ fn kill_opaque(pending: &mut Vec<Pending>, ctx: &DseContext) {
 }
 
 /// Backward scan of one block. Returns indices of dead stores.
-fn dse_block(
-    block: &crate::ir::reexports::BasicBlock,
-    ctx: &DseContext,
-) -> Vec<usize> {
+fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<usize> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut dead: Vec<usize> = Vec::new();
     for ii in (0..block.instructions.len()).rev() {
@@ -399,9 +394,10 @@ fn dse_block(
                     if size >= 0 {
                         // Exact cell: is a pending later store fully covering it?
                         if !*volatile {
-                            if let Some(_p) = pending.iter().find(|p| {
-                                p.root == addr.root && p.offset == off && p.size >= size
-                            }) {
+                            if let Some(_p) = pending
+                                .iter()
+                                .find(|p| p.root == addr.root && p.offset == off && p.size >= size)
+                            {
                                 dead.push(ii);
                                 // The dead store is removed, but the pending
                                 // overwriter stays: an even earlier store to
@@ -451,10 +447,9 @@ fn dse_block(
                             }
                         });
                     }
-                    Some(CellAddr {
-                        root,
-                        offset: None,
-                    }) => kill_unknown_offset(&mut pending, &root),
+                    Some(CellAddr { root, offset: None }) => {
+                        kill_unknown_offset(&mut pending, &root)
+                    }
                     None => kill_opaque(&mut pending, ctx),
                 }
             }
@@ -820,7 +815,10 @@ mod tests {
             source_spans: Vec::new(),
         });
         let n = eliminate_dead_stores(&mut f);
-        assert_eq!(n, 0, "&x escapes into sink(): the first store is observable");
+        assert_eq!(
+            n, 0,
+            "&x escapes into sink(): the first store is observable"
+        );
     }
 
     #[test]

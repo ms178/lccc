@@ -307,8 +307,7 @@ impl Lowerer {
                     .get(fname.as_str())
                     .map(|s| {
                         s.ret_eightbyte_classes.len() == 2
-                            && s
-                                .ret_eightbyte_classes
+                            && s.ret_eightbyte_classes
                                 .iter()
                                 .all(|c| *c == crate::common::types::EightbyteClass::Sse)
                     })

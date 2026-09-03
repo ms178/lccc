@@ -28,13 +28,10 @@ impl Lowerer {
 
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
-        let has_declarations = compound
-            .items
-            .iter()
-            .any(|item| {
-                matches!(item, BlockItem::Declaration(_))
-                    || matches!(item, BlockItem::NestedFunction(_))
-            });
+        let has_declarations = compound.items.iter().any(|item| {
+            matches!(item, BlockItem::Declaration(_))
+                || matches!(item, BlockItem::NestedFunction(_))
+        });
 
         if has_declarations {
             // Push a scope frame to track additions/modifications in this block.
@@ -1554,7 +1551,11 @@ impl Lowerer {
         let mut result: Option<Value> = None;
         // With a runtime element size, the constant dimension product folds
         // separately and the element factor is multiplied in at the end.
-        let mut const_product: usize = if elem_runtime.is_some() { 1 } else { base_elem_size };
+        let mut const_product: usize = if elem_runtime.is_some() {
+            1
+        } else {
+            base_elem_size
+        };
 
         for expr in array_dims.iter().copied().flatten() {
             if let Some(const_val) = self.expr_as_array_size(expr) {
@@ -1948,9 +1949,9 @@ impl Lowerer {
 
         // Locate the first VLA member (pure probe — the walk below produces
         // the size Values, so probing must not emit).
-        let vla_idx = fields.iter().position(|f| {
-            f.bit_width.is_none() && self.field_vla_runtime_size_probe(f)
-        });
+        let vla_idx = fields
+            .iter()
+            .position(|f| f.bit_width.is_none() && self.field_vla_runtime_size_probe(f));
         let Some(vla_idx) = vla_idx else { return None };
 
         // Union size is the max of members, not the sum. The VLA member is
@@ -1966,12 +1967,8 @@ impl Lowerer {
         // before it is fixed-size and its exact offset (including any
         // pre-VLA bitfield units) is already in the static layout.
         let max_field_align = if is_packed { Some(1) } else { pragma_pack };
-        let layout = self.compute_struct_union_layout_packed(
-            fields,
-            false,
-            max_field_align,
-            reverse_sso,
-        );
+        let layout =
+            self.compute_struct_union_layout_packed(fields, false, max_field_align, reverse_sso);
         let vla_member_static_offset = fields[..vla_idx]
             .iter()
             .filter_map(|f| {

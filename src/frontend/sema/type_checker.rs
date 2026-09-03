@@ -327,8 +327,8 @@ impl<'a> ExprTypeChecker<'a> {
                     if let Expr::StmtExpr(inner_compound, _) = expr {
                         let scope = self.build_compound_scope(compound, None);
                         if !scope.is_empty() {
-                            if let Some(ctype) = self
-                                .infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
+                            if let Some(ctype) =
+                                self.infer_stmt_expr_ctype_with_scope(inner_compound, Some(&scope))
                             {
                                 return Some(ctype);
                             }

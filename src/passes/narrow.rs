@@ -726,7 +726,11 @@ fn narrow_binops_without_cast(
                 // signedness can change the value when widened back to 64 bits
                 // (sign-extend vs zero-extend) even when low bits match
                 // (Regehr yarpgen fix 4d9913e7).
-                let op_narrow_ty = if *ty == IrType::I64 { IrType::I32 } else { IrType::U32 };
+                let op_narrow_ty = if *ty == IrType::I64 {
+                    IrType::I32
+                } else {
+                    IrType::U32
+                };
 
                 let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
                     (Some(lt), Some(rt)) if lt == rt && lt == op_narrow_ty => lt,

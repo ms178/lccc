@@ -929,7 +929,8 @@ impl ElfWriter {
             (false, true, _) => RelocType::MovwUabsG2Nc,
         };
         let word = super::encoder::movw_word(is_movz, rd, is_64, hw, 0);
-        self.base.add_reloc(reloc_type.elf_type(), symbol.to_string(), 0);
+        self.base
+            .add_reloc(reloc_type.elf_type(), symbol.to_string(), 0);
         self.base.emit_u32_le(word);
         Ok(())
     }
@@ -1124,8 +1125,8 @@ mod org_and_branch_tests {
 
     #[test]
     fn org_accepts_absolute_and_arithmetic_exprs() {
-        let writer = assemble_to_writer(".text\nnop\n.org 0x20\nnop\n.org . + 0x10\n")
-            .expect("assembles");
+        let writer =
+            assemble_to_writer(".text\nnop\n.org 0x20\nnop\n.org . + 0x10\n").expect("assembles");
         // nop(4) -> .org 0x20 -> nop(36) -> .org . + 0x10 = 52.
         assert_eq!(text_of(&writer).len(), 0x34);
     }
@@ -1239,8 +1240,8 @@ mod movw_tests {
         .expect("assembles");
         let data = text_of(&writer);
         let v = (-10526724i64) as u64; // 0 - 4 - 10526720
-        // Base words: sf=1, opc=10/11, fixed "100101" at bits 28-23
-        // (i.e. 0b1010_0101 << 23), then hw at 22-21 and imm16 at 20-5.
+                                       // Base words: sf=1, opc=10/11, fixed "100101" at bits 28-23
+                                       // (i.e. 0b1010_0101 << 23), then hw at 22-21 and imm16 at 20-5.
         let want = [
             0xD2800000u32 | (2 << 21) | (((v >> 32) & 0xFFFF) as u32) << 5,
             0xF2800000u32 | (1 << 21) | (((v >> 16) & 0xFFFF) as u32) << 5,
@@ -1275,7 +1276,8 @@ mod movw_tests {
     #[test]
     fn movw_overflow_and_movn_rejections() {
         // :abs_g0: with a value wider than 16 bits must be rejected.
-        let overflow = assemble_to_writer(".text\nval_set:\nret\n.set v, 70000\nmovz x2, :abs_g0:v\n");
+        let overflow =
+            assemble_to_writer(".text\nval_set:\nret\n.set v, 70000\nmovz x2, :abs_g0:v\n");
         assert!(overflow.is_err(), "abs_g0 overflow must be rejected");
         // A value that fits must pass.
         let fits = assemble_to_writer(".text\n.set v, 70000\nmovz x2, :abs_g1:v\n").expect("fits");

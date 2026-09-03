@@ -130,13 +130,11 @@ impl I686Codegen {
         // constant (writable before relocation, RELRO afterwards). The
         // template itself is never executed from here; only its copied
         // image on the stack runs. ──────────────────────────────────────
-        self.state
-            .trampoline_data_blocks
-            .push(format!(
-                "\n    .section .data.rel.ro,\"aw\"\n{}:\n    .byte 0xB9\n    .long 0\n\
+        self.state.trampoline_data_blocks.push(format!(
+            "\n    .section .data.rel.ro,\"aw\"\n{}:\n    .byte 0xB9\n    .long 0\n\
                  \x20    .byte 0xFF, 0x25\n    .long {}\n{}:\n    .long {}\n    .text",
-                tpl, slot, slot, func,
-            ));
+            tpl, slot, slot, func,
+        ));
 
         // ── Stage inputs with STRICT caller-saved-only discipline ────────
         // The i686 register allocator owns %ebx/%esi/%edi homes across this

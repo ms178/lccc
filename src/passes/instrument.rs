@@ -27,8 +27,8 @@
 //!
 //! Kill switch: `CCC_NO_INSTRUMENT=1`.
 use crate::common::types::IrType;
-use crate::ir::reexports::{CallInfo, Instruction, Operand, Terminator, Value};
 use crate::ir::module::{IrFunction, IrModule};
+use crate::ir::reexports::{CallInfo, Instruction, Operand, Terminator, Value};
 
 const HOOK_ENTER: &str = "__cyg_profile_func_enter";
 const HOOK_EXIT: &str = "__cyg_profile_func_exit";

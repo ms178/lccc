@@ -288,7 +288,10 @@ fn update_upper32_zero(t: &str, upper32_zero: &mut [bool]) {
 fn family_of_reg_name(name: &str) -> Option<RegId> {
     let n = name.trim_start_matches('%');
     for w in [W64, W32, W16, W8] {
-        if let Some(p) = REG_NAMES[w].iter().position(|r| r.trim_start_matches('%') == n) {
+        if let Some(p) = REG_NAMES[w]
+            .iter()
+            .position(|r| r.trim_start_matches('%') == n)
+        {
             return Some(p as RegId);
         }
     }

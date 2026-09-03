@@ -126,7 +126,9 @@ impl RiscvCodegen {
                             crate::ir::reexports::IrUnaryOp::Clz
                                 | crate::ir::reexports::IrUnaryOp::Ctz
                                 | crate::ir::reexports::IrUnaryOp::Popcount
-                        ) && !ty.is_float() && ty.size() <= 4 {
+                        ) && !ty.is_float()
+                            && ty.size() <= 4
+                        {
                             nonneg.insert(dest.0);
                         }
                     }
@@ -187,8 +189,7 @@ impl RiscvCodegen {
         // a live value out from under a later argument.  t-regs stay reserved
         // as emitter scratch (t0 acc / t1 secondary / t2 static chain and
         // indirect-call target / t3–t5 call staging / t6 jump tables).
-        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> =
-            if !self.state.disable_regalloc
+        let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
                 && Self::riscv_caller_pool_eligible(func)
@@ -198,13 +199,11 @@ impl RiscvCodegen {
                 // contract).  Belt and suspenders: refuse the pool outright
                 // otherwise.  Also re-asserts call-freeness.
                 && crate::backend::regalloc::riscv_param_caller_homes_safe(func)
-            {
-                (12..=19)
-                    .map(crate::backend::regalloc::PhysReg)
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        {
+            (12..=19).map(crate::backend::regalloc::PhysReg).collect()
+        } else {
+            Vec::new()
+        };
         let call_arg_regs = caller_saved_regs.clone();
         let (reg_assigned, cached_liveness, _caller_save_spans, accumulator_assignments) =
             crate::backend::generation::run_regalloc_and_merge_clobbers_ex(
@@ -847,8 +846,7 @@ impl RiscvCodegen {
                 // trip.  Sub-64-bit homes keep the sign/zero-filling extend
                 // (canonical-form discipline: homes hold sext/zext values).
                 let home = self.reg_assignments.get(&dest.0).copied();
-                let is_word64 =
-                    matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
+                let is_word64 = matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr);
                 if let Some(home) = home {
                     let home_name = callee_saved_name(home);
                     let arg = RISCV_ARG_REGS[reg_idx];

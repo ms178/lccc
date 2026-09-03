@@ -184,7 +184,6 @@ pub(super) fn i686_clobber_to_phys(clobber: &str) -> Option<PhysReg> {
 }
 
 impl I686Codegen {
-
     /// Pop the cached x87 top-of-stack copy, if one is live. The slot copy
     /// was already written by the non-popping `fstl`, so this is purely an
     /// FP-stack hygiene step (bounded depth); the popped value is dead.
@@ -1783,8 +1782,18 @@ impl I686Codegen {
             if let Operand::Const(IrConst::D64(bits)) = arg {
                 let lo = (bits & 0xFFFF_FFFF) as u32;
                 let hi = (bits >> 32) as u32;
-                emit!(self.state, "    movl ${}, {}(%esp)", lo as i32, stack_offset);
-                emit!(self.state, "    movl ${}, {}(%esp)", hi as i32, stack_offset + 4);
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    lo as i32,
+                    stack_offset
+                );
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    hi as i32,
+                    stack_offset + 4
+                );
             } else {
                 self.operand_to_eax(arg);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);

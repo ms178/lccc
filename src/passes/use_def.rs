@@ -301,7 +301,10 @@ impl UseDefInfo {
     /// Where `v` is defined. Out-of-range IDs report [`DefLoc::none`].
     #[inline]
     pub fn def_of(&self, v: u32) -> DefLoc {
-        self.def_loc.get(v as usize).copied().unwrap_or(DefLoc::none())
+        self.def_loc
+            .get(v as usize)
+            .copied()
+            .unwrap_or(DefLoc::none())
     }
 
     /// The instruction defining `v`, or `None` for parameters, undefined
@@ -512,7 +515,10 @@ mod tests {
         let info = UseDefInfo::build(&func);
 
         let uses0 = info.uses_of(0);
-        assert_eq!(uses0, &[UseLoc::instruction(0, 1), UseLoc::instruction(0, 1)]);
+        assert_eq!(
+            uses0,
+            &[UseLoc::instruction(0, 1), UseLoc::instruction(0, 1)]
+        );
         // The duplicate collapses for consumers that want distinct sites.
         assert_eq!(
             info.use_insts_of(0).collect::<Vec<_>>(),

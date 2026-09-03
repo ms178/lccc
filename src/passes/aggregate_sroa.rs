@@ -456,8 +456,8 @@ fn run_function(func: &mut IrFunction) -> usize {
                         // memjrnlCreateFile's `copy = *p; memset(p,0,..)` was
                         // forwarded across the memset by the old Store/Memcpy-
                         // only scan (speedtest1 --testset json SIGSEGV).
-                        let src_call_private = s.alloca_size.contains_key(&sr)
-                            && !any_escape(&s.escapes, &s.gep, sr);
+                        let src_call_private =
+                            s.alloca_size.contains_key(&sr) && !any_escape(&s.escapes, &s.gep, sr);
                         let mut src_dirty = false;
                         for k in (mi + 1)..ii {
                             if let Some(inst_k) = block.instructions.get(k) {

@@ -96,7 +96,10 @@ pub fn parse_decimal_literal(text: &str) -> Option<ExactDecimal> {
             exponent += trailing as i64;
         }
     }
-    Some(ExactDecimal { digits, exponent: exponent.clamp(-(1 << 30), (1 << 30) - 1) as i32 })
+    Some(ExactDecimal {
+        digits,
+        exponent: exponent.clamp(-(1 << 30), (1 << 30) - 1) as i32,
+    })
 }
 
 /// Divide the digit vector by 10 once, rounding half-even on the removed
@@ -239,7 +242,12 @@ fn encode_fields(p: &WidthParams, digits: &[u8], exponent: i32) -> (Option<(i32,
 /// Encode a decimal value into a BID32 bit pattern.
 pub fn encode_bid32(neg: bool, digits: &[u8], exponent: i32) -> u32 {
     let sign: u32 = if neg { 0x8000_0000 } else { 0 };
-    let p = WidthParams { prec: 7, bias: 96, emin: -95, emax: 96 };
+    let p = WidthParams {
+        prec: 7,
+        bias: 96,
+        emin: -95,
+        emax: 96,
+    };
     let (r, ef) = encode_fields(&p, digits, exponent);
     match r {
         None => {
@@ -263,7 +271,12 @@ pub fn encode_bid32(neg: bool, digits: &[u8], exponent: i32) -> u32 {
 /// Encode a decimal value into a BID64 bit pattern.
 pub fn encode_bid64(neg: bool, digits: &[u8], exponent: i32) -> u64 {
     let sign: u64 = if neg { 0x8000_0000_0000_0000 } else { 0 };
-    let p = WidthParams { prec: 16, bias: 398, emin: -383, emax: 384 };
+    let p = WidthParams {
+        prec: 16,
+        bias: 398,
+        emin: -383,
+        emax: 384,
+    };
     let (r, ef) = encode_fields(&p, digits, exponent);
     match r {
         None => {
@@ -287,7 +300,12 @@ pub fn encode_bid64(neg: bool, digits: &[u8], exponent: i32) -> u64 {
 /// Encode a decimal value into a BID128 bit pattern, returned (hi, lo).
 pub fn encode_bid128(neg: bool, digits: &[u8], exponent: i32) -> (u64, u64) {
     let sign: u64 = if neg { 0x8000_0000_0000_0000 } else { 0 };
-    let p = WidthParams { prec: 34, bias: 6176, emin: -6143, emax: 6144 };
+    let p = WidthParams {
+        prec: 34,
+        bias: 6176,
+        emin: -6143,
+        emax: 6144,
+    };
     let (r, ef) = encode_fields(&p, digits, exponent);
     match r {
         None => {

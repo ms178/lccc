@@ -435,7 +435,11 @@ impl IrConst {
             IrConst::I64(v) => Some(v),
             IrConst::I128(v) => Some(v as i64),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::D32(_) | IrConst::D64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_)
+            | IrConst::F64(_)
+            | IrConst::D32(_)
+            | IrConst::D64(_)
+            | IrConst::LongDouble(..) => None,
         }
     }
 
@@ -449,7 +453,11 @@ impl IrConst {
             IrConst::I64(v) => Some(v as i128),
             IrConst::I128(v) => Some(v),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::D32(_) | IrConst::D64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_)
+            | IrConst::F64(_)
+            | IrConst::D32(_)
+            | IrConst::D64(_)
+            | IrConst::LongDouble(..) => None,
         }
     }
 
@@ -462,7 +470,11 @@ impl IrConst {
             IrConst::I64(v) => Some(v as u64),
             IrConst::I128(v) => Some(v as u64),
             IrConst::Zero => Some(0),
-            IrConst::F32(_) | IrConst::F64(_) | IrConst::D32(_) | IrConst::D64(_) | IrConst::LongDouble(..) => None,
+            IrConst::F32(_)
+            | IrConst::F64(_)
+            | IrConst::D32(_)
+            | IrConst::D64(_)
+            | IrConst::LongDouble(..) => None,
         }
     }
 

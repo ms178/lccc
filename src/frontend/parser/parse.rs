@@ -152,8 +152,7 @@ pub(super) mod parsed_attr_flag {
 /// Boolean attributes are stored as a packed bitfield (`flags`) for memory
 /// efficiency — 19 booleans collapse from 19 bytes into 4 bytes. Accessor
 /// methods provide the same API as the old struct fields.
-#[derive(Default)]
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub(super) struct ParsedDeclAttrs {
     /// Packed boolean flags — see `parsed_attr_flag` constants.
     pub(super) flags: u32,
@@ -1055,13 +1054,7 @@ impl Parser {
     /// scalar_storage_order: Some(true) = big-endian, Some(false) = little-endian, None = unspecified.
     pub(super) fn parse_gcc_attributes(
         &mut self,
-    ) -> (
-        bool,
-        Option<usize>,
-        Option<ModeKind>,
-        bool,
-        Option<bool>,
-    ) {
+    ) -> (bool, Option<usize>, Option<ModeKind>, bool, Option<bool>) {
         let mut is_packed = false;
         let mut aligned = None;
         let mut mode_kind: Option<ModeKind> = None;

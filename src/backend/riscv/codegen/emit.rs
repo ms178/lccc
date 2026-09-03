@@ -388,10 +388,12 @@ impl RiscvCodegen {
                             .emit_fmt(format_args!("    li t0, {}", bits as i64));
                     }
                     IrConst::D32(v) => {
-                        self.state.emit_fmt(format_args!("    li t0, {}", *v as i64));
+                        self.state
+                            .emit_fmt(format_args!("    li t0, {}", *v as i64));
                     }
                     IrConst::D64(v) => {
-                        self.state.emit_fmt(format_args!("    li t0, {}", *v as i64));
+                        self.state
+                            .emit_fmt(format_args!("    li t0, {}", *v as i64));
                     }
                     IrConst::F64(v) => {
                         let bits = v.to_bits();

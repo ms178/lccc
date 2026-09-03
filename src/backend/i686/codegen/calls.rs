@@ -147,7 +147,11 @@ impl I686Codegen {
                     let ty = arg_types[i];
                     // D64: BID bit container, moved as an integer pair (never
                     // through x87 — that would reinterpret the bits).
-                    if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
+                    if ty == IrType::F64
+                        || ty == IrType::I64
+                        || ty == IrType::U64
+                        || ty == IrType::D64
+                    {
                         self.emit_call_8byte_stack_arg(&args[i], ty, stack_offset);
                         stack_offset += 8;
                     } else {

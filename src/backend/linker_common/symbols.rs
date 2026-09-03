@@ -162,7 +162,8 @@ pub fn is_layout_anchor_symbol(name: &str) -> bool {
             | "__rel_iplt_start"
             | "__rel_iplt_end"
             | "__GNU_EH_FRAME_HDR"
-    ) || name.starts_with("__start_") || name.starts_with("__stop_")
+    ) || name.starts_with("__start_")
+        || name.starts_with("__stop_")
 }
 
 pub fn is_linker_defined_symbol(name: &str) -> bool {

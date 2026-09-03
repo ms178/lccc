@@ -1017,5 +1017,4 @@ mod tests {
             "stale-scratch miscompile: {out}"
         );
     }
-
 }

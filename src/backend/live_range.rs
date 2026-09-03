@@ -341,8 +341,7 @@ impl LinearScanAllocator {
         // hole-aware coverage AND the kill switch is unset. Unit tests and
         // unenriched scans (Phase 2b, synthetic vector intervals) run the
         // exact fat kernel.
-        let segment_mode =
-            segment_scan_enabled() && ranges.iter().any(|r| !r.segments.is_empty());
+        let segment_mode = segment_scan_enabled() && ranges.iter().any(|r| !r.segments.is_empty());
         Self {
             ranges,
             active: Vec::new(),
@@ -944,13 +943,10 @@ impl LinearScanAllocator {
     /// Merge half-open spans into a register's sorted occupancy union.
     fn insert_occupancy(&mut self, reg: PhysReg, spans: &[(u32, u32)]) {
         let entry = self.reg_occupancy.entry(reg).or_default();
-        let mut merged: Vec<(u32, u32)> =
-            Vec::with_capacity(entry.len() + spans.len());
+        let mut merged: Vec<(u32, u32)> = Vec::with_capacity(entry.len() + spans.len());
         let (mut i, mut j) = (0usize, 0usize);
         while i < entry.len() || j < spans.len() {
-            let next = if j == spans.len()
-                || (i < entry.len() && entry[i] <= spans[j])
-            {
+            let next = if j == spans.len() || (i < entry.len() && entry[i] <= spans[j]) {
                 let v = entry[i];
                 i += 1;
                 v

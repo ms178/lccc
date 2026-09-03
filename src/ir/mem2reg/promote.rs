@@ -1776,7 +1776,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn backend_initialized_aggregate_param_is_not_promoted_from_undef() {
         let mut func = IrFunction::new(
@@ -1787,9 +1786,7 @@ mod tests {
                 noalias: false,
                 struct_size: Some(8),
                 struct_align: Some(8),
-                struct_eightbyte_classes: vec![
-                    crate::common::types::EightbyteClass::Integer,
-                ],
+                struct_eightbyte_classes: vec![crate::common::types::EightbyteClass::Integer],
                 riscv_float_class: None,
                 is_f128_sse: false,
             }],
@@ -1839,13 +1836,11 @@ mod tests {
         promote_allocas_with_params(&mut module);
 
         let instructions = &module.functions[0].blocks[0].instructions;
-        assert!(instructions.iter().any(|inst| matches!(
-            inst,
-            Instruction::Load { ptr: Value(0), .. }
-        )));
-        assert!(instructions.iter().any(|inst| matches!(
-            inst,
-            Instruction::Store { ptr: Value(0), .. }
-        )));
+        assert!(instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Load { ptr: Value(0), .. })));
+        assert!(instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. })));
     }
 }

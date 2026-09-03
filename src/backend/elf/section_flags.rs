@@ -88,10 +88,9 @@ pub fn well_known_section_type(name: &str) -> Option<u32> {
         ".init_array" => Some(SHT_INIT_ARRAY),
         ".fini_array" => Some(SHT_FINI_ARRAY),
         ".preinit_array" => Some(SHT_PREINIT_ARRAY),
-        ".text" | ".data" | ".rodata" | ".tdata" | ".sdata" | ".init"
-        | ".fini" | ".ctors" | ".dtors" | ".got" | ".got.plt" | ".plt"
-        | ".comment" | ".note.GNU-stack" | ".eh_frame" | ".interp"
-        | ".dynamic" | ".dynsym" | ".dynstr" | ".hash" | ".gnu.hash"
+        ".text" | ".data" | ".rodata" | ".tdata" | ".sdata" | ".init" | ".fini" | ".ctors"
+        | ".dtors" | ".got" | ".got.plt" | ".plt" | ".comment" | ".note.GNU-stack"
+        | ".eh_frame" | ".interp" | ".dynamic" | ".dynsym" | ".dynstr" | ".hash" | ".gnu.hash"
         | ".symtab" | ".strtab" | ".shstrtab" | ".jcr" => Some(SHT_PROGBITS),
         _ => None,
     }

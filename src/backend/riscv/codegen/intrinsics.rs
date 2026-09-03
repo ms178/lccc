@@ -258,8 +258,7 @@ impl RiscvCodegen {
                 };
                 self.operand_to_t0(&args[0]);
                 self.state.emit("    fmv.d.x fa0, t0");
-                self.state
-                    .emit_fmt(format_args!("    call {}", sym));
+                self.state.emit_fmt(format_args!("    call {}", sym));
                 self.state.emit("    fmv.x.d t0, fa0");
                 if let Some(d) = dest {
                     self.store_t0_to(d);
@@ -274,8 +273,7 @@ impl RiscvCodegen {
                 };
                 self.operand_to_t0(&args[0]);
                 self.state.emit("    fmv.s.x fa0, t0");
-                self.state
-                    .emit_fmt(format_args!("    call {}", sym));
+                self.state.emit_fmt(format_args!("    call {}", sym));
                 self.state.emit("    fmv.x.s t0, fa0");
                 if let Some(d) = dest {
                     self.store_t0_to(d);

@@ -60,8 +60,7 @@ impl RiscvCodegen {
         if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
             let name = callee_saved_name(d_reg);
             if name != "t2" {
-                self.state
-                    .emit_fmt(format_args!("    mv {}, t2", name));
+                self.state.emit_fmt(format_args!("    mv {}, t2", name));
             }
             return;
         }
@@ -101,8 +100,7 @@ impl RiscvCodegen {
             }
         } else if let Some(&reg) = self.reg_assignments.get(&buffer.0) {
             let reg_name = callee_saved_name(reg);
-            self.state
-                .emit_fmt(format_args!("    mv t0, {}", reg_name));
+            self.state.emit_fmt(format_args!("    mv t0, {}", reg_name));
         } else if let Some(slot) = self.state.get_slot(buffer.0) {
             self.emit_load_from_s0("t0", slot.0, "ld");
         }

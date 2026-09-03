@@ -328,7 +328,8 @@ impl Lowerer {
                 } else {
                     arg_vals.len()
                 };
-                let return_type = self.builtin_return_type(name)
+                let return_type = self
+                    .builtin_return_type(name)
                     .or_else(|| libc_sig.map(|s| s.return_type))
                     .unwrap_or(crate::common::types::target_int_ir_type());
                 let struct_arg_sizes = vec![None; arg_vals.len()];
@@ -1002,12 +1003,7 @@ impl Lowerer {
                     dest: None,
                     op: IntrinsicOp::DoBuiltinApply,
                     dest_ptr: None,
-                    args: vec![
-                        func,
-                        save_area,
-                        Operand::Value(result),
-                        size,
-                    ],
+                    args: vec![func, save_area, Operand::Value(result), size],
                 });
                 Some(Operand::Value(result))
             }
@@ -1136,8 +1132,9 @@ impl Lowerer {
         let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
 
         let dest = self.fresh_value();
-        let return_type =
-            self.builtin_return_type(name).unwrap_or(crate::common::types::target_int_ir_type());
+        let return_type = self
+            .builtin_return_type(name)
+            .unwrap_or(crate::common::types::target_int_ir_type());
         let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
         let struct_arg_sizes = vec![None; arg_vals.len()];
         self.emit(Instruction::Call {

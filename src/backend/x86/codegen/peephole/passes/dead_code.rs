@@ -381,9 +381,7 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                     // frame bytes). Overlap of the vector extent with the
                     // store's range is a read. Same range-vs-point model
                     // store_forwarding applies (16-byte invalidate).
-                    if let Some(ext) =
-                        vector_frame_move_extent(infos[j].trimmed(store.get(j)))
-                    {
+                    if let Some(ext) = vector_frame_move_extent(infos[j].trimmed(store.get(j))) {
                         if ranges_overlap(store_offset, store_bytes, rbp_off, ext) {
                             slot_read = true;
                             break;

@@ -113,8 +113,10 @@ impl Lowerer {
             // _Float128 (carrier U128) is NOT an integer: folding its bit
             // pattern as an i128 would compute garbage (e.g. 1.5F128 * 3.125F128
             // multiplied as integers). F128 ops go through libgcc soft-float.
-            let lhs_no_fold = matches!(self.expr_ctype(lhs), CType::Float128) || self.expr_ctype(lhs).is_decimal();
-            let rhs_no_fold = matches!(self.expr_ctype(rhs), CType::Float128) || self.expr_ctype(rhs).is_decimal();
+            let lhs_no_fold = matches!(self.expr_ctype(lhs), CType::Float128)
+                || self.expr_ctype(lhs).is_decimal();
+            let rhs_no_fold = matches!(self.expr_ctype(rhs), CType::Float128)
+                || self.expr_ctype(rhs).is_decimal();
             if !lhs_ty.is_float() && !rhs_ty.is_float() && !lhs_no_fold && !rhs_no_fold {
                 if let Some(val) = self.eval_const_expr_from_parts(op, lhs, rhs) {
                     return Operand::Const(val);
@@ -675,8 +677,8 @@ impl Lowerer {
                         _ => {}
                     }
                     let val = self.lower_expr(inner);
-                    let w = crate::ir::lowering::lower::Lowerer::decimal_width(&inner_ct)
-                        .unwrap_or(64);
+                    let w =
+                        crate::ir::lowering::lower::Lowerer::decimal_width(&inner_ct).unwrap_or(64);
                     if w == 128 {
                         // carrier is U128: xor bit 127 directly
                         let ty = IrType::U128;
@@ -722,7 +724,11 @@ impl Lowerer {
                         dest: xored,
                         op: crate::ir::ops::IrBinOp::Xor,
                         lhs: Operand::Value(bits),
-                        rhs: Operand::Const(if w == 32 { IrConst::I32(i32::MIN) } else { IrConst::I64(i64::MIN) }),
+                        rhs: Operand::Const(if w == 32 {
+                            IrConst::I32(i32::MIN)
+                        } else {
+                            IrConst::I64(i64::MIN)
+                        }),
                         ty: ity,
                     });
                     self.emit(Instruction::Store {
@@ -1236,8 +1242,7 @@ impl Lowerer {
         if result_ty.size() > int_size {
             // Wide aggregates: keep the exact (large) type for store/load width.
             (result_ty, result_ty.size())
-        } else if result_ty.is_integer()
-            && (result_ty.size() == 4 || result_ty.size() == int_size)
+        } else if result_ty.is_integer() && (result_ty.size() == 4 || result_ty.size() == int_size)
         {
             // `int` / target-width scalar integers: exact type. On LP64 this is
             // the I32 case (I64 already equals int_ty); on i686 both coincide

@@ -510,11 +510,11 @@ impl SemanticAnalyzer {
                 // lr_vector at offset 96 instead of 192 in the gen-as-const
                 // pipeline, and elf/dl-trampoline.S failed its
                 // "LR_VECTOR_OFFSET must be multiple of VEC_SIZE" #error.
-                let resolved_ctype = match self.resolve_decl_vector_size(decl, resolved_ctype.size())
-                {
-                    Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
-                    None => resolved_ctype,
-                };
+                let resolved_ctype =
+                    match self.resolve_decl_vector_size(decl, resolved_ctype.size()) {
+                        Some(vs) => CType::Vector(Box::new(resolved_ctype), vs),
+                        None => resolved_ctype,
+                    };
                 self.result
                     .type_context
                     .typedefs
@@ -1027,10 +1027,8 @@ impl SemanticAnalyzer {
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
                         };
-                        let expr_is_void = matches!(
-                            checker.infer_expr_ctype(expr),
-                            Some(CType::Void) | None
-                        );
+                        let expr_is_void =
+                            matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
                         if !expr_is_void {
                             self.diagnostics.borrow_mut().warning(
                                 "'return' with a value, in function returning void",
@@ -1045,7 +1043,12 @@ impl SemanticAnalyzer {
                             expr_types: Some(&self.result.expr_types),
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
-                            self.check_assignment_compatibility(&actual, &expected, *span, matches!(expr, Expr::Cast(..)));
+                            self.check_assignment_compatibility(
+                                &actual,
+                                &expected,
+                                *span,
+                                matches!(expr, Expr::Cast(..)),
+                            );
                         }
                     }
                 }
@@ -1716,7 +1719,12 @@ impl SemanticAnalyzer {
                 if let (Some(lhs_ty), Some(rhs_ty)) =
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
                 {
-                    self.check_assignment_compatibility(&rhs_ty, &lhs_ty, *span, matches!(&**rhs, Expr::Cast(..)));
+                    self.check_assignment_compatibility(
+                        &rhs_ty,
+                        &lhs_ty,
+                        *span,
+                        matches!(&**rhs, Expr::Cast(..)),
+                    );
                 }
             }
             Expr::CompoundAssign(_, lhs, rhs, _) => {
@@ -2022,7 +2030,13 @@ impl SemanticAnalyzer {
         }
     }
 
-    fn check_assignment_compatibility(&self, from_ty: &CType, to_ty: &CType, span: Span, is_explicit_cast: bool) {
+    fn check_assignment_compatibility(
+        &self,
+        from_ty: &CType,
+        to_ty: &CType,
+        span: Span,
+        is_explicit_cast: bool,
+    ) {
         self.check_pointer_float_conversion(from_ty, to_ty, span);
         let incompatible = match (from_ty, to_ty) {
             (CType::Struct(a), CType::Struct(b)) | (CType::Union(a), CType::Union(b)) => {
@@ -2286,7 +2300,11 @@ impl SemanticAnalyzer {
                 // violations GCC ignores entirely; drop from layout + init.
                 if f.name.is_none()
                     && bit_width.is_none()
-                    && !matches!(ty, crate::common::types::CType::Struct(_) | crate::common::types::CType::Union(_))
+                    && !matches!(
+                        ty,
+                        crate::common::types::CType::Struct(_)
+                            | crate::common::types::CType::Union(_)
+                    )
                 {
                     return None;
                 }

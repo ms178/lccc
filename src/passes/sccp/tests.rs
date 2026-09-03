@@ -145,13 +145,16 @@ fn phi_incoming(f: &IrFunction, bi: usize) -> Vec<(Operand, BlockId)> {
 /// The constant a value was materialised to, if the block now defines it with
 /// `Copy { dest, Const }`.
 fn materialised(f: &IrFunction, v: u32) -> Option<IrConst> {
-    f.blocks.iter().flat_map(|b| b.instructions.iter()).find_map(|i| match i {
-        Instruction::Copy {
-            dest,
-            src: Operand::Const(c),
-        } if dest.0 == v => Some(*c),
-        _ => None,
-    })
+    f.blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .find_map(|i| match i {
+            Instruction::Copy {
+                dest,
+                src: Operand::Const(c),
+            } if dest.0 == v => Some(*c),
+            _ => None,
+        })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -355,7 +358,10 @@ fn folds_a_switch_to_the_matching_case() {
     ]));
 
     assert_eq!(stats.branches_folded, 1);
-    assert!(matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(2))));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(2))
+    ));
     assert_eq!(stats.unreachable_blocks, 2, "b1 and b3 are dead");
 }
 
@@ -377,7 +383,10 @@ fn folds_a_switch_with_no_matching_case_to_the_default() {
         blk(3, vec![], ret(None)),
     ]));
 
-    assert!(matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(3))));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(3))
+    ));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -427,7 +436,10 @@ fn an_unmodelled_definition_is_overdefined_not_top() {
         "the phi merges a loaded value with 1 and cannot be constant"
     );
     assert!(
-        matches!(f.blocks[3].terminator, Terminator::Return(Some(Operand::Value(Value(2))))),
+        matches!(
+            f.blocks[3].terminator,
+            Terminator::Return(Some(Operand::Value(Value(2))))
+        ),
         "return must still read the phi, found {:?}",
         f.blocks[3].terminator
     );
@@ -488,7 +500,10 @@ fn folding_a_cond_branch_prunes_the_stale_phi_operand() {
     ]));
 
     assert_eq!(stats.branches_folded, 1);
-    assert!(matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(1))));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(1))
+    ));
 
     // The phi is now single-entry and resolves to 222.
     assert_eq!(stats.phi_edges_pruned, 1);
@@ -540,9 +555,7 @@ fn folding_a_switch_prunes_every_stale_phi_operand() {
     // With only the b2 arm left the phi is constant, so it is materialised as a
     // Copy; either way, no operand may survive for a dead edge.
     assert!(
-        phi_incoming(&f, 4)
-            .iter()
-            .all(|(_, l)| *l == BlockId(2)),
+        phi_incoming(&f, 4).iter().all(|(_, l)| *l == BlockId(2)),
         "an operand survived for a dead edge: {:?}",
         phi_incoming(&f, 4)
     );
@@ -617,7 +630,10 @@ fn a_nonzero_long_double_condition_takes_the_true_edge() {
         blk(2, vec![], ret(None)),
     ]));
 
-    assert!(matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(1))));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(1))
+    ));
 }
 
 /// **F4 — long double arithmetic keeps the target's precision.**
@@ -699,7 +715,8 @@ fn asm_goto_targets_stay_reachable() {
         "the asm goto target must be reachable"
     );
     assert_eq!(
-        stats.phi_edges_pruned, 0,
+        stats.phi_edges_pruned,
+        0,
         "no phi operand may be dropped, found {:?}",
         phi_incoming(&f, 3)
     );
@@ -909,9 +926,13 @@ fn sub_int_promotion_agrees_with_the_folder() {
 
     let cast_const = constant_fold::eval_cast_const(IrConst::I32(-1), IrType::I32, IrType::I8)
         .expect("the oracle folds the cast");
-    let expected =
-        constant_fold::eval_unaryop_const(IrUnaryOp::Not, cast_const, Some(IrType::I8), IrType::I32)
-            .expect("the oracle folds the negation");
+    let expected = constant_fold::eval_unaryop_const(
+        IrUnaryOp::Not,
+        cast_const,
+        Some(IrType::I8),
+        IrType::I32,
+    )
+    .expect("the oracle folds the negation");
 
     assert_eq!(
         materialised(&f, 2).map(|c| c.to_hash_key()),
@@ -1037,12 +1058,19 @@ fn a_cond_branch_to_one_target_folds_without_losing_the_edge() {
         blk(0, vec![i32c(0, 1)], cond_br(val(0), 1, 1)),
         blk(
             1,
-            vec![phi(1, vec![(Operand::Const(IrConst::I32(4)), 0)], IrType::I32)],
+            vec![phi(
+                1,
+                vec![(Operand::Const(IrConst::I32(4)), 0)],
+                IrType::I32,
+            )],
             ret(Some(val(1))),
         ),
     ]));
 
-    assert!(matches!(f.blocks[0].terminator, Terminator::Branch(BlockId(1))));
+    assert!(matches!(
+        f.blocks[0].terminator,
+        Terminator::Branch(BlockId(1))
+    ));
     assert_eq!(
         stats.phi_edges_pruned, 0,
         "the b0 -> b1 edge survives the fold; nothing may be pruned"
@@ -1090,6 +1118,9 @@ fn resolves_a_chain_of_dependent_conditionals() {
 
     assert_eq!(materialised(&f, 1), Some(IrConst::I32(10)));
     assert_eq!(materialised(&f, 2), Some(IrConst::I32(1)));
-    assert!(matches!(f.blocks[3].terminator, Terminator::Branch(BlockId(4))));
+    assert!(matches!(
+        f.blocks[3].terminator,
+        Terminator::Branch(BlockId(4))
+    ));
     assert_eq!(stats.unreachable_blocks, 2, "b2 and b5 are dead");
 }

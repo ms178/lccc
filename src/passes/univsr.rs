@@ -1269,7 +1269,7 @@ mod tests {
                 ty: IrType::I64,
                 incoming: vec![
                     (Operand::Const(IrConst::I64(5)), BlockId(0)), // init 5!
-                    (Operand::Value(Value(6)), BlockId(2)), // latch, unrotated
+                    (Operand::Value(Value(6)), BlockId(2)),        // latch, unrotated
                 ],
             },
             ptr_phi(2, 10, 7),

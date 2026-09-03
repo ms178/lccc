@@ -63,7 +63,7 @@ macro_rules! delegate_to_impl {
     };
 }
 
-use super::cast::{FloatOp, classify_float_binop};
+use super::cast::{classify_float_binop, FloatOp};
 use super::common::PtrDirective;
 use super::generation::{is_i128_type, is_wide_int_type};
 use super::regalloc::PhysReg;
