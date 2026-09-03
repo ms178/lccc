@@ -42,7 +42,6 @@ $K/include/linux/compiler_types.h
 -include
 $K/include/linux/hidden.h
 -D__KERNEL__
--D_SETUP
 -DDISABLE_BRANCH_PROFILING
 -D__DISABLE_EXPORTS
 -DKBUILD_BASENAME='"oracle"'
