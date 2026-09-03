@@ -710,24 +710,37 @@ impl X86Codegen {
         }
 
         // Register-direct: test the condition register directly, skip %rax relay.
+        // WIDE conditions never take this arm: their homes are the 16-byte
+        // slot or the rax:rdx pair (never a single GPR), and a single-half
+        // test is unsound — they route to the two-half form below.
         if let Operand::Value(v) = cond {
-            if let Some(&reg) = self.reg_assignments.get(&v.0) {
-                if !is_xmm_reg(reg) {
-                    self.emit_cond_gpr_test(v.0, reg);
-                    let jcc_hot = if pref_true { "jne" } else { "je" };
-                    if hot_next {
-                        self.state
-                            .out
-                            .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
-                    } else {
-                        self.state.out.emit_jcc_block(jcc_hot, hot.0);
-                        if !cold_next {
-                            self.state.out.emit_jmp_block(cold.0);
+            if !self.cond_is_wide(v.0) {
+                if let Some(&reg) = self.reg_assignments.get(&v.0) {
+                    if !is_xmm_reg(reg) {
+                        self.emit_cond_gpr_test(v.0, reg);
+                        let jcc_hot = if pref_true { "jne" } else { "je" };
+                        if hot_next {
+                            self.state
+                                .out
+                                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+                        } else {
+                            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+                            if !cold_next {
+                                self.state.out.emit_jmp_block(cold.0);
+                            }
                         }
+                        return;
                     }
-                    return;
                 }
             }
+        }
+        // WIDE conditions: two half-width tests (lo, hi) — a wide value is
+        // zero iff BOTH halves are zero. A single 64-bit test of either half
+        // misclassifies `(__int128)1 << 64` (low half 0, high half 1) as
+        // zero and branches to the wrong arm.
+        if matches!(cond, Operand::Value(v) if self.cond_is_wide(v.0)) {
+            self.emit_wide_cond_branch(cond, hot, cold, hot_next, cold_next, pref_true);
+            return;
         }
         self.operand_to_rax(cond);
         self.state.emit("    testq %rax, %rax");
@@ -800,6 +813,16 @@ impl X86Codegen {
     fn test_select_cond_in_place(&mut self, cond: &Operand) -> bool {
         if let Operand::Value(v) = cond {
             if !self.state.is_alloca(v.0) {
+                // WIDE (128-bit) conditions: zero-ness is (lo | hi) == 0, so a
+                // single 64-bit test on either half is unsound — a value with
+                // a zero low half and a nonzero high half is NOT zero (this
+                // is the `(__int128)1 << 64` class). Route to the wide
+                // in-place form BEFORE any single-register path can claim the
+                // condition: a wide value's homes are the 16-byte slot or the
+                // rax:rdx accumulator pair, never a single GPR.
+                if self.cond_is_wide(v.0) {
+                    return self.test_wide_cond_in_place(v.0);
+                }
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if !is_xmm_reg(reg) {
                         self.emit_cond_gpr_test(v.0, reg);
@@ -807,7 +830,21 @@ impl X86Codegen {
                     }
                 }
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    self.state.out.emit_cmp_zero_mem(slot.0);
+                    // Size the memory compare to the value's recorded IR
+                    // type. The historical unconditional `cmpl` under-read
+                    // every slot wider than 4 bytes: an I64-homed condition
+                    // whose low 4 bytes are zero is NOT zero (1 << 32), yet
+                    // `cmpl` reported zero. Reading fewer bytes than the
+                    // store defined is always sound (the low bytes of a
+                    // stored value are always defined), so the recorded type
+                    // width is the safe choice; an untracked type keeps the
+                    // historical form.
+                    let mnem = self
+                        .value_types
+                        .get(&v.0)
+                        .map(|ty| super::emit::cmp_width_info(*ty).0)
+                        .unwrap_or("cmpl");
+                    self.state.out.emit_cmp_zero_mem_sized(slot.0, mnem);
                     return true;
                 }
                 if self.state.reg_cache.acc_has(v.0, false)
@@ -819,6 +856,133 @@ impl X86Codegen {
             }
         }
         false
+    }
+
+    /// True when `val_id`'s recorded IR type is a WIDE integer (I128/U128):
+    /// a value whose zero-ness spans two 64-bit halves, so any single-width
+    /// zero test (`testq`, `cmpq`, `cmpl`) on one half is unsound.
+    fn cond_is_wide(&self, val_id: u32) -> bool {
+        self.value_types
+            .get(&val_id)
+            .map(|ty| crate::backend::generation::is_wide_int_type(*ty))
+            .unwrap_or(false)
+    }
+
+    /// In-place zero test for a WIDE condition, SELECT context (flags must
+    /// survive into a following cmovcc, so no clobber of the accumulator and
+    /// no branch). Zero-ness is `(lo | hi) == 0`; `orq` sets ZF from exactly
+    /// that.
+    ///
+    ///   * slot home      → `movq slot(%rbp), %rcx; orq slot+8(%rbp), %rcx`
+    ///   * acc-pair home  → `movq %rax, %rcx; orq %rdx, %rcx`
+    ///     (rax = lo, rdx = hi — the i128 accumulator-pair invariant)
+    ///
+    /// Only %rcx is written, and the SELECT flow stages its arms into %rcx
+    /// strictly AFTER the test, so the clobber is consumed before any live
+    /// use. The secondary-register cache is invalidated to keep the
+    /// `select_operand_to_reg` discipline (a stale "rcx holds K" claim must
+    /// not survive a register it no longer describes).
+    ///
+    /// Returns false when the condition's home is neither a known slot nor
+    /// the tracked accumulator pair (the caller falls back to the generic
+    /// materialize-and-test path).
+    fn test_wide_cond_in_place(&mut self, val_id: u32) -> bool {
+        if let Some(slot) = self.state.get_slot(val_id) {
+            // lo at slot+0, hi at slot+8 (the i128 slot layout used by
+            // emit_store_pair_to_slot / the Mov128 path).
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rcx");
+            self.state
+                .out
+                .emit_instr_rbp_reg("    orq", slot.0 + 8, "rcx");
+            self.state.reg_cache.invalidate_sec();
+            return true;
+        }
+        if self.state.reg_cache.acc_has(val_id, false) {
+            self.state.emit("    movq %rax, %rcx");
+            self.state.emit("    orq %rdx, %rcx");
+            self.state.reg_cache.invalidate_sec();
+            return true;
+        }
+        false
+    }
+
+    /// Branch-context zero test for a WIDE condition: fold the two halves
+    /// into the accumulator and let ONE conditional branch decide — the
+    /// GCC shape (`movq lo, %rax; orq hi, %rax; jcc`). Zero-ness of a wide
+    /// value is `(lo | hi) == 0`, so the fold is exact; two independent
+    /// half-tests would each need the OTHER half's verdict to place a jump
+    /// (a zero low half does NOT imply a zero value), which is exactly the
+    /// trap this fold avoids.
+    ///
+    ///   * slot home     → `movq slot(%rbp), %rax; orq slot+8(%rbp), %rax`
+    ///   * acc-pair home → `orq %rdx, %rax` (rax already holds lo)
+    ///   * anything else → stage the pair with `operand_to_rax_rdx` (handles
+    ///     I128 constants, indirect homes, alloca addressing), then fold
+    ///
+    /// Clobbering rax (and rdx when staging) at a block-terminating branch
+    /// matches the generic fallback's contract — the accumulator is staging
+    /// territory here and the cache is invalidated on exit.
+    fn emit_wide_cond_branch(
+        &mut self,
+        cond: &Operand,
+        hot: BlockId,
+        cold: BlockId,
+        hot_next: bool,
+        cold_next: bool,
+        pref_true: bool,
+    ) {
+        let val_id = match cond {
+            Operand::Value(v) => v.0,
+            Operand::Const(_) => u32::MAX, // constants: stage via operand_to_rax_rdx
+        };
+        let slot = match cond {
+            Operand::Value(v) => self.state.get_slot(v.0),
+            Operand::Const(_) => None,
+        };
+        if let Some(slot) = slot {
+            // lo at slot+0, hi at slot+8 (the i128 slot layout used by
+            // emit_store_pair_to_slot / the Mov128 path).
+            self.state.out.emit_instr_rbp_reg("    movq", slot.0, "rax");
+            self.state
+                .out
+                .emit_instr_rbp_reg("    orq", slot.0 + 8, "rax");
+        } else if self.state.reg_cache.acc_has(val_id, false) {
+            // rax = lo, rdx = hi (the i128 accumulator-pair invariant).
+            self.state.emit("    orq %rdx, %rax");
+        } else {
+            self.operand_to_rax_rdx(cond);
+            self.state.emit("    orq %rdx, %rax");
+        }
+        let jcc_hot = if pref_true { "jne" } else { "je" };
+        if hot_next {
+            self.state
+                .out
+                .emit_jcc_block(Self::invert_jcc(jcc_hot), cold.0);
+        } else {
+            self.state.out.emit_jcc_block(jcc_hot, hot.0);
+            if !cold_next {
+                self.state.out.emit_jmp_block(cold.0);
+            }
+        }
+        self.state.reg_cache.invalidate_all();
+    }
+
+    /// Legacy-path condition test (pushfq/popfq sites): stage the condition
+    /// and set ZF from its zero-ness. WIDE conditions stage the full rax:rdx
+    /// pair and fold the halves with `orq` — a wide value is zero iff BOTH
+    /// halves are zero, so a single-half `testq` misclassifies
+    /// `(__int128)1 << 64`. Everything else keeps the historical
+    /// single-register form. The callers save/restore flags around their arm
+    /// staging (pushfq/popfq), so the fold's register mutation is safe.
+    fn emit_legacy_cond_test(&mut self, cond: &Operand) {
+        let wide = matches!(cond, Operand::Value(v) if self.cond_is_wide(v.0));
+        if wide {
+            self.operand_to_rax_rdx(cond);
+            self.state.emit("    orq %rdx, %rax");
+        } else {
+            self.operand_to_rax(cond);
+            self.state.emit("    testq %rax, %rax");
+        }
     }
 
     /// Materialize a select operand into a register using ONLY flag-neutral
@@ -985,8 +1149,7 @@ impl X86Codegen {
         {
                 if !is_xmm_reg(d_reg) {
                     let d_name = phys_reg_name(d_reg);
-                    self.operand_to_rax(cond);
-                    self.state.emit("    testq %rax, %rax");
+                    self.emit_legacy_cond_test(cond);
                     self.state.emit("    pushfq");
                     if self.state.out.use_rsp_addressing {
                         self.state.out.rsp_frame_size += 8;
@@ -1003,8 +1166,7 @@ impl X86Codegen {
                     return;
                 }
             }
-            self.operand_to_rax(cond);
-            self.state.emit("    testq %rax, %rax");
+            self.emit_legacy_cond_test(cond);
             self.state.emit("    pushfq");
             if self.state.out.use_rsp_addressing {
                 self.state.out.rsp_frame_size += 8;
@@ -1127,8 +1289,7 @@ impl X86Codegen {
                     return;
                 }
                 // Legacy path: condition not testable in place.
-                self.operand_to_rax(cond);
-                self.state.emit("    testq %rax, %rax");
+                self.emit_legacy_cond_test(cond);
                 self.state.emit("    pushfq");
                 if self.state.out.use_rsp_addressing {
                     self.state.out.rsp_frame_size += 8;
@@ -1161,8 +1322,7 @@ impl X86Codegen {
         }
 
         // Legacy pushfq fallback (condition not testable in place).
-        self.operand_to_rax(cond);
-        self.state.emit("    testq %rax, %rax");
+        self.emit_legacy_cond_test(cond);
         self.state.emit("    pushfq");
         if self.state.out.use_rsp_addressing {
             self.state.out.rsp_frame_size += 8;

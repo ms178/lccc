@@ -598,6 +598,42 @@ fn instruction_corpus() -> Vec<MachInst> {
     let mut v = Vec::new();
     let regs = [PhysReg(0), PhysReg(7), PhysReg(15), PhysReg(2), PhysReg(16)];
 
+    // Mov128: the 16-byte SSE pair — every memory-operand combination the
+    // isel can produce (slot<->slot, slot<->pointer, both offsets), so the
+    // real-assembler differential proves the movdqu forms encode.
+    for (src_op, dst_op) in [
+        (MachOperand::StackSlot(-24), MachOperand::StackSlot(-48)),
+        (
+            MachOperand::StackSlot(-24),
+            MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(16)),
+                offset: 0,
+            },
+        ),
+        (
+            MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(16)),
+                offset: 8,
+            },
+            MachOperand::StackSlot(-40),
+        ),
+        (
+            MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(1)),
+                offset: -16,
+            },
+            MachOperand::Mem {
+                base: MachReg::Phys(PhysReg(2)),
+                offset: 32,
+            },
+        ),
+    ] {
+        v.push(MachInst::Mov128 {
+            src: src_op,
+            dst: dst_op,
+        });
+    }
+
     // CallTyped: every stage and operand shape the lowering can produce —
     // caller-save spill/restore pairs, zero/imm32/reg/slot arguments, the
     // sized return home — so the real-assembler differential proves the
@@ -3764,4 +3800,298 @@ mod typed_indirect_calls {
             "the wide-immediate staging form must be part of instruction_corpus"
         );
     }
+}
+
+// ── Mov128: the atomic 16-byte i128 transfer ─────────────────────────────
+
+/// Golden: the SSE pair through the pre-colored xmm0 scratch. Both the
+/// slot form and the pointer form must render at their own addressing,
+/// and the scratch must be named xmm0 exactly.
+#[test]
+fn mov128_renders_the_sse_scratch_pair() {
+    let lines = emit(&MachInst::Mov128 {
+        src: MachOperand::StackSlot(-24),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(RDX),
+            offset: 0,
+        },
+    });
+    assert_eq!(
+        lines,
+        vec!["movdqu -24(%rbp), %xmm0", "movdqu %xmm0, (%rdx)"],
+        "slot-to-pointer 16-byte move"
+    );
+    let lines = emit(&MachInst::Mov128 {
+        src: MachOperand::Mem {
+            base: MachReg::Phys(RBX),
+            offset: 16,
+        },
+        dst: MachOperand::StackSlot(-40),
+    });
+    assert_eq!(
+        lines,
+        vec!["movdqu 16(%rbx), %xmm0", "movdqu %xmm0, -40(%rbp)"],
+        "pointer-to-slot 16-byte move"
+    );
+}
+
+
+/// Const i128 store: two S64 Movs at the destination halves. The halves
+/// are the value's own 64-bit words; each is either an imm32-window movq
+/// or the emitter's hardened wide relay (which stores exactly 8 bytes).
+#[test]
+fn isel_const_i128_store_lowers_to_two_s64_movs() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+
+    let v: i128 = (0x1122334455667788i128 << 64) | 3;
+    let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
+    let slots: FxHashMap<u32, i64> = [(2u32, -48i64)].into_iter().collect();
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Store {
+            val: Operand::Const(IrConst::I128(v)),
+            ptr: Value(2),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert_eq!(out.len(), 2, "two half stores: {out:?}");
+    match (&out[0], &out[1]) {
+        (
+            MachInst::Mov {
+                src: MachOperand::Imm(lo),
+                dst: MachOperand::StackSlot(s),
+                size: OpSize::S64,
+            },
+            MachInst::Mov {
+                src: MachOperand::Imm(hi),
+                dst: MachOperand::StackSlot(sh),
+                size: OpSize::S64,
+            },
+        ) => {
+            assert_eq!(*lo, v as u64 as i64);
+            assert_eq!(*s, -48);
+            assert_eq!(*hi, ((v as u128) >> 64) as u64 as i64);
+            assert_eq!(*sh, -40, "hi half at slot+8");
+        }
+        other => panic!("unexpected shapes: {other:?}"),
+    }
+}
+
+/// Value i128 store: the atomic Mov128 from the value's 16-byte slot to
+/// the GPR-held destination.
+#[test]
+fn isel_value_i128_store_lowers_to_mov128() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect(); // rdi-held ptr
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect(); // value slot
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Store {
+            val: Operand::Value(Value(1)),
+            ptr: Value(2),
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert_eq!(out.len(), 1, "one atomic instruction: {out:?}");
+    match &out[0] {
+        MachInst::Mov128 {
+            src: MachOperand::StackSlot(s),
+            dst: MachOperand::Mem { base, offset },
+        } => {
+            assert_eq!(*s, -24);
+            assert_eq!(*base, MachReg::Phys(PhysReg(14)));
+            assert_eq!(*offset, 0);
+        }
+        other => panic!("expected Mov128, got {other:?}"),
+    }
+}
+
+/// xmm0 scratch live (an incoming float param home): the GPR fallback,
+/// with BOTH loads issued before EITHER store so an overlapping
+/// destination cannot corrupt the second half's source.
+#[test]
+fn isel_value_i128_store_falls_back_to_ordered_gpr_relay_when_scratch_unsafe() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    let ra: FxHashMap<u32, PhysReg> =
+        [(2u32, PhysReg(14)), (9u32, PhysReg(18))].into_iter().collect(); // 18 = live xmm0 home
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Store {
+            val: Operand::Value(Value(1)),
+            ptr: Value(2),
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert_eq!(out.len(), 4, "load lo, load hi, store lo, store hi: {out:?}");
+    let shape: Vec<(&str, &str)> = out
+        .iter()
+        .map(|inst| match inst {
+            MachInst::Mov {
+                src: MachOperand::StackSlot(s),
+                dst: MachOperand::Reg(MachReg::Phys(r)),
+                ..
+            } if *s == -24 && r.0 == RAX.0 => ("load", "lo"),
+            MachInst::Mov {
+                src: MachOperand::StackSlot(s),
+                dst: MachOperand::Reg(MachReg::Phys(r)),
+                ..
+            } if *s == -16 && r.0 == RDX.0 => ("load", "hi"),
+            MachInst::Mov {
+                src: MachOperand::Reg(MachReg::Phys(r)),
+                dst: MachOperand::Mem { offset, .. },
+                ..
+            } if r.0 == RAX.0 && *offset == 0 => ("store", "lo"),
+            MachInst::Mov {
+                src: MachOperand::Reg(MachReg::Phys(r)),
+                dst: MachOperand::Mem { offset, .. },
+                ..
+            } if r.0 == RDX.0 && *offset == 8 => ("store", "hi"),
+            other => panic!("unexpected instruction {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![("load", "lo"), ("load", "hi"), ("store", "lo"), ("store", "hi")],
+        "reads strictly before writes"
+    );
+}
+
+/// Value i128 load: the mirrored atomic Mov128 into the value's slot.
+#[test]
+fn isel_i128_load_lowers_to_mov128() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, Value};
+
+    let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect();
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
+    let mut out = Vec::new();
+    assert!(super::isel::lower_instruction_typed(
+        &Instruction::Load {
+            dest: Value(1),
+            ptr: Value(2),
+            ty: IrType::U128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    match &out[0] {
+        MachInst::Mov128 {
+            src: MachOperand::Mem { offset, .. },
+            dst: MachOperand::StackSlot(s),
+        } => {
+            assert_eq!(*offset, 0);
+            assert_eq!(*s, -24);
+        }
+        other => panic!("expected Mov128, got {other:?}"),
+    }
+}
+
+/// A C `volatile` i128 access keeps the mature path: the
+/// implementation-defined volatile access granularity stays the
+/// oracle-matching two 8-byte halves, and refusing here keeps the
+/// volatile flag out of the typed layer entirely.
+#[test]
+fn isel_refuses_volatile_i128_store_and_load() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    let ra: FxHashMap<u32, PhysReg> = [(2u32, PhysReg(14))].into_iter().collect();
+    let slots: FxHashMap<u32, i64> = [(1u32, -24i64)].into_iter().collect();
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &Instruction::Store {
+            val: Operand::Value(Value(1)),
+            ptr: Value(2),
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+    assert!(!super::isel::lower_instruction_typed(
+        &Instruction::Load {
+            dest: Value(1),
+            ptr: Value(2),
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
+}
+
+/// A value with a register assignment is NOT a slot-homed i128 value —
+/// refuse rather than guess (the register home has no 16-byte slot to
+/// read the halves from).
+#[test]
+fn isel_refuses_register_homed_store_value() {
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::IrType;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    let ra: FxHashMap<u32, PhysReg> =
+        [(2u32, PhysReg(14)), (1u32, PhysReg(1))].into_iter().collect();
+    let slots: FxHashMap<u32, i64> = FxHashMap::default();
+    let mut out = Vec::new();
+    assert!(!super::isel::lower_instruction_typed(
+        &Instruction::Store {
+            val: Operand::Value(Value(1)),
+            ptr: Value(2),
+            ty: IrType::I128,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        },
+        &ra,
+        &slots,
+        None,
+        &mut out,
+    ));
+    assert!(out.is_empty());
 }

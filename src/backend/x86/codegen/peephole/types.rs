@@ -1055,6 +1055,51 @@ pub(super) fn has_indirect_memory_access(s: &str) -> bool {
     false
 }
 
+/// Vector-move frame access extent: `Some(bytes)` when the line is an
+/// SSE/AVX PACKED vector load/store with a frame-base memory operand
+/// (`(%rbp` / `(%rsp`), in which case the access spans
+/// `[rbp_offset, rbp_offset + bytes)`. `None` for every other line.
+///
+/// The scalar slot tracker models one offset per line with an implicit
+/// 8-byte point (`parse_rbp_offset`), which is exact for scalar integer
+/// moves and for the scalar-FP forms (`movsd` = 8 bytes, `movss` = 4,
+/// SSE `movq` = 8) — the FP memory-operand folds DEPEND on those lines
+/// staying precisely modelled, so they must never become opaque. The packed
+/// 16/32-byte family is where the point model goes anti-conservative: a
+/// `movdqu 96(%rsp), %xmm0` reads `[96, 112)`, but the cached offset 96
+/// only credits reads of `[96, 104)` — the high half at 104 is invisible.
+/// `eliminate_dead_stores` elided an i128 parameter's high-half home store
+/// on exactly that miss (its only reader inside the window was the `movdqu`
+/// copy, and the wide condition test then read stale frame bytes). This is
+/// the same range-vs-point disease store_forwarding fixed with its
+/// 16-byte invalidate ("16 bytes covers every x86 access width") — here as
+/// a returned extent so the caller can overlap-check precisely instead of
+/// going opaque (which would kill the FP folds).
+pub(super) fn vector_frame_move_extent(s: &str) -> Option<i32> {
+    // Frame-base memory operand present at all? Cheap text gate first.
+    if !s.contains("(%rbp") && !s.contains("(%rsp") {
+        return None;
+    }
+    // Optional AVX `v` prefix, then the SSE packed family. Scalar forms
+    // (`movsd`, `movss`) and the SSE integer `movq`/`movd` with xmm regs are
+    // point-accurate (4/8 bytes) and deliberately absent — the existing
+    // single-offset model already covers them. String-op spellings that
+    // collide (`movsq`, `movsl`, `movsb`, `movsw`) use %rsi/%rdi bases,
+    // never the frame base, so the gate above already excludes them.
+    const PACKED_MNEMONICS: &[&str] = &[
+        "movdqu", "movdqa", "movups", "movaps", "movupd", "movapd", "lddqu",
+    ];
+    let body = s.strip_prefix('v').unwrap_or(s);
+    for m in PACKED_MNEMONICS {
+        if body.starts_with(m) {
+            // %ymm forms move 32 bytes; %xmm (and %st implicit) 16.
+            let extent = if s.contains("%ymm") { 32 } else { 16 };
+            return Some(extent);
+        }
+    }
+    None
+}
+
 /// Pre-parse an `Other` line for a %rbp offset reference.
 /// Looks for patterns like `N(%rbp)` and returns the offset N.
 /// Returns `RBP_OFFSET_NONE` if no rbp reference or multiple references found.

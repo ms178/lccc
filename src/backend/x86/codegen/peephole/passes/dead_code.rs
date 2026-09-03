@@ -371,6 +371,24 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 }
                 let rbp_off = infos[j].rbp_offset;
                 if rbp_off != RBP_OFFSET_NONE {
+                    // PACKED vector moves are RANGE accesses: movdqu et al.
+                    // read/write [rbp_offset, rbp_offset + 16) (32 for %ymm),
+                    // but the cached offset alone credits only the low 8
+                    // bytes. A scalar store fully inside the upper half of a
+                    // `movdqu` copy's read range was elided because the point
+                    // model missed the read (the i128 parameter's high-half
+                    // home store; the wide condition test then read stale
+                    // frame bytes). Overlap of the vector extent with the
+                    // store's range is a read. Same range-vs-point model
+                    // store_forwarding applies (16-byte invalidate).
+                    if let Some(ext) =
+                        vector_frame_move_extent(infos[j].trimmed(store.get(j)))
+                    {
+                        if ranges_overlap(store_offset, store_bytes, rbp_off, ext) {
+                            slot_read = true;
+                            break;
+                        }
+                    }
                     if rbp_off >= store_offset && rbp_off < store_offset + store_bytes {
                         slot_read = true;
                         break;

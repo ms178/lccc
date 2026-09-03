@@ -1554,10 +1554,84 @@ fn lower_instruction_typed_inner(
             ptr,
             ty,
             seg_override,
-            ..
+            volatile,
         } => {
-            if ty.is_128bit() || ty.is_long_double() {
+            if ty.is_long_double() {
                 return false;
+            }
+            // ── Typed i128 loads (the Load(other) census class) ──
+            //
+            // Mirror of the typed i128 store: the value's home is a
+            // contiguous 16-byte slot, the source address a direct slot or
+            // a GPR-held pointer, and the transfer is the atomic Mov128
+            // (movdqu pair through the pre-colored xmm0 scratch,
+            // alias-ordered) or the four-Mov GPR fallback through the
+            // reserved rax/rdx when the scratch is live.  Segment
+            // overrides stay on the mature path.
+            if ty.is_128bit() {
+                if *seg_override != AddressSpace::Default || *volatile {
+                    return false;
+                }
+                let Some(&dslot) = alloca_slots.get(&dest.0) else {
+                    return false;
+                };
+                if small_slots.is_some_and(|s| s.contains(&dest.0)) {
+                    return false;
+                }
+                if ra.contains_key(&dest.0) {
+                    return false;
+                }
+                let src = if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    if small_slots.is_some_and(|s| s.contains(&ptr.0)) {
+                        return false;
+                    }
+                    MachOperand::StackSlot(slot)
+                } else if let Some(&base) = ra.get(&ptr.0) {
+                    if is_xmm_phys(base) {
+                        return false;
+                    }
+                    MachOperand::Mem {
+                        base: MachReg::Phys(base),
+                        offset: 0,
+                    }
+                } else {
+                    return false;
+                };
+                let dst = MachOperand::StackSlot(dslot);
+                if xmm_scratch_unsafe(ra) {
+                    let dst_hi = MachOperand::StackSlot(dslot + 8);
+                    out.push(MachInst::Mov {
+                        src: src.clone(),
+                        dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                        size: OpSize::S64,
+                    });
+                    let src_hi = match src {
+                        MachOperand::StackSlot(slot) => MachOperand::StackSlot(slot + 8),
+                        MachOperand::Mem { base, offset } => MachOperand::Mem {
+                            base,
+                            offset: offset + 8,
+                        },
+                        _ => return false,
+                    };
+                    out.push(MachInst::Mov {
+                        src: src_hi,
+                        dst: MachOperand::Reg(MachReg::Phys(RDX)),
+                        size: OpSize::S64,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RAX)),
+                        dst,
+                        size: OpSize::S64,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Reg(MachReg::Phys(RDX)),
+                        dst: dst_hi,
+                        size: OpSize::S64,
+                    });
+                    return true;
+                }
+                out.push(MachInst::Mov128 { src, dst });
+                return true;
             }
             // Scalar float load: mirror of the float store subset. The dest
             // must be xmm-homed (direct) or spill-slot-homed (xmm0 scratch
@@ -1681,8 +1755,132 @@ fn lower_instruction_typed_inner(
             seg_override,
             volatile,
         } => {
-            if ty.is_128bit() || ty.is_long_double() {
+            if ty.is_long_double() {
                 return false;
+            }
+            // ── Typed i128 stores (the Store(other) census class) ──
+            //
+            // The mature text path materializes the value into the
+            // accumulator pair, SPILLS the pair (emit_save_acc_pair) and
+            // stores both halves from the spill slots — 6-8 instructions
+            // plus 16 bytes of dead frame traffic per store, where the
+            // oracles use 2 (gcc: pxor+movaps / pool movdqa+movaps / two
+            // direct pair stores).  Three typed forms, cheapest first:
+            //
+            //   * Const: the two 64-bit halves ARE the data — two S64 Movs
+            //     at the destination and destination+8 (every u64 half is
+            //     either an imm32-window `movq $imm` or takes the emitter's
+            //     hardened wide-imm relay, which stores exactly 8 bytes at
+            //     the operand's own size).  No staging register, no spill.
+            //   * Value (slot-homed, the universal i128 home): the atomic
+            //     Mov128 — `movdqu` load + `movdqu` store through the
+            //     pre-colored xmm0 scratch; alias-ordered (the source is
+            //     read in full before any destination byte is written).
+            //   * Scratch-unsafe: the GPR fallback, four S64 Movs through
+            //     the reserved rax/rdx with both loads before both stores.
+            //
+            // Destination subset: a direct (non-small) 16-byte slot or a
+            // GPR-held pointer — the same addressing subset every other
+            // typed store uses.  `movdqu`, never `movdqa`: frame slots sit
+            // at 8 mod 16 and pointer targets may be packed-member aligned
+            // (verified: packed i128 member stores run through this path
+            // today).  A C `volatile` store keeps the mature path (the
+            // implementation-defined volatile access granularity stays the
+            // oracle-matching two 8-byte halves); segment overrides and
+            // indexed addressing stay there too.
+            if ty.is_128bit() {
+                if *seg_override != AddressSpace::Default || *volatile {
+                    return false;
+                }
+                let dst = if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                    if small_slots.is_some_and(|s| s.contains(&ptr.0)) {
+                        return false;
+                    }
+                    MachOperand::StackSlot(slot)
+                } else if let Some(&base) = ra.get(&ptr.0) {
+                    if is_xmm_phys(base) {
+                        return false;
+                    }
+                    MachOperand::Mem {
+                        base: MachReg::Phys(base),
+                        offset: 0,
+                    }
+                } else {
+                    return false;
+                };
+                let dst_hi = match dst {
+                    MachOperand::StackSlot(slot) => MachOperand::StackSlot(slot + 8),
+                    MachOperand::Mem { base, offset } => MachOperand::Mem {
+                        base,
+                        offset: offset + 8,
+                    },
+                    _ => return false,
+                };
+                match val {
+                    Operand::Const(c) => {
+                        let bits: u128 = match c {
+                            IrConst::I128(v) => *v as u128,
+                            IrConst::Zero => 0,
+                            _ => return false,
+                        };
+                        let lo = bits as u64 as i64;
+                        let hi = (bits >> 64) as u64 as i64;
+                        out.push(MachInst::Mov {
+                            src: MachOperand::Imm(lo),
+                            dst: dst.clone(),
+                            size: OpSize::S64,
+                        });
+                        out.push(MachInst::Mov {
+                            src: MachOperand::Imm(hi),
+                            dst: dst_hi,
+                            size: OpSize::S64,
+                        });
+                        return true;
+                    }
+                    Operand::Value(val_v) => {
+                        // i128 values are slot-homed (the allocator never
+                        // assigns them); a register entry means this is not
+                        // a slot-homed i128 value.
+                        if ra.contains_key(&val_v.0) {
+                            return false;
+                        }
+                        let Some(&vslot) = alloca_slots.get(&val_v.0) else {
+                            return false;
+                        };
+                        if small_slots.is_some_and(|s| s.contains(&val_v.0)) {
+                            return false;
+                        }
+                        let src = MachOperand::StackSlot(vslot);
+                        if xmm_scratch_unsafe(ra) {
+                            // GPR fallback: load both halves into the
+                            // reserved rax/rdx BEFORE either store — the
+                            // destination may overlap the source slot.
+                            out.push(MachInst::Mov {
+                                src,
+                                dst: MachOperand::Reg(MachReg::Phys(RAX)),
+                                size: OpSize::S64,
+                            });
+                            out.push(MachInst::Mov {
+                                src: MachOperand::StackSlot(vslot + 8),
+                                dst: MachOperand::Reg(MachReg::Phys(RDX)),
+                                size: OpSize::S64,
+                            });
+                            out.push(MachInst::Mov {
+                                src: MachOperand::Reg(MachReg::Phys(RAX)),
+                                dst: dst.clone(),
+                                size: OpSize::S64,
+                            });
+                            out.push(MachInst::Mov {
+                                src: MachOperand::Reg(MachReg::Phys(RDX)),
+                                dst: dst_hi,
+                                size: OpSize::S64,
+                            });
+                            return true;
+                        }
+                        out.push(MachInst::Mov128 { src, dst });
+                        return true;
+                    }
+                }
             }
             // Scalar float store (F32/F64 and the D32/D64 bit-carriers).
             //

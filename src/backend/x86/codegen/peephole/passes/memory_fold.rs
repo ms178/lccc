@@ -25,10 +25,16 @@ use super::helpers::{
 /// AFTER a "killing" pure overwrite may still be reached from the load
 /// without ever executing the overwrite when a branch lies in between; the
 /// overwrite only dominates the code that follows it on the same straight-
-/// line fall-through.  Calls are deliberately NOT listed here: a call
-/// clobbers every caller-saved xmm, so no reader can observe the loaded
-/// value across it (the passes keep their own stricter call veto for the
-/// xmm0-xmm7 variadic-argument window).
+/// line fall-through.  Calls are deliberately NOT listed here, but they
+/// are not free passage either: a Call is an OPAQUE READER of %xmm0-%xmm7
+/// (the SysV FP argument registers — when the loaded value is passed to
+/// the call, the caller reads it implicitly, and the self-move-elided
+/// argument staging leaves no textual trace).  Every fold that deletes a
+/// load whose register can be read that way therefore carries its own
+/// call veto for %xmm0-%xmm7.  A call cannot read %xmm8-%xmm15 (they are
+/// callee-saved and never argument registers, and compiled code never
+/// reads a callee-saved register before defining it), so those are
+/// genuinely safe to scan across.
 fn is_cf_transfer(kind: LineKind) -> bool {
     matches!(
         kind,
@@ -254,6 +260,22 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         // overwrite, so a reader textually past it can still observe the
         // loaded value (see is_cf_transfer).  The kill is therefore accepted
         // only across a control-flow-free straight-line stretch.
+        // A Call is an OPAQUE READER of %xmm0-%xmm7 (the SysV FP argument
+        // registers): when the loaded value is itself an argument of the
+        // call, the caller reads it implicitly and the read leaves no
+        // textual trace ("call foo" mentions no register — the argument
+        // move is a self-move the builder elided).  Deleting the load
+        // would feed the call a stale register, so the kill proof stops
+        // at a call for the argument registers.  %xmm8-%xmm15 are
+        // callee-saved and never argument registers, and compiled code
+        // never reads a callee-saved register before defining it, so the
+        // scan keeps walking there.  (The sibling folds carry the same
+        // veto; unreachable through the current per-use constant
+        // materialization, pinned as defense in depth.)
+        let src_is_arg_reg = src_reg
+            .strip_prefix("%xmm")
+            .and_then(|d| d.parse::<u32>().ok())
+            .is_some_and(|n| n <= 7);
         let mut later_mention = false;
         for k in (i + 2)..len {
             if infos[k].is_nop() {
@@ -261,6 +283,10 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             }
             let t = infos[k].trimmed(store.get(k));
             if t.starts_with(".size ") {
+                break;
+            }
+            if src_is_arg_reg && infos[k].kind == LineKind::Call {
+                later_mention = true;
                 break;
             }
             if mentions_xmm(t, src_reg) {
@@ -1319,8 +1345,8 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
 /// `fold_scalar_fp_memory_into_vex_op`: from the load line to the end of the
 /// function the register must be mentioned in EXACTLY those two lines (token-
 /// bounded, so `%xmm1` never matches inside `%xmm11`), and no `call` may
-/// intervene — a call can read `%xmm0`-`%xmm7` as variadic FP arguments
-/// without naming them in the text.  Mentions BEFORE the load are irrelevant
+/// intervene — a call can read `%xmm0`-`%xmm7` implicitly as the FP
+/// argument registers without naming them in the text.  Mentions BEFORE the load are irrelevant
 /// (the load redefines the register), so a home reused across loop iterations
 /// stays foldable for the later load.  Being function-wide, the proof is
 /// immune to cross-block reads that a block-local scan cannot see.
@@ -1408,8 +1434,8 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
         // ── liveness: the load and the FMA consume exactly two mentions;
         //    the first mention past them must fully overwrite the register
         //    (killing the loaded value) or be absent.  No intervening call
-        //    for xmm0-xmm7 (variadic FP args are implicit reads of
-        //    xmm0-xmm7). ──────────────────────────────────────────────────
+        //    for xmm0-xmm7 (calls read %xmm0-%xmm7 implicitly as the FP
+        //    argument registers). ──────────────────────────────────────────────────
         let reg_token = format!("%xmm{}", n);
         let mut total = 0;
         let mut vetoed = false;
@@ -1868,6 +1894,15 @@ pub(super) fn fold_zero_addend_fma213_to_132(
         while m < len {
             let t = infos[m].trimmed(store.get(m));
             if t == ".cfi_endproc" {
+                break;
+            }
+            // Same call-as-argument-reader contract as the other FP folds:
+            // a Call implicitly reads %xmm1-%xmm7 when the loaded value is
+            // passed to it (self-move-elided argument staging is invisible
+            // to this textual scan).  %xmm0 is excluded by construction —
+            // it is the zeroing register itself.
+            if b <= 7 && !infos[m].is_nop() && infos[m].kind == LineKind::Call {
+                ok_after = false;
                 break;
             }
             if !infos[m].is_nop() && mentions_token(t, &b_tok) > 0 {
@@ -2726,6 +2761,51 @@ mod fma132_reuse_tests {
         );
         assert!(!changed, "taken path reads the loaded multiplier: {out:?}");
     }
+
+    /// Same call-as-argument-reader gap as fold_fp_register_loads: the
+    /// loaded multiplier %xmm1 survives the FMA (dest %xmm2), and a later
+    /// call may read it implicitly as its second FP argument.  The first
+    /// TEXTUAL mention being a pure overwrite does not make the value
+    /// dead — the call in between reads it without mentioning it.
+    #[test]
+    fn refuses_when_call_reads_loaded_multiplier_register() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm1\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm3, %xmm1\n",
+        );
+        assert!(!changed, "the call may read %xmm1 as its argument: {out:?}");
+    }
+
+    /// The veto is call-specific: a non-call line in the stretch leaves
+    /// the fold enabled.
+    #[test]
+    fn still_folds_when_non_call_intervenes() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm1\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
+             \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
+             \x20   vmovapd %xmm3, %xmm1\n",
+        );
+        assert!(changed, "no implicit reader of %xmm1 in the stretch: {out:?}");
+    }
+
+    /// A call is harmless when the multiplier lives in the callee-saved
+    /// half: %xmm9 is never an implicit call operand.
+    #[test]
+    fn still_folds_when_call_does_not_read_callee_saved_reg() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm9\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm9, %xmm2\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm3, %xmm9\n",
+        );
+        assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2744,6 +2824,54 @@ mod fp_reg_load_tests {
             .map(|i| store.get(i).trim().to_string())
             .collect();
         (changed, out)
+    }
+
+    /// A Call is an OPAQUE reader of %xmm0-%xmm7 (the SysV FP argument
+    /// registers): when the loaded value is passed to the call, the caller
+    /// reads it implicitly and the read is invisible to a textual scan
+    /// ("call foo" mentions no register — the argument move is a self-move
+    /// the builder elided).  The later full overwrite therefore does NOT
+    /// prove the loaded value dead: the call in between would read a stale
+    /// register.  (Unreachable through the current per-use constant
+    /// materialization; pinned as defense in depth so the contract holds
+    /// if the isel ever shares one load across uses.)
+    #[test]
+    fn refuses_when_call_reads_loaded_arg_register() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm0\n",
+        );
+        assert!(!changed, "the call may read %xmm0 as its argument: {out:?}");
+    }
+
+    /// Same stretch with a non-call line in place of the call: the fold
+    /// must stay enabled (the veto is call-specific, not a general
+    /// straight-line restriction).
+    #[test]
+    fn still_folds_when_non_call_intervenes() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm0\n\
+             \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
+             \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
+             \x20   vmovapd %xmm1, %xmm0\n",
+        );
+        assert!(changed, "no implicit reader between load and overwrite: {out:?}");
+    }
+
+    /// Calls are harmless for the callee-saved half: %xmm8-%xmm15 are never
+    /// argument registers and compiled code never reads one before
+    /// defining it, so the kill proof holds across the call.
+    #[test]
+    fn still_folds_when_call_does_not_read_callee_saved_reg() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm9\n\
+             \x20   vaddsd %xmm9, %xmm5, %xmm5\n\
+             \x20   call foo\n\
+             \x20   vmovapd %xmm1, %xmm9\n",
+        );
+        assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
     }
 
     /// The dot8d SSE2 shape: %xmm3 carries the b0 load, the consumer is
