@@ -2114,11 +2114,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         pieces.sort_unstable();
                     }
                     for &(s, e2) in &pieces {
-                        liveness.segments.push(crate::backend::liveness::LiveInterval {
-                            value_id: *idx,
-                            start: s,
-                            end: e2,
-                        });
+                        liveness
+                            .segments
+                            .push(crate::backend::liveness::LiveInterval {
+                                value_id: *idx,
+                                start: s,
+                                end: e2,
+                            });
                     }
                 }
                 // Values without segment data keep the fat-envelope
@@ -2381,9 +2383,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // GetStaticChain/Alloca defs, so the guard is computed from the actual
     // instruction order.  Params themselves are exempt (their homes are the
     // hinted incoming registers, written by nobody but the caller).
-    let riscv_entry_guard: FxHashSet<u32> = if
-        config.available_regs.iter().any(|r| r.0 == 11)
-            && config.caller_saved_regs.iter().any(|r| r.0 == 12)
+    let riscv_entry_guard: FxHashSet<u32> = if config.available_regs.iter().any(|r| r.0 == 11)
+        && config.caller_saved_regs.iter().any(|r| r.0 == 12)
     {
         let mut guard = FxHashSet::default();
         if let Some(block0) = func.blocks.first() {
@@ -2978,8 +2979,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         !assignments.contains_key(&iv.value_id)
                             && !call_spanning.contains(&iv.value_id)
                             && !scratch_denied.contains(&iv.value_id)
-                            && (ordered_param_homes
-                                || !param_restricted.contains(&iv.value_id))
+                            && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                             && !riscv_entry_guard.contains(&iv.value_id)
                     })
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
@@ -3101,7 +3101,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 !assignments.contains_key(&iv.value_id)
                     && !call_spanning.contains(&iv.value_id)
                     && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
-                && !riscv_entry_guard.contains(&iv.value_id)
+                    && !riscv_entry_guard.contains(&iv.value_id)
             })
             .filter(|iv| {
                 let idx = eax_hazards.partition_point(|&p| p <= iv.start);
@@ -3455,8 +3455,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                         !assignments.contains_key(&iv.value_id)
                             && !call_spanning.contains(&iv.value_id)
                             && !scratch_denied.contains(&iv.value_id)
-                            && (ordered_param_homes
-                                || !param_restricted.contains(&iv.value_id))
+                            && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
                             && !riscv_entry_guard.contains(&iv.value_id)
                     })
                     .filter(|iv| !overlaps_inclusive_skip_birth(iv, reg_hazards))
@@ -3474,9 +3473,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                             !assignments.contains_key(&iv.value_id)
                                 && !call_spanning.contains(&iv.value_id)
                                 && !scratch_denied.contains(&iv.value_id)
-                                && (ordered_param_homes
-                                    || !param_restricted.contains(&iv.value_id))
-                            && !riscv_entry_guard.contains(&iv.value_id)
+                                && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
+                                && !riscv_entry_guard.contains(&iv.value_id)
                         })
                         .map(|iv| format!("{}:[{}..{}]", iv.value_id, iv.start, iv.end))
                         .collect();
@@ -4009,7 +4007,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
                 let (wa, wb) = (class_weight(a), class_weight(b));
                 let loser = if wa != wb {
-                    if wa < wb { a } else { b }
+                    if wa < wb {
+                        a
+                    } else {
+                        b
+                    }
                 } else if a < b {
                     b
                 } else {
@@ -6838,12 +6840,8 @@ mod phi_coalesce_tests {
     /// is live across the call (callee-saved / spilled), not a clobbered %r10.
     #[test]
     fn multi_def_peeled_index_covers_call_before_gep() {
-        let mut func = IrFunction::new(
-            "vdbe_strndup_shape".to_string(),
-            IrType::Ptr,
-            vec![],
-            false,
-        );
+        let mut func =
+            IrFunction::new("vdbe_strndup_shape".to_string(), IrType::Ptr, vec![], false);
         func.blocks = vec![
             block(
                 0,
@@ -6955,10 +6953,7 @@ mod phi_coalesce_tests {
         };
         let result = allocate_registers(&func, &config);
         let liv = result.liveness.expect("liveness");
-        assert!(
-            !liv.call_points.is_empty(),
-            "Memcpy must be a call_point"
-        );
+        assert!(!liv.call_points.is_empty(), "Memcpy must be a call_point");
         let segs: Vec<(u32, u32)> = liv
             .segments
             .iter()

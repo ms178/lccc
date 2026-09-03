@@ -47,8 +47,8 @@
 //! the pass that broke the invariant, not the one that tripped over it later.
 
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 use crate::ir::instruction::{BlockId, Terminator};
+use crate::ir::reexports::{Instruction, IrFunction, IrModule};
 
 /// A single structural violation, with enough context to identify the culprit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,8 +175,8 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
     let mut preds: Vec<FxHashSet<BlockId>> = vec![FxHashSet::default(); func.blocks.len()];
     for block in func.blocks.iter() {
         let from = block.label;
-        let mut edge = |label: BlockId, kind: &str, out: &mut Vec<Violation>| {
-            match label_to_idx.get(&label) {
+        let mut edge =
+            |label: BlockId, kind: &str, out: &mut Vec<Violation>| match label_to_idx.get(&label) {
                 Some(&to) => {
                     preds[to].insert(from);
                 }
@@ -184,8 +184,7 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
                     out,
                     format!("{} in {:?} targets unknown block {:?}", kind, from, label),
                 ),
-            }
-        };
+            };
         for_each_target(&block.terminator, |l| edge(l, "terminator", out));
         for inst in &block.instructions {
             if let Instruction::InlineAsm { goto_labels, .. } = inst {
@@ -300,10 +299,7 @@ pub fn verify_function(func: &IrFunction, stage: &str, out: &mut Vec<Violation>)
 /// Phi *contiguity* is deliberately NOT gated: passes index the phi prefix
 /// arithmetically (`loop_rotate` scans instructions at block start) without
 /// first checking reachability, so the invariant must hold everywhere.
-fn reachable_blocks(
-    func: &IrFunction,
-    label_to_idx: &FxHashMap<BlockId, usize>,
-) -> Vec<bool> {
+fn reachable_blocks(func: &IrFunction, label_to_idx: &FxHashMap<BlockId, usize>) -> Vec<bool> {
     let mut seen = vec![false; func.blocks.len()];
     if func.blocks.is_empty() {
         return seen;

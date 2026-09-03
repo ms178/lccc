@@ -613,8 +613,14 @@ mod tests {
             "    .quad .LBB1\n",
         ));
         // Both jump-table targets must survive with their labels defined.
-        assert!(out.contains(".LBB0:\n"), "case 0 block was merged away:\n{out}");
-        assert!(out.contains(".LBB1:\n"), "case 1 block was merged away:\n{out}");
+        assert!(
+            out.contains(".LBB0:\n"),
+            "case 0 block was merged away:\n{out}"
+        );
+        assert!(
+            out.contains(".LBB1:\n"),
+            "case 1 block was merged away:\n{out}"
+        );
         assert!(out.contains(".quad .LBB0"), "{out}");
         assert!(out.contains(".quad .LBB1"), "{out}");
     }
@@ -647,7 +653,10 @@ mod tests {
         ));
         // .LBB3 is the jnc target: it must survive even though .LBB1 has
         // identical text (their predecessor sets differ once jnc counts).
-        assert!(out.contains(".LBB3:\n"), "jnc target block was merged away:\n{out}");
+        assert!(
+            out.contains(".LBB3:\n"),
+            "jnc target block was merged away:\n{out}"
+        );
         assert!(out.contains("jnc .LBB3"), "{out}");
         // And the genuinely unreferenced twin may still be canonicalised.
         assert!(out.matches("xorl %eax, %eax").count() >= 1, "{out}");

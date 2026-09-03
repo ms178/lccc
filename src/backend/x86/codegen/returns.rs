@@ -10,8 +10,10 @@ impl X86Codegen {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             let ret_ty = self.current_return_type;
-            if matches!(ret_ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64)
-                && matches!(val, Operand::Value(v)
+            if matches!(
+                ret_ty,
+                IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64
+            ) && matches!(val, Operand::Value(v)
                     if self.state.direct_fp_result == Some(v.0))
             {
                 self.emit_epilogue_and_ret_impl(frame_size);
@@ -120,7 +122,10 @@ impl X86Codegen {
         // `movq %rax, %xmm0`), bouncing the double through %rax (or a stack
         // slot) on every FP return — the libm round-family regression class
         // (PERF-1: 2.99× GCC on `vroundsd` wrappers).
-        if matches!(ret_ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
+        if matches!(
+            ret_ty,
+            IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64
+        ) {
             if let Some(val) = val {
                 self.load_fp_to_xmm0(val, ret_ty);
             }

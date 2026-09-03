@@ -102,7 +102,8 @@ fn collect_abi_reg_hints(
             Some(PhysReg(6)),
             Some(PhysReg(7)),
         ]
-    } else if available_regs.iter().any(|r| r.0 == 11) && caller_saved_regs.iter().any(|r| r.0 == 12)
+    } else if available_regs.iter().any(|r| r.0 == 11)
+        && caller_saved_regs.iter().any(|r| r.0 == 12)
     {
         // riscv64: the caller pool is a0–a7 (PhysReg 12..19) and integer
         // ABI slot i IS a_i — pinning the param home to its incoming

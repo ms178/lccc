@@ -1,8 +1,8 @@
 pub(crate) mod ast;
 mod declarations;
-mod nested_functions;
 mod declarators;
 mod expressions;
+mod nested_functions;
 pub(crate) mod parse;
 mod statements;
 mod types;

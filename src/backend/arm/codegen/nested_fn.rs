@@ -88,14 +88,15 @@ impl ArmCodegen {
         }
         // 4. Code words (encodings derived in the module docs).
         const CODE: [(i64, u32); 4] = [
-            (0, 0x5800_0092), // ldr x18, [pc, #16] -> chain literal at +16
-            (4, 0x5800_00B1), // ldr x17, [pc, #20] -> func literal at +24
-            (8, 0xD61F_0220), // br x17
+            (0, 0x5800_0092),  // ldr x18, [pc, #16] -> chain literal at +16
+            (4, 0x5800_00B1),  // ldr x17, [pc, #20] -> func literal at +24
+            (8, 0xD61F_0220),  // br x17
             (12, 0xD503_201F), // nop
         ];
         for (offset, word) in CODE {
             self.load_large_imm("x3", word as i64);
-            self.state.emit_fmt(format_args!("    str x3, [x0, #{}]", offset));
+            self.state
+                .emit_fmt(format_args!("    str x3, [x0, #{}]", offset));
         }
         // 5. Data: chain at +16, function address at +24.
         self.state.emit("    str x2, [x0, #16]");
@@ -115,10 +116,12 @@ impl ArmCodegen {
         rsp_off: i64,
     ) {
         self.operand_to_x0(&Operand::Value(*frame));
-        self.state.emit_fmt(format_args!("    str x29, [x0, #{}]", rbp_off));
+        self.state
+            .emit_fmt(format_args!("    str x29, [x0, #{}]", rbp_off));
         // sp cannot be a str source register; move it through x1.
         self.state.emit("    mov x1, sp");
-        self.state.emit_fmt(format_args!("    str x1, [x0, #{}]", rsp_off));
+        self.state
+            .emit_fmt(format_args!("    str x1, [x0, #{}]", rsp_off));
         self.state.reg_cache.invalidate_all();
     }
 

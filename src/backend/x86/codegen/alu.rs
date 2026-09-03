@@ -108,10 +108,7 @@ impl X86Codegen {
             return;
         }
 
-        if let Some(reg) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+        if let Some(reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
             let name = if narrow {
                 super::emit::phys_reg_name_32(reg)
             } else {
@@ -312,44 +309,44 @@ impl X86Codegen {
         // so the transient 16-byte stack excursion is safe at any alignment.
         if narrow || matches!(ty, IrType::I32 | IrType::U32) {
             self.state.emit("    pushq %rcx");
-            self.state.emit("    movl %eax, %ecx");   // c = x
+            self.state.emit("    movl %eax, %ecx"); // c = x
             self.state.emit("    shrl $1, %eax");
             self.state.emit("    andl $0x55555555, %eax"); // (x>>1)&0x55..
-            self.state.emit("    subl %eax, %ecx");   // c = x - pairs
+            self.state.emit("    subl %eax, %ecx"); // c = x - pairs
             self.state.emit("    movl %ecx, %eax");
             self.state.emit("    shrl $2, %eax");
             self.state.emit("    andl $0x33333333, %eax");
             self.state.emit("    andl $0x33333333, %ecx");
-            self.state.emit("    addl %eax, %ecx");   // c = nibble counts
+            self.state.emit("    addl %eax, %ecx"); // c = nibble counts
             self.state.emit("    movl %ecx, %eax");
             self.state.emit("    shrl $4, %eax");
             self.state.emit("    addl %ecx, %eax");
             self.state.emit("    andl $0x0f0f0f0f, %eax"); // byte counts
             self.state.emit("    imull $0x01010101, %eax, %eax"); // *0x01010101
-            self.state.emit("    shrl $24, %eax");    // top byte = popcount
+            self.state.emit("    shrl $24, %eax"); // top byte = popcount
             self.state.emit("    popq %rcx");
         } else {
             self.state.emit("    pushq %rcx");
             self.state.emit("    pushq %rdx");
-            self.state.emit("    movq %rax, %rcx");   // c = x
+            self.state.emit("    movq %rax, %rcx"); // c = x
             self.state.emit("    shrq $1, %rax");
             self.state.emit("    movabsq $0x5555555555555555, %rdx");
-            self.state.emit("    andq %rdx, %rax");   // (x>>1)&0x55..
-            self.state.emit("    subq %rax, %rcx");   // c = x - pairs
+            self.state.emit("    andq %rdx, %rax"); // (x>>1)&0x55..
+            self.state.emit("    subq %rax, %rcx"); // c = x - pairs
             self.state.emit("    movq %rcx, %rax");
             self.state.emit("    shrq $2, %rax");
             self.state.emit("    movabsq $0x3333333333333333, %rdx");
             self.state.emit("    andq %rdx, %rax");
             self.state.emit("    andq %rdx, %rcx");
-            self.state.emit("    addq %rax, %rcx");   // c = nibble counts
+            self.state.emit("    addq %rax, %rcx"); // c = nibble counts
             self.state.emit("    movq %rcx, %rax");
             self.state.emit("    shrq $4, %rax");
             self.state.emit("    addq %rcx, %rax");
             self.state.emit("    movabsq $0x0f0f0f0f0f0f0f0f, %rdx");
-            self.state.emit("    andq %rdx, %rax");   // byte counts
+            self.state.emit("    andq %rdx, %rax"); // byte counts
             self.state.emit("    movabsq $0x0101010101010101, %rdx");
-            self.state.emit("    imulq %rdx, %rax");  // *0x0101..0101
-            self.state.emit("    shrq $56, %rax");    // top byte = popcount
+            self.state.emit("    imulq %rdx, %rax"); // *0x0101..0101
+            self.state.emit("    shrq $56, %rax"); // top byte = popcount
             self.state.emit("    popq %rdx");
             self.state.emit("    popq %rcx");
         }
@@ -576,8 +573,16 @@ impl X86Codegen {
 
         // Which value takes which output register:
         //   div-flavoured dest -> %rax, rem-flavoured dest -> %rdx.
-        let div_dest = if self_is_div { *dest } else { Value(partner_dest) };
-        let rem_dest = if self_is_div { Value(partner_dest) } else { *dest };
+        let div_dest = if self_is_div {
+            *dest
+        } else {
+            Value(partner_dest)
+        };
+        let rem_dest = if self_is_div {
+            Value(partner_dest)
+        } else {
+            *dest
+        };
 
         let rem_home = self.dest_reg(&rem_dest);
         let div_home = self.dest_reg(&div_dest);
@@ -585,10 +590,8 @@ impl X86Codegen {
         // nor a slot: their consumer reads %rax directly. The pair tail can
         // never be one (the accumulator analysis excludes tails), so at most
         // the HEAD's own dest is slotless.
-        let rem_slotless =
-            rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
-        let div_slotless =
-            div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
+        let rem_slotless = rem_home.is_none() && self.state.get_slot(rem_dest.0).is_none();
+        let div_slotless = div_home.is_none() && self.state.get_slot(div_dest.0).is_none();
         // store_rdx(rem) writes %rax iff rem is HOMED in %rdx... impossible
         // here: %rdx (PhysReg 16) is excluded from allocation in any function
         // containing division (prologue). store_rax(div) writes %rdx iff the
@@ -661,7 +664,10 @@ impl X86Codegen {
         // (one divq/idivq instead of two: the remainder is free with the
         // quotient on x86). The HEAD emits one divide and stores its own
         // result AND the partner's.
-        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+        if matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        ) {
             if self.divrem_tail_dests.contains(&dest.0)
                 && !self.divrem_broken_tails.contains(&dest.0)
             {
@@ -688,8 +694,15 @@ impl X86Codegen {
                         dest.0, op, partner_dest, partner_from_eax
                     );
                 }
-                let fused =
-                    self.emit_divrem_pair_head(dest, op, lhs, rhs, ty, partner_dest, partner_from_eax);
+                let fused = self.emit_divrem_pair_head(
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                    partner_dest,
+                    partner_from_eax,
+                );
                 if fused {
                     return;
                 }
@@ -707,10 +720,7 @@ impl X86Codegen {
         // phys_reg_name_32's unreachable!(). The accumulator path below
         // handles XMM homes on both loads (operand_to_rax) and the final
         // store (store_rax_to).
-        if let Some(dest_phys) = self
-            .dest_reg(dest)
-            .filter(|r| !super::emit::is_xmm_reg(*r))
-        {
+        if let Some(dest_phys) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
             let is_simple_alu = matches!(
                 op,
                 IrBinOp::Add
@@ -822,45 +832,49 @@ impl X86Codegen {
                             // (I8/I16 ALU ops have use_32bit == false).
                             let dest_is_small = self.state.is_small_slot(dest.0);
                             if !dest_is_small || use_32bit {
-                            let sref = self.slot_ref(dest_slot.0);
-                            // Try register source: op %reg, mem
-                            if let Some(rhs_phys) = self
-                                .operand_reg(rhs)
-                                .filter(|r| !super::emit::is_xmm_reg(*r))
-                            {
-                                if use_32bit {
-                                    let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
-                                    self.state.emit_fmt(format_args!(
-                                        "    {}l %{}, {}",
-                                        mnem, rhs_32, sref
-                                    ));
-                                } else {
-                                    let rhs_64 = super::emit::phys_reg_name(rhs_phys);
-                                    self.state.emit_fmt(format_args!(
-                                        "    {}q %{}, {}",
-                                        mnem, rhs_64, sref
-                                    ));
+                                let sref = self.slot_ref(dest_slot.0);
+                                // Try register source: op %reg, mem
+                                if let Some(rhs_phys) = self
+                                    .operand_reg(rhs)
+                                    .filter(|r| !super::emit::is_xmm_reg(*r))
+                                {
+                                    if use_32bit {
+                                        let rhs_32 = super::emit::phys_reg_name_32(rhs_phys);
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}l %{}, {}",
+                                            mnem, rhs_32, sref
+                                        ));
+                                    } else {
+                                        let rhs_64 = super::emit::phys_reg_name(rhs_phys);
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}q %{}, {}",
+                                            mnem, rhs_64, sref
+                                        ));
+                                    }
+                                    // The MEMORY holding dest/lhs changed; a prior
+                                    // `store_rax_to` may have cached dest/lhs in the
+                                    // accumulator, which now holds a stale value.
+                                    // The register source is untouched, so only the
+                                    // memory-backed ids are invalidated.
+                                    self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
+                                    return;
                                 }
-                                // The MEMORY holding dest/lhs changed; a prior
-                                // `store_rax_to` may have cached dest/lhs in the
-                                // accumulator, which now holds a stale value.
-                                // The register source is untouched, so only the
-                                // memory-backed ids are invalidated.
-                                self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
-                                return;
-                            }
-                            // Try immediate source: op $imm, mem
-                            if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
-                                if use_32bit {
-                                    self.state
-                                        .emit_fmt(format_args!("    {}l ${}, {}", mnem, imm, sref));
-                                } else {
-                                    self.state
-                                        .emit_fmt(format_args!("    {}q ${}, {}", mnem, imm, sref));
+                                // Try immediate source: op $imm, mem
+                                if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
+                                    if use_32bit {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}l ${}, {}",
+                                            mnem, imm, sref
+                                        ));
+                                    } else {
+                                        self.state.emit_fmt(format_args!(
+                                            "    {}q ${}, {}",
+                                            mnem, imm, sref
+                                        ));
+                                    }
+                                    self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
+                                    return;
                                 }
-                                self.invalidate_cache_for_values(&[dest.0, lhs_val.0]);
-                                return;
-                            }
                             } // width guard
                         }
                     }
@@ -1011,10 +1025,7 @@ impl X86Codegen {
                 // rsi/rdi/r8-r11 homes are RA-managed end-to-end and safe.
                 .filter(|&r| {
                     let name = super::emit::phys_reg_name(r);
-                    !super::emit::is_xmm_reg(r)
-                        && name != "rax"
-                        && name != "rcx"
-                        && name != "rdx"
+                    !super::emit::is_xmm_reg(r) && name != "rax" && name != "rcx" && name != "rdx"
                 })
                 .map(|r| {
                     if use_32bit {
@@ -1026,14 +1037,12 @@ impl X86Codegen {
             _ => None,
         };
         let alu_imm_direct: Option<i64> = match op {
-            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => {
-                match rhs {
-                    Operand::Const(c) => c.to_i64().filter(|&imm| {
-                        imm >= i32::MIN as i64 && imm <= i32::MAX as i64
-                    }),
-                    _ => None,
-                }
-            }
+            IrBinOp::Add | IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor => match rhs {
+                Operand::Const(c) => c
+                    .to_i64()
+                    .filter(|&imm| imm >= i32::MIN as i64 && imm <= i32::MAX as i64),
+                _ => None,
+            },
             _ => None,
         };
         if let Some(reg_name) = alu_reg_direct {
@@ -1060,23 +1069,29 @@ impl X86Codegen {
                 }
                 IrBinOp::And => {
                     if use_32bit {
-                        self.state.emit_fmt(format_args!("    andl %{}, %eax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    andl %{}, %eax", reg_name));
                     } else {
-                        self.state.emit_fmt(format_args!("    andq %{}, %rax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    andq %{}, %rax", reg_name));
                     }
                 }
                 IrBinOp::Or => {
                     if use_32bit {
-                        self.state.emit_fmt(format_args!("    orl %{}, %eax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    orl %{}, %eax", reg_name));
                     } else {
-                        self.state.emit_fmt(format_args!("    orq %{}, %rax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    orq %{}, %rax", reg_name));
                     }
                 }
                 IrBinOp::Xor => {
                     if use_32bit {
-                        self.state.emit_fmt(format_args!("    xorl %{}, %eax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    xorl %{}, %eax", reg_name));
                     } else {
-                        self.state.emit_fmt(format_args!("    xorq %{}, %rax", reg_name));
+                        self.state
+                            .emit_fmt(format_args!("    xorq %{}, %rax", reg_name));
                     }
                 }
                 _ => unreachable!("register-direct path gated to ALU ops"),
@@ -1265,7 +1280,9 @@ impl X86Codegen {
         // that fits in imm32. Order matters: try this BEFORE the memory-source
         // and operand_to_eax paths so the register-homed lhs is not staged.
         if let Operand::Value(lhs_val) = mul_lhs {
-            if let Some(lhs_reg) = self.dest_reg(lhs_val).filter(|r| !super::emit::is_xmm_reg(*r))
+            if let Some(lhs_reg) = self
+                .dest_reg(lhs_val)
+                .filter(|r| !super::emit::is_xmm_reg(*r))
             {
                 if let Some(imm) = Self::const_as_imm32_typed(mul_rhs, use_32bit) {
                     if use_32bit {
@@ -1379,10 +1396,12 @@ impl X86Codegen {
                 let dest_name_64 = super::emit::phys_reg_name(dest_phys);
                 if use_32bit {
                     if dest_name != "eax" {
-                        self.state.emit_fmt(format_args!("    movl %eax, %{}", dest_name));
+                        self.state
+                            .emit_fmt(format_args!("    movl %eax, %{}", dest_name));
                     }
                 } else if dest_name_64 != "rax" {
-                    self.state.emit_fmt(format_args!("    movq %rax, %{}", dest_name_64));
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, %{}", dest_name_64));
                 }
                 self.state.reg_cache.invalidate_acc();
                 return;

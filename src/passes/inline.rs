@@ -1603,25 +1603,24 @@ impl CallArgMeta {
 
     /// Extract the metadata slice for arguments `[from..to]`.
     fn slice(&self, from: usize, to: usize) -> CallArgMeta {
-        let take = |v: &[IrType]|
-            -> Vec<IrType> { v[from.min(v.len())..to.min(v.len())].to_vec() };
+        let take = |v: &[IrType]| -> Vec<IrType> { v[from.min(v.len())..to.min(v.len())].to_vec() };
         CallArgMeta {
             arg_types: take(&self.arg_types),
-            struct_arg_sizes: self.struct_arg_sizes[from.min(self.struct_arg_sizes.len())
-                ..to.min(self.struct_arg_sizes.len())]
+            struct_arg_sizes: self.struct_arg_sizes
+                [from.min(self.struct_arg_sizes.len())..to.min(self.struct_arg_sizes.len())]
                 .to_vec(),
-            struct_arg_aligns: self.struct_arg_aligns[from.min(self.struct_arg_aligns.len())
-                ..to.min(self.struct_arg_aligns.len())]
+            struct_arg_aligns: self.struct_arg_aligns
+                [from.min(self.struct_arg_aligns.len())..to.min(self.struct_arg_aligns.len())]
                 .to_vec(),
-            struct_arg_classes: self.struct_arg_classes[from.min(self.struct_arg_classes.len())
-                ..to.min(self.struct_arg_classes.len())]
+            struct_arg_classes: self.struct_arg_classes
+                [from.min(self.struct_arg_classes.len())..to.min(self.struct_arg_classes.len())]
                 .to_vec(),
-            struct_arg_riscv_float_classes: self.struct_arg_riscv_float_classes
-                [from.min(self.struct_arg_riscv_float_classes.len())
+            struct_arg_riscv_float_classes: self.struct_arg_riscv_float_classes[from
+                .min(self.struct_arg_riscv_float_classes.len())
                 ..to.min(self.struct_arg_riscv_float_classes.len())]
                 .to_vec(),
-            struct_arg_is_f128_sse: self.struct_arg_is_f128_sse
-                [from.min(self.struct_arg_is_f128_sse.len())
+            struct_arg_is_f128_sse: self.struct_arg_is_f128_sse[from
+                .min(self.struct_arg_is_f128_sse.len())
                 ..to.min(self.struct_arg_is_f128_sse.len())]
                 .to_vec(),
         }
@@ -2419,7 +2418,10 @@ fn is_mandatory_first_pass_callee(data: &CalleeData) -> bool {
 
     let is_gnu_inline_eligible =
         data.is_gnu_inline_def && inst_count <= 128 && data.blocks.len() <= 16;
-    data.is_always_inline || is_tiny || is_small || is_static_inline_eligible
+    data.is_always_inline
+        || is_tiny
+        || is_small
+        || is_static_inline_eligible
         || is_gnu_inline_eligible
 }
 
@@ -2732,12 +2734,10 @@ fn inline_call_site(
             let vp_name = "__lccc_va_arg_pack";
             for block in &mut inlined_blocks {
                 // Delete the sentinel call itself.
-                block
-                    .instructions
-                    .retain(|inst| {
-                        !matches!(inst, Instruction::Call { func, info }
+                block.instructions.retain(|inst| {
+                    !matches!(inst, Instruction::Call { func, info }
                             if func == vp_name && info.dest == Some(vrem))
-                    });
+                });
                 // Splice the forwarded arguments at every consuming site.
                 for inst in &mut block.instructions {
                     if let Instruction::Call { info, .. } = inst {
@@ -2937,7 +2937,7 @@ fn inline_call_site(
         if substitutable[i] {
             if let Operand::Const(c) = &site.args[i] {
                 if let Some(at) = const_ir_type(c) {
-                    home_subst.insert(param_alloca_info[i].0.0, (site.args[i], at));
+                    home_subst.insert(param_alloca_info[i].0 .0, (site.args[i], at));
                 }
             }
         }
@@ -2970,7 +2970,7 @@ fn inline_call_site(
         let num_args_to_store = std::cmp::min(site.args.len(), param_alloca_info.len());
         let mut inserted_arg_count = 0usize;
         for i in (0..num_args_to_store).rev() {
-            if home_subst.contains_key(&param_alloca_info[i].0.0) {
+            if home_subst.contains_key(&param_alloca_info[i].0 .0) {
                 continue; // value flows via the older pure-home substitution
             }
             let param_struct_size = callee.param_struct_sizes.get(i).copied().flatten();

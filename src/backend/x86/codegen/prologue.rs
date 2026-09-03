@@ -624,7 +624,9 @@ impl X86Codegen {
                             crate::ir::reexports::IrUnaryOp::Clz
                                 | crate::ir::reexports::IrUnaryOp::Ctz
                                 | crate::ir::reexports::IrUnaryOp::Popcount
-                        ) && !ty.is_float() && ty.size() <= 4 {
+                        ) && !ty.is_float()
+                            && ty.size() <= 4
+                        {
                             nonneg.insert(dest.0);
                         }
                     }
@@ -711,19 +713,21 @@ impl X86Codegen {
                         if crate::backend::generation::is_wide_int_type(*ty) {
                             continue;
                         }
-                        let is_fp = matches!(ty, crate::common::types::IrType::F32
-                            | crate::common::types::IrType::F64);
+                        let is_fp = matches!(
+                            ty,
+                            crate::common::types::IrType::F32 | crate::common::types::IrType::F64
+                        );
                         if is_fp {
                             let relational = matches!(
                                 op,
                                 crate::ir::reexports::IrCmpOp::Sgt
-                                | crate::ir::reexports::IrCmpOp::Sge
-                                | crate::ir::reexports::IrCmpOp::Slt
-                                | crate::ir::reexports::IrCmpOp::Sle
-                                | crate::ir::reexports::IrCmpOp::Ugt
-                                | crate::ir::reexports::IrCmpOp::Uge
-                                | crate::ir::reexports::IrCmpOp::Ult
-                                | crate::ir::reexports::IrCmpOp::Ule
+                                    | crate::ir::reexports::IrCmpOp::Sge
+                                    | crate::ir::reexports::IrCmpOp::Slt
+                                    | crate::ir::reexports::IrCmpOp::Sle
+                                    | crate::ir::reexports::IrCmpOp::Ugt
+                                    | crate::ir::reexports::IrCmpOp::Uge
+                                    | crate::ir::reexports::IrCmpOp::Ult
+                                    | crate::ir::reexports::IrCmpOp::Ule
                             );
                             if !relational {
                                 continue;
@@ -845,9 +849,7 @@ impl X86Codegen {
                                     // the boolean materialization while the
                                     // Select still expects to read it — a
                                     // miscompile. FP fusion is CondBranch-only.
-                                    if !is_fp
-                                        && use_counts.get(&cur).copied().unwrap_or(0) == 1
-                                    {
+                                    if !is_fp && use_counts.get(&cur).copied().unwrap_or(0) == 1 {
                                         is_consumer = true;
                                     }
                                     break;
@@ -900,8 +902,7 @@ impl X86Codegen {
             // folded_index_uses; a slot-homed operand is always safe; an
             // operand with no home at all (never-materialized) prunes the
             // entry (the Cmp then materializes its boolean normally).
-            let replay_scan =
-                super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
+            let replay_scan = super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
             self.cmp_replay_operand_links = replay_scan.operand_links;
             self.cmp_replay = replay_scan.replay;
 
@@ -929,25 +930,21 @@ impl X86Codegen {
             for block in &func.blocks {
                 for inst in &block.instructions {
                     match inst {
-                        Instruction::ParamRef { dest, param_idx, .. } => {
-                            let is_i128_param = self
-                                .state
-                                .param_classes
-                                .get(*param_idx)
-                                .is_some_and(|c| {
+                        Instruction::ParamRef {
+                            dest, param_idx, ..
+                        } => {
+                            let is_i128_param =
+                                self.state.param_classes.get(*param_idx).is_some_and(|c| {
                                     matches!(
                                         c,
-                                        crate::backend::call_abi::ParamClass::I128RegPair {
-                                            ..
-                                        }
+                                        crate::backend::call_abi::ParamClass::I128RegPair { .. }
                                     )
                                 });
                             if is_i128_param {
                                 coherent_i128_homes.insert(dest.0);
                             }
                         }
-                        Instruction::Call { info, .. }
-                        | Instruction::CallIndirect { info, .. } => {
+                        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                             if let Some(dest) = info.dest {
                                 if matches!(info.return_type, IrType::I128 | IrType::U128) {
                                     coherent_i128_homes.insert(dest.0);
@@ -1035,10 +1032,8 @@ impl X86Codegen {
                 let mut promote: crate::common::fx_hash::FxHashSet<u32> =
                     crate::common::fx_hash::FxHashSet::default();
                 for (block_idx, block) in func.blocks.iter().enumerate() {
-                    let consumer_depth = depths
-                        .get(block_idx)
-                        .copied()
-                        .unwrap_or_else(|| usize::MAX);
+                    let consumer_depth =
+                        depths.get(block_idx).copied().unwrap_or_else(|| usize::MAX);
                     for inst in &block.instructions {
                         let Instruction::GetElementPtr {
                             base,
@@ -1268,10 +1263,13 @@ impl X86Codegen {
                     // the allocator, never under-constrains.
                     let mut links = crate::backend::generation::collect_folded_gep_links_all(func);
                     for (operand, dests) in &self.cmp_replay_operand_links {
-                        links.entry(*operand).or_default().extend(dests.iter().copied());
+                        links
+                            .entry(*operand)
+                            .or_default()
+                            .extend(dests.iter().copied());
                     }
                     links
-                }
+                },
             );
 
         // ── CMP-REPLAY post-RA home pruning (IS-09) ─────────────────────────
@@ -1398,7 +1396,11 @@ impl X86Codegen {
         if std::env::var("CCC_MI_DEBUG").is_ok() {
             eprintln!(
                 "[MI-PROFIT] fn={} loop_insts={} limit={} enabled={} fn_disabled={} fn_forced={}",
-                func.name, loop_insts, max_loop_insts, self.machinst_function_enabled, fn_disabled,
+                func.name,
+                loop_insts,
+                max_loop_insts,
+                self.machinst_function_enabled,
+                fn_disabled,
                 fn_forced
             );
         }
@@ -1516,12 +1518,12 @@ impl X86Codegen {
                                             // WITHOUT segment data keep the
                                             // conservative fat test.
                                             let mut seg_conflict = false;
-                                            'outer: for seg in
-                                                cached_liveness.iter().flat_map(|l| l.segments.iter())
+                                            'outer: for seg in cached_liveness
+                                                .iter()
+                                                .flat_map(|l| l.segments.iter())
                                             {
                                                 if seg.value_id == cd.0
-                                                    || !(seg.start <= load_pp
-                                                        && load_pp <= seg.end)
+                                                    || !(seg.start <= load_pp && load_pp <= seg.end)
                                                 {
                                                     continue;
                                                 }
@@ -1541,19 +1543,16 @@ impl X86Codegen {
                                             let mut fat_conflict = false;
                                             for &(vid, s, e) in &intervals {
                                                 if vid != cd.0 && s <= load_pp && load_pp <= e {
-                                                    if let Some(&r) =
-                                                        self.reg_assignments.get(&vid)
+                                                    if let Some(&r) = self.reg_assignments.get(&vid)
                                                     {
                                                         if r == reg
-                                                            && !cached_liveness.as_ref().is_some_and(
-                                                                |l| {
-                                                                    l.segments.iter().any(
-                                                                        |sg| {
-                                                                            sg.value_id == vid
-                                                                        },
-                                                                    )
-                                                                },
-                                                            )
+                                                            && !cached_liveness
+                                                                .as_ref()
+                                                                .is_some_and(|l| {
+                                                                    l.segments.iter().any(|sg| {
+                                                                        sg.value_id == vid
+                                                                    })
+                                                                })
                                                         {
                                                             fat_conflict = true;
                                                             break;
@@ -2812,11 +2811,7 @@ fn global_addr_loop_depths(func: &IrFunction, _watched: &FxHashSet<u32>) -> Vec<
 
 /// Defining block of a GlobalAddr root (or of the const-offset chain that
 /// ends in one), for the PF-07 depth comparison.
-fn gaddr_def_block(
-    func: &IrFunction,
-    mut v: u32,
-    gmap: &FxHashMap<u32, String>,
-) -> Option<usize> {
+fn gaddr_def_block(func: &IrFunction, mut v: u32, gmap: &FxHashMap<u32, String>) -> Option<usize> {
     for _ in 0..8 {
         if gmap.contains_key(&v) {
             // Find its defining block.

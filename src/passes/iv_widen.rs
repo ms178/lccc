@@ -126,9 +126,7 @@ use crate::ir::analysis::{CfgAnalysis, FlatAdj};
 use crate::ir::constants::IrConst;
 use crate::ir::instruction::{BasicBlock, Instruction, Operand, Terminator, Value};
 use crate::ir::reexports::{BlockId, IrBinOp, IrCmpOp, IrFunction};
-use crate::passes::loop_analysis::{
-    find_natural_loops, merge_loops_by_header, NaturalLoop,
-};
+use crate::passes::loop_analysis::{find_natural_loops, merge_loops_by_header, NaturalLoop};
 
 /// Entry point used by the dirty-tracking pipeline.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
@@ -197,8 +195,6 @@ enum ExtKind {
 fn is_unsigned_ty(ty: IrType) -> bool {
     matches!(ty, IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64)
 }
-
-
 
 fn ext_kind_for(ty: IrType) -> ExtKind {
     if is_unsigned_ty(ty) {
@@ -313,7 +309,11 @@ enum MemberKind {
     /// every `x`), and `LShr` is exact for zext, unconditionally. `Shl` is
     /// exact under the signed-overflow-is-UB theorem for signed IVs, and
     /// requires a non-wrapping range proof for unsigned IVs.
-    ShiftConst { op: IrBinOp, operand: Value, count: IrConst },
+    ShiftConst {
+        op: IrBinOp,
+        operand: Value,
+        count: IrConst,
+    },
     /// A widening cast of a member (`to_ty` ≥ 32 bits, same signedness).
     /// Dropped after its uses are redirected to the underlying member's wide
     /// value.
@@ -340,11 +340,7 @@ enum MemberKind {
     Copy { operand: Value },
     /// `y = select(cond, a, b)` where `a` is a member and `b` is a const or a
     /// member. The condition is never the IV.
-    Select {
-        cond: Operand,
-        a: Value,
-        b: Operand,
-    },
+    Select { cond: Operand, a: Value, b: Operand },
 }
 
 #[derive(Debug, Clone)]
@@ -442,12 +438,7 @@ struct PhiCandidate {
 
 /// Try to widen exactly one IV in `lp`. Returns true if a widening was
 /// applied.
-fn try_widen_loop(
-    func: &mut IrFunction,
-    lp: &NaturalLoop,
-    cfg: &CfgAnalysis,
-    debug: bool,
-) -> bool {
+fn try_widen_loop(func: &mut IrFunction, lp: &NaturalLoop, cfg: &CfgAnalysis, debug: bool) -> bool {
     let Some(preheader) = lp.find_preheader(&cfg.preds) else {
         return false;
     };
@@ -526,12 +517,7 @@ fn collect_widenable_phis(
     let header_block = &func.blocks[lp.header];
     let mut out = Vec::new();
     for inst in &header_block.instructions {
-        let Instruction::Phi {
-            dest,
-            ty,
-            incoming,
-        } = inst
-        else {
+        let Instruction::Phi { dest, ty, incoming } = inst else {
             continue;
         };
         if !matches!(*ty, IrType::I32 | IrType::U32) {
@@ -611,11 +597,7 @@ fn latch_step_uses_phi(
 /// Extract the step operand of the latch op (the operand that is NOT the
 /// phi). The caller has already validated the shape via
 /// `latch_step_uses_phi`.
-fn plan_step_operand(
-    func: &IrFunction,
-    phi_dest: Value,
-    latch_dest: Value,
-) -> Option<Operand> {
+fn plan_step_operand(func: &IrFunction, phi_dest: Value, latch_dest: Value) -> Option<Operand> {
     for b in &func.blocks {
         for inst in &b.instructions {
             if let Instruction::BinOp {
@@ -689,11 +671,7 @@ fn predicate_ok_wide(pred: IrCmpOp, ext: ExtKind) -> bool {
 /// The extension of the other side must match the member's so both sides live
 /// in the same universe: a sext-widened IV compares against sext-widened
 /// signed values; a zext-widened IV against zext-widened unsigned values.
-fn other_widen_for_pred(
-    ext: ExtKind,
-    other: &Operand,
-    func: &IrFunction,
-) -> Option<CmpOther> {
+fn other_widen_for_pred(ext: ExtKind, other: &Operand, func: &IrFunction) -> Option<CmpOther> {
     match other {
         Operand::Const(c) => Some(CmpOther::Const(*c)),
         Operand::Value(v) => {
@@ -749,7 +727,15 @@ fn analyze_iv(
 
     // Unsigned IVs need a provable counted-loop bound (theorem 5).
     let seed_range: Option<Range> = if ext == ExtKind::Ze {
-        Some(prove_counted_bound(func, lp, succs, uses, phi_dest, latch_is_sub, step)?)
+        Some(prove_counted_bound(
+            func,
+            lp,
+            succs,
+            uses,
+            phi_dest,
+            latch_is_sub,
+            step,
+        )?)
     } else {
         None
     };
@@ -851,8 +837,7 @@ fn analyze_iv(
                                 continue;
                             }
                             Operand::Value(ov) => {
-                                let other_admitted =
-                                    members.iter().any(|m| m.value.0 == ov.0);
+                                let other_admitted = members.iter().any(|m| m.value.0 == ov.0);
                                 if other_admitted || ov.0 == cur.0 {
                                     queue.push((*dest, false));
                                     continue;
@@ -912,11 +897,11 @@ fn analyze_iv(
                                 }
                                 // Signed: the UB theorem makes every constant
                                 // arithmetic op sound.
-                                let nr = match (member_range(&members, cur), const_as_range(*c, *ty))
-                                {
-                                    (Some(r), Some(cr)) => binop_range(*op, r, cr),
-                                    _ => None,
-                                };
+                                let nr =
+                                    match (member_range(&members, cur), const_as_range(*c, *ty)) {
+                                        (Some(r), Some(cr)) => binop_range(*op, r, cr),
+                                        _ => None,
+                                    };
                                 members.push(Member::of(
                                     *dest,
                                     MemberKind::BinOpConst {
@@ -936,8 +921,7 @@ fn analyze_iv(
                             // (UB theorem); the other operand must be an
                             // admitted member.
                             if let Operand::Value(ov) = other {
-                                let other_is_member =
-                                    members.iter().any(|m| m.value.0 == ov.0);
+                                let other_is_member = members.iter().any(|m| m.value.0 == ov.0);
                                 if !cur_is_unsigned && other_is_member {
                                     members.push(Member::of(
                                         *dest,
@@ -966,10 +950,7 @@ fn analyze_iv(
                                 ) {
                                     (IrBinOp::And, Some(_r), Some(cr)) => {
                                         // x & c ∈ [0, c] (bitwise subset).
-                                        Some(Range {
-                                            lo: 0,
-                                            hi: cr.hi,
-                                        })
+                                        Some(Range { lo: 0, hi: cr.hi })
                                     }
                                     (IrBinOp::Or, Some(_r), Some(cr)) => {
                                         // x | c ≥ c, and < 2^w.
@@ -1039,7 +1020,11 @@ fn analyze_iv(
                                         Some(r) => r,
                                         None => {
                                             narrow_escape_or_bail(
-                                                lp, bi, cur, narrow, &mut escapes,
+                                                lp,
+                                                bi,
+                                                cur,
+                                                narrow,
+                                                &mut escapes,
                                             )?;
                                             continue;
                                         }
@@ -1229,9 +1214,7 @@ fn analyze_iv(
                         let other_op = if cur_is_true { false_val } else { true_val };
                         let other_ok = match other_op {
                             Operand::Const(_) => true,
-                            Operand::Value(ov) => {
-                                members.iter().any(|m| m.value.0 == ov.0)
-                            }
+                            Operand::Value(ov) => members.iter().any(|m| m.value.0 == ov.0),
                         };
                         if other_ok {
                             // Select-data membership follows the same
@@ -1465,10 +1448,7 @@ fn prove_counted_bound(
             || matches!((op, lhs_is_phi), (IrCmpOp::Ugt | IrCmpOp::Sgt, true));
         if upper_bound && delta > 0 {
             // Body values ≤ n-1 ≤ max-1; latch result ≤ max — no wrap.
-            return Some(Range {
-                lo: 0,
-                hi: max - 1,
-            });
+            return Some(Range { lo: 0, hi: max - 1 });
         }
         if lower_bound && delta < 0 {
             // Body values ≥ 1; latch result ≥ 0 — no wrap.
@@ -1529,10 +1509,7 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                 const_is_lhs,
             } => {
                 let Instruction::BinOp {
-                    op: aop,
-                    lhs,
-                    rhs,
-                    ..
+                    op: aop, lhs, rhs, ..
                 } = inst
                 else {
                     return false;
@@ -1540,7 +1517,11 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                 if aop != op {
                     return false;
                 }
-                let (mop, cop) = if *const_is_lhs { (rhs, lhs) } else { (lhs, rhs) };
+                let (mop, cop) = if *const_is_lhs {
+                    (rhs, lhs)
+                } else {
+                    (lhs, rhs)
+                };
                 if !matches!(mop, Operand::Value(v) if v.0 == operand.0) {
                     return false;
                 }
@@ -1564,11 +1545,7 @@ fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
                     return false;
                 }
             }
-            MemberKind::ShiftConst {
-                op,
-                operand,
-                count,
-            } => {
+            MemberKind::ShiftConst { op, operand, count } => {
                 let Instruction::BinOp {
                     op: aop, lhs, rhs, ..
                 } = inst
@@ -1668,12 +1645,7 @@ fn find_def<'a>(func: &'a IrFunction, v: Value) -> Option<(usize, &'a Instructio
 // Apply (all mutations happen here, in a fixed safe order)
 // ---------------------------------------------------------------------------
 
-fn apply_widen(
-    func: &mut IrFunction,
-    plan: &WidenPlan,
-    preheader_idx: usize,
-    debug: bool,
-) -> bool {
+fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, debug: bool) -> bool {
     let wide_ty = plan.wide_ty;
     let phi_ty = plan.phi_ty;
     let phi_dest = plan.phi_dest;
@@ -1732,7 +1704,9 @@ fn apply_widen(
     //    in dependency order by the engine).
     for m in &plan.members {
         match &m.kind {
-            MemberKind::Seed | MemberKind::LatchResult | MemberKind::WidenCast { .. }
+            MemberKind::Seed
+            | MemberKind::LatchResult
+            | MemberKind::WidenCast { .. }
             | MemberKind::Copy { .. } => {
                 // Seed/latch handled above; casts/copies are dropped later.
             }
@@ -1741,9 +1715,8 @@ fn apply_widen(
                 // truncation for NarrowCast, a same-size reinterpretation for
                 // CrossCast (U64→I64 / I64→U64 emit as no-ops).
                 if let Some((bi, ii)) = find_def_mut(func, m.value) {
-                    if let Instruction::Cast {
-                        src, from_ty, ..
-                    } = &mut func.blocks[bi].instructions[ii]
+                    if let Instruction::Cast { src, from_ty, .. } =
+                        &mut func.blocks[bi].instructions[ii]
                     {
                         *src = Operand::Value(*operand);
                         *from_ty = wide_ty;
@@ -1757,9 +1730,8 @@ fn apply_widen(
                 const_is_lhs,
             } => {
                 if let Some((bi, ii)) = find_def_mut(func, m.value) {
-                    if let Instruction::BinOp {
-                        ty, lhs, rhs, ..
-                    } = &mut func.blocks[bi].instructions[ii]
+                    if let Instruction::BinOp { ty, lhs, rhs, .. } =
+                        &mut func.blocks[bi].instructions[ii]
                     {
                         *ty = wide_ty;
                         let cop = if *const_is_lhs { lhs } else { rhs };
@@ -1820,8 +1792,12 @@ fn apply_widen(
                 if still_used {
                     // Keep a well-typed identity so the IR stays consistent;
                     // DCE will collect it if it becomes dead.
-                    if let Instruction::Cast { src, from_ty, to_ty, .. } =
-                        &mut block.instructions[ii]
+                    if let Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    } = &mut block.instructions[ii]
                     {
                         *src = Operand::Value(*operand);
                         *from_ty = wide_ty;
@@ -1879,9 +1855,8 @@ fn apply_widen(
                     CmpOther::WideValue(v) => Operand::Value(*v),
                 };
                 if let Some((bi, ii)) = find_def_mut(func, *cmp_dest) {
-                    if let Instruction::Cmp {
-                        ty, lhs, rhs, ..
-                    } = &mut func.blocks[bi].instructions[ii]
+                    if let Instruction::Cmp { ty, lhs, rhs, .. } =
+                        &mut func.blocks[bi].instructions[ii]
                     {
                         *ty = wide_ty;
                         if *iv_is_lhs {
@@ -1902,10 +1877,7 @@ fn apply_widen(
                     // side (it may have been aliased by a cast/copy drop).
                     let (src, other_side, cmp_ty) = {
                         let inst = &func.blocks[bi].instructions[ii];
-                        let Instruction::Cmp {
-                            lhs, rhs, ty, ..
-                        } = inst
-                        else {
+                        let Instruction::Cmp { lhs, rhs, ty, .. } = inst else {
                             continue;
                         };
                         if *iv_is_lhs {
@@ -2045,12 +2017,7 @@ fn rewrite_seed_phi(
     let preheader_label = func.blocks[preheader_idx].label;
     for b in &mut func.blocks {
         for inst in &mut b.instructions {
-            if let Instruction::Phi {
-                dest,
-                ty,
-                incoming,
-            } = inst
-            {
+            if let Instruction::Phi { dest, ty, incoming } = inst {
                 if *dest == plan.phi_dest {
                     *ty = plan.wide_ty;
                     for (op, blk) in incoming.iter_mut() {
@@ -2128,7 +2095,9 @@ fn insert_inst(block: &mut BasicBlock, at: usize, inst: Instruction) {
         .or_else(|| block.source_spans.last())
         .copied();
     if let Some(sp) = fill {
-        block.source_spans.insert(at.min(block.source_spans.len()), sp);
+        block
+            .source_spans
+            .insert(at.min(block.source_spans.len()), sp);
     }
 }
 
@@ -2213,17 +2182,18 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
     match inst {
         // GEP offsets and intrinsic index arguments are address arithmetic.
         Instruction::GetElementPtr { .. } | Instruction::Intrinsic { .. } => false,
-        Instruction::BinOp { ty, lhs, rhs, .. } => {
-            ty.size() < 8 && (reads(lhs) || reads(rhs))
-        }
+        Instruction::BinOp { ty, lhs, rhs, .. } => ty.size() < 8 && (reads(lhs) || reads(rhs)),
         Instruction::Cmp { .. } => false,
         Instruction::Cast { .. } => false,
         // A Copy of a narrow member carries a narrow dest: it must read the
         // truncation, not the wide value.
         Instruction::Copy { .. } => true,
-        Instruction::Select { ty, true_val, false_val, .. } => {
-            ty.size() < 8 && (reads(true_val) || reads(false_val))
-        }
+        Instruction::Select {
+            ty,
+            true_val,
+            false_val,
+            ..
+        } => ty.size() < 8 && (reads(true_val) || reads(false_val)),
         Instruction::Phi { .. } => false,
         // Load reads a pointer, not the member; store values, calls, atomics
         // and everything else are narrow consumers.
@@ -2438,7 +2408,13 @@ mod tests {
         let mut func = counting_loop("basic", IrType::I32, IrBinOp::Add, body, None);
         check(&mut func, 1);
         let phi = &func.blocks[1].instructions[0];
-        assert!(matches!(phi, Instruction::Phi { ty: IrType::I64, .. }));
+        assert!(matches!(
+            phi,
+            Instruction::Phi {
+                ty: IrType::I64,
+                ..
+            }
+        ));
         assert!(!func.blocks[2]
             .instructions
             .iter()
@@ -2479,9 +2455,19 @@ mod tests {
         let shl = func.blocks[2]
             .instructions
             .iter()
-            .find(|i| matches!(i, Instruction::BinOp { op: IrBinOp::Shl, .. }))
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Shl,
+                        ..
+                    }
+                )
+            })
             .unwrap();
-        assert!(matches!(shl, Instruction::BinOp { ty: IrType::I64, lhs: Operand::Value(v), .. } if v.0 == 1));
+        assert!(
+            matches!(shl, Instruction::BinOp { ty: IrType::I64, lhs: Operand::Value(v), .. } if v.0 == 1)
+        );
     }
 
     /// Closure: `(i & 7)` bitwise member feeding a GEP through a cast.
@@ -2515,7 +2501,15 @@ mod tests {
         let and = func.blocks[2]
             .instructions
             .iter()
-            .find(|i| matches!(i, Instruction::BinOp { op: IrBinOp::And, .. }))
+            .find(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::And,
+                        ..
+                    }
+                )
+            })
             .unwrap();
         assert!(matches!(
             and,
@@ -2906,7 +2900,13 @@ mod tests {
             }
         ));
         let has_trunc = func.blocks[1].instructions.iter().any(|i| {
-            matches!(i, Instruction::Cast { to_ty: IrType::U32, .. })
+            matches!(
+                i,
+                Instruction::Cast {
+                    to_ty: IrType::U32,
+                    ..
+                }
+            )
         });
         assert!(has_trunc, "a truncation must feed the narrow cmp");
     }
@@ -3048,9 +3048,13 @@ mod tests {
             .filter(|i| matches!(i, Instruction::Cmp { .. }))
             .collect();
         assert_eq!(cmps.len(), 2, "both cmps must survive");
-        assert!(cmps
-            .iter()
-            .all(|c| matches!(c, Instruction::Cmp { ty: IrType::I64, .. })));
+        assert!(cmps.iter().all(|c| matches!(
+            c,
+            Instruction::Cmp {
+                ty: IrType::I64,
+                ..
+            }
+        )));
     }
 
     /// Two-member arithmetic (signed): `y = i + (i & 7)`.
@@ -3158,10 +3162,7 @@ mod tests {
         check(&mut func, 0);
         assert!(matches!(
             &func.blocks[1].instructions[0],
-            Instruction::Phi {
-                ty: IrType::I8,
-                ..
-            }
+            Instruction::Phi { ty: IrType::I8, .. }
         ));
     }
 
@@ -3196,17 +3197,24 @@ mod tests {
         let mut func = counting_loop("nshift", IrType::I32, IrBinOp::Add, body, None);
         check(&mut func, 1);
         let phi = &func.blocks[1].instructions[0];
-        assert!(matches!(phi, Instruction::Phi { ty: IrType::I64, .. }));
+        assert!(matches!(
+            phi,
+            Instruction::Phi {
+                ty: IrType::I64,
+                ..
+            }
+        ));
         // The narrow shift is retyped to I64 with its count left as-is.
-        assert!(func.blocks[2].instructions.iter().any(
-            |i| matches!(i, Instruction::BinOp {
+        assert!(func.blocks[2]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::BinOp {
                 op: IrBinOp::Shl,
                 ty: IrType::I64,
                 lhs: Operand::Value(v),
                 rhs: Operand::Const(IrConst::I32(1)),
                 ..
-            } if v.0 == 1)
-        ));
+            } if v.0 == 1)));
         // The widening cast was dropped; the GEP reads the shifted member.
         assert!(func.blocks[2].instructions.iter().any(
             |i| matches!(i, Instruction::GetElementPtr { offset: Operand::Value(v), .. } if v.0 == 10)
@@ -3388,26 +3396,20 @@ mod tests {
             }
         ));
         // The redundant sext cast was dropped: the GEP now reads the wide phi.
-        assert!(func.blocks[2]
-            .instructions
-            .iter()
-            .any(|i| matches!(
-                i,
-                Instruction::GetElementPtr {
-                    offset: Operand::Value(Value(1)),
-                    ..
-                }
-            )));
-        assert!(!func.blocks[2]
-            .instructions
-            .iter()
-            .any(|i| matches!(
-                i,
-                Instruction::Cast {
-                    dest: Value(11),
-                    ..
-                }
-            )));
+        assert!(func.blocks[2].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::GetElementPtr {
+                offset: Operand::Value(Value(1)),
+                ..
+            }
+        )));
+        assert!(!func.blocks[2].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::Cast {
+                dest: Value(11),
+                ..
+            }
+        )));
     }
 
     /// Rotated self-loop (header == latch): widenable with a preheader.
@@ -3482,17 +3484,14 @@ mod tests {
         ));
         // Locate the latch Add by dest — earlier indices shift when the
         // redundant sext cast is dropped.
-        assert!(func.blocks[1]
-            .instructions
-            .iter()
-            .any(|i| matches!(
-                i,
-                Instruction::BinOp {
-                    dest: Value(5),
-                    ty: IrType::I64,
-                    ..
-                }
-            )));
+        assert!(func.blocks[1].instructions.iter().any(|i| matches!(
+            i,
+            Instruction::BinOp {
+                dest: Value(5),
+                ty: IrType::I64,
+                ..
+            }
+        )));
     }
 
     /// The latch result (`a[i++]`-style post value) is itself a member: a GEP

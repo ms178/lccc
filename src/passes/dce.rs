@@ -273,10 +273,7 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
             })
             .take(func.params.len())
             .collect();
-        if let Some(last_live) = param_allocas
-            .iter()
-            .rposition(|&fi| live[fi as usize] != 0)
-        {
+        if let Some(last_live) = param_allocas.iter().rposition(|&fi| live[fi as usize] != 0) {
             for &fi in &param_allocas[..=last_live] {
                 mark_site_live(fi, &mut live, &mut worklist);
             }
@@ -469,7 +466,9 @@ fn dce_debug_enabled() -> bool {
 
 fn dump_dead_instructions(func: &IrFunction, live: &[u8], block_off: &[u32]) {
     for (bi, block) in func.blocks.iter().enumerate() {
-        let Some(&start) = block_off.get(bi) else { break };
+        let Some(&start) = block_off.get(bi) else {
+            break;
+        };
         let start = start as usize;
         for (ii, inst) in block.instructions.iter().enumerate() {
             match live.get(start + ii) {
@@ -503,11 +502,23 @@ fn has_side_effects(inst: &Instruction) -> bool {
     // a pure struct-returning call left the result buffer uninitialized
     // (gcc.c-torture 20070614-1: `pure _Complex double` callee).
     if let Instruction::Call {
-        info: CallInfo { is_sret, is_pure, is_const, .. },
+        info:
+            CallInfo {
+                is_sret,
+                is_pure,
+                is_const,
+                ..
+            },
         ..
     }
     | Instruction::CallIndirect {
-        info: CallInfo { is_sret, is_pure, is_const, .. },
+        info:
+            CallInfo {
+                is_sret,
+                is_pure,
+                is_const,
+                ..
+            },
         ..
     } = inst
     {
@@ -1099,8 +1110,7 @@ mod tests {
         // join block returns %5. A single-slot def map marks only the
         // last-seen copy live and sweeps the first — the returned value
         // would be garbage on the other path. Both copies must survive.
-        let mut func =
-            multi_def_fan_in(2, Terminator::Return(Some(Operand::Value(Value(5)))));
+        let mut func = multi_def_fan_in(2, Terminator::Return(Some(Operand::Value(Value(5)))));
         let removed = eliminate_dead_code(&mut func);
         assert_eq!(
             removed, 0,
@@ -1123,11 +1133,14 @@ mod tests {
     fn multi_def_three_sites_exercise_overflow_append() {
         // Third def of the same id takes the "already multi-def → append"
         // path rather than the "first collision → create entry" path.
-        let mut live_func =
-            multi_def_fan_in(3, Terminator::Return(Some(Operand::Value(Value(5)))));
+        let mut live_func = multi_def_fan_in(3, Terminator::Return(Some(Operand::Value(Value(5)))));
         assert_eq!(eliminate_dead_code(&mut live_func), 0);
         for p in 1..=3 {
-            assert_eq!(live_func.blocks[p].instructions.len(), 1, "copy {p} deleted");
+            assert_eq!(
+                live_func.blocks[p].instructions.len(),
+                1,
+                "copy {p} deleted"
+            );
         }
 
         let mut dead_func = multi_def_fan_in(3, Terminator::Return(None));
@@ -1216,7 +1229,10 @@ mod tests {
         assert_eq!(func.blocks[0].instructions.len(), 1);
         assert!(matches!(
             func.blocks[0].instructions[0],
-            Instruction::BinOp { dest: Value(HIGH), .. }
+            Instruction::BinOp {
+                dest: Value(HIGH),
+                ..
+            }
         ));
     }
 

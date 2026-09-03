@@ -721,13 +721,13 @@ pub(super) fn fold_extend_relay(store: &mut LineStore, infos: &mut [LineInfo]) -
             // Step 4: Transform.
             // Use the same sub-register for the source (al/ax from rax family=0).
             let src_name = REG_NAMES[src_sub_idx][0]; // %al or %ax
-            // Unsigned extends may target the 32-bit destination because the
-            // architectural 32-bit write zero-extends to the full GPR.  Signed
-            // byte/word extends must target the 64-bit destination: `movsbl
-            // %al,%esi` would sign-extend only to 32 bits and then zero the
-            // upper half of %rsi, corrupting negative values that are live as
-            // I64/long (gcc.c-torture/execute/20030218-1.c: -256 became
-            // 4294967040 after `movswl %ax,%esi; movq %rsi,%rax`).
+                                                      // Unsigned extends may target the 32-bit destination because the
+                                                      // architectural 32-bit write zero-extends to the full GPR.  Signed
+                                                      // byte/word extends must target the 64-bit destination: `movsbl
+                                                      // %al,%esi` would sign-extend only to 32 bits and then zero the
+                                                      // upper half of %rsi, corrupting negative values that are live as
+                                                      // I64/long (gcc.c-torture/execute/20030218-1.c: -256 became
+                                                      // 4294967040 after `movswl %ax,%esi; movq %rsi,%rax`).
             let dest = if matches!(new_op, "movsbl" | "movswl") {
                 REG_NAMES[0][dest_reg as usize]
             } else {
@@ -1364,7 +1364,6 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
         d.parse().ok()
     }
 
-
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
@@ -1412,10 +1411,10 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
             continue;
         }
         let lj = infos[j].trimmed(store.get(j));
-        let Some((fop, body)) = FMA231
-            .iter()
-            .find_map(|m| lj.strip_prefix(&format!("{}{} ", m, width)).map(|b| (*m, b)))
-        else {
+        let Some((fop, body)) = FMA231.iter().find_map(|m| {
+            lj.strip_prefix(&format!("{}{} ", m, width))
+                .map(|b| (*m, b))
+        }) else {
             i += 1;
             continue;
         };
@@ -1458,8 +1457,8 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
                     // reaches it — a control-flow transfer in between lets a
                     // branch skip the overwrite while a reader past the merge
                     // still observes the loaded value (is_cf_transfer).
-                    let straight = !(j + 1..k)
-                        .any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
+                    let straight =
+                        !(j + 1..k).any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
                     vetoed = !(is_pure_xmm_overwrite(t, &reg_token) && straight);
                     break;
                 }
@@ -1567,12 +1566,45 @@ pub(super) fn hoist_repeated_fp_constant_loads(
     infos: &mut [LineInfo],
 ) -> bool {
     const FP_OPS: &[&str] = &[
-        "addsd", "addss", "subsd", "subss", "mulsd", "mulss", "divsd", "divss", "vaddsd",
-        "vaddss", "vsubsd", "vsubss", "vmulsd", "vmulss", "vdivsd", "vdivss", "vfmadd132sd",
-        "vfmadd132ss", "vfmadd213sd", "vfmadd213ss", "vfmadd231sd", "vfmadd231ss", "vfmsub132sd",
-        "vfmsub132ss", "vfmsub213sd", "vfmsub213ss", "vfmsub231sd", "vfmsub231ss", "vfnmadd132sd",
-        "vfnmadd132ss", "vfnmadd213sd", "vfnmadd213ss", "vfnmadd231sd", "vfnmadd231ss",
-        "vfnmsub132sd", "vfnmsub132ss", "vfnmsub213sd", "vfnmsub213ss", "vfnmsub231sd",
+        "addsd",
+        "addss",
+        "subsd",
+        "subss",
+        "mulsd",
+        "mulss",
+        "divsd",
+        "divss",
+        "vaddsd",
+        "vaddss",
+        "vsubsd",
+        "vsubss",
+        "vmulsd",
+        "vmulss",
+        "vdivsd",
+        "vdivss",
+        "vfmadd132sd",
+        "vfmadd132ss",
+        "vfmadd213sd",
+        "vfmadd213ss",
+        "vfmadd231sd",
+        "vfmadd231ss",
+        "vfmsub132sd",
+        "vfmsub132ss",
+        "vfmsub213sd",
+        "vfmsub213ss",
+        "vfmsub231sd",
+        "vfmsub231ss",
+        "vfnmadd132sd",
+        "vfnmadd132ss",
+        "vfnmadd213sd",
+        "vfnmadd213ss",
+        "vfnmadd231sd",
+        "vfnmadd231ss",
+        "vfnmsub132sd",
+        "vfnmsub132ss",
+        "vfnmsub213sd",
+        "vfnmsub213ss",
+        "vfnmsub231sd",
         "vfnmsub231ss",
     ];
 
@@ -1695,8 +1727,7 @@ fn mentions_token(text: &str, token: &str) -> usize {
                 .chars()
                 .next_back()
                 .map_or(false, |c| c.is_ascii_alphanumeric() || c == '_' || c == '%');
-        let ok_after = !text[after..]
-            .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        let ok_after = !text[after..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
         if ok_before && ok_after {
             count += 1;
         }
@@ -1739,9 +1770,7 @@ fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
     for z in ["xorpd", "xorps", "pxor", "vxorpd", "vxorps", "vpxor"] {
         if let Some(rest) = t.strip_prefix(z) {
             let rest = rest.trim_start();
-            if rest == format!("{}, {}", reg, reg)
-                || rest == format!("{}, {}, {}", reg, reg, reg)
-            {
+            if rest == format!("{}, {}", reg, reg) || rest == format!("{}, {}, {}", reg, reg, reg) {
                 return true;
             }
         }
@@ -1872,10 +1901,8 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             continue;
         };
         let ops: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
-        let ok = ops.len() == 3
-            && ops[0] == "%xmm0"
-            && ops[1] == b_tok
-            && xmm_num(ops[2]) != Some(b);
+        let ok =
+            ops.len() == 3 && ops[0] == "%xmm0" && ops[1] == b_tok && xmm_num(ops[2]) != Some(b);
         if !ok {
             i += 1;
             continue;
@@ -2338,10 +2365,8 @@ mod fma_mem_fold_tests {
     /// into the FMA's memory src2 slot.
     #[test]
     fn folds_single_use_load_into_fma_src2() {
-        let (changed, out) = run(
-            "    movsd 32(%rsi), %xmm11\n\
-             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n",
-        );
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n");
         assert!(changed, "single-use load should fold");
         assert_eq!(out.len(), 1, "load must be gone: {out:?}");
         assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
@@ -2351,11 +2376,9 @@ mod fma_mem_fold_tests {
     /// is still needed after the FMA.
     #[test]
     fn refuses_when_register_mentioned_later() {
-        let (changed, _) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   vaddsd %xmm11, %xmm0, %xmm0\n",
-        );
+             \x20   vaddsd %xmm11, %xmm0, %xmm0\n");
         assert!(!changed, "later reader must veto the fold");
     }
 
@@ -2366,11 +2389,9 @@ mod fma_mem_fold_tests {
     /// a-element load).
     #[test]
     fn folds_when_next_mention_fully_overwrites() {
-        let (changed, out) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   movsd 40(%rdi), %xmm11\n",
-        );
+             \x20   movsd 40(%rdi), %xmm11\n");
         assert!(changed, "pure overwrite kills the loaded value");
         assert_eq!(out.len(), 2, "{out:?}");
         assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
@@ -2381,11 +2402,9 @@ mod fma_mem_fold_tests {
     /// look past them to the final operand.
     #[test]
     fn folds_when_overwrite_uses_sib_addressing() {
-        let (changed, out) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, out) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   vmovsd 32(%rdi,%rax,8), %xmm11\n",
-        );
+             \x20   vmovsd 32(%rdi,%rax,8), %xmm11\n");
         assert!(changed, "SIB-addressed overwrite still kills the value");
         assert_eq!(out[0], "vfmadd231sd 32(%rsi), %xmm10, %xmm2");
         assert_eq!(out.len(), 2, "{out:?}");
@@ -2394,22 +2413,18 @@ mod fma_mem_fold_tests {
     /// A self-zeroing xor is a full overwrite too.
     #[test]
     fn folds_when_next_mention_is_self_zeroing_xor() {
-        let (changed, _) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   pxor %xmm11, %xmm11\n",
-        );
+             \x20   pxor %xmm11, %xmm11\n");
         assert!(changed, "pxor zeroes the whole register");
     }
 
     /// A STORE mentioning the register reads it — not an overwrite.
     #[test]
     fn refuses_when_next_mention_is_a_store() {
-        let (changed, _) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   movsd %xmm11, (%rax)\n",
-        );
+             \x20   movsd %xmm11, (%rax)\n");
         assert!(!changed, "a store reads the loaded value");
     }
 
@@ -2417,11 +2432,9 @@ mod fma_mem_fold_tests {
     /// loaded value.
     #[test]
     fn refuses_when_next_mention_partially_writes() {
-        let (changed, _) = run(
-            "    movsd 32(%rsi), %xmm11\n\
+        let (changed, _) = run("    movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
-             \x20   movhpd (%rax), %xmm11\n",
-        );
+             \x20   movhpd (%rax), %xmm11\n");
         assert!(!changed, "movhpd leaves the low lane untouched");
     }
 
@@ -2431,14 +2444,15 @@ mod fma_mem_fold_tests {
     /// preserves the high bits the deleted load zeroed).
     #[test]
     fn refuses_reg_reg_scalar_movsd_merge_after_consumer() {
-        let (changed, _) = run(
-            "    movapd %xmm9, %xmm11\n\
+        let (changed, _) = run("    movapd %xmm9, %xmm11\n\
              \x20   movsd 32(%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
              \x20   vmovsd %xmm12, %xmm11\n\
-             \x20   vmovapd %xmm11, %xmm5\n",
+             \x20   vmovapd %xmm11, %xmm5\n");
+        assert!(
+            !changed,
+            "merge write preserves high bits from the deleted load"
         );
-        assert!(!changed, "merge write preserves high bits from the deleted load");
     }
 
     /// dest == loaded register means the FMA line mentions it twice; the
@@ -2446,10 +2460,8 @@ mod fma_mem_fold_tests {
     /// though the rewrite would actually be valid).
     #[test]
     fn refuses_when_dest_equals_loaded_reg() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm2\n\
-             \x20   vfmadd231sd %xmm2, %xmm3, %xmm2\n",
-        );
+        let (changed, _) = run("    movsd (%rsi), %xmm2\n\
+             \x20   vfmadd231sd %xmm2, %xmm3, %xmm2\n");
         assert!(!changed, "dest==src2 shape must be refused");
     }
 
@@ -2457,16 +2469,15 @@ mod fma_mem_fold_tests {
     /// register), so a home reused across iterations stays foldable.
     #[test]
     fn folds_reused_home_when_later_use_is_last() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm5\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm5\n\
              \x20   vfmadd213sd %xmm0, %xmm5, %xmm2\n\
              \x20   movsd 56(%rsi), %xmm5\n\
              \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
-             \x20   ret\n",
-        );
+             \x20   ret\n");
         assert!(changed, "second (last-def) load should fold");
         assert!(
-            out.iter().any(|l| l == "vfmadd231sd 56(%rsi), %xmm3, %xmm8"),
+            out.iter()
+                .any(|l| l == "vfmadd231sd 56(%rsi), %xmm3, %xmm8"),
             "expected folded second pair: {out:?}"
         );
         assert!(
@@ -2479,11 +2490,9 @@ mod fma_mem_fold_tests {
     /// arguments) — veto for registers in the argument range.
     #[test]
     fn refuses_when_call_intervenes_for_arg_reg() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm5\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm5\n\
              \x20   vfmadd231sd %xmm5, %xmm3, %xmm8\n\
-             \x20   call printf\n",
-        );
+             \x20   call printf\n");
         assert!(!changed, "call may read %xmm5 as variadic arg");
     }
 
@@ -2491,11 +2500,9 @@ mod fma_mem_fold_tests {
     /// never an implicit call operand, so the fold is safe.
     #[test]
     fn folds_past_call_for_non_arg_reg() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm11\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm11\n\
              \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n\
-             \x20   call printf\n",
-        );
+             \x20   call printf\n");
         assert!(changed, "xmm11 cannot be a variadic arg");
         assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
     }
@@ -2504,11 +2511,9 @@ mod fma_mem_fold_tests {
     /// of `%xmm1` and must not veto the fold.
     #[test]
     fn token_boundary_distinguishes_xmm1_from_xmm11() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm1\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
              \x20   vfmadd231sd %xmm1, %xmm3, %xmm8\n\
-             \x20   movsd (%rdi), %xmm11\n",
-        );
+             \x20   movsd (%rdi), %xmm11\n");
         assert!(changed, "%xmm11 must not count as %xmm1");
         assert_eq!(out[0], "vfmadd231sd (%rsi), %xmm3, %xmm8");
     }
@@ -2516,10 +2521,8 @@ mod fma_mem_fold_tests {
     /// Width mismatch (movss load feeding an -sd FMA) is not our pattern.
     #[test]
     fn refuses_width_mismatch() {
-        let (changed, _) = run(
-            "    movss (%rsi), %xmm11\n\
-             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n",
-        );
+        let (changed, _) = run("    movss (%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n");
         assert!(!changed, "ss load must not fold into sd fma");
     }
 
@@ -2527,10 +2530,8 @@ mod fma_mem_fold_tests {
     /// is the addend register, not the rm slot — must not fold.
     #[test]
     fn refuses_non_231_form() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm11\n\
-             \x20   vfmadd213sd %xmm11, %xmm3, %xmm8\n",
-        );
+        let (changed, _) = run("    movsd (%rsi), %xmm11\n\
+             \x20   vfmadd213sd %xmm11, %xmm3, %xmm8\n");
         assert!(!changed, "213 form has no memory src2 slot");
     }
 
@@ -2538,11 +2539,9 @@ mod fma_mem_fold_tests {
     /// without the load — adjacency (NOPs aside) is mandatory.
     #[test]
     fn refuses_when_label_between() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm11\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm11\n\
              .L5:\n\
-             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n",
-        );
+             \x20   vfmadd231sd %xmm11, %xmm3, %xmm8\n");
         assert!(!changed, "label breaks adjacency");
     }
 
@@ -2554,15 +2553,13 @@ mod fma_mem_fold_tests {
     /// pure full-width overwrite.
     #[test]
     fn refuses_when_branch_bypasses_the_killing_overwrite() {
-        let (changed, out) = run(
-            "    movsd 32(%rsi), %xmm5\n\
+        let (changed, out) = run("    movsd 32(%rsi), %xmm5\n\
              \x20   vfmadd231sd %xmm5, %xmm10, %xmm2\n\
              \x20   jne .Ldone\n\
              \x20   vmovsd 40(%rdi), %xmm5\n\
              .Ldone:\n\
              \x20   vaddsd %xmm5, %xmm3, %xmm3\n\
-             \x20   ret\n",
-        );
+             \x20   ret\n");
         assert!(!changed, "taken path reads the loaded value: {out:?}");
     }
 }
@@ -2590,11 +2587,9 @@ mod fma132_zero_tests {
     /// into the 132-form memory slot, the zeroing stays for the FMA.
     #[test]
     fn folds_zero_addend_triple_to_132() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
-             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
-        );
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
         assert!(changed, "triple must fold");
         assert_eq!(out.len(), 2, "b load must be gone: {out:?}");
         assert_eq!(out[0], "xorpd %xmm0, %xmm0");
@@ -2604,12 +2599,10 @@ mod fma132_zero_tests {
     /// A later use of the loaded register vetoes the fold.
     #[test]
     fn refuses_when_multiplier_used_later() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
-             \x20   vaddsd %xmm3, %xmm2, %xmm2\n",
-        );
+             \x20   vaddsd %xmm3, %xmm2, %xmm2\n");
         assert!(!changed, "later reader must veto");
     }
 
@@ -2617,10 +2610,8 @@ mod fma132_zero_tests {
     /// unproven %xmm0 — refuse.
     #[test]
     fn refuses_without_zeroing_line() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
-             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
-        );
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
         assert!(!changed, "missing zeroing must veto");
     }
 
@@ -2628,12 +2619,10 @@ mod fma132_zero_tests {
     /// entered without the load).
     #[test]
     fn refuses_when_label_between() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
              .L5:\n\
              \x20   xorpd %xmm0, %xmm0\n\
-             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n",
-        );
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n");
         assert!(!changed, "label breaks adjacency");
     }
 
@@ -2642,8 +2631,7 @@ mod fma132_zero_tests {
     /// die block-locally).
     #[test]
     fn dot8_first_iteration_collapses_to_one_zero() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
              \x20   movsd 8(%rsi), %xmm5\n\
@@ -2654,8 +2642,7 @@ mod fma132_zero_tests {
              \x20   vfmadd213sd %xmm0, %xmm7, %xmm6\n\
              \x20   movsd 24(%rsi), %xmm9\n\
              \x20   xorpd %xmm0, %xmm0\n\
-             \x20   vfmadd213sd %xmm0, %xmm9, %xmm8\n",
-        );
+             \x20   vfmadd213sd %xmm0, %xmm9, %xmm8\n");
         assert!(changed);
         let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
         assert_eq!(zeros, 1, "exactly one resident zero: {out:?}");
@@ -2666,11 +2653,9 @@ mod fma132_zero_tests {
     /// The zero state dies at a call: the zeroing after it must stay.
     #[test]
     fn zero_state_dies_at_call() {
-        let (_, out) = run(
-            "    xorpd %xmm0, %xmm0\n\
+        let (_, out) = run("    xorpd %xmm0, %xmm0\n\
              \x20   call foo\n\
-             \x20   xorpd %xmm0, %xmm0\n",
-        );
+             \x20   xorpd %xmm0, %xmm0\n");
         let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
         assert_eq!(zeros, 2, "call clobbers the zero: {out:?}");
     }
@@ -2679,13 +2664,11 @@ mod fma132_zero_tests {
     /// (last operand) kills it.
     #[test]
     fn zero_state_survives_reads_dies_on_writes() {
-        let (_, out) = run(
-            "    xorpd %xmm0, %xmm0\n\
+        let (_, out) = run("    xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vaddsd %xmm1, %xmm0\n\
-             \x20   xorpd %xmm0, %xmm0\n",
-        );
+             \x20   xorpd %xmm0, %xmm0\n");
         let zeros = out.iter().filter(|l| *l == "xorpd %xmm0, %xmm0").count();
         // first stays; second dies (still zero after the read); third stays
         // (the 2-operand vaddsd wrote %xmm0).
@@ -2715,13 +2698,11 @@ mod fma132_reuse_tests {
     /// by a pure load, so the first-iteration fold is still sound.
     #[test]
     fn folds_when_multiplier_redefined_later() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
              \x20   movsd 56(%rdi), %xmm3\n\
-             \x20   vfmadd231sd 56(%rsi), %xmm3, %xmm8\n",
-        );
+             \x20   vfmadd231sd 56(%rsi), %xmm3, %xmm8\n");
         assert!(changed, "pure later redefinition must allow the fold");
         assert!(
             out.iter().any(|l| l == "vfmadd132sd (%rsi), %xmm0, %xmm2"),
@@ -2733,12 +2714,10 @@ mod fma132_reuse_tests {
     /// the loaded value — must veto.
     #[test]
     fn refuses_rmw_on_multiplier() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
-             \x20   vaddsd %xmm1, %xmm3, %xmm3\n",
-        );
+             \x20   vaddsd %xmm1, %xmm3, %xmm3\n");
         assert!(!changed, "rmw reads the loaded value");
     }
 
@@ -2749,16 +2728,14 @@ mod fma132_reuse_tests {
     /// first later mention.
     #[test]
     fn refuses_when_branch_between_fma_and_redefinition() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
              \x20   jne .Ldone\n\
              \x20   movsd 56(%rdi), %xmm3\n\
              .Ldone:\n\
              \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
-             \x20   ret\n",
-        );
+             \x20   ret\n");
         assert!(!changed, "taken path reads the loaded multiplier: {out:?}");
     }
 
@@ -2769,13 +2746,11 @@ mod fma132_reuse_tests {
     /// dead — the call in between reads it without mentioning it.
     #[test]
     fn refuses_when_call_reads_loaded_multiplier_register() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm1\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
              \x20   call foo\n\
-             \x20   vmovapd %xmm3, %xmm1\n",
-        );
+             \x20   vmovapd %xmm3, %xmm1\n");
         assert!(!changed, "the call may read %xmm1 as its argument: {out:?}");
     }
 
@@ -2783,27 +2758,26 @@ mod fma132_reuse_tests {
     /// the fold enabled.
     #[test]
     fn still_folds_when_non_call_intervenes() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm1\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm1, %xmm2\n\
              \x20   vaddsd %xmm4, %xmm3, %xmm3\n\
-             \x20   vmovapd %xmm3, %xmm1\n",
+             \x20   vmovapd %xmm3, %xmm1\n");
+        assert!(
+            changed,
+            "no implicit reader of %xmm1 in the stretch: {out:?}"
         );
-        assert!(changed, "no implicit reader of %xmm1 in the stretch: {out:?}");
     }
 
     /// A call is harmless when the multiplier lives in the callee-saved
     /// half: %xmm9 is never an implicit call operand.
     #[test]
     fn still_folds_when_call_does_not_read_callee_saved_reg() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm9\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm9\n\
              \x20   xorpd %xmm0, %xmm0\n\
              \x20   vfmadd213sd %xmm0, %xmm9, %xmm2\n\
              \x20   call foo\n\
-             \x20   vmovapd %xmm3, %xmm9\n",
-        );
+             \x20   vmovapd %xmm3, %xmm9\n");
         assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
     }
 }
@@ -2837,12 +2811,10 @@ mod fp_reg_load_tests {
     /// if the isel ever shares one load across uses.)
     #[test]
     fn refuses_when_call_reads_loaded_arg_register() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm0\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
              \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
              \x20   call foo\n\
-             \x20   vmovapd %xmm1, %xmm0\n",
-        );
+             \x20   vmovapd %xmm1, %xmm0\n");
         assert!(!changed, "the call may read %xmm0 as its argument: {out:?}");
     }
 
@@ -2851,13 +2823,14 @@ mod fp_reg_load_tests {
     /// straight-line restriction).
     #[test]
     fn still_folds_when_non_call_intervenes() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm0\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm0\n\
              \x20   vaddsd %xmm0, %xmm5, %xmm5\n\
              \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
-             \x20   vmovapd %xmm1, %xmm0\n",
+             \x20   vmovapd %xmm1, %xmm0\n");
+        assert!(
+            changed,
+            "no implicit reader between load and overwrite: {out:?}"
         );
-        assert!(changed, "no implicit reader between load and overwrite: {out:?}");
     }
 
     /// Calls are harmless for the callee-saved half: %xmm8-%xmm15 are never
@@ -2865,12 +2838,10 @@ mod fp_reg_load_tests {
     /// defining it, so the kill proof holds across the call.
     #[test]
     fn still_folds_when_call_does_not_read_callee_saved_reg() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm9\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm9\n\
              \x20   vaddsd %xmm9, %xmm5, %xmm5\n\
              \x20   call foo\n\
-             \x20   vmovapd %xmm1, %xmm9\n",
-        );
+             \x20   vmovapd %xmm1, %xmm9\n");
         assert!(changed, "xmm9 is not an implicit call operand: {out:?}");
     }
 
@@ -2880,12 +2851,10 @@ mod fp_reg_load_tests {
     /// fold is sound.
     #[test]
     fn folds_when_register_reused_by_later_overwrite() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
              \x20   vaddsd %xmm4, %xmm2, %xmm2\n\
-             \x20   movsd 0x38(%rdi), %xmm3\n",
-        );
+             \x20   movsd 0x38(%rdi), %xmm3\n");
         assert!(changed, "later full overwrite kills the loaded value");
         assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
         assert_eq!(out.len(), 3, "{out:?}");
@@ -2894,11 +2863,9 @@ mod fp_reg_load_tests {
     /// A later reader vetoes the fold even with the refinement.
     #[test]
     fn refuses_when_later_line_reads_register() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
              \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
-             \x20   vaddsd %xmm3, %xmm0, %xmm0\n",
-        );
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n");
         assert!(!changed, "later reader must veto");
     }
 
@@ -2906,11 +2873,9 @@ mod fp_reg_load_tests {
     /// mention of %xmm1 — the scan must run past it and fold.
     #[test]
     fn folds_when_later_line_mentions_wider_numbered_register() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm1\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm1\n\
              \x20   vmulsd %xmm1, %xmm2, %xmm2\n\
-             \x20   movsd (%rdi), %xmm11\n",
-        );
+             \x20   movsd (%rdi), %xmm11\n");
         assert!(changed, "%xmm11 does not mention %xmm1");
         assert_eq!(out[0], "vmulsd (%rsi), %xmm2, %xmm2");
     }
@@ -2919,14 +2884,11 @@ mod fp_reg_load_tests {
     /// not a pure overwrite.
     #[test]
     fn refuses_when_reuse_is_read_modify_write() {
-        let (changed, _) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, _) = run("    movsd (%rsi), %xmm3\n\
              \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
-             \x20   vaddsd %xmm5, %xmm3, %xmm3\n",
-        );
+             \x20   vaddsd %xmm5, %xmm3, %xmm3\n");
         assert!(!changed, "rmw reads the loaded value before writing");
     }
-
 
     /// RED-TEAM REGRESSION (PR #359 follow-up): a reg-reg scalar `vmovsd`
     /// is a MERGE write — it preserves bits 64:127 of the destination.
@@ -2936,13 +2898,11 @@ mod fp_reg_load_tests {
     /// changes observable state; the fold must be refused.
     #[test]
     fn refuses_when_next_mention_is_reg_reg_scalar_movsd_merge() {
-        let (changed, _) = run(
-            "    movapd %xmm9, %xmm11\n\
+        let (changed, _) = run("    movapd %xmm9, %xmm11\n\
              \x20   movsd 32(%rsi), %xmm11\n\
              \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
              \x20   vmovsd %xmm12, %xmm11\n\
-             \x20   vmovapd %xmm11, %xmm5\n",
-        );
+             \x20   vmovapd %xmm11, %xmm5\n");
         assert!(
             !changed,
             "reg-reg vmovsd preserves the high half — not a full overwrite"
@@ -2952,14 +2912,15 @@ mod fp_reg_load_tests {
     /// Same shape, single-precision: a reg-reg `movss` merges bits 32:127.
     #[test]
     fn refuses_when_next_mention_is_reg_reg_scalar_movss_merge() {
-        let (changed, _) = run(
-            "    movaps %xmm9, %xmm11\n\
+        let (changed, _) = run("    movaps %xmm9, %xmm11\n\
              \x20   movss 32(%rsi), %xmm11\n\
              \x20   vmulss %xmm11, %xmm2, %xmm2\n\
              \x20   movss %xmm12, %xmm11\n\
-             \x20   movaps %xmm11, %xmm5\n",
+             \x20   movaps %xmm11, %xmm5\n");
+        assert!(
+            !changed,
+            "reg-reg movss merges bits 32:127 — not an overwrite"
         );
-        assert!(!changed, "reg-reg movss merges bits 32:127 — not an overwrite");
     }
 
     /// Memory-source scalar moves DO define the full register (the upper
@@ -2967,13 +2928,11 @@ mod fp_reg_load_tests {
     /// even with a packed read after the merge.
     #[test]
     fn folds_when_next_mention_is_memory_source_scalar_movsd() {
-        let (changed, out) = run(
-            "    movapd %xmm9, %xmm11\n\
+        let (changed, out) = run("    movapd %xmm9, %xmm11\n\
              \x20   movsd 32(%rsi), %xmm11\n\
              \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
              \x20   movsd 40(%rdi), %xmm11\n\
-             \x20   vmovapd %xmm11, %xmm5\n",
-        );
+             \x20   vmovapd %xmm11, %xmm5\n");
         assert!(
             changed,
             "memory-source movsd zeroes the high half: full overwrite"
@@ -2987,15 +2946,13 @@ mod fp_reg_load_tests {
     /// on the fall-through path.  Deleting the load corrupts the taken path.
     #[test]
     fn refuses_when_branch_skips_the_killing_overwrite() {
-        let (changed, out) = run(
-            "    movsd (%rsi), %xmm3\n\
+        let (changed, out) = run("    movsd (%rsi), %xmm3\n\
              \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
              \x20   jne .Ldone\n\
              \x20   vmovsd 40(%rdi), %xmm3\n\
              .Ldone:\n\
              \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
-             \x20   ret\n",
-        );
+             \x20   ret\n");
         assert!(!changed, "taken path reads the loaded value: {out:?}");
     }
 }
@@ -3045,7 +3002,10 @@ mod fp_const_hoist_tests {
             &[1],
         );
         assert!(changed, "two constant reads must hoist");
-        assert_eq!(out[1], "movsd .LCFP_0(%rip), %xmm0", "slot hosts load: {out:?}");
+        assert_eq!(
+            out[1], "movsd .LCFP_0(%rip), %xmm0",
+            "slot hosts load: {out:?}"
+        );
         assert_eq!(out[3], "vaddsd %xmm0, %xmm2, %xmm2");
         assert_eq!(out[4], "vaddsd %xmm0, %xmm4, %xmm4");
     }
@@ -3149,7 +3109,10 @@ mod fp_const_hoist_tests {
             &[0, 1],
         );
         assert!(changed, "still hoists with another register");
-        assert_eq!(out[0], "movsd .LCFP_0(%rip), %xmm1", "xmm0 is claimed by the dead line: {out:?}");
+        assert_eq!(
+            out[0], "movsd .LCFP_0(%rip), %xmm1",
+            "xmm0 is claimed by the dead line: {out:?}"
+        );
     }
 
     /// RED-TEAM REGRESSION (PR #359 follow-up): one rmw line mentions the
@@ -3181,8 +3144,7 @@ mod fp_const_hoist_tests {
         );
         assert!(changed, "two constant reads must hoist");
         assert_eq!(
-            out[1],
-            "movss .LCFP_0(%rip), %xmm0",
+            out[1], "movss .LCFP_0(%rip), %xmm0",
             "single-precision pool read: {out:?}"
         );
     }

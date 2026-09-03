@@ -25,19 +25,10 @@ pub fn run(module: &mut IrModule) -> usize {
 
     // Standard math builtins known to be const
     for name in &[
-        "abs", "labs", "llabs", "imaxabs",
-        "fabs", "fabsf", "fabsl",
-        "sqrt", "sqrtf", "sqrtl",
-        "sin", "sinf", "sinl",
-        "cos", "cosf", "cosl",
-        "tan", "tanf", "tanl",
-        "ceil", "ceilf", "ceill",
-        "floor", "floorf", "floorl",
-        "trunc", "truncf", "truncl",
-        "round", "roundf", "roundl",
-        "log", "logf", "logl",
-        "exp", "expf", "expl",
-        "pow", "powf", "powl",
+        "abs", "labs", "llabs", "imaxabs", "fabs", "fabsf", "fabsl", "sqrt", "sqrtf", "sqrtl",
+        "sin", "sinf", "sinl", "cos", "cosf", "cosl", "tan", "tanf", "tanl", "ceil", "ceilf",
+        "ceill", "floor", "floorf", "floorl", "trunc", "truncf", "truncl", "round", "roundf",
+        "roundl", "log", "logf", "logl", "exp", "expf", "expl", "pow", "powf", "powl",
     ] {
         const_fns.insert(name.to_string());
         pure_fns.insert(name.to_string());
@@ -45,8 +36,8 @@ pub fn run(module: &mut IrModule) -> usize {
 
     // Standard string/mem builtins known to be pure
     for name in &[
-        "strlen", "wcslen", "strcmp", "strncmp", "wcscmp", "wcsncmp",
-        "memcmp", "bcmp", "strchr", "strrchr", "strstr", "memchr",
+        "strlen", "wcslen", "strcmp", "strncmp", "wcscmp", "wcsncmp", "memcmp", "bcmp", "strchr",
+        "strrchr", "strstr", "memchr",
     ] {
         pure_fns.insert(name.to_string());
     }
@@ -55,7 +46,11 @@ pub fn run(module: &mut IrModule) -> usize {
     for func in &module.functions {
         for block in &func.blocks {
             for inst in &block.instructions {
-                if let Instruction::Call { func: ref fname, info } = inst {
+                if let Instruction::Call {
+                    func: ref fname,
+                    info,
+                } = inst
+                {
                     if info.is_const {
                         const_fns.insert(fname.clone());
                         pure_fns.insert(fname.clone());
@@ -146,7 +141,13 @@ fn analyze_function_purity(
     let mut local_allocas: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Alloca { dest, volatile, semantic_volatile, .. } = inst {
+            if let Instruction::Alloca {
+                dest,
+                volatile,
+                semantic_volatile,
+                ..
+            } = inst
+            {
                 if !volatile && !semantic_volatile {
                     local_allocas.insert(dest.0);
                 }

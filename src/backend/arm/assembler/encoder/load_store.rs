@@ -1306,7 +1306,10 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
         Some(Operand::Mem { base, offset: 0 }) => {
             let b = base.to_lowercase();
             if b == "xzr" || b == "wzr" {
-                return Err(format!("{}: xzr/wzr is not a valid CASP base register", mnemonic));
+                return Err(format!(
+                    "{}: xzr/wzr is not a valid CASP base register",
+                    mnemonic
+                ));
             }
             if !is_64bit_reg(base) {
                 return Err(format!(
@@ -1334,10 +1337,7 @@ pub(crate) fn encode_casp(mnemonic: &str, operands: &[Operand]) -> Result<Encode
     let suffix = mn.strip_prefix("casp").unwrap_or("");
     let (a, l, size_letter) = parse_atomic_order_suffix("casp", suffix)?;
     if size_letter.is_some() {
-        return Err(format!(
-            "{}: CASP has no byte/halfword variants",
-            mnemonic
-        ));
+        return Err(format!("{}: CASP has no byte/halfword variants", mnemonic));
     }
 
     let size_bit = if rs_64 { 1u32 } else { 0 };
@@ -1522,8 +1522,8 @@ mod lse_atomic_tests {
     // test also pins the mnemonic -> encoder wiring, not just internals.
     fn encode_any(mnemonic: &str, operands: &[Operand]) -> Result<EncodeResult, String> {
         match mnemonic {
-            "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb"
-            | "cash" | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
+            "cas" | "casa" | "casal" | "casl" | "casb" | "casab" | "casalb" | "caslb" | "cash"
+            | "casah" | "casalh" | "caslh" => encode_cas(mnemonic, operands),
             "casp" | "caspa" | "caspal" | "caspl" => encode_casp(mnemonic, operands),
             other => Err(format!("test harness: unknown mnemonic {}", other)),
         }
@@ -1578,16 +1578,37 @@ mod lse_atomic_tests {
 
     #[test]
     fn casp_family_exact_words() {
-        assert_eq!(enc("casp", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4820_7D62);
-        assert_eq!(enc("caspa", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4860_7D62);
-        assert_eq!(enc("caspl", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4820_FD62);
-        assert_eq!(enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "x11")), 0x4860_FD62);
+        assert_eq!(
+            enc("casp", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4820_7D62
+        );
+        assert_eq!(
+            enc("caspa", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4860_7D62
+        );
+        assert_eq!(
+            enc("caspl", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4820_FD62
+        );
+        assert_eq!(
+            enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "x11")),
+            0x4860_FD62
+        );
         // W pairs: SZ=0 (bit 30 clear).
-        assert_eq!(enc("caspal", &casp_ops("w0", "w1", "w2", "w3", "x11")), 0x0860_FD62);
+        assert_eq!(
+            enc("caspal", &casp_ops("w0", "w1", "w2", "w3", "x11")),
+            0x0860_FD62
+        );
         // SP base is GPR64sp-legal.
-        assert_eq!(enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "sp")), 0x4860_FFE2);
+        assert_eq!(
+            enc("caspal", &casp_ops("x0", "x1", "x2", "x3", "sp")),
+            0x4860_FFE2
+        );
         // High register pair: Rs=2, Rt=4.
-        assert_eq!(enc("caspal", &casp_ops("x2", "x3", "x4", "x5", "sp")), 0x4862_FFE4);
+        assert_eq!(
+            enc("caspal", &casp_ops("x2", "x3", "x4", "x5", "sp")),
+            0x4862_FFE4
+        );
     }
 
     #[test]

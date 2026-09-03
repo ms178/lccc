@@ -133,7 +133,7 @@ impl Parser {
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
             );
-                let _dbg_vs = d.vector_size_expr.is_some();
+            let _dbg_vs = d.vector_size_expr.is_some();
             d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
             d.set_static(self.attrs.parsing_static());
             d.set_extern(self.attrs.parsing_extern());
@@ -760,7 +760,7 @@ impl Parser {
             self.attrs.parsing_ext_vector_nelem.take(),
             start,
         );
-            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+        d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
         d.set_static(self.attrs.parsing_static());
         d.set_extern(self.attrs.parsing_extern());
         d.set_typedef(is_typedef);
@@ -820,7 +820,7 @@ impl Parser {
                 self.attrs.parsing_ext_vector_nelem.take(),
                 start,
             );
-                d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
             d.set_static(is_static);
             d.set_extern(is_extern);
             d.set_typedef(self.attrs.parsing_typedef());
@@ -932,7 +932,7 @@ impl Parser {
             self.attrs.parsing_ext_vector_nelem.take(),
             start,
         );
-            d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
+        d.set_vector_size_expr(self.attrs.parsing_vector_size_expr.take());
         d.set_static(is_static);
         d.set_extern(is_extern);
         d.set_typedef(is_typedef);

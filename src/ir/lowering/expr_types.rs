@@ -378,8 +378,11 @@ impl Lowerer {
             // target int (I32 on i686): every consumer sign-extended the low
             // dword (cltd) and discarded the high half of the eax:edx pair
             // (simd_insert_extract pextrq0/pextrq1).
-            "_mm_extract_epi64" | "_mm_cvtsi128_si64" | "_mm_cvtsi128_si64x"
-            | "__builtin_ia32_pextrq128" | "__builtin_ia32_cvtsi128si64" => Some(IrType::I64),
+            "_mm_extract_epi64"
+            | "_mm_cvtsi128_si64"
+            | "_mm_cvtsi128_si64x"
+            | "__builtin_ia32_pextrq128"
+            | "__builtin_ia32_cvtsi128si64" => Some(IrType::I64),
             // Float-returning builtins
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
@@ -1133,7 +1136,10 @@ impl Lowerer {
                 // raw storage types here makes an int conditional with a
                 // constant arm (born I64) report I64 and forces a spurious
                 // widen/narrow cast pair around the (now natural-width) merge.
-                Self::common_type(self.ternary_arm_type(then_expr), self.ternary_arm_type(else_expr))
+                Self::common_type(
+                    self.ternary_arm_type(then_expr),
+                    self.ternary_arm_type(else_expr),
+                )
             }
             Expr::GnuConditional(cond, else_expr, _) => Self::common_type(
                 self.ternary_arm_type(cond),

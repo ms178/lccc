@@ -1092,8 +1092,12 @@ fn eliminate_unused_x9_address_moves(lines: &[String], kinds: &mut [LineKind], n
                 LineKind::Nop | LineKind::Directive => {}
                 // Path ends: textually later lines belong to other paths, and
                 // a label can only be joined from before the mov (skipping it).
-                LineKind::Label | LineKind::Branch | LineKind::CondBranch
-                | LineKind::CmpBranch | LineKind::Ret | LineKind::Call => break,
+                LineKind::Label
+                | LineKind::Branch
+                | LineKind::CondBranch
+                | LineKind::CmpBranch
+                | LineKind::Ret
+                | LineKind::Call => break,
                 _ => {
                     if written_gp_register(&lines[j], kinds[j]) == Some(9)
                         && mentions_x9_count(&lines[j]) == 1
@@ -2135,7 +2139,6 @@ fn eliminate_redundant_sxtb(lines: &mut [String], kinds: &mut [LineKind], n: usi
     changed
 }
 
-
 // ── Redundant zero-extension mask elimination ────────────────────────────────
 //
 // The cast emitters stage through x0 and mask every widening/narrowing cast
@@ -2209,7 +2212,9 @@ fn first_operand_reg(line: &str) -> u8 {
 fn kill_writeback_base(line: &str, zext: &mut [u8; 33]) {
     let t = line.trim();
     let Some(bracket) = t.find('[') else { return };
-    let Some(close) = t[bracket..].find(']') else { return };
+    let Some(close) = t[bracket..].find(']') else {
+        return;
+    };
     let inner = &t[bracket + 1..bracket + close];
     // Post-index (`[xN], #imm`) or pre-index (`[xN, #imm]!`) writeback both
     // redefine the base register.
@@ -2296,7 +2301,11 @@ fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n:
                 // `sxth` saw its own 16-bit result instead of the 64-bit
                 // sign-extended input and deleted itself — cast_chain_fold,
                 // sqlite_yy_shift miscompiles).
-                let src_bound = if src < 32 { zext[src as usize] } else { ZEXT_NO_INFO };
+                let src_bound = if src < 32 {
+                    zext[src as usize]
+                } else {
+                    ZEXT_NO_INFO
+                };
                 if dst < 32 {
                     let w = third.and_then(zext_mask_bits).unwrap_or_else(|| {
                         let dform = rest.split(',').next().unwrap_or("").trim();
@@ -2311,12 +2320,7 @@ fn eliminate_redundant_zext_and(lines: &mut [String], kinds: &mut [LineKind], n:
                     if let Some(bits) = third.and_then(zext_mask_bits) {
                         if src < 32 && src_bound <= bits {
                             let dform = rest.split(',').next().unwrap_or("").trim();
-                            let sform = rest
-                                .split(',')
-                                .nth(1)
-                                .unwrap_or("")
-                                .trim()
-                                .to_string();
+                            let sform = rest.split(',').nth(1).unwrap_or("").trim().to_string();
                             let is32 = dform.starts_with('w');
                             let new = format!("    mov {}, {}", dform, sform);
                             kinds[i] = LineKind::Move {
@@ -2570,7 +2574,9 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
         // i+2: an N/Z/V-only flag consumer.
         let t2 = lines[i + 2].trim();
         let cc_ok = if let Some(rest) = t2.strip_prefix("b.") {
-            rest.split_once(' ').map(|(cc, _)| nzv_condition(cc)).unwrap_or(false)
+            rest.split_once(' ')
+                .map(|(cc, _)| nzv_condition(cc))
+                .unwrap_or(false)
         } else if t2.starts_with("cset ") || t2.starts_with("csetm ") {
             t2.split_once(' ')
                 .and_then(|(_, tail)| tail.split(',').nth(1))
@@ -2590,7 +2596,6 @@ fn fuse_and_cmp_zero(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> 
     }
     changed
 }
-
 
 // ── Dead move before return ──────────────────────────────────────────────────
 //
@@ -4339,9 +4344,7 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
             // (We also rely on effective matching, but breaking keeps the
             // window tight and matches the original pass's call/branch barriers.)
             let t_j = lines[j].trim_start();
-            if (t_j.starts_with("sub ") || t_j.starts_with("add "))
-                && t_j.contains("sp, sp, #")
-            {
+            if (t_j.starts_with("sub ") || t_j.starts_with("add ")) && t_j.contains("sp, sp, #") {
                 break;
             }
             match kinds[j] {
@@ -4365,7 +4368,9 @@ fn thread_spill_slots(lines: &mut [String], kinds: &mut [LineKind], n: usize) ->
                         other_refs += 1;
                     }
                 }
-                LineKind::LoadswSp { offset: o, reg: d, .. } => {
+                LineKind::LoadswSp {
+                    offset: o, reg: d, ..
+                } => {
                     let eff = o as i64 + disps[j];
                     if eff == eff_store {
                         if d >= 18 {
@@ -4838,7 +4843,12 @@ fn cse_adrp_remat_pairs(lines: &mut [String], kinds: &mut [LineKind], n: usize) 
 /// A maximal contiguous pure def-sequence starting at `idx`: returns the
 /// sequence length and its dest register, or None. Sequences: movz [+movk*],
 /// adrp [+ paired add], ldr-from-sp (single line).
-fn pure_def_sequence(lines: &[String], kinds: &[LineKind], n: usize, idx: usize) -> Option<(usize, u8)> {
+fn pure_def_sequence(
+    lines: &[String],
+    kinds: &[LineKind],
+    n: usize,
+    idx: usize,
+) -> Option<(usize, u8)> {
     let t = lines[idx].trim_start();
     // movz + contiguous movk chain
     if let Some(rest) = t.strip_prefix("movz ") {
@@ -4901,7 +4911,11 @@ fn branch_targets(line: &str, kind: LineKind, label: &str) -> bool {
     }
 }
 
-fn hoist_loop_invariant_remats(lines: &mut Vec<String>, kinds: &mut Vec<LineKind>, mut n: usize) -> bool {
+fn hoist_loop_invariant_remats(
+    lines: &mut Vec<String>,
+    kinds: &mut Vec<LineKind>,
+    mut n: usize,
+) -> bool {
     if std::env::var("CCC_NO_INVAR_HOIST").is_ok() {
         return false;
     }
@@ -5026,7 +5040,8 @@ fn hoist_loop_invariant_remats(lines: &mut Vec<String>, kinds: &mut Vec<LineKind
                         }
                     } else if matches!(kinds[m], LineKind::MemOther | LineKind::Other) {
                         let t = lines[m].trim_start();
-                        if t.starts_with("str ") || t.starts_with("stur ") || t.starts_with("stp ") {
+                        if t.starts_with("str ") || t.starts_with("stur ") || t.starts_with("stp ")
+                        {
                             for o in sp_offsets_in_line(t) {
                                 if (o - off).abs() < 8 {
                                     bad = true;
@@ -5094,8 +5109,7 @@ fn hoist_loop_invariant_remats(lines: &mut Vec<String>, kinds: &mut Vec<LineKind
             }
             let label_idx = (0..lines.len())
                 .find(|&q| {
-                    kinds[q] == LineKind::Label
-                        && lines[q].trim().trim_end_matches(':') == target
+                    kinds[q] == LineKind::Label && lines[q].trim().trim_end_matches(':') == target
                 })
                 .unwrap_or(top);
             for (off, l) in seq_lines.iter().enumerate() {
@@ -5233,8 +5247,16 @@ mod tests {
         // The load must never reach the final text: it is replaced by the
         // store's value (mov or propagated copy), and the then-dead store
         // is removed by DSE.
-        assert!(!result.contains("ldr x1, [sp, #16]"), "load kept:\n{}", result);
-        assert!(!result.contains("str x0, [sp, #16]"), "dead store kept:\n{}", result);
+        assert!(
+            !result.contains("ldr x1, [sp, #16]"),
+            "load kept:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("str x0, [sp, #16]"),
+            "dead store kept:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5269,16 +5291,32 @@ mod tests {
         // `mov x13, x0` disappears in one form or another.
         let input = "    mov x0, x14\n    mov x13, x0\n    add x15, x13, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("mov x13, x0"), "chain not folded:\n{}", result);
-        assert!(result.contains("add x15, x14, #1"), "value flow lost:\n{}", result);
+        assert!(
+            !result.contains("mov x13, x0"),
+            "chain not folded:\n{}",
+            result
+        );
+        assert!(
+            result.contains("add x15, x14, #1"),
+            "value flow lost:\n{}",
+            result
+        );
     }
 
     #[test]
     fn test_move_imm_chain() {
         let input = "    mov x0, #0\n    mov x14, x0\n    add x15, x14, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("mov x14, x0"), "chain not folded:\n{}", result);
-        assert!(result.contains("mov x14, #0"), "immediate not retargeted:\n{}", result);
+        assert!(
+            !result.contains("mov x14, x0"),
+            "chain not folded:\n{}",
+            result
+        );
+        assert!(
+            result.contains("mov x14, #0"),
+            "immediate not retargeted:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5355,7 +5393,11 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        let after = result
+            .split(".LBB10:")
+            .nth(1)
+            .unwrap_or("")
+            .trim_start_matches('\n');
         assert!(
             after.starts_with("    ldr w2, [sp, #40]"),
             "load moved despite in-loop store:\n{}",
@@ -5381,7 +5423,11 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        let after = result
+            .split(".LBB10:")
+            .nth(1)
+            .unwrap_or("")
+            .trim_start_matches('\n');
         assert!(
             after.starts_with("    ldr w2, [sp, #40]"),
             "hoisted despite post-loop reader:\n{}",
@@ -5405,7 +5451,11 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        let after = result.split(".LBB10:").nth(1).unwrap_or("").trim_start_matches('\n');
+        let after = result
+            .split(".LBB10:")
+            .nth(1)
+            .unwrap_or("")
+            .trim_start_matches('\n');
         assert!(
             after.starts_with("    ldr w2, [sp, #40]"),
             "hoisted despite call in loop:\n{}",
@@ -5429,8 +5479,16 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("[sp, #24]"), "slot round-trip survived:\n{}", result);
-        assert!(result.contains("mov x2, x0"), "scratch move missing:\n{}", result);
+        assert!(
+            !result.contains("[sp, #24]"),
+            "slot round-trip survived:\n{}",
+            result
+        );
+        assert!(
+            result.contains("mov x2, x0"),
+            "scratch move missing:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5447,7 +5505,11 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("str x0, [sp, #8]"), "store wrongly deleted:\n{}", result);
+        assert!(
+            result.contains("str x0, [sp, #8]"),
+            "store wrongly deleted:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5462,7 +5524,11 @@ mod tests {
         );
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("ldrsw"), "ldrsw survived:\n{}", result);
-        assert!(result.contains("sxtw x0, w"), "sxtw from scratch missing:\n{}", result);
+        assert!(
+            result.contains("sxtw x0, w"),
+            "sxtw from scratch missing:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5477,7 +5543,11 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("ldr x0, [sp, #16]"), "window crossed a call:\n{}", result);
+        assert!(
+            result.contains("ldr x0, [sp, #16]"),
+            "window crossed a call:\n{}",
+            result
+        );
     }
 
     // ── Pass 7: adrp remat CSE tests ───────────────────────────────────
@@ -5494,8 +5564,18 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert_eq!(result.matches("adrp x0, ring").count(), 1, "dup adrp:\n{}", result);
-        assert_eq!(result.matches("add x0, x0, :lo12:ring").count(), 1, "dup add:\n{}", result);
+        assert_eq!(
+            result.matches("adrp x0, ring").count(),
+            1,
+            "dup adrp:\n{}",
+            result
+        );
+        assert_eq!(
+            result.matches("add x0, x0, :lo12:ring").count(),
+            1,
+            "dup add:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5510,7 +5590,12 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert_eq!(result.matches("adrp x0, ring").count(), 2, "clobbered pair reused:\n{}", result);
+        assert_eq!(
+            result.matches("adrp x0, ring").count(),
+            2,
+            "clobbered pair reused:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5524,8 +5609,16 @@ mod tests {
             "    ret\n",
         );
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("adrp x0, tail"), "wrong symbol CSEd:\n{}", result);
-        assert!(result.contains("adrp x0, ring"), "first pair deleted:\n{}", result);
+        assert!(
+            result.contains("adrp x0, tail"),
+            "wrong symbol CSEd:\n{}",
+            result
+        );
+        assert!(
+            result.contains("adrp x0, ring"),
+            "first pair deleted:\n{}",
+            result
+        );
     }
 
     // ── Global store forwarding tests ─────────────────────────────────
@@ -5585,7 +5678,11 @@ mod tests {
             result
         );
         assert!(!result.contains("[sp, #16]"));
-        assert!(!result.contains("mov x1, x0"), "stale forwarding:\n{}", result);
+        assert!(
+            !result.contains("mov x1, x0"),
+            "stale forwarding:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -5799,7 +5896,11 @@ g:
         let second_half_ok = result.contains("ldr x1, [x9, #8]")
             || result.contains("ldr x1, [x0, #8]")
             || result.contains("mov x9,");
-        assert!(!stale_x9_read, "x9 read without a live definition:\n{}", result);
+        assert!(
+            !stale_x9_read,
+            "x9 read without a live definition:\n{}",
+            result
+        );
         assert!(second_half_ok, "second carrier-load half lost:\n{}", result);
     }
 
@@ -6440,7 +6541,11 @@ f:
         // ret (bool_gate shape): dead, removed.
         let input = "f:\n    cset x0, ne\n    sxtw x0, w0\n    mov x5, x0\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(!result.contains("mov x5, x0"), "dead staging mov kept:\n{}", result);
+        assert!(
+            !result.contains("mov x5, x0"),
+            "dead staging mov kept:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -6448,7 +6553,11 @@ f:
         // A write to x0 immediately before ret IS the return value: kept.
         let input = "f:\n    mov x0, x5\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mov x0, x5"), "return-register write deleted:\n{}", result);
+        assert!(
+            result.contains("mov x0, x5"),
+            "return-register write deleted:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -6457,7 +6566,11 @@ f:
         // observable through the caller's view of x0. Never delete.
         let input = "f:\n    mov x0, x22\n    mov w0, w0\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mov w0, w0"), "zext-into-x0 deleted:\n{}", result);
+        assert!(
+            result.contains("mov w0, w0"),
+            "zext-into-x0 deleted:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -6467,7 +6580,11 @@ f:
         // whole sequence must survive verbatim.
         let input = "f:\n    mov x5, x0\n    str x5, [x19]\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("mov x5, x0"), "live move deleted:\n{}", result);
+        assert!(
+            result.contains("mov x5, x0"),
+            "live move deleted:\n{}",
+            result
+        );
         assert!(result.contains("str x5, [x19]"), "store lost:\n{}", result);
     }
 
@@ -6477,18 +6594,31 @@ f:
     fn test_and_cmp_fused_to_ands() {
         let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    cset x0, ne\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("ands w5, w19, w20"), "fusion missed:\n{}", result);
-        assert!(!result.contains("cmp w5, #0"), "cmp kept after fusion:\n{}", result);
+        assert!(
+            result.contains("ands w5, w19, w20"),
+            "fusion missed:\n{}",
+            result
+        );
+        assert!(
+            !result.contains("cmp w5, #0"),
+            "cmp kept after fusion:\n{}",
+            result
+        );
     }
 
     #[test]
     fn test_and_cmp_ccond_not_fused() {
         // b.cs consumes the C flag: cmp #0 sets C=1, ands sets the shifter
         // carry — the flags differ, so no fusion.
-        let input = "f:\n    and w5, w19, w20\n    cmp w5, #0\n    b.cs .L1\n    ret\n.L1:\n    ret\n";
+        let input =
+            "f:\n    and w5, w19, w20\n    cmp w5, #0\n    b.cs .L1\n    ret\n.L1:\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(!result.contains("ands w5"), "C-consumer fused:\n{}", result);
-        assert!(result.contains("cmp w5, #0"), "cmp dropped for C-consumer:\n{}", result);
+        assert!(
+            result.contains("cmp w5, #0"),
+            "cmp dropped for C-consumer:\n{}",
+            result
+        );
     }
 
     // ── eliminate_redundant_zext_and ──────────────────────────────────────
@@ -6496,14 +6626,19 @@ f:
     #[test]
     fn test_zext_and_after_ldrb_removed() {
         // ldrb already zero-extends: the #0xff re-mask is a no-op.
-        let input = "f:\n    ldrb w5, [x19, x1]\n    and w4, w5, #0xff\n    add x9, x4, #1\n    ret\n";
+        let input =
+            "f:\n    ldrb w5, [x19, x1]\n    and w4, w5, #0xff\n    add x9, x4, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
         assert!(
             !result.contains("and w4, w5, #0xff"),
             "redundant mask kept:\n{}",
             result
         );
-        assert!(result.contains("mov w4, w5"), "mask not rewritten to mov:\n{}", result);
+        assert!(
+            result.contains("mov w4, w5"),
+            "mask not rewritten to mov:\n{}",
+            result
+        );
     }
 
     #[test]
@@ -6511,15 +6646,24 @@ f:
         // w6's high bits are unknown: the mask is semantically required.
         let input = "f:\n    mov w4, w6\n    and w5, w4, #0xff\n    add x9, x5, #1\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("and w5, w4, #0xff"), "needed mask removed:\n{}", result);
+        assert!(
+            result.contains("and w5, w4, #0xff"),
+            "needed mask removed:\n{}",
+            result
+        );
     }
 
     #[test]
     fn test_zext_and_never_rewrites_ands() {
         // ands defines flags for the cset: value-redundant or not, it must
         // stay an ands.
-        let input = "f:\n    ldrb w5, [x19, x1]\n    ands w4, w5, #0xff\n    cset x9, ne\n    ret\n";
+        let input =
+            "f:\n    ldrb w5, [x19, x1]\n    ands w4, w5, #0xff\n    cset x9, ne\n    ret\n";
         let result = peephole_optimize(input.to_string());
-        assert!(result.contains("ands w4, w5, #0xff"), "flag-setting ands rewritten:\n{}", result);
+        assert!(
+            result.contains("ands w4, w5, #0xff"),
+            "flag-setting ands rewritten:\n{}",
+            result
+        );
     }
 }

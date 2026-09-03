@@ -323,48 +323,48 @@ fn code16_encode_inner(
     encoder.code16gcc = gcc_mode;
     encoder.encode(instr)?;
 
-        let instr_len = encoder.bytes.len();
-        let jump = {
-            let mnem = &instr.mnemonic;
-            let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
-            if is_jump && instr.operands.len() == 1 {
-                if let Operand::Label(_) = &instr.operands[0] {
-                    let is_conditional = mnem != "jmp";
-                    // In 16-bit mode a near jump carries a 16-bit
-                    // displacement, so the long forms are one byte shorter
-                    // than in 32-bit mode.
-                    let expected_len = if is_conditional { 4 } else { 3 };
-                    if instr_len == expected_len {
-                        Some(JumpDetection {
-                            is_conditional,
-                            already_short: false,
-                        })
-                    } else {
-                        None
-                    }
+    let instr_len = encoder.bytes.len();
+    let jump = {
+        let mnem = &instr.mnemonic;
+        let is_jump = mnem.starts_with('j') && mnem.len() >= 2;
+        if is_jump && instr.operands.len() == 1 {
+            if let Operand::Label(_) = &instr.operands[0] {
+                let is_conditional = mnem != "jmp";
+                // In 16-bit mode a near jump carries a 16-bit
+                // displacement, so the long forms are one byte shorter
+                // than in 32-bit mode.
+                let expected_len = if is_conditional { 4 } else { 3 };
+                if instr_len == expected_len {
+                    Some(JumpDetection {
+                        is_conditional,
+                        already_short: false,
+                    })
                 } else {
                     None
                 }
             } else {
                 None
             }
-        };
+        } else {
+            None
+        }
+    };
 
-        let relocations = encoder
-            .relocations
-            .into_iter()
-            .map(|r| EncoderReloc {
-                offset: r.offset,
-                symbol: r.symbol,
-                reloc_type: r.reloc_type,
-                addend: r.addend,
-                diff_symbol: None,
-            })
-            .collect();
-
-        Ok(EncodeResult {
-            bytes: encoder.bytes,
-            relocations,
-            jump,
+    let relocations = encoder
+        .relocations
+        .into_iter()
+        .map(|r| EncoderReloc {
+            offset: r.offset,
+            symbol: r.symbol,
+            reloc_type: r.reloc_type,
+            addend: r.addend,
+            diff_symbol: None,
         })
-    }
+        .collect();
+
+    Ok(EncodeResult {
+        bytes: encoder.bytes,
+        relocations,
+        jump,
+    })
+}

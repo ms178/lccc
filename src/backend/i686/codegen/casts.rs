@@ -193,7 +193,10 @@ impl I686Codegen {
                 // no-ops must still materialise for the standalone tail.
                 if self.mulacc_virtual_casts.contains(&dest.0) {
                     if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                        eprintln!("[MULACC] virtual no-op cast dest={} (emits nothing)", dest.0);
+                        eprintln!(
+                            "[MULACC] virtual no-op cast dest={} (emits nothing)",
+                            dest.0
+                        );
                     }
                     return;
                 }
@@ -212,7 +215,10 @@ impl I686Codegen {
                 // dest has no other reader).
                 if self.mulacc_virtual_casts.contains(&dest.0) {
                     if std::env::var_os("CCC_DEBUG_MULACC").is_some() {
-                        eprintln!("[MULACC] virtual widening feeder dest={} (emits nothing)", dest.0);
+                        eprintln!(
+                            "[MULACC] virtual widening feeder dest={} (emits nothing)",
+                            dest.0
+                        );
                     }
                     return;
                 }

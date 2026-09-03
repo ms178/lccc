@@ -43,7 +43,8 @@ impl X86Codegen {
         if let Some(&d_reg) = self.reg_assignments.get(&dest.0) {
             let d_name = crate::backend::x86::codegen::emit::phys_reg_name(d_reg);
             if d_name != "r10" {
-                self.state.emit_fmt(format_args!("    movq %r10, %{}", d_name));
+                self.state
+                    .emit_fmt(format_args!("    movq %r10, %{}", d_name));
                 self.state.reg_cache.invalidate_all();
                 return;
             }
@@ -99,10 +100,10 @@ impl X86Codegen {
         // 49 BA <chain imm64>: opcode word + qword immediate.
         self.state.emit("    movw $0xBA49, (%rdi)"); // bytes 49 BA (LE)
         self.state.emit("    movq %rsi, 2(%rdi)"); // chain at offset 2..9
-        // FF 25 00 00 00 00: jmp qword ptr [rip+0]; rip after = buf+16.
+                                                   // FF 25 00 00 00 00: jmp qword ptr [rip+0]; rip after = buf+16.
         self.state.emit("    movl $0x0025FF, 10(%rdi)"); // FF 25 00 00
         self.state.emit("    movw $0x0000, 14(%rdi)"); // 00 00
-        // Absolute function address at offset 16..23.
+                                                       // Absolute function address at offset 16..23.
         self.state.emit("    movq %rcx, 16(%rdi)");
 
         // The trampoline address (= buffer address) is the function-pointer

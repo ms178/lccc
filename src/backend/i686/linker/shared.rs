@@ -1217,7 +1217,11 @@ pub(super) fn emit_shared_library_32(
             .iter()
             .any(|sec| sec.name == ".note.GNU-stack" && sec.flags & SHF_EXECINSTR != 0)
     });
-    let stack_flags = if exec_stack { PF_R | PF_W | PF_X } else { PF_R | PF_W };
+    let stack_flags = if exec_stack {
+        PF_R | PF_W | PF_X
+    } else {
+        PF_R | PF_W
+    };
     write_phdr(
         &mut output,
         ph_off,

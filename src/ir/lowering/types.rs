@@ -196,8 +196,7 @@ impl Lowerer {
             // `int[5]` and `int[]` are therefore compatible, while `int[5]`
             // and `int[6]` are not.
             (CType::Array(e1, s1), CType::Array(e2, s2)) => {
-                Self::ctypes_compatible(e1, e2)
-                    && (s1 == s2 || s1.is_none() || s2.is_none())
+                Self::ctypes_compatible(e1, e2) && (s1 == s2 || s1.is_none() || s2.is_none())
             }
             // Structs/Unions: use derived PartialEq (compares name + fields)
             (CType::Struct(s1), CType::Struct(s2)) => s1 == s2,
@@ -378,14 +377,7 @@ impl Lowerer {
     /// Returns an Rc<StructLayout> for cheap cloning.
     fn struct_union_layout(&self, ts: &TypeSpecifier) -> Option<RcLayout> {
         match ts {
-            TypeSpecifier::Struct(
-                tag,
-                Some(fields),
-                is_packed,
-                pragma_pack,
-                _,
-                reverse_sso,
-            ) => {
+            TypeSpecifier::Struct(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
                 // Use cached layout for tagged structs
                 if let Some(tag) = tag {
                     if let Some(layout) = self
@@ -404,14 +396,7 @@ impl Lowerer {
                     reverse_sso.is_some_and(|v| v),
                 )))
             }
-            TypeSpecifier::Union(
-                tag,
-                Some(fields),
-                is_packed,
-                pragma_pack,
-                _,
-                reverse_sso,
-            ) => {
+            TypeSpecifier::Union(tag, Some(fields), is_packed, pragma_pack, _, reverse_sso) => {
                 // Use cached layout for tagged unions
                 if let Some(tag) = tag {
                     if let Some(layout) = self

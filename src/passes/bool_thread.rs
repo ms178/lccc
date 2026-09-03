@@ -311,13 +311,10 @@ fn thread_round(func: &mut IrFunction) -> usize {
                 // Rule 7: the compare's type equals the tested phi's type —
                 // the per-predecessor re-materialization compares the
                 // identical value (phi arms carry the phi's type).
-                let phi_ty = func.blocks[mi]
-                    .instructions
-                    .iter()
-                    .find_map(|i| match i {
-                        Instruction::Phi { dest, ty, .. } if *dest == p => Some(*ty),
-                        _ => None,
-                    });
+                let phi_ty = func.blocks[mi].instructions.iter().find_map(|i| match i {
+                    Instruction::Phi { dest, ty, .. } if *dest == p => Some(*ty),
+                    _ => None,
+                });
                 if phi_ty != Some(*ty) {
                     continue;
                 }
@@ -829,7 +826,11 @@ fn eval_const_cmp(op: IrCmpOp, lhs: &IrConst, rhs: &IrConst, ty: &IrType) -> Opt
     let l = const_to_i64(lhs)?;
     let r = const_to_i64(rhs)?;
     let bits = ty.size() as u32 * 8;
-    let mask = if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let mask = if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
     let (lu, ru) = ((l as u64) & mask, (r as u64) & mask);
     Some(match op {
         IrCmpOp::Eq => l == r,
@@ -893,9 +894,33 @@ mod tests {
             "t".to_string(),
             IrType::I32,
             vec![
-                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
-                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
-                IrParam { ty: IrType::I32, noalias: false, struct_size: None, struct_align: None, struct_eightbyte_classes: vec![], is_f128_sse: false, riscv_float_class: None },
+                IrParam {
+                    ty: IrType::I32,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    struct_eightbyte_classes: vec![],
+                    is_f128_sse: false,
+                    riscv_float_class: None,
+                },
+                IrParam {
+                    ty: IrType::I32,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    struct_eightbyte_classes: vec![],
+                    is_f128_sse: false,
+                    riscv_float_class: None,
+                },
+                IrParam {
+                    ty: IrType::I32,
+                    noalias: false,
+                    struct_size: None,
+                    struct_align: None,
+                    struct_eightbyte_classes: vec![],
+                    is_f128_sse: false,
+                    riscv_float_class: None,
+                },
             ],
             false,
         );
@@ -903,14 +928,26 @@ mod tests {
         let (va, vb, vc) = (Value(0), Value(1), Value(2));
         let (vp, vq) = (Value(6), Value(7));
         let vr = Value(8); // join phi result
-        // Mirror the real front-end shape: entry block opens with one
-        // ParamRef per parameter defining its value id.
+                           // Mirror the real front-end shape: entry block opens with one
+                           // ParamRef per parameter defining its value id.
         let b0 = BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::ParamRef { dest: va, param_idx: 0, ty: IrType::I32 },
-                Instruction::ParamRef { dest: vb, param_idx: 1, ty: IrType::I32 },
-                Instruction::ParamRef { dest: vc, param_idx: 2, ty: IrType::I32 },
+                Instruction::ParamRef {
+                    dest: va,
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: vb,
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: vc,
+                    param_idx: 2,
+                    ty: IrType::I32,
+                },
             ],
             terminator: Terminator::CondBranch {
                 cond: Operand::Value(vc),
@@ -921,7 +958,10 @@ mod tests {
         };
         let mut arm = |label: u32, src: Value, target: BlockId| BasicBlock {
             label: BlockId(label),
-            instructions: vec![Instruction::Copy { dest: vp, src: Operand::Value(src) }],
+            instructions: vec![Instruction::Copy {
+                dest: vp,
+                src: Operand::Value(src),
+            }],
             terminator: Terminator::Branch(target),
             source_spans: Vec::new(),
         };
@@ -956,17 +996,15 @@ mod tests {
         let b4 = empty_block(4, Terminator::Branch(BlockId(5)));
         let b5 = BasicBlock {
             label: BlockId(5),
-            instructions: vec![
-                Instruction::Phi {
-                    dest: vr,
-                    ty: IrType::I32,
-                    incoming: vec![
-                        // false edge: b3 falls through into b5 directly
-                        (Operand::Const(IrConst::I32(100)), BlockId(4)),
-                        (Operand::Const(IrConst::I32(200)), BlockId(3)),
-                    ],
-                },
-            ],
+            instructions: vec![Instruction::Phi {
+                dest: vr,
+                ty: IrType::I32,
+                incoming: vec![
+                    // false edge: b3 falls through into b5 directly
+                    (Operand::Const(IrConst::I32(100)), BlockId(4)),
+                    (Operand::Const(IrConst::I32(200)), BlockId(3)),
+                ],
+            }],
             terminator: if live_cmp {
                 // return q*1000 + r — q crosses the merge boundary
                 Terminator::Return(Some(Operand::Value(vq)))
@@ -1026,10 +1064,12 @@ mod tests {
             .instructions
             .iter()
             .any(|i| matches!(i, Instruction::Cmp { dest, .. } if *dest == Value(7)));
-        let preds_still_branch_to_merge = is_branch_to(&f.blocks[1].terminator, 3)
-            && is_branch_to(&f.blocks[2].terminator, 3);
-        assert!(has_cmp && preds_still_branch_to_merge,
-            "the live-Cmp bool candidate must be rejected outright");
+        let preds_still_branch_to_merge =
+            is_branch_to(&f.blocks[1].terminator, 3) && is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(
+            has_cmp && preds_still_branch_to_merge,
+            "the live-Cmp bool candidate must be rejected outright"
+        );
         assert!(all_uses_resolved(&f));
     }
 
@@ -1041,8 +1081,8 @@ mod tests {
         super::run(&mut f);
         assert!(all_uses_resolved(&f));
         // The merge must not be reachable from the entry anymore.
-        let arms_leave = !is_branch_to(&f.blocks[1].terminator, 3)
-            || !is_branch_to(&f.blocks[2].terminator, 3);
+        let arms_leave =
+            !is_branch_to(&f.blocks[1].terminator, 3) || !is_branch_to(&f.blocks[2].terminator, 3);
         assert!(arms_leave, "dead-Cmp bool candidate is expected to thread");
     }
 
@@ -1063,9 +1103,12 @@ mod tests {
         }
         super::run(&mut f);
         assert!(all_uses_resolved(&f));
-        let arms_leave = !is_branch_to(&f.blocks[1].terminator, 3)
-            && !is_branch_to(&f.blocks[2].terminator, 3);
-        assert!(arms_leave, "int-shape candidate (every pred threadable) must thread");
+        let arms_leave =
+            !is_branch_to(&f.blocks[1].terminator, 3) && !is_branch_to(&f.blocks[2].terminator, 3);
+        assert!(
+            arms_leave,
+            "int-shape candidate (every pred threadable) must thread"
+        );
     }
 
     #[test]

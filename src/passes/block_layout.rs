@@ -291,10 +291,7 @@ enum BlockLayoutStart {
     Rpo,
 }
 
-fn relayout_blocks_loop_aware_impl(
-    func: &mut IrFunction,
-    start: BlockLayoutStart,
-) -> usize {
+fn relayout_blocks_loop_aware_impl(func: &mut IrFunction, start: BlockLayoutStart) -> usize {
     let n = func.blocks.len();
     if n < 2 {
         return 0;
@@ -563,7 +560,11 @@ mod tests {
         assert_eq!(pos(2), pos(1) + 1);
         assert_eq!(pos(4), pos(2) + 1);
         // ...and the cold return no longer splits it.
-        assert!(pos(3) > pos(4), "cold block must sink past the latch: {:?}", order);
+        assert!(
+            pos(3) > pos(4),
+            "cold block must sink past the latch: {:?}",
+            order
+        );
     }
 
     /// The property that keeps this pass from being a random shuffler. When a

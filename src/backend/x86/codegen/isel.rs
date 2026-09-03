@@ -1018,7 +1018,10 @@ fn kind_name(inst: &Instruction) -> &'static str {
             // Name the remaining variants rather than lumping them into a
             // bucket that hides the biggest opportunity.
             let d = format!("{:?}", other);
-            let name = d.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap_or("other");
+            let name = d
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or("other");
             Box::leak(format!("other:{}", name).into_boxed_str())
         }
     }
@@ -1185,8 +1188,7 @@ pub fn build_typed_call_ex(
                 // the builder's topological order cannot interleave with
                 // the CallTyped-internal moves.
                 let conflicts = args.iter().enumerate().any(|(j, other)| {
-                    j != i
-                        && matches!(other, Some(TypedCallSrc::Reg(r)) if *r == dst_reg)
+                    j != i && matches!(other, Some(TypedCallSrc::Reg(r)) if *r == dst_reg)
                 });
                 if conflicts {
                     return Err(TypedCallReject::ArgNotRepresentable(i));
@@ -1194,11 +1196,7 @@ pub fn build_typed_call_ex(
                 MachOperand::AllocaAddr(*id)
             }
         };
-        pending.push(PendingMove {
-            src,
-            dst_reg,
-            size,
-        });
+        pending.push(PendingMove { src, dst_reg, size });
     }
     // Callee staging for indirect targets: exactly one extra move with the
     // same edge semantics as an argument move. The destination is r10/r11,
@@ -1228,9 +1226,9 @@ pub fn build_typed_call_ex(
                 // argument-side pre-moves), so its destination register
                 // must not be read by any argument move — identical guard
                 // to the argument-side AllocaAddr.
-                let conflicts = args.iter().any(
-                    |other| matches!(other, Some(TypedCallSrc::Reg(r)) if *r == target_reg),
-                );
+                let conflicts = args
+                    .iter()
+                    .any(|other| matches!(other, Some(TypedCallSrc::Reg(r)) if *r == target_reg));
                 if conflicts {
                     return Err(TypedCallReject::MoveCycle);
                 }
@@ -1297,7 +1295,7 @@ pub fn build_typed_call_ex(
                 // A destination receives the return value; an immediate or
                 // an alloca address is not a value home (the emit-side gate
                 // rejects alloca destinations before the builder runs).
-                return Err(TypedCallReject::RetNotRepresentable)
+                return Err(TypedCallReject::RetNotRepresentable);
             }
             Some(TypedCallSrc::Reg(r)) => {
                 // rax→rax is a no-op; anything else register-hosted is a
@@ -1412,14 +1410,7 @@ pub fn lower_instruction_typed(
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     out: &mut Vec<MachInst>,
 ) -> bool {
-    lower_instruction_typed_ss(
-        inst,
-        reg_assignments,
-        alloca_slots,
-        value_types,
-        None,
-        out,
-    )
+    lower_instruction_typed_ss(inst, reg_assignments, alloca_slots, value_types, None, out)
 }
 
 /// Production entry point: additionally receives the certified-small-slot set
@@ -2062,7 +2053,8 @@ fn lower_instruction_typed_inner(
                 };
                 match relay_slot {
                     None => {
-                        let src = MachOperand::Reg(MachReg::Phys(ra.get(&val_v.0).copied().unwrap()));
+                        let src =
+                            MachOperand::Reg(MachReg::Phys(ra.get(&val_v.0).copied().unwrap()));
                         out.push(MachInst::FMov { src, dst, size });
                     }
                     Some(vslot) => {
@@ -2204,13 +2196,9 @@ fn lower_instruction_typed_inner(
             // width. So: certified-small destination -> value-type width
             // (≤32-bit); anything else -> full-width S64 relay, whose
             // destination upper half is always defined for 64-bit readers.
-            let dest_small = small_slots
-                .map(|ss| ss.contains(&dest.0))
-                .unwrap_or(false);
+            let dest_small = small_slots.map(|ss| ss.contains(&dest.0)).unwrap_or(false);
             let src_small = match src {
-                Operand::Value(v) => small_slots
-                    .map(|ss| ss.contains(&v.0))
-                    .unwrap_or(false),
+                Operand::Value(v) => small_slots.map(|ss| ss.contains(&v.0)).unwrap_or(false),
                 Operand::Const(_) => true,
             };
             let narrow = dest_small && src_small;

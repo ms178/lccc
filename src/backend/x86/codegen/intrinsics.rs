@@ -11,7 +11,7 @@
 //! - Frame/return address intrinsics
 //! - SSE scalar float math (sqrt, fabs) for F32/F64
 
-use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_256};
+use super::emit::{is_xmm_reg, phys_reg_name, phys_reg_name_256, X86Codegen};
 use crate::backend::regalloc::PhysReg;
 use crate::backend::state::StackSlot;
 use crate::common::types::IrType;
@@ -2758,12 +2758,10 @@ impl X86Codegen {
                 } else if disp != 0 {
                     // Extract base from Add
                     if let Operand::Value(v) = &args[2] {
-                        if let Some(crate::ir::reexports::Instruction::BinOp {
-                            lhs, rhs, ..
-                        }) = self.get_defining_instruction(v.0)
+                        if let Some(crate::ir::reexports::Instruction::BinOp { lhs, rhs, .. }) =
+                            self.get_defining_instruction(v.0)
                         {
-                            if matches!(lhs, Operand::Value(_))
-                                && matches!(rhs, Operand::Const(_))
+                            if matches!(lhs, Operand::Value(_)) && matches!(rhs, Operand::Const(_))
                             {
                                 lhs.clone()
                             } else if matches!(rhs, Operand::Value(_))
@@ -3008,7 +3006,8 @@ impl X86Codegen {
                     }
                 }
                 if !loaded_home {
-                    self.state.emit_fmt(format_args!("    vmovupd {}, %ymm0", mem));
+                    self.state
+                        .emit_fmt(format_args!("    vmovupd {}, %ymm0", mem));
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -3056,7 +3055,8 @@ impl X86Codegen {
                     }
                 }
                 if !loaded_home {
-                    self.state.emit_fmt(format_args!("    movupd {}, %xmm0", mem));
+                    self.state
+                        .emit_fmt(format_args!("    movupd {}, %xmm0", mem));
                 }
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
@@ -3135,10 +3135,9 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
                 match index {
-                    Some(idx) => self.state.emit_fmt(format_args!(
-                        "    vmovdqu (%{},%{}), %xmm0",
-                        base, idx
-                    )),
+                    Some(idx) => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %xmm0", base, idx)),
                     None => self
                         .state
                         .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
@@ -3183,12 +3182,16 @@ impl X86Codegen {
                             // reuse it for the accumulator round-trip — never
                             // touch an allocatable XMM (xmm2..xmm15).
                             if let Some(slot) = self.state.get_slot(acc.0) {
-                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
+                                self.state
+                                    .out
+                                    .emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
                                 self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                                 if let Some(dslot) = self.state.get_slot(d.0) {
-                                    self.state
-                                        .out
-                                        .emit_instr_reg_rbp("    vmovdqu", "xmm0", dslot.0);
+                                    self.state.out.emit_instr_reg_rbp(
+                                        "    vmovdqu",
+                                        "xmm0",
+                                        dslot.0,
+                                    );
                                 }
                             } else {
                                 // No slot, no register (dead acc): fold in-place.
@@ -3221,10 +3224,9 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
                 match index {
-                    Some(idx) => self.state.emit_fmt(format_args!(
-                        "    vmovdqu (%{},%{}), %xmm0",
-                        base, idx
-                    )),
+                    Some(idx) => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %xmm0", base, idx)),
                     None => self
                         .state
                         .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
@@ -3291,12 +3293,16 @@ impl X86Codegen {
                             // Slot-homed: reuse xmm0 (free after the fold
                             // into xmm1) for the accumulator round-trip.
                             if let Some(slot) = self.state.get_slot(acc.0) {
-                                self.state.out.emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
+                                self.state
+                                    .out
+                                    .emit_instr_rbp_reg("    vmovdqu", slot.0, "xmm0");
                                 self.state.emit("    vpaddq %xmm1, %xmm0, %xmm0");
                                 if let Some(dslot) = self.state.get_slot(d.0) {
-                                    self.state
-                                        .out
-                                        .emit_instr_reg_rbp("    vmovdqu", "xmm0", dslot.0);
+                                    self.state.out.emit_instr_reg_rbp(
+                                        "    vmovdqu",
+                                        "xmm0",
+                                        dslot.0,
+                                    );
                                 }
                             } else {
                                 self.state.emit("    vpaddq %xmm1, %xmm1, %xmm1");
@@ -4308,17 +4314,11 @@ impl X86Codegen {
                 let Operand::Value(sv) = &args[1] else {
                     unreachable!("vfmadd132 scale operand must be a value");
                 };
-                let scale_mem = self
-                    .value_ptr_mem_operand(sv.0)
-                    .unwrap_or_else(|| {
-                        unreachable!(
-                            "vfmadd132 scale operand must be homed, tracked, or slot-homed"
-                        )
-                    });
-                self.state.emit_fmt(format_args!(
-                    "    {} {}, %ymm1, %ymm0",
-                    mnemonic, scale_mem
-                ));
+                let scale_mem = self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
+                    unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
+                });
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", mnemonic, scale_mem));
                 self.state.vec_last_store_reg = false;
                 self.avx_store_dest(dest);
             }

@@ -548,10 +548,8 @@ impl StructLayoutBuilder {
         let (sso, sso_storage_ty, field_bit_in_storage, storage_ctype) = if self.reverse_sso {
             field_bit_in_storage = unit_bits - field_bit_in_storage - bw;
             if storage_mask >= 2 {
-                let unit_ctype = StructLayout::smallest_int_ctype_for_bytes(
-                    storage_mask,
-                    field.ty.is_signed(),
-                );
+                let unit_ctype =
+                    StructLayout::smallest_int_ctype_for_bytes(storage_mask, field.ty.is_signed());
                 (
                     SsoMode::ByteSwapUnit(storage_mask as u32),
                     Some(unit_ctype.clone()),
@@ -868,26 +866,22 @@ impl StructLayout {
             // Reverse-SSO union bitfields with multi-byte units need the
             // unit-wide access type; the union bit offset maps to the top of
             // the unit.
-            let (bf_offset, sso_storage_ty) = if let (Some(bw), Some(bo)) =
-                (field.bit_width, bf_offset)
-            {
-                if reverse_sso && field_size >= 2 && max_field_align != Some(1) {
-                    let unit_ctype = StructLayout::smallest_int_ctype_for_bytes(
-                        field_size,
-                        field.ty.is_signed(),
-                    );
-                    (
-                        Some(field_size as u32 * 8 - bo - bw),
-                        Some(unit_ctype),
-                    )
-                } else if reverse_sso && field_size == 1 {
-                    (Some(8 - bo - bw), None)
+            let (bf_offset, sso_storage_ty) =
+                if let (Some(bw), Some(bo)) = (field.bit_width, bf_offset) {
+                    if reverse_sso && field_size >= 2 && max_field_align != Some(1) {
+                        let unit_ctype = StructLayout::smallest_int_ctype_for_bytes(
+                            field_size,
+                            field.ty.is_signed(),
+                        );
+                        (Some(field_size as u32 * 8 - bo - bw), Some(unit_ctype))
+                    } else if reverse_sso && field_size == 1 {
+                        (Some(8 - bo - bw), None)
+                    } else {
+                        (Some(bo), None)
+                    }
                 } else {
-                    (Some(bo), None)
-                }
-            } else {
-                (bf_offset, None)
-            };
+                    (bf_offset, None)
+                };
 
             field_layouts.push(StructFieldLayout {
                 name: field.name.clone(),
@@ -1611,8 +1605,7 @@ impl std::fmt::Display for CType {
 /// ABIs specify unsigned char; x86-64/i686 use signed char). One target per
 /// driver process, so a process-global set by the driver before parsing is
 /// the single source of truth — the front end is otherwise target-blind.
-static CHAR_UNSIGNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CHAR_UNSIGNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record the target's plain-char signedness. Called once by the driver
 /// after the target is known, before any parsing/sema/lowering runs.
@@ -1831,7 +1824,10 @@ impl CType {
     /// with binary floats in the usual arithmetic conversions and never
     /// reach binary FP codegen paths.
     pub fn is_decimal(&self) -> bool {
-        matches!(self, CType::Decimal32 | CType::Decimal64 | CType::Decimal128)
+        matches!(
+            self,
+            CType::Decimal32 | CType::Decimal64 | CType::Decimal128
+        )
     }
 
     /// Decimal precision rank: 0 = not decimal, else 32 < 64 < 128.
@@ -2314,7 +2310,10 @@ impl IrType {
     /// F128 (long double) is included because at computation level it is treated
     /// as F64 (stored in D registers), with 16-byte storage for ABI correctness.
     pub fn is_float(&self) -> bool {
-        matches!(self, IrType::F32 | IrType::F64 | IrType::F128 | IrType::D32 | IrType::D64)
+        matches!(
+            self,
+            IrType::F32 | IrType::F64 | IrType::F128 | IrType::D32 | IrType::D64
+        )
     }
 
     /// Whether this is a decimal floating-point carrier type (D32/D64).
@@ -2491,8 +2490,14 @@ mod cast_nop_tests {
         // (double)ptr — the check_ptr_to_float_cast precedent (8 == 8 bytes).
         assert!(!IrType::cast_is_bitidentical_nop(IrType::Ptr, IrType::F64));
         // U128 carrier -> F128 (both 16 bytes on LP64): soft-float conversion.
-        assert!(!IrType::cast_is_bitidentical_nop(IrType::U128, IrType::F128));
-        assert!(!IrType::cast_is_bitidentical_nop(IrType::F128, IrType::U128));
+        assert!(!IrType::cast_is_bitidentical_nop(
+            IrType::U128,
+            IrType::F128
+        ));
+        assert!(!IrType::cast_is_bitidentical_nop(
+            IrType::F128,
+            IrType::U128
+        ));
     }
 
     #[test]

@@ -491,7 +491,6 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
     saw_shift && saw_and && !other_arith
 }
 
-
 /// Complete-unroll a constant-trip loop of ANY block shape, including bodies
 /// that contain inner loops (their headers/latches are cloned wholesale; the
 /// inner IV phis' initial values — typically `i+1` of the outer IV — become
@@ -631,12 +630,7 @@ fn try_complete_unroll_general(
     }
 
     // Body blocks: everything except the header. The latch is among them.
-    let body_blocks: Vec<usize> = lp
-        .body
-        .iter()
-        .copied()
-        .filter(|&b| b != header)
-        .collect();
+    let body_blocks: Vec<usize> = lp.body.iter().copied().filter(|&b| b != header).collect();
     if body_blocks.is_empty() || body_blocks.len() > 32 {
         return false;
     }
@@ -724,7 +718,10 @@ fn try_complete_unroll_general(
     // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
     // 2^63): refuse before mutating rather than substitute a wrapped
     // constant, or worse, return false after rewriting the CFG.
-    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
+    let Some(final_iv_n) = iv_step
+        .checked_mul(trip)
+        .and_then(|d| iv_init.checked_add(d))
+    else {
         return false;
     };
     if !(2..=16).contains(&trip) {
@@ -902,10 +899,10 @@ fn try_complete_unroll_general(
 
     for (ci, plan) in plans.iter().enumerate() {
         let t = (ci + 1) as i64; // iteration index this clone represents
-        // Clone `t` observes the IV after `t` strides, not after `t` steps of
-        // 1: with the constant-stride trip count in place the stride may be
-        // any non-zero constant, so the substituted constant must be scaled
-        // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
+                                 // Clone `t` observes the IV after `t` strides, not after `t` steps of
+                                 // 1: with the constant-stride trip count in place the stride may be
+                                 // any non-zero constant, so the substituted constant must be scaled
+                                 // (mirrors the two-block cloner's `iv_init + t_idx * iv_step`).
         let iv_const = Operand::Const(IrConst::from_i64(iv_init + t * iv_step, iv_ty));
 
         // label_map: original label → clone label (header + body).
@@ -1208,7 +1205,10 @@ fn try_complete_unroll_two_block(
     // (e.g. init = 0, limit = i64::MAX, step = 2^62 -> trip = 2, final =
     // 2^63): refuse before mutating rather than substitute a wrapped
     // constant, or worse, return false after rewriting the CFG.
-    let Some(final_iv_n) = iv_step.checked_mul(trip).and_then(|d| iv_init.checked_add(d)) else {
+    let Some(final_iv_n) = iv_step
+        .checked_mul(trip)
+        .and_then(|d| iv_init.checked_add(d))
+    else {
         return false;
     };
     // Trip bound 16 with a 512-expanded-instruction budget (levkropp
@@ -1406,11 +1406,7 @@ fn try_complete_unroll_two_block(
         for instruction in &mut block.instructions {
             subst_value_with_operand(instruction, iv_phi.0, &final_iv);
             for &(phi_id, final_id) in &final_carried {
-                subst_value_with_operand(
-                    instruction,
-                    phi_id,
-                    &Operand::Value(Value(final_id)),
-                );
+                subst_value_with_operand(instruction, phi_id, &Operand::Value(Value(final_id)));
             }
         }
         subst_value_in_terminator(&mut block.terminator, iv_phi.0, &final_iv);
@@ -1521,14 +1517,17 @@ pub(crate) fn subst_value_with_operand(inst: &mut Instruction, old_id: u32, new_
     }
 }
 
-pub(crate) fn subst_value_in_terminator(terminator: &mut Terminator, old_id: u32, new_op: &Operand) {
+pub(crate) fn subst_value_in_terminator(
+    terminator: &mut Terminator,
+    old_id: u32,
+    new_op: &Operand,
+) {
     terminator.for_each_operand_mut(|operand| {
         if matches!(operand, Operand::Value(value) if value.0 == old_id) {
             *operand = new_op.clone();
         }
     });
 }
-
 
 /// Evaluate an operand as an integer constant by looking through a bounded
 /// chain of pure integer Copy/Cast/BinOp(Add/Sub/Mul) definitions.
@@ -2102,12 +2101,10 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                         l0.clone()
                     } else {
                         match l0 {
-                            Operand::Value(lv) => {
-                                match clone_vmaps[j - 1].get(&lv.0) {
-                                    Some(nv) => Operand::Value(Value(*nv)),
-                                    None => l0.clone(),
-                                }
-                            }
+                            Operand::Value(lv) => match clone_vmaps[j - 1].get(&lv.0) {
+                                Some(nv) => Operand::Value(Value(*nv)),
+                                None => l0.clone(),
+                            },
                             other => other.clone(),
                         }
                     };
@@ -2340,12 +2337,10 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             let mut edges = Vec::with_capacity(num_new);
             for j in 0..num_new {
                 let ev = match l0 {
-                    Operand::Value(lv) if j > 0 => {
-                        match clone_vmaps[j - 1].get(&lv.0) {
-                            Some(nv) => Operand::Value(Value(*nv)),
-                            None => l0.clone(),
-                        }
-                    }
+                    Operand::Value(lv) if j > 0 => match clone_vmaps[j - 1].get(&lv.0) {
+                        Some(nv) => Operand::Value(Value(*nv)),
+                        None => l0.clone(),
+                    },
                     _ => l0.clone(),
                 };
                 edges.push(ev);
@@ -2377,9 +2372,14 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             for (j, ev) in edges.iter().enumerate() {
                 incoming.push((ev.clone(), ec_labels[j]));
             }
-            func.blocks[exit_idx]
-                .instructions
-                .insert(0, Instruction::Phi { dest: new_phi, incoming, ty: pty.clone() });
+            func.blocks[exit_idx].instructions.insert(
+                0,
+                Instruction::Phi {
+                    dest: new_phi,
+                    incoming,
+                    ty: pty.clone(),
+                },
+            );
 
             // Rewrite readers of `dest` in the post-exit region: every block
             // reachable from the exit block without re-entering the loop.
@@ -2397,7 +2397,11 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                 }
                 let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
                     Terminator::Branch(l) => vec![*l],
-                    Terminator::CondBranch { true_label, false_label, .. } => {
+                    Terminator::CondBranch {
+                        true_label,
+                        false_label,
+                        ..
+                    } => {
                         vec![*true_label, *false_label]
                     }
                     _ => vec![],
@@ -2406,9 +2410,7 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                     if loop_labels.contains(&l) {
                         continue;
                     }
-                    if let Some(si) =
-                        func.blocks.iter().position(|b| b.label == l)
-                    {
+                    if let Some(si) = func.blocks.iter().position(|b| b.label == l) {
                         if visited.insert(si) {
                             stack.push(si);
                         }
@@ -3118,7 +3120,6 @@ mod tests {
         }
     }
 
-
     // ── complete_unroll_trip truth table ─────────────────────────────────
     // Exhaustive closed-form coverage of the constant-stride trip count:
     // the historical step-1 arithmetic must reduce verbatim, and every
@@ -3201,14 +3202,26 @@ mod tests {
         // Sle at the top of the range: span/step + 1 would be MAX + 1.
         assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
         // Extremes that stay in range must still unroll.
-        assert_eq!(complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2), Some(4));
-        assert_eq!(complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3), Some(3));
-        assert_eq!(complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3), Some(3));
+        assert_eq!(
+            complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2),
+            Some(4)
+        );
+        assert_eq!(
+            complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3),
+            Some(3)
+        );
+        assert_eq!(
+            complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3),
+            Some(3)
+        );
         // The post-loop IV bound used by both cloners: final = init +
         // trip * step must be computed with checked arithmetic (this mirrors
         // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
         let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
-        assert!((1i64 << 62).checked_mul(trip).and_then(|d| 0i64.checked_add(d)).is_none());
+        assert!((1i64 << 62)
+            .checked_mul(trip)
+            .and_then(|d| 0i64.checked_add(d))
+            .is_none());
     }
 
     // The trip count above is representable (2), but the post-loop IV
@@ -3422,5 +3435,4 @@ mod tests {
             }
         }
     }
-
 }

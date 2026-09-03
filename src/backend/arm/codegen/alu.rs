@@ -1,7 +1,7 @@
 //! ArmCodegen: ALU operations (integer arithmetic, bitwise, unary).
 
 use super::emit::{
-    ArmCodegen, arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys,
+    arm_alu_mnemonic, callee_saved_name, callee_saved_name_32, is_arm_fp_phys, ArmCodegen,
 };
 use crate::common::types::IrType;
 use crate::ir::reexports::{IrBinOp, Operand, Value};
@@ -293,7 +293,10 @@ impl ArmCodegen {
         // (exactly GCC's shape: one divide, the remainder folded as
         // lhs - q*rhs). Dead tails skip the msub entirely — unlike x86's
         // free dual-output, the msub costs a cycle on AArch64.
-        if matches!(op, IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem) {
+        if matches!(
+            op,
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+        ) {
             if self.divrem_tail_dests.contains(&dest.0) {
                 if std::env::var_os("CCC_DEBUG_DIVREM").is_some() {
                     eprintln!("[DIVREM-ARM] tail-skip dest={}", dest.0);
@@ -453,12 +456,8 @@ impl ArmCodegen {
                 // into x0/w0 and using the three-operand form. This preserves
                 // the aggressive allocator's half-open handoff policy while
                 // keeping same-instruction uses correct.
-                if let (
-                    Operand::Value(lv),
-                    Operand::Value(rv),
-                    Some(lp),
-                    Some(rp),
-                ) = (lhs, rhs, lhs_phys, rhs_phys)
+                if let (Operand::Value(lv), Operand::Value(rv), Some(lp), Some(rp)) =
+                    (lhs, rhs, lhs_phys, rhs_phys)
                 {
                     if lv.0 != rv.0 && lp.0 == rp.0 {
                         let scratch = if use_32bit { "w0" } else { "x0" };

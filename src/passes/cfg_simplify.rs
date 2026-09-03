@@ -41,7 +41,9 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
 /// Module-level entry for the driver's pre-codegen integrity gate: strips
 /// unreachable blocks from every defined function. See
 /// `eliminate_unreachable_blocks` for the full soundness argument.
-pub(crate) fn for_each_function_eliminate_unreachable(module: &mut crate::ir::module::IrModule) -> usize {
+pub(crate) fn for_each_function_eliminate_unreachable(
+    module: &mut crate::ir::module::IrModule,
+) -> usize {
     module.for_each_function(eliminate_unreachable_blocks)
 }
 
@@ -811,7 +813,11 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
                 false_label,
             } => {
                 if let Operand::Const(c) = cond {
-                    let taken = if c.is_nonzero() { *true_label } else { *false_label };
+                    let taken = if c.is_nonzero() {
+                        *true_label
+                    } else {
+                        *false_label
+                    };
                     block.terminator = Terminator::Branch(taken);
                     folded += 1;
                 }
@@ -836,8 +842,7 @@ fn fold_constant_terminators(func: &mut IrFunction) -> usize {
                         };
                         let mut target = *default;
                         for &(case_val, case_target) in cases {
-                            let case_bits =
-                                ((case_val as i128) as u128) & mask;
+                            let case_bits = ((case_val as i128) as u128) & mask;
                             if case_bits == val_bits {
                                 target = case_target;
                                 break;

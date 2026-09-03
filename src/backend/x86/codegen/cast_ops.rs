@@ -2,8 +2,8 @@
 
 use super::emit::X86Codegen;
 use crate::backend::generation::is_i128_type;
-use crate::common::types::IrType;
 use crate::backend::regalloc::PhysReg;
+use crate::common::types::IrType;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
 /// One deferred widening move (PF-15): the Cast was eligible but its
@@ -530,17 +530,41 @@ impl X86Codegen {
             // addressing automatically.
             if ft.is_signed() {
                 match ft.size() {
-                    1 => self.state.out.emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
-                    2 => self.state.out.emit_instr_rbp_reg("    movswq", slot_off, dest_64),
-                    4 => self.state.out.emit_instr_rbp_reg("    movslq", slot_off, dest_64),
-                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    1 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movsbq", slot_off, dest_64),
+                    2 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movswq", slot_off, dest_64),
+                    4 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movslq", slot_off, dest_64),
+                    _ => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                 }
             } else {
                 match ft.size() {
-                    1 => self.state.out.emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
-                    2 => self.state.out.emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
-                    4 => self.state.out.emit_instr_rbp_reg("    movl", slot_off, dest_32),
-                    _ => self.state.out.emit_instr_rbp_reg("    movq", slot_off, dest_64),
+                    1 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzbl", slot_off, dest_32),
+                    2 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movzwl", slot_off, dest_32),
+                    4 => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movl", slot_off, dest_32),
+                    _ => self
+                        .state
+                        .out
+                        .emit_instr_rbp_reg("    movq", slot_off, dest_64),
                 }
             }
         } else {
@@ -579,10 +603,7 @@ impl X86Codegen {
                 return false;
             }};
         }
-        if !matches!(
-            from_ty,
-            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-        ) {
+        if !matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16) {
             refuse!("from_ty");
         }
         if to_ty.is_float() || !(to_ty.size() == 4 || to_ty.size() == 8) || is_i128_type(to_ty) {
@@ -756,12 +777,7 @@ impl X86Codegen {
         op: crate::ir::reexports::IrCmpOp,
         lhs: &Operand,
         rhs: &Operand,
-    ) -> Option<(
-        Operand,
-        Operand,
-        IrType,
-        crate::ir::reexports::IrCmpOp,
-    )> {
+    ) -> Option<(Operand, Operand, IrType, crate::ir::reexports::IrCmpOp)> {
         use crate::ir::reexports::IrCmpOp;
         // Compare-replay dests re-emit the comparison at a DISTANT consumer
         // (cmov/jcc far from here). The adjacency guarantee that keeps the
@@ -805,7 +821,11 @@ impl X86Codegen {
             } else {
                 None // mixed sext/zext: widened values diverge
             };
-            self.pf15_trace(if folded.is_some() { "pair FOLD" } else { "pair matrix refuse" });
+            self.pf15_trace(if folded.is_some() {
+                "pair FOLD"
+            } else {
+                "pair matrix refuse"
+            });
             if let Some(f) = folded {
                 return Some(f);
             }

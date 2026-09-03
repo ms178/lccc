@@ -135,17 +135,11 @@ fn add_const(opnd: Operand, amount: u64, defs: &[Option<Instruction>]) -> Option
 /// This is the condition form produced by lowering Linux's portable `__ffs`
 /// tree. It is intentionally stricter than a generic equality simplifier: the
 /// mask is part of the idiom's proof and each stage is checked independently.
-fn equal_zero_mask(
-    condition: Operand,
-    mask: u64,
-    defs: &[Option<Instruction>],
-) -> Option<Operand> {
+fn equal_zero_mask(condition: Operand, mask: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
     let Operand::Value(v) = peel(condition, defs) else {
         return None;
     };
-    let Instruction::Cmp { op, lhs, rhs, .. } = defs
-        .get(v.0 as usize)
-        .and_then(Option::as_ref)?
+    let Instruction::Cmp { op, lhs, rhs, .. } = defs.get(v.0 as usize).and_then(Option::as_ref)?
     else {
         return None;
     };

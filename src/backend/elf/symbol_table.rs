@@ -304,7 +304,15 @@ mod tests {
         // RISC-V: calls and PC-relative data references are NOT TLS.
         set_target_elf_machine(EM_RISCV);
         assert_eq!(target_elf_machine(), EM_RISCV);
-        for r in [16u32 /*BRANCH*/, 17 /*JAL*/, 18 /*CALL*/, 19 /*CALL_PLT*/, 23 /*PCREL_HI20*/, 24 /*PCREL_LO12_I*/, 51 /*RELAX*/] {
+        for r in [
+            16u32, /*BRANCH*/
+            17,    /*JAL*/
+            18,    /*CALL*/
+            19,    /*CALL_PLT*/
+            23,    /*PCREL_HI20*/
+            24,    /*PCREL_LO12_I*/
+            51,    /*RELAX*/
+        ] {
             assert!(!is_tls_reloc(r), "RISC-V r{r} must not be TLS");
         }
         for r in [21u32, 22, 29, 30, 31, 32] {

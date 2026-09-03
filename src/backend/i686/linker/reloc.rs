@@ -175,8 +175,8 @@ fn apply_one_reloc(
         R_386_TLS_GOTIE => resolve_tls_gotie(sym, sym_addr, addend, ctx),
         R_386_TLS_GD => {
             if ctx.has_tls && sym.sym_type == STT_TLS {
-                let tpoff = sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32
-                    + addend;
+                let tpoff =
+                    sym_addr as i32 - ctx.tls_addr as i32 - ctx.tls_mem_size as i32 + addend;
                 // GD→LE relaxation for executables (matches GNU ld's
                 // elf32-i386 tls transform). The GD sequence is:
                 //   lea  sym@tlsgd(%x), %y   ; 8d /r disp32   (6 bytes)
@@ -235,7 +235,8 @@ fn apply_one_reloc(
                         // Sequence above already covers the original call bytes; no NOP needed.
 
                         // Suppress the call's PLT32 relocation (disp field).
-                        ctx.tls_relaxed_call_slots.insert(patch_addr + (call_at - off) as u32 + 1);
+                        ctx.tls_relaxed_call_slots
+                            .insert(patch_addr + (call_at - off) as u32 + 1);
                         // The relaxed bytes at the reloc offset are the zero
                         // displacement of ; patching the
                         // returned value there would corrupt the sequence.

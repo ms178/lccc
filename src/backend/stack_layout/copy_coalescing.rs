@@ -2067,15 +2067,14 @@ pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
             let (a, b) = (&w[0], &w[1]);
             let dest = match a {
                 Instruction::BinOp {
-                    dest, op, ty: IrType::F64, ..
+                    dest,
+                    op,
+                    ty: IrType::F64,
+                    ..
                 } => {
                     if !matches!(
                         op,
-                        IrBinOp::Add
-                            | IrBinOp::Sub
-                            | IrBinOp::Mul
-                            | IrBinOp::SDiv
-                            | IrBinOp::UDiv
+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv
                     ) {
                         continue;
                     }
@@ -2093,11 +2092,7 @@ pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
                 } => {
                     if !matches!(
                         b_op,
-                        IrBinOp::Add
-                            | IrBinOp::Sub
-                            | IrBinOp::Mul
-                            | IrBinOp::SDiv
-                            | IrBinOp::UDiv
+                        IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul | IrBinOp::SDiv | IrBinOp::UDiv
                     ) {
                         continue;
                     }

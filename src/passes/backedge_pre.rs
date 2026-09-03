@@ -31,11 +31,11 @@
 //! FP phi/copy until register allocation can coalesce that state. Disable with
 //! `CCC_DISABLE_PASSES=bepre` or `CCC_NO_BEPRE=1`.
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::analysis::CfgAnalysis;
-use crate::common::types::IrType;
-use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 use super::loop_analysis;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::analysis::CfgAnalysis;
+use crate::ir::reexports::{BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// A planned rewrite: replace uses of `e_dest` with a new header phi whose
 /// latch incoming is `eprime_dest` and whose preheader incoming is a fresh
@@ -97,7 +97,12 @@ fn const_key(c: &IrConst) -> Option<ConstKey> {
 
 fn fold_preheader_binop(op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option<IrConst> {
     match (op, lhs, rhs, ty) {
-        (IrBinOp::Mul, Operand::Const(IrConst::F64(a)), Operand::Const(IrConst::F64(b)), IrType::F64) => {
+        (
+            IrBinOp::Mul,
+            Operand::Const(IrConst::F64(a)),
+            Operand::Const(IrConst::F64(b)),
+            IrType::F64,
+        ) => {
             // `0.0 * 0.0` is the hot Mandelbrot PRE init. Folding it avoids
             // adding a useless preheader multiply and, more importantly, avoids
             // lengthening the loop-carried FP live set before the first iteration.
@@ -109,23 +114,70 @@ fn fold_preheader_binop(op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) -
                 None
             }
         }
-        (IrBinOp::Add, Operand::Const(IrConst::F64(a)), Operand::Const(IrConst::F64(b)), IrType::F64) => {
-            if a.is_finite() && b.is_finite() { Some(IrConst::F64(a + b)) } else { None }
+        (
+            IrBinOp::Add,
+            Operand::Const(IrConst::F64(a)),
+            Operand::Const(IrConst::F64(b)),
+            IrType::F64,
+        ) => {
+            if a.is_finite() && b.is_finite() {
+                Some(IrConst::F64(a + b))
+            } else {
+                None
+            }
         }
-        (IrBinOp::Sub, Operand::Const(IrConst::F64(a)), Operand::Const(IrConst::F64(b)), IrType::F64) => {
-            if a.is_finite() && b.is_finite() { Some(IrConst::F64(a - b)) } else { None }
+        (
+            IrBinOp::Sub,
+            Operand::Const(IrConst::F64(a)),
+            Operand::Const(IrConst::F64(b)),
+            IrType::F64,
+        ) => {
+            if a.is_finite() && b.is_finite() {
+                Some(IrConst::F64(a - b))
+            } else {
+                None
+            }
         }
-        (IrBinOp::Mul, Operand::Const(IrConst::F32(a)), Operand::Const(IrConst::F32(b)), IrType::F32) => {
-            if a.is_finite() && b.is_finite() { Some(IrConst::F32(a * b)) } else { None }
+        (
+            IrBinOp::Mul,
+            Operand::Const(IrConst::F32(a)),
+            Operand::Const(IrConst::F32(b)),
+            IrType::F32,
+        ) => {
+            if a.is_finite() && b.is_finite() {
+                Some(IrConst::F32(a * b))
+            } else {
+                None
+            }
         }
-        (IrBinOp::Add, Operand::Const(IrConst::F32(a)), Operand::Const(IrConst::F32(b)), IrType::F32) => {
-            if a.is_finite() && b.is_finite() { Some(IrConst::F32(a + b)) } else { None }
+        (
+            IrBinOp::Add,
+            Operand::Const(IrConst::F32(a)),
+            Operand::Const(IrConst::F32(b)),
+            IrType::F32,
+        ) => {
+            if a.is_finite() && b.is_finite() {
+                Some(IrConst::F32(a + b))
+            } else {
+                None
+            }
         }
-        (IrBinOp::Sub, Operand::Const(IrConst::F32(a)), Operand::Const(IrConst::F32(b)), IrType::F32) => {
-            if a.is_finite() && b.is_finite() { Some(IrConst::F32(a - b)) } else { None }
+        (
+            IrBinOp::Sub,
+            Operand::Const(IrConst::F32(a)),
+            Operand::Const(IrConst::F32(b)),
+            IrType::F32,
+        ) => {
+            if a.is_finite() && b.is_finite() {
+                Some(IrConst::F32(a - b))
+            } else {
+                None
+            }
         }
         (IrBinOp::Mul, Operand::Const(a), Operand::Const(b), ty) if ty.is_integer() => {
-            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else { return None; };
+            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else {
+                return None;
+            };
             let v = av.wrapping_mul(bv);
             match ty {
                 IrType::I8 | IrType::U8 => Some(IrConst::I8(v as i8)),
@@ -136,7 +188,9 @@ fn fold_preheader_binop(op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) -
             }
         }
         (IrBinOp::Add, Operand::Const(a), Operand::Const(b), ty) if ty.is_integer() => {
-            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else { return None; };
+            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else {
+                return None;
+            };
             let v = av.wrapping_add(bv);
             match ty {
                 IrType::I8 | IrType::U8 => Some(IrConst::I8(v as i8)),
@@ -147,7 +201,9 @@ fn fold_preheader_binop(op: IrBinOp, lhs: &Operand, rhs: &Operand, ty: IrType) -
             }
         }
         (IrBinOp::Sub, Operand::Const(a), Operand::Const(b), ty) if ty.is_integer() => {
-            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else { return None; };
+            let (Some(av), Some(bv)) = (a.to_i64(), b.to_i64()) else {
+                return None;
+            };
             let v = av.wrapping_sub(bv);
             match ty {
                 IrType::I8 | IrType::U8 => Some(IrConst::I8(v as i8)),
@@ -181,7 +237,11 @@ fn fusion_eligible(
     };
     let insts = &func.blocks[b].instructions;
     let (mul_ty, is_float) = match &insts[i] {
-        Instruction::BinOp { op: IrBinOp::Mul, ty, .. } => (ty, ty.is_float()),
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            ty,
+            ..
+        } => (ty, ty.is_float()),
         _ => return false,
     };
     if matches!(mul_ty, IrType::F128 | IrType::I128 | IrType::U128) {
@@ -191,9 +251,9 @@ fn fusion_eligible(
     for j in (i + 1)..usize::min(i + 4, insts.len()) {
         match &insts[j] {
             Instruction::Load { .. } | Instruction::GetElementPtr { .. } => continue,
-            Instruction::BinOp { op, lhs, rhs, ty, .. }
-                if matches!(op, IrBinOp::Add | IrBinOp::Sub) && ty == mul_ty =>
-            {
+            Instruction::BinOp {
+                op, lhs, rhs, ty, ..
+            } if matches!(op, IrBinOp::Add | IrBinOp::Sub) && ty == mul_ty => {
                 let lhs_is = matches!(lhs, Operand::Value(v) if v.0 == value);
                 let rhs_is = matches!(rhs, Operand::Value(v) if v.0 == value);
                 if !lhs_is && !rhs_is {
@@ -273,11 +333,17 @@ fn schedule_eprime_early(
     def_site: &FxHashMap<u32, (usize, usize)>,
 ) {
     let block_idx = rw.eprime_block;
-    let Some(block) = func.blocks.get_mut(block_idx) else { return };
-    let Some(cur_idx) = block.instructions.iter().position(|inst| {
-        matches!(inst, Instruction::BinOp { dest, .. } if dest.0 == rw.eprime_dest.0)
-    }) else { return };
-    let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[cur_idx] else { return };
+    let Some(block) = func.blocks.get_mut(block_idx) else {
+        return;
+    };
+    let Some(cur_idx) = block.instructions.iter().position(
+        |inst| matches!(inst, Instruction::BinOp { dest, .. } if dest.0 == rw.eprime_dest.0),
+    ) else {
+        return;
+    };
+    let Instruction::BinOp { lhs, rhs, .. } = &block.instructions[cur_idx] else {
+        return;
+    };
     // Resolve operand defs against the *current* instruction list. The
     // caller inserts the PRE phi into the header before this runs; when
     // the loop is a rotated self-loop, header == eprime_block and that
@@ -287,9 +353,11 @@ fn schedule_eprime_early(
     let mut latest_dep: Option<usize> = None;
     for op in [lhs, rhs] {
         if let Operand::Value(v) = op {
-            if let Some(di) = block.instructions.iter().position(|inst| {
-                inst.dest().map(|d| d.0) == Some(v.0)
-            }) {
+            if let Some(di) = block
+                .instructions
+                .iter()
+                .position(|inst| inst.dest().map(|d| d.0) == Some(v.0))
+            {
                 latest_dep = Some(latest_dep.map_or(di, |old| old.max(di)));
             } else if let Some(&(db, di)) = def_site.get(&v.0) {
                 if db == block_idx {
@@ -304,7 +372,9 @@ fn schedule_eprime_early(
         .iter()
         .position(|i| !matches!(i, Instruction::Phi { .. }))
         .unwrap_or(0);
-    let insert_idx = latest_dep.map_or(first_non_phi, |i| i.saturating_add(1)).max(first_non_phi);
+    let insert_idx = latest_dep
+        .map_or(first_non_phi, |i| i.saturating_add(1))
+        .max(first_non_phi);
     if insert_idx >= cur_idx {
         return;
     }
@@ -343,7 +413,12 @@ fn replace_use_in_inst(inst: &mut Instruction, old: u32, new: Value) {
             op(lhs);
             op(rhs);
         }
-        Instruction::Select { cond, true_val, false_val, .. } => {
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } => {
             op(cond);
             op(true_val);
             op(false_val);
@@ -362,7 +437,9 @@ fn replace_use_in_inst(inst: &mut Instruction, old: u32, new: Value) {
                 op(a);
             }
         }
-        Instruction::SetReturnF64Second { src } | Instruction::SetReturnF32Second { src } => op(src),
+        Instruction::SetReturnF64Second { src } | Instruction::SetReturnF32Second { src } => {
+            op(src)
+        }
         _ => {}
     }
 }
@@ -447,8 +524,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 ((a, from_a), (b, from_b)) if *from_b == preheader_label => (b, a, *from_a),
                 _ => continue,
             };
-            let Operand::Value(next_val) = latch_op else { continue };
-            let Some(&latch) = idx_of_label.get(&latch_label) else { continue };
+            let Operand::Value(next_val) = latch_op else {
+                continue;
+            };
+            let Some(&latch) = idx_of_label.get(&latch_label) else {
+                continue;
+            };
             if !lp.body.contains(&latch) || multi_def.contains(&next_val.0) {
                 continue;
             }
@@ -469,7 +550,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             // Scan loop body for candidate top expressions f(phi, inv).
             for &eb in lp.body.iter() {
                 for inst in func.blocks[eb].instructions.iter() {
-                    let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst else {
+                    let Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } = inst
+                    else {
                         continue;
                     };
                     if op.can_trap() {
@@ -512,8 +600,12 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                             },
                         }
                     };
-                    let Some((lhs_is_phi, tgt_lhs)) = subst(lhs) else { continue };
-                    let Some((rhs_is_phi, tgt_rhs)) = subst(rhs) else { continue };
+                    let Some((lhs_is_phi, tgt_lhs)) = subst(lhs) else {
+                        continue;
+                    };
+                    let Some((rhs_is_phi, tgt_rhs)) = subst(rhs) else {
+                        continue;
+                    };
                     if !lhs_is_phi && !rhs_is_phi {
                         continue;
                     }
@@ -544,8 +636,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                             if op2 != op || ty2 != ty || d2.0 == e_dest.0 {
                                 continue;
                             }
-                            let (Some(l2k), Some(r2k)) = (operand_key(l2), operand_key(r2))
-                            else {
+                            let (Some(l2k), Some(r2k)) = (operand_key(l2), operand_key(r2)) else {
                                 continue;
                             };
                             let direct = l2k == kl && r2k == kr;
@@ -559,7 +650,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                             break;
                         }
                     }
-                    let Some((eprime_block, eprime_dest)) = eprime else { continue };
+                    let Some((eprime_block, eprime_dest)) = eprime else {
+                        continue;
+                    };
 
                     // Fusion-aware profitability: the top expression must be
                     // a really-emitted instruction, and the bottom one must
@@ -572,8 +665,16 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     }
 
                     // Preheader operands: phi replaced by the init operand.
-                    let init_lhs = if lhs_is_phi { init_op.clone() } else { tgt_lhs.clone() };
-                    let init_rhs = if rhs_is_phi { init_op.clone() } else { tgt_rhs.clone() };
+                    let init_lhs = if lhs_is_phi {
+                        init_op.clone()
+                    } else {
+                        tgt_lhs.clone()
+                    };
+                    let init_rhs = if rhs_is_phi {
+                        init_op.clone()
+                    } else {
+                        tgt_rhs.clone()
+                    };
 
                     rewrites.push(Rewrite {
                         header,
@@ -614,26 +715,25 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // loops that start from zero (Mandelbrot): the naive PRE inserted a
         // useless `0.0 * 0.0` and increased FP pressure enough to spill an
         // outer-loop constant on x86-64.
-        let preheader_incoming = if let Some(c) =
-            fold_preheader_binop(rw.op, &rw.init_lhs, &rw.init_rhs, rw.ty)
-        {
-            Operand::Const(c)
-        } else {
-            let pv = Value(func.next_value_id);
-            func.next_value_id += 1;
-            let preh = &mut func.blocks[rw.preheader];
-            preh.instructions.push(Instruction::BinOp {
-                dest: pv,
-                op: rw.op,
-                lhs: rw.init_lhs.clone(),
-                rhs: rw.init_rhs.clone(),
-                ty: rw.ty,
-            });
-            if !preh.source_spans.is_empty() {
-                preh.source_spans.clear();
-            }
-            Operand::Value(pv)
-        };
+        let preheader_incoming =
+            if let Some(c) = fold_preheader_binop(rw.op, &rw.init_lhs, &rw.init_rhs, rw.ty) {
+                Operand::Const(c)
+            } else {
+                let pv = Value(func.next_value_id);
+                func.next_value_id += 1;
+                let preh = &mut func.blocks[rw.preheader];
+                preh.instructions.push(Instruction::BinOp {
+                    dest: pv,
+                    op: rw.op,
+                    lhs: rw.init_lhs.clone(),
+                    rhs: rw.init_rhs.clone(),
+                    ty: rw.ty,
+                });
+                if !preh.source_spans.is_empty() {
+                    preh.source_spans.clear();
+                }
+                Operand::Value(pv)
+            };
         let q = Value(func.next_value_id);
         func.next_value_id += 1;
 
@@ -670,9 +770,11 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         // are single-def (checked above), so locate the def by its dest.
         replace_value_everywhere(func, rw.e_dest.0, q);
         let blk = &mut func.blocks[rw.e_block];
-        if let Some(idx) = blk.instructions.iter().position(|i| {
-            matches!(i, Instruction::BinOp { dest, .. } if dest.0 == rw.e_dest.0)
-        }) {
+        if let Some(idx) = blk
+            .instructions
+            .iter()
+            .position(|i| matches!(i, Instruction::BinOp { dest, .. } if dest.0 == rw.e_dest.0))
+        {
             blk.instructions.remove(idx);
             if !blk.source_spans.is_empty() {
                 blk.source_spans.clear();

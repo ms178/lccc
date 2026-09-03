@@ -1261,9 +1261,8 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 let struct_align = param
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
-                let tf_carrier_ia32 = slot_size == 4
-                    && param.is_some_and(|p| p.is_f128_sse)
-                    && struct_align >= 16;
+                let tf_carrier_ia32 =
+                    slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
                 if tf_carrier_ia32 {
                     stack_offset = (stack_offset + 15) & !15;
                 } else if struct_align > slot_size as usize {
@@ -1353,7 +1352,11 @@ pub fn named_params_stack_bytes(param_classes: &[ParamClass]) -> usize {
             ParamClass::F128Stack { offset } => Some(offset + 16),
             // i686 x87 long double occupies 12 bytes; x86-64 uses 16.
             ParamClass::F128AlwaysStack { offset } => {
-                let sz = if crate::common::types::target_ptr_size() == 4 { 12 } else { 16 };
+                let sz = if crate::common::types::target_ptr_size() == 4 {
+                    12
+                } else {
+                    16
+                };
                 Some(offset + sz)
             }
             ParamClass::StructStack { offset, size }

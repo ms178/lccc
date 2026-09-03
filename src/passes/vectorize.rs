@@ -76,8 +76,8 @@
 //! - `LCCC_FORCE_AVX2=1`: Explicitly enable AVX2 (default behavior, provided for clarity)
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
 
-use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::fp_contract::FpContract;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminator, Value};
@@ -329,19 +329,14 @@ fn vectorize_with_analysis_mode(
                 let mut const_zero_init = false;
                 for inst in &hdr.instructions {
                     if let Instruction::Phi {
-                        dest,
-                        ty,
-                        incoming,
-                        ..
+                        dest, ty, incoming, ..
                     } = inst
                     {
                         if *dest != red_pattern.iv {
                             continue;
                         }
-                        narrow_iv = matches!(
-                            ty,
-                            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16
-                        );
+                        narrow_iv =
+                            matches!(ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16);
                         const_zero_init = incoming.iter().any(|(op, lbl)| {
                             *lbl != latch_label
                                 && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))
@@ -415,8 +410,7 @@ fn vectorize_with_analysis_mode(
                 // intrinsics are not wired for the displacement form yet.
                 if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
                     if !neon {
-                        let avx2 = !force_two_wide
-                            && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
+                        let avx2 = !force_two_wide && std::env::var("LCCC_FORCE_MAP_SSE").is_err();
                         if debug {
                             eprintln!(
                                 "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
@@ -1858,8 +1852,7 @@ fn analyze_reduction_pattern(
                             ..
                         } = sin
                         {
-                            let tv_is_add =
-                                matches!(true_val, Operand::Value(v) if v.0 == dest.0);
+                            let tv_is_add = matches!(true_val, Operand::Value(v) if v.0 == dest.0);
                             let fv_is_phi = matches!(
                                 false_val,
                                 Operand::Value(v) if v.0 == accumulator_phi.0
@@ -2055,8 +2048,8 @@ fn analyze_reduction_pattern(
         return Some(ReductionPattern {
             kind: ReductionKind::Max,
             seconds: Vec::new(),
-                guard_cond: None,
-                guard_rhs: None,
+            guard_cond: None,
+            guard_rhs: None,
             element_type: IrType::I32,
             accumulator_type: IrType::I32,
             header_idx,
@@ -2363,8 +2356,8 @@ fn analyze_reduction_pattern(
                     exit_cmp_dest,
                     loop_blocks: loop_info.body.clone(),
                     seconds: Vec::new(),
-                guard_cond: select_guard_cond,
-                guard_rhs,
+                    guard_cond: select_guard_cond,
+                    guard_rhs,
                 }
             } else {
                 if debug {
@@ -3517,11 +3510,7 @@ impl<'a> MapEmitCtx<'a> {
             }
             MapExpr::Invariant(operand) => {
                 let key = format!("{:?}", operand);
-                if let Some(&(_, cached)) = self
-                    .broadcast_cache
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                {
+                if let Some(&(_, cached)) = self.broadcast_cache.iter().find(|(k, _)| *k == key) {
                     return Some(cached);
                 }
                 let dest = self.fresh();
@@ -3565,11 +3554,7 @@ impl<'a> MapEmitCtx<'a> {
                             dest: Some(dest),
                             op: madd,
                             dest_ptr: None,
-                            args: vec![
-                                Operand::Value(lv),
-                                Operand::Value(rv),
-                                Operand::Value(av),
-                            ],
+                            args: vec![Operand::Value(lv), Operand::Value(rv), Operand::Value(av)],
                         });
                         return Some(dest);
                     }
@@ -3793,10 +3778,7 @@ fn analyze_map_pattern(
     if load_infos.is_empty() {
         return None;
     }
-    if load_infos
-        .iter()
-        .any(|&(_, _, _, ty)| ty != elem_ty)
-    {
+    if load_infos.iter().any(|&(_, _, _, ty)| ty != elem_ty) {
         return None;
     }
 
@@ -3960,7 +3942,9 @@ fn parse_map_expr(
     }
     let (_, inst) = find_inst_in_loop(func, loop_blocks, value)?;
     match inst {
-        Instruction::BinOp { op, lhs, rhs, ty, .. } => {
+        Instruction::BinOp {
+            op, lhs, rhs, ty, ..
+        } => {
             if *ty != *elem_ty {
                 return None;
             }
@@ -4389,8 +4373,7 @@ fn analyze_stencil_pattern(
         let mut derived = FxHashSet::default();
         derived.insert(*dest);
         for candidate in &header.instructions {
-            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } =
-                candidate
+            if let Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } = candidate
             {
                 if matches!(src, Operand::Value(v) if derived.contains(v)) {
                     derived.insert(*dest);
@@ -4565,7 +4548,10 @@ fn analyze_stencil_pattern(
                     for &b2 in &loop_info.body {
                         for inst2 in &func.blocks[b2].instructions {
                             if let Instruction::GetElementPtr {
-                                dest: gd, base, offset, ..
+                                dest: gd,
+                                base,
+                                offset,
+                                ..
                             } = inst2
                             {
                                 if *gd == gep {
@@ -4599,7 +4585,10 @@ fn analyze_stencil_pattern(
     for &b2 in &loop_info.body {
         for inst2 in &func.blocks[b2].instructions {
             if let Instruction::GetElementPtr {
-                dest: gd, base, offset, ..
+                dest: gd,
+                base,
+                offset,
+                ..
             } = inst2
             {
                 if *gd == store_gep {
@@ -4626,7 +4615,11 @@ fn analyze_stencil_pattern(
 
     // Displacements must fit the x86 SIB disp32.
     let disp_ok = |d: i64| d.unsigned_abs() <= 0x7FFF_FFF0;
-    if !disp_ok(dst_disp) || load_infos.iter().any(|(_, _, _, a)| !disp_ok(a.const_bytes)) {
+    if !disp_ok(dst_disp)
+        || load_infos
+            .iter()
+            .any(|(_, _, _, a)| !disp_ok(a.const_bytes))
+    {
         set_reject("stencil displacement exceeds the SIB disp32 range");
         return None;
     }
@@ -4759,13 +4752,15 @@ fn transform_stencil_vector(
             Operand::Const(int_const(n))
         }
         Operand::Value(limit_val) => {
-            func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
-                dest: trip_val,
-                op: IrBinOp::Sub,
-                lhs: Operand::Value(*limit_val),
-                rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
-                ty: pattern.iv_ty,
-            });
+            func.blocks[preheader_idx]
+                .instructions
+                .push(Instruction::BinOp {
+                    dest: trip_val,
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(*limit_val),
+                    rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
+                    ty: pattern.iv_ty,
+                });
             changes += 1;
             Operand::Value(trip_val)
         }
@@ -4822,25 +4817,29 @@ fn transform_stencil_vector(
             changes += 1;
         }
     } else {
-        func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
-            dest: vec_trip,
-            op: IrBinOp::LShr,
-            lhs: trip_operand.clone(),
-            rhs: Operand::Const(int_const(shift)),
-            ty: pattern.iv_ty,
-        });
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::BinOp {
+                dest: vec_trip,
+                op: IrBinOp::LShr,
+                lhs: trip_operand.clone(),
+                rhs: Operand::Const(int_const(shift)),
+                ty: pattern.iv_ty,
+            });
         changes += 1;
     }
     // bound = vec_trip + (cmp_k + iv_start)
     let bound = Value(next_val_id);
     next_val_id += 1;
-    func.blocks[preheader_idx].instructions.push(Instruction::BinOp {
-        dest: bound,
-        op: IrBinOp::Add,
-        lhs: Operand::Value(vec_trip),
-        rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
-        ty: pattern.iv_ty,
-    });
+    func.blocks[preheader_idx]
+        .instructions
+        .push(Instruction::BinOp {
+            dest: bound,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(vec_trip),
+            rhs: Operand::Const(int_const(pattern.cmp_k + pattern.iv_start)),
+            ty: pattern.iv_ty,
+        });
     changes += 1;
 
     // Rewrite the header compare's limit operand. The compare's IV-derived
@@ -5060,13 +5059,8 @@ fn transform_stencil_vector(
         changes += inserted;
     }
 
-    changes += insert_stencil_remainder_loop(
-        func,
-        pattern,
-        vec_width,
-        &mut next_val_id,
-        &mut next_label,
-    );
+    changes +=
+        insert_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -5121,12 +5115,14 @@ fn emit_stencil_expr(
         }
         let dest = Value(*next_val_id);
         *next_val_id += 1;
-        func.blocks[preheader_idx].instructions.push(Instruction::Intrinsic {
-            dest: Some(dest),
-            op: broadcast_op,
-            dest_ptr: None,
-            args: vec![op.clone()],
-        });
+        func.blocks[preheader_idx]
+            .instructions
+            .push(Instruction::Intrinsic {
+                dest: Some(dest),
+                op: broadcast_op,
+                dest_ptr: None,
+                args: vec![op.clone()],
+            });
         *changes += 1;
         cache.insert(key, dest);
         Some(dest)
@@ -5357,7 +5353,9 @@ fn emit_stencil_expr(
                 }
                 _ => None,
             },
-            Instruction::UnaryOp { op, src: operand, .. } => match op {
+            Instruction::UnaryOp {
+                op, src: operand, ..
+            } => match op {
                 IrUnaryOp::Neg => {
                     let v_node = match operand {
                         Operand::Value(v) => *v,
@@ -5661,11 +5659,7 @@ fn insert_stencil_remainder_loop(
         let def = defs.get(&node.0)?.clone();
         match def {
             Instruction::BinOp {
-                op,
-                lhs,
-                rhs,
-                ty,
-                ..
+                op, lhs, rhs, ty, ..
             } => {
                 let map_op = |o: &Operand,
                               remap: &mut FxHashMap<u32, Value>,
@@ -5816,9 +5810,9 @@ fn gep_uses_iv(
                     // rewrite over/under-covers the array. Require the
                     // canonical shape; anything else stays scalar.
                     return match offset {
-                        Operand::Value(v) => offset_is_canonical_unit_stride(
-                            func, *v, iv, iv_derived, elem_size,
-                        ),
+                        Operand::Value(v) => {
+                            offset_is_canonical_unit_stride(func, *v, iv, iv_derived, elem_size)
+                        }
                         _ => false,
                     };
                 }
@@ -5888,8 +5882,7 @@ fn offset_is_canonical_unit_stride(
             } => {
                 // Accept only widening casts (sext/zext of the same value);
                 // narrowing casts change the value — fail closed.
-                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
-                {
+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size()) {
                     return false;
                 }
                 cur = *s;
@@ -5968,8 +5961,7 @@ fn scaled_operand_is_iv(
             } => {
                 // Accept only widening casts (sext/zext of the same value);
                 // narrowing casts change the value — fail closed.
-                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size())
-                {
+                if !(from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= from_ty.size()) {
                     return false;
                 }
                 cur = *s;
@@ -7747,7 +7739,10 @@ fn transform_to_fma_f64x4(func: &mut IrFunction, pattern: &VectorizablePattern) 
                             }
                             changes += 1;
                             if debug {
-                                eprintln!("[VEC]   Promoted IV Phi Value({}) from I32 to I64", dest.0);
+                                eprintln!(
+                                    "[VEC]   Promoted IV Phi Value({}) from I32 to I64",
+                                    dest.0
+                                );
                             }
                         }
                         break;
@@ -7989,7 +7984,6 @@ fn reduction_gep_base(func: &IrFunction, body_idx: usize, gep: Value) -> Value {
     }
     gep
 }
-
 
 /// Repair uses of the loop counter that ESCAPE a vectorized loop.
 ///
@@ -8877,7 +8871,6 @@ fn transform_reduction_avx2(
     // aborting midway leaves the loop half-transformed, which is worse than
     // either outcome.
 
-
     {
         let elem_size = reduction_element_size(pattern.element_type).unwrap_or(0) as u32;
         let all_geps = reduction_array_geps(pattern);
@@ -8922,7 +8915,8 @@ fn transform_reduction_avx2(
     // The widening I32→I64 reduction consumes FOUR I32 lanes per iteration
     // (VecWidenAddI32x4ToI64x2) and reduces into an I64x2 accumulator; its
     // horizontal intrinsic is the I64x2 hadd.
-    let widening_i64 = pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
+    let widening_i64 =
+        pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
     let (vec_width, _load_intrinsic, _add_intrinsic, _mul_intrinsic, horizontal_intrinsic) =
         match pattern.element_type {
             IrType::F64 => (
@@ -9061,17 +9055,13 @@ fn transform_reduction_avx2(
     // arrays too; otherwise the whole loop uses the element-index scheme
     // (scaled GEP offsets), which is correct but one LEA per access heavier.
     for sec in &pattern.seconds {
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
-        use_byte_iv &= sec_byte_iv_a.is_some()
-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+        use_byte_iv &=
+            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
@@ -9475,8 +9465,8 @@ fn transform_reduction_avx2(
                 // intrinsic: one instruction = load 4×I32 + sign-extend +
                 // paddq into the I64x2 accumulator. The emitted body then
                 // carries a single intrinsic instead of a load/add pair.
-                let widening_i64 = pattern.accumulator_type == IrType::I64
-                    && pattern.element_type == IrType::I32;
+                let widening_i64 =
+                    pattern.accumulator_type == IrType::I64 && pattern.element_type == IrType::I32;
                 let (vec_load_op, vec_add_op, vec_zero_op) = match pattern.element_type {
                     IrType::F64 => (
                         IntrinsicOp::VecLoadF64x4,
@@ -9571,9 +9561,10 @@ fn transform_reduction_avx2(
                         // the lowering builds the per-lane compare mask
                         // internally. Splice: remove the Select first (it
                         // sits after the Add), then replace the Add.
-                        let guard_rhs = pattern.guard_rhs.clone().unwrap_or(Operand::Const(
-                            IrConst::I32(0),
-                        ));
+                        let guard_rhs = pattern
+                            .guard_rhs
+                            .clone()
+                            .unwrap_or(Operand::Const(IrConst::I32(0)));
                         let masked_inst = Instruction::Intrinsic {
                             dest: Some(vec_sum_value),
                             op: IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
@@ -9622,11 +9613,7 @@ fn transform_reduction_avx2(
                             dest: Some(vec_sum_value),
                             op: vec_load_op,
                             dest_ptr: None,
-                            args: vec![
-                                Operand::Value(pattern.accumulator_phi),
-                                base,
-                                off,
-                            ],
+                            args: vec![Operand::Value(pattern.accumulator_phi), base, off],
                         };
                         body_block
                             .instructions
@@ -9978,12 +9965,8 @@ fn transform_reduction_avx2(
             true,
         ));
         for sec in &pattern.seconds {
-            let sec_byte_iv_a = find_reduction_byte_iv(
-                func,
-                &pattern.loop_blocks,
-                sec.array_a_gep,
-                elem_sz as u32,
-            );
+            let sec_byte_iv_a =
+                find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
             let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
                 find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
             });
@@ -10061,7 +10044,7 @@ fn transform_reduction_avx2(
         horizontal_intrinsic,
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        None, // AVX2 path uses a single NEON accumulator
+        None,             // AVX2 path uses a single NEON accumulator
         &pattern.seconds, // Extra independent accumulators, if any
         &mut next_val_id,
         &mut next_label,
@@ -10239,17 +10222,13 @@ fn transform_reduction_sse2(
     // arrays too; otherwise the whole loop uses the element-index scheme
     // (scaled GEP offsets), which is correct but one LEA per access heavier.
     for sec in &pattern.seconds {
-        let sec_byte_iv_a = find_reduction_byte_iv(
-            func,
-            &pattern.loop_blocks,
-            sec.array_a_gep,
-            elem_sz as u32,
-        );
-        let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
-            find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
-        });
-        use_byte_iv &= sec_byte_iv_a.is_some()
-            && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
+        let sec_byte_iv_a =
+            find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
+        let sec_byte_iv_b = sec
+            .array_b_gep
+            .and_then(|g| find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32));
+        use_byte_iv &=
+            sec_byte_iv_a.is_some() && (sec.array_b_gep.is_none() || sec_byte_iv_b.is_some());
     }
 
     // Step 1: Divide loop bound by vector width (byte limit under byte-offset IV)
@@ -11227,12 +11206,8 @@ fn transform_reduction_sse2(
             true,
         ));
         for sec in &pattern.seconds {
-            let sec_byte_iv_a = find_reduction_byte_iv(
-                func,
-                &pattern.loop_blocks,
-                sec.array_a_gep,
-                elem_sz as u32,
-            );
+            let sec_byte_iv_a =
+                find_reduction_byte_iv(func, &pattern.loop_blocks, sec.array_a_gep, elem_sz as u32);
             let sec_byte_iv_b = sec.array_b_gep.and_then(|g| {
                 find_reduction_byte_iv(func, &pattern.loop_blocks, g, elem_sz as u32)
             });
@@ -11310,7 +11285,7 @@ fn transform_reduction_sse2(
         horizontal_intrinsic,
         vec_sum_value, // Pass the vector accumulator SSA value
         use_byte_iv,
-        second_acc, // Second NEON accumulator phi (smlal2 half), if any
+        second_acc,       // Second NEON accumulator phi (smlal2 half), if any
         &pattern.seconds, // Extra independent accumulators, if any
         &mut next_val_id,
         &mut next_label,
@@ -12163,8 +12138,8 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
         lane_addresses.push((a_addr, b_addr));
     }
     lane_addresses.sort_by_key(|((_, offset), _)| *offset);
-    let a_base = lane_addresses[0].0.0;
-    let b_base = lane_addresses[0].1.0;
+    let a_base = lane_addresses[0].0 .0;
+    let b_base = lane_addresses[0].1 .0;
     let elem_size = if ty == IrType::F64 { 8 } else { 4 };
     for (lane, ((this_a, a_offset), (this_b, b_offset))) in lane_addresses.iter().enumerate() {
         let expected = lane as i64 * elem_size;

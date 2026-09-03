@@ -26,7 +26,11 @@ impl X86Codegen {
     pub(super) fn load_fp_to_xmm0(&mut self, op: &Operand, ty: IrType) {
         // Decimal carriers are bit containers: D64 moves exactly like a
         // 64-bit double (movsd), D32 like a 32-bit float (movss).
-        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) { "movsd" } else { "movss" };
+        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+            "movsd"
+        } else {
+            "movss"
+        };
         if let Operand::Value(v) = op {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if is_xmm_reg(reg) {
@@ -100,7 +104,11 @@ impl X86Codegen {
     /// home first (mirrors load_fp_to_xmm0; the result stays in the XMM domain).
 
     pub(super) fn store_xmm0_fp_dest(&mut self, dest: &Value, ty: IrType) {
-        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) { "movsd" } else { "movss" };
+        let mov_instr = if matches!(ty, IrType::F64 | IrType::D64) {
+            "movsd"
+        } else {
+            "movss"
+        };
         if let Some(&reg) = self.reg_assignments.get(&dest.0) {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name(reg);
@@ -896,10 +904,7 @@ impl X86Codegen {
         // then `mnem %eax, %eax`. Sub-32-bit types still take the default path
         // (they need an explicit zero-extend first).
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
-            if matches!(
-                ty,
-                IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64
-            ) {
+            if matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
                 let bitcount = match op {
                     IrUnaryOp::Popcount if self.popcnt_enabled => Some("popcnt"),
                     IrUnaryOp::Clz if self.lzcnt_enabled => Some("lzcnt"),
@@ -1047,9 +1052,15 @@ impl X86Codegen {
                             // `movaps` was rejected here for full-register
                             // partial-dependency reasons; the VEX scalar form
                             // has neither defect: it reads only the source.
-                            let mv = if ty == IrType::F32 { "vmovss" } else { "vmovsd" };
-                            self.state
-                                .emit_fmt(format_args!("    {} %{}, %{}, %{}", mv, name, name, xmm));
+                            let mv = if ty == IrType::F32 {
+                                "vmovss"
+                            } else {
+                                "vmovsd"
+                            };
+                            self.state.emit_fmt(format_args!(
+                                "    {} %{}, %{}, %{}",
+                                mv, name, name, xmm
+                            ));
                         }
                     } else {
                         let gpr = phys_reg_name(reg);
@@ -1283,7 +1294,10 @@ impl X86Codegen {
         // constant accumulator materialised in the xmm0 scratch.  Two
         // instructions, result lands in the destination home directly — no
         // xmm0 store-back.  Requires the rhs in a distinct XMM home.
-        if matches!(acc, Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_))) {
+        if matches!(
+            acc,
+            Operand::Const(IrConst::F64(_)) | Operand::Const(IrConst::F32(_))
+        ) {
             if let (Some(dest_reg), Operand::Value(rv)) = (self.dest_reg(add_dest), mul_rhs) {
                 if is_xmm_reg(dest_reg) {
                     let dest_name = phys_reg_name(dest_reg);
@@ -1365,10 +1379,8 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let n = phys_reg_name(reg);
                         // reg form: src2=n, src1=xmm1, dest=xmm0
-                        self.state.emit_fmt(format_args!(
-                            "    {} %{}, {}, %xmm0",
-                            fma, n, lhs_src
-                        ));
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, {}, %xmm0", fma, n, lhs_src));
                         self.store_xmm0_fp_dest(add_dest, ty);
                         return;
                     }
@@ -1376,18 +1388,14 @@ impl X86Codegen {
                 if let Some(slot) = self.state.get_slot(v.0) {
                     let sr = self.slot_ref(slot.0);
                     // mem form: encoder wants (mem, vvvv, dst) = src2, src1, dest
-                    self.state.emit_fmt(format_args!(
-                        "    {} {}, {}, %xmm0",
-                        fma, sr, lhs_src
-                    ));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, {}, %xmm0", fma, sr, lhs_src));
                     self.store_xmm0_fp_dest(add_dest, ty);
                     return;
                 }
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state.emit_fmt(format_args!(
-                    "    {} %xmm2, {}, %xmm0",
-                    fma, lhs_src
-                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm2, {}, %xmm0", fma, lhs_src));
             }
             Operand::Const(IrConst::F64(v)) => {
                 let bits = v.to_bits();
@@ -1405,10 +1413,8 @@ impl X86Codegen {
                     // (-0.0 + 0.0 = +0.0, not -0.0). Materialise +0.0 in
                     // xmm2 (VEX xor keeps the unified AVX domain) and fuse.
                     self.state.emit("    vxorpd %xmm2, %xmm2, %xmm2");
-                    self.state.emit_fmt(format_args!(
-                        "    {} %xmm2, {}, %xmm0",
-                        fma, lhs_src
-                    ));
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm2, {}, %xmm0", fma, lhs_src));
                 }
             }
             Operand::Const(IrConst::F32(v)) => {
@@ -1422,18 +1428,14 @@ impl X86Codegen {
                 } else {
                     // Same +0.0 rule as the F64 arm above.
                     self.state.emit("    vxorps %xmm2, %xmm2, %xmm2");
-                    self.state.emit_fmt(format_args!(
-                        "    {} %xmm2, {}, %xmm0",
-                        fma, lhs_src
-                    ));
+                    self.state
+                        .emit_fmt(format_args!("    {} %xmm2, {}, %xmm0", fma, lhs_src));
                 }
             }
             _ => {
                 self.load_fp_to_reg(mul_rhs, ty, "xmm2");
-                self.state.emit_fmt(format_args!(
-                    "    {} %xmm2, {}, %xmm0",
-                    fma, lhs_src
-                ));
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm2, {}, %xmm0", fma, lhs_src));
             }
         }
         self.store_xmm0_fp_dest(add_dest, ty);

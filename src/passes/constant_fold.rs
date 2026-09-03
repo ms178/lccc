@@ -688,11 +688,7 @@ pub(crate) fn eval_cmp_const(
 }
 
 /// Evaluate a cast of a constant operand from `from_ty` to `to_ty`.
-pub(crate) fn eval_cast_const(
-    src: IrConst,
-    from_ty: IrType,
-    to_ty: IrType,
-) -> Option<IrConst> {
+pub(crate) fn eval_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
     if from_ty.is_128bit() || to_ty.is_128bit() {
         return fold_cast_i128(&src, from_ty, to_ty);
     }

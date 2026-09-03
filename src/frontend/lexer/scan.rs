@@ -666,19 +666,33 @@ impl Lexer {
                     let bits = crate::common::decimal::parse_decimal_literal(text)
                         .map(|lit| match width {
                             32 => {
-                                let b = crate::common::decimal::encode_bid32(false, &lit.digits, lit.exponent).to_le_bytes();
+                                let b = crate::common::decimal::encode_bid32(
+                                    false,
+                                    &lit.digits,
+                                    lit.exponent,
+                                )
+                                .to_le_bytes();
                                 let mut out = [0u8; 16];
                                 out[..4].copy_from_slice(&b);
                                 out
                             }
                             64 => {
-                                let b = crate::common::decimal::encode_bid64(false, &lit.digits, lit.exponent).to_le_bytes();
+                                let b = crate::common::decimal::encode_bid64(
+                                    false,
+                                    &lit.digits,
+                                    lit.exponent,
+                                )
+                                .to_le_bytes();
                                 let mut out = [0u8; 16];
                                 out[..8].copy_from_slice(&b);
                                 out
                             }
                             _ => {
-                                let (hi, lo) = crate::common::decimal::encode_bid128(false, &lit.digits, lit.exponent);
+                                let (hi, lo) = crate::common::decimal::encode_bid128(
+                                    false,
+                                    &lit.digits,
+                                    lit.exponent,
+                                );
                                 let mut out = [0u8; 16];
                                 out[..8].copy_from_slice(&lo.to_le_bytes());
                                 out[8..].copy_from_slice(&hi.to_le_bytes());

@@ -155,9 +155,7 @@ fn rewrite_covered_arm_loads(
                 for _ in 0..16 {
                     let vid = match off_root {
                         Operand::Value(v) => v.0,
-                        Operand::Const(c) => {
-                            return format!("gep({}@{:?})", base_key, c)
-                        }
+                        Operand::Const(c) => return format!("gep({}@{:?})", base_key, c),
                     };
                     let next = match defs.get(&vid) {
                         Some(Instruction::Cast {
@@ -718,7 +716,10 @@ fn detect_diamond(
                     Instruction::GetElementPtr { .. }
                         | Instruction::Copy { .. }
                         | Instruction::GlobalAddr { .. }
-                        | Instruction::BinOp { op: IrBinOp::Shl, .. }
+                        | Instruction::BinOp {
+                            op: IrBinOp::Shl,
+                            ..
+                        }
                 )
             })
             .count()
@@ -1367,12 +1368,10 @@ mod tests {
         ));
 
         // Merge block should have no phi
-        assert!(
-            !func.blocks[3]
-                .instructions
-                .iter()
-                .any(|i| matches!(i, Instruction::Phi { .. }))
-        );
+        assert!(!func.blocks[3]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Phi { .. })));
     }
 
     #[test]

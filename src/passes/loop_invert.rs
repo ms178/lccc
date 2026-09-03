@@ -213,7 +213,12 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
 
         // Guard 3: nothing defined in the header escapes it.
-        let defined: FxHashSet<u32> = hb.instructions.iter().filter_map(|i| i.dest()).map(|d| d.0).collect();
+        let defined: FxHashSet<u32> = hb
+            .instructions
+            .iter()
+            .filter_map(|i| i.dest())
+            .map(|d| d.0)
+            .collect();
         if !defined.is_empty() {
             for (bi, b) in func.blocks.iter().enumerate() {
                 if bi == h {
@@ -242,14 +247,22 @@ fn find_one(func: &IrFunction, debug: bool) -> Option<Plan> {
         }
 
         // Guard 4: an entry from outside the loop, so the guard is reachable.
-        if !cfg.preds.row(h).iter().any(|&p| !lp.body.contains(&(p as usize))) {
+        if !cfg
+            .preds
+            .row(h)
+            .iter()
+            .any(|&p| !lp.body.contains(&(p as usize)))
+        {
             continue;
         }
 
         if debug {
             eprintln!("[INV] rotating header={} latch={}", h, t);
         }
-        return Some(Plan { header: h, latch: t });
+        return Some(Plan {
+            header: h,
+            latch: t,
+        });
     }
     None
 }
@@ -306,7 +319,9 @@ fn apply(func: &mut IrFunction, plan: &Plan) {
     if latch.source_spans.len() == latch.instructions.len() {
         let fill = latch.source_spans.last().copied();
         if let Some(sp) = fill {
-            latch.source_spans.extend(std::iter::repeat_n(sp, cloned.len()));
+            latch
+                .source_spans
+                .extend(std::iter::repeat_n(sp, cloned.len()));
         } else {
             latch.source_spans.clear();
         }
@@ -325,7 +340,16 @@ fn set_dest(inst: &mut Instruction, new: Value) {
             }
         };
     }
-    d!(Cmp, BinOp, UnaryOp, Copy, Cast, Select, GetElementPtr, GlobalAddr);
+    d!(
+        Cmp,
+        BinOp,
+        UnaryOp,
+        Copy,
+        Cast,
+        Select,
+        GetElementPtr,
+        GlobalAddr
+    );
 }
 
 fn terminator_uses(term: &Terminator, f: &mut impl FnMut(u32)) {
@@ -350,9 +374,9 @@ const _: Option<BlockId> = None;
 mod tests {
     use super::*;
     use crate::common::types::IrType;
-    use crate::ir::reexports::{IrBinOp, IrCmpOp};
     use crate::ir::instruction::BasicBlock;
     use crate::ir::reexports::IrConst;
+    use crate::ir::reexports::{IrBinOp, IrCmpOp};
 
     fn blk(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {
@@ -421,7 +445,10 @@ mod tests {
         assert_eq!(invert_loops(&mut f), 1);
 
         // The header keeps its test and becomes the guard, executed once.
-        assert!(matches!(f.blocks[1].terminator, Terminator::CondBranch { .. }));
+        assert!(matches!(
+            f.blocks[1].terminator,
+            Terminator::CondBranch { .. }
+        ));
         assert_eq!(f.blocks[1].instructions.len(), 1);
 
         // The latch now carries a COPY of the test and branches like the

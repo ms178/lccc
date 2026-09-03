@@ -247,7 +247,11 @@ fn global_addr(dest: Value, literal: &str) -> Instruction {
 /// target exactly like the frontend's own fwrite lowering (U64 LP64,
 /// U32 ILP32; the constants stay I64 in both cases, as lowered).
 fn fwrite_call(ptr: Operand, len: usize, stream: Operand, size_t_is_u32: bool) -> Instruction {
-    let sz = if size_t_is_u32 { IrType::U32 } else { IrType::U64 };
+    let sz = if size_t_is_u32 {
+        IrType::U32
+    } else {
+        IrType::U64
+    };
     mk_call(
         "fwrite",
         vec![
@@ -297,12 +301,13 @@ fn classify(
     // The flag gate applies only to the hardened family (plain calls have
     // no fortify flag; their only gates are result-unused + const format).
     let has_flag = !plain;
-    let (stream_idx, flag_idx, fmt_idx): (Option<usize>, usize, usize) = match (stream_first, has_flag) {
-        (true, true) => (Some(0), 1, 2),
-        (true, false) => (Some(0), 0, 1),
-        (false, true) => (None, 0, 1),
-        (false, false) => (None, 0, 0),
-    };
+    let (stream_idx, flag_idx, fmt_idx): (Option<usize>, usize, usize) =
+        match (stream_first, has_flag) {
+            (true, true) => (Some(0), 1, 2),
+            (true, false) => (Some(0), 0, 1),
+            (false, true) => (None, 0, 1),
+            (false, false) => (None, 0, 0),
+        };
     if info.args.len() <= fmt_idx {
         return None;
     }
@@ -333,9 +338,8 @@ fn classify(
             ),
         }
     };
-    let fputsish = |s: Operand, st: Operand| {
-        mk_call("fputs", vec![s, st], vec![IrType::Ptr, IrType::Ptr])
-    };
+    let fputsish =
+        |s: Operand, st: Operand| mk_call("fputs", vec![s, st], vec![IrType::Ptr, IrType::Ptr]);
 
     // ---- PLAIN (non-hardened) family -------------------------------------
     // Same oracle discipline as the hardened matrix: only shapes GCC's -O2
@@ -343,7 +347,11 @@ fn classify(
     if plain {
         let bytes = fmt.as_bytes();
         if bytes.is_empty() {
-            return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+            return Some(Decision {
+                insts: Vec::new(),
+                new_literal: None,
+                extra_values: 0,
+            });
         }
         if bytes.len() == 1 {
             return Some(Decision {
@@ -390,12 +398,7 @@ fn classify(
             }
             if let Some(st) = &stream_op {
                 return Some(Decision {
-                    insts: vec![fwrite_call(
-                        arg_op(),
-                        s.len(),
-                        st.clone(),
-                        size_t_is_u32,
-                    )],
+                    insts: vec![fwrite_call(arg_op(), s.len(), st.clone(), size_t_is_u32)],
                     new_literal: None,
                     extra_values: 0,
                 });
@@ -435,13 +438,8 @@ fn classify(
             if !(callee == "printf" && !fmt.ends_with('\n')) {
                 if let Some(st) = &stream_op {
                     return Some(Decision {
-                    extra_values: 0,
-                        insts: vec![fwrite_call(
-                            fmt_op,
-                            bytes.len(),
-                            st.clone(),
-                            size_t_is_u32,
-                        )],
+                        extra_values: 0,
+                        insts: vec![fwrite_call(fmt_op, bytes.len(), st.clone(), size_t_is_u32)],
                         new_literal: None,
                     });
                 }
@@ -491,7 +489,11 @@ fn classify(
             }
             let bytes = s.as_bytes();
             if bytes.is_empty() {
-                return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+                return Some(Decision {
+                    insts: Vec::new(),
+                    new_literal: None,
+                    extra_values: 0,
+                });
             }
             if bytes.len() == 1 {
                 return Some(Decision {
@@ -519,7 +521,11 @@ fn classify(
             return Some(Decision {
                 insts: vec![
                     global_addr(Value(next_val), fresh_literal),
-                    mk_call("puts", vec![Operand::Value(Value(next_val))], vec![IrType::Ptr]),
+                    mk_call(
+                        "puts",
+                        vec![Operand::Value(Value(next_val))],
+                        vec![IrType::Ptr],
+                    ),
                 ],
                 new_literal: Some((fresh_literal.to_string(), stripped)),
                 extra_values: 1,
@@ -556,11 +562,15 @@ fn classify(
     // Argument-independent shapes.
     let bytes = fmt.as_bytes();
     if bytes.is_empty() {
-        return Some(Decision { insts: Vec::new(), new_literal: None, extra_values: 0 });
+        return Some(Decision {
+            insts: Vec::new(),
+            new_literal: None,
+            extra_values: 0,
+        });
     }
     if bytes.len() == 1 {
         return Some(Decision {
-                    extra_values: 0,
+            extra_values: 0,
             insts: vec![char_call("putchar", "fputc", bytes[0] as i32)],
             new_literal: None,
         });
@@ -772,10 +782,10 @@ mod tests {
             src: Operand::Const(IrConst::I32(1)),
         });
         for (id, name) in [
-            (1u32, ".LstrA"),   // "hello\n"
-            (2, ".LstrB"),      // "hello"
-            (3, ".LstrC"),      // "a"
-            (4, ".LstrEmpty"),  // ""
+            (1u32, ".LstrA"),  // "hello\n"
+            (2, ".LstrB"),     // "hello"
+            (3, ".LstrC"),     // "a"
+            (4, ".LstrEmpty"), // ""
         ] {
             insts.push(Instruction::GlobalAddr {
                 dest: Value(id),
@@ -827,10 +837,9 @@ mod tests {
         let calls = flat_calls(&func);
         assert_eq!(calls, vec!["puts"], "hardened call replaced by puts");
         // The stripped literal was interned and is referenced by a fresh addr.
-        let has_addr = func.blocks[0]
-            .instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold")));
+        let has_addr = func.blocks[0].instructions.iter().any(
+            |i| matches!(i, Instruction::GlobalAddr { name, .. } if name.starts_with(".Lchkfold")),
+        );
         assert!(has_addr, "stripped literal GlobalAddr must be spliced in");
     }
 
@@ -859,7 +868,10 @@ mod tests {
             vec![IrType::I32, IrType::Ptr],
         ));
         let func = run_module(simple_func(insts), std_strings());
-        assert!(flat_calls(&func).is_empty(), "empty format deletes the call");
+        assert!(
+            flat_calls(&func).is_empty(),
+            "empty format deletes the call"
+        );
     }
 
     #[test]
@@ -1020,7 +1032,11 @@ mod tests {
                 (".LstrArg".to_string(), "hello\n".to_string()),
             ],
         );
-        assert_eq!(flat_calls(&func), vec!["puts"], "%s\n + const arg -> puts(arg)");
+        assert_eq!(
+            flat_calls(&func),
+            vec!["puts"],
+            "%s\n + const arg -> puts(arg)"
+        );
     }
 
     #[test]
@@ -1511,10 +1527,7 @@ mod tests {
         insts.push(hardened_call(
             "fprintf",
             None,
-            vec![
-                Operand::Value(Value(2)),
-                Operand::Value(Value(1)),
-            ],
+            vec![Operand::Value(Value(2)), Operand::Value(Value(1))],
             vec![IrType::Ptr, IrType::Ptr],
         ));
         let func = run_module(simple_func(insts), std_strings());
@@ -1541,7 +1554,7 @@ mod tests {
             "printf",
             None,
             vec![
-                Operand::Value(Value(0)) /*placeholder*/,
+                Operand::Value(Value(0)), /*placeholder*/
                 Operand::Value(Value(1)),
                 Operand::Value(Value(2)),
             ],
@@ -1577,11 +1590,18 @@ mod tests {
             vec![IrType::Ptr, IrType::Ptr],
         ));
         let _ = insts;
-        let func2 = run_module(simple_func(insts2), vec![
-            (".LstrFmtS".to_string(), "%s\n".to_string()),
-            (".LstrArg".to_string(), "hello\n".to_string()),
-        ]);
-        assert_eq!(flat_calls(&func2), vec!["puts"], "printf(\"%s\\n\", S) -> puts(S)");
+        let func2 = run_module(
+            simple_func(insts2),
+            vec![
+                (".LstrFmtS".to_string(), "%s\n".to_string()),
+                (".LstrArg".to_string(), "hello\n".to_string()),
+            ],
+        );
+        assert_eq!(
+            flat_calls(&func2),
+            vec!["puts"],
+            "printf(\"%s\\n\", S) -> puts(S)"
+        );
         assert_eq!(
             flat_calls(&func),
             vec!["printf"],

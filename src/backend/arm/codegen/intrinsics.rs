@@ -3,7 +3,7 @@
 //! NEON intrinsics: SSE-equivalent operations via 128-bit NEON instructions.
 //! F128: IEEE 754 binary128 via compiler-rt/libgcc soft-float libcalls.
 
-use super::emit::{ArmCodegen, arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys};
+use super::emit::{arm_fp_name, arm_vector_name, callee_saved_name, is_arm_fp_phys, ArmCodegen};
 use crate::common::types::IrType;
 use crate::ir::reexports::{IntrinsicOp, Operand, Value};
 
@@ -647,10 +647,8 @@ impl ArmCodegen {
                     if *op == IntrinsicOp::VecAddI64x2 {
                         if let Some(name) = self.assigned_vector_reg(d.0) {
                             self.state.vector_values.insert(d.0);
-                            self.state.emit_fmt(format_args!(
-                                "    add {}.2d, {}.2d, {}.2d",
-                                name, a, b
-                            ));
+                            self.state
+                                .emit_fmt(format_args!("    add {}.2d, {}.2d, {}.2d", name, a, b));
                         } else {
                             self.state
                                 .emit_fmt(format_args!("    add v0.2d, {}.2d, {}.2d", a, b));
@@ -801,9 +799,7 @@ impl ArmCodegen {
                 }
             }
 
-            IntrinsicOp::VecZeroF64x2
-            | IntrinsicOp::VecZeroF32x4
-            | IntrinsicOp::VecZeroI32x4 => {
+            IntrinsicOp::VecZeroF64x2 | IntrinsicOp::VecZeroF32x4 | IntrinsicOp::VecZeroI32x4 => {
                 if let Some(d) = dest {
                     if let Some(name) = self.assigned_vector_reg(d.0) {
                         self.state.vector_values.insert(d.0);
