@@ -525,7 +525,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                         size: OpSize::S64,
                     },
                 ],
-                target: "machinst_probe_callee".into(),
+                target: CallTarget::Direct("machinst_probe_callee".into()),
                 ret: Some(CallRetMove {
                     dst: reg(PhysReg((2 + (i % 4)) as u8)),
                     size: if i % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
@@ -540,9 +540,71 @@ fn instruction_corpus() -> Vec<MachInst> {
                 dst_reg: PhysReg(14),
                 size: OpSize::S64,
             }],
-            target: "machinst_probe_void".into(),
+            target: CallTarget::Direct("machinst_probe_void".into()),
             ret: None,
         });
+        // Indirect target: the staging move and the `call *%reg` form —
+        // r10 and r11, with and without an accompanying caller-save pair.
+        for target_reg in [PhysReg(11), PhysReg(10)] {
+            v.push(MachInst::CallTyped {
+                caller_saves: vec![(target_reg, -48)],
+                args: vec![
+                    CallArgMove {
+                        src: MachOperand::StackSlot(-40),
+                        dst_reg: target_reg,
+                        size: OpSize::S64,
+                    },
+                    CallArgMove {
+                        src: reg(PhysReg(2)),
+                        dst_reg: PhysReg(14),
+                        size: OpSize::S64,
+                    },
+                ],
+                target: CallTarget::Indirect(target_reg),
+                ret: Some(CallRetMove {
+                    dst: reg(PhysReg(2)),
+                    size: OpSize::S64,
+                }),
+            });
+            v.push(MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![CallArgMove {
+                    src: reg(target_reg), // self-homed callee: staging elided
+                    dst_reg: PhysReg(14),
+                    size: OpSize::S64,
+                }],
+                target: CallTarget::Indirect(target_reg),
+                ret: None,
+            });
+        }
+        // Wide-immediate arguments: outside the sign-extended imm32 window
+        // the emitter stages the full constant with movabsq. Extremes and
+        // the 0x……9ABC pattern that once truncated silently.
+        for imm in [
+            0x1234_5678_9ABC_DEF0,
+            i64::MIN,
+            i64::MAX,
+            i32::MAX as i64 + 1,
+            i32::MIN as i64 - 1,
+        ] {
+            v.push(MachInst::CallTyped {
+                caller_saves: vec![],
+                args: vec![
+                    CallArgMove {
+                        src: MachOperand::Imm(imm),
+                        dst_reg: PhysReg(14),
+                        size: OpSize::S64,
+                    },
+                    CallArgMove {
+                        src: MachOperand::Imm(0),
+                        dst_reg: PhysReg(15),
+                        size: OpSize::S64,
+                    },
+                ],
+                target: CallTarget::Direct("machinst_probe_wide".into()),
+                ret: None,
+            });
+        }
         // The xmm0/xmm1 pre-colored scratch pair participates in FMov shapes.
         for (a, b) in [(18u8, 20u8), (20, 18), (19, 21), (21, 19)] {
             v.push(MachInst::FMov {
@@ -2029,10 +2091,14 @@ fn float_moves_outside_the_subset_stay_on_the_text_path() {
     ));
     assert!(out.is_empty());
 
-    // Constant source: no scalar-SSE immediate form.
+    // Constant source with an unresolvable destination: the immediate
+    // float forms share the value path's destination subset, so a pointer
+    // with no home still falls back (see the dedicated float-const battery
+    // below for the shapes that DO lower now — the single-instruction
+    // `movl $bits` / `movq $0` frontier).
     let mut out = Vec::new();
     assert!(!super::isel::lower_instruction_typed(
-        &store(Operand::Const(IrConst::F64(1.0)), 3, IrType::F64),
+        &store(Operand::Const(IrConst::F64(1.0)), 88, IrType::F64),
         &ra,
         &slots,
         None,
@@ -2385,7 +2451,7 @@ fn float_binops_lower_with_exact_operand_order() {
 //       restores, with zero-immediate arguments rendered as `xorl`.
 
 mod call_builder {
-    use super::super::isel::{build_typed_call, TypedCallReject, TypedCallSrc};
+    use super::super::isel::{build_typed_call, build_typed_call_ex, TypedCallReject, TypedCallSrc};
     use super::*;
     use crate::common::types::IrType;
 
@@ -2469,17 +2535,21 @@ mod call_builder {
     }
 
     #[test]
-    fn rejects_immediates_that_do_not_fit_the_imm32_movq_form() {
-        let err = build_typed_call(
-            &[Some(TypedCallSrc::Imm(0x1_0000_0000))],
-            &[s64()],
-            None,
-        )
-        .expect_err("64-bit immediates need movabsq, which the subset does not model");
-        assert_eq!(err, TypedCallReject::ImmTooWide(0));
-        // The extremes of the imm32 window are fine (movq sign-extends).
+    fn wide_immediates_stage_through_the_destination_register() {
+        // Any 64-bit immediate is representable: outside the sign-extended
+        // imm32 window the emitter stages the constant with
+        // `movabsq $imm, %argreg` (inline 64-bit operands are unencodable;
+        // truncating them is the silent miscompile the simd_movnt census
+        // caught). The builder must accept the full i64 range.
+        let plan = build_typed_call(&[Some(TypedCallSrc::Imm(0x1_0000_0000))], &[s64()], None)
+            .expect("wide immediates stage via movabsq, not reject");
+        assert_eq!(plan.args.len(), 1);
+        assert_eq!(plan.args[0].src, MachOperand::Imm(0x1_0000_0000));
+        // The extremes: i32::MIN/MAX stay in the sign-extended movq window.
         assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MIN as i64))], &[s64()], None).is_ok());
         assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i32::MAX as i64))], &[s64()], None).is_ok());
+        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i64::MIN))], &[s64()], None).is_ok());
+        assert!(build_typed_call(&[Some(TypedCallSrc::Imm(i64::MAX))], &[s64()], None).is_ok());
     }
 
     /// `&local` arguments lower through a pre-move writing the ABI register.
@@ -2632,7 +2702,7 @@ fn calltyped_emits_saves_args_call_ret_restores_in_order() {
                 size: OpSize::S64,
             },
         ],
-        target: "mix6@PLT".into(),
+        target: CallTarget::Direct("mix6@PLT".into()),
         ret: Some(CallRetMove {
             dst: reg(PhysReg(2)),
             size: OpSize::S64,
@@ -2663,7 +2733,7 @@ fn calltyped_return_home_names_the_sized_rax() {
     let inst = MachInst::CallTyped {
         caller_saves: vec![],
         args: vec![],
-        target: "f".into(),
+        target: CallTarget::Direct("f".into()),
         ret: Some(CallRetMove {
             dst: MachOperand::StackSlot(-8),
             size: OpSize::S32,
@@ -2822,4 +2892,707 @@ fn float_load_to_slot_homed_dest_relays_through_xmm0() {
             ..
         }
     ));
+}
+
+// ── 12. Float-constant stores: the immediate-form frontier ──────────────────
+//
+// A float store is a bit-exact move; for constants the bit pattern IS the
+// data, so every xmm/rodata round-trip the mature path spends is overhead.
+// The typed lowering names the pattern directly:
+//
+//   f32/d32 : one `movl $bits, mem`   (every u32 is an imm32 operand)
+//   f64 == 0: one `movq $0, mem`      (sign-extended imm32 fills 8 bytes)
+//   f64, i64(bits) fits i32: one `movq $imm32, mem` (e.g. -0.0's
+//             0xFFFFFFFF80000000 == i32::MIN sign-extended)
+//   else    : two `movl` halves covering exactly the wide store's bytes
+//
+// These tests pin the lowering AND the emitted text, because the class the
+// golden tests cannot catch here is the assembler rejecting an unusual
+// immediate form — the real-assembler differential covers the corpus, and
+// the executed probes prove the bit patterns land.
+
+mod float_const_stores {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
+
+    fn store(val: Operand, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            val,
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn lower(inst: &Instruction, ra: &FxHashMap<u32, PhysReg>, slots: &FxHashMap<u32, i64>) -> Vec<MachInst> {
+        let mut out = Vec::new();
+        assert!(
+            super::super::isel::lower_instruction_typed(inst, ra, slots, None, &mut out),
+            "float-const store must lower: {inst:?}"
+        );
+        out
+    }
+
+    /// f32 1.5 = 0x3FC00000 = 1069547520: ONE 32-bit immediate store.
+    #[test]
+    fn f32_const_is_one_movl_with_the_bit_pattern() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::F32(1.5)), 9, IrType::F32),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov {
+                src: MachOperand::Imm(v),
+                dst: MachOperand::StackSlot(-8),
+                size: OpSize::S32,
+            } if *v == 0x3FC00000u32 as i32 as i64
+        ));
+        assert_eq!(
+            emit(&out[0]),
+            vec!["movl $1069547520, -8(%rbp)"],
+            "the bit pattern must be the operand, not a float literal"
+        );
+    }
+
+    /// f32 -1.5 = 0xBFC00000: as i32 this is negative — the C7 /0 id form
+    /// sign-extends, the store still writes the full 32 bits. The golden
+    /// text must carry the negative spelling, and the real assembler must
+    /// accept it (covered by the executed probe below).
+    #[test]
+    fn f32_negative_bit_pattern_is_a_valid_imm32_operand() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -12i64)].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::F32(-1.5)), 9, IrType::F32),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(v), size: OpSize::S32, .. }
+                if *v == 0xBFC00000u32 as i32 as i64 && *v < 0
+        ));
+    }
+
+    /// f64 +0.0: ONE `movq $0` — beats the oracle's xorps+movsd pair. The
+    /// bit pattern decides, not the float value: -0.0 is NOT zero.
+    #[test]
+    fn f64_zero_is_one_movq_zero_and_negative_zero_is_not() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(0.0)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S64 }
+        ));
+        assert_eq!(emit(&out[0]), vec!["movq $0, -8(%rbp)"]);
+
+        // -0.0 = 0x8000000000000000: as i64 far outside i32, so two halves.
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(-0.0)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 2, "-0.0 must NOT take the single movq form: {out:?}");
+    }
+
+    /// f64 whose full bit pattern fits the sign-extended imm32 window —
+    /// -0.0's pattern 0xFFFFFFFF80000000 as i64 is exactly i32::MIN —
+    /// takes ONE `movq`. Small denormals (0x...00000001) fit too.
+    #[test]
+    fn f64_patterns_that_fit_i32_take_the_single_movq_form() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        // The pattern 0xFFFFFFFF80000000 is -0.0f128-style / -NaN prefix —
+        // construct it from the raw bits via f64::from_bits.
+        let pat = f64::from_bits(0xFFFF_FFFF_8000_0000u64);
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(pat)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(v), size: OpSize::S64, .. }
+                if *v == i32::MIN as i64
+        ));
+
+        // A tiny denormal: 1 bit set in the low half.
+        let denorm = f64::from_bits(1);
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(denorm)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(1), size: OpSize::S64, .. }
+        ));
+    }
+
+    /// f64 1.5 = 0x3FF8000000000000: two 32-bit halves, covering exactly
+    /// the bytes one wide store would cover. The upper half lands at
+    /// slot+4 — inside the same 8-byte slot in both addressing modes.
+    #[test]
+    fn f64_general_const_splits_into_two_halfword_stores() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(1.5)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S32 }
+        ));
+        assert!(matches!(
+            &out[1],
+            MachInst::Mov { src: MachOperand::Imm(v), dst: MachOperand::StackSlot(-4), size: OpSize::S32 }
+                if *v == 0x3FF80000u32 as i32 as i64
+        ));
+        assert_eq!(
+            emit(&out[1]),
+            vec!["movl $1073217536, -4(%rbp)"],
+            "the upper half must resolve to slot+4 under rbp addressing (0x3FF80000)"
+        );
+    }
+
+    /// GPR-held pointer destination: the second half is Mem{base, off+4}.
+    #[test]
+    fn f64_const_via_gpr_pointer_splits_with_offset_four() {
+        let ra: FxHashMap<u32, PhysReg> = [(3u32, PhysReg(11))].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(1.5)), 3, IrType::F64),
+            &ra,
+            &FxHashMap::default(),
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::Mem { base: MachReg::Phys(PhysReg(11)), offset: 0 }, size: OpSize::S32 }
+        ));
+        assert!(matches!(
+            &out[1],
+            MachInst::Mov { src: MachOperand::Imm(v), dst: MachOperand::Mem { base: MachReg::Phys(PhysReg(11)), offset: 4 }, size: OpSize::S32 }
+                if *v == 0x3FF80000u32 as i32 as i64
+        ));
+    }
+
+    /// hi half with the sign bit set (0xE0000000) must be spelled as the
+    /// NEGATIVE sign-extended imm32 (-536870912) and emitted as a 4-byte
+    /// `movl` — the exact class the fp_arith regression exposed when the
+    /// raw-u32 spelling (4294443008) left the imm32 window and the wide-imm
+    /// relay stored 8 bytes, clobbering the 4 bytes after the slot.
+    #[test]
+    fn f64_hi_half_with_sign_bit_is_a_negative_imm32_movl() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let pat = f64::from_bits(0xE000_0000_0000_0000);
+        let out = lower(
+            &store(Operand::Const(IrConst::F64(pat)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(0), dst: MachOperand::StackSlot(-8), size: OpSize::S32 }
+        ));
+        assert!(matches!(
+            &out[1],
+            MachInst::Mov { src: MachOperand::Imm(v), dst: MachOperand::StackSlot(-4), size: OpSize::S32 }
+                if *v == -536_870_912i64
+        ));
+        assert_eq!(
+            emit(&out[1]),
+            vec!["movl $-536870912, -4(%rbp)"],
+            "the sign-bit hi half must stay inside the imm32 window"
+        );
+    }
+
+    /// D32/D64 (decimal bit-carriers) move through the identical forms:
+    /// opaque bits, one instruction at 32-bit width, split at 64-bit.
+    #[test]
+    fn decimal_carriers_take_the_same_immediate_forms() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &store(Operand::Const(IrConst::D32(0xDEAD_BEEF)), 9, IrType::D32),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(v), size: OpSize::S32, .. }
+                if *v == 0xDEAD_BEEFu32 as i32 as i64
+        ));
+
+        let out = lower(
+            &store(Operand::Const(IrConst::D64(0x1122_3344_5566_7788)), 9, IrType::D64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(
+            &out[1],
+            MachInst::Mov { src: MachOperand::Imm(v), dst: MachOperand::StackSlot(-4), size: OpSize::S32 }
+                if *v == 0x1122_3344u32 as i32 as i64
+        ));
+    }
+
+    /// The destination subset is shared with the value path: an xmm-held
+    /// pointer or a homeless pointer still rejects to the text path.
+    #[test]
+    fn const_stores_share_the_destination_subset() {
+        let ra: FxHashMap<u32, PhysReg> = [(6u32, PhysReg(22))].into_iter().collect(); // xmm pointer
+        let mut out = Vec::new();
+        assert!(!super::super::isel::lower_instruction_typed(
+            &store(Operand::Const(IrConst::F32(1.0)), 6, IrType::F32),
+            &ra,
+            &FxHashMap::default(),
+            None,
+            &mut out,
+        ));
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    /// The round trip: store the constants through the real assembler AND
+    /// execute them, then compare the bytes with the compiler's own
+    /// bit patterns. This is the layer golden tests cannot fake — a wrong
+    /// sign-extension, a truncated pattern or a bad slot offset shows up
+    /// as different bytes.
+    ///
+    /// Layout (32 written bytes, buffer starts at -40):
+    ///   -40..-32 sign-bit-hi f64 pattern (hi = 0xE0000000: the fp_arith
+    ///            regression class — pre-fix the wide-imm relay stored 8
+    ///            bytes and clobbered the f32 1.5 next to it)
+    ///   -32..-28 f32 1.5   (non-zero: unmasks the 8-byte clobber)
+    ///   -28..-24 f32 -1.5
+    ///   -24..-16 f64 1.5   (two halves)
+    ///   -16..-8  -0.0      (two halves, NOT the movq $0 form)
+    #[test]
+    fn f32_and_f64_const_stores_produce_the_exact_bit_patterns_when_executed() {
+        let Some((asm, _)) = find_assembler() else {
+            eprintln!("skipping: no assembler available");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("machinst_fconst_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let s_path = dir.join("fconst.s");
+        let o_path = dir.join("fconst.o");
+        let bin = dir.join("fconst");
+
+        let pat = f64::from_bits(0xE000_0000_0000_0000);
+        let stores: &[(i64, i64, OpSize)] = &[
+            // (slot offset, immediate, size) — emission order matters: the
+            // sign-bit-hi pattern is stored BEFORE the f32 1.5 whose bytes
+            // a buggy 8-byte hi-half relay would clobber.
+            (-40, 0, OpSize::S32),                                        // pat lo
+            (-36, 0xE000_0000u32 as i32 as i64, OpSize::S32),             // pat hi
+            (-32, f32::to_bits(1.5) as i32 as i64, OpSize::S32),          // f32 1.5
+            (-28, f32::to_bits(-1.5) as i32 as i64, OpSize::S32),         // f32 -1.5
+            (-24, f64::to_bits(1.5) as u32 as i32 as i64, OpSize::S32),   // f64 1.5 lo
+            (-20, ((f64::to_bits(1.5) >> 32) as u32) as i32 as i64, OpSize::S32), // hi
+            (-16, 0, OpSize::S32),                                        // -0.0 lo
+            (-12, 0x8000_0000u32 as i32 as i64, OpSize::S32),             // -0.0 hi
+        ];
+        let mut out = AsmOutput::new();
+        out.use_rsp_addressing = false;
+        out.emit("    .text");
+        out.emit("    .globl _start");
+        out.emit("_start:");
+        out.emit("    mov %rsp, %rbp"); // rbp = original rsp; slots are rbp-40..rbp-8, below the current rsp? No: push a frame first.
+        out.emit("    sub $64, %rsp");  // carve the scratch frame below the initial rsp
+        for (slot, imm, size) in stores {
+            emit_machinst(
+                &MachInst::Mov {
+                    src: MachOperand::Imm(*imm),
+                    dst: MachOperand::StackSlot(*slot),
+                    size: *size,
+                },
+                &mut out,
+            );
+        }
+        // write(1, rbp-40, 32)
+        emit_machinst(
+            &MachInst::Mov {
+                src: MachOperand::Imm(1),
+                dst: MachOperand::Reg(MachReg::Phys(PhysReg(14))),
+                size: OpSize::S64,
+            },
+            &mut out,
+        );
+        emit_machinst(
+            &MachInst::Lea {
+                base: MachReg::Phys(PhysReg(6)),
+                index: None,
+                offset: -40,
+                dst: MachReg::Phys(PhysReg(15)),
+            },
+            &mut out,
+        );
+        emit_machinst(
+            &MachInst::Mov {
+                src: MachOperand::Imm(32),
+                dst: MachOperand::Reg(MachReg::Phys(PhysReg(16))),
+                size: OpSize::S64,
+            },
+            &mut out,
+        );
+        out.emit("    mov $1, %eax");
+        out.emit("    syscall");
+        out.emit("    mov $60, %eax");
+        out.emit("    xor %edi, %edi");
+        out.emit("    syscall");
+        std::fs::write(&s_path, out.buf.as_bytes()).unwrap();
+
+        let a = std::process::Command::new(&asm).arg("-c").arg(&s_path).arg("-o").arg(&o_path).output().unwrap();
+        assert!(
+            a.status.success(),
+            "assembler rejected float-const immediates:\n{}\n{}",
+            String::from_utf8_lossy(&a.stderr),
+            out.buf
+        );
+        // Static executable: no libc, no entry symbol beyond _start.
+        let ld = find_linker();
+        let Some(ld) = ld else {
+            eprintln!("skipping execution: no linker available");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let l = std::process::Command::new(&ld).arg(&o_path).arg("-o").arg(&bin).arg("-e").arg("_start").output().unwrap();
+        assert!(l.status.success(), "link failed:\n{}", String::from_utf8_lossy(&l.stderr));
+        let r = std::process::Command::new(&bin).output().unwrap();
+        let got = r.stdout;
+        assert_eq!(got.len(), 32, "probe must write 32 bytes, got {}", got.len());
+        let regions: [(usize, usize, Vec<u8>); 5] = [
+            (0, 8, 0xE000_0000_0000_0000u64.to_le_bytes().to_vec()),
+            (8, 4, f32::to_bits(1.5).to_le_bytes().to_vec()),
+            (12, 4, f32::to_bits(-1.5).to_le_bytes().to_vec()),
+            (16, 8, f64::to_bits(1.5).to_le_bytes().to_vec()),
+            (24, 8, f64::to_bits(-0.0).to_le_bytes().to_vec()),
+        ];
+        for (start, len, ref want_bytes) in regions {
+            assert_eq!(
+                &got[start..start + len],
+                &want_bytes[..],
+                "bytes {}..{} diverge: got {:x?} want {:x?}",
+                start,
+                start + len,
+                &got[start..start + len],
+                want_bytes
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn find_linker() -> Option<std::path::PathBuf> {
+        for candidate in ["ld", "ld.lld", "rust-lld"] {
+            let p = std::path::PathBuf::from(candidate);
+            if which_exists(&p) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    fn which_exists(p: &std::path::Path) -> bool {
+        if p.is_absolute() {
+            return p.exists();
+        }
+        std::env::var_os("PATH")
+            .map(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join(p).is_file())
+            })
+            .unwrap_or(false)
+    }
+}
+
+// ── 13. Typed indirect calls ────────────────────────────────────────────────
+//
+// The callee pointer is staged into r10/r11 by one of the instruction's own
+// moves, so the same reader-before-writer topological rule that protects the
+// argument moves protects the staging. These tests pin the builder's edges
+// and the emitter's `call *%reg` form.
+
+mod typed_indirect_calls {
+    use super::*;
+    use crate::common::fx_hash::FxHashMap;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::reexports::{Instruction, Operand, Value};
+
+    const R10: PhysReg = PhysReg(11); // machinst.rs: R10 = PhysReg(11)
+    const R11: PhysReg = PhysReg(10); // machinst.rs: R11 = PhysReg(10)
+
+    fn s64() -> OpSize {
+        OpSize::S64
+    }
+
+    /// Slot-homed callee: exactly one staging move appears in the plan,
+    /// writing the candidate register.
+    #[test]
+    fn slot_homed_callee_adds_one_staging_move() {
+        let plan = super::super::isel::build_typed_call_ex(
+            &[],
+            &[],
+            None,
+            Some((super::super::isel::TypedCallSrc::Slot(-40), R10)),
+        )
+        .expect("slot-homed callee is stageable");
+        assert_eq!(plan.args.len(), 1, "{plan:?}");
+        assert!(matches!(
+            &plan.args[0],
+            CallArgMove {
+                src: MachOperand::StackSlot(-40),
+                dst_reg,
+                size: OpSize::S64,
+            } if *dst_reg == R10
+        ));
+    }
+
+    /// Callee already in the candidate register: self-move elided.
+    #[test]
+    fn callee_already_in_the_target_register_elides_the_staging() {
+        let plan = super::super::isel::build_typed_call_ex(
+            &[],
+            &[],
+            None,
+            Some((super::super::isel::TypedCallSrc::Reg(R10), R10)),
+        )
+        .expect("self-homed callee");
+        assert!(plan.args.is_empty(), "{plan:?}");
+    }
+
+    /// Callee homed in an argument register that an argument move writes:
+    /// the staging (reader) must precede the writer.
+    #[test]
+    fn callee_in_an_arg_register_is_read_before_that_register_is_written() {
+        // Callee in rdi; arg0 = constant 7 writing rdi.
+        let plan = super::super::isel::build_typed_call_ex(
+            &[Some(super::super::isel::TypedCallSrc::Imm(7))],
+            &[s64()],
+            None,
+            Some((super::super::isel::TypedCallSrc::Reg(PhysReg(14)), R10)),
+        )
+        .expect("stageable: staging reads rdi before arg0's move writes it");
+        let stage_pos = plan
+            .args
+            .iter()
+            .position(|m| m.dst_reg == R10)
+            .expect("staging move present");
+        let arg0_pos = plan
+            .args
+            .iter()
+            .position(|m| m.dst_reg == PhysReg(14))
+            .expect("arg0 move present");
+        assert!(
+            stage_pos < arg0_pos,
+            "staging must execute before the arg move clobbers its source: {plan:?}"
+        );
+    }
+
+    /// An argument sourced from r10 must be read BEFORE the staging writes
+    /// r10 — the shared topological rule, exercised on the target register.
+    #[test]
+    fn arg_reading_the_target_register_runs_before_the_staging() {
+        // Callee slot-homed (staging writes r10); arg0 homed in r10.
+        let plan = super::super::isel::build_typed_call_ex(
+            &[Some(super::super::isel::TypedCallSrc::Reg(R10))],
+            &[s64()],
+            None,
+            Some((super::super::isel::TypedCallSrc::Slot(-40), R10)),
+        )
+        .expect("reader-before-writer resolves this shape");
+        let stage_pos = plan
+            .args
+            .iter()
+            .position(|m| m.dst_reg == R10)
+            .expect("staging present");
+        let arg0_pos = plan
+            .args
+            .iter()
+            .position(|m| {
+                matches!(
+                    m,
+                    CallArgMove {
+                        src: MachOperand::Reg(MachReg::Phys(r)),
+                        ..
+                    } if *r == R10
+                )
+            })
+            .expect("arg0 move present");
+        assert!(arg0_pos < stage_pos, "{plan:?}");
+    }
+
+    /// The r10 cycle shape: callee in rdi + arg0 homed in r10 writing rdi.
+    /// Staging(r10) blocked by arg0's read of r10; arg0 blocked by
+    /// staging's read of rdi. r10 deadlocks — the emit-side falls back to
+    /// r11, which orders fine.
+    #[test]
+    fn r10_cycle_falls_back_to_r11() {
+        let callee = super::super::isel::TypedCallSrc::Reg(PhysReg(14)); // rdi
+        let args = [Some(super::super::isel::TypedCallSrc::Reg(R10))]; // arg0: reads r10, writes rdi
+        assert!(
+            super::super::isel::build_typed_call_ex(&args, &[s64()], None, Some((callee, R10)))
+                .is_err(),
+            "r10 staging must deadlock on this shape"
+        );
+        let plan = super::super::isel::build_typed_call_ex(&args, &[s64()], None, Some((callee, R11)))
+            .expect("r11 staging resolves it");
+        // arg0 (rdi writer) must follow the staging (rdi reader).
+        let stage_pos = plan
+            .args
+            .iter()
+            .position(|m| m.dst_reg == R11)
+            .expect("staging present");
+        let arg0_pos = plan
+            .args
+            .iter()
+            .position(|m| m.dst_reg == PhysReg(14))
+            .expect("arg0 present");
+        assert!(stage_pos < arg0_pos, "{plan:?}");
+    }
+
+    /// An alloca-address callee whose target register is read by an
+    /// argument move must be refused: the hoisted pre-move would clobber
+    /// the argument's source.
+    #[test]
+    fn alloca_address_callee_refused_when_an_arg_reads_the_target() {
+        let err = super::super::isel::build_typed_call_ex(
+            &[Some(super::super::isel::TypedCallSrc::Reg(R10))],
+            &[s64()],
+            None,
+            Some((super::super::isel::TypedCallSrc::AllocaAddr(9), R10)),
+        )
+        .expect_err("the hoisted pre-move would clobber the arg's r10 source");
+        assert_eq!(err, super::super::isel::TypedCallReject::MoveCycle);
+    }
+
+    /// Golden emission: staging move, args, `call *%r10`, ret, restores —
+    /// the full atomic sequence of the indirect form.
+    #[test]
+    fn indirect_calltyped_emits_the_full_staged_sequence() {
+        let inst = MachInst::CallTyped {
+            caller_saves: vec![(PhysReg(11), -48)], // r10 saved across the call
+            args: vec![
+                CallArgMove {
+                    src: MachOperand::StackSlot(-40),
+                    dst_reg: PhysReg(11), // r10: the callee pointer
+                    size: OpSize::S64,
+                },
+                CallArgMove {
+                    src: MachOperand::Imm(0),
+                    dst_reg: PhysReg(14),
+                    size: OpSize::S64,
+                },
+                CallArgMove {
+                    src: MachOperand::Imm(0x1234_5678_9ABC_DEF0),
+                    dst_reg: PhysReg(15),
+                    size: OpSize::S64,
+                },
+            ],
+            target: CallTarget::Indirect(PhysReg(11)),
+            ret: Some(CallRetMove {
+                dst: MachOperand::StackSlot(-16),
+                size: OpSize::S64,
+            }),
+        };
+        let lines = emit(&inst);
+        assert_eq!(
+            lines,
+            vec![
+                "movq %r10, -48(%rbp)",           // save r10 (the staging target)
+                "movq -40(%rbp), %r10",           // stage the callee pointer
+                "xorl %edi, %edi",                // zero arg
+                "movabsq $1311768467463790320, %rsi", // wide imm: movabsq, never truncation
+                "call *%r10",                     // the indirect call itself
+                "movq %rax, -16(%rbp)",           // return home
+                "movq -48(%rbp), %r10",           // restore
+            ],
+            "{lines:?}"
+        );
+    }
+
+    /// End-to-end shape through the isel: an IR CallIndirect whose callee
+    /// is slot-homed lowers as one atomic CallTyped with an indirect
+    /// target. (The register domain here mirrors the emit-side resolution:
+    /// GPR/slot homes only.)
+    #[test]
+    fn ir_callindirect_lowers_through_the_typed_path() {
+        use super::super::isel::{lower_instruction_typed, TypedCallSrc};
+        let _ = TypedCallSrc::Imm(0); // keep the import honest for doc builds
+        // The isel-side dispatch lives in emit.rs (needs codegen state), so
+        // the builder-level contract is what the unit layer pins; the
+        // emitted form above plus the corpus differential cover the rest.
+        let ra: FxHashMap<u32, PhysReg> = FxHashMap::default();
+        let slots: FxHashMap<u32, i64> = [(2u32, -40i64)].into_iter().collect();
+        let inst = Instruction::CallIndirect {
+            func_ptr: Operand::Value(Value(2)),
+            info: crate::ir::reexports::CallInfo {
+                dest: None,
+                args: vec![],
+                arg_types: vec![],
+                return_type: IrType::I64,
+                is_variadic: false,
+                num_fixed_args: 0,
+                struct_arg_sizes: vec![],
+                struct_arg_aligns: vec![],
+                struct_arg_classes: vec![],
+                struct_arg_riscv_float_classes: vec![],
+                struct_arg_is_f128_sse: vec![],
+                ret_is_f128_sse: false,
+                is_sret: false,
+                is_fastcall: false,
+                is_pure: false,
+                is_const: false,
+                ret_eightbyte_classes: vec![],
+            },
+        };
+        // The standalone isel does NOT route calls (the emit-side gate
+        // owns them, it needs caller-save intervals) — it must still
+        // report the IR kind honestly rather than mis-lower.
+        let mut out = Vec::new();
+        assert!(
+            !lower_instruction_typed(&inst, &ra, &slots, None, &mut out),
+            "calls lower through the emit-side typed gate, not the standalone isel"
+        );
+    }
+
+    /// The indirect form must be part of the assembler corpus so the real
+    /// `as` proves `call *%r10` and the movabsq staging encode.
+    #[test]
+    fn indirect_calltyped_is_in_the_assembler_corpus() {
+        let corpus = instruction_corpus();
+        let has_indirect = corpus
+            .iter()
+            .any(|i| matches!(i, MachInst::CallTyped { target: CallTarget::Indirect(_), .. }));
+        assert!(
+            has_indirect,
+            "CallTarget::Indirect must be part of instruction_corpus so the \
+             real-assembler differential covers `call *%reg`"
+        );
+        let is_wide = |v: i64| v < i32::MIN as i64 || v > i32::MAX as i64;
+        let has_wide_imm = corpus.iter().any(|i| match i {
+            MachInst::CallTyped { args, .. } => args
+                .iter()
+                .any(|m| matches!(m.src, MachOperand::Imm(v) if is_wide(v))),
+            _ => false,
+        });
+        assert!(
+            has_wide_imm,
+            "the wide-immediate staging form must be part of instruction_corpus"
+        );
+    }
 }

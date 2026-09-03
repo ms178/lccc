@@ -1062,7 +1062,12 @@ pub fn can_lower(inst: &Instruction) -> bool {
 /// A pre-resolved argument source for the typed-call builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypedCallSrc {
-    /// imm32 immediate (sign-extended by `movq`; zero emits as `xorl`).
+    /// Immediate argument. Any 64-bit value is representable: inside the
+    /// sign-extended imm32 window the move is the regular `movq $imm`,
+    /// outside it the emitter stages the full constant with
+    /// `movabsq $imm, %reg` (inline 64-bit operands are unencodable and
+    /// truncating them is a miscompile — the movabs form is both the
+    /// shortest and the only sound rendering).
     Imm(i64),
     /// GPR home (never rax/rcx/rbp — the emit-side gate rejects those).
     Reg(PhysReg),
@@ -1084,8 +1089,6 @@ pub enum TypedCallReject {
     /// An argument has no representable home (accumulator, xmm, alloca
     /// address, rax/rcx/rbp home, …) — the mature path stages it.
     ArgNotRepresentable(usize),
-    /// An immediate argument does not fit the imm32 `movq` form.
-    ImmTooWide(usize),
     /// The argument moves form a register-exchange cycle (e.g. both
     /// arguments homed in each other's ABI registers). The text path
     /// owns the hazard-spill machinery for this shape.
@@ -1099,7 +1102,6 @@ impl TypedCallReject {
     pub fn label(self) -> &'static str {
         match self {
             TypedCallReject::ArgNotRepresentable(_) => "Call(arg-unrepresentable)",
-            TypedCallReject::ImmTooWide(_) => "Call(imm-too-wide)",
             TypedCallReject::MoveCycle => "Call(move-cycle)",
             TypedCallReject::RetNotRepresentable => "Call(ret-unrepresentable)",
         }
@@ -1133,26 +1135,37 @@ pub fn build_typed_call(
     arg_sizes: &[OpSize],
     ret: Option<(Option<TypedCallSrc>, OpSize)>,
 ) -> Result<TypedCallPlan, TypedCallReject> {
+    build_typed_call_ex(args, arg_sizes, ret, None)
+}
+
+/// [`build_typed_call`] with an optional callee-pointer staging move for
+/// indirect targets. The staging move joins the same pending list and is
+/// ordered by the identical reader-before-writer rule: it reads the
+/// callee's home and writes the target register, so any argument move
+/// that reads the target register runs before it, and any argument move
+/// that writes its source home runs after it. A callee already resident
+/// in the target register is a self-move and elides the staging entirely.
+pub fn build_typed_call_ex(
+    args: &[Option<TypedCallSrc>],
+    arg_sizes: &[OpSize],
+    ret: Option<(Option<TypedCallSrc>, OpSize)>,
+    callee: Option<(TypedCallSrc, PhysReg)>,
+) -> Result<TypedCallPlan, TypedCallReject> {
     debug_assert_eq!(args.len(), arg_sizes.len());
 
-    // 1. Resolve sources; elide self-moves (value already in its ABI reg).
+    // 1. Resolve sources; elide self-moves (value already in place).
     struct PendingMove {
         src: MachOperand,
         dst_reg: PhysReg,
         size: OpSize,
     }
-    let mut pending: Vec<PendingMove> = Vec::with_capacity(args.len());
+    let mut pending: Vec<PendingMove> = Vec::with_capacity(args.len() + 1);
     for (i, src) in args.iter().enumerate() {
         let size = arg_sizes[i];
         let dst_reg = SYSCALL_ARG_REGS[i];
         let src = match src {
             None => return Err(TypedCallReject::ArgNotRepresentable(i)),
-            Some(TypedCallSrc::Imm(v)) => {
-                if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
-                    return Err(TypedCallReject::ImmTooWide(i));
-                }
-                MachOperand::Imm(*v)
-            }
+            Some(TypedCallSrc::Imm(v)) => MachOperand::Imm(*v),
             Some(TypedCallSrc::Reg(r)) => {
                 // Defensive re-check of the emit-side gate: rax is the
                 // accumulator (not a stable home in this model), rbp is the
@@ -1186,6 +1199,51 @@ pub fn build_typed_call(
             dst_reg,
             size,
         });
+    }
+    // Callee staging for indirect targets: exactly one extra move with the
+    // same edge semantics as an argument move. The destination is r10/r11,
+    // which no argument move ever writes (arguments go to ABI registers
+    // only), so the only ordering edges are: readers of the target register
+    // before the staging, and writers of the staging's source home after
+    // the staging — both handled by the shared topological rule below.
+    if let Some((callee_src, target_reg)) = callee {
+        let src = match callee_src {
+            TypedCallSrc::Imm(v) => Some(MachOperand::Imm(v)),
+            TypedCallSrc::Reg(r) if r == target_reg => {
+                // Self-move: the callee pointer already sits in the
+                // target register; no staging move.
+                None
+            }
+            TypedCallSrc::Reg(r) => {
+                // A callee homed in an ABI argument register is still
+                // stageable: the staging reads it before any argument
+                // move writes that register (topological rule).
+                Some(MachOperand::Reg(MachReg::Phys(r)))
+            }
+            TypedCallSrc::Slot(off) => Some(MachOperand::StackSlot(off)),
+            TypedCallSrc::AllocaAddr(id) => {
+                // A callee pointer that is the address of a local
+                // (trampoline buffer). The pre-move reads no register, but
+                // it is hoisted before the caller-save spills (same as the
+                // argument-side pre-moves), so its destination register
+                // must not be read by any argument move — identical guard
+                // to the argument-side AllocaAddr.
+                let conflicts = args.iter().any(
+                    |other| matches!(other, Some(TypedCallSrc::Reg(r)) if *r == target_reg),
+                );
+                if conflicts {
+                    return Err(TypedCallReject::MoveCycle);
+                }
+                Some(MachOperand::AllocaAddr(id))
+            }
+        };
+        if let Some(src) = src {
+            pending.push(PendingMove {
+                src,
+                dst_reg: target_reg,
+                size: OpSize::S64,
+            });
+        }
     }
 
     // 2. Topologically order the moves. Precedence rule: for every register
@@ -1633,12 +1691,127 @@ fn lower_instruction_typed_inner(
             // move) or in a spill slot (two-move relay through the
             // pre-colored xmm0 scratch, which no allocator home can occupy),
             // and the address is a direct alloca slot or a GPR-held pointer.
-            // Everything else -- GPR-homed values, constants, xmm-based
-            // pointers, indexed/folded GEP addressing, F128/x87 -- keeps the
-            // mature emitter.
+            // Everything else -- GPR-homed values, xmm-based pointers,
+            // indexed/folded GEP addressing, F128/x87 -- keeps the mature
+            // emitter. Float CONSTANTS have their own branch below: routing
+            // an opaque bit pattern through the xmm domain would be pure
+            // overhead.
             if matches!(ty, IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64) {
                 if *seg_override != AddressSpace::Default {
                     return false;
+                }
+                // ── Float-constant stores: the immediate-form frontier ──
+                //
+                // The value's bit pattern IS the data; there is nothing to
+                // compute, so materializing it in the xmm domain (the mature
+                // path's xorps / rodata-pool `movss .LCn(%rip), %xmm0` + SSE
+                // store) spends a register, a pool entry and a load on
+                // nothing. The integer immediate forms are strictly better
+                // and strictly sound — a float store is a bit-exact move:
+                //
+                //   F32/D32:      `movl $bits, mem`          — ONE instruction;
+                //                 every 32-bit pattern is a valid imm32
+                //                 operand (C7 /0 id sign-extends, the store
+                //                 writes the full 32 bits). GCC/Clang/ICX all
+                //                 use the 2-instruction pool-load form for
+                //                 non-zero constants.
+                //   F64/D64 == 0: `movq $0, mem`            — ONE instruction
+                //                 (sign-extended imm32 writes all 8 bytes);
+                //                 beats the oracle xorps+movsd pair. The
+                //                 bit pattern decides, not the float value:
+                //                 -0.0 is NOT zero (its high half is set).
+                //   F64/D64 fits i32 (as i64, sign-extended):
+                //                 `movq $imm32, mem`       — ONE instruction
+                //                 for -0.0, small denormals, 0xNNNNNNNN_
+                //                 FFFFFFFF patterns.
+                //   otherwise:    two `movl $lo / $hi, mem` halves — equal
+                //                 instruction count to the oracle pool form
+                //                 but no rodata entry, no load, no xmm
+                //                 dependency; the two stores cover exactly
+                //                 the bytes the one wide store covered.
+                //
+                // Destination subset is the same as the value path: direct
+                // alloca slot or GPR-held pointer (StackSlot(slot+4) and
+                // Mem{base, off+4} resolve to the upper half under both the
+                // rbp and rsp addressing modes — the offset arithmetic is
+                // frame-mode independent).
+                if let Operand::Const(c) = val {
+                    let (bits64, width32): (u64, bool) = match c {
+                        IrConst::F32(v) => (v.to_bits() as u64, true),
+                        IrConst::D32(v) => (*v as u64, true),
+                        IrConst::F64(v) => (v.to_bits(), false),
+                        IrConst::D64(v) => (*v, false),
+                        _ => return false,
+                    };
+                    let dst = if let Some(&slot) = alloca_slots.get(&ptr.0) {
+                        MachOperand::StackSlot(slot)
+                    } else if let Some(&base) = ra.get(&ptr.0) {
+                        if is_xmm_phys(base) {
+                            return false;
+                        }
+                        MachOperand::Mem {
+                            base: MachReg::Phys(base),
+                            offset: 0,
+                        }
+                    } else {
+                        return false;
+                    };
+                    if width32 {
+                        out.push(MachInst::Mov {
+                            src: MachOperand::Imm(bits64 as i32 as i64),
+                            dst,
+                            size: OpSize::S32,
+                        });
+                        return true;
+                    }
+                    if bits64 == 0 {
+                        out.push(MachInst::Mov {
+                            src: MachOperand::Imm(0),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                        return true;
+                    }
+                    let as_i64 = bits64 as i64;
+                    if as_i64 >= i32::MIN as i64 && as_i64 <= i32::MAX as i64 {
+                        out.push(MachInst::Mov {
+                            src: MachOperand::Imm(as_i64),
+                            dst,
+                            size: OpSize::S64,
+                        });
+                        return true;
+                    }
+                    // Both halves MUST be spelled as sign-extended imm32
+                    // (`as i32`): the C7 /0 id store form takes a 32-bit
+                    // operand and writes exactly 32 bits. Spelling the raw
+                    // u32 (e.g. hi half 0xE0000000 as 4294443008) would
+                    // leave the imm32 window, and the emitter's wide-
+                    // immediate relay is a 64-bit store — it would clobber
+                    // the 4 bytes after the slot (caught by fp_arith's
+                    // NaN-constant store at -O2).
+                    let (lo, hi) = (
+                        bits64 as u32 as i32 as i64,
+                        (bits64 >> 32) as u32 as i32 as i64,
+                    );
+                    let dst_hi = match dst {
+                        MachOperand::StackSlot(slot) => MachOperand::StackSlot(slot + 4),
+                        MachOperand::Mem { base, offset } => MachOperand::Mem {
+                            base,
+                            offset: offset + 4,
+                        },
+                        _ => return false,
+                    };
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Imm(lo),
+                        dst,
+                        size: OpSize::S32,
+                    });
+                    out.push(MachInst::Mov {
+                        src: MachOperand::Imm(hi),
+                        dst: dst_hi,
+                        size: OpSize::S32,
+                    });
+                    return true;
                 }
                 let Operand::Value(val_v) = val else {
                     return false;

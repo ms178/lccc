@@ -27,7 +27,12 @@ REPO=${LCCC_REPO:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
 LCCC=${LCCC_BIN:-$REPO/target/fastbuild/lccc}
 GCC=${GCC_BIN:-gcc}
 FIRST=${1:-1}
-LAST=${2:-20}
+# Default range 1..45: the pre-existing -O2 VLA-store miscompile documented in
+# engineering/BUG-2026-09-03-O2-vla-store-miscompile.md (seed 32) is FIXED
+# (wide-imm memory-relay operand-size hardening), so the gate now covers the
+# range that used to expose it.  Verified 720/720 across seeds 1..45 at
+# -O1/-O2/-O3/-Os in all four layout configurations.
+LAST=${2:-45}
 shift 2 2>/dev/null || true
 OPTS=${*:-"-O1 -O2 -O3 -Os"}
 

@@ -1559,6 +1559,13 @@ pub(super) fn hoist_repeated_fp_constant_loads(
             }
         }
     }
+    // A line whose token scanner reports the same symbol twice (rmw spell
+    // variants) must count as ONE use: the "at least two rewritten uses"
+    // threshold counts distinct lines.  Sites are pushed in ascending line
+    // order, so adjacent duplicates dedup in place.
+    for (_, sites) in uses.iter_mut() {
+        sites.dedup();
+    }
 
     let mut changed = false;
     for (sym, sites) in uses.iter().filter(|(_, s)| s.len() >= 2) {
@@ -1589,11 +1596,25 @@ pub(super) fn hoist_repeated_fp_constant_loads(
             continue;
         }
 
+        // Materialization width: `movss` for a symbol used only by
+        // single-precision ops (an exact 4-byte pool read, zero-extending
+        // into the register), `movsd` as soon as any double-precision site
+        // needs the full 8 bytes.  Mnemonics are never touched by the
+        // rewrite below, so reading them off the live store is exact.
+        let any_double = sites.iter().any(|&k| {
+            store
+                .get(k)
+                .trim()
+                .split_once(' ')
+                .is_some_and(|(op, _)| op.ends_with("sd"))
+        });
+        let load_op = if any_double { "movsd" } else { "movss" };
+
         replace_line(
             store,
             &mut infos[slot],
             slot,
-            format!("    movsd {}(%rip), {}", sym, reg),
+            format!("    {} {}(%rip), {}", load_op, sym, reg),
         );
         let tok = format!("{}(%rip)", sym);
         for &k in sites {
@@ -1642,23 +1663,57 @@ fn is_xmm0_zeroing(t: &str) -> bool {
 }
 
 /// True when `t` unconditionally overwrites `reg` (its last operand) from
-/// sources that do not include `reg`: the scalar/vector mov families and
-/// the self-xor zeroings.  Anything else (ALU/FMA/cvt forms) READS the
-/// register even when it also writes it, so it does not redefine it.
+/// sources that do not include `reg`: the full-width mov families, the
+/// zero-extending narrow movs, and the self-xor zeroings.  Anything else
+/// (ALU/FMA/cvt forms) READS the register even when it also writes it, so
+/// it does not redefine it.
+///
+/// MERGE-WRITE RULE (red-team fix, PR #359 follow-up): the scalar move
+/// forms `movsd`/`movss`/`vmovsd`/`vmovss` with a REGISTER source write
+/// only the low element and PRESERVE the remaining bits of the destination
+/// (SDM: MOVSD/MOVSS 128-bit legacy and VEX forms merge).  Those preserved
+/// bits may have been defined by the very load a fold deletes — a
+/// memory-source scalar load zeroes bits above the element — so treating a
+/// reg-reg scalar move as a full overwrite let the load-folding passes
+/// delete a load whose zeroed high half was still observable through the
+/// merge chain (`vmovsd %xmm12, %xmm11` followed by a packed
+/// `vmovapd %xmm11, ...`).  Reg-reg scalar moves are therefore NOT
+/// overwrites; only their memory-source forms are.  VEX-encoded xor keeps
+/// the full self-xor spelling (`vxorpd %r, %r, %r`) as an overwrite.
 fn is_pure_xmm_overwrite(t: &str, reg: &str) -> bool {
     let t = t.trim();
     for z in ["xorpd", "xorps", "pxor", "vxorpd", "vxorps", "vpxor"] {
         if let Some(rest) = t.strip_prefix(z) {
-            if rest.trim_start() == format!("{}, {}", reg, reg) {
+            let rest = rest.trim_start();
+            if rest == format!("{}, {}", reg, reg)
+                || rest == format!("{}, {}, {}", reg, reg, reg)
+            {
                 return true;
             }
         }
     }
-    const MOVS: &[&str] = &[
-        "vmovsd ", "vmovss ", "movsd ", "movss ", "vmovapd ", "vmovaps ", "movapd ", "movaps ",
-        "vmovdqa ", "vmovdqu ", "movdqa ", "movdqu ", "vmovd ", "vmovq ", "movd ", "movq ",
+    // Scalar merge forms: only the memory-source spelling defines the whole
+    // register (upper bits zeroed); the register-source spelling merges.
+    const MERGE_MOVS: &[&str] = &["vmovsd ", "vmovss ", "movsd ", "movss "];
+    for m in MERGE_MOVS {
+        if let Some(rest) = t.strip_prefix(m) {
+            if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
+                if dst.trim() == reg
+                    && mentions_token(srcs, reg) == 0
+                    && !srcs.trim_start().starts_with('%')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    // Full-width packed and zero-extending narrow forms define the whole
+    // register from any source.
+    const FULL_MOVS: &[&str] = &[
+        "vmovapd ", "vmovaps ", "movapd ", "movaps ", "vmovdqa ", "vmovdqu ", "movdqa ", "movdqu ",
+        "vmovd ", "vmovq ", "movd ", "movq ",
     ];
-    for m in MOVS {
+    for m in FULL_MOVS {
         if let Some(rest) = t.strip_prefix(m) {
             if let Some((srcs, dst)) = rest.trim().rsplit_once(',') {
                 if dst.trim() == reg && mentions_token(srcs, reg) == 0 {
@@ -2301,6 +2356,22 @@ mod fma_mem_fold_tests {
         assert!(!changed, "movhpd leaves the low lane untouched");
     }
 
+    /// RED-TEAM REGRESSION (PR #359 follow-up): the three-mention scan must
+    /// apply the same merge-write rule as the two-mention proof — a reg-reg
+    /// scalar `vmovsd` past load+consumer is NOT a full overwrite (it
+    /// preserves the high bits the deleted load zeroed).
+    #[test]
+    fn refuses_reg_reg_scalar_movsd_merge_after_consumer() {
+        let (changed, _) = run(
+            "    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vfmadd231sd %xmm11, %xmm10, %xmm2\n\
+             \x20   vmovsd %xmm12, %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n",
+        );
+        assert!(!changed, "merge write preserves high bits from the deleted load");
+    }
+
     /// dest == loaded register means the FMA line mentions it twice; the
     /// two-mention budget is exhausted, so the fold is refused (sound even
     /// though the rewrite would actually be valid).
@@ -2653,6 +2724,59 @@ mod fp_reg_load_tests {
         );
         assert!(!changed, "rmw reads the loaded value before writing");
     }
+
+    /// RED-TEAM REGRESSION (PR #359 follow-up): a reg-reg scalar `vmovsd`
+    /// is a MERGE write — it preserves bits 64:127 of the destination.
+    /// Here those preserved bits come from the load being deleted (a
+    /// memory-source `movsd` zeroes them), and the final packed `vmovapd`
+    /// observes them through the merge chain. Deleting the load therefore
+    /// changes observable state; the fold must be refused.
+    #[test]
+    fn refuses_when_next_mention_is_reg_reg_scalar_movsd_merge() {
+        let (changed, _) = run(
+            "    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
+             \x20   vmovsd %xmm12, %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n",
+        );
+        assert!(
+            !changed,
+            "reg-reg vmovsd preserves the high half — not a full overwrite"
+        );
+    }
+
+    /// Same shape, single-precision: a reg-reg `movss` merges bits 32:127.
+    #[test]
+    fn refuses_when_next_mention_is_reg_reg_scalar_movss_merge() {
+        let (changed, _) = run(
+            "    movaps %xmm9, %xmm11\n\
+             \x20   movss 32(%rsi), %xmm11\n\
+             \x20   vmulss %xmm11, %xmm2, %xmm2\n\
+             \x20   movss %xmm12, %xmm11\n\
+             \x20   movaps %xmm11, %xmm5\n",
+        );
+        assert!(!changed, "reg-reg movss merges bits 32:127 — not an overwrite");
+    }
+
+    /// Memory-source scalar moves DO define the full register (the upper
+    /// bits are zeroed), so the accept side of the refinement is preserved
+    /// even with a packed read after the merge.
+    #[test]
+    fn folds_when_next_mention_is_memory_source_scalar_movsd() {
+        let (changed, out) = run(
+            "    movapd %xmm9, %xmm11\n\
+             \x20   movsd 32(%rsi), %xmm11\n\
+             \x20   vmulsd %xmm11, %xmm2, %xmm2\n\
+             \x20   movsd 40(%rdi), %xmm11\n\
+             \x20   vmovapd %xmm11, %xmm5\n",
+        );
+        assert!(
+            changed,
+            "memory-source movsd zeroes the high half: full overwrite"
+        );
+        assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2805,5 +2929,40 @@ mod fp_const_hoist_tests {
         );
         assert!(changed, "still hoists with another register");
         assert_eq!(out[0], "movsd .LCFP_0(%rip), %xmm1", "xmm0 is claimed by the dead line: {out:?}");
+    }
+
+    /// RED-TEAM REGRESSION (PR #359 follow-up): one rmw line mentions the
+    /// token twice (`vaddsd .LCFP_0(%rip), %xmm2, %xmm2`); the site list
+    /// must be deduplicated so a SINGLE rewritten line does not pass the
+    /// "at least two rewritten uses" threshold — hoisting there keeps the
+    /// static instruction count identical and adds a dynamic pool load.
+    #[test]
+    fn refuses_single_use_line_mentioned_twice() {
+        let (changed, _) = run(
+            "    movsd (%rdi), %xmm2\n\
+             \x20   vaddsd .LCFP_0(%rip), %xmm2, %xmm2\n",
+            &[0],
+        );
+        assert!(!changed, "one distinct use line is below the >=2 threshold");
+    }
+
+    /// Single-precision-only sites materialize with `movss` (an exact
+    /// 4-byte pool read); any double-precision site keeps `movsd`.
+    #[test]
+    fn materializes_movss_for_single_precision_sites() {
+        let (changed, out) = run(
+            "    movss (%rdi), %xmm2\n\
+             \x20   movss (%rsi), %xmm3\n\
+             \x20   vmulss %xmm3, %xmm2, %xmm2\n\
+             \x20   vaddss .LCFP_0(%rip), %xmm2, %xmm2\n\
+             \x20   vaddss .LCFP_0(%rip), %xmm4, %xmm4\n",
+            &[1],
+        );
+        assert!(changed, "two constant reads must hoist");
+        assert_eq!(
+            out[1],
+            "movss .LCFP_0(%rip), %xmm0",
+            "single-precision pool read: {out:?}"
+        );
     }
 }

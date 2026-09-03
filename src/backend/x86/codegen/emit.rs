@@ -626,7 +626,7 @@ fn machinst_kind_bit(inst: &crate::ir::reexports::Instruction) -> u32 {
         Instruction::Select { .. } => MI_SELECT,
         Instruction::GetElementPtr { .. } => MI_GEP,
         Instruction::Alloca { .. } => MI_ALLOCA,
-        Instruction::Call { .. } => MI_CALL_TYPED,
+        Instruction::Call { .. } | Instruction::CallIndirect { .. } => MI_CALL_TYPED,
         _ => 0,
     }
 }
@@ -3600,9 +3600,6 @@ fn collect_vregs_in_inst(
             use_reg(dst, all);
             def_reg(dst, all, defs);
         }
-        MachInst::CallIndirect { reg, .. } => {
-            use_reg(reg, all);
-        }
         _ => {}
     }
 }
@@ -3955,7 +3952,6 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
             check_op(src) || check_reg(dst)
         }
         MachInst::Cmov { src, dst, .. } => check_op(src) || check_reg(dst),
-        MachInst::CallIndirect { reg, .. } => check_reg(reg),
         _ => false,
     }
 }
@@ -4158,12 +4154,13 @@ impl X86Codegen {
     fn try_lower_call_typed(
         &mut self,
         inst: &crate::ir::reexports::Instruction,
-        func: &str,
+        direct_sym: Option<&str>,
+        func_ptr: Option<&crate::ir::reexports::Operand>,
         info: &crate::ir::reexports::CallInfo,
         folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
     ) -> bool {
-        use super::isel::{build_typed_call, TypedCallSrc};
-        use super::machinst::{CallArgMove, MachInst, MachOperand, MachReg, OpSize};
+        use super::isel::{build_typed_call, build_typed_call_ex, TypedCallSrc};
+        use super::machinst::{CallArgMove, CallTarget, MachInst, MachOperand, MachReg, OpSize};
 
         let _ = folded_global_addrs; // subset needs no fold-map interaction
 
@@ -4172,13 +4169,17 @@ impl X86Codegen {
         }
         // Inline fixed-size memcpy/__memcpy_chk must keep winning over any
         // call sequence (dispatch-loop interception, mirrored gate).
-        if crate::backend::generation::inline_memcpy_len(func, &info.args, info.is_variadic)
+        if crate::backend::generation::inline_memcpy_len(direct_sym.unwrap_or(""), &info.args, info.is_variadic)
             .is_some()
         {
             return false;
         }
-        // Direct named target, non-variadic, no sret.
-        if func.is_empty() || info.is_variadic || info.is_sret {
+        // Non-variadic, no sret. Direct calls need a named symbol; indirect
+        // calls are admitted through the callee-pointer resolution below.
+        if info.is_variadic || info.is_sret {
+            return false;
+        }
+        if direct_sym.is_none() && func_ptr.is_none() {
             return false;
         }
         // No struct/by-value aggregates (the classification would leave the
@@ -4269,11 +4270,78 @@ impl X86Codegen {
             }
         };
 
-        let plan = match build_typed_call(&arg_srcs, &arg_sizes, ret_plan) {
-            Ok(p) => p,
-            Err(reason) => {
-                super::isel::stats::note_reject_named(reason.label());
+        // Decide the call form and build the move plan together.
+        //
+        // Direct target: symbol naming mirrors emit_call_instruction_impl —
+        // versioned symbols use the base name in @PLT references (GAS 2.47
+        // rejects `sym@ver@PLT`; the linker resolves the version).
+        //
+        // Indirect target: the callee pointer is staged into a scratch
+        // register by one of the instruction's own moves (see
+        // build_typed_call_ex). Candidate registers are r10 then r11 —
+        // never ABI argument registers, so no argument move can write
+        // them. Under an EXTERNAL retpoline thunk the call form is
+        // `call __x86_indirect_thunk_r10`, whose name encodes the register
+        // and whose patching contract the mature path owns: reject the
+        // typed path for indirect calls in both thunk modes instead of
+        // approximating it. The paravirt fast-path (callee resolves to
+        // global+offset) must likewise keep the mature path: it emits the
+        // patchable `call *sym+off(%rip)` the kernel alternatives
+        // machinery rewrites at boot.
+        let (plan, target): (super::isel::TypedCallPlan, CallTarget) = if let Some(sym) =
+            direct_sym
+        {
+            let target = if self.state.needs_plt(sym) {
+                let n = sym.split('@').next().unwrap_or(sym);
+                CallTarget::Direct(format!("{}@PLT", n))
+            } else {
+                CallTarget::Direct(sym.to_string())
+            };
+            match build_typed_call(&arg_srcs, &arg_sizes, ret_plan) {
+                Ok(p) => (p, target),
+                Err(reason) => {
+                    super::isel::stats::note_reject_named(reason.label());
+                    return false;
+                }
+            }
+        } else {
+            let fp = func_ptr.expect("indirect call without func_ptr");
+            if self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline {
                 return false;
+            }
+            if self.try_resolve_indirect_call_global(fp).is_some() {
+                return false; // patchable `call *sym(%rip)` form is load-bearing
+            }
+            let callee_src = match arg_src(fp) {
+                Some(s) => s,
+                None => {
+                    // Accumulator-homed callees are the dominant shape here
+                    // (a GOT load with no allocator home leaves the pointer
+                    // in %rax and the mature path relays it into r10).
+                    // Visible rejection, not a silent fallback: the census
+                    // must rank this or the next round cannot target it.
+                    super::isel::stats::note_reject_named("CallIndirect(callee-unrepresentable)");
+                    return false;
+                }
+            };
+            let mut built: Option<(super::isel::TypedCallPlan, CallTarget)> = None;
+            for candidate in [super::machinst::R10, super::machinst::R11] {
+                if let Ok(p) =
+                    build_typed_call_ex(&arg_srcs, &arg_sizes, ret_plan, Some((callee_src, candidate)))
+                {
+                    built = Some((p, CallTarget::Indirect(candidate)));
+                    break;
+                }
+            }
+            match built {
+                Some(pair) => pair,
+                None => {
+                    // Both scratch candidates dead (e.g. a register-exchange
+                    // cycle involving r10 and r11): the text path owns the
+                    // hazard-spill machinery for that shape.
+                    super::isel::stats::note_reject_named("CallIndirect(no-scratch)");
+                    return false;
+                }
             }
         };
 
@@ -4288,16 +4356,6 @@ impl X86Codegen {
                 }
             }
         }
-
-        // Target naming mirrors emit_call_instruction_impl: versioned
-        // symbols use the base name in @PLT references (GAS 2.47 rejects
-        // `sym@ver@PLT`; the linker resolves the version).
-        let target = if self.state.needs_plt(func) {
-            let n = func.split('@').next().unwrap_or(func);
-            format!("{}@PLT", n)
-        } else {
-            func.to_string()
-        };
 
         // Split alloca-address arguments into pre-moves. The pre-move
         // writes the ABI register BEFORE the caller-save spills run, so a
@@ -4495,14 +4553,19 @@ impl ArchCodegen for X86Codegen {
             return false;
         }
 
-        // Typed direct calls (CallTyped): the SysV integer-register subset
-        // lowered as one atomic machine instruction. Everything else —
-        // variadic/sret/struct/i128/F128 calls, stack-overflow arguments,
-        // register-exchange hazard cycles, inline-memcpy candidates — keeps
-        // the mature path, which owns the general contract. See
+        // Typed calls (CallTyped): the SysV integer-register subset — direct
+        // AND indirect — lowered as one atomic machine instruction. Indirect
+        // calls stage the callee pointer into r10/r11 inside the same move
+        // list. Everything else — variadic/sret/struct/i128/F128 calls,
+        // stack-overflow arguments, register-exchange hazard cycles, inline-
+        // memcpy candidates, retpoline/paravirt indirect forms — keeps the
+        // mature path, which owns the general contract. See
         // try_lower_call_typed for the full admission contract.
         if let crate::ir::reexports::Instruction::Call { func, info } = inst {
-            return self.try_lower_call_typed(inst, func, info, folded_global_addrs);
+            return self.try_lower_call_typed(inst, Some(func), None, info, folded_global_addrs);
+        }
+        if let crate::ir::reexports::Instruction::CallIndirect { func_ptr, info } = inst {
+            return self.try_lower_call_typed(inst, None, Some(func_ptr), info, folded_global_addrs);
         }
 
         // Div/rem pair heads and tails must stay on the classic emitter path:

@@ -75,6 +75,19 @@ pub struct CallRetMove {
     pub size: OpSize,
 }
 
+/// The call form of a [`MachInst::CallTyped`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallTarget {
+    /// `call sym` — the symbol string with PLT/version decoration already
+    /// applied by the lowering.
+    Direct(String),
+    /// `call *%reg` — the callee pointer was staged into `reg` by one of
+    /// the instruction's own argument moves (or already lived there).
+    /// The register is never an ABI argument register (r10/r11 only), so
+    /// no argument move can clobber it after its staging.
+    Indirect(PhysReg),
+}
+
 /// Shift operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftOp {
@@ -326,10 +339,11 @@ pub enum MachInst {
         target: String,
     },
 
-    /// Fully typed direct call — the SysV integer-register-call contract as
-    /// ONE machine instruction, the way an MIR `CALL` or a Cranelift
-    /// `call` instruction models it: declared clobbers, declared uses,
-    /// atomic under the replay fallback.
+    /// Fully typed call — the SysV integer-register-call contract as ONE
+    /// machine instruction, the way an MIR `CALL` or a Cranelift `call`
+    /// instruction models it: declared clobbers, declared uses, atomic
+    /// under the replay fallback. Direct and indirect targets share the
+    /// contract; only the final call form differs ([`CallTarget`]).
     ///
     /// Emission order (all stages are part of this instruction):
     ///   1. `caller_saves`: spill every caller-saved register that holds a
@@ -338,14 +352,26 @@ pub enum MachInst {
     ///      path's Phase 2b consumes, at the call's program point.
     ///   2. `args`: one move per register argument, placing its (already
     ///      resolved) source into the SysV integer argument register.
-    ///      Sources are GPR homes, spill-slot reads, or imm32 immediates;
+    ///      Sources are GPR homes, spill-slot reads, or 64-bit immediates;
     ///      a zero immediate emits as `xorl reg, reg` (3 bytes vs 7, the
-    ///      GCC/Clang/ICC form). The moves are execution-ordered by the
-    ///      lowering so no source is clobbered by an earlier move's
-    ///      destination; register-exchange cycles never reach this
-    ///      variant (they are rejected to the text path, which owns the
-    ///      hazard-spill area machinery).
-    ///   3. `call target` — PLT/version decoration is baked into `target`.
+    ///      GCC/Clang/ICC form) and an immediate outside the sign-extended
+    ///      imm32 window emits as `movabsq imm, reg` (the only sound way to
+    ///      name a full 64-bit constant — inline truncation is not an
+    ///      option and GAS rejects the raw operand). For an indirect call,
+    ///      the callee-pointer staging move (`slot → %r10`) is part of this
+    ///      same ordered list, so the topological reader-before-writer rule
+    ///      protects its source against every argument move for free.
+    ///      The moves are execution-ordered by the lowering so no source is
+    ///      clobbered by an earlier move's destination; register-exchange
+    ///      cycles never reach this variant (they are rejected to the text
+    ///      path, which owns the hazard-spill area machinery).
+    ///   3. the call itself — `call target` for a direct target (PLT and
+    ///      version decoration baked into the symbol), `call *%reg` for an
+    ///      indirect one. Under an external retpoline thunk the register is
+    ///      pinned to r10 (the thunk symbol encodes the register:
+    ///      `__x86_indirect_thunk_r10`); the emit-side gate refuses any
+    ///      other register in that mode rather than emitting an unpatchable
+    ///      call shape.
     ///   4. `ret`: copy rax to the return value's home (register or slot).
     ///      None for void calls.
     ///   5. `caller_saves` again, reversed direction: restore each spilled
@@ -353,31 +379,31 @@ pub enum MachInst {
     ///
     /// Declared clobbers: the six SysV integer argument registers, rax,
     /// rdx, r8-r11 and every xmm — the full caller-clobber set. Declared
-    /// uses: the argument sources (all read before any clobber) and the
-    /// spill slots (memory, not registers). Because the lowering flushes
-    /// the buffer immediately around the call run, no allocated vreg can
-    /// coexist with this instruction — the pre-colored argument/return
-    /// registers are therefore conflict-free by construction.
+    /// uses: the argument sources, the callee-pointer staging source (all
+    /// read before any clobber) and the spill slots (memory, not
+    /// registers). Because the lowering flushes the buffer immediately
+    /// around the call run, no allocated vreg can coexist with this
+    /// instruction — the pre-colored argument/return registers are
+    /// therefore conflict-free by construction.
     ///
     /// The subset that may reach this variant (enforced twice — emit-side
-    /// gate and builder): direct call to a named symbol, non-variadic, no
-    /// sret/struct/i128/F128/x87 arguments, at most six integer/pointer
-    /// arguments of width 4 or 8, integer or pointer return. Everything
-    /// else stays on the mature path, which owns the general contract.
+    /// gate and builder): non-variadic, no sret/struct/i128/F128/x87
+    /// arguments, at most six integer/pointer arguments of width 4 or 8,
+    /// integer or pointer return; the target is a named symbol (direct) or
+    /// a GPR/slot-homed pointer value (indirect, staged into r10/r11).
+    /// Everything else stays on the mature path, which owns the general
+    /// contract, the paravirt patchable `call *sym(%rip)` form and the
+    /// hazard-spill machinery.
     CallTyped {
         /// (register, spill slot offset) pairs saved before / restored after.
         caller_saves: Vec<(PhysReg, i64)>,
-        /// Register-argument moves in execution order.
+        /// Register-argument moves in execution order (indirect callee
+        /// staging included, see above).
         args: Vec<CallArgMove>,
-        /// Direct call target (PLT decoration already applied).
-        target: String,
+        /// Call target: direct symbol or indirect register.
+        target: CallTarget,
         /// Return-value home: rax is copied here after the call.
         ret: Option<CallRetMove>,
-    },
-
-    /// Indirect function call: `call *%reg`. Clobbers caller-saved regs.
-    CallIndirect {
-        reg: MachReg,
     },
 
     /// Return: `ret`.

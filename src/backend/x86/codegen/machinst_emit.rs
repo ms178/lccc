@@ -392,15 +392,28 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 }
             }
             // Large immediates (>i32): use movabsq for register dest,
-            // or relay through rax for memory dest.
+            // or relay through rax for memory dest. The relay's store
+            // honors the OPERAND size: a 64-bit immediate with an S32
+            // destination must store 4 bytes (`movl %eax`), never the
+            // 8-byte `movq %rax` — the wide-imm memory relay predates the
+            // float-const lowering, where an S32 half-store with a
+            // sign-bit-set immediate (hi half 0xE0000000) would otherwise
+            // clobber the 4 bytes after the destination (fp_arith, -O2).
+            // Typed IR never produces a legitimate wide S8/S16/S32 store,
+            // but the emitter defines the behavior instead of trusting it.
             if let MachOperand::Imm(v) = src {
                 if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
                     if let MachOperand::Reg(MachReg::Phys(r)) = dst {
                         out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(*r)));
                     } else {
-                        // movq $large_imm, mem needs rax relay
                         out.emit_fmt(format_args!("    movabsq ${}, %rax", v));
-                        out.emit_fmt(format_args!("    movq %rax, {}", dst_str));
+                        let rax = sized_reg_name(RAX, *size);
+                        out.emit_fmt(format_args!(
+                            "    mov{} %{}, {}",
+                            suffix,
+                            rax,
+                            dst_str
+                        ));
                     }
                     return;
                 }
@@ -832,6 +845,16 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 ));
             }
             // Phase 2: argument moves in the lowering's execution order.
+            // Immediate-width contract: 0 → xorl (3 bytes, full-register
+            // zero, the GCC/Clang/ICC form); inside the sign-extended imm32
+            // window → the regular mov; outside it → movabsq into the
+            // destination register itself. A 64-bit constant cannot be
+            // named by an inline mov operand (GAS: "operand type mismatch")
+            // and truncating it would be a silent miscompile — staging it
+            // through the destination register is both the shortest and the
+            // only sound form. The move reads nothing, so it is a pure
+            // writer in the lowering's topological order: every move that
+            // reads this argument register executes before it.
             for m in args {
                 match &m.src {
                     // Zero immediate: `xorl` zeroes the full register
@@ -840,6 +863,15 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     MachOperand::Imm(0) => {
                         let r = fmt_reg(&MachReg::Phys(m.dst_reg), OpSize::S32);
                         out.emit_fmt(format_args!("    xorl {}, {}", r, r));
+                    }
+                    MachOperand::Imm(v)
+                        if *v < i32::MIN as i64 || *v > i32::MAX as i64 =>
+                    {
+                        out.emit_fmt(format_args!(
+                            "    movabsq ${}, %{}",
+                            v,
+                            reg_name(m.dst_reg)
+                        ));
                     }
                     _ => out.emit_fmt(format_args!(
                         "    mov{} {}, {}",
@@ -850,7 +882,13 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                 }
             }
             // Phase 3: the call itself.
-            out.emit_fmt(format_args!("    call {}", target));
+            match target {
+                CallTarget::Direct(sym) => out.emit_fmt(format_args!("    call {}", sym)),
+                CallTarget::Indirect(reg) => out.emit_fmt(format_args!(
+                    "    call *%{}",
+                    reg_name(*reg)
+                )),
+            }
             // Phase 4: return home.
             if let Some(r) = ret {
                 out.emit_fmt(format_args!(
@@ -868,11 +906,6 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     fmt_reg(&MachReg::Phys(*reg), OpSize::S64)
                 ));
             }
-        }
-
-        MachInst::CallIndirect { reg } => {
-            let reg_str = fmt_reg(reg, OpSize::S64);
-            out.emit_fmt(format_args!("    call *{}", reg_str));
         }
 
         MachInst::LeaSym { sym, dst } => {
