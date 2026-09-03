@@ -232,6 +232,63 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
             continue;
         }
 
+        // ── Cost model (session 30, measured ──────────────────────────────
+        //
+        // `sum2' = sum2 + N*adler + Σ (N-i)*b[i]` replaces N dependent adds
+        // with 2N+2 mostly-independent ops (one shift/mul and one add per
+        // term) and, worse for a backend without instruction scheduling,
+        // keeps all N byte terms AND all N weighted terms live to the splice
+        // point. It wins only when the loop-carried recurrence — not issue
+        // throughput — is the binding constraint.
+        //
+        // Both accumulator phis advance by a single 1-cycle add per
+        // iteration, so the inter-iteration critical path is ~2 cycles and an
+        // out-of-order core overlaps iterations freely: with a 4-wide
+        // machine any body of >= ~8 ops is already throughput-bound. The pass
+        // requires N >= 4, which guarantees a body of at least 4 loads +
+        // 8 adds — i.e. exactly the throughput-bound regime.
+        //
+        // Measured on the source-unrolled zlib DO8 loop (1 MiB x 30, -O2,
+        // see k_adler32_do8 / scripts/bench_kernels.py):
+        //
+        //     N     insns on/off     runtime on/off
+        //     4      75 / 58          21.7 / 10.2 ms
+        //     8     106 / 70          18.7 / 11.1 ms
+        //    16     169 / 94          20.3 / 10.5 ms
+        //
+        // The closed form is a uniform ~1.9x slowdown and +30..80% code size
+        // on its own flagship pattern, so the rewrite is gated on a real
+        // cycle estimate instead of being applied unconditionally. Set
+        // CCC_REASSOC_ACCUM_FORCE=1 to bypass the model (research / targets
+        // where the recurrence, not throughput, dominates).
+        if !force_reassoc_accum() {
+            let width: usize = if crate::common::types::target_is_32bit() {
+                3
+            } else {
+                4
+            };
+            let body_ops = func.blocks[body_block].instructions.len();
+            // N removed adds, N*(shift|mul) + N adds + 2 spliced back in.
+            let ops_after = body_ops + n + 2;
+            // Loop-carried critical path: both phis are one 1-cycle add.
+            let recurrence = 2usize;
+            let cycles_before = recurrence.max(body_ops / width);
+            let cycles_after = recurrence.max(ops_after / width);
+            if cycles_after >= cycles_before {
+                continue;
+            }
+            // Peak register pressure: N byte terms + N weighted terms +
+            // the s1/s2/pointer/counter quartet must coexist at the splice.
+            let usable = if crate::common::types::target_is_32bit() {
+                6usize
+            } else {
+                12usize
+            };
+            if 2 * n + 4 > usable {
+                continue;
+            }
+        }
+
         if rewrite_sum2_chain(func, body_block, &chain, adler0, sum2_0, sum2_n, ty) {
             changes += 1;
         }
@@ -370,4 +427,11 @@ fn rewrite_sum2_chain(
     block.instructions = new_insts;
     func.next_value_id = next_id;
     true
+}
+
+/// `CCC_REASSOC_ACCUM_FORCE=1` bypasses the cost model above. Kept so the
+/// transform stays reachable for targets (in-order cores, long-latency
+/// accumulator operations) where the throughput/latency trade-off inverts.
+fn force_reassoc_accum() -> bool {
+    std::env::var_os("CCC_REASSOC_ACCUM_FORCE").is_some()
 }
