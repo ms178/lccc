@@ -139,6 +139,16 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
                 did = true;
                 break;
             }
+            // The linear flattener needs trip ≥ 2; a single-trip tiny loop
+            // (the last row of a triangular nest once the outer loop is
+            // straightened, or `for (i = n-1; i < n; i++)` after inlining)
+            // is deleted by the general cloner instead of surviving as a
+            // rolled loop with a compare, two phis and a back-edge.
+            if try_complete_unroll_general(func, lp, &cfg, 1..=1) {
+                count += 1;
+                did = true;
+                break;
+            }
         }
         if !did {
             // General shape: prefer SMALL bodies (innermost-first), but any
@@ -156,7 +166,7 @@ pub(crate) fn unroll_loops(func: &mut IrFunction) -> usize {
                     .sum::<usize>()
             });
             for lp in &general {
-                if try_complete_unroll_general(func, lp, &cfg) {
+                if try_complete_unroll_general(func, lp, &cfg, 1..=16) {
                     count += 1;
                     did = true;
                     break;
@@ -502,8 +512,12 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   header's CondBranch; every body block's successors stay inside
 ///   body ∪ {header}; body terminators are Branch/CondBranch/Switch only.
 /// - constant IV init (after const-chain resolution) and constant limit,
-///   trip in 2..=16, and (header non-phi + body) instructions × trip within
-///   the expansion budget.
+///   trip inside `trip_range` (callers pass `1..=16`; a trip of exactly 1
+///   deletes the loop — header phis become copies of their init values, the
+///   latch falls through to the exit — with zero code growth, which is what
+///   the last row of a triangular nest `for (j = i+1; j < n; …)` becomes
+///   after the outer loop is straightened), and (header non-phi + body)
+///   instructions × trip within the expansion budget.
 /// - no calls / inline asm / dynamic allocas in body or header; intrinsics
 ///   only when pure (sqrt/FMA-class loop bodies stay eligible — the nbody
 ///   `advance`/`energy` shapes).
@@ -527,59 +541,189 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   uses of carried phis with the last clone's corresponding value; the exit
 ///   block's phi edges from the header label are relabeled to the last
 ///   clone's latch (the block that now branches to the exit).
-/// Exact static trip count for a constant-stride IV loop, or `None` when the
-/// stride is degenerate (0) or its sign contradicts the exit comparison
-/// (e.g. a negative step against `i < limit`), which would mean the loop
-/// never terminates or never runs past the guard.
+/// Fixed-width integer types whose constants the unroller can reason about
+/// exactly.  `Ptr`, the 128-bit types and non-integers are excluded: their
+/// canonical `IrConst` representation is target- or width-dependent and the
+/// closed-form trip arithmetic below would silently lose bits.
+fn is_fixed_width_int(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I8
+            | IrType::U8
+            | IrType::I16
+            | IrType::U16
+            | IrType::I32
+            | IrType::U32
+            | IrType::I64
+            | IrType::U64
+    )
+}
+
+/// Bring an i64 into the canonical `IrConst::to_i64()` representation of a
+/// value of type `ty` — sign-extended for signed types, zero-extended for
+/// unsigned ones.  This is exactly the convention the frontend and constant
+/// folder use (`IrConst::from_i64(v, ty).to_i64()`), so every value the
+/// unroller derives by folding is bit-for-bit what the rest of the pipeline
+/// would have produced.  Any other narrowing (e.g. `x as i32 as i64` for a
+/// U32) turns `0xFFFFFFF9` into `-7`, and a trip count computed from `-7`
+/// unrolls a loop that never executes.
+fn normalize_to_type(v: i64, ty: IrType) -> Option<i64> {
+    if !is_fixed_width_int(ty) {
+        return None;
+    }
+    IrConst::from_i64(v, ty).to_i64()
+}
+
+/// Ordering comparisons that read their operands as unsigned.
+fn cmp_is_unsigned(op: IrCmpOp) -> bool {
+    matches!(op, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge)
+}
+
+/// `a OP b`  ⇔  `b MIRROR(OP) a`.
+fn mirror_cmp(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Slt,
+        IrCmpOp::Sle => IrCmpOp::Sge,
+        IrCmpOp::Sge => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ult,
+        IrCmpOp::Ule => IrCmpOp::Uge,
+        IrCmpOp::Uge => IrCmpOp::Ule,
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+    }
+}
+
+/// `!(a OP b)`  ⇔  `a NEGATE(OP) b`  (total order on integers).
+fn negate_cmp(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Slt => IrCmpOp::Sge,
+        IrCmpOp::Sge => IrCmpOp::Slt,
+        IrCmpOp::Sle => IrCmpOp::Sgt,
+        IrCmpOp::Sgt => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Uge,
+        IrCmpOp::Uge => IrCmpOp::Ult,
+        IrCmpOp::Ule => IrCmpOp::Ugt,
+        IrCmpOp::Ugt => IrCmpOp::Ule,
+        IrCmpOp::Eq => IrCmpOp::Ne,
+        IrCmpOp::Ne => IrCmpOp::Eq,
+    }
+}
+
+/// Rewrite the header's exit compare into the canonical "continue while
+/// `iv OP limit`" form that the trip-count arithmetic assumes.
 ///
-/// Complete unrolling needs the EXACT count up front — there is no cleanup
-/// loop — so every arm is closed-form:
-///   * `i <  limit`, step > 0: ceil((limit - init) / step)
-///   * `i <= limit`, step > 0: floor((limit - init) / step) + 1
-///   * `i >  limit`, step < 0: ceil((init - limit) / -step)
-///   * `i >= limit`, step < 0: floor((init - limit) / -step) + 1
-/// The ceil forms are exact for non-divisible spans because the exit test
-/// runs every stride; the floor+1 forms count the last in-range iteration.
-/// Non-positive spans (loop body never executes) yield `None`, matching the
-/// pre-existing step-1 guards. For step == 1 this reduces to the historical
-/// arithmetic verbatim.
-fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64) -> Option<i64> {
+/// [`find_exit_condition`] reports the compare exactly as written: the IV may
+/// be the RIGHT operand (`limit > i`) and the CondBranch may send `true` to
+/// the EXIT (`for (;;) { if (i >= n) break; … }` or `!(i >= n)` guards).
+/// Feeding the raw operator into the closed form in either case computes the
+/// trip count of a different loop.  Both call sites of
+/// [`complete_unroll_trip`] go through this normalisation.
+fn canonical_continue_cmp(op: IrCmpOp, iv_is_lhs: bool, exit_cond_positive: bool) -> IrCmpOp {
+    let op = if iv_is_lhs { op } else { mirror_cmp(op) };
+    if exit_cond_positive {
+        negate_cmp(op)
+    } else {
+        op
+    }
+}
+
+/// Exact static trip count of a constant-stride counted loop
+/// `for (iv = init; iv OP limit; iv += step)` whose IV has type `iv_ty`, or
+/// `None` whenever the count cannot be established EXACTLY.  Complete
+/// unrolling has no cleanup loop, so an off-by-anything here is a miscompile,
+/// and every arm is closed-form and checked:
+///
+///   * `iv <  limit`, step > 0: ceil((limit - init) / step)
+///   * `iv <= limit`, step > 0: floor((limit - init) / step) + 1
+///   * `iv >  limit`, step < 0: ceil((init - limit) / -step)
+///   * `iv >= limit`, step < 0: floor((init - limit) / -step) + 1
+///   * `iv != limit`          : (limit - init) / step when step divides the
+///                              span exactly and the walk moves TOWARDS the
+///                              limit; anything else wraps around the type
+///                              first and is refused.
+///
+/// The arithmetic is done in i128 in the comparison's own value domain:
+/// `init` and `limit` are first normalised to `iv_ty`'s canonical constant
+/// representation and then read as unsigned (for `Ult`/`Ule`/`Ugt`/`Uge`) or
+/// signed values.  A U64 constant such as `0xFFFF_FFFF_FFFF_FFF9` is stored as
+/// a negative i64 by `IrConst`; read as signed it is "less than 4" and a
+/// signed-only closed form unrolls ten iterations of a loop that never runs.
+///
+/// Finally every IV value the unrolled iterations will observe —
+/// `init + k*step` for `k = 0..=trip`, including the value the last exit test
+/// sees — must be representable in `iv_ty` without wrapping.  Narrow IVs
+/// with strides > 1 (`unsigned char i = 250; i < 255; i += 3`) wrap past the
+/// limit and keep looping; the closed form would report 2 trips for a loop
+/// that executes 87.  A wrap is refused, not modelled: such loops are never
+/// worth unrolling.
+///
+/// Mismatched signedness between the operator and the IV type is refused
+/// outright (the frontend never emits it; anything that does is not a shape
+/// this pass has evidence for).
+fn complete_unroll_trip(
+    iv_init: i64,
+    limit: i64,
+    cmp_op: IrCmpOp,
+    iv_step: i64,
+    iv_ty: IrType,
+) -> Option<i64> {
     if iv_step == 0 {
         return None; // non-advancing IV: infinite or empty; not a trip count
     }
-    // All intermediates use checked arithmetic.  `limit - iv_init` wraps for
-    // extreme constant pairs (e.g. limit = i64::MAX, iv_init = -1) and
-    // `-iv_step` wraps for iv_step = i64::MIN; a wrapped span would yield a
-    // nonsensical trip count, so bail and leave the loop rolled.
-    let ascending = iv_step > 0;
-    let step_abs = iv_step.checked_abs()?;
-    let trip = match cmp_op {
+    let init = normalize_to_type(iv_init, iv_ty)?;
+    let limit = normalize_to_type(limit, iv_ty)?;
+
+    // Value domain of the comparison.
+    let unsigned = match cmp_op {
+        IrCmpOp::Eq | IrCmpOp::Ne => iv_ty.is_unsigned(),
+        op => {
+            let u = cmp_is_unsigned(op);
+            if u != iv_ty.is_unsigned() {
+                return None;
+            }
+            u
+        }
+    };
+    let to_domain = |v: i64| -> i128 {
+        if unsigned {
+            (v as u64) as i128
+        } else {
+            v as i128
+        }
+    };
+    let (init_d, limit_d) = (to_domain(init), to_domain(limit));
+    let step = iv_step as i128;
+    let ascending = step > 0;
+    let step_abs = step.abs();
+
+    let trip: i128 = match cmp_op {
         IrCmpOp::Slt | IrCmpOp::Ult => {
             if !ascending {
                 return None;
             }
-            let span = limit.checked_sub(iv_init)?;
+            let span = limit_d - init_d;
             if span <= 0 {
                 return None;
             }
-            // ceil(span / step), overflow-free for span >= 1
-            (span - 1) / step_abs + 1
+            (span - 1) / step_abs + 1 // ceil(span / step)
         }
         IrCmpOp::Sle | IrCmpOp::Ule => {
             if !ascending {
                 return None;
             }
-            let span = limit.checked_sub(iv_init)?;
+            let span = limit_d - init_d;
             if span < 0 {
                 return None;
             }
-            (span / step_abs).checked_add(1)?
+            span / step_abs + 1
         }
         IrCmpOp::Sgt | IrCmpOp::Ugt => {
             if ascending {
                 return None;
             }
-            let span = iv_init.checked_sub(limit)?;
+            let span = init_d - limit_d;
             if span <= 0 {
                 return None;
             }
@@ -589,21 +733,42 @@ fn complete_unroll_trip(iv_init: i64, limit: i64, cmp_op: IrCmpOp, iv_step: i64)
             if ascending {
                 return None;
             }
-            let span = iv_init.checked_sub(limit)?;
+            let span = init_d - limit_d;
             if span < 0 {
                 return None;
             }
-            (span / step_abs).checked_add(1)?
+            span / step_abs + 1
         }
-        _ => return None,
+        IrCmpOp::Ne => {
+            let span = limit_d - init_d;
+            if span == 0 || (span > 0) != ascending || span % step != 0 {
+                return None;
+            }
+            span / step
+        }
+        IrCmpOp::Eq => return None,
     };
-    Some(trip)
+
+    // Every observed IV value — including the one the final exit test sees —
+    // must stay inside `iv_ty` in this domain.
+    let bits = (iv_ty.size() * 8) as u32;
+    let (lo, hi): (i128, i128) = if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    };
+    let final_iv = init_d + trip * step;
+    if final_iv < lo || final_iv > hi {
+        return None;
+    }
+    i64::try_from(trip).ok()
 }
 
 fn try_complete_unroll_general(
     func: &mut IrFunction,
     lp: &loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
+    trip_range: std::ops::RangeInclusive<i64>,
 ) -> bool {
     let header = lp.header;
     let header_label = func.blocks[header].label;
@@ -681,11 +846,17 @@ fn try_complete_unroll_general(
     };
 
     // Exit from the header's CondBranch.
-    let Some((exit_target, body_entry, cmp_op, _cmp_ty, exit_limit, _iv_is_lhs, _pos)) =
+    let Some((exit_target, body_entry, raw_cmp_op, cmp_ty, exit_limit, iv_is_lhs, exit_pos)) =
         find_exit_condition(func, header, &lp.body, iv_phi)
     else {
         return false;
     };
+    // The compare must be in the IV's own type, and its operator is put into
+    // the canonical "continue while iv OP limit" form before any arithmetic.
+    if cmp_ty != iv_ty {
+        return false;
+    }
+    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_pos);
 
     // Constant init (through const chains) and constant limit.
     let mut iv_init_op: Option<Operand> = None;
@@ -711,7 +882,7 @@ fn try_complete_unroll_general(
     };
 
     // Trip count (same arithmetic as the two-block unroller).
-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
         return false;
     };
     // The post-loop IV may exceed i64 even when the trip count is small
@@ -724,7 +895,7 @@ fn try_complete_unroll_general(
     else {
         return false;
     };
-    if !(2..=16).contains(&trip) {
+    if !trip_range.contains(&trip) {
         return false;
     }
 
@@ -1036,8 +1207,17 @@ fn try_complete_unroll_general(
     // Iteration 0 keeps the original header + body. The header's terminator
     // becomes an unconditional Branch into the body entry.
     func.blocks[header].terminator = Terminator::Branch(body_entry);
-    // The original latch's back-edge flows into clone 1's header copy.
-    func.blocks[latch].terminator = Terminator::Branch(plans[0].header_copy);
+    // The original latch's back-edge flows into clone 1's header copy — or
+    // straight to the exit when the loop runs exactly once (no clones).
+    func.blocks[latch].terminator = Terminator::Branch(match plans.first() {
+        Some(first) => first.header_copy,
+        None => exit_target,
+    });
+    if num_clones == 0 {
+        // No clone ever renamed the carried values: the original body's
+        // back-edge definitions ARE the final values.
+        final_carried = carried.iter().map(|&(phi_id, _, back)| (phi_id, back)).collect();
+    }
 
     // Outside uses: IV → final constant; carried phis → final clone values.
     let final_iv = Operand::Const(IrConst::from_i64(final_iv_n, iv_ty));
@@ -1064,10 +1244,13 @@ fn try_complete_unroll_general(
     // exit target).
     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
         if exit_bi != header && !lp.body.contains(&exit_bi) {
-            let last_latch_label = plans[num_clones - 1].block_labels[body_blocks
-                .iter()
-                .position(|&b| b == latch)
-                .expect("latch is a body block")];
+            let last_latch_label = match plans.last() {
+                Some(last) => last.block_labels[body_blocks
+                    .iter()
+                    .position(|&b| b == latch)
+                    .expect("latch is a body block")],
+                None => latch_label,
+            };
             for inst in &mut func.blocks[exit_bi].instructions {
                 if let Instruction::Phi { incoming, .. } = inst {
                     for (_, lbl) in incoming.iter_mut() {
@@ -1140,15 +1323,19 @@ fn try_complete_unroll_two_block(
     let Some((
         exit_target,
         body_entry,
-        cmp_op,
-        _cmp_ty,
+        raw_cmp_op,
+        cmp_ty,
         exit_limit,
-        _iv_is_lhs,
+        iv_is_lhs,
         exit_cond_positive,
     )) = find_exit_condition(func, header, &lp.body, iv_phi)
     else {
         return false;
     };
+    if cmp_ty != iv_ty {
+        return false;
+    }
+    let cmp_op = canonical_continue_cmp(raw_cmp_op, iv_is_lhs, exit_cond_positive);
     // work_blocks: instructions to clone each iteration (excluding IV increment).
     // 2-block: work lives in the latch (body_entry == latch).
     // 3-block: header -> body_entry (one work block) -> latch (IV incr only) -> header.
@@ -1172,33 +1359,33 @@ fn try_complete_unroll_two_block(
         }
         vec![bi, latch]
     };
-    // Constant IV init from preheader.
-    let mut iv_init: Option<i64> = None;
+    // Constant IV init from the preheader edge.  Resolved through the same
+    // const-chain evaluator as the general cloner so that a 2–3 block inner
+    // loop whose init became `Add(const, const)` after an outer complete
+    // unroll is handled in the SAME fixpoint round instead of waiting for a
+    // later folding pass (or never, when unroll is the last loop pass).
+    let mut iv_init_op: Option<Operand> = None;
     for inst in &func.blocks[header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
             if dest.0 == iv_phi.0 {
                 for (op, lbl) in incoming {
                     if *lbl != latch_label {
-                        iv_init = match op {
-                            Operand::Const(c) => c.to_i64(),
-                            _ => None,
-                        };
+                        iv_init_op = Some(op.clone());
                     }
                 }
             }
         }
     }
-    let Some(iv_init) = iv_init else {
+    let Some(iv_init_op) = iv_init_op else {
         return false;
     };
-    let limit_n: i64 = match &exit_limit {
-        Operand::Const(c) => match c.to_i64() {
-            Some(n) => n,
-            None => return false,
-        },
-        _ => return false,
+    let Some(iv_init) = resolve_const_operand(func, &iv_init_op, 0) else {
+        return false;
     };
-    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step) else {
+    let Some(limit_n) = resolve_const_operand(func, &exit_limit, 0) else {
+        return false;
+    };
+    let Some(trip) = complete_unroll_trip(iv_init, limit_n, cmp_op, iv_step, iv_ty) else {
         return false;
     };
     // The post-loop IV may exceed i64 even when the trip count is small
@@ -1415,7 +1602,7 @@ fn try_complete_unroll_two_block(
     // emitted `xorl %eax,%eax` — i.e. a miscompile.  Marking the block
     // `Unreachable` states the truth; DCE/CFG-simplify then delete it.
     func.blocks[latch].terminator = Terminator::Unreachable;
-    let _ = (body_entry, exit_cond_positive);
+    let _ = body_entry;
 
     // Repair the exit block's phis.  The `header -> exit_target` edge is gone
     // (the header now branches into the clone chain); the block that reaches
@@ -1656,6 +1843,18 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
     false
 }
 
+/// Evaluate `op` to a constant when it is a constant or a short chain of
+/// `Copy` / integer `Cast` / `Add` / `Sub` / `Mul` over constants — the shape
+/// an inner loop's `j = i + 1` init takes once the outer loop has been
+/// completely unrolled and `i` substituted by a per-clone constant.
+///
+/// Every intermediate result is normalised to the canonical `IrConst`
+/// representation of the instruction's result type via
+/// [`normalize_to_type`], so unsigned arithmetic zero-extends and narrowing
+/// casts truncate exactly as the constant folder would.  Values are only ever
+/// compared by [`complete_unroll_trip`] after a second normalisation to the
+/// IV type, which makes the whole chain representation-stable regardless of
+/// which pass produced the constants.
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
     if depth > 6 {
         return None;
@@ -1682,34 +1881,48 @@ fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Optio
                     from_ty,
                     to_ty,
                     ..
-                } if from_ty.is_integer()
-                    && to_ty.is_integer()
-                    && from_ty.size() <= to_ty.size() =>
-                {
-                    resolve_const_operand(func, src, depth + 1)
+                } if is_fixed_width_int(*from_ty) && is_fixed_width_int(*to_ty) => {
+                    // The source value is already in `from_ty`'s canonical
+                    // form (sign- or zero-extended to i64 per its own
+                    // signedness), so widening is the identity and narrowing
+                    // is a truncation into `to_ty` — both are exactly
+                    // `normalize_to_type`.
+                    let v = resolve_const_operand(func, src, depth + 1)?;
+                    let v = normalize_to_type(v, *from_ty)?;
+                    normalize_to_type(v, *to_ty)
                 }
                 Instruction::BinOp {
                     op, lhs, rhs, ty, ..
-                } if ty.is_integer() => {
+                } if is_fixed_width_int(*ty) => {
                     let l = resolve_const_operand(func, lhs, depth + 1)?;
                     let r = resolve_const_operand(func, rhs, depth + 1)?;
-                    let narrow = |x: i64| -> i64 {
-                        if ty.size() <= 4 {
-                            x as i32 as i64
-                        } else {
-                            x
-                        }
+                    let raw = match op {
+                        IrBinOp::Add => l.wrapping_add(r),
+                        IrBinOp::Sub => l.wrapping_sub(r),
+                        IrBinOp::Mul => l.wrapping_mul(r),
+                        _ => return None,
                     };
-                    match op {
-                        IrBinOp::Add => Some(narrow(l.wrapping_add(r))),
-                        IrBinOp::Sub => Some(narrow(l.wrapping_sub(r))),
-                        IrBinOp::Mul => Some(narrow(l.wrapping_mul(r))),
-                        _ => None,
-                    }
+                    normalize_to_type(raw, *ty)
                 }
                 _ => None,
             }
         }
+    }
+}
+
+/// Read a step constant of IV type `ty` as a SIGNED stride.  Unsigned IR
+/// constants are stored zero-extended (`IrConst::I64(0xFFFFFFFE)` for a U32
+/// `-2`); sign-extending them at the IV's width recovers the arithmetic
+/// stride so that `for (unsigned i = n; i != 0; i += -2)` and `i -= 2` are
+/// recognised as the same countdown.
+fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
+    let raw = c.to_i64()?;
+    match ty {
+        IrType::I8 | IrType::U8 => Some(raw as u8 as i8 as i64),
+        IrType::I16 | IrType::U16 => Some(raw as u16 as i16 as i64),
+        IrType::I32 | IrType::U32 => Some(raw as u32 as i32 as i64),
+        IrType::I64 | IrType::U64 => Some(raw),
+        _ => None,
     }
 }
 
@@ -1738,29 +1951,42 @@ fn find_iv_in_loop(
             });
         let back_val = back_val?;
 
-        // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
-        // in the latch that produces `back_val`.
+        // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
+        // or `Sub(phi_dest, const_step)` in the latch that produces
+        // `back_val`.  `i -= k` lowers to a `Sub` — the countdown-loop
+        // idiom of every decompressor and hash routine — and is the same
+        // basic IV with step `-k`.  The step is expressed as a signed i64 of
+        // the IV's width: `Sub(phi, 2)` on a U32 is the additive step
+        // `0xFFFFFFFE`, i.e. `-2`, and every consumer (the closed-form trip
+        // count, the per-clone `init + t*step` constants and the partial
+        // unroller's `Add(iv, step)` checks) re-materialises it through
+        // `IrConst::from_i64(step, iv_ty)`, so the two-complement identity
+        // `x - k == x + (-k)` holds bit-exactly for every fixed-width type.
         let phi_id = phi_dest.0;
         for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
-            if let Instruction::BinOp {
-                dest,
-                op: IrBinOp::Add,
-                lhs,
-                rhs,
-                ..
+            let Instruction::BinOp {
+                dest, op, lhs, rhs, ..
             } = latch_inst
-            {
-                if *dest != back_val {
-                    continue;
+            else {
+                continue;
+            };
+            if *dest != back_val {
+                continue;
+            }
+            let step = match (op, lhs, rhs) {
+                (IrBinOp::Add, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
+                    signed_step(*c, *ty)
                 }
-                let step = match (lhs, rhs) {
-                    (Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),
-                    (Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),
-                    _ => None,
-                };
-                if let Some(step) = step {
-                    return Some((*phi_dest, *ty, step, idx));
+                (IrBinOp::Add, Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => {
+                    signed_step(*c, *ty)
                 }
+                (IrBinOp::Sub, Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => {
+                    signed_step(*c, *ty).and_then(i64::checked_neg)
+                }
+                _ => None,
+            };
+            if let Some(step) = step {
+                return Some((*phi_dest, *ty, step, idx));
             }
         }
     }
@@ -2610,6 +2836,12 @@ mod tests {
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, BasicBlock, BlockId, IrConst, Value};
 
+    /// Historical truth table entry point: the closed form on a signed
+    /// 64-bit IV (the domain the pre-typed arithmetic implicitly assumed).
+    fn trip_i64(init: i64, limit: i64, op: IrCmpOp, step: i64) -> Option<i64> {
+        complete_unroll_trip(init, limit, op, step, IrType::I64)
+    }
+
     /// Build a simple counting loop:
     ///   preheader → header → body → latch → (back to header) / exit
     ///
@@ -3444,62 +3676,62 @@ mod tests {
     fn unroll_trip_step_one_matches_historical_arithmetic() {
         use crate::ir::reexports::IrCmpOp::*;
         // i < 8, step 1  → 8 trips (classic 0..8).
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 1), Some(8));
+        assert_eq!(trip_i64(0, 8, Slt, 1), Some(8));
         // i <= 7, step 1 → 8 trips.
-        assert_eq!(complete_unroll_trip(0, 7, Sle, 1), Some(8));
+        assert_eq!(trip_i64(0, 7, Sle, 1), Some(8));
         // Non-zero init.
-        assert_eq!(complete_unroll_trip(3, 8, Slt, 1), Some(5));
+        assert_eq!(trip_i64(3, 8, Slt, 1), Some(5));
         // Empty / inverted spans stay rejected (pre-existing guards).
-        assert_eq!(complete_unroll_trip(8, 8, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(9, 8, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(8, 7, Sle, 1), None);
+        assert_eq!(trip_i64(8, 8, Slt, 1), None);
+        assert_eq!(trip_i64(9, 8, Slt, 1), None);
+        assert_eq!(trip_i64(8, 7, Sle, 1), None);
     }
 
     #[test]
     fn unroll_trip_positive_strides() {
         use crate::ir::reexports::IrCmpOp::*;
         // dot8's shape: i < 8, i += 4 → exactly 2 trips.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 4), Some(2));
+        assert_eq!(trip_i64(0, 8, Slt, 4), Some(2));
         // Non-divisible Slt: ceil. i < 10, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 10, Slt, 3), Some(4));
+        assert_eq!(trip_i64(0, 10, Slt, 3), Some(4));
         // Odd limit: i < 7, i += 2 → 0,2,4,6 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 7, Slt, 2), Some(4));
+        assert_eq!(trip_i64(0, 7, Slt, 2), Some(4));
         // Sle floor+1: i <= 9, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 9, Sle, 3), Some(4));
+        assert_eq!(trip_i64(0, 9, Sle, 3), Some(4));
         // Sle non-divisible: i <= 10, i += 3 → 0,3,6,9 → 4 trips.
-        assert_eq!(complete_unroll_trip(0, 10, Sle, 3), Some(4));
+        assert_eq!(trip_i64(0, 10, Sle, 3), Some(4));
         // Single iteration: i < 5, i += 5 → 1 (callers reject trip < 2).
-        assert_eq!(complete_unroll_trip(0, 5, Slt, 5), Some(1));
+        assert_eq!(trip_i64(0, 5, Slt, 5), Some(1));
         // Non-zero init with stride: i = 2; i < 11; i += 3 → 2,5,8 → 3.
-        assert_eq!(complete_unroll_trip(2, 11, Slt, 3), Some(3));
+        assert_eq!(trip_i64(2, 11, Slt, 3), Some(3));
     }
 
     #[test]
     fn unroll_trip_negative_strides_countdown() {
         use crate::ir::reexports::IrCmpOp::*;
         // for (i = 10; i > 0; i -= 2) → 10,8,6,4,2 → 5 trips.
-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -2), Some(5));
+        assert_eq!(trip_i64(10, 0, Sgt, -2), Some(5));
         // Non-divisible countdown: i > 0, i -= 3 → 10,7,4,1 → 4 (ceil).
-        assert_eq!(complete_unroll_trip(10, 0, Sgt, -3), Some(4));
+        assert_eq!(trip_i64(10, 0, Sgt, -3), Some(4));
         // Sge floor+1: i >= 0, i -= 3 → 9,6,3,0 → 4 trips.
-        assert_eq!(complete_unroll_trip(9, 0, Sge, -3), Some(4));
+        assert_eq!(trip_i64(9, 0, Sge, -3), Some(4));
         // Empty countdown.
-        assert_eq!(complete_unroll_trip(0, 0, Sgt, -1), None);
+        assert_eq!(trip_i64(0, 0, Sgt, -1), None);
     }
 
     #[test]
     fn unroll_trip_rejects_degenerate_shapes() {
         use crate::ir::reexports::IrCmpOp::*;
         // Zero stride: infinite loop, no trip count.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, 0), None);
+        assert_eq!(trip_i64(0, 8, Slt, 0), None);
         // Sign/stride contradictions: a negative stride against an
         // ascending comparison diverges (or wraps); must be refused.
-        assert_eq!(complete_unroll_trip(0, 8, Slt, -1), None);
-        assert_eq!(complete_unroll_trip(0, 8, Sle, -4), None);
-        assert_eq!(complete_unroll_trip(8, 0, Sgt, 1), None);
-        assert_eq!(complete_unroll_trip(8, 0, Sge, 2), None);
+        assert_eq!(trip_i64(0, 8, Slt, -1), None);
+        assert_eq!(trip_i64(0, 8, Sle, -4), None);
+        assert_eq!(trip_i64(8, 0, Sgt, 1), None);
+        assert_eq!(trip_i64(8, 0, Sge, 2), None);
         // Equality-style comparisons carry no ordering: refused.
-        assert_eq!(complete_unroll_trip(0, 8, Eq, 1), None);
+        assert_eq!(trip_i64(0, 8, Eq, 1), None);
     }
 
     #[test]
@@ -3507,37 +3739,35 @@ mod tests {
         use crate::ir::reexports::IrCmpOp::*;
         // `limit - iv_init` overflows i64 (MAX - (-1)); the checked span
         // must refuse rather than produce a wrapped trip count.
-        assert_eq!(complete_unroll_trip(-1, i64::MAX, Slt, 1), None);
-        assert_eq!(complete_unroll_trip(i64::MIN, 0, Sgt, -1), None);
+        assert_eq!(trip_i64(-1, i64::MAX, Slt, 1), None);
+        assert_eq!(trip_i64(i64::MIN, 0, Sgt, -1), None);
         // `-iv_step` overflows for iv_step = i64::MIN; checked_abs refuses.
-        assert_eq!(complete_unroll_trip(0, i64::MIN, Sgt, i64::MIN), None);
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, i64::MIN), None);
-        // Representable but huge: 0, 2^62 < MAX → 2 trips.  (The cloner's
-        // checked final IV then refuses to substitute 2^63; see below.)
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Slt, 1 << 62), Some(2));
+        assert_eq!(trip_i64(0, i64::MIN, Sgt, i64::MIN), None);
+        assert_eq!(trip_i64(0, i64::MAX, Slt, i64::MIN), None);
+        // Huge stride: 0, 2^62 are < MAX (2 body executions) but the exit
+        // test would then observe 2^63, which is not an i64.  The typed
+        // closed form refuses up front — previously the cloner's checked
+        // final-IV guard was the only thing standing between this shape and
+        // a wrapped substituted constant.
+        assert_eq!(trip_i64(0, i64::MAX, Slt, 1 << 62), None);
         // Sle at the top of the range: span/step + 1 would be MAX + 1.
-        assert_eq!(complete_unroll_trip(0, i64::MAX, Sle, 1), None);
+        assert_eq!(trip_i64(0, i64::MAX, Sle, 1), None);
         // Extremes that stay in range must still unroll.
         assert_eq!(
-            complete_unroll_trip(i64::MIN, i64::MIN + 8, Slt, 2),
+            trip_i64(i64::MIN, i64::MIN + 8, Slt, 2),
             Some(4)
         );
         assert_eq!(
-            complete_unroll_trip(i64::MAX, i64::MAX - 9, Sgt, -3),
+            trip_i64(i64::MAX, i64::MAX - 9, Sgt, -3),
             Some(3)
         );
-        assert_eq!(
-            complete_unroll_trip(i64::MAX - 6, i64::MAX, Sle, 3),
-            Some(3)
-        );
-        // The post-loop IV bound used by both cloners: final = init +
-        // trip * step must be computed with checked arithmetic (this mirrors
-        // the cloner-side guard; trip = 2, step = 2^62 → 2^63 overflows).
-        let trip = complete_unroll_trip(0, i64::MAX, Slt, 1 << 62).unwrap();
-        assert!((1i64 << 62)
-            .checked_mul(trip)
-            .and_then(|d| 0i64.checked_add(d))
-            .is_none());
+        // `i <= MAX` with stride 3 from MAX-6 executes for MAX-6, MAX-3,
+        // MAX and then increments PAST the type: the exit test never sees
+        // an in-range value, so the loop has no static trip (UB in C, an
+        // infinite loop on hardware).  Refused.
+        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX, Sle, 3), None);
+        // One stride shorter it is a well-defined 2-trip loop again.
+        assert_eq!(trip_i64(i64::MAX - 6, i64::MAX - 3, Sle, 3), Some(2));
     }
 
     // The trip count above is representable (2), but the post-loop IV
@@ -3702,7 +3932,7 @@ mod tests {
                                 Some(old)
                             })
                             .count() as i64;
-                        let closed = complete_unroll_trip(init, limit, op, step);
+                        let closed = trip_i64(init, limit, op, step);
                         if simulated == 0 {
                             assert!(
                                 closed.is_none(),
@@ -3733,7 +3963,7 @@ mod tests {
                                 Some(old)
                             })
                             .count() as i64;
-                        let closed = complete_unroll_trip(init, limit, op, step);
+                        let closed = trip_i64(init, limit, op, step);
                         if simulated == 0 {
                             assert!(
                                 closed.is_none(),
