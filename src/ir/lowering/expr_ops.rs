@@ -1031,14 +1031,13 @@ impl Lowerer {
             );
         }
 
-        let mut then_ty = self.get_expr_type(then_expr);
-        let mut else_ty = self.get_expr_type(else_expr);
-        if self.expr_is_pointer(then_expr) {
-            then_ty = IrType::Ptr;
-        }
-        if self.expr_is_pointer(else_expr) {
-            else_ty = IrType::Ptr;
-        }
+        // Arm types follow C semantics (ternary_arm_type), not storage types:
+        // get_expr_type() reports the target-int (I64 on LP64) storage type for
+        // integer literals even though C `int`/`unsigned` literals are 32-bit
+        // values. Merging on storage types would widen an int ternary that has
+        // a constant arm to I64.
+        let then_ty = self.ternary_arm_type(then_expr);
+        let else_ty = self.ternary_arm_type(else_expr);
         let common_ty = Self::common_type(then_ty, else_ty);
 
         // Detect struct-typed ternary where branches produce inconsistent
@@ -1121,8 +1120,8 @@ impl Lowerer {
     /// The "then" value is the condition value itself (evaluated once).
     pub(super) fn lower_gnu_conditional(&mut self, cond: &Expr, else_expr: &Expr) -> Operand {
         let cond_val = self.lower_expr(cond);
-        let cond_ty = self.get_expr_type(cond);
-        let else_ty = self.get_expr_type(else_expr);
+        let cond_ty = self.ternary_arm_type(cond);
+        let else_ty = self.ternary_arm_type(else_expr);
 
         // Complex types always lower to Ptr; avoid type mismatch with function
         // call return types (e.g., F64 for packed _Complex float).
@@ -1176,6 +1175,80 @@ impl Lowerer {
         )
     }
 
+    /// C-semantic type of an expression when used as a ternary/branch arm.
+    ///
+    /// get_expr_type() reports the *storage* type, which is the target int
+    /// (I64 on LP64) for integer literals even though C `int`/`unsigned`
+    /// literals are 32-bit values. A ternary that merges such a literal with
+    /// a 32-bit operand would otherwise promote the whole result to I64 and
+    /// force 64-bit cmovs/selects. When the arm's C type is a 32-bit integer
+    /// but its storage is 64-bit, report the C type so the merged (common)
+    /// type and resulting Select stay 32-bit. Pointer arms report Ptr.
+    pub(super) fn ternary_arm_type(&self, e: &Expr) -> IrType {
+        if self.expr_is_pointer(e) {
+            return IrType::Ptr;
+        }
+        let ty = self.get_expr_type(e);
+        match self.expr_ctype(e) {
+            CType::Int if ty == IrType::I64 => IrType::I32,
+            CType::UInt if ty == IrType::I64 || ty == IrType::U64 => IrType::U32,
+            _ => ty,
+        }
+    }
+
+    /// Store an arm value into a ternary merge slot, narrowing integer
+    /// constants to the slot type first.
+    ///
+    /// Integer literals are lowered with the target-int (I64 on LP64)
+    /// representation regardless of C type, so a constant arm stored into a
+    /// natural-width (e.g. I32) slot would carry an I64 constant unless it is
+    /// narrowed here. narrowing keeps mem2reg's Phi, and therefore the
+    /// Select/cmov, at the natural width.
+    fn emit_ternary_merge_store(&mut self, val: Operand, ptr: Value, ty: IrType) {
+        let val = match val {
+            Operand::Const(c) if ty.is_integer() => Operand::Const(c.narrowed_to(ty)),
+            other => other,
+        };
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr,
+            ty,
+            seg_override: AddressSpace::Default,
+        });
+    }
+
+    /// Choose the stack-slot (merge) type for a conditional-expression alloca.
+    ///
+    /// The slot type becomes the mem2reg phi type, which in turn becomes the
+    /// Select type the backend lowers to a cmov/move. Forcing every narrow
+    /// scalar through the target-int (I64-on-LP64) slot made `int` conditionals
+    /// materialize as I64 selects — 64-bit cmovs/moves plus redundant
+    /// widen/narrow Cast pairs around the select — whereas C `int` is 4 bytes
+    /// and GCC/Clang/ICX keep such selects 32-bit. Keeping the exact scalar
+    /// type for register-int widths mirrors the i686 path (where `int` already
+    /// maps to the 4-byte target int), so LP64 `int` selects stay I32.
+    /// Unchanged: >8-byte aggregates (I128/F128/vectors), floats (carried by
+    /// bit pattern), and sub-int types (I8/I16 keep their historical widening).
+    fn ternary_merge_slot(result_ty: IrType) -> (IrType, usize) {
+        let int_ty = crate::common::types::target_int_ir_type();
+        let int_size = int_ty.size();
+        if result_ty.size() > int_size {
+            // Wide aggregates: keep the exact (large) type for store/load width.
+            (result_ty, result_ty.size())
+        } else if result_ty.is_integer()
+            && (result_ty.size() == 4 || result_ty.size() == int_size)
+        {
+            // `int` / target-width scalar integers: exact type. On LP64 this is
+            // the I32 case (I64 already equals int_ty); on i686 both coincide
+            // with prior behavior.
+            (result_ty, result_ty.size())
+        } else {
+            // Floats, sub-int types, pointers: historical target-int slot.
+            (int_ty, result_ty.size().max(int_size))
+        }
+    }
+
     /// Shared helper for ternary branch patterns (conditional and GNU conditional).
     /// Evaluates `then_fn` in the true branch and `else_fn` in the false branch,
     /// stores both results to an alloca, and returns the loaded result.
@@ -1190,14 +1263,7 @@ impl Lowerer {
     ) -> Operand {
         // Use emit_entry_alloca so the alloca is in the entry block, ensuring
         // mem2reg can promote it to SSA/Phi form.
-        let int_ty = crate::common::types::target_int_ir_type();
-        let min_alloca_size = int_ty.size();
-        let alloca_size = result_ty.size().max(min_alloca_size);
-        let alloca_ty = if result_ty.size() > min_alloca_size {
-            result_ty
-        } else {
-            int_ty
-        };
+        let (alloca_ty, alloca_size) = Self::ternary_merge_slot(result_ty);
         let result_alloca = self.emit_entry_alloca(alloca_ty, alloca_size, 0, false);
 
         let then_label = self.fresh_label();
@@ -1208,24 +1274,12 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = then_fn(self);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: then_val,
-            ptr: result_alloca,
-            ty: alloca_ty,
-            seg_override: AddressSpace::Default,
-        });
+        self.emit_ternary_merge_store(then_val, result_alloca, alloca_ty);
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(else_label);
         let else_val = else_fn(self);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: else_val,
-            ptr: result_alloca,
-            ty: alloca_ty,
-            seg_override: AddressSpace::Default,
-        });
+        self.emit_ternary_merge_store(else_val, result_alloca, alloca_ty);
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
@@ -1255,14 +1309,7 @@ impl Lowerer {
         //
         // Use the actual result type for the alloca size so that wider types like
         // long double (F128, 16 bytes) and __int128 are stored correctly.
-        let int_ty = crate::common::types::target_int_ir_type();
-        let min_alloca_size = int_ty.size();
-        let alloca_size = result_ty.size().max(min_alloca_size);
-        let alloca_ty = if result_ty.size() > min_alloca_size {
-            result_ty
-        } else {
-            int_ty
-        };
+        let (alloca_ty, alloca_size) = Self::ternary_merge_slot(result_ty);
         let result_alloca = self.emit_entry_alloca(alloca_ty, alloca_size, 0, false);
 
         let then_label = self.fresh_label();
@@ -1277,24 +1324,12 @@ impl Lowerer {
 
         self.start_block(then_label);
         let then_val = then_fn(self);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: then_val,
-            ptr: result_alloca,
-            ty: alloca_ty,
-            seg_override: AddressSpace::Default,
-        });
+        self.emit_ternary_merge_store(then_val, result_alloca, alloca_ty);
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(else_label);
         let else_val = else_fn(self);
-        self.emit(Instruction::Store {
-            volatile: false,
-            val: else_val,
-            ptr: result_alloca,
-            ty: alloca_ty,
-            seg_override: AddressSpace::Default,
-        });
+        self.emit_ternary_merge_store(else_val, result_alloca, alloca_ty);
         self.terminate(Terminator::Branch(end_label));
 
         self.start_block(end_label);
