@@ -1679,7 +1679,7 @@ fn lower_instruction_typed_inner(
             ptr,
             ty,
             seg_override,
-            ..
+            volatile,
         } => {
             if ty.is_128bit() || ty.is_long_double() {
                 return false;
@@ -1780,6 +1780,20 @@ fn lower_instruction_typed_inner(
                             size: OpSize::S64,
                         });
                         return true;
+                    }
+                    // A C `volatile` store is ONE abstract access to the
+                    // object (C11 5.1.2.3); splitting an 8-byte double into
+                    // two 4-byte stores makes a torn intermediate state
+                    // observable to a signal handler or a concurrent reader
+                    // that the abstract machine forbids. The single-instruction
+                    // immediate forms above (movl for F32/D32, movq $0 /
+                    // movq $imm32 for F64/D64 that fit) are each a single
+                    // access of the object's own width and stay allowed; only
+                    // the two-half split is refused for volatile destinations.
+                    // The mature path then emits the pool+movsd form (one
+                    // store), matching gcc/clang/icc.
+                    if *volatile {
+                        return false;
                     }
                     // Both halves MUST be spelled as sign-extended imm32
                     // (`as i32`): the C7 /0 id store form takes a 32-bit

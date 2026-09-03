@@ -20,6 +20,22 @@ use super::helpers::{
     get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
 };
 
+/// True when a line transfers control or merges paths, so that textual line
+/// order can diverge from execution order.  A load-value reader textually
+/// AFTER a "killing" pure overwrite may still be reached from the load
+/// without ever executing the overwrite when a branch lies in between; the
+/// overwrite only dominates the code that follows it on the same straight-
+/// line fall-through.  Calls are deliberately NOT listed here: a call
+/// clobbers every caller-saved xmm, so no reader can observe the loaded
+/// value across it (the passes keep their own stricter call veto for the
+/// xmm0-xmm7 variadic-argument window).
+fn is_cf_transfer(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::Label | LineKind::CondJmp | LineKind::Jmp | LineKind::JmpIndirect | LineKind::Ret
+    )
+}
+
 /// Format a stack slot as an assembly memory operand string.
 /// Uses (%rbp) or (%rsp) depending on the original instruction text.
 fn format_stack_offset(offset: i32, original_line: &str) -> String {
@@ -232,7 +248,12 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         // refinement: when the next mention fully overwrites the register,
         // the loaded value is dead at that point — every later mention refers
         // to the new value — so the fold stays sound when the allocator
-        // reuses the register for an unrelated value later on.
+        // reuses the register for an unrelated value later on.  The overwrite
+        // only PROVES the value dead for code reached after it: a branch
+        // between the consumer and the overwrite lets a path skip the
+        // overwrite, so a reader textually past it can still observe the
+        // loaded value (see is_cf_transfer).  The kill is therefore accepted
+        // only across a control-flow-free straight-line stretch.
         let mut later_mention = false;
         for k in (i + 2)..len {
             if infos[k].is_nop() {
@@ -243,7 +264,9 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
                 break;
             }
             if mentions_xmm(t, src_reg) {
-                later_mention = !is_pure_xmm_overwrite(t, src_reg);
+                let straight =
+                    !(i + 2..k).any(|m| !infos[m].is_nop() && is_cf_transfer(infos[m].kind));
+                later_mention = !(is_pure_xmm_overwrite(t, src_reg) && straight);
                 break;
             }
         }
@@ -1404,9 +1427,14 @@ pub(super) fn fold_fma_memory_src2(store: &mut LineStore, infos: &mut [LineInfo]
                 let m = mentions_token(t, &reg_token);
                 if m > 0 && total == 2 {
                     // First mention past load+consumer: sound only when it
-                    // rewrites the whole register; everything after it uses
-                    // the new value.
-                    vetoed = !is_pure_xmm_overwrite(t, &reg_token);
+                    // rewrites the whole register (everything after it then
+                    // uses the new value) AND every path from the consumer
+                    // reaches it — a control-flow transfer in between lets a
+                    // branch skip the overwrite while a reader past the merge
+                    // still observes the loaded value (is_cf_transfer).
+                    let straight = !(j + 1..k)
+                        .any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
+                    vetoed = !(is_pure_xmm_overwrite(t, &reg_token) && straight);
                     break;
                 }
                 total += m;
@@ -1843,7 +1871,13 @@ pub(super) fn fold_zero_addend_fma213_to_132(
                 break;
             }
             if !infos[m].is_nop() && mentions_token(t, &b_tok) > 0 {
-                ok_after = is_pure_xmm_overwrite(t, &b_tok);
+                // Pure redefinition kills the loaded value only for code it
+                // dominates; a branch between the FMA and the redefinition
+                // lets the other path read the loaded multiplier past the
+                // merge (is_cf_transfer).
+                let straight =
+                    !(k + 1..m).any(|h| !infos[h].is_nop() && is_cf_transfer(infos[h].kind));
+                ok_after = is_pure_xmm_overwrite(t, &b_tok) && straight;
                 break;
             }
             m += 1;
@@ -2476,6 +2510,26 @@ mod fma_mem_fold_tests {
         );
         assert!(!changed, "label breaks adjacency");
     }
+
+    /// A BRANCH between the FMA and the "killing" overwrite breaks the
+    /// whole-function textual proof: when the branch is taken, %xmm5 still
+    /// holds the LOADED value at the merge, and the reader past `.Ldone`
+    /// depends on it.  The overwrite only dominates the fall-through path,
+    /// so the fold must be refused even though the first later mention is a
+    /// pure full-width overwrite.
+    #[test]
+    fn refuses_when_branch_bypasses_the_killing_overwrite() {
+        let (changed, out) = run(
+            "    movsd 32(%rsi), %xmm5\n\
+             \x20   vfmadd231sd %xmm5, %xmm10, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   vmovsd 40(%rdi), %xmm5\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm5, %xmm3, %xmm3\n\
+             \x20   ret\n",
+        );
+        assert!(!changed, "taken path reads the loaded value: {out:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2652,6 +2706,26 @@ mod fma132_reuse_tests {
         );
         assert!(!changed, "rmw reads the loaded value");
     }
+
+    /// Same dominance gap as the other two folds: a branch between the FMA
+    /// and the later redefinition means the branch-taken path reaches the
+    /// merge reader with the LOADED multiplier intact.  The textual
+    /// whole-function scan must refuse despite the pure overwrite being the
+    /// first later mention.
+    #[test]
+    fn refuses_when_branch_between_fma_and_redefinition() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   xorpd %xmm0, %xmm0\n\
+             \x20   vfmadd213sd %xmm0, %xmm3, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   movsd 56(%rdi), %xmm3\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
+             \x20   ret\n",
+        );
+        assert!(!changed, "taken path reads the loaded multiplier: {out:?}");
+    }
 }
 
 #[cfg(test)]
@@ -2725,6 +2799,7 @@ mod fp_reg_load_tests {
         assert!(!changed, "rmw reads the loaded value before writing");
     }
 
+
     /// RED-TEAM REGRESSION (PR #359 follow-up): a reg-reg scalar `vmovsd`
     /// is a MERGE write — it preserves bits 64:127 of the destination.
     /// Here those preserved bits come from the load being deleted (a
@@ -2776,6 +2851,24 @@ mod fp_reg_load_tests {
             "memory-source movsd zeroes the high half: full overwrite"
         );
         assert_eq!(out[1], "vmulsd 32(%rsi), %xmm2, %xmm2", "{out:?}");
+    }
+
+    /// A BRANCH between the consumer and the pure overwrite invalidates the
+    /// textual kill proof: the taken path reaches the reader past the merge
+    /// with the LOADED value still in %xmm3, while the overwrite only runs
+    /// on the fall-through path.  Deleting the load corrupts the taken path.
+    #[test]
+    fn refuses_when_branch_skips_the_killing_overwrite() {
+        let (changed, out) = run(
+            "    movsd (%rsi), %xmm3\n\
+             \x20   vmulsd %xmm3, %xmm2, %xmm2\n\
+             \x20   jne .Ldone\n\
+             \x20   vmovsd 40(%rdi), %xmm3\n\
+             .Ldone:\n\
+             \x20   vaddsd %xmm3, %xmm0, %xmm0\n\
+             \x20   ret\n",
+        );
+        assert!(!changed, "taken path reads the loaded value: {out:?}");
     }
 }
 

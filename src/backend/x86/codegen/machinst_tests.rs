@@ -318,7 +318,106 @@ fn a_rip_relative_symbol_emits_the_rip_form() {
     assert!(line.contains("glob(%rip)"), "{}", line);
 }
 
-// ── 3b. golden emission, per instruction variant ────────────────────────────
+// ── 3c. width contract: large-immediate narrow stores ───────────────────────
+//
+// A `Store { val: Const(I64(v)), ty: U32 }` lowers to
+// `Mov { src: Imm(v), dst: mem, size: S32 }` even when v does not fit in a
+// signed 32-bit immediate (e.g. `3041712678u`). The store semantics are
+// "write the low `size` bits"; emitting `movq` here wrote 8 bytes and the
+// last element of a 4-byte-strided VLA overran its allocation (a[0] corrupted
+// / saved VLA base pointer clobbered → SIGSEGV in o2_vla_fill.c). The
+// immediate field of mov{b,w,l} is a RAW {8,16,32}-bit value, so the
+// truncated constant stores directly at the move's own width.
+
+#[test]
+fn a_32bit_memory_store_of_a_large_immediate_uses_movl_not_movq() {
+    // Regression for the VLA fill-store corruption: `movq` overran the slot.
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(3041712678),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(7)),
+            offset: 0,
+        },
+        size: OpSize::S32,
+    });
+    assert_eq!(line, "movl $3041712678, (%rcx)", "narrow store must stay narrow");
+}
+
+#[test]
+fn a_16bit_memory_store_of_a_large_immediate_truncates_to_the_word() {
+    // v = 0x1234_5678_9ABC_DE0F -> low 16 bits 0xDE0F = 56847.
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(0x123456789ABCDE0F),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(7)),
+            offset: 4,
+        },
+        size: OpSize::S16,
+    });
+    assert_eq!(line, "movw $56847, 4(%rcx)");
+}
+
+#[test]
+fn a_8bit_memory_store_of_a_large_immediate_truncates_to_the_byte() {
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(0x123456789ABCDEAF),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(7)),
+            offset: 0,
+        },
+        size: OpSize::S8,
+    });
+    assert_eq!(line, "movb $175, (%rcx)", "low byte 0xAF = 175");
+}
+
+#[test]
+fn a_stack_slot_store_of_a_large_immediate_stays_narrow() {
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(3041712681),
+        dst: MachOperand::StackSlot(-16),
+        size: OpSize::S32,
+    });
+    assert_eq!(line, "movl $3041712681, -16(%rbp)");
+}
+
+#[test]
+fn a_64bit_memory_store_of_a_large_immediate_still_relays_through_rax() {
+    // 64-bit stores of an >i32 immediate have no imm form (movq's imm32 is
+    // sign-extended), so the %rax relay remains the correct lowering.
+    let lines = emit(&MachInst::Mov {
+        src: MachOperand::Imm(0x1122334455667788),
+        dst: MachOperand::Mem {
+            base: MachReg::Phys(PhysReg(7)),
+            offset: 0,
+        },
+        size: OpSize::S64,
+    });
+    assert_eq!(lines, vec!["movabsq $1234605616436508552, %rax", "movq %rax, (%rcx)"]);
+}
+
+#[test]
+fn a_64bit_register_move_of_a_large_immediate_uses_movabsq() {
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(0x1122334455667788),
+        dst: reg(PhysReg(0)),
+        size: OpSize::S64,
+    });
+    assert_eq!(line, "movabsq $1234605616436508552, %rax");
+}
+
+#[test]
+fn a_32bit_register_move_of_a_large_immediate_uses_movl_zero_extended() {
+    // movl's imm32 field is raw (not sign-extended like the ALU forms), so a
+    // value in (INT32_MAX, UINT32_MAX] stores in one zero-extending move.
+    let line = emit1(&MachInst::Mov {
+        src: MachOperand::Imm(3041712678),
+        dst: reg(PhysReg(0)),
+        size: OpSize::S32,
+    });
+    assert_eq!(line, "movl $3041712678, %eax");
+}
+
+// ── 3d. golden emission, per instruction variant ────────────────────────────
 
 #[test]
 fn every_alu_operation_emits_its_mnemonic() {
@@ -2925,6 +3024,76 @@ mod float_const_stores {
             seg_override: AddressSpace::Default,
             volatile: false,
         }
+    }
+
+    fn volatile_store(val: Operand, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            val,
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+            volatile: true,
+        }
+    }
+
+    /// A C `volatile` store is ONE abstract access (C11 5.1.2.3): splitting
+    /// an 8-byte double into two 4-byte movl halves would make a torn state
+    /// observable to a signal handler / concurrent reader that the abstract
+    /// machine forbids.  The typed lowering must REFUSE the two-half split
+    /// for volatile destinations (the mature pool+movsd path then emits a
+    /// single store, like gcc/clang/icc).
+    #[test]
+    fn volatile_wide_f64_const_store_is_refused_not_split() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let mut out = Vec::new();
+        // 1.5 = 0x3FF8000000000000: does not fit a sign-extended imm32, so a
+        // non-volatile store splits into two movl halves.
+        let lowered = super::super::isel::lower_instruction_typed(
+            &volatile_store(Operand::Const(IrConst::F64(1.5)), 9, IrType::F64),
+            &FxHashMap::default(),
+            &slots,
+            None,
+            &mut out,
+        );
+        assert!(
+            !lowered,
+            "volatile 8-byte store must not be split: {out:?}"
+        );
+    }
+
+    /// A volatile F32/D32 store is a single 4-byte access and MAY take the
+    /// one-instruction immediate form (the object's own width, one store).
+    #[test]
+    fn volatile_f32_const_store_still_lowers_to_one_movl() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &volatile_store(Operand::Const(IrConst::F32(3.5)), 9, IrType::F32),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(v), size: OpSize::S32, .. } if *v == 0x40600000u32 as i32 as i64
+        ));
+    }
+
+    /// A volatile F64 whose bit pattern fits a sign-extended imm32 (e.g. the
+    /// smallest denormal, bits == 1) stays a SINGLE movq $imm32 store — one
+    /// 8-byte access, still one abstract store.
+    #[test]
+    fn volatile_f64_fitting_imm32_still_lowers_to_one_movq() {
+        let slots: FxHashMap<u32, i64> = [(9u32, -8i64)].into_iter().collect();
+        let out = lower(
+            &volatile_store(Operand::Const(IrConst::D64(1)), 9, IrType::D64),
+            &FxHashMap::default(),
+            &slots,
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(matches!(
+            &out[0],
+            MachInst::Mov { src: MachOperand::Imm(1), size: OpSize::S64, .. }
+        ));
     }
 
     fn lower(inst: &Instruction, ra: &FxHashMap<u32, PhysReg>, slots: &FxHashMap<u32, i64>) -> Vec<MachInst> {

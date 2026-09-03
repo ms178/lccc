@@ -391,18 +391,74 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
                     return;
                 }
             }
-            // Large immediates (>i32): use movabsq for register dest,
-            // or relay through rax for memory dest. The relay's store
-            // honors the OPERAND size: a 64-bit immediate with an S32
-            // destination must store 4 bytes (`movl %eax`), never the
-            // 8-byte `movq %rax` — the wide-imm memory relay predates the
-            // float-const lowering, where an S32 half-store with a
-            // sign-bit-set immediate (hi half 0xE0000000) would otherwise
-            // clobber the 4 bytes after the destination (fp_arith, -O2).
-            // Typed IR never produces a legitimate wide S8/S16/S32 store,
-            // but the emitter defines the behavior instead of trusting it.
+            // WIDTH CONTRACT (2026-09-03, VLA fill-store corruption; found
+            // independently here and upstream as PR #363): a store whose
+            // immediate lies outside the sign-extended imm32 window must
+            // still write exactly `size` bytes. The IR that reaches here is
+            // e.g. `Store { val: Const(I64(3041712678)), ty: U32 }` (an
+            // unsigned 32-bit value held in an i64 constant); the store
+            // semantics are "write the low `size` bits". Emitting `movq %rax`
+            // for such a store writes 8 bytes, so the last element of a
+            // 4-byte-strided VLA overran its allocation and clobbered the
+            // adjacent frame slot (a[0]'s low word in the o2_vla_fill.c repro;
+            // the saved VLA base pointer → SIGSEGV in the minimal case), or —
+            // on the float side — an S32 hi-half store with the sign bit set
+            // (0xE0000000) clobbered the 4 bytes after its destination.
+            //
+            // Two layered defenses, cheapest first:
+            //   * NARROW FAST PATH (S8/S16/S32): mov{b,w,l} immediate fields
+            //     are RAW {8,16,32}-bit values — they encode the full unsigned
+            //     range, unlike the sign-extended imm32 form of the ALU ops —
+            //     so the constant truncates to the destination width and a
+            //     single sized move stores it directly, with no %rax staging:
+            //         movl $3041712678, (%rax)      (mem / stack-slot dest)
+            //         movl $3041712678, %eax        (reg dest: movl
+            //                                        zero-extends into the
+            //                                        full register)
+            //     This is one instruction and touches no temporary register,
+            //     where the relay below needs two instructions and clobbers
+            //     %rax.  (Upstream PR #363 fixed the same defect with the
+            //     relay alone; the direct form is strictly shorter.)
+            //   * WIDE RELAY (S64 >i32, and any residual path): a 64-bit
+            //     destination cannot take a direct imm, so stage through rax
+            //     and store at the operand's OWN width (`sized_reg_name`) —
+            //     never the 8-byte default. This is the emitter defining the
+            //     behavior instead of trusting typed IR never to produce a
+            //     wide store, and stays as defense in depth beneath the fast
+            //     path.
             if let MachOperand::Imm(v) = src {
                 if *v < i32::MIN as i64 || *v > i32::MAX as i64 {
+                    if matches!(size, OpSize::S8 | OpSize::S16 | OpSize::S32) {
+                        // Truncate to the destination width and emit the
+                        // single sized move (raw imm field encodes all bits).
+                        let mask: i64 = match size {
+                            OpSize::S8 => 0xff,
+                            OpSize::S16 => 0xffff,
+                            _ => 0xffff_ffff,
+                        };
+                        let t = *v & mask;
+                        match dst {
+                            // A register dest takes the sized immediate
+                            // directly: movl zero-extends the result into the
+                            // full register (imm32 is a raw field, not the
+                            // sign-extended ALU form), so the value is exact
+                            // and the instruction count stays at one.
+                            MachOperand::Reg(MachReg::Phys(r)) => {
+                                let reg = sized_reg_name(*r, *size);
+                                out.emit_fmt(format_args!(
+                                    "    mov{} ${}, %{}",
+                                    suffix, t, reg
+                                ));
+                            }
+                            _ => {
+                                out.emit_fmt(format_args!(
+                                    "    mov{} ${}, {}",
+                                    suffix, t, dst_str
+                                ));
+                            }
+                        }
+                        return;
+                    }
                     if let MachOperand::Reg(MachReg::Phys(r)) = dst {
                         out.emit_fmt(format_args!("    movabsq ${}, %{}", v, reg_name(*r)));
                     } else {
