@@ -192,6 +192,36 @@ pub enum MachInst {
         size: OpSize,
     },
 
+    /// 16-byte integer move: `movdqu src, %xmm0` + `movdqu %xmm0, dst` —
+    /// the atomic 128-bit mem-to-mem transfer the scalar Mov cannot express
+    /// (x86 has no general mem-to-mem move; the GPR relay needs FOUR S64
+    /// moves where the SSE2 scratch pair needs TWO).
+    ///
+    /// Serves the typed i128 Store and Load lowerings (the Store(other) /
+    /// Load(other) census classes): an i128 value lives in a contiguous
+    /// 16-byte slot, and a store/load copies that region to/from the
+    /// destination address. Both operands must be memory forms (StackSlot
+    /// or Mem); register and immediate halves take the scalar Mov path —
+    /// the const i128 store splits into two S64 Movs, and the
+    /// scratch-unsafe fallback is four S64 Movs through the reserved
+    /// rax/rdx.
+    ///
+    /// Ordering is semantic: the 16-byte source is read in full before any
+    /// destination byte is written, so overlapping regions stay correct
+    /// (the SSE pair is data-dependent — the store reads the scratch the
+    /// load wrote; the GPR fallback orders both loads before both stores).
+    ///
+    /// `movdqu` (not `movdqa`) is deliberate: frame slots sit at 8 mod 16
+    /// under the rsp-mode layout and pointer targets may be packed-member
+    /// aligned, so unaligned-safe is the only sound spelling; on modern
+    /// cores it costs nothing for aligned data. Clobber: the pre-colored
+    /// xmm0 scratch (PhysReg 18) — the isel refuses this instruction when
+    /// the scratch is live (xmm_scratch_unsafe) and uses the GPR fallback.
+    Mov128 {
+        src: MachOperand,
+        dst: MachOperand,
+    },
+
     /// movzx src, dst (zero-extend: movzbl, movzwl, movzbq, movzwq)
     Movzx {
         src: MachOperand,

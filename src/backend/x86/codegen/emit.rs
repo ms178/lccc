@@ -490,6 +490,11 @@ pub struct X86Codegen {
     pub(super) fold_skip_cast: Option<u32>,
     /// Type of each SSA value (for type-aware stack slot loads/stores).
     pub(super) value_types: FxHashMap<u32, IrType>,
+    /// Value ids whose 16-byte i128 slot home is written eagerly at their
+    /// definition (i128 ParamRefs, 128-bit call results) — the only
+    /// slot-homed i128 values the typed store route may read. See the
+    /// prologue scan that fills it.
+    pub(super) coherent_i128_homes: crate::common::fx_hash::FxHashSet<u32>,
     /// Pending condition flags from a fused Cmp: (cmp dest value, cmp opcode).
     /// Set by the Cmp emitter when the consumer is the next instruction.
     pub(super) pending_cmp: Option<(u32, crate::ir::reexports::IrCmpOp)>,
@@ -839,6 +844,7 @@ impl X86Codegen {
             folded_cast_dests: FxHashSet::default(),
             fold_skip_cast: None,
             value_types: FxHashMap::default(),
+            coherent_i128_homes: crate::common::fx_hash::FxHashSet::default(),
             pending_cmp: None,
             pending_widen: [None, None],
             pending_fp_cmp: None,
@@ -4001,6 +4007,109 @@ impl X86Codegen {
     /// not model. Everything else (slot-homed floats needing the xmm scratch
     /// relay, constants, xmm-based pointers, folded GEP/global addressing,
     /// F128/x87) returns false and keeps the mature text path.
+    /// Exact admission predicate for the typed i128 Load/Store route.
+    ///
+    /// The subset the isel arms accept, mirrored here so the generic
+    /// operand scan never sees these instructions: an i128 value is
+    /// slot-homed (the allocator never assigns one), so the generic
+    /// no-register rules reject the Load dest / Store val before the isel
+    /// could offer its typed forms. The predicate is the admission
+    /// contract; the isel arm re-checks everything (belt and suspenders —
+    /// a decline here falls back to the mature path unchanged).
+    ///
+    /// Subset: `ty.is_128bit()` (I128/U128 — F128/x87 long double stays on
+    /// the mature x87 path), non-volatile (the volatile access granularity
+    /// stays the oracle-matching two 8-byte halves), default address space,
+    /// pointer = direct alloca slot or GPR-homed pointer value (never a
+    /// folded address or an over-aligned alloca — the raw slot would be
+    /// the wrong address), and the value side either an I128/Zero constant
+    /// or a slot-homed non-small i128 value.
+    fn i128_typed_candidate(
+        &self,
+        inst: &crate::ir::reexports::Instruction,
+        folded_global_addrs: &crate::common::fx_hash::FxHashSet<u32>,
+    ) -> bool {
+        let (ty, ptr, val, volatile, seg_override) = match inst {
+            crate::ir::reexports::Instruction::Load {
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+                ..
+            } => (ty, ptr, None, *volatile, seg_override),
+            crate::ir::reexports::Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                volatile,
+            } => (ty, ptr, Some(val), *volatile, seg_override),
+            _ => return false,
+        };
+        if !ty.is_128bit() || volatile || *seg_override != AddressSpace::Default {
+            return false;
+        }
+        let ptr_ok = (self.state.is_alloca(ptr.0)
+            && !matches!(
+                self.state.resolve_slot_addr(ptr.0),
+                Some(crate::backend::state::SlotAddr::OverAligned(_, _))
+            )) || self
+            .reg_assignments
+            .get(&ptr.0)
+            .is_some_and(|r| r.0 < 20);
+        if !ptr_ok
+            || folded_global_addrs.contains(&ptr.0)
+            || self.state.folded_gep_values.contains(&ptr.0)
+        {
+            return false;
+        }
+        match val {
+            None => {
+                let dest = match inst {
+                    crate::ir::reexports::Instruction::Load { dest, .. } => dest.0,
+                    _ => unreachable!(),
+                };
+                // Genuine-i128-carrier requirement only (mirrors the
+                // Store val's first check). Coherence does NOT apply to a
+                // load dest: the load itself is the dest's defining write,
+                // so the slot cannot be stale. Vector carriers (which also
+                // ride the I128 type) are safe here too — writing the
+                // loaded 16 bytes to the vector's spill slot eagerly is
+                // data-identical to the vec machinery's own lazy spill.
+                self.state.is_i128_value(dest)
+                    && !self.reg_assignments.contains_key(&dest)
+                    && self.state.get_slot(dest).is_some()
+                    && !self.state.small_slot_values.contains(&dest)
+            }
+            Some(operand) => match operand {
+                crate::ir::reexports::Operand::Const(c) => matches!(
+                    c,
+                    crate::ir::reexports::IrConst::I128(_)
+                        | crate::ir::reexports::IrConst::Zero
+                ),
+                crate::ir::reexports::Operand::Value(v) => {
+                    // A GENUINE i128 carrier, not a 16-byte value that
+                    // merely carries the I128 type in the IR: the vector
+                    // path reuses I128 as the v4sf/v4si carrier type, and
+                    // a vector value's spill slot is lazily written by the
+                    // vec machinery (flush_pending_vec_store) — reading it
+                    // here would load stale bytes.  The state's i128
+                    // registry is the type truth; the builtin_ia32_
+                    // vector_value regression pins the distinction.
+                    // ...and its slot home must be COHERENT: written
+                    // eagerly at the value's definition. A value computed
+                    // into the accumulator pair has a stale slot (its only
+                    // writer would be the very store being lowered).
+                    self.state.is_i128_value(v.0)
+                        && self.coherent_i128_homes.contains(&v.0)
+                        && !self.reg_assignments.contains_key(&v.0)
+                        && self.state.get_slot(v.0).is_some()
+                        && !self.state.small_slot_values.contains(&v.0)
+                }
+            },
+        }
+    }
+
     fn float_typed_candidate(
         &self,
         inst: &crate::ir::reexports::Instruction,
@@ -4757,6 +4866,53 @@ impl ArchCodegen for X86Codegen {
                 inst,
                 &self.reg_assignments,
                 &float_alloca_slots,
+                Some(&self.value_types),
+                Some(&self.state.small_slot_values),
+                &mut self.machinst_buf,
+            );
+            if lowered {
+                self.machinst_buf_ir.push(inst.clone());
+            }
+            return lowered;
+        }
+
+        // Typed i128 route (the Store(other) / Load(other) census classes).
+        // Mirrors the float route: an early, exact admission gate plus a
+        // slot map that includes the VALUE home — the 16-byte i128 slot,
+        // which the generic scan below would reject outright (i128 values
+        // are never register-assigned, so a Load dest / Store val with no
+        // RA entry trips the no-register rule before the isel could speak).
+        if self.i128_typed_candidate(inst, folded_global_addrs) {
+            let mut i128_slots = crate::common::fx_hash::FxHashMap::default();
+            match inst {
+                crate::ir::reexports::Instruction::Load { dest, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            i128_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let Some(slot) = self.state.get_slot(dest.0) {
+                        i128_slots.insert(dest.0, slot.0);
+                    }
+                }
+                crate::ir::reexports::Instruction::Store { val, ptr, .. } => {
+                    if self.state.is_alloca(ptr.0) {
+                        if let Some(slot) = self.state.get_slot(ptr.0) {
+                            i128_slots.insert(ptr.0, slot.0);
+                        }
+                    }
+                    if let crate::ir::reexports::Operand::Value(v) = val {
+                        if let Some(slot) = self.state.get_slot(v.0) {
+                            i128_slots.insert(v.0, slot.0);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let lowered = super::isel::lower_instruction_typed_ss(
+                inst,
+                &self.reg_assignments,
+                &i128_slots,
                 Some(&self.value_types),
                 Some(&self.state.small_slot_values),
                 &mut self.machinst_buf,

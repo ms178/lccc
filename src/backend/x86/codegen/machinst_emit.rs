@@ -810,6 +810,18 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             out.emit_fmt(format_args!("    set{} {}", cc_str, dst_str));
         }
 
+        MachInst::Mov128 { src, dst } => {
+            // The atomic 16-byte transfer: load the whole source region into
+            // the pre-colored xmm0 scratch, then store it to the destination.
+            // The pair is data-dependent, so overlapping source/destination
+            // regions stay correct. The isel refuses this instruction when
+            // the scratch is live, so the clobber is conflict-free here.
+            let src_str = fmt_operand(src, OpSize::S64, out);
+            let dst_str = fmt_operand(dst, OpSize::S64, out);
+            let scratch = freg_name(XMM0_SCRATCH);
+            out.emit_fmt(format_args!("    movdqu {}, %{}", src_str, scratch));
+            out.emit_fmt(format_args!("    movdqu %{}, {}", scratch, dst_str));
+        }
         MachInst::Movzx {
             src,
             dst,

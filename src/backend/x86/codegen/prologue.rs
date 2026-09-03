@@ -910,6 +910,88 @@ impl X86Codegen {
             self.value_use_counts = use_counts;
 
             self.value_types = value_types;
+
+            // Values whose 16-byte i128 slot home is written EAGERLY at
+            // their definition: the ParamRef of an i128 parameter (the
+            // prologue's param pre-store spills the incoming pair) and the
+            // result of a call returning a 16-bit... a 128-bit aggregate
+            // (the call-result machinery writes the pair to the slot).
+            // These are the only slot-homed i128 values the typed store
+            // route may READ: a value computed into the accumulator pair
+            // by arithmetic or an inlined vector builtin has no slot
+            // writer of its own — its slot is stale until a mature-path
+            // store materializes it (builtin_ia32_vector_value regression:
+            // the inlined maxps/minps result read zeros through the
+            // un-written slot).
+            let mut coherent_i128_homes = crate::common::fx_hash::FxHashSet::default();
+            // (dest, source-value) edges for the Copy/Load propagation pass.
+            let mut home_writes: Vec<(u32, Option<u32>)> = Vec::new();
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    match inst {
+                        Instruction::ParamRef { dest, param_idx, .. } => {
+                            let is_i128_param = self
+                                .state
+                                .param_classes
+                                .get(*param_idx)
+                                .is_some_and(|c| {
+                                    matches!(
+                                        c,
+                                        crate::backend::call_abi::ParamClass::I128RegPair {
+                                            ..
+                                        }
+                                    )
+                                });
+                            if is_i128_param {
+                                coherent_i128_homes.insert(dest.0);
+                            }
+                        }
+                        Instruction::Call { info, .. }
+                        | Instruction::CallIndirect { info, .. } => {
+                            if let Some(dest) = info.dest {
+                                if matches!(info.return_type, IrType::I128 | IrType::U128) {
+                                    coherent_i128_homes.insert(dest.0);
+                                }
+                            }
+                        }
+                        // A Copy from a coherent source eagerly writes the
+                        // dest's home (the mature i128 copy materializes
+                        // the pair into the dest slot); a load's dest home
+                        // is written by the load itself. Propagate to a
+                        // fixpoint so Copy chains stay coherent.
+                        Instruction::Copy { dest, src } => {
+                            if let Operand::Value(v) = src {
+                                home_writes.push((dest.0, Some(v.0)));
+                            }
+                        }
+                        Instruction::Load {
+                            dest,
+                            ty,
+                            seg_override: _,
+                            ..
+                        } if matches!(ty, IrType::I128 | IrType::U128) => {
+                            home_writes.push((dest.0, None));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            loop {
+                let mut grew = false;
+                for (dest, src) in &home_writes {
+                    let coherent = match src {
+                        Some(v) => coherent_i128_homes.contains(v),
+                        None => true,
+                    };
+                    if coherent && coherent_i128_homes.insert(*dest) {
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            self.coherent_i128_homes = coherent_i128_homes;
         }
 
         // Direct scalar global accesses and safely reconstructible global

@@ -1168,7 +1168,25 @@ impl AsmOutput {
     /// slot and leaves the upper bytes of the containing register untouched).
     #[inline]
     pub fn emit_cmp_zero_mem(&mut self, offset: i64) {
-        self.buf.push_str("    cmpl $0, ");
+        self.emit_cmp_zero_mem_sized(offset, "cmpl");
+    }
+
+    /// Sized variant of [`Self::emit_cmp_zero_mem`]: `    {mnem} $0, {offset}(%rbp)`
+    /// (or rsp-relative when the frame pointer is omitted). The caller picks
+    /// the compare width from the value's recorded IR type. The width rule is
+    /// directional: a compare may read FEWER bytes than the slot's storing
+    /// operations defined (the low bytes of any stored value are always
+    /// defined — `cmpb` on a zero-extended I32 store reads a defined byte),
+    /// but reading MORE than the store defined reads stale frame bytes. An
+    /// 8-byte slot holding an I64 whose low 4 bytes are zero is nonzero, yet
+    /// the historical unconditional `cmpl` reported zero — the same
+    /// under-wide-test disease PR #368 fixed for register-direct conditions,
+    /// in its stack-slot sibling.
+    #[inline]
+    pub fn emit_cmp_zero_mem_sized(&mut self, offset: i64, mnem: &str) {
+        self.buf.push_str("    ");
+        self.buf.push_str(mnem);
+        self.buf.push_str(" $0, ");
         if self.use_rsp_addressing {
             write_i64_fast(&mut self.buf, self.rsp_frame_size + offset);
             self.buf.push_str("(%rsp)\n");
