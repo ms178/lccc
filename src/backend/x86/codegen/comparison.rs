@@ -713,9 +713,7 @@ impl X86Codegen {
         if let Operand::Value(v) = cond {
             if let Some(&reg) = self.reg_assignments.get(&v.0) {
                 if !is_xmm_reg(reg) {
-                    let name = phys_reg_name(reg);
-                    self.state
-                        .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                    self.emit_cond_gpr_test(v.0, reg);
                     let jcc_hot = if pref_true { "jne" } else { "je" };
                     if hot_next {
                         self.state
@@ -746,10 +744,51 @@ impl X86Codegen {
         }
     }
 
+    /// Emit `test{size} %reg, %reg` for a GPR-homed condition value, sized to
+    /// the value's IR type.
+    ///
+    /// The historical form was always `testq %r64, %r64`. That is wrong for
+    /// every condition narrower than 64 bits: the SysV x86-64 ABI leaves the
+    /// bits above a parameter's width UNDEFINED, so `testq` on a 32-bit
+    /// condition reads garbage that may set/clear ZF regardless of the actual
+    /// value — an `if (c)` / `c ? a : b` on a zero `int` could spuriously
+    /// branch/select the true arm when the caller passed stale high bits.
+    /// Size the test to the value's own width (`testl`/`testw`/`testb`),
+    /// exactly as the stack-slot path already sizes its memory compare
+    /// (`emit_cmp_zero_mem` → `cmpl` for I32 homed bools).
+    fn emit_cond_gpr_test(&mut self, val_id: u32, reg: PhysReg) {
+        // Only integer (and pointer) conditions carry a zero/nonzero
+        // semantic worth testing; bools arrive as I8. For every other
+        // recorded type keep the historical full-width test.
+        if let Some(ty) = self.value_types.get(&val_id).copied() {
+            match ty {
+                IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32 => {
+                    let (_, test_mnem, _) = super::emit::cmp_width_info(ty);
+                    let name = super::emit::typed_phys_reg_name(reg, ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", test_mnem, name, name));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let name = phys_reg_name(reg);
+        self.state
+            .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+    }
+
     /// Test the select condition in place, WITHOUT materializing it into a
     /// register and WITHOUT `pushfq`/`popfq`:
     ///
-    ///   * register-allocated cond → `testq %reg, %reg` (no clobbers)
+    ///   * register-allocated cond → `test{size} %reg, %reg` (no clobbers;
+    ///                               sized to the condition's IR width so a
+    ///                               32-bit condition never reads the
+    ///                               undefined upper register bits)
     ///   * stack-slot cond         → `cmpl $0, off(%rsp/%rbp)` (no clobbers;
     ///                               bools are stored as zero-extended I32)
     ///   * accumulator-cached cond → `testq %rax, %rax`
@@ -763,9 +802,7 @@ impl X86Codegen {
             if !self.state.is_alloca(v.0) {
                 if let Some(&reg) = self.reg_assignments.get(&v.0) {
                     if !is_xmm_reg(reg) {
-                        let name = phys_reg_name(reg);
-                        self.state
-                            .emit_fmt(format_args!("    testq %{}, %{}", name, name));
+                        self.emit_cond_gpr_test(v.0, reg);
                         return true;
                     }
                 }
