@@ -94,9 +94,10 @@ impl I686Codegen {
 
         // Same-block div/rem pair fusion table (one divl serves a
         // URem+UDiv couple with identical operands). Constant-RHS pairs
-        // never fuse (compute_i686_divrem_pairs excludes them
-        // unconditionally): the magic-number path may claim them at any
-        // optimisation level, and the RA model must stay exact.
+        // fuse as well: the head runs ONE magic-number sequence producing
+        // q in %eax and r in %edx (emit_divrem_const_in_eax_edx), or the
+        // staged `divl` at -Os: the same clobber set the RA model charges
+        // any constant-divisor division with, so the model stays exact.
         let pairs = crate::backend::regalloc::compute_i686_divrem_pairs(
             func,
             crate::backend::regalloc::DivRemTarget::I686,

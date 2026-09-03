@@ -229,95 +229,68 @@ impl I686Codegen {
         }
     }
 
-    /// Single-instruction multiply-by-constant into `dest` from register `src`
-    /// (bare names; they may alias). Only the forms that are ≤ the size of
-    /// `imull $imm, %src, %dest` (3 bytes) and one cycle:
-    ///   0 → xorl d,d          (2 bytes)
-    ///   1 → movl n,d          (2 bytes, only when n != d)
-    ///  -1 → negl d            (2 bytes) / movl n,d; negl d
-    ///   2 → addl d,d          (2 bytes, n == d) / leal (n,n),d (3 bytes)
-    ///   3 → leal (n,n,2),d    (3 bytes)
-    ///   5 → leal (n,n,4),d    (3 bytes)
-    ///   9 → leal (n,n,8),d    (3 bytes)
-    ///   4/8 → shll $2/$3, d   (3 bytes, only when n == d; the n != d form
-    ///         needs an SIB+disp32 leal of 7 bytes, so imull stays smaller)
-    /// Everything else (including negatives beyond -1, which would need a
-    /// negl on top) stays `imull`. No scratch register is ever used, so the
-    /// direct path's "%eax/%ecx/%edx untouched" invariant holds.
+    /// Multiply `dest = src * imm` (bare register names; they may alias)
+    /// without `imull` when a chain of 1-cycle LEA/shift/add/sub steps is
+    /// cheaper. No scratch register is ever used, so the direct path's
+    /// "%eax/%ecx/%edx untouched" invariant holds. Returns false when
+    /// `imull $imm` is the right choice; the caller emits it.
+    ///
+    /// Policy (measured, see docs/I686_ALU_AUDIT.md):
+    /// * -Os/-Oz: only single instructions that are ≤ the 3-byte
+    ///   `imull $imm8,%r,%r` (xor / mov / leal (n,n,k) / addl d,d / shll /
+    ///   negl); the 7-byte `leal (,%n,k)` form is excluded.
+    /// * speed: up to two dependent 1c steps (2c latency, 2 µops) beat the
+    ///   3c `imull`; a third step is admitted only when the chain starts with
+    ///   a `movl` (eliminated at rename on every P-core since Ivy Bridge, so
+    ///   the dependent latency stays 2c). This is the same admission rule as
+    ///   GCC's synth_mult and LLVM's `combineMulSpecial` (11 = x+2·5x,
+    ///   7 = 8x−x, 17 = 16x+x, 24 = 3x·8, −3 = −(3x), ...), derived here by a
+    ///   bounded search instead of a hand-maintained table so every constant
+    ///   in the admissible space is covered and the byte-cheapest form wins.
     fn try_emit_mul_imm_reg(&mut self, src: &str, dest: &str, imm: i64) -> bool {
         let same = src == dest;
-        let handled = match imm {
-            0 => {
-                emit!(self.state, "    xorl %{}, %{}", dest, dest);
-                true
-            }
-            1 => {
-                if !same {
-                    emit!(self.state, "    movl %{}, %{}", src, dest);
-                }
-                true
-            }
-            -1 => {
-                if !same {
-                    emit!(self.state, "    movl %{}, %{}", src, dest);
-                }
-                emit!(self.state, "    negl %{}", dest);
-                true
-            }
-            2 => {
-                if same {
-                    emit!(self.state, "    addl %{}, %{}", dest, dest);
-                } else {
-                    emit!(self.state, "    leal (%{}, %{}), %{}", src, src, dest);
-                }
-                true
-            }
-            3 => {
-                emit!(self.state, "    leal (%{}, %{}, 2), %{}", src, src, dest);
-                true
-            }
-            4 if same => {
-                emit!(self.state, "    shll $2, %{}", dest);
-                true
-            }
-            5 => {
-                emit!(self.state, "    leal (%{}, %{}, 4), %{}", src, src, dest);
-                true
-            }
-            8 if same => {
-                emit!(self.state, "    shll $3, %{}", dest);
-                true
-            }
-            9 => {
-                emit!(self.state, "    leal (%{}, %{}, 8), %{}", src, src, dest);
-                true
-            }
-            // Two-instruction scratch-free chains — one cycle faster than
-            // `imull` (which is 3c latency), only when NOT optimizing for
-            // size (`imull` is a single 3-byte instruction). Both chains
-            // reuse dest in place, so no scratch register is clobbered and
-            // the direct path's no-clobber contract holds.
-            6 if !self.optimize_for_size => {
-                // x*3 then *2
-                emit!(self.state, "    leal (%{}, %{}, 2), %{}", src, src, dest);
-                emit!(self.state, "    addl %{}, %{}", dest, dest);
-                true
-            }
-            10 if !self.optimize_for_size => {
-                // x*5 then *2
-                emit!(self.state, "    leal (%{}, %{}, 4), %{}", src, src, dest);
-                emit!(self.state, "    addl %{}, %{}", dest, dest);
-                true
-            }
-            12 if !self.optimize_for_size => {
-                // x*3 then *4
-                emit!(self.state, "    leal (%{}, %{}, 2), %{}", src, src, dest);
-                emit!(self.state, "    shll $2, %{}", dest);
-                true
-            }
-            _ => false,
+        let imm = imm as i32;
+        if imm == 0 {
+            emit!(self.state, "    xorl %{}, %{}", dest, dest);
+            return true;
+        }
+        let budget = if self.optimize_for_size {
+            1
+        } else if same {
+            2
+        } else {
+            3
         };
-        handled
+        let Some(chain) = synth_mul(imm as u32, same, budget, !self.optimize_for_size) else {
+            return false;
+        };
+        for step in chain {
+            match step {
+                MulStep::Mov => emit!(self.state, "    movl %{}, %{}", src, dest),
+                MulStep::LeaSrcSrc(k) => {
+                    if k == 1 {
+                        emit!(self.state, "    leal (%{}, %{}), %{}", src, src, dest)
+                    } else {
+                        emit!(self.state, "    leal (%{}, %{}, {}), %{}", src, src, k, dest)
+                    }
+                }
+                MulStep::LeaScaleSrc(k) => emit!(self.state, "    leal (, %{}, {}), %{}", src, k, dest),
+                MulStep::LeaSelf(k) => emit!(self.state, "    leal (%{}, %{}, {}), %{}", dest, dest, k, dest),
+                MulStep::LeaSrcPlus(k) => {
+                    if k == 1 {
+                        emit!(self.state, "    leal (%{}, %{}), %{}", src, dest, dest)
+                    } else {
+                        emit!(self.state, "    leal (%{}, %{}, {}), %{}", src, dest, k, dest)
+                    }
+                }
+                MulStep::Shl(k) => emit!(self.state, "    shll ${}, %{}", k, dest),
+                MulStep::AddSelf => emit!(self.state, "    addl %{}, %{}", dest, dest),
+                MulStep::AddSrc => emit!(self.state, "    addl %{}, %{}", src, dest),
+                MulStep::SubSrc => emit!(self.state, "    subl %{}, %{}", src, dest),
+                MulStep::Neg => emit!(self.state, "    negl %{}", dest),
+            }
+        }
+        true
     }
 
     // ── Constant division / remainder strength reduction ──────────────────
@@ -326,7 +299,10 @@ impl I686Codegen {
     // 32-bit `mull`/`imull` mulhi — the exact sequences GCC/Clang/ICX emit
     // (verified against the godbolt oracle). Gated by !optimize_for_size:
     // `idiv` is shorter, so -Os/-Oz keep it. n is in %eax on entry; q/r is
-    // left in %eax. Clobbers %ecx/%edx.
+    // left in %eax. Clobbers %ecx/%edx and NOTHING else; in particular no
+    // stack traffic (a push/pop round trip costs ~5 cycles of store-forward
+    // latency on the critical path, which is why the remainder forms keep
+    // the dividend in %ecx instead).
 
     /// `q = n / d` (unsigned), n in %eax, d >= 2.
     fn emit_udiv_const_in_eax(&mut self, d: u32) {
@@ -362,6 +338,35 @@ impl I686Codegen {
         }
     }
 
+    /// Unsigned magic quotient that PRESERVES the dividend: n in %eax on
+    /// entry; on exit q is in %eax and n in %ecx (%edx clobbered). This is
+    /// the shape every remainder / div+rem form needs (r = n - q*d), one
+    /// `movl` longer than `emit_udiv_const_in_eax` but with no stack traffic.
+    /// d must be a non-power-of-two >= 3.
+    fn emit_udiv_magic_keep_n(&mut self, d: u32) {
+        debug_assert!(d >= 3 && !d.is_power_of_two());
+        let (m, s, add) = magic_u32(d);
+        self.state.emit("    movl %eax, %ecx"); // n
+        emit!(self.state, "    movl ${}, %eax", m as i32);
+        self.state.emit("    mull %ecx"); // edx = mulhi(n, m)
+        if add {
+            // q = (((n - hi) >> 1) + hi) >> (s - 1), computed in %eax so
+            // %ecx keeps n.
+            self.state.emit("    movl %ecx, %eax");
+            self.state.emit("    subl %edx, %eax");
+            self.state.emit("    shrl $1, %eax");
+            self.state.emit("    addl %edx, %eax");
+            if s > 1 {
+                emit!(self.state, "    shrl ${}, %eax", s - 1);
+            }
+        } else {
+            self.state.emit("    movl %edx, %eax");
+            if s > 0 {
+                emit!(self.state, "    shrl ${}, %eax", s);
+            }
+        }
+    }
+
     /// `r = n % d` (unsigned), n in %eax, d >= 2.
     fn emit_urem_const_in_eax(&mut self, d: u32) {
         if d == 1 {
@@ -372,13 +377,41 @@ impl I686Codegen {
             emit!(self.state, "    andl ${}, %eax", (d - 1) as i32);
             return;
         }
-        // r = n - (n/d)*d ; q*d < 2^32 (q <= n/d), so no overflow.
-        self.state.emit("    pushl %eax"); // save n
-        self.emit_udiv_const_in_eax(d);
-        emit!(self.state, "    imull ${}, %eax, %eax", d as i32);
-        self.state.emit("    movl %eax, %ecx");
-        self.state.emit("    popl %eax"); // n
-        self.state.emit("    subl %ecx, %eax");
+        // r = n - q*d with n kept in %ecx; q*d < 2^32 (q <= n/d), so the
+        // product cannot overflow. The multiply-back reuses the LEA/shift
+        // synthesiser (%eax -> %edx never aliases), e.g. `*7` = 8q - q.
+        self.emit_udiv_magic_keep_n(d);
+        if !self.try_emit_mul_imm_reg("eax", "edx", d as i64) {
+            emit!(self.state, "    imull ${}, %eax, %edx", d as i32);
+        }
+        self.state.emit("    movl %ecx, %eax");
+        self.state.emit("    subl %edx, %eax");
+    }
+
+    /// Signed magic quotient core for |d| >= 3 non-power-of-two: n in %eax
+    /// on entry; on exit q = trunc(n / |d|) is in %edx, n is preserved in
+    /// %ecx and %eax holds the sign mask of n (0 / -1). Callers finish the
+    /// job (move to %eax, negate for negative divisors, or fold the
+    /// remainder).
+    fn emit_sdiv_magic_core(&mut self, ad: u32) {
+        debug_assert!(ad >= 3 && !ad.is_power_of_two());
+        let (m, s) = magic_s32(ad as i32);
+        // q = mulhs(n, m) [+ n if m < 0] >> s - sign(n).
+        self.state.emit("    movl %eax, %ecx"); // save n
+        emit!(self.state, "    movl ${}, %eax", m);
+        self.state.emit("    imull %ecx"); // edx = mulhs
+        if m < 0 {
+            self.state.emit("    addl %ecx, %edx"); // q += n
+        }
+        if s > 0 {
+            emit!(self.state, "    sarl ${}, %edx", s);
+        }
+        self.state.emit("    movl %ecx, %eax");
+        // Arithmetic shift: 0 for n >= 0, -1 for n < 0. The sign correction
+        // subtracts this mask, so a LOGICAL shift (0/1) here would make every
+        // negative dividend come out one low (sd3(-9) == -5 instead of -3).
+        self.state.emit("    sarl $31, %eax"); // sign mask
+        self.state.emit("    subl %eax, %edx"); // q -= sign
     }
 
     /// `q = n / d` (signed, trunc toward zero), n in %eax, d != 0, ±1.
@@ -398,23 +431,7 @@ impl I686Codegen {
             }
             return;
         }
-        let (m, s) = magic_s32(ad as i32);
-        // q = mulhs(n, m) [+ n if m < 0] >> s - sign(n); negate if d < 0.
-        self.state.emit("    movl %eax, %ecx"); // save n
-        emit!(self.state, "    movl ${}, %eax", m);
-        self.state.emit("    imull %ecx"); // edx = mulhs
-        if m < 0 {
-            self.state.emit("    addl %ecx, %edx"); // q += n
-        }
-        if s > 0 {
-            emit!(self.state, "    sarl ${}, %edx", s);
-        }
-        self.state.emit("    movl %ecx, %eax");
-        // Arithmetic shift: 0 for n >= 0, -1 for n < 0. The sign correction
-        // subtracts this mask, so a LOGICAL shift (0/1) here would make every
-        // negative dividend come out one low (sd3(-9) == -5 instead of -3).
-        self.state.emit("    sarl $31, %eax"); // sign mask
-        self.state.emit("    subl %eax, %edx"); // q -= sign
+        self.emit_sdiv_magic_core(ad);
         self.state.emit("    movl %edx, %eax");
         if d < 0 {
             self.state.emit("    negl %eax");
@@ -436,13 +453,94 @@ impl I686Codegen {
             self.state.emit("    subl %edx, %eax");
             return;
         }
-        // r = n - (n/|d|)*|d| ; (n/|d|)*|d| fits in 32 bits.
-        self.state.emit("    pushl %eax"); // save n
-        self.emit_sdiv_const_in_eax(ad as i32);
-        emit!(self.state, "    imull ${}, %eax, %eax", ad as i32);
-        self.state.emit("    movl %eax, %ecx");
-        self.state.emit("    popl %eax");
-        self.state.emit("    subl %ecx, %eax");
+        // r = n - q*|d|; q in %edx, n in %ecx after the core. The product
+        // fits in 32 bits (|q*|d|| <= |n|).
+        self.emit_sdiv_magic_core(ad);
+        if !self.try_emit_mul_imm_reg("edx", "eax", ad as i64) {
+            emit!(self.state, "    imull ${}, %edx, %eax", ad as i32);
+        }
+        self.state.emit("    subl %eax, %ecx");
+        self.state.emit("    movl %ecx, %eax");
+    }
+
+    /// Fused constant div+rem: n in %eax on entry; on exit q in %eax and r
+    /// in %edx — the register split the div/rem pair store logic expects
+    /// (quotient from %eax, remainder from %edx, exactly like `divl`).
+    /// Clobbers %ecx. d != 0 (unsigned d is passed as a positive i64).
+    /// Returns false for shapes it does not fold (the caller then emits the
+    /// plain `divl`/`idivl` pair head).
+    fn emit_divrem_const_in_eax_edx(&mut self, signed: bool, d: i64) -> bool {
+        if !signed {
+            let Ok(d) = u32::try_from(d) else { return false };
+            match d {
+                0 => return false,
+                1 => {
+                    self.state.emit("    xorl %edx, %edx");
+                    return true;
+                }
+                _ if d.is_power_of_two() => {
+                    let k = d.trailing_zeros();
+                    self.state.emit("    movl %eax, %edx");
+                    emit!(self.state, "    andl ${}, %edx", (d - 1) as i32);
+                    emit!(self.state, "    shrl ${}, %eax", k);
+                    return true;
+                }
+                _ => {
+                    self.emit_udiv_magic_keep_n(d);
+                    if !self.try_emit_mul_imm_reg("eax", "edx", d as i64) {
+                        emit!(self.state, "    imull ${}, %eax, %edx", d as i32);
+                    }
+                    // r = n - q*d, landing in %edx.
+                    self.state.emit("    subl %edx, %ecx");
+                    self.state.emit("    movl %ecx, %edx");
+                    return true;
+                }
+            }
+        }
+        let Ok(d) = i32::try_from(d) else { return false };
+        match d {
+            0 => false,
+            1 | -1 => {
+                if d < 0 {
+                    self.state.emit("    negl %eax");
+                }
+                self.state.emit("    xorl %edx, %edx");
+                true
+            }
+            _ if d.unsigned_abs().is_power_of_two() => {
+                let ad = d.unsigned_abs();
+                let k = ad.trailing_zeros();
+                // bias = n < 0 ? 2^k - 1 : 0 ; q = (n + bias) >> k ;
+                // r = ((n + bias) & (2^k - 1)) - bias.
+                self.state.emit("    cltd");
+                emit!(self.state, "    shrl ${}, %edx", 32 - k);
+                self.state.emit("    addl %edx, %eax");
+                self.state.emit("    movl %eax, %ecx");
+                emit!(self.state, "    andl ${}, %ecx", (ad - 1) as i32);
+                self.state.emit("    subl %edx, %ecx");
+                emit!(self.state, "    sarl ${}, %eax", k);
+                if d < 0 {
+                    self.state.emit("    negl %eax");
+                }
+                self.state.emit("    movl %ecx, %edx");
+                true
+            }
+            _ => {
+                let ad = d.unsigned_abs();
+                self.emit_sdiv_magic_core(ad);
+                // q in %edx, n in %ecx. r = n - q*|d|.
+                if !self.try_emit_mul_imm_reg("edx", "eax", ad as i64) {
+                    emit!(self.state, "    imull ${}, %edx, %eax", ad as i32);
+                }
+                self.state.emit("    subl %eax, %ecx");
+                self.state.emit("    movl %edx, %eax");
+                if d < 0 {
+                    self.state.emit("    negl %eax");
+                }
+                self.state.emit("    movl %ecx, %edx");
+                true
+            }
+        }
     }
 
     /// Compute a 32-bit int binop straight into the destination's register,
@@ -712,9 +810,20 @@ impl I686Codegen {
             }
         }
 
-        // Immediate multiply
+        // Immediate multiply. A register-homed lhs is read in place (the
+        // linear scan guarantees the register holds the value, exactly as
+        // direct_reg_src_ref relies on), which turns `movl %r,%eax; imull
+        // $c,%eax,%eax` into a src != dest LEA chain from %r into %eax.
         if op == IrBinOp::Mul {
             if let Some(imm) = Self::const_as_imm32(rhs) {
+                if let Some(BinopLoc::Reg(src)) = self.binop_loc(lhs) {
+                    if !self.try_emit_mul_imm_reg(src, "eax", imm) {
+                        emit!(self.state, "    imull ${}, %{}, %eax", imm, src);
+                    }
+                    self.state.reg_cache.invalidate_acc();
+                    self.store_eax_to(dest);
+                    return;
+                }
                 self.operand_to_eax(lhs);
                 if !self.try_emit_mul_imm_reg("eax", "eax", imm) {
                     emit!(self.state, "    imull ${}, %eax, %eax", imm);
@@ -930,24 +1039,39 @@ impl I686Codegen {
         let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
         let self_is_div = matches!(op, IrBinOp::UDiv | IrBinOp::SDiv);
         self.operand_to_eax(lhs);
-        let rhs_ref: String = if let Operand::Value(rv) = rhs {
-            match self.div_rhs_direct_ref(rv) {
-                Some(r) => r,
-                None => {
-                    self.operand_to_ecx(rhs);
-                    "%ecx".to_string()
-                }
+        // Constant divisor (speed builds): ONE magic-number sequence yields
+        // q in %eax and r = n - q*d in %edx — the same register split as
+        // `divl`, so the store logic below is shared. Unsigned divisors
+        // >= 2^31 come through as negative imm32 and take the `divl` path
+        // (imm == 0 is UB and traps there too, matching C).
+        let folded = if !self.optimize_for_size {
+            match Self::const_as_imm32(rhs) {
+                Some(d) if d != 0 && (signed || d > 0) => self.emit_divrem_const_in_eax_edx(signed, d),
+                _ => false,
             }
         } else {
-            self.operand_to_ecx(rhs);
-            "%ecx".to_string()
+            false
         };
-        if signed {
-            self.state.emit("    cltd");
-            emit!(self.state, "    idivl {}", rhs_ref);
-        } else {
-            self.state.emit("    xorl %edx, %edx");
-            emit!(self.state, "    divl {}", rhs_ref);
+        if !folded {
+            let rhs_ref: String = if let Operand::Value(rv) = rhs {
+                match self.div_rhs_direct_ref(rv) {
+                    Some(r) => r,
+                    None => {
+                        self.operand_to_ecx(rhs);
+                        "%ecx".to_string()
+                    }
+                }
+            } else {
+                self.operand_to_ecx(rhs);
+                "%ecx".to_string()
+            };
+            if signed {
+                self.state.emit("    cltd");
+                emit!(self.state, "    idivl {}", rhs_ref);
+            } else {
+                self.state.emit("    xorl %edx, %edx");
+                emit!(self.state, "    divl {}", rhs_ref);
+            }
         }
         self.state.reg_cache.invalidate_acc();
 
@@ -1016,5 +1140,280 @@ impl I686Codegen {
             self.store_eax_to(&div_dest);
         }
         true
+    }
+}
+
+// ── Multiply-by-constant synthesis ───────────────────────────────────────────
+
+/// One step of a synthesised `dest = src * imm` chain. `src` is never
+/// written; `dest` is the accumulator. Steps that read `src` are only
+/// generated when `src != dest` (see `synth_mul`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum MulStep {
+    /// `movl %src, %dest`                  dest = src            (init)
+    Mov,
+    /// `leal (%src,%src,k), %dest`        dest = src * (k+1)    (init)
+    LeaSrcSrc(u8),
+    /// `leal (,%src,k), %dest`            dest = src * k        (init, 7 bytes)
+    LeaScaleSrc(u8),
+    /// `leal (%dest,%dest,k), %dest`      dest *= (k+1)
+    LeaSelf(u8),
+    /// `leal (%src,%dest,k), %dest`       dest = src + dest * k
+    LeaSrcPlus(u8),
+    /// `shll $k, %dest`                   dest <<= k
+    Shl(u8),
+    /// `addl %dest, %dest`                dest *= 2
+    AddSelf,
+    /// `addl %src, %dest`                 dest += src
+    AddSrc,
+    /// `subl %src, %dest`                 dest -= src
+    SubSrc,
+    /// `negl %dest`                       dest = -dest
+    Neg,
+}
+
+impl MulStep {
+    /// Encoded size in bytes for 32-bit operands without REX (what the
+    /// tie-break minimises once the instruction count is minimal).
+    fn bytes(self) -> u32 {
+        match self {
+            MulStep::Mov | MulStep::AddSelf | MulStep::AddSrc | MulStep::SubSrc | MulStep::Neg => 2,
+            MulStep::LeaSrcSrc(_) | MulStep::LeaSelf(_) | MulStep::LeaSrcPlus(_) | MulStep::Shl(_) => 3,
+            MulStep::LeaScaleSrc(_) => 7,
+        }
+    }
+}
+
+/// Find the cheapest chain of ≤ `budget` single-cycle steps computing
+/// `dest = src * imm` (mod 2^32), or `None` when `imull` should be used.
+///
+/// * `same`: src and dest are the same register — only in-place steps
+///   (LeaSelf / Shl / AddSelf / Neg) are admissible and the chain starts
+///   from dest == src.
+/// * `allow_scale_lea`: admit the 7-byte `leal (,%src,k)` form (speed
+///   builds only; at -Os `imull` is smaller).
+///
+/// Cost model: primary = instruction count (each step is 1c latency and one
+/// µop; `imull r32,imm` is 3c/1 µop, so a 2-step chain wins on latency and a
+/// 3-step chain is admitted only when it starts with a rename-eliminated
+/// `movl`), secondary = encoded bytes. Iterative deepening keeps the search
+/// tiny (≤ ~20k nodes for budget 3) and results are memoised per
+/// (imm, same, budget, allow_scale_lea), so the cost per multiply is a hash
+/// lookup after the first occurrence.
+pub(super) fn synth_mul(imm: u32, same: bool, budget: usize, allow_scale_lea: bool) -> Option<Vec<MulStep>> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static MEMO: RefCell<HashMap<(u32, bool, usize, bool), Option<Vec<MulStep>>>> =
+            RefCell::new(HashMap::new());
+    }
+    let key = (imm, same, budget, allow_scale_lea);
+    if let Some(hit) = MEMO.with(|m| m.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let result = synth_mul_uncached(imm, same, budget, allow_scale_lea);
+    MEMO.with(|m| m.borrow_mut().insert(key, result.clone()));
+    result
+}
+
+fn synth_mul_uncached(imm: u32, same: bool, budget: usize, allow_scale_lea: bool) -> Option<Vec<MulStep>> {
+    if imm == 0 {
+        return None; // caller emits xorl
+    }
+    if same && imm == 1 {
+        return Some(Vec::new());
+    }
+    struct Search {
+        target: u32,
+        same: bool,
+        allow_scale_lea: bool,
+        best: Option<(u32, Vec<MulStep>)>,
+        path: Vec<MulStep>,
+    }
+    impl Search {
+        fn consider(&mut self) {
+            let bytes: u32 = self.path.iter().map(|s| s.bytes()).sum();
+            if self.best.as_ref().is_none_or(|(b, _)| bytes < *b) {
+                self.best = Some((bytes, self.path.clone()));
+            }
+        }
+        fn go(&mut self, cur: Option<u32>, depth: usize) {
+            if cur == Some(self.target) {
+                // A 3-step chain must start with a rename-eliminated mov so
+                // its dependent latency stays at two cycles.
+                if self.path.len() < 3 || self.path.first() == Some(&MulStep::Mov) {
+                    self.consider();
+                }
+                return;
+            }
+            if depth == 0 {
+                return;
+            }
+            let mut step = |s: &mut Search, st: MulStep, next: u32| {
+                s.path.push(st);
+                s.go(Some(next), depth - 1);
+                s.path.pop();
+            };
+            match cur {
+                None => {
+                    step(self, MulStep::Mov, 1);
+                    for k in [1u8, 2, 4, 8] {
+                        step(self, MulStep::LeaSrcSrc(k), 1 + k as u32);
+                    }
+                    if self.allow_scale_lea {
+                        for k in [2u8, 4, 8] {
+                            step(self, MulStep::LeaScaleSrc(k), k as u32);
+                        }
+                    }
+                }
+                Some(c) => {
+                    for k in [2u8, 4, 8] {
+                        step(self, MulStep::LeaSelf(k), c.wrapping_mul(1 + k as u32));
+                    }
+                    step(self, MulStep::AddSelf, c.wrapping_mul(2));
+                    // Shifts that do not overflow past the 32-bit target
+                    // magnitude; k = 1 is `addl d,d` (shorter).
+                    let lz = c.leading_zeros();
+                    for k in 2..=lz.min(31) as u8 {
+                        step(self, MulStep::Shl(k), c << k);
+                    }
+                    step(self, MulStep::Neg, c.wrapping_neg());
+                    if !self.same {
+                        for k in [1u8, 2, 4, 8] {
+                            step(self, MulStep::LeaSrcPlus(k), c.wrapping_mul(k as u32).wrapping_add(1));
+                        }
+                        step(self, MulStep::AddSrc, c.wrapping_add(1));
+                        step(self, MulStep::SubSrc, c.wrapping_sub(1));
+                    }
+                }
+            }
+        }
+    }
+    let mut s = Search {
+        target: imm,
+        same,
+        allow_scale_lea,
+        best: None,
+        path: Vec::new(),
+    };
+    for depth in 1..=budget {
+        s.go(if same { Some(1) } else { None }, depth);
+        if let Some((_, chain)) = s.best.take() {
+            return Some(chain);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod synth_mul_tests {
+    use super::{synth_mul, MulStep};
+
+    /// Interpret a chain symbolically: returns the multiple of `src` held in
+    /// `dest` (mod 2^32), and checks the src/dest aliasing contract.
+    fn eval(chain: &[MulStep], same: bool) -> u32 {
+        let mut d: Option<u32> = if same { Some(1) } else { None };
+        for &st in chain {
+            d = Some(match (st, d) {
+                (MulStep::Mov, None) => 1,
+                (MulStep::LeaSrcSrc(k), None) => 1 + k as u32,
+                (MulStep::LeaScaleSrc(k), None) => k as u32,
+                (MulStep::LeaSelf(k), Some(c)) => c.wrapping_mul(1 + k as u32),
+                (MulStep::LeaSrcPlus(k), Some(c)) => {
+                    assert!(!same, "LeaSrcPlus reads src after dest was written");
+                    c.wrapping_mul(k as u32).wrapping_add(1)
+                }
+                (MulStep::Shl(k), Some(c)) => c << k,
+                (MulStep::AddSelf, Some(c)) => c.wrapping_mul(2),
+                (MulStep::AddSrc, Some(c)) => {
+                    assert!(!same);
+                    c.wrapping_add(1)
+                }
+                (MulStep::SubSrc, Some(c)) => {
+                    assert!(!same);
+                    c.wrapping_sub(1)
+                }
+                (MulStep::Neg, Some(c)) => c.wrapping_neg(),
+                other => panic!("ill-formed chain step {:?}", other),
+            });
+        }
+        d.expect("empty chain only legal for same && imm == 1")
+    }
+
+    #[test]
+    fn every_admitted_chain_is_correct_and_within_budget() {
+        let mut consts: Vec<i64> = (-300..=1100).collect();
+        consts.extend([0x7FFF_FFFF, -0x8000_0000, 0x1_0000, 0x1_0001, 0xFFFF, 0x0101_0101, 16777619]);
+        for &c in &consts {
+            let imm = c as u32;
+            for same in [false, true] {
+                for budget in 1..=3 {
+                    for scale in [false, true] {
+                        if let Some(chain) = synth_mul(imm, same, budget, scale) {
+                            assert!(chain.len() <= budget, "{c}: {chain:?}");
+                            if chain.len() == 3 {
+                                assert_eq!(chain[0], MulStep::Mov, "{c}: 3-step chain must start with mov");
+                            }
+                            if !scale {
+                                assert!(!chain.iter().any(|s| matches!(s, MulStep::LeaScaleSrc(_))));
+                            }
+                            assert_eq!(eval(&chain, same), imm, "{c} same={same} chain={chain:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_gcc_and_llvm_canonical_forms() {
+        // Speed, src != dest, budget 3 (direct-to-dest path).
+        let f = |c: i64| synth_mul(c as u32, false, 3, true).unwrap();
+        assert_eq!(f(3), vec![MulStep::LeaSrcSrc(2)]);
+        assert_eq!(f(5), vec![MulStep::LeaSrcSrc(4)]);
+        assert_eq!(f(9), vec![MulStep::LeaSrcSrc(8)]);
+        assert_eq!(f(4), vec![MulStep::LeaScaleSrc(4)]);
+        // 7 = x + 2*(3x): two fast LEAs (6 bytes) — GCC's `leal (,x,8); subl` is 9 bytes.
+        assert_eq!(f(7), vec![MulStep::LeaSrcSrc(2), MulStep::LeaSrcPlus(2)]);
+        assert_eq!(f(11), vec![MulStep::LeaSrcSrc(4), MulStep::LeaSrcPlus(2)]);
+        assert_eq!(f(13), vec![MulStep::LeaSrcSrc(2), MulStep::LeaSrcPlus(4)]);
+        assert_eq!(f(15), vec![MulStep::LeaSrcSrc(2), MulStep::LeaSelf(4)]);
+        // 17 = x + 8*(2x): two LEAs beat GCC's mov/sal/add.
+        assert_eq!(f(17), vec![MulStep::LeaSrcSrc(1), MulStep::LeaSrcPlus(8)]);
+        // 33 = 32x + x needs the shift: mov (eliminated) + shl + add.
+        assert_eq!(f(33), vec![MulStep::Mov, MulStep::Shl(5), MulStep::AddSrc]);
+        assert_eq!(f(31), vec![MulStep::Mov, MulStep::Shl(5), MulStep::SubSrc]);
+        assert_eq!(f(24), vec![MulStep::LeaSrcSrc(2), MulStep::Shl(3)]);
+        assert_eq!(f(-3), vec![MulStep::LeaSrcSrc(2), MulStep::Neg]);
+        assert_eq!(f(45), vec![MulStep::LeaSrcSrc(4), MulStep::LeaSelf(8)]);
+        assert_eq!(f(73), vec![MulStep::LeaSrcSrc(8), MulStep::LeaSrcPlus(8)]);
+        assert_eq!(f(-1), vec![MulStep::Mov, MulStep::Neg]);
+        // No cheap chain: imull stays (23 = 24x - x would be three dependent
+        // non-mov steps = imull latency with 3x the µops).
+        assert!(synth_mul(23, false, 3, true).is_none());
+        assert!(synth_mul(0x9E37_79B9, false, 3, true).is_none());
+        assert!(synth_mul(1000, false, 3, true).is_none());
+    }
+
+    #[test]
+    fn in_place_and_size_policies() {
+        // In place (same register): no src reads, budget 2.
+        let g = |c: i64| synth_mul(c as u32, true, 2, true);
+        assert_eq!(g(1), Some(vec![]));
+        assert_eq!(g(2), Some(vec![MulStep::AddSelf]));
+        assert_eq!(g(4), Some(vec![MulStep::Shl(2)]));
+        assert_eq!(g(16), Some(vec![MulStep::Shl(4)]));
+        assert_eq!(g(6), Some(vec![MulStep::LeaSelf(2), MulStep::AddSelf]));
+        assert_eq!(g(10), Some(vec![MulStep::LeaSelf(4), MulStep::AddSelf]));
+        assert_eq!(g(12), Some(vec![MulStep::LeaSelf(2), MulStep::Shl(2)]));
+        assert_eq!(g(25), Some(vec![MulStep::LeaSelf(4), MulStep::LeaSelf(4)]));
+        assert_eq!(g(-1), Some(vec![MulStep::Neg]));
+        assert_eq!(g(7), None);
+        assert_eq!(g(11), None);
+        // -Os: single instruction, no 7-byte LEA.
+        assert_eq!(synth_mul(4, false, 1, false), None);
+        assert_eq!(synth_mul(4, true, 1, false), Some(vec![MulStep::Shl(2)]));
+        assert_eq!(synth_mul(3, false, 1, false), Some(vec![MulStep::LeaSrcSrc(2)]));
+        assert_eq!(synth_mul(6, true, 1, false), None);
     }
 }

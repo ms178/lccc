@@ -608,11 +608,16 @@ pub(crate) fn compute_i686_divrem_pairs(
             } = inst
             {
                 if div_flavor(*op).is_some() && is_gpr32_ty(ty) {
-                    // Constant-RHS divisions NEVER pair: the emitters may
-                    // strength-reduce them to magic sequences, so the RA
-                    // model ("tail emits nothing, head emits the divide")
-                    // would not describe the emitted code.
-                    if !matches!(rhs, Operand::Const(_)) {
+                    // i686: constant divisors pair too: the head folds the
+                    // pair into ONE magic-number sequence (q in %eax, r in
+                    // %edx, `emit_divrem_const_in_eax_edx`) or, at -Os, one
+                    // `divl $imm`-staged division. Both clobber exactly the
+                    // {%eax,%ecx,%edx} set the RA model already charges a
+                    // constant-divisor division with, and the tail still
+                    // emits nothing, so the model stays exact. Other
+                    // targets keep the non-constant rule (their IR-level
+                    // div_by_const pass owns constant divisors).
+                    if target == DivRemTarget::I686 || !matches!(rhs, Operand::Const(_)) {
                         cands.push((ii, *op, lhs, rhs, is_signed(*op), dest.0));
                     }
                 }
@@ -5583,7 +5588,8 @@ fn collect_i686_scratch_hazard_points_refined(
 
     // Same-block div/rem pair tails emit no code (the head stored both
     // results); see compute_i686_divrem_pairs for the soundness model.
-    // Constant-RHS divisions never pair, so the model is exact.
+    // Constant-RHS pairs fold at the head with the same clobber set as a
+    // staged `divl`, so the model is exact for them too.
     let divrem_pairs = match divrem_target_for_current_arch() {
         Some(t) => compute_i686_divrem_pairs(func, t),
         None => I686DivRemPairs {
@@ -5644,9 +5650,10 @@ fn collect_i686_scratch_hazard_points_refined(
             // Fused same-block div/rem pairs: the TAIL instruction emits
             // nothing (its result was stored by the head's dual-store
             // emission earlier in the block), so it is a hazard for neither
-            // %ecx nor %edx. Conservative constant rule: only non-constant
-            // RHS pairs — those can never fall back to the magic-number
-            // path that would break the fusion.
+            // %ecx nor %edx. Constant-RHS pairs are fused by the head's
+            // constant fold (one magic sequence yields both results), so
+            // the tail is clean for them as well; the head keeps the
+            // "constant divisor: never clean" rule below.
             let divrem_tail = divrem_pairs.tail_points.contains(&(bi, ii));
             let (ecx_clean, edx_clean) = match inst {
                 Instruction::BinOp { op, ty, rhs, .. }
