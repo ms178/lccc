@@ -138,6 +138,11 @@ pub(super) mod parsed_attr_flag {
     pub const PURE: u32 = 1 << 20;
     /// `__attribute__((const))` encountered.
     pub const CONST_ATTR: u32 = 1 << 21;
+    /// A `const` qualifier appeared AFTER a `*` in the declarator, i.e. the
+    /// POINTER itself is const (`T *const p`), not the pointee (`const T *p`).
+    /// Tracked separately from `CONST` because `Declaration::is_const()`
+    /// describes the pointee for pointer declarators.
+    pub const POINTER_CONST: u32 = 1 << 22;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -216,6 +221,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_const(&self) -> bool {
         self.flags & parsed_attr_flag::CONST != 0
+    }
+    #[inline]
+    pub fn parsing_pointer_const(&self) -> bool {
+        self.flags & parsed_attr_flag::POINTER_CONST != 0
     }
     #[inline]
     pub fn parsing_volatile(&self) -> bool {
@@ -307,6 +316,10 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn set_const(&mut self, v: bool) {
         self.set_flag(parsed_attr_flag::CONST, v)
+    }
+    #[inline]
+    pub fn set_pointer_const(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::POINTER_CONST, v)
     }
     #[inline]
     pub fn set_volatile(&mut self, v: bool) {
@@ -931,7 +944,17 @@ impl Parser {
         loop {
             match self.peek() {
                 TokenKind::Const | TokenKind::Restrict => {
+                    let was_const = matches!(self.peek(), TokenKind::Const);
                     self.advance();
+                    // `skip_cv_qualifiers` is called right after each `*` in a
+                    // declarator, so a `const` seen here qualifies the POINTER
+                    // (`T *const p`), not the pointee.  Record it: such a
+                    // variable is genuinely read-only and, when its initializer
+                    // needs a relocation, must be placed in `.data.rel.ro`
+                    // rather than `.data` (see `classify_global`).
+                    if was_const {
+                        self.attrs.set_pointer_const(true);
+                    }
                 }
                 TokenKind::Volatile => {
                     self.advance();

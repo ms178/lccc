@@ -461,11 +461,40 @@ impl Lowerer {
             }
             _ => da.actual_alloc_size,
         };
-        // For pointer variables, decl.is_const refers to the pointee type, not the pointer.
-        let var_is_const = decl.is_const()
+        // For pointer variables, decl.is_const refers to the pointee type, not
+        // the pointer, so `const char *p` must NOT be treated as a read-only
+        // object -- `p` itself is writable.
+        //
+        // `char *const p` is the opposite case: the POINTER is read-only.  The
+        // parser records that separately (`decl_flag::POINTER_CONST`, set from
+        // a `const` seen after a `*` in the declarator) because the two cannot
+        // be distinguished from `is_const()` alone.
+        //
+        // The distinction matters beyond diagnostics: `classify_global` sends a
+        // const global whose initializer needs a relocation to `.data.rel.ro`,
+        // and a non-const one to `.data`.  Under -fPIE a pointer initialized
+        // with the address of a string literal needs a relocation, so getting
+        // this wrong emits an absolute R_X86_64_64 into writable `.data`, which
+        // becomes a run-time `.rela.dyn` entry at link time.
+        //
+        // linux-cachymod 6.18.47 caught this in
+        // `lib/zstd/common/error_private.c`:
+        //
+        //     static const char* const notErrorCode = "Unspecified error code";
+        //
+        // Inlined into the boot decompressor, it produced one R_X86_64_64 in
+        // `.rela.data`, and the kernel's own link-time check rejected the
+        // image:
+        //
+        //     ld: Unexpected run-time relocations (.rela) detected!
+        //
+        // GCC constant-folds the same declaration into direct PC-relative
+        // references and emits no data object at all.
+        let var_is_const = (decl.is_const()
             && !da.is_pointer
             && !da.is_array_of_pointers
-            && !da.is_array_of_func_ptrs;
+            && !da.is_array_of_func_ptrs)
+            || (decl.is_pointer_const() && da.is_pointer);
 
         self.emitted_global_names.insert(declarator.name.clone());
         // Honour the declaration's asm label (`extern int x __asm("abccb"); int x = 1;`

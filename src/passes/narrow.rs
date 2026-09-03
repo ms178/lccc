@@ -155,11 +155,78 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
         });
     }
 
+    // Values consumed by (or produced by) an `asm` operand must keep the
+    // width the front end recorded in `InlineAsm::operand_types`.
+    //
+    // The backend allocates each asm operand's home from that declared type
+    // and emits the corresponding move width.  Narrowing the PRODUCER of an
+    // asm input changes only the store, never the asm's own load, so the two
+    // disagree: the value is stored with `movl` (4 bytes) and read back with
+    // `movq` (8 bytes), pulling four bytes of unrelated stack into the
+    // operand register.
+    //
+    // Found building linux-cachymod 6.18.47:
+    // `arch/x86/boot/compressed/string.c`'s `____memcpy`
+    //
+    //     asm volatile("rep movsq\n\t movq %4,%%rcx\n\t rep movsb"
+    //                  : "=&c"(d0), "=&D"(d1), "=&S"(d2)
+    //                  : "0"(n >> 3), "g"(n & 7), "1"(dest), "2"(src)
+    //                  : "memory");
+    //
+    // Phase 5 narrowed `n & 7` (a single-use 64-bit AND) to 32 bits, so the
+    // generated code stored `movl %eax,28(%rsp)` but the asm read
+    // `movq 28(%rsp),%rdx`.  The garbage upper half became `%rcx` for the
+    // trailing `rep movsb`, which then copied ~2^32 bytes.  In userspace that
+    // is an immediate SIGSEGV; in the kernel's decompression stub it silently
+    // corrupted the output buffer and the boot died with "ZSTD-compressed
+    // data is corrupt" (`decompress_kernel -> zstd_decompress_dctx ->
+    // handle_zstd_error -> error`).
+    //
+    // The narrowing itself is a legitimate optimization; what is illegal is
+    // doing it to a value whose width is part of an opaque ABI contract with
+    // hand-written assembly.  `asm` operands are exactly that, so pin them.
+    let mut asm_pinned: Vec<bool> = vec![false; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::InlineAsm {
+                outputs, inputs, ..
+            } = inst
+            {
+                for (_, value, _) in outputs {
+                    let idx = value.0 as usize;
+                    if idx < asm_pinned.len() {
+                        asm_pinned[idx] = true;
+                    }
+                }
+                for (_, operand, _) in inputs {
+                    if let Operand::Value(value) = operand {
+                        let idx = value.0 as usize;
+                        if idx < asm_pinned.len() {
+                            asm_pinned[idx] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut narrowed_map: Vec<Option<IrType>> = vec![None; max_id + 1];
 
-    changes +=
-        narrow_binops_with_cast(func, &binop_map, &use_counts, &widen_map, &mut narrowed_map);
-    changes += narrow_binops_without_cast(func, &use_counts, &widen_map, &mut narrowed_map);
+    changes += narrow_binops_with_cast(
+        func,
+        &binop_map,
+        &use_counts,
+        &widen_map,
+        &mut narrowed_map,
+        &asm_pinned,
+    );
+    changes += narrow_binops_without_cast(
+        func,
+        &use_counts,
+        &widen_map,
+        &mut narrowed_map,
+        &asm_pinned,
+    );
     changes += narrow_through_stores(func, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
@@ -561,6 +628,7 @@ fn narrow_binops_with_cast(
     use_counts: &[u32],
     widen_map: &[Option<CastInfo>],
     narrowed_map: &mut [Option<IrType>],
+    asm_pinned: &[bool],
 ) -> usize {
     let max_id = narrowed_map.len() - 1;
     let mut changes = 0;
@@ -635,6 +703,16 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
+                // Never rewrite a value that an `asm` operand names, nor
+                // produce a narrowed result into one: the operand's width is
+                // fixed by `InlineAsm::operand_types` and the backend sizes
+                // its home accordingly (see `asm_pinned` in `narrow_function`).
+                if (src_id < asm_pinned.len() && asm_pinned[src_id])
+                    || ((dest.0 as usize) < asm_pinned.len() && asm_pinned[dest.0 as usize])
+                {
+                    continue;
+                }
+
                 let narrow_lhs =
                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
                 let narrow_rhs =
@@ -674,6 +752,7 @@ fn narrow_binops_without_cast(
     use_counts: &[u32],
     widen_map: &[Option<CastInfo>],
     narrowed_map: &mut [Option<IrType>],
+    asm_pinned: &[bool],
 ) -> usize {
     if crate::common::types::target_is_32bit() {
         return 0;
@@ -710,6 +789,14 @@ fn narrow_binops_without_cast(
                 }
                 let dest_id = dest.0 as usize;
                 if dest_id >= use_counts.len() || use_counts[dest_id] != 1 {
+                    continue;
+                }
+                // An `asm` operand's width is an ABI contract with hand-written
+                // assembly (see `asm_pinned` in `narrow_function`): the backend
+                // sizes the operand's home from `InlineAsm::operand_types`, so
+                // narrowing its producer makes the store and the asm's load
+                // disagree.  (kernel `____memcpy`: `movl` store vs `movq` load.)
+                if dest_id < asm_pinned.len() && asm_pinned[dest_id] {
                     continue;
                 }
                 // Only bitwise ops are safe without an explicit narrowing Cast.

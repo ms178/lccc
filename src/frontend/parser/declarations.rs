@@ -140,6 +140,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(ExternalDecl::Declaration(d));
         }
@@ -766,6 +767,7 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_common(ctx.is_common);
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
@@ -787,6 +789,7 @@ impl Parser {
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
         self.attrs.set_volatile(false);
+        self.attrs.set_pointer_const(false);
         self.attrs.parsing_address_space = AddressSpace::Default;
         let type_spec = self.parse_type_specifier()?;
 
@@ -826,6 +829,7 @@ impl Parser {
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
             d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
             return Some(d);
         }
@@ -938,6 +942,7 @@ impl Parser {
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
         d.set_volatile(self.attrs.parsing_volatile());
+        d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
         Some(d)

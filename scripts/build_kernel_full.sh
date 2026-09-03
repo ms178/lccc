@@ -101,4 +101,8 @@ targets=("$@")
 if (( ${#targets[@]} == 0 )); then
   targets=(vmlinux)
 fi
-exec make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" as="$LCCC" -j"$JOBS" "${targets[@]}"
+# `AS` (uppercase) is the Kbuild assembler variable; the previous lowercase
+# `as=` was a plain (ignored) make variable, so .S files silently used the host
+# binutils `as` instead of LCCC.  Kbuild drives .S files through $(CC) anyway,
+# but AS is consumed by a handful of arch rules and must be consistent.
+exec make ARCH=x86_64 CC="$LCCC" LD="$LCCC_LD" AS="$LCCC" -j"$JOBS" "${targets[@]}"

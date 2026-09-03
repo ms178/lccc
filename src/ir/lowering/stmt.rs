@@ -601,11 +601,27 @@ impl Lowerer {
         // For struct initializers emitted as byte arrays, set element type to I8
         let global_ty = da.resolve_global_ty(&init);
 
-        // For pointer variables, decl.is_const refers to the pointee type, not the variable.
-        let var_is_const = decl.is_const()
+        // Function-scope statics get the same const classification as
+        // file-scope globals -- see the long comment in
+        // `global_decl.rs::lower_global_decl`.  `decl.is_const()` describes the
+        // POINTEE for pointer declarators, while `T *const p` (the pointer
+        // itself read-only) is carried separately by `is_pointer_const()`.
+        //
+        // This is the path that matters for the case that motivated the fix,
+        // because the declaration is inside a function:
+        //
+        //     static const char* const notErrorCode = "Unspecified error code";
+        //         -- lib/zstd/common/error_private.c, ERR_getErrorString()
+        //
+        // Misclassifying it as non-const put it in `.data` with an absolute
+        // R_X86_64_64 relocation, and the kernel's boot-decompressor link
+        // rejected the result with
+        //   "ld: Unexpected run-time relocations (.rela) detected!".
+        let var_is_const = (decl.is_const()
             && !da.is_pointer
             && !da.is_array_of_pointers
-            && !da.is_array_of_func_ptrs;
+            && !da.is_array_of_func_ptrs)
+            || (decl.is_pointer_const() && da.is_pointer);
 
         self.emitted_global_names.insert(static_name.clone());
         self.module.globals.push(IrGlobal {

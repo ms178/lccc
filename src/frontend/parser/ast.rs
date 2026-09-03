@@ -319,6 +319,9 @@ pub mod decl_flag {
     /// Used to implement C99 6.7.4p7: a function provides an external definition
     /// only if not ALL file-scope declarations include `inline`.
     pub const INLINE: u16 = 1 << 8;
+    /// The POINTER itself is const (`T *const p`), as opposed to `CONST`
+    /// which describes the pointee for pointer declarators.
+    pub const POINTER_CONST: u16 = 1 << 9;
 }
 
 /// A variable/type declaration.
@@ -426,6 +429,15 @@ impl Declaration {
     #[inline]
     pub fn set_volatile(&mut self, v: bool) {
         self.set_flag(decl_flag::VOLATILE, v)
+    }
+    #[inline]
+    pub fn set_pointer_const(&mut self, v: bool) {
+        self.set_flag(decl_flag::POINTER_CONST, v)
+    }
+    /// True for `T *const p`: the pointer object itself is read-only.
+    #[inline]
+    pub fn is_pointer_const(&self) -> bool {
+        self.flags & decl_flag::POINTER_CONST != 0
     }
     #[inline]
     pub fn set_common(&mut self, v: bool) {

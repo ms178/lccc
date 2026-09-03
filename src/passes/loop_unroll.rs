@@ -1392,8 +1392,62 @@ fn try_complete_unroll_two_block(
     func.next_value_id = next_val;
 
     func.blocks[header].terminator = Terminator::Branch(labels[0]);
-    func.blocks[latch].terminator = Terminator::Branch(exit_target);
+    // The latch is now UNREACHABLE: the header branches into the clone chain
+    // and the chain's last block branches straight to `exit_target`, so no
+    // edge reaches the latch any more.
+    //
+    // This used to be `Branch(exit_target)`, which fabricated a control-flow
+    // edge latch->exit that the *program* does not have.  The latch was only
+    // ever a predecessor of the header (its terminator is checked to be
+    // `Branch(header_label)` above), never of the exit, so any phi in the
+    // exit block acquired a predecessor it had no incoming for.  That is a
+    // hard SSA violation, and it is exactly what the IR verifier reported on
+    // linux-cachymod 6.18.47 `drivers/gpu/drm/i915/display/intel_sprite.c`:
+    //
+    //   after `loop_unroll_post_vec` in `vlv_sprite_update_arm`:
+    //     phi v904 has an incoming from BlockId(94080), which is not a
+    //     predecessor (real predecessors: [93725, 94081, 94090])
+    //     phi v904 has no incoming for predecessor BlockId(94090)
+    //
+    // Downstream, v904 reached x86 codegen with no register home and no stack
+    // slot, and `operand_to_rax`'s hard gate aborted the compile ("refusing to
+    // fabricate a value").  Before that gate existed this same shape silently
+    // emitted `xorl %eax,%eax` — i.e. a miscompile.  Marking the block
+    // `Unreachable` states the truth; DCE/CFG-simplify then delete it.
+    func.blocks[latch].terminator = Terminator::Unreachable;
     let _ = (body_entry, exit_cond_positive);
+
+    // Repair the exit block's phis.  The `header -> exit_target` edge is gone
+    // (the header now branches into the clone chain); the block that reaches
+    // the exit is the LAST CLONE, `labels[trip - 1]`.  Every phi incoming
+    // still labelled `header_label` must therefore be relabelled to that
+    // clone, otherwise it names a non-predecessor and the real predecessor
+    // has no incoming at all.
+    //
+    // Only the LABEL changes, never the operand: the substitution sweep below
+    // visits every block outside `lp.body` -- the exit block included -- and
+    // rewrites the IV to `final_iv` and each carried phi to its final clone
+    // value, which are precisely the values live on that edge.
+    //
+    // A phi incoming labelled `latch_label` cannot exist here (the latch's
+    // terminator was verified to be `Branch(header_label)`), but drop any such
+    // entry defensively rather than leave a dangling predecessor behind.
+    {
+        let last_clone = labels[(trip - 1) as usize];
+        if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
+            for inst in func.blocks[exit_bi].instructions.iter_mut() {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    continue;
+                };
+                incoming.retain(|(_, lbl)| *lbl != latch_label);
+                for (_, lbl) in incoming.iter_mut() {
+                    if *lbl == header_label {
+                        *lbl = last_clone;
+                    }
+                }
+            }
+        }
+    }
 
     // `final_iv_n` was already computed and overflow-checked above, before
     // any CFG mutation — a second check here would bail with the header and
@@ -2361,16 +2415,47 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
             }
         }
 
+        // Predecessors the exit block already had that are NOT the header and
+        // NOT one of the new exit-check blocks.  An exit block is very often a
+        // control-flow JOIN — `if (cond) { for (...) ... }` merges the loop's
+        // exit with the skip path — and such a block has predecessors that the
+        // unroll knows nothing about.  A phi inserted here must still supply an
+        // incoming for every one of them or it is malformed (the verifier
+        // reports "phi vN has no incoming for predecessor BlockId(M)").
+        //
+        // On those edges the loop never ran, so the live value is exactly the
+        // one that reached the exit before the unroll: `dest` itself (the
+        // header phi's SSA name, which on a non-loop path still holds its
+        // pre-loop definition).  That is the same operand used for the header
+        // edge, so reuse it.
+        let foreign_preds: Vec<BlockId> = {
+            let exit_label = func.blocks[exit_idx].label;
+            let ec_set: FxHashSet<BlockId> = ec_labels.iter().copied().collect();
+            func.blocks
+                .iter()
+                .filter(|b| {
+                    b.label != header_label
+                        && !ec_set.contains(&b.label)
+                        && crate::pgo::branch_prob::successors(&b.terminator).contains(&exit_label)
+                })
+                .map(|b| b.label)
+                .collect()
+        };
+
         for (dest, edges, pty) in &need {
             if existing.contains_key(&dest.0) {
                 continue; // Step 5 already threaded this phi's edges
             }
             let new_phi = Value(next_val);
             next_val += 1;
-            let mut incoming: Vec<(Operand, BlockId)> = Vec::with_capacity(num_new + 1);
+            let mut incoming: Vec<(Operand, BlockId)> =
+                Vec::with_capacity(num_new + 1 + foreign_preds.len());
             incoming.push((Operand::Value(*dest), header_label));
             for (j, ev) in edges.iter().enumerate() {
                 incoming.push((ev.clone(), ec_labels[j]));
+            }
+            for fp in &foreign_preds {
+                incoming.push((Operand::Value(*dest), *fp));
             }
             func.blocks[exit_idx].instructions.insert(
                 0,
@@ -2643,6 +2728,237 @@ mod tests {
 
         func.next_value_id = 11; // 0–10 used (10 = arr placeholder)
         func
+    }
+
+    /// `make_counting_loop`, but the loop is entered CONDITIONALLY and the
+    /// exit block is a join carrying a phi.
+    ///
+    /// This is the shape the plain `make_counting_loop` cannot express and
+    /// therefore could not test: with an unconditional loop the exit block has
+    /// a single predecessor and no phi at all, so nothing in the exit block
+    /// records which block reaches it.  Once the exit block DOES carry a phi,
+    /// the complete unroller's CFG rewrite must keep that phi's predecessor
+    /// labels in sync:
+    ///
+    ///   * the `header -> exit` edge disappears (the header now branches into
+    ///     the clone chain), so the header-labelled incoming must be
+    ///     relabelled to the LAST CLONE, which is the block that actually
+    ///     reaches the exit; and
+    ///   * the latch must NOT be given a fabricated `latch -> exit` edge — its
+    ///     only successor was the header, so after the rewrite it is
+    ///     unreachable.
+    ///
+    /// Layout:
+    ///   B0 preheader -> cond ? B1 (loop header) : B5 (skip)
+    ///   B1 header -> B2 body -> B3 latch -> B1,  header exits to B4
+    ///   B5 skip   -> B4
+    ///   B4 exit: phi [ Value(20) from B1 (header), Value(21) from B5 ]
+    fn make_conditional_counting_loop_with_exit_phi(n_val: i32) -> IrFunction {
+        make_conditional_counting_loop_with_exit_phi_impl(n_val, true)
+    }
+
+    fn make_conditional_counting_loop_with_exit_phi_impl(
+        n_val: i32,
+        const_iv_init: bool,
+    ) -> IrFunction {
+        let mut func = make_counting_loop(n_val);
+
+        // `try_complete_unroll_two_block` requires a LITERAL constant IV init
+        // on the non-latch incoming (it constant-folds the trip count before
+        // it will touch the CFG).  `make_counting_loop` feeds the phi
+        // `Value(0)` -- a Copy of 0 in the preheader -- which routes the
+        // fixture to the partial unroller instead.  Use the constant directly
+        // so BOTH complete-unroll and partial-unroll paths are exercised.
+        if const_iv_init {
+        if let Some(Instruction::Phi { incoming, .. }) = func.blocks[1]
+            .instructions
+            .iter_mut()
+            .find(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == 1))
+        {
+            for (op, lbl) in incoming.iter_mut() {
+                if *lbl == BlockId(0) {
+                    *op = Operand::Const(IrConst::I32(0));
+                }
+            }
+        }
+        }
+
+        // B0 becomes a conditional dispatch into the loop or around it.
+        func.blocks[0].instructions.push(Instruction::Cmp {
+            dest: Value(11),
+            op: IrCmpOp::Slt,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        func.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(11)),
+            true_label: BlockId(1),
+            false_label: BlockId(5),
+        };
+
+        // Two values that reach the join from the two paths.  v20 is defined
+        // in the PREHEADER, not the header: a header's phis must remain the
+        // first instructions in the block, so a Copy inserted ahead of them
+        // would itself be a (different) structural violation.
+        func.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(20),
+            src: Operand::Const(IrConst::I32(7)),
+        });
+
+        // B5: the skip path.
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![Instruction::Copy {
+                dest: Value(21),
+                src: Operand::Const(IrConst::I32(9)),
+            }],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+
+        // B4 (exit) gains the join phi.
+        let exit_bi = func
+            .blocks
+            .iter()
+            .position(|b| b.label == BlockId(4))
+            .expect("exit block");
+        func.blocks[exit_bi].instructions.insert(
+            0,
+            Instruction::Phi {
+                dest: Value(22),
+                ty: IrType::I32,
+                incoming: vec![
+                    (Operand::Value(Value(20)), BlockId(1)),
+                    (Operand::Value(Value(21)), BlockId(5)),
+                ],
+            },
+        );
+        func.blocks[exit_bi].terminator = Terminator::Return(Some(Operand::Value(Value(22))));
+
+        func.next_value_id = 23;
+        func
+    }
+
+    /// Sibling of `complete_unroll_repairs_exit_block_phi_labels` for the
+    /// PARTIAL unroller (`do_unroll`).
+    ///
+    /// Routing: `try_complete_unroll_two_block` only fires when the IV's
+    /// non-latch incoming is a literal `Const` (it folds the trip count before
+    /// touching the CFG).  Leaving the fixture's `Copy v0 = 0` preheader init
+    /// in place therefore sends the loop down the partial-unroll path instead,
+    /// which is a genuinely different rewrite: it builds a chain of
+    /// exit-check blocks, each of which becomes a NEW predecessor of the exit
+    /// block, and synthesises fresh exit phis for the IV and every carried
+    /// value (Step 5b).
+    ///
+    /// Those synthesised phis used to list only the header edge and the new
+    /// exit-check edges.  When the exit block is a JOIN — `if (cond) { for
+    /// (...) ... }`, the overwhelmingly common shape — it also has
+    /// predecessors from outside the loop entirely, and the new phi had no
+    /// incoming for any of them:
+    ///
+    ///   phi v44 has no incoming for predecessor BlockId(5)
+    ///
+    /// On such an edge the loop never executed, so the correct value is the
+    /// one that reached the exit before the unroll: the header phi's own SSA
+    /// name.
+    #[test]
+    fn partial_unroll_exit_phi_covers_preexisting_predecessors() {
+        // Trip counts large enough that complete unrolling would be refused
+        // anyway (>16), so this exercises `do_unroll` even if the routing
+        // condition above is ever relaxed.
+        for trip in [40i32, 100, 257] {
+            let mut func = make_conditional_counting_loop_with_exit_phi_impl(trip, false);
+            unroll_loops(&mut func);
+
+            let mut violations = Vec::new();
+            crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
+            assert!(
+                violations.is_empty(),
+                "trip={trip} left malformed IR after partial unrolling:\n{}",
+                violations
+                    .iter()
+                    .map(|v| format!("  {v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+    }
+
+    /// Regression: complete unrolling must repair the EXIT block's phi
+    /// predecessor labels.
+    ///
+    /// Found building linux-cachymod 6.18.47 with lccc:
+    /// `drivers/gpu/drm/i915/display/intel_sprite.c`'s `vlv_sprite_update_gamma`
+    /// (`for (i = 1; i < 8 - 1; i++)`) inlined into `vlv_sprite_update_arm`.
+    /// `CCC_VERIFY_IR=1` reported the exit phi naming the header — no longer a
+    /// predecessor — while the real predecessor had no incoming.  The value
+    /// then reached x86 ISel with no register home and no stack slot and
+    /// `operand_to_rax`'s hard gate aborted the build.  Before that gate
+    /// existed the same shape silently emitted `xorl %eax,%eax`: a miscompile.
+    ///
+    /// The trip counts below all take the 2-or-3-block complete-unroll path
+    /// (`try_complete_unroll_two_block`); 6 is the i915 loop's own trip count.
+    #[test]
+    fn complete_unroll_repairs_exit_block_phi_labels() {
+        for trip in [2i32, 3, 4, 6, 8] {
+            let mut func = make_conditional_counting_loop_with_exit_phi(trip);
+            unroll_loops(&mut func);
+
+            let mut violations = Vec::new();
+            crate::passes::verify::verify_function(&func, "unroll_loops", &mut violations);
+            assert!(
+                violations.is_empty(),
+                "trip={trip} left malformed IR after unrolling:\n{}",
+                violations
+                    .iter()
+                    .map(|v| format!("  {v}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+
+            // Directly assert the two facts the verifier encodes, so a future
+            // weakening of the verifier cannot silently un-cover this bug.
+            let succs: Vec<(BlockId, Vec<BlockId>)> = func
+                .blocks
+                .iter()
+                .map(|b| (b.label, crate::pgo::branch_prob::successors(&b.terminator)))
+                .collect();
+            let exit = func
+                .blocks
+                .iter()
+                .find(|b| b.label == BlockId(4))
+                .expect("exit block survives");
+            let real_preds: Vec<BlockId> = succs
+                .iter()
+                .filter(|(_, ss)| ss.contains(&BlockId(4)))
+                .map(|(l, _)| *l)
+                .collect();
+            for inst in &exit.instructions {
+                let Instruction::Phi { dest, incoming, .. } = inst else {
+                    continue;
+                };
+                for (_, lbl) in incoming {
+                    assert!(
+                        real_preds.contains(lbl),
+                        "trip={trip}: exit phi v{} names {:?}, not a predecessor \
+                         (real predecessors: {:?})",
+                        dest.0,
+                        lbl,
+                        real_preds
+                    );
+                }
+                for pred in &real_preds {
+                    assert!(
+                        incoming.iter().any(|(_, l)| l == pred),
+                        "trip={trip}: exit phi v{} has no incoming for predecessor {:?}",
+                        dest.0,
+                        pred
+                    );
+                }
+            }
+        }
     }
 
     #[test]
