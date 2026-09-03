@@ -688,6 +688,13 @@ enum GepOffset {
     Index(u32),
 }
 
+/// Hard bound on the number of address links one folded access may walk up
+/// (`GEP(GEP(GEP(p,+a),+b),+c)` ...). The backend composes const chains into a
+/// single `disp(%base)` and can carry at most one variable index, so real
+/// chains are short; the bound only exists to keep the walk finite if the IR
+/// ever contains a cycle.
+const MAX_GEP_CHAIN_LINKS: usize = 64;
+
 /// Keep GEP/Add bases (and variable indices) live at the Load/Store that
 /// folds them into an addressing mode. Mirrors `build_gep_fold_map`.
 fn extend_gep_base_liveness(
@@ -776,38 +783,75 @@ fn extend_gep_base_liveness(
         return FxHashSet::default();
     }
 
-    // A GEP dest used as anything other than a (non-i128) Load/Store pointer
-    // is not foldable — don't fake a use of the base there.
-    let mut non_foldable: FxHashSet<u32> = FxHashSet::default();
+    // ── Which GEP dests can the backend actually absorb? ───────────────────
+    //
+    // A GEP dest is foldable only if the backend can absorb it into the
+    // addressing mode of *every* consumer. Two use kinds are absorbable:
+    //
+    //   1. the `ptr` of a foldable (non-i128) Load/Store — the access reads
+    //      `disp(%base)` (or `disp(%base,%idx,scale)`) directly;
+    //   2. the `base` / variable `offset` of ANOTHER foldable GEP — a const
+    //      chain `GEP(GEP(p, +32), +16)` is composed by the backend into the
+    //      single displacement `48(%p)` (`compose_const_gep_folds`), so the
+    //      register the access reads is the ROOT `p`, not the intermediate.
+    //
+    // Anything else (call argument, stored value, Cmp operand, terminator
+    // operand, i128 access, ...) materialises the address and is a hard
+    // non-fold use.  Kind (2) is only absorbable while its consumer stays
+    // foldable, so foldability is a fixed point over the address-link graph.
+    //
+    // The pre-session-30 code treated kind (2) as non-foldable and extended
+    // only the IMMEDIATE base of a folded access.  For a chain of depth >= 2
+    // that left the root's last use at the first GEP — before an inlined
+    // callee body that (legally, per IR liveness) recycled the root's
+    // register while the folded accesses still read it: sqlite3.50
+    // `sqlite3FindIndex` inlines `sqlite3HashFind`/`findElementWithHash`, the
+    // `strHash` loop takes the register holding `pSchema`, and
+    // `pSchema->idxHash.ht` then dereferences the key pointer (SIGSEGV at
+    // -O1; -O2 hides it because the allocation differs).
+    let mut hard_bad: FxHashSet<u32> = FxHashSet::default();
+    // address-link value -> GEP dests that consume it as `base`/`offset`.
+    let mut link_users: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
                 Instruction::Load { ptr, ty, .. } => {
                     if matches!(ty, IrType::I128 | IrType::U128) && gep_info.contains_key(&ptr.0) {
-                        non_foldable.insert(ptr.0);
+                        hard_bad.insert(ptr.0);
                     }
                 }
                 Instruction::Store { val, ptr, ty, .. } => {
                     if let Operand::Value(v) = val {
                         if gep_info.contains_key(&v.0) {
-                            non_foldable.insert(v.0);
+                            hard_bad.insert(v.0);
                         }
                     }
                     if matches!(ty, IrType::I128 | IrType::U128) && gep_info.contains_key(&ptr.0) {
-                        non_foldable.insert(ptr.0);
+                        hard_bad.insert(ptr.0);
+                    }
+                }
+                Instruction::GetElementPtr { dest, base, offset, .. } => {
+                    if gep_info.contains_key(&base.0) {
+                        link_users.entry(base.0).or_default().push(dest.0);
+                    }
+                    if let Operand::Value(off) = offset {
+                        if gep_info.contains_key(&off.0) {
+                            link_users.entry(off.0).or_default().push(dest.0);
+                        }
                     }
                 }
                 _ => {
                     for_each_operand_in_instruction(inst, |op| {
                         if let Operand::Value(v) = op {
                             if gep_info.contains_key(&v.0) {
-                                non_foldable.insert(v.0);
+                                hard_bad.insert(v.0);
                             }
                         }
                     });
                     for_each_value_use_in_instruction(inst, |v| {
                         if gep_info.contains_key(&v.0) {
-                            non_foldable.insert(v.0);
+                            hard_bad.insert(v.0);
                         }
                     });
                 }
@@ -816,24 +860,50 @@ fn extend_gep_base_liveness(
         for_each_operand_in_terminator(&block.terminator, |op| {
             if let Operand::Value(v) = op {
                 if gep_info.contains_key(&v.0) {
-                    non_foldable.insert(v.0);
+                    hard_bad.insert(v.0);
                 }
             }
         });
     }
-    for id in &non_foldable {
-        gep_info.remove(id);
+
+    // Foldability fixed point. Dropping a dest re-exposes the bases it
+    // consumed as ordinary (non-fold) uses, so iterate until stable.
+    let mut foldable: FxHashSet<u32> = gep_info.keys().copied().collect();
+    loop {
+        let mut dropped: Vec<u32> = Vec::new();
+        for &d in &foldable {
+            let materialised = hard_bad.contains(&d)
+                || link_users
+                    .get(&d)
+                    .is_some_and(|users| users.iter().any(|u| !foldable.contains(u)));
+            if materialised {
+                dropped.push(d);
+            }
+        }
+        if dropped.is_empty() {
+            break;
+        }
+        for d in dropped {
+            foldable.remove(&d);
+        }
     }
+    gep_info.retain(|dest, _| foldable.contains(dest));
     if gep_info.is_empty() {
         return FxHashSet::default();
     }
 
-    // Collect the folded base/index values: every folded Load/Store reads
-    // them at its own program point, so their effective use count is far
-    // higher than the raw operand walk records. The allocator uses this set
-    // to rank them fairly (otherwise a hot-loop base with one recorded use
-    // loses its register and every folded access reloads it).
+    // Collect the folded base/index values: every folded Load/Store reads them
+    // at its own program point, so their effective use count is far higher
+    // than the raw operand walk records. The allocator uses this set to rank
+    // them fairly (otherwise a hot-loop base with one recorded use loses its
+    // register and every folded access reloads it).
     let mut folded_bases: FxHashSet<u32> = FxHashSet::default();
+    // Debug A/B: `CCC_GEP_CHAIN_LIVENESS_DEPTH=1` restores the pre-session-30
+    // immediate-base-only extension.
+    let max_links: usize = match std::env::var("CCC_GEP_CHAIN_LIVENESS_DEPTH").ok() {
+        Some(v) => v.parse().unwrap_or(MAX_GEP_CHAIN_LINKS),
+        None => MAX_GEP_CHAIN_LINKS,
+    };
 
     let mut block_point: u32 = 0;
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -843,23 +913,50 @@ fn extend_gep_base_liveness(
                 _ => None,
             };
             if let Some(ptr_id) = ptr_id {
-                if let Some(&(base_id, ref offset)) = gep_info.get(&ptr_id) {
-                    extend_use_following_copies(
-                        base_id,
-                        block_point,
-                        bi,
-                        alloca_set,
-                        id_to_dense,
-                        def_points,
-                        &(block_start_points[bi], block_end_points[bi]),
-                        copy_src,
-                        last_use_points,
-                        block_gen,
-                    );
-                    folded_bases.insert(base_id);
-                    if let GepOffset::Index(idx_id) = *offset {
+                if gep_info.contains_key(&ptr_id) {
+                    // Walk the WHOLE composed chain: `GEP(GEP(p,+32),+16)` is
+                    // emitted as `48(%p)`, so `p` — not only the immediate
+                    // base — is read at this access. Stop before a link the
+                    // backend cannot fold into one addressing mode (a second
+                    // variable index, or a displacement that leaves the i32
+                    // disp range): that link is materialised into its own
+                    // register, whose def/use the raw walk already records.
+                    let mut cur = ptr_id;
+                    let mut disp: i64 = 0;
+                    let mut indices: usize = 0;
+                    let mut hops: usize = 0;
+                    while hops < max_links {
+                        let Some(&(base_id, ref offset)) = gep_info.get(&cur) else {
+                            break;
+                        };
+                        if let GepOffset::Index(idx_id) = *offset {
+                            if indices > 0 {
+                                break;
+                            }
+                            indices += 1;
+                            extend_use_following_copies(
+                                idx_id,
+                                block_point,
+                                bi,
+                                alloca_set,
+                                id_to_dense,
+                                def_points,
+                                &(block_start_points[bi], block_end_points[bi]),
+                                copy_src,
+                                last_use_points,
+                                block_gen,
+                            );
+                            folded_bases.insert(idx_id);
+                        } else if let GepOffset::Const(off) = *offset {
+                            match disp.checked_add(off) {
+                                Some(d) if (i32::MIN as i64..=i32::MAX as i64).contains(&d) => {
+                                    disp = d;
+                                }
+                                _ => break,
+                            }
+                        }
                         extend_use_following_copies(
-                            idx_id,
+                            base_id,
                             block_point,
                             bi,
                             alloca_set,
@@ -870,7 +967,13 @@ fn extend_gep_base_liveness(
                             last_use_points,
                             block_gen,
                         );
-                        folded_bases.insert(idx_id);
+                        folded_bases.insert(base_id);
+                        hops += 1;
+                        if gep_info.contains_key(&base_id) {
+                            cur = base_id;
+                        } else {
+                            break;
+                        }
                     }
                 }
             }

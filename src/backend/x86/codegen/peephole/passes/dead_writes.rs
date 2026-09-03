@@ -185,6 +185,26 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
         for f in &addr_fams {
             addr_mask |= 1u16 << f;
         }
+        // A load whose destination is one of its OWN address registers
+        // destroys its address operand: `movq (%r15), %r15` leaves %r15
+        // holding the loaded value, not the address. A later load with the
+        // same textual memory operand therefore reads a DIFFERENT location
+        // (the value loaded here), so this load can never be a reuse source
+        // for it. The per-line `addr_mask` invalidation below cannot catch
+        // this: it only inspects lines AFTER the load, and the clobber is
+        // the load itself.
+        //
+        // Found by scripts/gen_gep_chain_stress.py (seed 12, -O2): a hash
+        // bucket walk emitted
+        //     leaq 8(%r11), %r15     # &b->chain
+        //     movq (%r15), %r15      # chain   <- dst == addr
+        //     movq (%r15), %r12      # chain[0]
+        // and the third instruction was rewritten to `movq %r15, %r12`,
+        // returning the `char **` instead of the string it points at.
+        if addr_fams.contains(&dst_fam) {
+            i += 1;
+            continue;
+        }
         let dst_mask = 1u16 << dst_fam;
         let mem_owned = mem.to_string();
         let dst_owned = dst.to_string();
