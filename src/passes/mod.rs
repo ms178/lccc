@@ -1589,6 +1589,28 @@ module.for_each_function(dce::eliminate_dead_code);
             total_changes_excl_dce += n;
         }
 
+        // Redundant zero-guard elimination for Clz/Ctz. If-conversion turns a
+        // guarded `x ? __builtin_clz(x) : width` ternary (the k09_clz `lz`
+        // kernel shape) into a Select whose intrinsic arm ALREADY yields the
+        // width constant at zero — the IR defines Clz(0)/Ctz(0) == operand
+        // width. Collapsing the Select onto the intrinsic arm stops codegen
+        // from re-selecting the same answer and emitting the dead cmov tail
+        // after the bsr/bsf zero fix-up. Idempotent; shares the simplify
+        // disable switch.
+        if !pass_disabled(&disabled, "simplify") {
+            let n = timed_pass!(
+                "bitop_zero_guard_fold",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    simplify::remove_redundant_bitop_guards
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 7b: Range-check folding.
         // (x >= lo && x <= hi) -> (unsigned)(x - lo) <= (hi - lo), and the
         // complement (x < lo || x > hi) -> (unsigned)(x - lo) > (hi - lo).

@@ -290,6 +290,30 @@ impl X86Codegen {
     }
 
     pub(super) fn emit_global_store_rip_rel_impl(&mut self, val: &Operand, sym: &str, ty: IrType) {
+        // Constant-immediate direct store: `movX $imm, sym(%rip)`. Without this
+        // arm EVERY constant store to a global — even `g = 5` — relayed the
+        // value through %rax (`movabsq $imm,%rax; movX %eax, sym(%rip)`), and
+        // unsigned 32-bit constants above i32::MAX could never take the direct
+        // form at all. `direct_store_imm` is the same raw-field width contract
+        // the base-register/stack destinations apply (GCC/Clang both emit the
+        // single movl for `g = 3041712678u`).
+        if let Operand::Const(c) = val {
+            if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+                if let Some(imm) = c.to_i64() {
+                    if let Some(imm_print) = super::memory::direct_store_imm(imm, ty) {
+                        let store_instr = Self::mov_store_for_type(ty);
+                        self.state.emit_fmt(format_args!(
+                            "    {} ${}, {}(%rip)",
+                            store_instr, imm_print, sym
+                        ));
+                        self.state.reg_cache.invalidate_all();
+                        self.flush_pending_vec_store_impl();
+                        self.state.invalidate_vec_peephole();
+                        return;
+                    }
+                }
+            }
+        }
         // Register-direct: store directly from val register, skip operand_to_rax.
         if let Operand::Value(v) = val {
             if let Some(v_reg) = self.reg_assignments.get(&v.0).copied() {

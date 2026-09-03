@@ -5,6 +5,42 @@ use crate::backend::state::{SlotAddr, StackSlot};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
+/// Printable immediate for a direct `movX $imm, <mem>` store that stages
+/// nothing through %rax.
+///
+/// x86 stores take an immediate field of the STORE's width: `movb`/`movw`/
+/// `movl` encode raw {8,16,32}-bit values (the same raw-field width contract
+/// the MachInst emitter applies on its narrow fast path), so for every store
+/// width <= 4 bytes ANY constant is directly encodable once truncated to the
+/// destination width — including unsigned 32-bit constants like 3041712678
+/// whose value sits above `i32::MAX` (the historical gate here rejected
+/// them, forcing the `movabsq $imm,%rax; movl %eax,addr` relay that PR #364's
+/// direct path only removed for the MachInst side). A 64-bit store cannot
+/// take a full imm64 to memory, so it still needs the sign-extended imm32
+/// form or the accumulator relay.
+pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64> {
+    if ty.is_float() || matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
+        return None;
+    }
+    if ty.size() >= 8 {
+        // 64-bit destinations: only `movq $imm32` (sign-extended) is legal.
+        return (imm >= i32::MIN as i64 && imm <= i32::MAX as i64).then_some(imm);
+    }
+    // Narrow destinations: keep the historical signed spelling when the
+    // value fits an imm32 (small negatives print like GCC's `movl $-1`),
+    // otherwise print the value truncated to the destination's raw field.
+    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+        Some(imm)
+    } else {
+        let mask: i64 = match ty.size() {
+            1 => 0xff,
+            2 => 0xffff,
+            _ => 0xffff_ffff,
+        };
+        Some(imm & mask)
+    }
+}
+
 impl X86Codegen {
     /// S11: soundness gate for raw SIB-index use of `reg_assignments`.
     ///
@@ -673,9 +709,13 @@ impl X86Codegen {
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128 | IrType::F128) {
             if let Operand::Const(c) = val {
                 if let Some(imm) = c.to_i64() {
-                    // Only use immediate form when value fits in i32 (x86 mov mem,imm limitation)
-                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
-                        if self.try_emit_const_store(imm as i32, ptr, ty) {
+                    // Direct `movX $imm, ADDR` is legal whenever the value
+                    // fits the store's immediate field — for narrow stores
+                    // that is EVERY constant (see `direct_store_imm`), which
+                    // removes the `movabsq $imm,%rax; movX %eax,ADDR` relay
+                    // for unsigned 32-bit constants above i32::MAX too.
+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
+                        if self.try_emit_const_store(imm_print, ptr, ty) {
                             return;
                         }
                     }
@@ -775,7 +815,9 @@ impl X86Codegen {
 
     /// Try to emit a constant-immediate store: `movX $IMM, ADDR`.
     /// Bypasses the accumulator entirely, saving 1-3 instructions.
-    fn try_emit_const_store(&mut self, imm: i32, ptr: &Value, ty: IrType) -> bool {
+    /// `imm` is the print value already validated by [`direct_store_imm`]:
+    /// its low `store width` bits are exactly the bytes the store writes.
+    fn try_emit_const_store(&mut self, imm: i64, ptr: &Value, ty: IrType) -> bool {
         let store_instr = Self::mov_store_for_type(ty);
         let addr = self.state.resolve_slot_addr(ptr.0);
 
@@ -786,7 +828,7 @@ impl X86Codegen {
                 out.write_str("    ");
                 out.write_str(store_instr);
                 out.write_str(" $");
-                out.write_i64(imm as i64);
+                out.write_i64(imm);
                 out.write_str(", ");
                 if out.use_rsp_addressing {
                     out.write_i64(out.rsp_frame_size + slot.0);
@@ -1226,9 +1268,14 @@ impl X86Codegen {
         if !ty.is_float() && !matches!(ty, IrType::I128 | IrType::U128) {
             if let Operand::Const(c) = val {
                 if let Some(imm) = c.to_i64() {
-                    if imm >= i32::MIN as i64 && imm <= i32::MAX as i64 {
+                    // The folded-offset destination accepts the same raw-field
+                    // immediates as a base-register store (see
+                    // `direct_store_imm`): fold `$imm`, offset AND the store
+                    // width into one memory operand. Unsigned 32-bit constants
+                    // above i32::MAX previously took the
+                    // `movabsq $imm,%rax; movl %eax, off(%reg)` relay here.
+                    if let Some(imm_print) = direct_store_imm(imm, ty) {
                         let store_instr = Self::mov_store_for_type(ty);
-                        let imm32 = imm as i32;
                         let addr = self.state.resolve_slot_addr(base.0);
                         match addr {
                             Some(SlotAddr::Direct(slot)) => {
@@ -1237,7 +1284,7 @@ impl X86Codegen {
                                 out.write_str("    ");
                                 out.write_str(store_instr);
                                 out.write_str(" $");
-                                out.write_i64(imm32 as i64);
+                                out.write_i64(imm_print);
                                 out.write_str(", ");
                                 if out.use_rsp_addressing {
                                     out.write_i64(out.rsp_frame_size + folded_slot.0);
@@ -1263,12 +1310,12 @@ impl X86Codegen {
                                     if offset != 0 {
                                         self.state.emit_fmt(format_args!(
                                             "    {} ${}, {}(%{})",
-                                            store_instr, imm32, offset, reg_name
+                                            store_instr, imm_print, offset, reg_name
                                         ));
                                     } else {
                                         self.state.emit_fmt(format_args!(
                                             "    {} ${}, (%{})",
-                                            store_instr, imm32, reg_name
+                                            store_instr, imm_print, reg_name
                                         ));
                                     }
                                 } else {
@@ -1278,7 +1325,7 @@ impl X86Codegen {
                                     }
                                     self.state.emit_fmt(format_args!(
                                         "    {} ${}, (%rcx)",
-                                        store_instr, imm32
+                                        store_instr, imm_print
                                     ));
                                 }
                                 self.state.reg_cache.invalidate_all();
@@ -1297,12 +1344,12 @@ impl X86Codegen {
                                     if offset != 0 {
                                         self.state.emit_fmt(format_args!(
                                             "    {} ${}, {}(%{})",
-                                            store_instr, imm32, offset, reg_name
+                                            store_instr, imm_print, offset, reg_name
                                         ));
                                     } else {
                                         self.state.emit_fmt(format_args!(
                                             "    {} ${}, (%{})",
-                                            store_instr, imm32, reg_name
+                                            store_instr, imm_print, reg_name
                                         ));
                                     }
                                     self.state.reg_cache.invalidate_all();
@@ -1321,7 +1368,7 @@ impl X86Codegen {
                                 }
                                 self.state.emit_fmt(format_args!(
                                     "    {} ${}, (%rcx)",
-                                    store_instr, imm32
+                                    store_instr, imm_print
                                 ));
                                 self.state.reg_cache.invalidate_all();
                                 self.flush_pending_vec_store_impl();

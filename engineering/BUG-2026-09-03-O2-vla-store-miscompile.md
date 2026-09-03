@@ -193,3 +193,43 @@ Closed by: this branch's `tests/regression/vla_largeconst_u32_fill.c` +
 upstream's `tests/regression/vla_narrow_const_store_family.c` + `run_slot_stress`
 default range now 1..45 (both upstream and this branch: 720/720 four-way /
 900/900 incl. -O0/-Os).
+
+---
+
+## Addendum (same day, after PR #364 merged as `77eb34e1`): relay eliminated from the default emitters
+
+After upstream merged the above two layers (#363 sized relay + #364 MachInst raw-width fast path) as
+`77eb34e1`, the **default/mature** emitters still relayed constant stores: on `77eb34e1` a `-O2` build
+emitted `movabsq $3041712678, %rax; movl %eax, ga(%rip)` for a global store and, with
+`CCC_MI_ALL_CLASSIC=1`, relayed **every** constant store (even `ga[0] = 7`). The relay was correct but
+two instructions, clobbered `%rax`, and kept a width hazard alive in the very code that must not have
+one. The raw-width principle of the MachInst fast path now also governs the mature emitters (commit
+`cd049d7a`):
+
+* `memory.rs` — `pub(super) direct_store_imm(imm, ty)` centralises the raw-field contract; the main
+  scalar const-store caller, the const-offset GEP store arm, and `try_emit_const_store` store directly.
+* `globals.rs` — direct `movX $imm, sym(%rip)` arm at the head of `emit_global_store_rip_rel_impl`.
+
+Post-fix `-O2` A/B on pristine `77eb34e1` vs this branch (default mode):
+
+```
+f(unsigned *p){ p[1]=3041712678u; p[2]=2147483648u; }
+  77eb34e1:  movl $4294967295,(%rdi); movabsq $3041712678,%rax; movl %eax,4(%rdi);
+             movabsq $2147483648,%rax; movl %eax,8(%rdi)
+  branch:    movl $4294967295,(%rdi); movl $3041712678,4(%rdi); movl $2147483648,8(%rdi); ret
+
+g(){ ga[0]=3041712678u; ga[1]=4294967295u; }
+  77eb34e1:  movabsq $3041712678,%rax; movl %eax,ga(%rip); movabsq $4294967295,%rax; movl %eax,ga+4(%rip)
+  branch:    movl $3041712678,ga(%rip); movl $4294967295,ga+4(%rip); ret
+
+k(){ ga[2]=7; ga[3]=5; }          # even small constants relayed to globals on 77eb34e1
+  77eb34e1:  movl $7,%eax; movl %eax,ga+8(%rip); movl $5,%eax; movl %eax,ga+12(%rip)
+  branch:    movl $7,ga+8(%rip); movl $5,ga+12(%rip); ret
+```
+
+Under `CCC_MI_ALL_CLASSIC=1` upstream relayed even `0xFFFFFFFF` for register-homed stores; the branch
+is direct in both text paths. Runtime parity GCC/upstream/branch: identical (`ok=1`). A direct sized
+`mov` truncates by hardware to exactly the destination width, so the over-wide-store class cannot
+re-enter through these emitters by construction. Pinned by `tests/regression/wide_const_imm_stores.c`
+(differential vs GCC) and `tests/regression/check_wide_const_imm_stores.sh` (asserts no `movabsq`
+relay, direct `movl $3041712678, ga(%rip)` etc., passes in default and `CCC_MI_ALL_CLASSIC` modes).
