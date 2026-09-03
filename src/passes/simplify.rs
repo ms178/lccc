@@ -103,6 +103,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
+    let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max_id + 1];
     let mut value_types: Vec<Option<IrType>> = vec![None; max_id + 1];
     // Track values known to be boolean (0 or 1). This includes Cmp results
     // and bitwise And/Or/Xor of boolean values.
@@ -270,14 +271,23 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                         },
                     );
                 }
-                Instruction::UnaryOp {
-                    dest,
-                    op: IrUnaryOp::Neg,
-                    src,
-                    ..
-                } => {
-                    set_def(&mut neg_defs, dest.0, NegDef { src: *src });
-                }
+                Instruction::UnaryOp { dest, op, src, ty } => match op {
+                    IrUnaryOp::Neg => {
+                        set_def(&mut neg_defs, dest.0, NegDef { src: *src });
+                    }
+                    IrUnaryOp::Clz | IrUnaryOp::Ctz => {
+                        set_def(
+                            &mut unary_defs,
+                            dest.0,
+                            UnaryDef {
+                                op: *op,
+                                src: *src,
+                                ty: *ty,
+                            },
+                        );
+                    }
+                    _ => {}
+                },
                 Instruction::Call { func, info } => {
                     if matches!(
                         func.as_str(),
@@ -389,6 +399,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &cmp_defs,
                 &binop_defs,
                 &neg_defs,
+                &unary_defs,
                 &is_boolean,
                 &value_types,
                 &use_counts,
@@ -451,6 +462,221 @@ struct NegDef {
     src: Operand,
 }
 
+/// Cached information about a UnaryOp::Clz / UnaryOp::Ctz instruction.
+/// The IR defines Clz(0)/Ctz(0) == operand width, which lets a guarded
+/// ternary `x ? clz(x) : width` collapse onto the bare intrinsic.
+#[derive(Clone, Copy)]
+struct UnaryDef {
+    op: IrUnaryOp,
+    src: Operand,
+    ty: IrType,
+}
+
+/// Peel integer->integer Cast chains (optionally only same-carrier-size
+/// casts — used on the condition/clz-operand side, where only a same-size
+/// cast is guaranteed to preserve zero-ness) off an operand.
+fn peel_int_cast_chain(mut op: Operand, cast_defs: &[Option<CastDef>], same_size_only: bool) -> Operand {
+    for _ in 0..32 {
+        let Operand::Value(v) = op else { break };
+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() && (!same_size_only
+                || from_ty.size() == to_ty.size()) =>
+            {
+                op = *src;
+            }
+            _ => break,
+        }
+    }
+    op
+}
+
+/// Redundant zero-guard select elimination for the bit intrinsics.
+///
+/// `select(cond != 0 → t, else W)` where `t` is a Clz/Ctz result chain over
+/// `x`, the condition selects the intrinsic arm exactly when `x` is nonzero,
+/// and `W` equals the intrinsic's operand width collapses onto `t`: the IR
+/// defines Clz(0)/Ctz(0) == width, so `t` already yields `W` in the zero
+/// case. This is the shape C sources write as `x ? __builtin_clz(x) : 32`
+/// (and the bsr/bsf clz lowering already provides the zero answer, so the
+/// emitted codegen otherwise duplicates the zero fix-up as a dead cmov).
+///
+/// Public entry point for the dedicated pass placed right after if-conversion
+/// (which *creates* the Select form from a branchy ternary only after the
+/// generic simplify sweep has already run in the same pipeline iteration).
+pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
+    let max = func.max_value_id() as usize + 1;
+    let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
+    let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => {
+                    if (dest.0 as usize) < cast_defs.len() {
+                        cast_defs[dest.0 as usize] = Some(CastDef {
+                            src: *src,
+                            from_ty: *from_ty,
+                            to_ty: *to_ty,
+                        });
+                    }
+                }
+                Instruction::UnaryOp { dest, op, src, ty }
+                    if matches!(op, IrUnaryOp::Clz | IrUnaryOp::Ctz) =>
+                {
+                    if (dest.0 as usize) < unary_defs.len() {
+                        unary_defs[dest.0 as usize] = Some(UnaryDef {
+                            op: *op,
+                            src: *src,
+                            ty: *ty,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            match inst {
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    if let Some(t) = clz_ctz_zero_guard_replacement(
+                        cond,
+                        true_val,
+                        false_val,
+                        &cast_defs,
+                        &unary_defs,
+                    ) {
+                        *inst = Instruction::Copy {
+                            dest: *dest,
+                            src: t,
+                        };
+                        changes += 1;
+                    }
+                }
+                // The select collapse above exposes the pre-existing round
+                // trip that wrapped the intrinsic arm to the select's (wider)
+                // carrier type: sext(clz(x)) i32->i64 followed by a truncate
+                // back to i32. Truncate(sext(v)) == v for every v, so the
+                // round trip is exact; for a Clz/Ctz root the intermediate
+                // sign-extension is additionally never needed (results are
+                // non-negative). Fold it onto the intrinsic result, keeping
+                // the types consistent (the outer trunc's destination type
+                // equals the intrinsic result type).
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                }
+                    if from_ty.is_integer()
+                        && to_ty.is_integer()
+                        && from_ty.size() > to_ty.size() =>
+                {
+                    if let Operand::Value(s) = src {
+                        if let Some(Some(inner)) = cast_defs.get(s.0 as usize) {
+                            let is_round_trip = inner.to_ty == *from_ty
+                                && inner.from_ty == *to_ty;
+                            let root = peel_int_cast_chain(inner.src, &cast_defs, true);
+                            let bitop_root = match root {
+                                Operand::Value(rv) => matches!(
+                                    unary_defs.get(rv.0 as usize).and_then(|d| d.as_ref()),
+                                    Some(UnaryDef {
+                                        op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
+                                        ..
+                                    })
+                                ),
+                                _ => false,
+                            };
+                            if is_round_trip && bitop_root {
+                                *inst = Instruction::Copy {
+                                    dest: *dest,
+                                    src: inner.src,
+                                };
+                                changes += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changes
+}
+
+/// Core predicate + rewrite of the redundant zero-guard pattern. Returns the
+/// operand the select should collapse onto (the intrinsic arm), or None when
+/// the select is not provably redundant.
+fn clz_ctz_zero_guard_replacement(
+    cond: &Operand,
+    true_val: &Operand,
+    false_val: &Operand,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+) -> Option<Operand> {
+    let Operand::Value(_) = cond else { return None };
+    // Walk the true arm through its integer cast chain (value-preserving for
+    // the small clz/ctz results) to the intrinsic.
+    let mut cur = *true_val;
+    let found = loop {
+        let Operand::Value(v) = cur else { break None };
+        if let Some(Some(UnaryDef {
+            op: IrUnaryOp::Clz | IrUnaryOp::Ctz,
+            ..
+        })) = unary_defs.get(v.0 as usize)
+        {
+            break Some(v);
+        }
+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() => cur = *src,
+            _ => break None,
+        }
+    };
+    let root = found?;
+    let UnaryDef { op, src, ty } = *unary_defs[root.0 as usize].as_ref()?;
+    if !ty.is_integer() {
+        return None;
+    }
+    let bits = ty.size() as u128 * 8;
+    // The zero-case constant must be exactly the intrinsic width.
+    let false_imm = match false_val {
+        Operand::Const(c) => c.to_i128(),
+        _ => None,
+    };
+    if false_imm != Some(bits as i128) {
+        return None;
+    }
+    // The condition must select the intrinsic arm exactly when its operand is
+    // nonzero (same value up to zero-ness-preserving casts).
+    if peel_int_cast_chain(*cond, cast_defs, true)
+        != peel_int_cast_chain(src, cast_defs, true)
+    {
+        return None;
+    }
+    Some(*true_val)
+}
+
 /// Cached information about a BinOp instruction for constant reassociation.
 /// We only store BinOps where at least one operand is a constant, since
 /// reassociation requires folding two constants together.
@@ -483,6 +709,7 @@ fn try_simplify_with_types(
     cmp_defs: &[Option<CmpDef>],
     binop_defs: &[Option<BinOpDef>],
     neg_defs: &[Option<NegDef>],
+    unary_defs: &[Option<UnaryDef>],
     is_boolean: &[bool],
     value_types: &[Option<IrType>],
     use_counts: &[u32],
@@ -591,6 +818,18 @@ fn try_simplify_with_types(
                     });
                 }
             }
+            // select(cond != 0 -> clz/ctz(x), else W) => clz/ctz(x): the IR
+            // defines Clz(0)/Ctz(0) == width, so the intrinsic arm already
+            // produces W for zero and the guarded ternary is redundant.
+            if let Some(t) = clz_ctz_zero_guard_replacement(
+                cond,
+                true_val,
+                false_val,
+                cast_defs,
+                unary_defs,
+            ) {
+                return Some(Instruction::Copy { dest: *dest, src: t });
+            }
             None
         }
         Instruction::Call { func, info } => {
@@ -621,6 +860,7 @@ fn try_simplify(
         cmp_defs,
         binop_defs,
         neg_defs,
+        &[],
         is_boolean,
         &[],
         &[],
@@ -2566,6 +2806,120 @@ mod tests {
                 ret_is_f128_sse: false,
             },
         }
+    }
+
+    // === clz/ctz guarded-ternary zero-guard elimination ===
+
+    #[test]
+    fn test_select_clz_guard_elimination() {
+        // `x ? __builtin_clz(x) : 32` shape after the ternary lowers:
+        //   v2 = cast v1 (u32 -> i32, same size)
+        //   v3 = Clz(v2)                    // IR defines Clz(0) == 32
+        //   v4 = sext v3 (i32 -> i64)
+        //   v5 = select cond=v1 ? v4 : 32   // redundant zero guard
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 6];
+        cast_defs[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I32,
+        });
+        cast_defs[4] = Some(CastDef {
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 6];
+        unary_defs[3] = Some(UnaryDef {
+            op: IrUnaryOp::Clz,
+            src: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        });
+        let r = clz_ctz_zero_guard_replacement(
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(4)),
+            &Operand::Const(IrConst::I64(32)),
+            &cast_defs,
+            &unary_defs,
+        );
+        assert!(
+            matches!(r, Some(Operand::Value(v)) if v.0 == 4),
+            "select(x ? clz(x) : 32) should collapse onto the clz arm"
+        );
+        // The condition may itself be a same-size cast of x (same zero-ness).
+        let r2 = clz_ctz_zero_guard_replacement(
+            &Operand::Value(Value(2)),
+            &Operand::Value(Value(4)),
+            &Operand::Const(IrConst::I64(32)),
+            &cast_defs,
+            &unary_defs,
+        );
+        assert!(matches!(r2, Some(Operand::Value(v)) if v.0 == 4));
+        // Ctz variant with its width constant folds the same way.
+        unary_defs[3] = Some(UnaryDef {
+            op: IrUnaryOp::Ctz,
+            src: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        });
+        let r3 = clz_ctz_zero_guard_replacement(
+            &Operand::Value(Value(1)),
+            &Operand::Value(Value(4)),
+            &Operand::Const(IrConst::I64(32)),
+            &cast_defs,
+            &unary_defs,
+        );
+        assert!(matches!(r3, Some(Operand::Value(v)) if v.0 == 4));
+    }
+
+    #[test]
+    fn test_select_clz_guard_rejects_bad_width_and_unrelated_cond() {
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 7];
+        cast_defs[2] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I32,
+        });
+        cast_defs[4] = Some(CastDef {
+            src: Operand::Value(Value(3)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        // A truncating cast on the CONDITION side changes zero-ness (x ==
+        // 0x100 has low byte 0), so it must never fold.
+        cast_defs[5] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::I64,
+            to_ty: IrType::U32,
+        });
+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 7];
+        unary_defs[3] = Some(UnaryDef {
+            op: IrUnaryOp::Clz,
+            src: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        });
+        let near = |cond: Operand| {
+            clz_ctz_zero_guard_replacement(
+                &cond,
+                &Operand::Value(Value(4)),
+                &Operand::Const(IrConst::I64(32)),
+                &cast_defs,
+                &unary_defs,
+            )
+        };
+        // Width mismatch: zero-case constant 31 != clz width 32.
+        assert_eq!(
+            clz_ctz_zero_guard_replacement(
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(4)),
+                &Operand::Const(IrConst::I64(31)),
+                &cast_defs,
+                &unary_defs,
+            ),
+            None
+        );
+        // Unrelated condition value.
+        assert_eq!(near(Operand::Value(Value(6))), None);
+        // Truncated-condition value id 5 peels to nothing (same-size only).
+        assert_eq!(near(Operand::Value(Value(5))), None);
     }
 
     // === BinOp identity tests ===
