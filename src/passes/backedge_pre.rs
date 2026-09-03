@@ -958,15 +958,16 @@ fn find_available_expr(
                 return None;
             }
             budget -= 1;
-            let Instruction::BinOp { dest, op, lhs, rhs, ty } = inst else {
-                continue;
-            };
-            if *op != key.op || *ty != key.ty || defs.tainted(dest.0) {
-                continue;
-            }
-            if let (Some(kl), Some(kr)) = (operand_key(lhs, *ty), operand_key(rhs, *ty)) {
-                if ExprKey::new(*op, *ty, kl, kr) == *key {
-                    return Some(*dest);
+            // Parts::of sees both shapes the key can name (ExprOp::Bin and
+            // ExprOp::Cast); a BinOp-only matcher would never reuse an
+            // available cast computation and vice versa.
+            if let Some(p) = Parts::of(inst) {
+                if p.op == key.op
+                    && p.ty == key.ty
+                    && !defs.tainted(p.dest.0)
+                    && p.key().as_ref() == Some(key)
+                {
+                    return Some(p.dest);
                 }
             }
         }
@@ -1023,10 +1024,10 @@ fn fusion_partner_after(insts: &[Instruction], at: usize, limit: usize) -> Optio
 /// or spilled value).
 fn hoist_bottom_expr(block: &mut BasicBlock, e2: Value, q: Value) -> bool {
     let insts = &block.instructions;
-    let Some(cur) = binop_index(block, e2) else {
+    let Some(cur) = expr_index(block, e2) else {
         return false;
     };
-    let Instruction::BinOp { lhs, rhs, .. } = &insts[cur] else {
+    let Some(p) = Parts::of(&insts[cur]) else {
         return false;
     };
     // Resolve operand definitions against the *current* instruction list:
@@ -1034,7 +1035,7 @@ fn hoist_bottom_expr(block: &mut BasicBlock, e2: Value, q: Value) -> bool {
     // pre-rewrite snapshot would be stale (that stale snapshot once moved
     // `v*v` above `v = x+3` in a rotated self-loop).
     let mut floor = first_non_phi(block);
-    for o in [lhs, rhs] {
+    for o in std::iter::once(&p.lhs).chain(p.rhs.iter()) {
         if let Operand::Value(v) = o {
             if let Some(di) = insts[..cur].iter().position(|i| i.dest() == Some(*v)) {
                 floor = floor.max(di + 1);
@@ -1081,10 +1082,7 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
     // valid IR; cross-rewrite references are fixed up by the joint rename.
     for rw in rewrites {
         let e_span = span_of_def(&func.blocks[rw.e_block], rw.e_dest);
-        let init_key = match (operand_key(&rw.init_lhs, rw.ty), operand_key(&rw.init_rhs, rw.ty)) {
-            (Some(kl), Some(kr)) => Some(ExprKey::new(rw.op, rw.ty, kl, kr)),
-            _ => None,
-        };
+        let init_key = Parts::key_of(rw.op, rw.ty, &rw.init_lhs, rw.init_rhs.as_ref());
         let share_key = init_key.map(|k| (rw.header, rw.e2_dest.0, k));
         if let Some(&q) = share_key.as_ref().and_then(|k| shared.get(k)) {
             rename.insert(rw.e_dest.0, q);
@@ -1095,9 +1093,21 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
             }
             continue;
         }
-        let preheader_incoming = if let Some(c) =
-            fold_const_binop(rw.op, &rw.init_lhs, &rw.init_rhs, rw.ty)
-        {
+        // Fold f(init) where both operands are constants: the per-shape
+        // folders (fold_const_binop for ExprOp::Bin, fold_const_cast for
+        // ExprOp::Cast — the latter keyed on the SOURCE type the ExprOp
+        // carries).
+        let folded = match rw.op {
+            ExprOp::Bin(b) => rw
+                .init_rhs
+                .as_ref()
+                .and_then(|rhs| fold_const_binop(b, &rw.init_lhs, rhs, rw.ty)),
+            ExprOp::Cast(from) => match &rw.init_lhs {
+                Operand::Const(c) => fold_const_cast(c, from, rw.ty),
+                Operand::Value(_) => None,
+            },
+        };
+        let preheader_incoming = if let Some(c) = folded {
             Operand::Const(c)
         } else if let Some(v) = init_key
             .as_ref()
@@ -1111,13 +1121,7 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
             insert_inst(
                 preh,
                 at,
-                Instruction::BinOp {
-                    dest: pv,
-                    op: rw.op,
-                    lhs: rw.init_lhs,
-                    rhs: rw.init_rhs,
-                    ty: rw.ty,
-                },
+                Parts::build(rw.op, rw.ty, pv, rw.init_lhs, rw.init_rhs),
                 e_span,
             );
             Operand::Value(pv)
@@ -1218,7 +1222,7 @@ fn apply(func: &mut IrFunction, rewrites: &[Rewrite], idom: &[usize], defs: &Def
             continue;
         }
         let blk = &mut func.blocks[rw.e_block];
-        if let Some(idx) = binop_index(blk, rw.e_dest) {
+        if let Some(idx) = expr_index(blk, rw.e_dest) {
             remove_inst(blk, idx);
         }
         applied += 1;
@@ -1316,12 +1320,12 @@ mod tests {
     fn expr_key_canonicalizes_commutative_operands() {
         let (x, y) = (OperandKey::Val(7), OperandKey::Con(3));
         assert_eq!(
-            ExprKey::new(IrBinOp::Add, IrType::I32, x, y),
-            ExprKey::new(IrBinOp::Add, IrType::I32, y, x)
+            ExprKey::new(ExprOp::Bin(IrBinOp::Add), IrType::I32, x, y),
+            ExprKey::new(ExprOp::Bin(IrBinOp::Add), IrType::I32, y, x)
         );
         assert_ne!(
-            ExprKey::new(IrBinOp::Sub, IrType::I32, x, y),
-            ExprKey::new(IrBinOp::Sub, IrType::I32, y, x)
+            ExprKey::new(ExprOp::Bin(IrBinOp::Sub), IrType::I32, x, y),
+            ExprKey::new(ExprOp::Bin(IrBinOp::Sub), IrType::I32, y, x)
         );
     }
 
