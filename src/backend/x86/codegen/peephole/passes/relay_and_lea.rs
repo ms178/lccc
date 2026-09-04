@@ -133,7 +133,19 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
     // The source half must not read the family (`movq 8(%r13), %r13`,
     // `leaq 1(%r10), %r10`).
     let src_part = &t[..t.rfind(',').unwrap_or(t.len())];
-    !line_refs_family(src_part, fam)
+    !line_refs_family(src_part, fam) && dest_is_full_width(t, fam)
+}
+
+/// The destination token names `fam` at 32 or 64 bits — the only widths at
+/// which a write fully redefines the architectural 64-bit family (a 32-bit
+/// write zero-extends).  A byte/word destination (`movb $1, %al`,
+/// `movzbl %al, %al`, `movw %cx, %ax`) rewrites only part of it and must
+/// never be accepted as a full redefinition: the upper bits of the old
+/// value stay observable.
+#[inline]
+fn dest_is_full_width(t: &str, fam: RegId) -> bool {
+    let dest = t.rsplit(',').next().unwrap_or(t).trim();
+    dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
 }
 
 /// Proof 1: block-local write-before-read deadness of `fam` from `from`.

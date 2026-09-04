@@ -1905,7 +1905,10 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
         b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
         // Serialising / system instructions with fixed register interfaces.
-        b"cpuid" => (RAX, RAX | RBX | RCX | RDX),
+        // cpuid takes the leaf in %eax AND the subleaf in %ecx — the subleaf
+        // read was missing, so a definition of %rcx feeding cpuid could be
+        // retired as dead.
+        b"cpuid" => (RAX | RCX, RAX | RBX | RCX | RDX),
         b"rdtsc" => (0, RAX | RDX),
         b"rdtscp" => (0, RAX | RCX | RDX),
         b"rdpmc" | b"rdmsr" | b"xgetbv" => (RCX, RAX | RDX),
@@ -1918,7 +1921,26 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9,
         // and the kernel clobbers %rcx/%r11.
         b"syscall" => (RAX | RDX | RSI | RDI | R8 | R9 | R10, RAX | RCX | R11),
-        b"sysenter" | b"sysexit" | b"sysret" | b"sysretq" => (RAX | RCX | RDX, RAX | RCX | RDX),
+        // sysenter reads the target from MSRs and writes no GP register;
+        // sysexit takes the return RIP in %rdx and the return RSP in %rcx;
+        // sysret returns through %rcx (RIP) and %r11 (RFLAGS) and writes no
+        // GP register either.  (The old shared row claimed all three wrote
+        // %rax:%rcx:%rdx — a fabricated clobber that an acceptance-style
+        // redefinition check could use to retire a live value, e.g. a cltq
+        // before a sysret whose %rax IS the syscall return value.)
+        b"sysenter" => (0, 0),
+        b"sysexit" => (RCX | RDX, 0),
+        b"sysret" | b"sysretq" => (RCX | R11, 0),
+        // Flags saved/restored through the stack: both forms implicitly
+        // read and write %rsp (8 bytes per instruction).
+        b"pushf" | b"pushfq" | b"pushfw" | b"pushfl" => (RSP, RSP),
+        b"popf" | b"popfq" | b"popfw" | b"popfl" => (RSP, RSP),
+        // Interrupt return pops through %rsp.
+        b"iret" | b"iretq" | b"iretw" | b"iretl" => (RSP, RSP),
+        // RTM: the abort status lands in %eax (only on the abort path — the
+        // union keeps the family conservative; the exact full-write oracle
+        // deliberately excludes this conditional write).
+        b"xbegin" => (0, RAX),
         // Software interrupt: the handler's register contract is unknown
         // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
         b"int" => (
@@ -1931,10 +1953,14 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         // CMPXCHG8B/16B compares %edx:%eax (reloaded on failure) against
         // memory; %ecx:%ebx are the store payload, read-only.
         b"cmpxchg8b" | b"cmpxchg16b" => (RAX | RBX | RCX | RDX, RAX | RDX),
-        // Misc legacy: table lookup, flags <-> %ah, counted loops.
-        b"xlat" | b"xlatb" => (RBX, RAX),
+        // Misc legacy: table lookup (AL index + %rbx base), flags <-> %ah,
+        // counted loops.
+        b"xlat" | b"xlatb" => (RAX | RBX, RAX),
         b"lahf" => (0, RAX),
         b"sahf" => (RAX, 0),
+        // Bare `fnstsw` (no operand) writes the status word into %ax without
+        // naming it; the explicit `fnstsw %ax` form is a textual mention.
+        b"fnstsw" => (0, RAX),
         b"loop" | b"loope" | b"loopz" | b"loopne" | b"loopnz" => (RCX, RCX),
         b"jrcxz" | b"jecxz" => (RCX, 0),
         // Frame instructions.
@@ -1943,6 +1969,60 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         _ => (0, 0),
     };
     (reads | table.0, writes | table.1)
+}
+
+/// The exact ≥32-bit subset of the implicit WRITE set ([`classify_implicit_operands`].1):
+/// families whose architectural value is FULLY redefined by the instruction
+/// (a 32-bit write zero-extends to the whole 64-bit family).  This is the
+/// acceptance-grade counterpart of [`implicit_write_refs`]: a bit here proves
+/// the old value unobservable, so redefinition checks that DELETE a
+/// definition may trust it.
+///
+/// Excluded by design:
+/// * byte/word partial writes — `lahf` (AH), `xlat` (AL), `cbtw` (AX),
+///   `cwtd` (DX), `divb`/`idivb`/`mulb`/`imulb` (AL/AH), `lodsb`/`lodsw`
+///   (AL/AX), `in`/`inb`/`inw` (AL/AX), `fnstsw` (AX);
+/// * conditional writes — `cmpxchg*` accumulator reloads (write only on the
+///   failure path) and `xbegin` (abort status only);
+/// * over-approximate rows — `int` (the handler's contract is unknown).
+pub(super) fn implicit_full_write_refs(b: &[u8]) -> u16 {
+    const RAX: u16 = 1 << 0;
+    const RDX: u16 = 1 << 2;
+    // Skip `lock`/`rep*` prefixes exactly like classify_implicit_operands
+    // does, so the partial mask keys on the real mnemonic (`rep lodsb`).
+    let mut m = b;
+    loop {
+        let mut i = 0;
+        while i < m.len() && m[i] != b' ' && m[i] != b'\t' {
+            i += 1;
+        }
+        match &m[..i] {
+            b"lock" | b"rep" | b"repe" | b"repz" | b"repne" | b"repnz" => {
+                while i < m.len() && (m[i] == b' ' || m[i] == b'\t') {
+                    i += 1;
+                }
+                m = &m[i..];
+            }
+            _ => {
+                m = &m[..i];
+                break;
+            }
+        }
+    }
+    let partial = match m {
+        b"cbtw" | b"cbw" => RAX,
+        b"cwd" | b"cwtd" => RDX,
+        b"divb" | b"idivb" | b"mulb" | b"imulb" => RAX,
+        b"lodsb" | b"lodsw" => RAX,
+        b"in" | b"inb" | b"inw" => RAX,
+        b"xlat" | b"xlatb" | b"lahf" | b"fnstsw" => RAX,
+        b"cmpxchg" | b"cmpxchgb" | b"cmpxchgw" | b"cmpxchgl" | b"cmpxchgq" => RAX,
+        b"cmpxchg8b" | b"cmpxchg16b" => RAX | RDX,
+        b"xbegin" => RAX,
+        b"int" => u16::MAX,
+        _ => 0,
+    };
+    classify_implicit_operands(b).1 & !partial
 }
 
 /// Write an integer and the "(%rbp)" suffix into a buffer without using core::fmt.

@@ -88,8 +88,17 @@ int main(void)
         init(); stencil3(fbase + off, fbase, N); snprintf(tag, sizeof tag, "stencil3[%d]", off); dump_f(tag, fb[0], N + 32);
         init(); from_one(fbase + off, fbase, N); snprintf(tag, sizeof tag, "from_one[%d]", off); dump_f(tag, fb[0], N + 32);
     }
-    /* Partial (2-byte) overlap: dst = (char*)src + 2. */
-    init(); scale_f((float *)((char *)(fb[0] + 16) + 2), fb[0] + 16, 1.5f, N); dump_f("scale_f[+2B]", fb[0], N + 32);
+    /* Partial (2-byte) overlap: dst = (char*)src + 2.  The cast forms a
+     * MISALIGNED float pointer, so dereferencing it is undefined behaviour
+     * and this case cannot take part in the GCC-oracle output comparison:
+     * GCC exploits the UB and vectorizes without a guard, while lccc keeps
+     * its defined-behaviour fallback and enters the scalar remainder —
+     * both are valid under the standard and their bytes differ.  The case
+     * is still executed so the runtime guard-fallback path (the exact
+     * reason the test exists) is exercised on every run: the kernel must
+     * neither crash nor fall through, and the process must exit 0.  Its
+     * bytes are deliberately not printed and not mixed into the hash. */
+    init(); scale_f((float *)((char *)(fb[0] + 16) + 2), fb[0] + 16, 1.5f, N);
     init(); prefix_f(fb[0] + 1, N); dump_f("prefix_f", fb[0], N + 32);
     init(); shift_f(fb[0] + 1, N); dump_f("shift_f", fb[0], N + 32);
     printf("hash %016llx\n", h);

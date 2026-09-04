@@ -599,9 +599,22 @@ impl FileLiveness {
                 // (`syscall` would never retire %r11, `cltd` never %rdx).
                 // The exact read set is: explicit mentions, minus the
                 // implicit write half, plus the implicit read half.
-                reads &= !implicit_write_refs(t.as_bytes());
+                //
+                // Width exactness: the oracle's write half is the UNION of
+                // any-width writes, but this analysis works on 64-bit
+                // families, where only a ≥32-bit write is a KILL.  A partial
+                // implicit write (`lahf` → AH, `xlat`/`divb`/`lodsb` → AX,
+                // `fnstsw` → AX, the conditional `cmpxchg`/`xbegin`
+                // accumulator reloads) leaves the rest of the old family
+                // observable, so it must keep the family LIVE (model it as
+                // a read), never kill it: killing on `lahf` deleted a
+                // `movslq %eax, %rax` whose high bits `ret` still returned.
+                let iw = implicit_write_refs(t.as_bytes());
+                let iwf = implicit_full_write_refs(t.as_bytes());
+                reads &= !iwf; // only a full implicit write cancels an observation
                 reads |= implicit_read_refs(t.as_bytes());
-                writes |= implicit_write_refs(t.as_bytes());
+                reads |= iw & !iwf; // partial implicit writes preserve the old value
+                writes |= iwf; // only a full implicit write is a kill
                 if t.starts_with("xchg") || t.starts_with("cmpxchg") || t.starts_with("xadd") {
                     reads |= mentioned;
                     writes |= mentioned;
