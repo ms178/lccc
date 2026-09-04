@@ -297,7 +297,11 @@ impl Parser {
     /// the rest of the function (the stress lab's `switch` family emits this
     /// shape and GCC 12 accepts it).
     fn parse_label_body(&mut self) -> Stmt {
-        if matches!(self.peek(), TokenKind::RBrace) {
+        // GNU/C23 6.8.1: a label may be the last item of a compound statement
+        // (`case 2:` directly before `}`).  `label_at_block_end` also accepts
+        // a truncated token stream (Eof) so malformed input degrades to a
+        // null-statement label instead of an unhandled parse failure.
+        if self.label_at_block_end() {
             return Stmt::Expr(None);
         }
         self.parse_stmt()

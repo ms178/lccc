@@ -487,6 +487,15 @@ impl X86Codegen {
             _ => None,
         };
         if let Some(src_reg) = src_phys {
+            // XMM-homed source (integer bit-punned in the float domain): the
+            // extending move forms below name GP sub-registers only, and
+            // typed_phys_reg_name has no spelling for xmm indices. Stage
+            // through the generic callee-register path, which owns the
+            // xmm→GPR move.
+            if super::emit::is_xmm_reg(src_reg) {
+                self.operand_to_callee_reg(src, dest_phys);
+                return;
+            }
             // Source is in a register — emit reg-to-reg extending move.
             let src_typed = typed_phys_reg_name(src_reg, ft);
             if ft.is_signed() {
@@ -908,6 +917,14 @@ impl X86Codegen {
 
         // Need either a source register or a stack slot.
         if src_phys.is_none() && src_slot.is_none() {
+            return false;
+        }
+        // An XMM-homed source is an integer bit-punned in the float domain
+        // (fp-select/int-select blending keeps the value in the SSE domain).
+        // The extending moves below encode GP register names only — route
+        // such sources through the accumulator fallback, which performs the
+        // xmm→GPR move (same contract as emit_int_cmp_insn_typed).
+        if src_phys.is_some_and(super::emit::is_xmm_reg) {
             return false;
         }
 

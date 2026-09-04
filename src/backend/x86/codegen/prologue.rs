@@ -297,6 +297,14 @@ impl X86Codegen {
         }
         // Count named params using the shared ABI classification, so this
         // stays in sync with classify_call_args (caller side) automatically.
+        //
+        // NOTE (SysV x86-64 sret): for functions returning a MEMORY-class
+        // struct the IR already carries the hidden return pointer as an
+        // extra leading parameter, so the classification's GP count includes
+        // the sret slot — gp_offset and the register-save gp_start derived
+        // below are correct as-is. Do NOT add another +1 here (verified:
+        // stress abi fn3 `union A3 fn3(long, float, uchar, A3, ull, A3, ...)`
+        // expects gp_offset = 32 = sret(rdi) + a0(rsi) + a3(rdx) + a5(rcx)).
         {
             let config = self.call_abi_config_impl();
             let classification = crate::backend::call_abi::classify_params_full(func, &config);

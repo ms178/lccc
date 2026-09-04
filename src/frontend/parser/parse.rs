@@ -1831,6 +1831,25 @@ impl Parser {
         }
     }
 
+    /// True when the next token terminates the enclosing block, i.e. a
+    /// `case` / `default` / identifier label is the final item before the
+    /// closing brace of a compound statement (or the token stream ends).
+    ///
+    /// This accepts the GNU/C23 form where a label directly precedes `}`:
+    ///
+    /// ```c
+    /// switch (x) {
+    ///     case 1: return 10;
+    ///     case 2:          // falls out of the switch
+    /// }
+    /// ```
+    ///
+    /// Callers attach a null statement in that situation; execution simply
+    /// continues with the statement following the enclosing block.
+    pub(super) fn label_at_block_end(&self) -> bool {
+        matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof)
+    }
+
     /// Parse the parenthesized argument of `aligned(expr)` in __attribute__.
     /// Expects the opening `(` to be the current token (not yet consumed).
     /// Parses and evaluates a constant expression, consuming through the closing `)`.

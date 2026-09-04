@@ -1755,6 +1755,17 @@ impl X86Codegen {
                         let n = lines.len();
                         lines[n.saturating_sub(30)..].to_vec()
                     };
+                    if std::env::var_os("CCC_DEBUG_NOHOME").is_some() {
+                        eprintln!(
+                            "[NOHOME] fn={} value={} defined_by={:?} in_ir_shadow={}",
+                            self.state.current_func_name,
+                            v.0,
+                            self.get_defining_instruction(v.0).map(|i| format!("{i:?}")),
+                            self.machinst_buf_ir
+                                .iter()
+                                .any(|i| i.dest().map(|d| d.0) == Some(v.0))
+                        );
+                    }
                     panic!(
                         "x86 codegen: operand_to_rax: value {} in function '{}' \
                          has no register home, no stack slot and no acc-cache \
@@ -4965,6 +4976,38 @@ impl ArchCodegen for X86Codegen {
             || self.machinst_disabled_kinds & machinst_kind_bit(inst) != 0
         {
             return false;
+        }
+        // PF-15 hazard closure: a Cast admitted to the MachInst queue never
+        // runs the mature cast emitter, so it neither records a pending
+        // widening move nor honours try_record_pending_widen's refusal
+        // contract ("any refusal flushes the deferred moves FIRST"). Every
+        // other instruction kind flushes at the per-instruction loop head;
+        // a Cmp folds-or-flushes in its dispatch arm. A Cast is therefore
+        // the ONLY instruction that can be lowered while a pending-widen
+        // record is alive, and its register writes are invisible to the
+        // record's soundness model.
+        //
+        // Why that is a miscompile: the recorded source's only modelled use
+        // is its own deferred move, so RA legally reuses the source's home
+        // for a later cast's destination. Queueing that cast emits the
+        // clobbering move while the record still promises the consuming
+        // compare an intact source home
+        // (stress reproducer: `cmp((int)p2, (uint16)p1)` after
+        // `movzwl %esi, %edx` — both operands collapsed to %rdx, lccc
+        // returned 1 for 58142 <= 0).
+        //
+        // Ordering: the record-creating cast went through the classic path,
+        // which flushed the MachInst run first, so every buffered
+        // instruction POSTDATES the record. Emitting the deferred widening
+        // moves before that buffered run restores exact program order: the
+        // moves read their source homes at the record point, ahead of any
+        // queued clobber. The flushed run is pure performance state — the
+        // buffer reforms behind the widening moves.
+        if matches!(inst, crate::ir::reexports::Instruction::Cast { .. })
+            && (self.pending_widen[0].is_some() || self.pending_widen[1].is_some())
+        {
+            self.flush_pending_widen_impl();
+            self.flush_machinst();
         }
         // ParamRef: lower the no-code subset AND the single-move
         // materializations through MachInst.
