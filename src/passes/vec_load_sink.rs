@@ -138,10 +138,10 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
     for (bi, block) in func.blocks.iter_mut().enumerate() {
         // Walk backwards.  Moving the load at `i` to `uj-1` only permutes
         // instructions inside `[i, uj)`; every position `>= uj` and every
-        // position `< i` is untouched, so the recorded use index of any
-        // candidate still to be visited (all at positions `< i`) stays valid
-        // as long as its consumer lies outside the permuted window — which
-        // is re-verified below before each move (fail-closed).
+        // position `< i` is untouched.  A candidate still to be visited
+        // (position `< i`) may have its consumer INSIDE the permuted window,
+        // so the recorded use index can go stale — the consumer is therefore
+        // re-located by value before each move (fail-closed).
         let mut i = block.instructions.len();
         while i > 0 {
             i -= 1;
@@ -155,31 +155,38 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
             let Some(sites) = uses.get(&d) else {
                 continue;
             };
-            // Exactly one use, in this block, at a later instruction that is
-            // an intrinsic (the only consumer class able to take a memory
-            // operand), and not already adjacent.
+            // Exactly one use total, in this block, not the terminator.
             let [(ub, uj)] = sites.as_slice() else {
                 continue;
             };
-            let (ub, uj) = (*ub, *uj);
-            if ub != bi || uj == usize::MAX || uj <= i + 1 || uj >= block.instructions.len() {
+            if *ub != bi || *uj == usize::MAX {
                 continue;
             }
-            // Re-verify the consumer really is at `uj` (earlier moves may have
-            // permuted the window) and still names `d`.
-            let consumer_ok = match &block.instructions[uj] {
-                inst @ Instruction::Intrinsic { .. } => {
-                    let mut found = false;
-                    for_each_operand_in_instruction(inst, |op| {
-                        if matches!(op, Operand::Value(v) if v.0 == d) {
-                            found = true;
+            // Earlier moves may have permuted positions inside `[i, uj)`, so
+            // the recorded index is not trustworthy.  Re-locate the consumer
+            // by value: the unique use of `d` is the first instruction after
+            // the load that names it, and it must be an intrinsic (the only
+            // consumer class able to take a memory operand).
+            let Some(uj) = block.instructions[i + 1..]
+                .iter()
+                .position(|inst| {
+                    matches!(inst, Instruction::Intrinsic { .. })
+                        && {
+                            let mut found = false;
+                            for_each_operand_in_instruction(inst, |op| {
+                                if matches!(op, Operand::Value(v) if v.0 == d) {
+                                    found = true;
+                                }
+                            });
+                            found
                         }
-                    });
-                    found
-                }
-                _ => false,
+                })
+                .map(|p| p + i + 1)
+            else {
+                continue;
             };
-            if !consumer_ok {
+            // Not already adjacent (nothing to gain), not past the end.
+            if uj <= i + 1 || uj >= block.instructions.len() {
                 continue;
             }
             if !block.instructions[i + 1..uj]

@@ -1121,6 +1121,7 @@ impl Lowerer {
             "__builtin___strncat_chk" => "__strncat_chk",
             "__builtin___sprintf_chk" => "__sprintf_chk",
             "__builtin___snprintf_chk" => "__snprintf_chk",
+            "__builtin___dprintf_chk" => "__dprintf_chk",
             "__builtin___vsprintf_chk" => "__vsprintf_chk",
             "__builtin___vsnprintf_chk" => "__vsnprintf_chk",
             "__builtin___printf_chk" => "__printf_chk",
@@ -1146,6 +1147,7 @@ impl Lowerer {
             name,
             "__builtin___sprintf_chk"
                 | "__builtin___snprintf_chk"
+                | "__builtin___dprintf_chk"
                 | "__builtin___printf_chk"
                 | "__builtin___fprintf_chk"
         );
@@ -2156,6 +2158,8 @@ fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
         "__sprintf_chk" => 4,
         // __snprintf_chk(s, maxlen, flag, slen, fmt, ...)
         "__snprintf_chk" => 5,
+        // __dprintf_chk(fd, flag, fmt, ...)
+        "__dprintf_chk" => 3,
         _ => return None,
     })
 }

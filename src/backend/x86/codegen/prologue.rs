@@ -1216,6 +1216,28 @@ impl X86Codegen {
                 set
             }
         };
+        // Fusion-certified Cmp chains (flag consumers) are never materialized:
+        // the Cmp skips setcc and the Select/CondBranch reads live flags.
+        // Their register homes would be PHANTOM — assigned, never written —
+        // and a phantom co-holder is indistinguishable from a real one to the
+        // allocator's interference checks: in split-latch loops it blocks the
+        // apply-phase phi-coalescing override (adler_split's s-chain kept a
+        // `movq %r10, %r8` per iteration because the fused exit Cmp's home
+        // sat in %r8) and the scan's birth-at-death register handoff.
+        // Certified never-written values may hold no home at all. Replay
+        // Cmps and materialized booleans keep their homes (they are not in
+        // `fused_cmp_dests`/`fused_forward_dests` by construction).
+        let never_materialized = {
+            let mut set = never_materialized;
+            set.extend(
+                self.fused_cmp_dests
+                    .keys()
+                    .chain(self.fused_cmp_dests.values())
+                    .copied()
+                    .chain(self.fused_forward_dests.iter().copied()),
+            );
+            set
+        };
 
         // SysV AMD64 argument registers present in the caller-saved pool
         // (r8, r9, rdi, rsi and — when enabled — rdx). A value consumed as a
