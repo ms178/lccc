@@ -250,7 +250,17 @@ fn a_copy_SURVIVES_when_the_use_also_writes_the_destination() {
         "    movl %esi, %eax\n",
         "    ret"
     )));
-    assert_eq!(count(&out, "movl %eax, %esi"), 1, "must not fold:\n{}", out);
+    // Rule 4 must never rewrite the use into `addl %ecx, %eax` (that would
+    // clobber the copy source before `movl %esi, %eax` reads the result).
+    assert_eq!(count(&out, "addl %ecx, %eax"), 0, "rule 4 violated:\n{}", out);
+    // The copy may still disappear through a different, legal route: the
+    // later `load_op_fuse` "copy + commutative op into the dying operand"
+    // pass turns the triple into `addl %eax, %ecx; movl %ecx, %eax` because
+    // %ecx (caller-saved) and %esi are dead at `ret`. Either shape is correct;
+    // the illegal rule-4 shape is the only thing this test forbids.
+    let survives = count(&out, "movl %eax, %esi") == 1 && out.contains("addl %ecx, %esi");
+    let bridged = out.contains("addl %eax, %ecx") && out.contains("movl %ecx, %eax");
+    assert!(survives || bridged, "unexpected shape:\n{}", out);
 }
 
 #[test]

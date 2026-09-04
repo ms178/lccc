@@ -1380,8 +1380,16 @@ mod synth_mul_tests {
         assert_eq!(f(15), vec![MulStep::LeaSrcSrc(2), MulStep::LeaSelf(4)]);
         // 17 = x + 8*(2x): two LEAs beat GCC's mov/sal/add.
         assert_eq!(f(17), vec![MulStep::LeaSrcSrc(1), MulStep::LeaSrcPlus(8)]);
-        // 33 = 32x + x needs the shift: mov (eliminated) + shl + add.
-        assert_eq!(f(33), vec![MulStep::Mov, MulStep::Shl(5), MulStep::AddSrc]);
+        // 33 = x + 8*(4x): two fast LEAs (2 µops, 2c dependent latency) beat
+        // GCC's mov/shl/add (3 µops, 2c) under the speed policy; the scaled
+        // LEA `leal (,%src,4)` is a two-component (index*scale + disp) form,
+        // 1c on every Intel/AMD core since Sandy Bridge. Without the scale
+        // LEA (size policy) the canonical GCC form is the only 2c chain.
+        assert_eq!(f(33), vec![MulStep::LeaScaleSrc(4), MulStep::LeaSrcPlus(8)]);
+        assert_eq!(
+            synth_mul(33, false, 3, false).unwrap(),
+            vec![MulStep::Mov, MulStep::Shl(5), MulStep::AddSrc]
+        );
         assert_eq!(f(31), vec![MulStep::Mov, MulStep::Shl(5), MulStep::SubSrc]);
         assert_eq!(f(24), vec![MulStep::LeaSrcSrc(2), MulStep::Shl(3)]);
         assert_eq!(f(-3), vec![MulStep::LeaSrcSrc(2), MulStep::Neg]);
