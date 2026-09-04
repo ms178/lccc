@@ -215,11 +215,11 @@ impl Parser {
                     // GNU case range extension: case low ... high:
                     let high = self.parse_expr();
                     self.expect_context(&TokenKind::Colon, "after 'case' expression");
-                    let stmt = self.parse_stmt();
+                    let stmt = self.parse_label_body();
                     Stmt::CaseRange(expr, high, Box::new(stmt), span)
                 } else {
                     self.expect_context(&TokenKind::Colon, "after 'case' expression");
-                    let stmt = self.parse_stmt();
+                    let stmt = self.parse_label_body();
                     Stmt::Case(expr, Box::new(stmt), span)
                 }
             }
@@ -227,7 +227,7 @@ impl Parser {
                 let span = self.peek_span();
                 self.advance();
                 self.expect_context(&TokenKind::Colon, "after 'default'");
-                let stmt = self.parse_stmt();
+                let stmt = self.parse_label_body();
                 Stmt::Default(Box::new(stmt), span)
             }
             TokenKind::Goto => {
@@ -264,7 +264,7 @@ impl Parser {
                                     // In GNU C, labels can have attributes (e.g., unused, hot, cold).
                                     // We consume and discard them since they only affect diagnostics.
                     self.skip_label_attributes();
-                    let stmt = self.parse_stmt();
+                    let stmt = self.parse_label_body();
                     Stmt::Label(name_clone, Box::new(stmt), span)
                 } else {
                     let expr = self.parse_expr();
@@ -283,6 +283,24 @@ impl Parser {
                 Stmt::Expr(Some(expr))
             }
         }
+    }
+
+    /// Parse the statement that a label (`case`, `default`, or `name:`)
+    /// applies to.
+    ///
+    /// C23 §6.8.1 (and GCC 11+ in every language mode) allow a label to be the
+    /// last thing in a compound statement: `switch (x) { case 0: return 1;
+    /// case 2: }` or `{ ...; out: }`. Before C23 a label had to be followed by
+    /// a statement, which forced the idiom `case 2: ;`. The trailing label
+    /// denotes a null statement, so it is parsed as one instead of emitting
+    /// "expected expression before '}'" and desynchronising the parser for
+    /// the rest of the function (the stress lab's `switch` family emits this
+    /// shape and GCC 12 accepts it).
+    fn parse_label_body(&mut self) -> Stmt {
+        if matches!(self.peek(), TokenKind::RBrace) {
+            return Stmt::Expr(None);
+        }
+        self.parse_stmt()
     }
 
     /// Parse a for statement: for (init; cond; inc) body

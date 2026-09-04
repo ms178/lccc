@@ -107,8 +107,8 @@ impl Lowerer {
                     rhs_raw
                 };
 
-                // Compute exactly, truncate, and check
-                // if the truncated result round-trips back to the wide value.
+                // Compute in the wide type, truncate, and check whether the
+                // truncated result round-trips back to the wide value.
                 let wide_result = self.emit_binop_val(op, lhs_compute, rhs_compute, compute_ty);
 
                 let truncated =
@@ -116,12 +116,51 @@ impl Lowerer {
 
                 let extended_back =
                     self.emit_cast_val(Operand::Value(truncated), result_ir_ty, compute_ty);
-                let overflow = self.emit_cmp_val(
+                let mut overflow = self.emit_cmp_val(
                     IrCmpOp::Ne,
                     Operand::Value(wide_result),
                     Operand::Value(extended_back),
                     compute_ty,
                 );
+
+                // The round-trip test is only a complete overflow test when the
+                // operation itself cannot wrap in `compute_ty`. `compute_ty` is
+                // strictly wider than the RESULT, but not necessarily wider
+                // than the OPERANDS: `__builtin_mul_overflow(int64, int64,
+                // &uint32)` computes in I64, where 10 * (INT64_MIN + 1) wraps
+                // to 10, which round-trips through uint32 and reported "no
+                // overflow" (stress lab builtins seed 5 case 19; GCC/Clang
+                // report 1 and store 10). Exactness, in signed bits: a signed
+                // n-bit operand needs n bits, an unsigned one n+1; a sum or
+                // difference needs one bit more than the wider operand, a
+                // product the sum of both. When the compute type is not that
+                // wide, OR in the compute type's own signed-overflow flag
+                // (imul/add OF via compute_signed_overflow), which is cheaper
+                // than re-widening to I128.
+                let signed_bits = |ir: IrType, signed: bool| ir.size() * 8 + usize::from(!signed);
+                let lb = signed_bits(lhs_src_ir, lhs_src_ctype.is_signed());
+                let rb = signed_bits(rhs_src_ir, rhs_src_ctype.is_signed());
+                let cb = compute_ty.size() * 8;
+                let exact = if op == IrBinOp::Mul {
+                    cb >= lb + rb
+                } else {
+                    cb > lb.max(rb)
+                };
+                if !exact {
+                    let signed_ov = self.compute_signed_overflow(
+                        op,
+                        lhs_compute,
+                        rhs_compute,
+                        wide_result,
+                        compute_ty,
+                    );
+                    overflow = self.emit_binop_val(
+                        IrBinOp::Or,
+                        Operand::Value(overflow),
+                        Operand::Value(signed_ov),
+                        IrType::I32,
+                    );
+                }
 
                 // Store the truncated result
                 self.emit(Instruction::Store {

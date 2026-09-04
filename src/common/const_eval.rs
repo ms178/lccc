@@ -362,6 +362,22 @@ pub fn irconst_to_bits(val: &IrConst) -> (u64, bool) {
     (bits, true) // default to signed
 }
 
+/// C11 6.3.1.1p2 integer promotion on a (byte size, is_unsigned) pair.
+///
+/// Types with rank below `int` promote to `int` when `int` can represent all
+/// their values, which holds for every sub-`int` integer type in the LP64 /
+/// ILP32 models LCCC targets (`unsigned short` is 16 bits < 32). The promoted
+/// type is therefore always **signed** `int`; only types at least as wide as
+/// `int` keep their own signedness.
+#[inline]
+pub fn integer_promote_size_sign(size: usize, is_unsigned: bool) -> (usize, bool) {
+    if size < 4 {
+        (4, false)
+    } else {
+        (size, is_unsigned)
+    }
+}
+
 /// Evaluate a binary operation on constant operands with given type parameters.
 ///
 /// This wraps `const_arith::eval_const_binop` with the C usual arithmetic
@@ -369,10 +385,18 @@ pub fn irconst_to_bits(val: &IrConst) -> (u64, bool) {
 /// the result type (C11 6.5.7); for other ops, use the wider of both types.
 ///
 /// Parameters:
-/// - `lhs_size`: byte size of LHS type (minimum 4 after integer promotion)
-/// - `lhs_unsigned`: whether LHS type is unsigned
-/// - `rhs_size`: byte size of RHS type (minimum 4 after integer promotion)
-/// - `rhs_unsigned`: whether RHS type is unsigned
+/// - `lhs_size`: byte size of the LHS operand's *unpromoted* C type
+/// - `lhs_unsigned`: whether that unpromoted type is unsigned
+/// - `rhs_size`: byte size of the RHS operand's *unpromoted* C type
+/// - `rhs_unsigned`: whether that unpromoted type is unsigned
+///
+/// Integer promotion (C11 6.3.1.1p2) is applied HERE, not by the callers:
+/// every type narrower than `int` (`_Bool`, `char`, `short`, and their
+/// unsigned variants, whose full value range fits in `int`) promotes to
+/// **signed** `int`. Callers used to clamp the size with `.max(4)` while
+/// forwarding the unpromoted signedness, so `(uint8_t)201 | (int16_t)-1`
+/// folded as `unsigned int` (0xFFFFFFFF, then zero-extended to 64 bits)
+/// instead of `int` -1 (stress lab: intexpr seed 5 case 22, wrong at -O0).
 pub fn eval_binop_with_types(
     op: &BinOp,
     lhs: &IrConst,
@@ -382,6 +406,8 @@ pub fn eval_binop_with_types(
     rhs_size: usize,
     rhs_unsigned: bool,
 ) -> Option<IrConst> {
+    let (lhs_size, lhs_unsigned) = integer_promote_size_sign(lhs_size, lhs_unsigned);
+    let (rhs_size, rhs_unsigned) = integer_promote_size_sign(rhs_size, rhs_unsigned);
     let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
 
     // For shifts (C11 6.5.7): result type is the promoted LHS type only.

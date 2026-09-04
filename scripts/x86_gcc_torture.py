@@ -248,6 +248,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Progress must be visible in `nohup ... > log` runs on the constrained
+    # research host; default block buffering hides it for tens of minutes.
+    sys.stdout.reconfigure(line_buffering=True)
     args = parse_args(argv)
     args.suite = args.suite.expanduser().resolve()
     args.lccc = args.lccc.expanduser().resolve()

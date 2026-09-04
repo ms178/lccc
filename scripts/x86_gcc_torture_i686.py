@@ -55,8 +55,30 @@ DEFAULT_FLAGS = ("-O0", "-O1", "-O2", "-O3", "-Os")
 _DIRECTIVE = re.compile(r"\{\s*dg-(?:additional-)?options\s+\"([^\"]*)\"([^}]*)\}")
 
 # GCC multilib include dirs required for 32-bit system headers (stdarg.h etc.).
+#
+# The compiler-private include directory is derived from the host GCC rather
+# than hard-coded to one major version: research hosts have shipped GCC 12,
+# 14 and 16, and a stale `/usr/lib/gcc/<triple>/<N>/include` silently turns
+# every test that needs <stddef.h>/<stdarg.h> into a bogus compile-fail.
+def _gcc_private_include(gcc: str) -> list[str]:
+    try:
+        proc = subprocess.run([gcc, "-m32", "-print-file-name=include"],
+                              capture_output=True, text=True, timeout=10, check=False)
+        path = proc.stdout.strip()
+        if proc.returncode == 0 and path and os.path.isdir(path):
+            return ["-isystem", path]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    import glob as _glob
+    candidates = sorted(
+        _glob.glob("/usr/lib/gcc/x86_64-linux-gnu/*/include"),
+        key=lambda p: int(p.split("/")[-2]) if p.split("/")[-2].isdigit() else -1,
+    )
+    return ["-isystem", candidates[-1]] if candidates else []
+
+
 _I686_INCLUDES = [
-    "-isystem", "/usr/lib/gcc/x86_64-linux-gnu/14/include",
+    *_gcc_private_include(os.environ.get("GCC_BIN", "gcc")),
     "-isystem", "/usr/include/x86_64-linux-gnu",
     "-isystem", "/usr/include/i386-linux-gnu",
     "-isystem", "/usr/include",
@@ -248,6 +270,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Progress must be visible in `nohup ... > log` runs on the constrained
+    # research host; default block buffering hides it for tens of minutes.
+    sys.stdout.reconfigure(line_buffering=True)
     args = parse_args(argv)
     args.suite = args.suite.expanduser().resolve()
     args.lccc = args.lccc.expanduser().resolve()
