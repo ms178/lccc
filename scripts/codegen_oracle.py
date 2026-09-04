@@ -352,6 +352,42 @@ def _markdown(results: list[dict[str, Any]], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def _print_totals(results: list[dict[str, Any]]) -> None:
+    """Cross-source aggregate: sum static stats per compiler and count
+    per-source bests.  Gives a one-glance answer to 'which compiler is
+    smallest over this whole corpus' that the per-file tables cannot.
+
+    These are screening metrics, not PMU evidence (see _markdown header).
+    """
+    import collections
+
+    totals: dict[str, dict[str, float]] = collections.defaultdict(
+        lambda: {"instructions": 0, "loads": 0, "stores": 0,
+                 "spills": 0, "branches": 0, "vectors": 0, "sources": 0}
+    )
+    wins: dict[str, int] = collections.defaultdict(int)
+    for result in results:
+        records = {r["key"]: r for r in result["records"]}
+        comparable = [r for r in result["records"] if r.get("instructions", 0) > 0]
+        if comparable:
+            best = min(comparable, key=lambda r: r["instructions"])
+            wins[best["key"]] += 1
+        for key, record in records.items():
+            agg = totals[key]
+            for field in ("instructions", "loads", "stores", "spills", "branches", "vectors"):
+                agg[field] += record.get(field, 0)
+            agg["sources"] += 1
+    print(f"\nTOTALS across {len(results)} source(s) per compiler:"
+          " instruction/load/store/spill/branch/vector sums, per-source bests")
+    print(f"{'compiler':<12} {'insns':>7} {'loads':>6} {'stores':>7} "
+          f"{'spills':>7} {'branch':>7} {'vector':>6} {'best':>5}")
+    print("-" * 72)
+    for key, agg in sorted(totals.items(), key=lambda kv: kv[1]["instructions"]):
+        print(f"{key:<12} {agg['instructions']:>7.0f} {agg['loads']:>6.0f} "
+              f"{agg['stores']:>7.0f} {agg['spills']:>7.0f} {agg['branches']:>7.0f} "
+              f"{agg['vectors']:>6.0f} {wins.get(key, 0):>5}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Dash-leading flag values ("--local-flags -O3", "--flags -O3 ...") are
@@ -378,6 +414,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--json", type=Path)
     parser.add_argument("--markdown", type=Path)
+    parser.add_argument("--totals", action="store_true",
+                        help="also print a cross-source aggregate per compiler "
+                             "(summed static stats + per-source bests)")
     parser.add_argument("-j", "--jobs", type=int, default=4)
     return parser.parse_args(argv)
 
@@ -420,6 +459,8 @@ def main(argv: list[str] | None = None) -> int:
         tmp.replace(args.json)
     if args.markdown:
         _markdown(results, args.markdown)
+    if args.totals:
+        _print_totals(results)
     return 1 if any(result["errors"] for result in results) else 0
 
 

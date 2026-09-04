@@ -2262,6 +2262,17 @@ fn analyze_reduction_pattern(
             set_reject("conditional-sum guard shape not expressible (needs loaded > rhs)");
             return None;
         }
+        // The masked composite step exists for I32 lanes (x86 vpcmpgtd /
+        // vpand / vpaddd).  A guarded F32/F64 (or narrow-int) equal-width sum
+        // has no expressible masked form and the equal-width transform would
+        // silently DROP the guard (miscompile: `if (a[i] > 0) s += a[i]`
+        // summed every element).  Keep such loops scalar — correct code
+        // beats wrong vectors, and the scalar guarded sum is what GCC emits
+        // for the innermost remainder anyway.
+        if element_type != IrType::I32 {
+            set_reject("conditional-sum guard needs an I32 element type (masked equal-width form)");
+            return None;
+        }
     }
 
     let mut primary_loads: Vec<Value> = Vec::new();
@@ -9694,6 +9705,60 @@ fn transform_reduction_avx2(
                         body_block
                             .instructions
                             .insert(pattern.accumulator_add_idx, widen_inst);
+                        body_block
+                            .instructions
+                            .remove(pattern.accumulator_add_idx + 1);
+                        changes += 1;
+                    } else if pattern.guard_cond.is_some() {
+                        // CONDITIONAL (guarded) EQUAL-WIDTH sum: the old
+                        // transform silently DROPPED the Select guard here —
+                        // `if (a[i] > 0) s += a[i]` summed every element
+                        // (regression: tests/regression/vector_guard_sum.c,
+                        // lccc returned 612 where GCC returns 651).  Use the
+                        // composite masked intrinsic whose lowering builds
+                        // the per-lane compare mask internally; splice out
+                        // the Select (it sits after the Add) and replace the
+                        // scalar Add with the masked step.
+                        let guard_rhs = pattern
+                            .guard_rhs
+                            .clone()
+                            .unwrap_or(Operand::Const(IrConst::I32(0)));
+                        let masked_inst = Instruction::Intrinsic {
+                            dest: Some(vec_sum_value),
+                            op: IntrinsicOp::VecMaskedAddI32x8,
+                            dest_ptr: None,
+                            args: vec![
+                                Operand::Value(pattern.accumulator_phi),
+                                base,
+                                off,
+                                guard_rhs,
+                            ],
+                        };
+                        // The Add's result id (the Select's true_val), read
+                        // BEFORE any splice shifts indices.
+                        let add_result_id = body_block
+                            .instructions
+                            .get(pattern.accumulator_add_idx)
+                            .and_then(|i| i.dest())
+                            .map(|d| d.0);
+                        let mut select_idx = None;
+                        for (sidx, sin) in body_block.instructions.iter().enumerate() {
+                            if let Instruction::Select { true_val, .. } = sin {
+                                if matches!(
+                                    true_val,
+                                    Operand::Value(tv) if Some(tv.0) == add_result_id
+                                ) {
+                                    select_idx = Some(sidx);
+                                    break;
+                                }
+                            }
+                        }
+                        if let Some(si) = select_idx {
+                            body_block.instructions.remove(si);
+                        }
+                        body_block
+                            .instructions
+                            .insert(pattern.accumulator_add_idx, masked_inst);
                         body_block
                             .instructions
                             .remove(pattern.accumulator_add_idx + 1);

@@ -361,6 +361,17 @@ pub enum IntrinsicOp {
     /// values before the paddq folds — exact lane-guarded I64 accumulation
     /// (GCC's canonical conditional-reduction form).
     VecWidenMaskedAddI32x4ToI64x2,
+    /// Masked equal-width reduction step: dest(I32x8 accumulator) +=
+    /// 8×I32 loaded from (base, byte_offset) WHERE the lane satisfies
+    /// `lane > guard_rhs` (signed).  args = [accumulator, base,
+    /// byte_offset, guard_rhs].  The x86 lowering builds the per-lane I32
+    /// mask with vpcmpgtd (lanes > rhs), vpand zero-masks the loaded lanes
+    /// and vpaddd folds them into the accumulator — the equal-width sibling
+    /// of VecWidenMaskedAddI32x4ToI64x2.  Without it the non-widening
+    /// conditional-sum transform silently DROPPED the Select guard
+    /// (`if (a[i] > 0) s += a[i]` summed every element; regression:
+    /// tests/regression/vector_guard_sum.c).
+    VecMaskedAddI32x8,
     /// Vector multiply: %dest_vec = %src1_vec * %src2_vec - 4×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecMulI32x4,
@@ -1196,6 +1207,7 @@ impl IntrinsicOp {
             | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
+            | VecMaskedAddI32x8
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
@@ -1222,7 +1234,8 @@ impl IntrinsicOp {
             IntrinsicOp::CopysignF32 | IntrinsicOp::CopysignF64 |
             IntrinsicOp::F128Fabs | IntrinsicOp::F128Neg | IntrinsicOp::F128Copysign |
             IntrinsicOp::VecWidenAddI32x4ToI64x2
-            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2 |
+            | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+            | IntrinsicOp::VecMaskedAddI32x8 |
             IntrinsicOp::LDFabs | IntrinsicOp::LDCopysign |
             IntrinsicOp::Aesenc128 | IntrinsicOp::Aesenclast128 |
             IntrinsicOp::Aesdec128 | IntrinsicOp::Aesdeclast128 |
@@ -1319,6 +1332,7 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecSqrtF32x4
                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
                 | IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2
+                | IntrinsicOp::VecMaskedAddI32x8
                 | IntrinsicOp::VecBroadcastF32x8
                 | IntrinsicOp::VecBroadcastF32x4
                 | IntrinsicOp::VecFmaF64x4

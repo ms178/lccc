@@ -4990,6 +4990,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // VecHorizontalAdd — stays classified and reaches the XMM
             // allocator (register-homed accumulator, no stack round-trip).
             O::VecWidenAddI32x4ToI64x2 | O::VecWidenMaskedAddI32x4ToI64x2 => Some(7),
+            // Equal-width masked add consumes an I32x8 accumulator exactly
+            // like VecAddI32x8 (its lowering confines scratch to ymm0/ymm1,
+            // mirroring the widening-masked path's xmm0/xmm1 discipline).
+            O::VecMaskedAddI32x8 => Some(5),
             O::VecLoadWidenI32ToI64x2 => Some(7),
             _ => None,
         }
@@ -5022,6 +5026,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // it. Both lowerings confine scratch to xmm0/xmm1.
                     | O::VecMaxI32x8
                     | O::VecHorizontalMaxI32x8
+                    | O::VecMaskedAddI32x8
             ),
             6 => matches!(
                 op,
