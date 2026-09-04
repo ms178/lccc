@@ -16,7 +16,22 @@ impl Lowerer {
         // C99 6.8.4.2: Integer promotions are performed on the controlling expression.
         // Non-integer types (pointers, floats, etc.) are rejected by sema; this Ptr
         // arm is a defensive fallback to avoid crashes if sema is bypassed.
-        let raw_expr_ty = self.get_expr_type(expr);
+        //
+        // The controlling value is consumed at a CONVERSION BOUNDARY (the
+        // `Switch` terminator compares exactly `ty` bits), so its type must
+        // describe the bits the lowered expression really produces.
+        // `get_expr_type` reports the widened *storage* type: on LP64 an
+        // integer literal is I64, so `x + 0` / `x * 1` / `x + 1` with
+        // `int x` was reported as I64 while `lower_arithmetic_binop` computed
+        // the sum as a 32-bit `addl`.  The dispatch chain then compared the
+        // full 64-bit register (`cmpq $-1, %rdi`), whose upper half is
+        // ABI-undefined for an `int` argument (SysV: only the low 32 bits of
+        // a 32-bit parameter are meaningful) or zero after a 32-bit ALU op —
+        // so `case -1:` never matched and `case 5:` matched garbage.  Found
+        // by tests/stress (switch family, every seed, every -O level).
+        // `value_ir_type` mirrors lower_arithmetic_binop's exact type
+        // computation and is the documented query for such boundaries.
+        let raw_expr_ty = self.value_ir_type(expr);
         let switch_expr_ty = match raw_expr_ty {
             IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
             IrType::Ptr => crate::common::types::target_int_ir_type(),
