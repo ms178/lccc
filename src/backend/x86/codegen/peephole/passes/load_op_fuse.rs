@@ -528,6 +528,13 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             || c_fam == b_fam
             || c_fam == t_fam
             || !COMMUTATIVE_OPS.contains(&op)
+            // The replacement is TWO instructions: `mov C, B` (at j) followed
+            // by `op mem, B` (at k), and the folded memory operand's address
+            // is evaluated at k. If B is one of the address families the copy
+            // writes an address input BEFORE the op reads it (e.g. an index
+            // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
+            // miscompile. Bail: the copy-bridged shape stays untouched.
+            || (b_bit & addr) != 0
         {
             i += 1;
             continue;

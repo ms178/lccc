@@ -295,6 +295,15 @@ fn eval_const_function(
                     Instruction::Copy { dest, src } => {
                         values.insert(dest.0, eval_const_operand(src, &values)?);
                     }
+                    // Cast/UnaryOp/BinOp/Cmp are evaluated by the canonical
+                    // constant-fold evaluators so that the interprocedural
+                    // interpreter can never disagree with the intraprocedural
+                    // folder.  The previous hand-rolled arms went through
+                    // `to_i64()` and ignored the operation TYPE: a `Cmp Ne` at
+                    // U16 between `Cast U32(0xFFFFFFFF)->U16` (held as
+                    // I64(65535)) and `I16(-1)` (the same 16-bit pattern)
+                    // evaluated 65535 != -1 and proved a branch that was
+                    // never taken, so a caller was folded onto its abort path.
                     Instruction::Cast {
                         dest,
                         src,
@@ -302,35 +311,26 @@ fn eval_const_function(
                         to_ty,
                     } => {
                         let value = eval_const_operand(src, &values)?;
-                        values.insert(dest.0, value.coerce_to_with_src(*to_ty, Some(*from_ty)));
+                        values.insert(
+                            dest.0,
+                            crate::passes::constant_fold::eval_cast_const(
+                                value, *from_ty, *to_ty,
+                            )?,
+                        );
                     }
                     Instruction::UnaryOp { dest, op, src, ty } => {
-                        let value = eval_const_operand(src, &values)?.to_i64()?;
-                        let result = match op {
-                            crate::ir::reexports::IrUnaryOp::Neg => value.checked_neg()?,
-                            crate::ir::reexports::IrUnaryOp::Not => !value,
-                            crate::ir::reexports::IrUnaryOp::Clz => {
-                                (value as u64).leading_zeros() as i64
-                            }
-                            crate::ir::reexports::IrUnaryOp::Ctz => {
-                                (value as u64).trailing_zeros() as i64
-                            }
-                            crate::ir::reexports::IrUnaryOp::Popcount => {
-                                (value as u64).count_ones() as i64
-                            }
-                            crate::ir::reexports::IrUnaryOp::Bswap => match *ty {
-                                IrType::I32 | IrType::U32 => (value as i32).swap_bytes() as i64,
-                                _ => value.swap_bytes(),
-                            },
-                            crate::ir::reexports::IrUnaryOp::BitReverse => match *ty {
-                                IrType::I8 | IrType::U8 => (value as u8).reverse_bits() as i64,
-                                IrType::I16 | IrType::U16 => (value as u16).reverse_bits() as i64,
-                                IrType::I32 | IrType::U32 => (value as u32).reverse_bits() as i64,
-                                _ => (value as u64).reverse_bits() as i64,
-                            },
-                            crate::ir::reexports::IrUnaryOp::IsConstant => 1,
-                        };
-                        values.insert(dest.0, IrConst::from_i64(result, *ty));
+                        // `__builtin_constant_p` is phase-dependent; the pure
+                        // evaluator must not commit to an answer for it.
+                        if *op == crate::ir::reexports::IrUnaryOp::IsConstant {
+                            return None;
+                        }
+                        let value = eval_const_operand(src, &values)?;
+                        values.insert(
+                            dest.0,
+                            crate::passes::constant_fold::eval_unaryop_const(
+                                *op, value, None, *ty,
+                            )?,
+                        );
                     }
                     Instruction::BinOp {
                         dest,
@@ -339,19 +339,25 @@ fn eval_const_function(
                         rhs,
                         ty,
                     } => {
-                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
-                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
-                        let result = op.eval_i64(lhs, rhs)?;
-                        values.insert(dest.0, IrConst::from_i64(result, *ty));
-                    }
-                    Instruction::Cmp {
-                        dest, op, lhs, rhs, ..
-                    } => {
-                        let lhs = eval_const_operand(lhs, &values)?.to_i64()?;
-                        let rhs = eval_const_operand(rhs, &values)?.to_i64()?;
+                        let lhs = eval_const_operand(lhs, &values)?;
+                        let rhs = eval_const_operand(rhs, &values)?;
                         values.insert(
                             dest.0,
-                            IrConst::I32(if op.eval_i64(lhs, rhs) { 1 } else { 0 }),
+                            crate::passes::constant_fold::eval_binop_const(*op, lhs, rhs, *ty)?,
+                        );
+                    }
+                    Instruction::Cmp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        let lhs = eval_const_operand(lhs, &values)?;
+                        let rhs = eval_const_operand(rhs, &values)?;
+                        values.insert(
+                            dest.0,
+                            crate::passes::constant_fold::eval_cmp_const(*op, lhs, rhs, *ty)?,
                         );
                     }
                     Instruction::Select {

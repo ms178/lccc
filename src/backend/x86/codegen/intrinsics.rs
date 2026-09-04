@@ -4618,9 +4618,19 @@ impl X86Codegen {
                 let Operand::Value(sv) = &args[1] else {
                     unreachable!("vfmadd132 scale operand must be a value");
                 };
-                let scale_mem = self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
-                    unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
-                });
+                // VLFOLD soundness: an elided load leaves its home slot NEVER
+                // WRITTEN, so a pending fold on the scale must be consumed as
+                // the real source memory operand here — never through the
+                // value's slot (the pre-fix vfmadd132pd read of an uninitialised
+                // stack slot that miscompiled streamed `a*b+c` maps).
+                let scale_mem = if let Some(mem) = self.memfold_operand(&args[1]) {
+                    self.state.pending_vec_memfold = None;
+                    mem
+                } else {
+                    self.value_ptr_mem_operand(sv.0).unwrap_or_else(|| {
+                        unreachable!("vfmadd132 scale operand must be homed, tracked, or slot-homed")
+                    })
+                };
                 self.state
                     .emit_fmt(format_args!("    {} {}, %ymm1, %ymm0", mnemonic, scale_mem));
                 self.state.vec_last_store_reg = false;
