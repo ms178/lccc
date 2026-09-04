@@ -3518,6 +3518,12 @@ struct MapPattern {
     /// GEPs for the source load streams (src[iv]); all advance by the same
     /// byte induction variable.
     src_geps: Vec<Value>,
+    /// Indices into `src_geps` whose object root could not be proven
+    /// disjoint from the destination.  The transform versions the loop with
+    /// an exact runtime dependence-distance guard for each of them (see
+    /// `emit_alias_guards`); an empty list means the packed loop is
+    /// unconditionally legal.
+    guarded_streams: Vec<usize>,
     /// The elementwise expression stored to dst[iv].
     expr: MapExpr,
     /// All block indices in the loop body
@@ -3960,23 +3966,52 @@ fn analyze_map_pattern(
     // Only WRITE-vs-READ aliasing matters: source streams only read, so they
     // may alias each other freely; each source must be disjoint from the
     // destination (or the exact same GEP for lane-local in-place maps).
-    let dst_root = proven_object_root(func, dst_gep)?;
-    for &(_, _, src_gep, _) in &load_infos {
-        let src_root = proven_object_root(func, src_gep)?;
-        // Exact in-place maps are lane-local and safe (`a[i] = a[i] * s + b`).
-        // Otherwise require disjoint complete-object roots; merely seeing
-        // different SSA pointer values is not an alias proof.
-        if !geps_proven_identical(func, &loop_info.body, src_gep, dst_gep)
-            && !roots_proven_distinct(&dst_root, &src_root)
-        {
+    // IV start: the transform's byte IV starts at element 0 and the scalar
+    // remainder resumes at `iv * width`; both assume the counter starts at a
+    // constant zero.  A non-zero or dynamic start is left to the stencil
+    // path (which models `iv_start`) or stays scalar.  (Before this check a
+    // `for (i = 1; ...) y[i] = 2 * x[i]` loop would have processed elements
+    // 0.. in the packed body.)
+    {
+        let latch_label = func.blocks[latch_idx].label;
+        let starts_at_zero = header.instructions.iter().any(|inst| {
+            matches!(inst, Instruction::Phi { dest, incoming, .. }
+                if *dest == iv
+                    && incoming.iter().any(|(op, lbl)| *lbl != latch_label
+                        && matches!(op, Operand::Const(c) if c.to_i64() == Some(0))))
+        });
+        if !starts_at_zero {
+            set_reject("map induction variable does not start at a constant 0");
+            return None;
+        }
+    }
+
+    // Alias legality.  Exact in-place streams (`a[i] = a[i] * s + b`) are
+    // lane-local and always safe.  Streams whose complete-object root is
+    // proven disjoint from the destination are safe.  Every other stream is
+    // recorded for RUNTIME versioning: the transform emits one exact
+    // dependence-distance check per such stream and enters the scalar loop
+    // when the destination writes ahead of a read within one vector step.
+    // Different SSA pointer values are NOT an alias proof; ordinary pointer
+    // parameters may overlap.  Without versioning GCC/Clang/ICX vectorize
+    // `y[i] = x[i] + z[i]` and LCCC did not.
+    let dst_root = proven_object_root(func, dst_gep);
+    let mut guarded_streams = Vec::new();
+    for (idx, &(_, _, src_gep, _)) in load_infos.iter().enumerate() {
+        if geps_proven_identical(func, &loop_info.body, src_gep, dst_gep) {
+            continue;
+        }
+        let src_root = proven_object_root(func, src_gep);
+        let distinct = matches!((&dst_root, &src_root),
+            (Some(d), Some(s)) if roots_proven_distinct(d, s));
+        if !distinct {
             if debug {
                 eprintln!(
-                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct: {:?} vs {:?}",
+                    "[VEC-MAP]   GEP {:?}/{:?} bases not provably distinct ({:?} vs {:?}): runtime alias guard",
                     dst_gep, src_gep, dst_root, src_root
                 );
             }
-            set_reject("map source/destination may alias (use restrict or exact in-place access)");
-            return None;
+            guarded_streams.push(idx);
         }
     }
 
@@ -3996,6 +4031,7 @@ fn analyze_map_pattern(
         exit_cmp_op,
         dst_gep,
         src_geps: load_infos.iter().map(|&(_, _, g, _)| g).collect(),
+        guarded_streams,
         expr,
         loop_blocks: loop_info.body.clone(),
     })
@@ -4264,6 +4300,10 @@ struct StencilPattern {
     /// The stored value (the expression tree root).
     store_val: Value,
     store_gep: Value,
+    /// `src_base` and `dst_base` are different pointers whose object roots
+    /// could not be proven disjoint: the transform versions the loop with a
+    /// runtime dependence-distance guard (see `emit_alias_guards`).
+    needs_alias_guard: bool,
 }
 
 /// Affine form `a*iv + b` over the loop IV, in BYTE units (GEP offsets).
@@ -4711,15 +4751,45 @@ fn analyze_stencil_pattern(
         return None;
     }
 
-    // Alias safety: distinct proven roots, or an exact lane-local in-place
-    // update (store disp 0 AND every tap disp 0).
-    let dst_root = proven_object_root(func, dst_base)?;
-    let src_root = proven_object_root(func, src_base)?;
-    let lane_local = dst_disp == 0 && load_infos.iter().all(|(_, _, _, a)| a.const_bytes == 0);
-    if dst_base != src_base && !roots_proven_distinct(&dst_root, &src_root) && !lane_local {
-        set_reject("stencil source/destination may alias (use restrict)");
-        return None;
-    }
+    // Dependence legality.  A packed step performs all W loads before all W
+    // stores, so the only illegal shape is a tap that reads an element the
+    // SAME step stores earlier in scalar order: writes at byte
+    // `dst + i*e + dst_disp`, reads at `src + i*e + tap`, and the read of
+    // lane j observes the store of lane k < j iff
+    //     0 < (dst + dst_disp) - (src + tap) < W*e.
+    // Reads ahead of the write cursor (distance <= 0) and reads far behind
+    // it (distance >= W*e) see exactly the values the scalar loop saw.
+    //
+    // * Same pointer root value: the distance is a compile-time constant per
+    //   tap; reject statically when any tap is inside the window (this is
+    //   `x[i] = x[i-1] + x[i]`, a true recurrence).  The window uses the
+    //   widest lowering (8 x F32 / 4 x F64 = 32 bytes) because the lane
+    //   count is chosen later.
+    // * Proven-disjoint roots (restrict params, distinct globals/allocas):
+    //   unconditionally legal.
+    // * Otherwise: legal under a RUNTIME guard evaluating the same
+    //   inequality once in the preheader (loop versioning; falls back to the
+    //   exact scalar remainder over the whole range).
+    //
+    // The previous "lane-local" exemption accepted distinct, unproven
+    // pointers whenever every displacement was 0 — but `scale(y, x)` with
+    // `x == y - 1` is exactly the recurrence above, so that was unsound.
+    const STATIC_WINDOW_BYTES: i64 = 32;
+    let needs_alias_guard = if dst_base == src_base {
+        if load_infos.iter().any(|(_, _, _, a)| {
+            let distance = dst_disp - a.const_bytes;
+            distance > 0 && distance < STATIC_WINDOW_BYTES
+        }) {
+            set_reject("stencil has a loop-carried dependence inside the vector window");
+            return None;
+        }
+        false
+    } else {
+        let dst_root = proven_object_root(func, dst_base);
+        let src_root = proven_object_root(func, src_base);
+        !matches!((&dst_root, &src_root),
+            (Some(d), Some(s)) if roots_proven_distinct(d, s))
+    };
 
     // Constant trip counts of 4 or fewer are better left scalar (mirrors
     // the map gate).
@@ -4755,6 +4825,7 @@ fn analyze_stencil_pattern(
             .collect(),
         store_val,
         store_gep,
+        needs_alias_guard,
     };
     if debug {
         eprintln!(
@@ -4826,6 +4897,17 @@ fn transform_stencil_vector(
     let int_const = |n: i64| match pattern.iv_ty {
         IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
         _ => IrConst::I64(n),
+    };
+
+    // Exact scalar remainder, built before any mutation (see the map
+    // transform for the rationale); committed after the packed body.
+    let Some(remainder) =
+        build_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
+    else {
+        if debug {
+            eprintln!("[VEC-STENCIL] scalar remainder mirror unavailable; bailing");
+        }
+        return 0;
     };
 
     // ── Vector trip count and the rewritten bound ─────────────────────────
@@ -5146,8 +5228,31 @@ fn transform_stencil_vector(
         changes += inserted;
     }
 
-    changes +=
-        insert_stencil_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
+    let rem_header_label = remainder.header_label;
+    let rem_iv_phi = remainder.iv_phi;
+    changes += remainder.commit(func, pattern.header_idx);
+
+    if pattern.needs_alias_guard {
+        let disp_min = pattern.taps.iter().map(|t| t.disp_bytes).min().unwrap_or(0);
+        let disp_max = pattern.taps.iter().map(|t| t.disp_bytes).max().unwrap_or(0);
+        changes += emit_alias_guards(
+            func,
+            preheader_idx,
+            pattern.dst_base,
+            pattern.dst_disp,
+            &[AliasCheck {
+                src_base: pattern.src_base,
+                disp_min,
+                disp_max,
+            }],
+            elem_size * vec_width as i64,
+            rem_header_label,
+            rem_iv_phi,
+            Operand::Const(int_const(pattern.iv_start)),
+            &mut next_val_id,
+            &mut next_label,
+        );
+    }
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -5524,14 +5629,13 @@ fn emit_stencil_expr(
 /// Insert an exact scalar remainder for a vectorized stencil: a fresh loop
 /// over the unprocessed tail elements that recomputes the ORIGINAL
 /// expression (same ops, same order) from the tap GEP shapes.
-fn insert_stencil_remainder_loop(
-    func: &mut IrFunction,
+fn build_stencil_remainder_loop(
+    func: &IrFunction,
     pattern: &StencilPattern,
     vec_width: u64,
     next_val_id: &mut u32,
     next_label: &mut u32,
-) -> usize {
-    let mut changes = 0usize;
+) -> Option<RemainderLoop> {
     let elem_size: i64 = if pattern.elem_ty == IrType::F64 { 8 } else { 4 };
     let int_const = |n: i64| match pattern.iv_ty {
         IrType::I32 | IrType::U32 => IrConst::I32(n as i32),
@@ -5557,13 +5661,6 @@ fn insert_stencil_remainder_loop(
     *next_val_id += 1;
     let i_rem_cmp_lhs = Value(*next_val_id);
     *next_val_id += 1;
-
-    // Redirect the vector loop's exit edge to the remainder entry.
-    if let Terminator::CondBranch { false_label, .. } =
-        &mut func.blocks[pattern.header_idx].terminator
-    {
-        *false_label = vec_exit_label;
-    }
 
     // Remainder start element = iv_start + (vector-iv − iv_start) * width.
     // The header phi at vector-loop exit holds the next unprocessed scalar
@@ -5743,7 +5840,13 @@ fn insert_stencil_remainder_loop(
         if let Some(&v) = remap.get(&node.0) {
             return Some(v);
         }
-        let def = defs.get(&node.0)?.clone();
+        // Not defined inside the loop: a loop-invariant leaf (parameter,
+        // preheader value, global address).  It dominates the remainder and
+        // is reused as-is — exactly what the packed emitter broadcasts.
+        let Some(def) = defs.get(&node.0).cloned() else {
+            remap.insert(node.0, node);
+            return Some(node);
+        };
         match def {
             Instruction::BinOp {
                 op, lhs, rhs, ty, ..
@@ -5797,24 +5900,20 @@ fn insert_stencil_remainder_loop(
                 remap.insert(node.0, dest);
                 Some(dest)
             }
-            // Invariant leaf: reuse the original value directly.
-            _ => {
-                remap.insert(node.0, node);
-                Some(node)
-            }
+            // Any other loop-local definition (Phi, Cast, Select, Load,
+            // ...) is outside the mirrored grammar; the packed emitter
+            // rejects the same nodes, so this is unreachable in practice
+            // and fails closed if the two ever disagree.
+            _ => None,
         }
     }
-    let Some(result) = remap_expr(
+    let result = remap_expr(
         pattern.store_val,
         &defs,
         &mut remap,
         next_val_id,
         &mut body_insts,
-    ) else {
-        // Without a remainder the transform would be unsound; the caller
-        // already replaced the store, so report failure (0 added blocks).
-        return 0;
-    };
+    )?;
     body_insts.push(Instruction::Store {
         val: Operand::Value(result),
         ptr: dst_gep_v,
@@ -5842,14 +5941,14 @@ fn insert_stencil_remainder_loop(
         source_spans: vec![],
     };
 
-    // The remainder blocks are appended at the end; the final layout pass
-    // re-orders everything in reverse post-order.
-    func.blocks.push(vec_exit_block);
-    func.blocks.push(rem_header_block);
-    func.blocks.push(rem_body_block);
-    func.blocks.push(rem_latch_block);
-    changes += 4;
-    changes
+    // The blocks are appended by `RemainderLoop::commit`; the final layout
+    // pass re-orders everything in reverse post-order.
+    Some(RemainderLoop {
+        blocks: vec![vec_exit_block, rem_header_block, rem_body_block, rem_latch_block],
+        vec_exit_label,
+        header_label: rem_header_label,
+        iv_phi: i_rem_iv,
+    })
 }
 
 /// Check if a GEP uses the induction variable.
@@ -11519,6 +11618,21 @@ fn transform_map_vector(
         return 0;
     };
 
+    // Build the exact scalar remainder BEFORE touching the function: if the
+    // scalar mirror cannot be produced nothing has been mutated and the loop
+    // simply stays scalar.  The blocks are committed (appended + exit edge
+    // redirected) only after the packed body is in place.  (Redirecting the
+    // exit edge first and bailing later left a dangling branch into the
+    // next function's labels.)
+    let Some(remainder) =
+        build_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label)
+    else {
+        if debug {
+            eprintln!("[VEC-MAP]   Scalar remainder mirror unavailable; bailing");
+        }
+        return 0;
+    };
+
     // Build IV-derived values for comparison rewriting.
     let mut iv_derived = FxHashSet::default();
     iv_derived.insert(pattern.iv);
@@ -11823,8 +11937,39 @@ fn transform_map_vector(
         changes += inserted;
     }
 
-    changes +=
-        insert_map_remainder_loop(func, pattern, vec_width, &mut next_val_id, &mut next_label);
+    let rem_header_label = remainder.header_label;
+    let rem_iv_phi = remainder.iv_phi;
+    changes += remainder.commit(func, pattern.header_idx);
+
+    // Loop versioning for streams that may alias the destination.
+    if !pattern.guarded_streams.is_empty() {
+        let checks: Vec<AliasCheck> = pattern
+            .guarded_streams
+            .iter()
+            .map(|&i| AliasCheck {
+                src_base: src_bases[i],
+                disp_min: 0,
+                disp_max: 0,
+            })
+            .collect();
+        let zero = match pattern.iv_ty {
+            IrType::I32 | IrType::U32 => IrConst::I32(0),
+            _ => IrConst::I64(0),
+        };
+        changes += emit_alias_guards(
+            func,
+            preheader_idx,
+            dst_base,
+            0,
+            &checks,
+            elem_size as i64 * vec_width as i64,
+            rem_header_label,
+            rem_iv_phi,
+            Operand::Const(zero),
+            &mut next_val_id,
+            &mut next_label,
+        );
+    }
 
     func.next_value_id = next_val_id;
     func.next_label = next_label;
@@ -11835,16 +11980,230 @@ fn transform_map_vector(
     changes
 }
 
+/// A scalar remainder loop built but not yet attached to the function.
+struct RemainderLoop {
+    blocks: Vec<BasicBlock>,
+    /// Entry block (computes the resume element from the vector IV).
+    vec_exit_label: BlockId,
+    /// Remainder loop header; its IV phi is `iv_phi`.
+    header_label: BlockId,
+    iv_phi: Value,
+}
+
+impl RemainderLoop {
+    /// Append the blocks and redirect the vector header's exit edge to the
+    /// remainder entry.  Returns the number of blocks added.
+    fn commit(self, func: &mut IrFunction, header_idx: usize) -> usize {
+        if let Terminator::CondBranch { false_label, .. } = &mut func.blocks[header_idx].terminator
+        {
+            *false_label = self.vec_exit_label;
+        }
+        let added = self.blocks.len();
+        func.blocks.extend(self.blocks);
+        added
+    }
+}
+
+/// One runtime dependence check between the destination stream and a source
+/// stream of an elementwise loop.
+struct AliasCheck {
+    src_base: Value,
+    /// Smallest and largest byte displacement read through `src_base`
+    /// (equal for a plain `src[i]` stream).
+    disp_min: i64,
+    disp_max: i64,
+}
+
+/// Loop versioning by exact dependence distance.
+///
+/// The packed body performs all `W` loads of a step before its `W` stores.
+/// With destination writes at `D_i = dst + dst_disp + i*e` and reads at
+/// `S_i = src + tap + i*e` (`tap ∈ [disp_min, disp_max]`), lane `j`'s read
+/// observes lane `k < j`'s store — the only way the packed order differs
+/// from scalar order — iff `0 < D - S < W*e`, i.e. iff
+///
+/// ```text
+///     (dst + dst_disp) - (src + disp_min) - 1  <u  W*e + (disp_max - disp_min) - 1
+/// ```
+///
+/// One subtraction, one decrement and one unsigned compare per stream.  The
+/// check is exact for every byte offset (partial overlaps included); a zero
+/// distance (in-place update) is correctly classified as SAFE, which LLVM's
+/// coarser `dst - src >=u VF*e` check does not do.
+///
+/// Each check lives in its own block so the tests chain without a boolean
+/// OR; a failing check enters the scalar remainder loop at the loop's first
+/// element (`rem_start`), so no clone of the original loop is needed.  The
+/// vector header's phis are re-pointed from the preheader to the last guard
+/// block, which becomes their entry predecessor.
+#[allow(clippy::too_many_arguments)]
+fn emit_alias_guards(
+    func: &mut IrFunction,
+    preheader_idx: usize,
+    dst_base: Value,
+    dst_disp: i64,
+    checks: &[AliasCheck],
+    window_bytes: i64,
+    rem_header_label: BlockId,
+    rem_iv_phi: Value,
+    rem_start: Operand,
+    next_val_id: &mut u32,
+    next_label: &mut u32,
+) -> usize {
+    if checks.is_empty() {
+        return 0;
+    }
+    let Terminator::Branch(header_label) = func.blocks[preheader_idx].terminator else {
+        return 0;
+    };
+    let preheader_label = func.blocks[preheader_idx].label;
+    let mut changes = 0usize;
+    let mut fresh = || {
+        let v = Value(*next_val_id);
+        *next_val_id += 1;
+        v
+    };
+    let i64c = |n: i64| Operand::Const(IrConst::I64(n));
+
+    // Destination lane-0 address as an integer (hoisted; shared by all checks).
+    let d_raw = fresh();
+    let mut pending = vec![Instruction::Cast {
+        dest: d_raw,
+        src: Operand::Value(dst_base),
+        from_ty: IrType::Ptr,
+        to_ty: IrType::I64,
+    }];
+    let d = if dst_disp != 0 {
+        let v = fresh();
+        pending.push(Instruction::BinOp {
+            dest: v,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(d_raw),
+            rhs: i64c(dst_disp),
+            ty: IrType::I64,
+        });
+        v
+    } else {
+        d_raw
+    };
+
+    let mut cur_idx = preheader_idx;
+    let n = checks.len();
+    for (i, check) in checks.iter().enumerate() {
+        let s_raw = fresh();
+        pending.push(Instruction::Cast {
+            dest: s_raw,
+            src: Operand::Value(check.src_base),
+            from_ty: IrType::Ptr,
+            to_ty: IrType::I64,
+        });
+        let s = if check.disp_min != 0 {
+            let v = fresh();
+            pending.push(Instruction::BinOp {
+                dest: v,
+                op: IrBinOp::Add,
+                lhs: Operand::Value(s_raw),
+                rhs: i64c(check.disp_min),
+                ty: IrType::I64,
+            });
+            v
+        } else {
+            s_raw
+        };
+        let distance = fresh();
+        pending.push(Instruction::BinOp {
+            dest: distance,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(d),
+            rhs: Operand::Value(s),
+            ty: IrType::I64,
+        });
+        let distance_m1 = fresh();
+        pending.push(Instruction::BinOp {
+            dest: distance_m1,
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(distance),
+            rhs: i64c(1),
+            ty: IrType::I64,
+        });
+        let unsafe_overlap = fresh();
+        pending.push(Instruction::Cmp {
+            dest: unsafe_overlap,
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(distance_m1),
+            rhs: i64c(window_bytes + (check.disp_max - check.disp_min) - 1),
+            ty: IrType::I64,
+        });
+        changes += pending.len();
+        let next_target = if i + 1 == n {
+            header_label
+        } else {
+            let l = BlockId(*next_label);
+            *next_label += 1;
+            l
+        };
+        let cur = &mut func.blocks[cur_idx];
+        cur.instructions.append(&mut pending);
+        cur.terminator = Terminator::CondBranch {
+            cond: Operand::Value(unsafe_overlap),
+            true_label: rem_header_label,
+            false_label: next_target,
+        };
+        let cur_label = cur.label;
+        add_phi_incoming(func, rem_header_label, rem_iv_phi, rem_start.clone(), cur_label);
+        if i + 1 < n {
+            func.blocks.push(BasicBlock {
+                label: next_target,
+                instructions: Vec::new(),
+                terminator: Terminator::Branch(header_label),
+                source_spans: vec![],
+            });
+            cur_idx = func.blocks.len() - 1;
+        }
+    }
+
+    // The last guard block is now the vector loop's entry predecessor.
+    let entry_label = func.blocks[cur_idx].label;
+    if entry_label != preheader_label {
+        if let Some(header) = func.blocks.iter_mut().find(|b| b.label == header_label) {
+            for inst in header.instructions.iter_mut() {
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (_, lbl) in incoming.iter_mut() {
+                        if *lbl == preheader_label {
+                            *lbl = entry_label;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changes
+}
+
+/// Add `(value, pred)` to the phi `phi` in the block labelled `block`.
+fn add_phi_incoming(func: &mut IrFunction, block: BlockId, phi: Value, value: Operand, pred: BlockId) {
+    if let Some(b) = func.blocks.iter_mut().find(|b| b.label == block) {
+        for inst in b.instructions.iter_mut() {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                if *dest == phi {
+                    incoming.push((value, pred));
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Insert an exact scalar remainder for a vectorized map.  It mirrors the
 /// source element/IV widths and optional operations rather than assuming the
 /// old fixed I32/F32 `mul + add` shape.
-fn insert_map_remainder_loop(
-    func: &mut IrFunction,
+fn build_map_remainder_loop(
+    func: &IrFunction,
     pattern: &MapPattern,
     vec_width: u64,
     next_val_id: &mut u32,
     next_label: &mut u32,
-) -> usize {
+) -> Option<RemainderLoop> {
     let mut src_bases: Vec<Option<Value>> = vec![None; pattern.src_geps.len()];
     let mut dst_base = None;
     for &block_idx in &pattern.loop_blocks {
@@ -11859,13 +12218,8 @@ fn insert_map_remainder_loop(
             }
         }
     }
-    let Some(dst_base) = dst_base else {
-        return 0;
-    };
-    let src_bases: Vec<Value> = match src_bases.into_iter().collect::<Option<Vec<_>>>() {
-        Some(v) => v,
-        None => return 0,
-    };
+    let dst_base = dst_base?;
+    let src_bases: Vec<Value> = src_bases.into_iter().collect::<Option<Vec<_>>>()?;
 
     let vec_exit_label = BlockId(*next_label);
     *next_label += 1;
@@ -11888,13 +12242,6 @@ fn insert_map_remainder_loop(
     let i_rem_cast = matches!(pattern.iv_ty, IrType::I32 | IrType::U32).then(|| fresh());
     let offset_v = fresh();
     let gep_dst = fresh();
-
-    // Redirect the vectorized header's known false/exit edge.
-    if let Terminator::CondBranch { false_label, .. } =
-        &mut func.blocks[pattern.header_idx].terminator
-    {
-        *false_label = vec_exit_label;
-    }
 
     let iv_width_const = match pattern.iv_ty {
         IrType::I32 | IrType::U32 => IrConst::I32(vec_width as i32),
@@ -11976,16 +12323,14 @@ fn insert_map_remainder_loop(
     // Sqrt re-emits the scalar SqrtF32/SqrtF64 intrinsic, and BinOps re-emit
     // the identical scalar operation — lane-exact by construction.
     let mut next_val_local = *next_val_id;
-    let Some(scalar_result) = emit_map_scalar_tree(
+    let scalar_result = emit_map_scalar_tree(
         &pattern.expr,
         &src_bases,
         pattern,
         Operand::Value(offset_v),
         &mut remainder_insts,
         &mut next_val_local,
-    ) else {
-        return 0;
-    };
+    )?;
     *next_val_id = next_val_local;
     remainder_insts.push(Instruction::Store {
         volatile: false,
@@ -12015,12 +12360,17 @@ fn insert_map_remainder_loop(
         source_spans: vec![],
     };
 
-    func.blocks.push(vec_exit_block);
-    func.blocks.push(remainder_header_block);
-    func.blocks.push(remainder_body_block);
-    func.blocks.push(remainder_latch_block);
-
-    4
+    Some(RemainderLoop {
+        blocks: vec![
+            vec_exit_block,
+            remainder_header_block,
+            remainder_body_block,
+            remainder_latch_block,
+        ],
+        vec_exit_label,
+        header_label: remainder_header_label,
+        iv_phi: i_rem_iv,
+    })
 }
 
 /// Scalar mirror of the map expression tree for the exact remainder loop
