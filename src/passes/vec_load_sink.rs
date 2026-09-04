@@ -131,7 +131,7 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
     if func.is_declaration || func.blocks.is_empty() {
         return 0;
     }
-    let uses = collect_use_sites(func);
+    let mut uses = collect_use_sites(func);
     let debug = std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some();
     let mut moved = 0usize;
 
@@ -208,6 +208,20 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
             if block.source_spans.len() > uj - 1 {
                 let span = block.source_spans.remove(i);
                 block.source_spans.insert(uj - 1, span);
+            }
+            // The permutation `remove(i); insert(uj-1)` shifts every recorded
+            // use site strictly inside (i, uj) down by one; sites at uj (the
+            // moved load's own consumer) and outside the window are stable.
+            // Without this remap, a still-unvisited load whose consumer sits
+            // inside the permuted window fails the re-verification below and
+            // its sink is forfeited (two independent streams in one block
+            // sank only the higher-indexed load).
+            for sites in uses.values_mut() {
+                for (b, p) in sites.iter_mut() {
+                    if *b == bi && *p > i && *p < uj {
+                        *p -= 1;
+                    }
+                }
             }
             moved += 1;
         }

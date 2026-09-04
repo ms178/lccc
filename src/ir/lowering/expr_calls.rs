@@ -262,12 +262,36 @@ impl Lowerer {
 
         // For sret calls, allocate space and prepend hidden pointer argument
         let sret_alloca = if let Some(size) = sret_size {
+            // The buffer's alignment MUST be the returned aggregate's natural
+            // alignment (SysV: the callee writes the return value through the
+            // hidden pointer — with aligned SSE stores, i.e. movaps, whenever
+            // that alignment is 16, e.g. structs containing long double).
+            // Recording `align: 0` made the FPO frame layout place the buffer
+            // at an address ≡ 8 (mod 16); any GCC-compiled callee then faulted
+            // with #GP on `movaps %xmm,(%rdi)` — SIGSEGV with si_addr = 0
+            // (stress abi family, seed 0, lccc-caller/gcc-callee pairing;
+            // frame-parity dependent, hence seed-shape dependent).
+            // Direct calls read the alignment from the callee's recorded
+            // return CType; indirect calls resolve it from the function
+            // pointer's type via get_call_return_struct_align (same type
+            // query as the sret SIZE, so the two can never disagree).
+            let sret_align = match stripped_func {
+                Expr::Identifier(name, _) if !self.is_func_ptr_variable(name) => self
+                    .func_meta
+                    .sigs
+                    .get(name.as_str())
+                    .and_then(|s| s.return_ctype.as_ref())
+                    .map(|ct| self.ctype_align(ct).max(1))
+                    .or_else(|| self.get_call_return_struct_align(stripped_func))
+                    .unwrap_or(0),
+                _ => self.get_call_return_struct_align(stripped_func).unwrap_or(0),
+            };
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: IrType::Ptr,
                 size,
-                align: 0,
+                align: sret_align,
                 volatile: false,
                 semantic_volatile: false,
             });

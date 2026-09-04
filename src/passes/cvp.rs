@@ -416,30 +416,54 @@ fn decide_pred(stack: &[Fact], p: Pred) -> Option<bool> {
 }
 
 /// Decide the truth of a boolean operand under the active facts.
+///
+/// `cond` values defined by a `Copy` are looked through recursively (depth
+/// capped): this covers BOTH the values this pass itself folds — a decided
+/// `Cmp` becomes `Copy { src: bool_const }` at its own def site, and every
+/// later `Select`/branch conditioned on it must see the constant — and
+/// ordinary copy chains left by earlier passes. Without the look-through,
+/// folding a guard `Cmp` would erase the very fact its consumers need
+/// (reproduced: full_function_folds_guard_and_branch folded 2/4 instead of
+/// 4/4 — the select and the branch after the folded guard stayed put).
 fn decide_bool(
     stack: &[Fact],
     func: &IrFunction,
     defs: &FxHashMap<Value, (usize, usize)>,
     cond: &Operand,
 ) -> Option<bool> {
-    match cond {
-        Operand::Const(k) => k.to_i128().map(|v| v != 0),
-        Operand::Value(v) => {
-            if let Some(s) = known_set(stack, *v, BOOL_BITS) {
-                if s.as_slice() == [(0, 0)] {
-                    return Some(false);
+    fn go(
+        stack: &[Fact],
+        func: &IrFunction,
+        defs: &FxHashMap<Value, (usize, usize)>,
+        cond: &Operand,
+        depth: u8,
+    ) -> Option<bool> {
+        match cond {
+            Operand::Const(k) => k.to_i128().map(|v| v != 0),
+            Operand::Value(v) => {
+                if let Some(s) = known_set(stack, *v, BOOL_BITS) {
+                    if s.as_slice() == [(0, 0)] {
+                        return Some(false);
+                    }
+                    if !s.is_empty() && s[0].0 >= 1 {
+                        return Some(true);
+                    }
                 }
-                if !s.is_empty() && s[0].0 >= 1 {
-                    return Some(true);
+                if depth == 0 {
+                    return None;
+                }
+                let &(bi, ii) = defs.get(v)?;
+                match &func.blocks[bi].instructions[ii] {
+                    Instruction::Copy { src, .. } => go(stack, func, defs, src, depth - 1),
+                    Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } => {
+                        decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?)
+                    }
+                    _ => None,
                 }
             }
-            let &(bi, ii) = defs.get(v)?;
-            if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
-                return decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?);
-            }
-            None
         }
     }
+    go(stack, func, defs, cond, 16)
 }
 
 fn bool_const(b: bool) -> Operand {
@@ -513,10 +537,12 @@ pub fn run_function(func: &mut IrFunction) -> usize {
                     _ => None,
                 };
                 if let Some(r) = repl {
-                    // A folded Cmp must no longer be looked through.
-                    if let Instruction::Cmp { dest, .. } = &func.blocks[blk].instructions[i] {
-                        defs.remove(dest);
-                    }
+                    // The fold REPLACES the Cmp with its decided constant at
+                    // the same (bi, ii), so the defs entry stays valid — it
+                    // now maps to a `Copy { src: bool_const }`, which
+                    // decide_bool looks through. Erasing the entry here would
+                    // hide the folded fact from later consumers in this very
+                    // block (select cond / branch cond follow the guard).
                     func.blocks[blk].instructions[i] = r;
                     changes += 1;
                 }

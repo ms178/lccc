@@ -16,6 +16,7 @@ use super::liveness::{
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis;
+use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -238,6 +239,73 @@ pub fn riscv_param_caller_homes_safe(func: &IrFunction) -> bool {
     true
 }
 
+/// True when ANY instruction of `func` implicitly clobbers %rdx: division
+/// (cqto/cltd sign-extends into rdx:rax), i128 arithmetic (the rax:rdx
+/// pair), Switch (jump-table dispatch scratch), or a fixed-scratch
+/// intrinsic. This is the SAME condition under which the x86-64 prologue
+/// excludes %rdx (PhysReg 16) from allocation — both gates must stay in
+/// lockstep: a value homed in %rdx is unsound exactly when the body can
+/// overwrite %rdx behind the allocator's back.
+pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::BinOp { op, ty, .. } => {
+                    if matches!(
+                        op,
+                        IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                    ) {
+                        return true;
+                    }
+                    if matches!(ty, IrType::I128 | IrType::U128) {
+                        return true;
+                    }
+                }
+                Instruction::UnaryOp { ty, .. }
+                | Instruction::Cmp { ty, .. }
+                | Instruction::Store { ty, .. } => {
+                    if matches!(ty, IrType::I128 | IrType::U128) {
+                        return true;
+                    }
+                }
+                Instruction::Cast { from_ty, to_ty, .. } => {
+                    if matches!(from_ty, IrType::I128 | IrType::U128)
+                        || matches!(to_ty, IrType::I128 | IrType::U128)
+                    {
+                        return true;
+                    }
+                }
+                Instruction::Intrinsic { op, .. } => {
+                    if matches!(
+                        op,
+                        IntrinsicOp::Rdtsc
+                            | IntrinsicOp::Rdtscp
+                            | IntrinsicOp::F128Copysign
+                            | IntrinsicOp::FmaF64x2
+                            | IntrinsicOp::FmaF64x4
+                            | IntrinsicOp::FmaF64x4Hoisted
+                            | IntrinsicOp::FmaF64x4SIB
+                            | IntrinsicOp::FmaF64x4HoistedSIB
+                            | IntrinsicOp::LoadF64x4
+                            | IntrinsicOp::LoadF64x2
+                            | IntrinsicOp::LoadI32x8
+                            | IntrinsicOp::LoadI32x4
+                            | IntrinsicOp::VecZeroI32x8
+                            | IntrinsicOp::VecZeroI32x4
+                    ) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if matches!(block.terminator, Terminator::Switch { .. }) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
         return false;
@@ -258,6 +326,19 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
             )
         })
     }) {
+        return false;
+    }
+    // The pre-store model parks each register param in its incoming ABI
+    // register for the WHOLE body. Any instruction that implicitly clobbers
+    // %rdx (division via cqto/cltd, i128 rax:rdx pairs, switch jump tables,
+    // fixed-scratch intrinsics) destroys a param homed there behind the
+    // allocator's back. Reproduced: `(uint8_t)p2` read from %dl after an
+    // `idivq`'s cqto zeroed it — every truncation of the param silently
+    // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
+    // Mirror the prologue's rdx-allocation exclusion (see
+    // x86_body_implicitly_clobbers_rdx): when the body can clobber %rdx,
+    // params fall back to the ordinary spill-home path.
+    if x86_body_implicitly_clobbers_rdx(func) {
         return false;
     }
     for (bi, block) in func.blocks.iter().enumerate() {

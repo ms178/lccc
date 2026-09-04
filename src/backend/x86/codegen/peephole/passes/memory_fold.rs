@@ -106,8 +106,8 @@ fn parse_alu_reg_reg(trimmed: &str) -> Option<(&str, &str, RegId, RegId)> {
 /// Fold movsd stack load into subsequent scalar FP binary op as memory operand.
 ///
 /// Pattern (produced after eliminate_fp_xmm_roundtrips):
-///   movsd -M(%rbp), %xmm1   ; Other{dest_reg: 25 (xmm1), rbp_offset: -M}
-///   OP %xmm1, %xmm0          ; Other{dest_reg: 24 (xmm0)}, OP ∈ {mulsd, addsd, subsd, divsd}
+///   movsd -M(%rbp), %xmm1   ; LoadXmmRbp{offset: -M} (historically Other{dest_reg: 25})
+///   OP %xmm1, %xmm0          ; OP ∈ {mulsd, addsd, subsd, divsd}
 ///
 /// Transformed to:
 ///   OP -M(%rbp), %xmm0
@@ -124,8 +124,15 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
 
-        // Look for Other{dest_reg: 25} = writes to %xmm1 (family 24+1=25)
-        if let LineKind::Other { dest_reg: 25 } = infos[i].kind {
+        // Candidate: an XMM slot LOAD (`movsd -M(%rbp), %xmmN`). The line
+        // classifier routes these to LoadXmmRbp (with `rbp_offset` cached by
+        // xmm_slot_line_info); when this pass was written they were classified
+        // as `Other{dest_reg: 25}` and the stale pre-filter silently disabled
+        // the whole fold (caught by test_fp_memory_fold_mulsd after the
+        // classifier gained the dedicated XMM slot kinds). The dest-register
+        // check stays textual below: LoadXmmRbp records offset/size, not the
+        // register, and the pass folds only the exact `%xmm1` dest form.
+        if let LineKind::LoadXmmRbp { .. } = infos[i].kind {
             let offset = infos[i].rbp_offset;
             if offset == RBP_OFFSET_NONE {
                 i += 1;
