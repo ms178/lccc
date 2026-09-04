@@ -3151,15 +3151,12 @@ impl X86Codegen {
             }
             IntrinsicOp::VecLoadI64x2 => {
                 // Load two I64 lanes (movdqu). Same addressing as VecLoadF64x2.
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => self
-                        .state
-                        .emit_fmt(format_args!("    movdqu (%{},%{}), %xmm0", base, ix)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    movdqu (%{}), %xmm0", base)),
-                }
+                // An optional third argument is a constant displacement
+                // (vec_interleave interleave slices), folded into the SIB
+                // operand.
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state
+                    .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     self.sse_store_dest(d, "xmm0");
@@ -3201,32 +3198,25 @@ impl X86Codegen {
             IntrinsicOp::VecLoadI32x8 => {
                 // Defer-aware store; reuse register-allocated base/offset.
                 // Commit a pending deferred %ymm0 result before clobbering
-                // the scratch register (see VecLoadF64x4).
+                // the scratch register (see VecLoadF64x4).  An optional
+                // third argument is a constant displacement (vec_interleave
+                // interleave slices), folded into the SIB operand.
                 self.flush_pending_vec_store_impl();
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => self
-                        .state
-                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %ymm0", base, ix)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    vmovdqu (%{}), %ymm0", base)),
-                }
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state
+                    .emit_fmt(format_args!("    vmovdqu {}, %ymm0", mem));
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     self.avx_store_dest(d);
                 }
             }
             IntrinsicOp::VecLoadI32x4 => {
-                let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
-                match &index {
-                    Some(ix) => self
-                        .state
-                        .emit_fmt(format_args!("    movdqu (%{},%{}), %xmm0", base, ix)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    movdqu (%{}), %xmm0", base)),
-                }
+                // An optional third argument is a constant displacement
+                // (vec_interleave interleave slices), folded into the SIB
+                // operand.
+                let mem = self.vec_mem_operand(&args[0], &args[1], Self::vec_disp_arg(args, 2));
+                self.state
+                    .emit_fmt(format_args!("    movdqu {}, %xmm0", mem));
                 if let Some(d) = dest {
                     self.state.vector_values.insert(d.0);
                     self.sse_store_dest(d, "xmm0");
@@ -3269,15 +3259,12 @@ impl X86Codegen {
                 // while the IV advances only four — lanes 4..7 double-counted.)
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
-                match index {
-                    Some(idx) => self
-                        .state
-                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %xmm0", base, idx)),
-                    None => self
-                        .state
-                        .emit_fmt(format_args!("    vmovdqu (%{}), %xmm0", base)),
-                }
+                // An optional fourth argument is a constant displacement
+                // (vec_interleave interleave slices), folded into the SIB
+                // operand.
+                let mem = self.vec_mem_operand(&args[1], &args[2], Self::vec_disp_arg(args, 3));
+                self.state
+                    .emit_fmt(format_args!("    vmovdqu {}, %xmm0", mem));
                 // Widen low half into xmm1, then in-place shuffle + widen
                 // high half into xmm0 (freeing the old xmm0 contents), then
                 // sum both halves into xmm1.
@@ -4652,10 +4639,16 @@ impl X86Codegen {
         mnemonic: &str,
     ) {
         assert!(
-            args.len() == 5,
+            args.len() >= 5,
             "{} expects accumulator plus two base/offset pairs",
             mnemonic
         );
+        // Optional trailing constant displacements (vec_interleave):
+        // args[5] folds into the A-stream memory operand, args[6] into the
+        // B-stream one (`vfmadd231pd 32(%rsi,%rax), %ymm1, %ymm5`).  Absent
+        // for the plain 5-arg vectorizer form.
+        let a_disp = Self::vec_disp_arg(args, 5);
+        let b_disp = Self::vec_disp_arg(args, 6);
 
         let assigned = self
             .reg_assignments
@@ -4678,26 +4671,14 @@ impl X86Codegen {
             self.avx_load_arg_to(&args[0], target);
         }
 
-        let (a_base, a_index) = self.vec_load_addr_regs(&args[1], &args[2]);
-        match a_index {
-            Some(index) => self
-                .state
-                .emit_fmt(format_args!("    vmovdqu (%{},%{}), %ymm0", a_base, index)),
-            None => self
-                .state
-                .emit_fmt(format_args!("    vmovdqu (%{}), %ymm0", a_base)),
-        }
-        let (b_base, b_index) = self.vec_load_addr_regs(&args[3], &args[4]);
-        match b_index {
-            Some(index) => self.state.emit_fmt(format_args!(
-                "    {} (%{},%{}), %ymm0, %{}",
-                mnemonic, b_base, index, target
-            )),
-            None => self.state.emit_fmt(format_args!(
-                "    {} (%{}), %ymm0, %{}",
-                mnemonic, b_base, target
-            )),
-        }
+        let a_mem = self.vec_mem_operand(&args[1], &args[2], a_disp);
+        self.state
+            .emit_fmt(format_args!("    vmovdqu {}, %ymm0", a_mem));
+        let b_mem = self.vec_mem_operand(&args[3], &args[4], b_disp);
+        self.state.emit_fmt(format_args!(
+            "    {} {}, %ymm0, %{}",
+            mnemonic, b_mem, target
+        ));
 
         self.state.vector_values.insert(dest.0);
         if let Some(reg) = assigned {
