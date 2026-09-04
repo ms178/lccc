@@ -104,7 +104,11 @@ const MAX_GAP: usize = 12;
 pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     match info.kind {
         LineKind::Nop | LineKind::Empty | LineKind::Directive | LineKind::Label => return 0,
-        LineKind::StoreRbp { .. } => return 0,
+        // Scalar-FP slot moves write no GP family (XMM stores write only
+        // memory; XMM loads write only an XMM register).
+        LineKind::StoreRbp { .. } | LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. } => {
+            return 0;
+        }
         // `Cmp` also covers `cmpxchg*` (writes %rax and its destination), so
         // it must go through the mnemonic analysis below.
         LineKind::Cmp => {}

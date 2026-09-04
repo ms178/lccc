@@ -30,6 +30,10 @@ use crate::ir::reexports::{BlockId, IrCmpOp, IrConst, Operand, Value};
 pub(crate) struct CmpReplayScan {
     pub replay: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
     pub operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    /// FP-Cmp records for the FP-SELECT blend (S05): float Cmp dests whose
+    /// single use is a Select; keyed by Cmp dest with the recorded operands
+    /// re-derived as a vcmpsd/vcmpss mask by the select.
+    pub fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
 }
 
 pub(crate) fn compute_cmp_replay_scan(
@@ -39,6 +43,8 @@ pub(crate) fn compute_cmp_replay_scan(
 ) -> CmpReplayScan {
     let mut replay = crate::common::fx_hash::FxHashMap::default();
     let mut operand_links: crate::common::fx_hash::FxHashMap<u32, Vec<u32>> =
+        crate::common::fx_hash::FxHashMap::default();
+    let mut fp_select: crate::common::fx_hash::FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)> =
         crate::common::fx_hash::FxHashMap::default();
     for block in &func.blocks {
         let insts = &block.instructions;
@@ -56,22 +62,16 @@ pub(crate) fn compute_cmp_replay_scan(
             if use_counts.get(&cdest).copied().unwrap_or(0) != 1 {
                 continue;
             }
-            // Integer comparisons only: float comparisons use ucomiss/
-            // ucomisd with a different flag contract (PF for NaN, the
-            // setnp/sete dance) — replaying them as integer cmps produces
-            // wrong selects (simd_sse2_arith regression). WIDE (I128)
-            // compares are excluded too: emit_cmp routes them to
-            // emit_i128_cmp, which ignores cmp_replay AND could not be
-            // replayed by emit_int_cmp_replay_insn (multi-instruction
-            // 128-bit compare).
-            if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
-                continue;
-            }
-            // Already handled by the (better) adjacent fusion.
+            // Already handled by the (better) adjacent fusion (integer
+            // Cmp→Select adjacency; FP Cmp→CondBranch adjacency). For FP
+            // Cmp→Select there is NO fusion (the prologue fuse gate excludes
+            // it — FP fusion is CondBranch-only), so the FP-SELECT branch
+            // below remains reachable for every FP Cmp whose single use is a
+            // Select.
             if fused.contains_key(&cdest) {
                 continue;
             }
-            // The single use must be a Select in this block or the
+            // Locate the single use: a same-block Select or the
             // block-terminator CondBranch.
             let mut used_by_select = false;
             for (jj, other) in insts.iter().enumerate() {
@@ -89,6 +89,7 @@ pub(crate) fn compute_cmp_replay_scan(
                     }
                 }
             }
+            let mut used_by_branch = false;
             if !used_by_select {
                 if let crate::ir::reexports::Terminator::CondBranch {
                     cond: Operand::Value(v),
@@ -96,11 +97,41 @@ pub(crate) fn compute_cmp_replay_scan(
                 } = &block.terminator
                 {
                     if v.0 == cdest {
-                        used_by_select = true;
+                        used_by_branch = true;
                     }
                 }
             }
-            if used_by_select {
+            // FP-SELECT blend (S05): a float Cmp consumed ONLY by a Select
+            // emits no boolean — the select re-derives the VEX blend mask
+            // (vcmpsd/vcmpss) and blends the FP arms (vblendvpd/vblendvps).
+            // A CondBranch consumer is excluded: branches keep the (better)
+            // flag-fusion jcc path or the materialized boolean. The operand
+            // links use the SAME consumer-position contract as the integer
+            // replay above, so register homes survive to the select.
+            if matches!(cty, IrType::F64 | IrType::F32) {
+                if used_by_select {
+                    for op in [&clhs, &crhs] {
+                        if let Operand::Value(v) = op {
+                            operand_links.entry(v.0).or_default().push(cdest);
+                        }
+                    }
+                    fp_select.insert(cdest, (cop, clhs, crhs, cty));
+                }
+                continue;
+            }
+            // Integer comparisons only: float comparisons use ucomiss/
+            // ucomisd with a different flag contract (PF for NaN, the
+            // setnp/sete dance) — replaying them as integer cmps produces
+            // wrong selects (simd_sse2_arith regression). WIDE (I128)
+            // compares are excluded too: emit_cmp routes them to
+            // emit_i128_cmp, which ignores cmp_replay AND could not be
+            // replayed by emit_int_cmp_replay_insn (multi-instruction
+            // 128-bit compare). This gate sits AFTER the FP-SELECT branch:
+            // float Cmps reach the branch above first.
+            if !cty.is_integer() || crate::backend::generation::is_wide_int_type(cty) {
+                continue;
+            }
+            if used_by_select || used_by_branch {
                 for op in [&clhs, &crhs] {
                     if let Operand::Value(v) = op {
                         operand_links.entry(v.0).or_default().push(cdest);
@@ -113,10 +144,93 @@ pub(crate) fn compute_cmp_replay_scan(
     CmpReplayScan {
         replay,
         operand_links,
+        fp_select,
     }
 }
 
 impl X86Codegen {
+    /// Materialize the FP boolean (`setcc` chain) — used by
+    /// `emit_float_cmp_impl` right after the ucomisd and by the FP-SELECT
+    /// fallback at a non-adjacent position (flags were just set there).
+    fn emit_fp_cmp_setcc(&mut self, dest: &Value, op: IrCmpOp) {
+        match op {
+            IrCmpOp::Eq => {
+                self.state.emit("    setnp %al");
+                self.state.emit("    sete %cl");
+                self.state.emit("    andb %cl, %al");
+            }
+            IrCmpOp::Ne => {
+                self.state.emit("    setp %al");
+                self.state.emit("    setne %cl");
+                self.state.emit("    orb %cl, %al");
+            }
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
+                self.state.emit("    seta %al");
+            }
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
+                self.state.emit("    setae %al");
+            }
+        }
+        // The Eq/Ne chains WRITE %cl — a partial clobber of %rcx. The
+        // secondary cache claims "rcx holds K"; a later select reuses the
+        // claim as its true-arm staging register (select_operand_to_reg
+        // skips the reload for a claimed constant), so the stale claim
+        // would feed the CORRUPTED arm. Drop it for the chains that touch
+        // %cl; seta/setae are pure %al.
+        if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            self.state.reg_cache.invalidate_sec();
+        }
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
+    /// Re-materialize an FP comparison at a NON-Cmp position. The FP-SELECT
+    /// fallback: the Cmp elided its boolean (its result feeds only Selects)
+    /// but the select could not use the blend — re-emit the loads + ucomisd
+    /// so the ordinary select path below is sound.
+    ///
+    /// RELATIONAL ops need no boolean at all: the flags just set are the
+    /// condition, so `pending_fp_cmp` is handed to the select (which maps
+    /// the FP jcc ja/jae directly onto its cmov) — the select then runs its
+    /// register-direct or accumulator cmov path with the in-place flags and
+    /// no setcc/movzbl/test. Eq/Ne cannot fold (parity-based chains), so
+    /// they materialize the boolean via the setcc chain and the select
+    /// tests the materialized value (the %cl clobber in that chain is
+    /// handled inside emit_fp_cmp_setcc).
+    pub(super) fn emit_fp_cmp_boolean(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        ty: IrType,
+    ) {
+        let swap_operands = matches!(
+            op,
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
+        );
+        let (first, second) = if swap_operands { (rhs, lhs) } else { (lhs, rhs) };
+        self.emit_fp_operand_to_xmm(first, ty, "xmm0");
+        self.emit_fp_operand_to_xmm(second, ty, "xmm1");
+        if ty == IrType::F64 {
+            self.state.emit("    ucomisd %xmm1, %xmm0");
+        } else {
+            self.state.emit("    ucomiss %xmm1, %xmm0");
+        }
+        match op {
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
+                self.pending_fp_cmp = Some((dest.0, "ja"));
+            }
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
+                self.pending_fp_cmp = Some((dest.0, "jae"));
+            }
+            IrCmpOp::Eq | IrCmpOp::Ne => {
+                self.emit_fp_cmp_setcc(dest, op);
+            }
+        }
+    }
+
     pub(super) fn emit_float_cmp_impl(
         &mut self,
         dest: &Value,
@@ -125,6 +239,18 @@ impl X86Codegen {
         rhs: &Operand,
         ty: IrType,
     ) {
+        // FP-SELECT blend (S05): a float Cmp whose boolean feeds ONLY Selects
+        // emits nothing here — every select re-derives the VEX blend mask
+        // (vcmpsd/vcmpss, see try_emit_fp_select_blend) from the recorded
+        // operands and blends the FP arms. The scan excluded `fused` dests,
+        // so no pending-flag handshake state is skipped with it.
+        if std::env::var_os("CCC_NO_FP_SELECT").is_none() && self.fp_select_cmps.contains_key(&dest.0)
+        {
+            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                eprintln!("[FP-SELECT] cmp %{} emits nothing (blend at select)", dest.0);
+            }
+            return;
+        }
         let swap_operands = matches!(
             op,
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
@@ -175,27 +301,7 @@ impl X86Codegen {
             }
         }
 
-        match op {
-            IrCmpOp::Eq => {
-                self.state.emit("    setnp %al");
-                self.state.emit("    sete %cl");
-                self.state.emit("    andb %cl, %al");
-            }
-            IrCmpOp::Ne => {
-                self.state.emit("    setp %al");
-                self.state.emit("    setne %cl");
-                self.state.emit("    orb %cl, %al");
-            }
-            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
-                self.state.emit("    seta %al");
-            }
-            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
-                self.state.emit("    setae %al");
-            }
-        }
-        self.state.emit("    movzbl %al, %eax");
-        self.state.reg_cache.invalidate_acc();
-        self.store_rax_to(dest);
+        self.emit_fp_cmp_setcc(dest, op);
     }
 
     /// Consume a pending FP fused-Cmp's live flags for a boolean condition.
@@ -246,6 +352,10 @@ impl X86Codegen {
             IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
                 self.state.emit("    setae %al");
             }
+        }
+        // %cl partial-clobber (see emit_fp_cmp_setcc): drop the sec claim.
+        if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            self.state.reg_cache.invalidate_sec();
         }
         self.state.emit("    movzbl %al, %eax");
         self.state.reg_cache.invalidate_acc();
@@ -1127,6 +1237,118 @@ impl X86Codegen {
         }
     }
 
+    /// S05 FP-SELECT: blend the FP arms of a Select whose condition is a
+    /// float Cmp that elided its boolean (see emit_float_cmp_impl). The mask
+    /// is re-derived as vcmpsd/vcmpss from the recorded operands, then
+    /// vblendvpd/vblendvps selects the arms — gcc's exact shape.
+    ///
+    /// Register contract: XMM homes are xmm2-xmm15, so xmm0/xmm1 are the
+    /// only scratch XMMs and no operand can alias them. Both arms are pure
+    /// reads with the compare-replay consumer-position liveness contract
+    /// (the operand links extended their intervals to this select).
+    ///
+    /// Blend order is TRUE-ARM-SECOND: vblendvpd %mask, %true, %false, %dst
+    /// (the VEX /is4 src2 — the AT&T middle operand — is selected when the
+    /// mask MSB is 1). Reversing it silently swaps the arms — the
+    /// `rint(-0.5) → -0.5` miscompile class.
+    ///
+    /// Returns true when the blend was emitted; false when the operands /
+    /// destination cannot be blended in registers (the caller then
+    /// re-materializes the boolean and uses the ordinary path).
+    fn try_emit_fp_select_blend(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        // vcmpsd predicate per the ucomisd-setcc semantics:
+        //   * Eq  → EQ_OQ (0):  ordered equal, NaN → false  (setnp&sete)
+        //   * Ne  → NEQ_UQ (4): unordered OR not-equal, NaN → true (setp|setne)
+        //   * Slt → LT_OQ (17), Sle → LE_OQ (18), Sgt → GT_OQ (14),
+        //     Sge → GE_OQ (13): ordered, NaN → false (seta/setae).
+        // The OQ (quiet) variants avoid signaling-NaN exceptions while
+        // preserving bit-exact predicate results. NOTE the RAW (lhs, rhs)
+        // order — vcmpsd encodes the predicate directly, unlike the
+        // swapped ucomisd+seta dance.
+        let imm: u8 = match op {
+            IrCmpOp::Eq => 0,
+            IrCmpOp::Ne => 4,
+            IrCmpOp::Slt | IrCmpOp::Ult => 17,
+            IrCmpOp::Sle | IrCmpOp::Ule => 18,
+            IrCmpOp::Sgt | IrCmpOp::Ugt => 14,
+            IrCmpOp::Sge | IrCmpOp::Uge => 13,
+        };
+        let is_f64 = ty == IrType::F64;
+        let cmp_insn = if is_f64 { "vcmpsd" } else { "vcmpss" };
+        let blend_insn = if is_f64 { "vblendvpd" } else { "vblendvps" };
+
+        // Case A: XMM-homed destination — blend straight into the home.
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                eprintln!("[FP-SELECT] blend into {}", d_name);
+            }
+            // 1. mask: lhs → xmm0, rhs → xmm1, mask → xmm0. (The operands'
+            //    homes can only be xmm2-xmm15, so no aliasing with scratch.)
+            self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+            self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+            self.state
+                .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0, %xmm0", cmp_insn, imm));
+            // 2. true → xmm1 BEFORE false can clobber a shared home.
+            self.emit_fp_operand_to_xmm(true_val, ty, "xmm1");
+            // 3. false → dest home (no-op when the false arm already lives
+            //    there; the true-arm copy above stays safe either way).
+            self.emit_fp_operand_to_xmm(false_val, ty, d_name);
+            // 4. blend: mask ? true : false, into the dest home.
+            self.state.emit_fmt(format_args!(
+                "    {} %xmm0, %xmm1, %{}, %{}",
+                blend_insn, d_name, d_name
+            ));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+
+        // Case B: destination has no XMM home — blend into the xmm0 FP
+        // accumulator, then store_xmm0_fp_dest (XMM home is impossible here
+        // by construction; GPR home / slot / accumulator all handled).
+        // Requires the FALSE arm to be XMM-homed: only src1 (vvvv) can take
+        // a spare register in this budget — mask in xmm1, true in xmm0, so
+        // the false arm is read straight from its home register.
+        let false_home = match false_val {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| is_xmm_reg(*r)),
+            _ => None,
+        };
+        let Some(f_reg) = false_home else {
+            return false;
+        };
+        let f_name = phys_reg_name(f_reg);
+        if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+            eprintln!("[FP-SELECT] blend into xmm0 (false in {})", f_name);
+        }
+        // 1. mask → xmm1: lhs → xmm0, rhs → xmm1, vcmpsd into xmm1.
+        self.emit_fp_operand_to_xmm(lhs, ty, "xmm0");
+        self.emit_fp_operand_to_xmm(rhs, ty, "xmm1");
+        self.state
+            .emit_fmt(format_args!("    {} ${}, %xmm1, %xmm0, %xmm1", cmp_insn, imm));
+        // 2. true → xmm0 (any operand kind; the false arm stays in its home).
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        // 3. blend into the accumulator: mask ? xmm0 : %f.
+        self.state.emit_fmt(format_args!(
+            "    {} %xmm1, %xmm0, %{}, %xmm0",
+            blend_insn, f_name
+        ));
+        self.store_xmm0_fp_dest(dest, ty);
+        return true;
+    }
+
     pub(super) fn emit_select_impl(
         &mut self,
         dest: &Value,
@@ -1191,10 +1413,74 @@ impl X86Codegen {
             return;
         }
 
+        // FP-SELECT blend (S05): the condition is a float Cmp whose single
+        // use is this select; the Cmp emitted no boolean (see
+        // emit_float_cmp_impl). Re-derive the vcmpsd/vcmpss mask and blend
+        // the FP arms. On failure (or non-blendable arms), re-materialize
+        // the boolean with emit_fp_cmp_boolean and fall through to the
+        // ordinary materialized-select path below.
+        //
+        // Arm acceptance: the blend is a pure BIT select. The frontend
+        // lowers FP selects as INTEGER selects over bitcast arms (the FP
+        // bits live in the same XMM homes), so the arms are accepted when
+        // they carry a clean full-lane bit pattern at the Cmp's width:
+        //   * cty F64 → arms typed F64 or I64
+        //   * cty F32 → arms typed F32 or I32
+        // (I32 values in XMM homes occupy only the low 32 bits — writing a
+        // GPR→XMM lane leaves the upper bits stale — so an F64-width blend
+        // over an I32 arm would mix stale lanes; the width must match.)
+        if std::env::var_os("CCC_NO_FP_SELECT").is_none() {
+            if let Operand::Value(cv) = cond {
+                if let Some((cop, clhs, crhs, cty)) = self.fp_select_cmps.get(&cv.0).cloned() {
+                    let arm_ok = |op: &Operand| -> bool {
+                        match op {
+                            Operand::Const(_) => true,
+                            Operand::Value(v) => match self.value_types.get(&v.0).copied() {
+                                Some(tt) => {
+                                    tt == cty
+                                        || (cty == IrType::F64 && tt == IrType::I64)
+                                        || (cty == IrType::F32 && tt == IrType::I32)
+                                }
+                                None => false,
+                            },
+                        }
+                    };
+                    if arm_ok(true_val) && arm_ok(false_val) {
+                        if !self.try_emit_fp_select_blend(
+                            dest, cop, &clhs, &crhs, true_val, false_val, cty,
+                        ) {
+                            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                                eprintln!(
+                                    "[FP-SELECT] cmp %{}: blend refused, materialize boolean",
+                                    cv.0
+                                );
+                            }
+                            self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                        } else {
+                            return;
+                        }
+                    } else {
+                        if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                            eprintln!(
+                                "[FP-SELECT] cmp %{}: arm types not blendable, materialize",
+                                cv.0
+                            );
+                        }
+                        self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                    }
+                }
+            }
+        }
+
         // FLAG FUSION: the condition is the direct result of the immediately
         // preceding Cmp whose flags are live — use the comparison's condition
         // code directly for the cmov, no test needed.
         let fused_op = self.take_pending_cmp(cond);
+        // FP-SELECT fallback flags: emit_fp_cmp_boolean (above) just ran the
+        // ucomisd and left its FP relational flags live. The FP flag → cmov
+        // mapping is ja/jae (unordered → not-taken → false arm, C99 NaN), the
+        // SAME contract as the CondBranch fusion.
+        let fused_fp = self.take_pending_fp_cmp(cond);
         // COMPARE-REPLAY: the condition is a Cmp result consumed only by this
         // select but not adjacent to the Cmp (flags clobbered in between).
         // Re-emit the comparison from the recorded operands right before the
@@ -1208,18 +1494,23 @@ impl X86Codegen {
         }
         // Test the condition in place (no pushfq). Only when the condition is
         // not directly testable (rare) do we fall back to the legacy
-        // materialize + pushfq/popfq path.
+        // materialize + pushfq/popfq path. With live FP flags the in-place
+        // path is MANDATORY (the condition's boolean was never materialized,
+        // so any load/test would read a stale home).
         let tested_in_place = if std::env::var("CCC_NO_INPLACE_SELECT").is_ok() {
             false
-        } else if fused_op.is_some() || replay_op.is_some() {
+        } else if fused_op.is_some() || fused_fp.is_some() || replay_op.is_some() {
             true
         } else {
             self.test_select_cond_in_place(cond)
         };
-        let cmov_cc = match (fused_op, replay_op.as_ref()) {
-            (Some(op), _) => Self::cmp_cmov(op),
-            (None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
-            (None, None) => "ne",
+        let cmov_cc = match (fused_op, fused_fp, replay_op.as_ref()) {
+            (Some(op), _, _) => Self::cmp_cmov(op),
+            (None, Some("ja"), _) => "a",
+            (None, Some("jae"), _) => "ae",
+            (None, Some(_), _) => "ne",
+            (None, None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
+            (None, None, None) => "ne",
         };
 
         // Register-direct: when dest has a register, operate directly on it.

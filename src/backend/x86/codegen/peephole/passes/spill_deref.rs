@@ -354,7 +354,11 @@ fn is_barrier_kind(kind: LineKind) -> bool {
 /// Does the instruction at index `idx` write the GP register family `reg`?
 fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> bool {
     match infos[idx].kind {
-        LineKind::StoreRbp { .. } => false,
+        // FP slot moves write no GP register (the XMM domain is invisible
+        // to the GP spill machinery).
+        LineKind::StoreRbp { .. } | LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. } => {
+            false
+        }
         LineKind::LoadRbp { reg: r, .. } => r == reg,
         LineKind::Pop { reg: r } => r == reg,
         LineKind::SetCC { reg: r } => r == reg,
@@ -379,7 +383,10 @@ fn writes_reg(store: &LineStore, infos: &[LineInfo], idx: usize, reg: u8) -> boo
 /// Does the instruction at index `idx` read or write stack slot `offset`?
 fn accesses_slot(store: &LineStore, infos: &[LineInfo], idx: usize, offset: i32) -> bool {
     match infos[idx].kind {
-        LineKind::StoreRbp { offset: o, .. } | LineKind::LoadRbp { offset: o, .. } => o == offset,
+        LineKind::StoreRbp { offset: o, .. }
+        | LineKind::LoadRbp { offset: o, .. }
+        | LineKind::StoreXmmRbp { offset: o, .. }
+        | LineKind::LoadXmmRbp { offset: o, .. } => o == offset,
         _ => false,
     }
 }

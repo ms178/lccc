@@ -71,6 +71,19 @@ pub(super) enum LineKind {
         offset: i32,
         size: MoveSize,
     },
+    /// Scalar-FP / SSE stack store (`movsd|movss|movq|movd %xmmN, slot`) —
+    /// same slot semantics as StoreRbp; kept separate because the XMM
+    /// family ids (24-39) do not fit the GP reg_refs bitmask and the
+    /// GP-oriented passes must not treat an XMM store as a GP def/use.
+    StoreXmmRbp {
+        offset: i32,
+        size: MoveSize,
+    },
+    /// Scalar-FP / SSE stack load (`movsd|movss|movq|movd slot, %xmmN`).
+    LoadXmmRbp {
+        offset: i32,
+        size: MoveSize,
+    },
 
     /// `movq %reg, %reg` – self-move (pre-classified to avoid string ops in hot loop)
     SelfMove,
@@ -161,6 +174,8 @@ pub(super) enum MoveSize {
     W,   // movw  (16-bit)
     B,   // movb  (8-bit)
     SLQ, // movslq (sign-extend 32->64)
+    SD,  // movsd (scalar double, 8 bytes)
+    SS,  // movss (scalar single, 4 bytes)
 }
 
 impl MoveSize {
@@ -171,14 +186,16 @@ impl MoveSize {
             MoveSize::W => "movw",
             MoveSize::B => "movb",
             MoveSize::SLQ => "movslq",
+            MoveSize::SD => "movsd",
+            MoveSize::SS => "movss",
         }
     }
 
     /// Return the number of bytes this move size covers.
     pub(super) fn byte_size(self) -> i32 {
         match self {
-            MoveSize::Q => 8,
-            MoveSize::L | MoveSize::SLQ => 4,
+            MoveSize::Q | MoveSize::SD => 8,
+            MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
             MoveSize::W => 2,
             MoveSize::B => 1,
         }
@@ -324,23 +341,56 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         return line_info(LineKind::Directive, ts);
     }
 
+    // Scalar-FP / SSE XMM stack moves: classified precisely (offset + byte
+    // size) so eliminate_never_read_stores can delete unread FP slots and
+    // the read census is exact instead of a conservative 32-byte block.
+    // Handled BEFORE the mov fast path (movsd/movss/movd are not 'mov' + a
+    // GP-sized suffix) and also for the VEX memory forms (vmovsd/vmovss).
+    if first == b'v' && sb.len() >= 7 && sb[1] == b'm' && sb[2] == b'o' && sb[3] == b'v' {
+        if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
+            let offset = fast_parse_i32(offset_str);
+            return line_info(
+                if store {
+                    LineKind::StoreXmmRbp { offset, size }
+                } else {
+                    LineKind::LoadXmmRbp { offset, size }
+                },
+                ts,
+            );
+        }
+    }
+
     // Fast path: only try store/load/self-move/extension parsing if line starts with 'mov' or 'movs'
     if first == b'm' && sb.len() >= 4 && sb[1] == b'o' && sb[2] == b'v' {
+        if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
+            let offset = fast_parse_i32(offset_str);
+            return line_info(
+                if store {
+                    LineKind::StoreXmmRbp { offset, size }
+                } else {
+                    LineKind::LoadXmmRbp { offset, size }
+                },
+                ts,
+            );
+        }
         if let Some((reg_str, offset_str, size)) = parse_store_to_rbp_str(s) {
             let reg = register_family_fast(reg_str);
-            // Only classify as StoreRbp for GP registers (0..15).
-            // XMM/MMX stores to stack fall through to generic Other classification
-            // since the store forwarding pass only tracks GP registers.
+            // GP stores keep the historical StoreRbp classification.
+            // XMM stores (movq %xmmN, slot) get the XMM slot kind — the
+            // XMM family ids cannot be represented in the GP reg_refs
+            // bitmask, and the GP consumers must not see them as GP.
             if reg <= REG_GP_MAX {
                 let offset = fast_parse_i32(offset_str);
                 let rr = (1u16 << reg) | (1u16 << 5);
                 return line_info_with_regs(LineKind::StoreRbp { reg, offset, size }, ts, rr);
             }
+            if is_xmm_family(reg) {
+                let offset = fast_parse_i32(offset_str);
+                return line_info(LineKind::StoreXmmRbp { offset, size }, ts);
+            }
         }
         if let Some((offset_str, reg_str, size)) = parse_load_from_rbp_str(s) {
             let reg = register_family_fast(reg_str);
-            // Only classify as LoadRbp for GP registers (0..15).
-            // XMM/MMX loads from stack fall through to generic Other classification.
             if reg <= REG_GP_MAX {
                 let offset = fast_parse_i32(offset_str);
                 let ext = if reg == 0 {
@@ -356,6 +406,10 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 let mut info = line_info_ext(LineKind::LoadRbp { reg, offset, size }, ext, ts);
                 info.reg_refs = rr;
                 return info;
+            }
+            if is_xmm_family(reg) {
+                let offset = fast_parse_i32(offset_str);
+                return line_info(LineKind::LoadXmmRbp { offset, size }, ts);
             }
         }
         // Check for self-move: movq %reg, %reg (same src and dst)
@@ -841,6 +895,52 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
     } else {
         None
     }
+}
+
+/// Parse a scalar-FP / SSE stack move: `movsd`, `movss`, `movd` (or AVX
+/// `vmovsd`/`vmovss`) between an XMM register and a frame slot. Returns
+/// (is_store, offset_str, size). The string-op and reg-reg forms are
+/// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
+/// must be one of the two ends).
+pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
+    let body = if let Some(r) = s.strip_prefix("vmovsd ") {
+        (r, MoveSize::SD)
+    } else if let Some(r) = s.strip_prefix("vmovss ") {
+        (r, MoveSize::SS)
+    } else if let Some(r) = s.strip_prefix("movsd ") {
+        (r, MoveSize::SD)
+    } else if let Some(r) = s.strip_prefix("movss ") {
+        (r, MoveSize::SS)
+    } else if let Some(r) = s.strip_prefix("movd ") {
+        (r, MoveSize::L)
+    } else if let Some(r) = s.strip_prefix("vmovd ") {
+        (r, MoveSize::L)
+    } else {
+        return None;
+    };
+    let (src, dst) = body.0.split_once(',')?;
+    let src = src.trim();
+    let dst = dst.trim();
+    let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
+    let load = dst.starts_with('%') && (src.ends_with("(%rbp)") || src.ends_with("(%rsp)"));
+    if !store && !load {
+        return None;
+    }
+    let mem = if store { dst } else { src };
+    if mem.ends_with("(%rbp)") {
+        Some((store, &mem[..mem.len() - 6], body.1))
+    } else if mem.ends_with("(%rsp)") {
+        Some((store, &mem[..mem.len() - 6], body.1))
+    } else {
+        None
+    }
+}
+
+/// True when `reg_id` is an XMM family id (24..39), which cannot be
+/// represented in the GP reg_refs bitmask and must not be handled by the
+/// GP-oriented StoreRbp/LoadRbp consumers.
+pub(super) fn is_xmm_family(reg_id: RegId) -> bool {
+    (24..=39).contains(&reg_id)
 }
 
 /// Parse `movX %reg, offset(%rbp)` (store to rbp-relative slot).
@@ -1661,8 +1761,8 @@ fn write_u32_digits(buf: &mut [u8], mut v: u32) -> usize {
 pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
     debug_assert!(id <= 15, "invalid register family id: {}", id);
     let row = match size {
-        MoveSize::Q | MoveSize::SLQ => 0,
-        MoveSize::L => 1,
+        MoveSize::Q | MoveSize::SLQ | MoveSize::SD => 0,
+        MoveSize::L | MoveSize::SS => 1,
         MoveSize::W => 2,
         MoveSize::B => 3,
     };
