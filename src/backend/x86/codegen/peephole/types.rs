@@ -282,6 +282,40 @@ pub(super) fn cmp_line_info(ts: u16, s: &str, sb: &[u8]) -> LineInfo {
     }
 }
 
+/// Build a `LineInfo` for a scalar-FP / SSE frame-slot move
+/// (`StoreXmmRbp` / `LoadXmmRbp`).
+///
+/// These lines used to be classified as `Other`, which populated the
+/// memory-operand caches (`rbp_offset`, `has_indirect_mem`) and the GP
+/// `reg_refs` bitmask (the `%rbp`/`%rsp` base). Every slot-tracking pass that
+/// reaches an XMM slot move through a generic `_ =>` arm — windowed
+/// dead-store elimination, frame compaction, store forwarding's range
+/// invalidation, the `%rbp`-as-data-register escape checks — depends on
+/// those caches. Constructing the new kinds with the bare `line_info` helper
+/// left them empty, so a GP store feeding `movss slot, %xmmN` was deleted as
+/// dead (gcc.c-torture 20000605-1.c, pr47538.c, pr59229.c, pr109938.c,
+/// pr109986.c, 20021120-1.c at -O0; 920428-2.c/pr37573.c at -O1;
+/// 20060420-1.c at -O2/-O3). Same contract as `cmp_line_info`.
+#[inline]
+pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) -> LineInfo {
+    debug_assert!(matches!(kind, LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }));
+    let has_indirect = has_indirect_memory_access(s);
+    let rbp_off = if has_indirect {
+        RBP_OFFSET_NONE
+    } else {
+        parse_rbp_offset(s)
+    };
+    LineInfo {
+        kind,
+        ext_kind: ExtKind::None,
+        trim_start: ts,
+        has_indirect_mem: has_indirect,
+        rbp_offset: rbp_off,
+        reg_refs: scan_register_refs(sb),
+        pinned: false,
+    }
+}
+
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
 #[inline]
 pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
@@ -349,13 +383,15 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     if first == b'v' && sb.len() >= 7 && sb[1] == b'm' && sb[2] == b'o' && sb[3] == b'v' {
         if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
             let offset = fast_parse_i32(offset_str);
-            return line_info(
+            return xmm_slot_line_info(
                 if store {
                     LineKind::StoreXmmRbp { offset, size }
                 } else {
                     LineKind::LoadXmmRbp { offset, size }
                 },
                 ts,
+                s,
+                sb,
             );
         }
     }
@@ -364,13 +400,15 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     if first == b'm' && sb.len() >= 4 && sb[1] == b'o' && sb[2] == b'v' {
         if let Some((store, offset_str, size)) = parse_fp_slot_move(s) {
             let offset = fast_parse_i32(offset_str);
-            return line_info(
+            return xmm_slot_line_info(
                 if store {
                     LineKind::StoreXmmRbp { offset, size }
                 } else {
                     LineKind::LoadXmmRbp { offset, size }
                 },
                 ts,
+                s,
+                sb,
             );
         }
         if let Some((reg_str, offset_str, size)) = parse_store_to_rbp_str(s) {

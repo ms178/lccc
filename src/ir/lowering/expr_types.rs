@@ -718,6 +718,28 @@ impl Lowerer {
     /// zero-extended instead of sign-extending). Mirrors the exact type
     /// computation of lower_arithmetic_binop.
     pub(super) fn value_ir_type(&self, expr: &Expr) -> IrType {
+        // Comparisons and logical operators materialise a C `int` boolean:
+        // the Cmp/select that defines the value is I32-wide (setcc + movzbl,
+        // spilled to a 4-byte slot). get_expr_type reports the widened
+        // storage type (target_int_ir_type() == I64 on LP64), which is a
+        // width lie for the ACTUAL value: when the boolean is an operand of a
+        // 64-bit operation (`p1 < (p1 == 2)`), lower_expr_with_type saw
+        // I64 -> I64, emitted no Cast, and the backend's memory-operand form
+        // read 8 bytes from the 4-byte slot — the high half was whatever
+        // lived in the neighbouring slot (stress lab intexpr seed 5 case 30,
+        // wrong at -O0 only because -O1+ keeps the setcc result in a register
+        // whose upper 32 bits movzbl happened to clear). Reporting I32 here
+        // makes the consumer insert the explicit zero-extension. (`&&`/`||`
+        // are NOT included: lower_short_circuit merges its result at the
+        // target int storage width, which get_expr_type already reports.)
+        if let Expr::BinaryOp(op, _, _, _) = expr {
+            if op.is_comparison() {
+                return IrType::I32;
+            }
+        }
+        if matches!(expr, Expr::UnaryOp(UnaryOp::LogicalNot, _, _)) {
+            return IrType::I32;
+        }
         if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
             if !op.is_comparison() && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
                 // C23 decimal FP: decimal operands carry the result in the

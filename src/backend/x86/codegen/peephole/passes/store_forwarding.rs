@@ -556,6 +556,23 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
 
             LineKind::Cmp | LineKind::Directive => {}
 
+            // A scalar-FP / SSE store rewrites frame bytes: every GP mapping
+            // whose slot range intersects it is stale. When %rbp is a data
+            // register the `(%rbp)` form is an opaque pointer write. (These
+            // lines were `Other` before the XMM slot kinds existed and were
+            // range-invalidated through `gsf_handle_other`; falling into
+            // `_ => {}` silently kept stale GP mappings alive.)
+            LineKind::StoreXmmRbp { offset, size } => {
+                if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
+                    invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+                } else {
+                    invalidate_slots_at(&mut slot_entries, &mut reg_offsets, offset, size.byte_size());
+                }
+            }
+            // An XMM load writes no GP register and no memory: mappings stay
+            // valid (a later GP reload of the same slot may still forward).
+            LineKind::LoadXmmRbp { .. } => {}
+
             _ => {}
         }
     }

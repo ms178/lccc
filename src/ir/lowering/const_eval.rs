@@ -666,13 +666,18 @@ impl Lowerer {
         lhs_ty: IrType,
         rhs_ty: IrType,
     ) -> Option<IrConst> {
+        // Raw (unpromoted) sizes: the shared helper applies C11 6.3.1.1
+        // integer promotion, which turns a sub-int unsigned operand into a
+        // SIGNED int. Clamping here with `.max(4)` while keeping the
+        // unpromoted signedness would fold `(uint8_t)x | (int16_t)y` as
+        // unsigned.
         shared_const_eval::eval_binop_with_types(
             op,
             lhs,
             rhs,
-            lhs_ty.size().max(4),
+            lhs_ty.size(),
             lhs_ty.is_unsigned(),
-            rhs_ty.size().max(4),
+            rhs_ty.size(),
             rhs_ty.is_unsigned(),
         )
     }

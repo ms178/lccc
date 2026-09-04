@@ -362,6 +362,29 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 }
             }
 
+            // Scalar-FP / SSE slot traffic participates in the same byte-range
+            // model. A GP store that is reloaded into an XMM register through
+            // the slot (`movq %rax, -72(%rbp)` / `movss -72(%rbp), %xmm0` —
+            // the -O0 int<->float bit-transfer idiom) is a live store; an XMM
+            // store that fully covers our bytes kills it exactly like a GP one.
+            if let LineKind::LoadXmmRbp { offset: load_off, size: load_sz } = infos[j].kind {
+                if ranges_overlap(store_offset, store_bytes, load_off, load_sz.byte_size()) {
+                    slot_read = true;
+                    break;
+                }
+            }
+            if let LineKind::StoreXmmRbp { offset: new_off, size: new_sz } = infos[j].kind {
+                let new_bytes = new_sz.byte_size();
+                if new_off <= store_offset && new_off + new_bytes >= store_offset + store_bytes {
+                    slot_overwritten = true;
+                    break;
+                }
+                if ranges_overlap(store_offset, store_bytes, new_off, new_bytes) {
+                    slot_read = true;
+                    break;
+                }
+            }
+
             // Check Other and Cmp lines for rbp references. Cmp lines can
             // have memory operands after memory fold (e.g., cmpq -N(%rbp), %rax).
             if matches!(infos[j].kind, LineKind::Other { .. } | LineKind::Cmp) {
