@@ -190,6 +190,16 @@ pub struct CodegenState {
     /// needs. When the store is skipped the value stays in the register and
     /// the consumer's load becomes a no-op (accumulator renaming).
     pub vector_defer_values: FxHashSet<u32>,
+    /// VLFOLD: 256-bit `VecLoad*` results whose single use is the adjacent
+    /// two-operand VEX arithmetic intrinsic (`compute_vector_memfold_values`).
+    /// The load is not emitted; the consumer folds its source memory operand.
+    pub vector_memfold_values: FxHashSet<u32>,
+    /// The elided load awaiting its consumer: (value id, memory operand,
+    /// load mnemonic for materialisation). Consumed by `emit_avx_binary_256`
+    /// as a memory operand, or by `avx_load_arg_to` as a real load; the
+    /// safety net in `emit_intrinsic_impl` materialises it before any other
+    /// intrinsic.
+    pub pending_vec_memfold: Option<(u32, String, &'static str)>,
     /// Lazy-flush half of the deferred-store mechanism: a skipped vector
     /// result store is kept PENDING here (value id, holding register, 256-bit
     /// flag) instead of being dropped. If the consumer really receives the
@@ -490,6 +500,8 @@ impl CodegenState {
             sse_last_store_reg: false,
             sse_last_store_reg_name: None,
             vector_defer_values: FxHashSet::default(),
+            vector_memfold_values: FxHashSet::default(),
+            pending_vec_memfold: None,
             pending_vec_store: None,
             x87_pending: None,
             x87_defer_values: FxHashSet::default(),
@@ -738,6 +750,8 @@ impl CodegenState {
         self.vector128_values.clear();
         self.protected_slot_values.clear();
         self.vector_defer_values.clear();
+        self.vector_memfold_values.clear();
+        self.pending_vec_memfold = None;
         self.pending_vec_store = None;
         self.x87_pending = None;
         self.x87_defer_values.clear();

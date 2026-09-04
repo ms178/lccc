@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================================
-# LCCC session snapshot for the Vite/web-app harness ("Kontinuität v2").
+# LCCC session snapshot for the Vite/web-app harness ("Kontinuität v3").
 #
-# ROOT CAUSE of lost snapshots: in this harness the ONLY artefact that reaches
-# the user is the single-file Vite build (dist/index.html produced by
-# vite-plugin-singlefile) plus the sandbox source tree.  Files written under
+# ROOT CAUSE of lost snapshots in earlier sessions: in this harness the ONLY
+# artefact guaranteed to reach the user is the single-file Vite build
+# (dist/index.html produced by vite-plugin-singlefile).  Files written under
 # /home/user/artifacts or the repo worktree are invisible to the user and are
-# wiped with the sandbox.
+# wiped together with the sandbox.
 #
 # Therefore every validated improvement is materialised INSIDE the web
 # bundle's source tree so `npm run build` inlines it into the delivered HTML:
 #
-#   $SANDBOX/public/patches/ms178-1.patch           (static copy, canonical)
+#   $SANDBOX/public/patches/ms178-1.patch           (static copy)
 #   $SANDBOX/public/patches/ms178-1.<tag>.patch     (per-snapshot copy)
 #   $SANDBOX/src/generated/patch.ts                 (patch as a TS string,
 #                                                    bundled into index.html)
@@ -20,13 +20,17 @@
 #
 # The web app offers the patch as a Blob download, shows its SHA-256, the
 # ledger and the docs, so the deliverable survives even if only the HTML
-# survives.  Writes are atomic (tmp + rename); the patch is verified to apply
-# cleanly to the recorded upstream base before it is published.
+# survives.  All writes are atomic (tmp + rename) so a mid-write kill can
+# never leave a truncated deliverable.
 #
 # Usage:  scripts/lccc-harness-snapshot.sh "<slug>" "<one-line description>"
-# Env:    LCCC_REPO (default /home/user/lccc)   LCCC_SANDBOX (default
-#         /home/user/sandbox)   LCCC_BASE_REF (upstream commit; recorded once)
-#         LCCC_SNAPSHOT_DOCS (space-separated repo-relative docs to bundle)
+# Env:    LCCC_REPO      (default /home/user/lccc)
+#         LCCC_SANDBOX   (default /home/user/sandbox)
+#         LCCC_BASE_REF  (upstream commit the session is rebased on; recorded
+#                         once in $GEN/.base_ref and reused afterwards)
+#         LCCC_SNAPSHOT_DOCS  (extra space-separated repo-relative doc paths)
+#         LCCC_SKIP_WEB_BUILD=1  (skip `npm run build`; useful while a cargo
+#                         build is saturating the 2 cores)
 # ============================================================================
 set -euo pipefail
 
@@ -36,7 +40,6 @@ GEN="$SANDBOX/src/generated"
 PUB="$SANDBOX/public/patches"
 LEDGER="$GEN/ledger.json"
 BASE_REF_FILE="$GEN/.base_ref"
-DOCS=${LCCC_SNAPSHOT_DOCS:-"docs/I686_ALU_AUDIT.md docs/FOLLOWUP_I686_ALU.md"}
 
 slug=${1:-snapshot}
 desc=${2:-"session snapshot"}
@@ -52,7 +55,8 @@ else
   printf '%s\n' "$BASE" > "$BASE_REF_FILE"
 fi
 
-# Commit pending work (deterministic identity).
+# Commit pending work (deterministic identity).  Build outputs, caches and
+# oracle artefacts are excluded via .gitignore; never `git add -f` here.
 if ! git diff --quiet || ! git diff --cached --quiet || \
    [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
   git add -A
@@ -119,23 +123,23 @@ tmp = path + ".tmp"
 json.dump(led, open(tmp, "w"), indent=2); os.replace(tmp, path)
 PY
 
-# 5. Bundle docs that must reach the user.
-#    Auto-discover: every Markdown file added or modified in base..HEAD is a
-#    session deliverable (follow-up notes, audits, task files) and is bundled
-#    without manual list maintenance; LCCC_SNAPSHOT_DOCS adds extra paths.
-session_docs=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- '*.md' 2>/dev/null || true)
-for d in $DOCS $session_docs; do
-  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(printf '%s' "$d" | tr '/' '_')"
+# 5. Bundle docs that must reach the user: every follow-up / audit document
+#    touched by this session (base..HEAD) plus anything listed explicitly.
+docs=$(git diff --name-only "$BASE" HEAD -- 'engineering/*.md' 'engineering/agent/*.md' 'docs/*.md' 'scripts/*.md' 2>/dev/null || true)
+for d in $docs ${LCCC_SNAPSHOT_DOCS:-}; do
+  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(echo "$d" | tr '/' '_')"
 done
 ( cd "$GEN/docs" && python3 -c "
 import json,glob,os
-print(json.dumps({os.path.basename(f): open(f).read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
+print(json.dumps({os.path.basename(f): open(f, encoding='utf-8', errors='replace').read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
 
 rm -f "$patch_tmp"
 
 # 6. Rebuild the single-file web bundle so dist/index.html carries this
 #    snapshot even if the session dies before the harness's final build.
-if [[ -f "$SANDBOX/package.json" ]]; then
+if [[ "${LCCC_SKIP_WEB_BUILD:-0}" == "1" ]]; then
+  web="web build skipped (LCCC_SKIP_WEB_BUILD=1)"
+elif [[ -f "$SANDBOX/package.json" ]]; then
   ( cd "$SANDBOX" && npm run build >/dev/null 2>&1 ) && web="dist rebuilt" || web="WARN: web build failed"
 else
   web="no sandbox package.json"

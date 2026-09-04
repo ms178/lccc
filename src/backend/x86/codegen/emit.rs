@@ -6230,6 +6230,10 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn flush_pending_vec_store(&mut self) {
+        // Boundary hook (block ends, calls, inline asm, non-intrinsic
+        // instructions): a VLFOLD-elided load that has not met its consumer
+        // is materialised first so the mechanism is sound by construction.
+        self.materialize_pending_memfold();
         self.flush_pending_vec_store_impl();
     }
 

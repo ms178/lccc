@@ -269,6 +269,101 @@ impl X86Codegen {
     /// leave the block without the consumer having taken the value — emits the
     /// store that was originally skipped, making deferred stores sound by
     /// construction. No-op when nothing is pending.
+    /// VLFOLD entry (see `compute_vector_memfold_values`): elide an eligible
+    /// 256-bit load and remember its source memory operand for the adjacent
+    /// consumer. Returns `true` when nothing must be emitted for this
+    /// intrinsic. Falls back to the ordinary load path unless base/index are
+    /// RA-homed GPRs (or a zero constant) — scratch `%rax`/`%rcx` addressing
+    /// would not survive the intervening load — and unless the destination
+    /// has no XMM home (a homed load is already a single instruction).
+    fn try_elide_vec_load(
+        &mut self,
+        dest: &Option<Value>,
+        op: &IntrinsicOp,
+        args: &[Operand],
+    ) -> bool {
+        let Some(d) = dest else {
+            return false;
+        };
+        if !self.state.vector_memfold_values.contains(&d.0)
+            || self.state.pending_vec_memfold.is_some()
+            || args.len() < 2
+        {
+            return false;
+        }
+        if self
+            .reg_assignments
+            .get(&d.0)
+            .is_some_and(|r| is_xmm_reg(*r))
+        {
+            return false;
+        }
+        let mnemonic = match op {
+            IntrinsicOp::VecLoadF64x4 => "vmovupd",
+            IntrinsicOp::VecLoadF32x8 => "vmovups",
+            IntrinsicOp::VecLoadI32x8 => "vmovdqu",
+            _ => return false,
+        };
+        // The allocator only hands out rbx/r8-r15 (never rsp/rbp/rdi/rsi/rdx
+        // and never the scratch pair), all legal base AND index registers.
+        let is_gpr = |r: PhysReg| (1..=16).contains(&r.0);
+        let Some(base) = self.operand_reg(&args[0]).filter(|r| is_gpr(*r)) else {
+            return false;
+        };
+        let index = match &args[1] {
+            Operand::Const(c) if c.to_i64() == Some(0) => None,
+            Operand::Const(_) => return false,
+            other => match self.operand_reg(other) {
+                Some(r) if is_gpr(r) => Some(r),
+                _ => return false,
+            },
+        };
+        let disp = Self::vec_disp_arg(args, 2);
+        let disp_str = if disp == 0 {
+            String::new()
+        } else {
+            disp.to_string()
+        };
+        let mem = match index {
+            Some(ix) => format!("{}(%{},%{})", disp_str, phys_reg_name(base), phys_reg_name(ix)),
+            None => format!("{}(%{})", disp_str, phys_reg_name(base)),
+        };
+        if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
+            eprintln!("[VLFOLD-EMIT] elide load %{} <- {} {}", d.0, mnemonic, mem);
+        }
+        self.state.vector_values.insert(d.0);
+        self.state.pending_vec_memfold = Some((d.0, mem, mnemonic));
+        true
+    }
+
+    /// Memory operand of a pending VLFOLD load if `arg` is that value.
+    fn memfold_operand(&self, arg: &Operand) -> Option<String> {
+        match (arg, &self.state.pending_vec_memfold) {
+            (Operand::Value(v), Some((pv, mem, _))) if v.0 == *pv => Some(mem.clone()),
+            _ => None,
+        }
+    }
+
+    /// Materialise a pending VLFOLD load through `%ymm0` and its ordinary
+    /// home (register or slot). Never expected on the analysed shapes; keeps
+    /// the elision sound if an unexpected instruction intervenes.
+    pub(super) fn materialize_pending_memfold(&mut self) {
+        let Some((val, mem, mnemonic)) = self.state.pending_vec_memfold.take() else {
+            return;
+        };
+        if std::env::var("CCC_DEBUG_VLFOLD").is_ok() {
+            eprintln!("[VLFOLD-EMIT] materialising %{} (unexpected consumer)", val);
+        }
+        self.flush_pending_vec_store_impl();
+        self.state
+            .emit_fmt(format_args!("    {} {}, %ymm0", mnemonic, mem));
+        self.state.dirty_upper_ymm = true;
+        self.avx_store_dest(&Value(val));
+        // The value now has a real home; a later deferral is not permitted
+        // to skip the store again for this def.
+        self.flush_pending_vec_store_impl();
+    }
+
     pub(super) fn flush_pending_vec_store_impl(&mut self) {
         let Some((val_id, reg, is_256)) = self.state.pending_vec_store.take() else {
             return;
@@ -450,6 +545,20 @@ impl X86Codegen {
 
     pub(super) fn avx_load_arg_to(&mut self, arg: &Operand, ymm: &'static str) {
         if let Operand::Value(v) = arg {
+            // VLFOLD: a consumer path that needs the elided load in a
+            // register performs the load itself (from the recorded source
+            // operand, never from the never-written home slot).
+            if self.memfold_operand(arg).is_some() {
+                let (_, mem, mnemonic) = self.state.pending_vec_memfold.take().unwrap();
+                if self.state.pending_vec_store.map(|(_, r, _)| r) == Some(ymm) {
+                    self.flush_pending_vec_store_impl();
+                }
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %{}", mnemonic, mem, ymm));
+                self.state.dirty_upper_ymm = true;
+                self.state.vec_last_store_reg = false;
+                return;
+            }
             // Width-aware register allocation: PhysReg 20..33 names the SIMD
             // register family; this AVX helper selects its YMM view. Consult
             // the assignment at every block boundary because vec_live_regs is
@@ -839,6 +948,25 @@ impl X86Codegen {
         dest_ptr: &Option<Value>,
         args: &[Operand],
     ) {
+        // VLFOLD: an eligible single-use 256-bit load emits nothing; its
+        // adjacent consumer folds the source memory operand.
+        if self.try_elide_vec_load(dest, op, args) {
+            return;
+        }
+        // VLFOLD safety net: only the registered consumer or an intervening
+        // pure vector load may follow an elided load; anything else
+        // materialises it first.
+        if let Some((pv, _, _)) = &self.state.pending_vec_memfold {
+            let pv = *pv;
+            let consumes = args
+                .iter()
+                .any(|a| matches!(a, Operand::Value(v) if v.0 == pv));
+            if !consumes
+                && !crate::backend::stack_layout::copy_coalescing::is_pure_vec_load(op)
+            {
+                self.materialize_pending_memfold();
+            }
+        }
         // Lazy flush: a deferred vector result may be pending in a register.
         // Flush it before any intrinsic that is not its cache-aware consumer
         // (fences/pause/rdtsc neither clobber XMM regs nor read vector slots,
@@ -4319,7 +4447,68 @@ impl X86Codegen {
     /// operand as the memory source, and copies at most ONE operand through
     /// %ymm1.
     fn emit_avx_map_fma(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
+        let folded = self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .map(|(pv, _, _)| *pv)
+            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
+        self.emit_avx_map_fma_inner(dest, args, mnemonic);
+        if folded.is_some() {
+            self.state.pending_vec_memfold = None;
+        }
+    }
+
+    fn emit_avx_map_fma_inner(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
+        // VLFOLD forms (ICX saxpy shape). With the scale in an XMM home:
+        //   bias elided : input streams in %ymm0 → `vfmadd213 mem, %s, %ymm0`
+        //                 (= s*input + mem)
+        //   input elided: bias  streams in %ymm0 → `vfmadd231 mem, %s, %ymm0`
+        //                 (= s*mem + bias)
+        if let (Some((pv, mem, _)), Operand::Value(m0), Operand::Value(m1), Operand::Value(bias)) = (
+            self.state.pending_vec_memfold.clone(),
+            &args[0],
+            &args[1],
+            &args[2],
+        ) {
+            // The multiplicands commute: whichever of args[0]/args[1] has an
+            // XMM home (the loop-invariant broadcast) is the register source,
+            // the other one is the streamed element vector.
+            let home = |this: &Self, v: &Value| {
+                this.reg_assignments
+                    .get(&v.0)
+                    .copied()
+                    .filter(|r| is_xmm_reg(*r))
+            };
+            let (scale_reg, streamed_mul) = match (home(self, m0), home(self, m1)) {
+                (Some(r), None) => (Some(r), Some((m1, &args[1]))),
+                (None, Some(r)) => (Some(r), Some((m0, &args[0]))),
+                _ => (None, None),
+            };
+            if let (Some(scale_reg), Some((streamed, streamed_arg))) = (scale_reg, streamed_mul) {
+                let form = if bias.0 == pv {
+                    Some((mnemonic.replace("132", "213"), streamed_arg))
+                } else if streamed.0 == pv {
+                    Some((mnemonic.replace("132", "231"), &args[2]))
+                } else {
+                    None
+                };
+                if let Some((form, streamed)) = form {
+                    self.avx_load_arg(streamed);
+                    self.state.emit_fmt(format_args!(
+                        "    {} {}, %{}, %ymm0",
+                        form,
+                        mem,
+                        phys_reg_name_256(scale_reg)
+                    ));
+                    self.state.pending_vec_memfold = None;
+                    self.state.vec_last_store_reg = false;
+                    self.avx_store_dest(dest);
+                    return;
+                }
+            }
+        }
         if let (Operand::Value(input), Operand::Value(scale), Operand::Value(bias)) =
             (&args[0], &args[1], &args[2])
         {
@@ -4513,6 +4702,81 @@ impl X86Codegen {
         avx_inst: &str,
         commutative: bool,
     ) {
+        let folded = self
+            .state
+            .pending_vec_memfold
+            .as_ref()
+            .map(|(pv, _, _)| *pv)
+            .filter(|pv| args.iter().any(|a| matches!(a, Operand::Value(v) if v.0 == *pv)));
+        self.emit_avx_binary_256_inner(dest_ptr, args, avx_inst, commutative);
+        // VLFOLD: every path of the consumer either used the memory operand
+        // or materialised the load; the elided value is consumed now.
+        if folded.is_some() {
+            self.state.pending_vec_memfold = None;
+        }
+    }
+
+    fn emit_avx_binary_256_inner(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        avx_inst: &str,
+        commutative: bool,
+    ) {
+        // VLFOLD register forms. `acc' = op(acc, load)` with acc/acc' in one
+        // YMM family becomes the single ICX reduction instruction
+        // `op mem, %ymmA, %ymmA`; a homed non-accumulator source (map
+        // broadcast invariant) gives `op mem, %ymmS, %ymmD` for a homed
+        // destination or `op mem, %ymmS, %ymm0` + home store otherwise —
+        // never a per-iteration `vmovdqa %ymmS, %ymm1` copy.
+        if let Some((pv, mem, _)) = self.state.pending_vec_memfold.clone() {
+            if let (Operand::Value(x), Operand::Value(y)) = (&args[0], &args[1]) {
+                let other = if y.0 == pv {
+                    Some(x)
+                } else if x.0 == pv && commutative {
+                    Some(y)
+                } else {
+                    None
+                };
+                let other_reg = other
+                    .and_then(|o| self.reg_assignments.get(&o.0).copied())
+                    .filter(|r| is_xmm_reg(*r));
+                if let Some(oreg) = other_reg {
+                    let src = phys_reg_name_256(oreg);
+                    self.state.dirty_upper_ymm = true;
+                    let dest_home = self
+                        .reg_assignments
+                        .get(&dest_ptr.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r));
+                    if let Some(dest_reg) = dest_home {
+                        let dst = phys_reg_name_256(dest_reg);
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}, %{}",
+                            avx_inst, mem, src, dst
+                        ));
+                        self.state.vec_live_regs.insert(dest_ptr.0, dst);
+                        self.state.vec_last_store_val = Some(dest_ptr.0);
+                        self.state.vec_last_store_reg = true;
+                        self.state.vec_last_store_reg_name = Some(dst);
+                        self.state.reg_cache.invalidate_acc();
+                    } else {
+                        // %ymm0 may hold a deferred value of a different def:
+                        // commit it before overwriting the scratch register.
+                        self.flush_pending_vec_store_impl();
+                        self.state.emit_fmt(format_args!(
+                            "    {} {}, %{}, %ymm0",
+                            avx_inst, mem, src
+                        ));
+                        self.state.vec_last_store_reg = false;
+                        self.avx_store_dest(dest_ptr);
+                    }
+                    self.state.pending_vec_memfold = None;
+                    return;
+                }
+            }
+        }
+
         // In AT&T VEX syntax only the first textual source may be memory.
         // Preserve operand order for non-commutative operations.
         //
@@ -4618,6 +4882,9 @@ impl X86Codegen {
         }
 
         let mem_of = |this: &Self, arg: &Operand| -> Option<String> {
+            if let Some(mem) = this.memfold_operand(arg) {
+                return Some(mem);
+            }
             match arg {
                 Operand::Value(v) => {
                     if this.state.vec_live_regs.contains_key(&v.0)

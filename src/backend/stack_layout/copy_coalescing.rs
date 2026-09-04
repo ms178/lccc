@@ -2114,6 +2114,222 @@ pub(super) fn compute_x87_defer_values(func: &IrFunction) -> FxHashSet<u32> {
     result
 }
 
+/// Pure vector loads: they write no memory and define no GPR (their address
+/// is either an RA-homed GPR pair or the `%rax`/`%rcx` scratch pair).
+pub(crate) fn is_pure_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x4
+            | O::VecLoadF32x8
+            | O::VecLoadI32x8
+            | O::VecLoadF64x2
+            | O::VecLoadF32x4
+            | O::VecLoadI32x4
+            | O::VecLoadI64x2
+    )
+}
+
+/// 256-bit loads eligible for source-operand folding (VLFOLD).
+pub(crate) fn is_memfold_vec_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(op, O::VecLoadF64x4 | O::VecLoadF32x8 | O::VecLoadI32x8)
+}
+
+/// Map FMA intrinsics `VecMadd*(input, scale, bias)` (`emit_avx_map_fma`):
+/// the bias folds through the 213 form (`vfmadd213ps mem, %scale, %ymm0` =
+/// scale*input + mem) and the input through the 231 form
+/// (`vfmadd231ps mem, %scale, %ymm0` = scale*mem + bias).
+pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(op, O::VecMaddF64x4 | O::VecMaddF32x8)
+}
+
+/// Two-operand 256-bit VEX arithmetic intrinsics that go through
+/// `emit_avx_binary_256` and therefore can take a memory operand.
+/// Returns `Some(commutative)`.
+pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<bool> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    match op {
+        O::VecAddF64x4
+        | O::VecMulF64x4
+        | O::VecAddF32x8
+        | O::VecMulF32x8
+        | O::VecAddI32x8
+        | O::VecMulI32x8
+        | O::VecMaxI32x8 => Some(true),
+        O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
+        _ => None,
+    }
+}
+
+/// VLFOLD (the general form of IS-05): a single-use 256-bit `VecLoad*` whose
+/// only consumer is the next — or next-but-one, across another pure
+/// `VecLoad*` — two-operand VEX arithmetic intrinsic in the same block is
+/// elided entirely; the consumer folds the load's *source* memory operand
+/// (`vpaddd (%rdx,%r13), %ymm0, %ymm0`) exactly like ICX/GCC/Clang emit for
+/// `c[i] = a[i] + b[i]` and `s += a[i]`.  Before this analysis the first of
+/// two streamed loads was deferred, then flushed to its home slot when the
+/// second load claimed `%ymm0`, and the consumer re-read the slot: one
+/// store + one stack load per iteration in every map/reduction body.
+///
+/// Soundness argument (mirrors the deferred-store whitelist above):
+/// * the only instructions allowed between load and consumer are pure
+///   vector loads, which write no memory and define no GPR, so the elided
+///   load's RA-homed base/index registers still hold the same values when
+///   the consumer re-materialises the memory operand;
+/// * the emitter additionally requires base/index to be RA-homed GPRs (or a
+///   zero constant): scratch `%rax`/`%rcx` addressing would not survive the
+///   intervening load — it falls back to the ordinary load otherwise;
+/// * VEX arithmetic imposes no alignment on memory operands, so unaligned
+///   streams are legal; legacy-SSE 128-bit forms (`paddd m128`) would fault,
+///   hence only the 256-bit family is eligible;
+/// * a non-commutative consumer may only fold its second operand (AT&T
+///   `op mem, %src1, %dst` computes `src1 op mem`);
+/// * every consumer path either uses the memory operand or materialises the
+///   load (`avx_load_arg_to`), and a safety net in `emit_intrinsic_impl`
+///   materialises a pending fold before any unexpected intrinsic.
+///
+/// When both operands of a consumer are adjacent loads, the farther one is
+/// folded: the nearer load then streams through `%ymm0` under the existing
+/// deferral and the consumer becomes `op mem, %ymm0, %ymm0`.
+/// Kill switch: `CCC_NO_VLFOLD=1`.
+pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+    if env_flag("CCC_NO_VLFOLD") {
+        return result;
+    }
+
+    // Exact use census: intrinsic-argument uses are counted, every other
+    // kind of reference (non-intrinsic operand, terminator, value ref,
+    // dest_ptr) poisons the value.
+    let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut poisoned: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Intrinsic { args, dest_ptr, .. } => {
+                    for a in args {
+                        if let Operand::Value(v) = a {
+                            *use_count.entry(v.0).or_default() += 1;
+                        }
+                    }
+                    if let Some(p) = dest_ptr {
+                        poisoned.insert(p.0);
+                    }
+                }
+                other => {
+                    for_each_operand_in_instruction(other, |op| {
+                        if let Operand::Value(v) = op {
+                            poisoned.insert(v.0);
+                        }
+                    });
+                    for_each_value_use_in_instruction(other, |v| {
+                        poisoned.insert(v.0);
+                    });
+                }
+            }
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                poisoned.insert(v.0);
+            }
+        });
+    }
+
+    let debug = env_flag("CCC_DEBUG_VLFOLD");
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let insts = &block.instructions;
+        let load_at = |k: usize| -> Option<u32> {
+            match insts.get(k) {
+                Some(Instruction::Intrinsic {
+                    dest: Some(d), op, ..
+                }) if is_memfold_vec_load(op) => Some(d.0),
+                _ => None,
+            }
+        };
+        let pure_load_at = |k: usize| -> bool {
+            matches!(insts.get(k), Some(Instruction::Intrinsic { op, .. }) if is_pure_vec_load(op))
+        };
+        for j in 0..insts.len() {
+            let Instruction::Intrinsic {
+                dest: Some(_),
+                op: cop,
+                args: cargs,
+                ..
+            } = &insts[j]
+            else {
+                continue;
+            };
+            // Madd `a*b + c`: every position may fold (the multiplicands
+            // commute; the emitter picks the 213/231 form and keeps the
+            // XMM-homed broadcast as the register source).
+            let madd = memfold_consumer_madd_256(cop);
+            let (commutative, a0, a1) = if madd {
+                if cargs.len() != 3 {
+                    continue;
+                }
+                let (Operand::Value(a0), Operand::Value(_), Operand::Value(a2)) =
+                    (&cargs[0], &cargs[1], &cargs[2])
+                else {
+                    continue;
+                };
+                (true, a0, a2)
+            } else {
+                let Some(commutative) = memfold_consumer_256(cop) else {
+                    continue;
+                };
+                if cargs.len() != 2 {
+                    continue;
+                }
+                let (Operand::Value(a0), Operand::Value(a1)) = (&cargs[0], &cargs[1]) else {
+                    continue;
+                };
+                (commutative, a0, a1)
+            };
+            if a0.0 == a1.0 {
+                continue;
+            }
+            let eligible = |d: u32, is_second: bool| -> bool {
+                (is_second || commutative)
+                    && !poisoned.contains(&d)
+                    && use_count.get(&d).copied() == Some(1)
+            };
+            let a_mid = match (madd, &cargs[1]) {
+                (true, Operand::Value(v)) => Some(v.0),
+                _ => None,
+            };
+            let pick_from = |d: u32| -> Option<u32> {
+                if d == a1.0 && eligible(d, true) {
+                    Some(d)
+                } else if (d == a0.0 || a_mid == Some(d)) && eligible(d, false) {
+                    Some(d)
+                } else {
+                    None
+                }
+            };
+            let mut pick = None;
+            if j >= 2 && pure_load_at(j - 1) {
+                if let Some(d) = load_at(j - 2) {
+                    pick = pick_from(d);
+                }
+            }
+            if pick.is_none() && j >= 1 {
+                if let Some(d) = load_at(j - 1) {
+                    pick = pick_from(d);
+                }
+            }
+            if let Some(d) = pick {
+                if debug {
+                    eprintln!("[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}", func.name, bi, j, d, cop);
+                }
+                result.insert(d);
+            }
+        }
+    }
+    result
+}
+
 /// Defer a vector home-slot store when every def is consumed once from the
 /// last-store peephole by a cache-aware intrinsic in the same block.
 pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
@@ -2304,9 +2520,13 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
             let pos = cargs
                 .iter()
                 .position(|a| matches!(a, Operand::Value(v) if v.0 == slot));
+            // VLFOLD: `emit_avx_map_fma` streams whichever multiplicand or
+            // bias is not folded/homed through `avx_load_arg`, which is a
+            // no-op for the deferred value (positions 1 and 2 of VecMadd*).
             let cache_aware = match pos {
                 Some(0) => !is_raw_reader_intrinsic(cop),
-                Some(1) => is_two_operand_binary(cop),
+                Some(1) => is_two_operand_binary(cop) || memfold_consumer_madd_256(cop),
+                Some(2) => memfold_consumer_madd_256(cop),
                 _ => false,
             };
             if !cache_aware {
