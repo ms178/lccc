@@ -1,0 +1,239 @@
+{
+ "title": "Benchmark corpus: 10 worst LCCC/GCC ratios (-O2, paired medians)",
+ "generated_utc": "2026-09-04T14:14:23Z",
+ "note": "Screening evidence from a 2-vCPU KVM guest without PMU access; paired randomized rounds, checksums verified for every kernel.",
+ "before": [
+  {
+   "name": "tls_seg_access",
+   "lccc_ms": 24.152067,
+   "gcc_ms": 10.937758,
+   "ratio": 2.2091903112136873,
+   "status": "ok"
+  },
+  {
+   "name": "spectral_norm",
+   "lccc_ms": 306.044871,
+   "gcc_ms": 201.460543,
+   "ratio": 1.5146497892641937,
+   "status": "ok"
+  },
+  {
+   "name": "arith_loop",
+   "lccc_ms": 139.794095,
+   "gcc_ms": 99.299197,
+   "ratio": 1.409308449834654,
+   "status": "ok"
+  },
+  {
+   "name": "glibc_memcmp",
+   "lccc_ms": 12.140464999999999,
+   "gcc_ms": 8.792697,
+   "ratio": 1.3792183444965749,
+   "status": "ok"
+  },
+  {
+   "name": "expat_xml_scan",
+   "lccc_ms": 50.885195,
+   "gcc_ms": 40.096147,
+   "ratio": 1.2692522746158021,
+   "status": "ok"
+  },
+  {
+   "name": "loop_patterns",
+   "lccc_ms": 88.472422,
+   "gcc_ms": 71.54279500000001,
+   "ratio": 1.236750510846314,
+   "status": "ok"
+  },
+  {
+   "name": "fannkuch",
+   "lccc_ms": 3043.660145,
+   "gcc_ms": 2473.449672,
+   "ratio": 1.2341518445672182,
+   "status": "ok"
+  },
+  {
+   "name": "aarch64_select_patterns",
+   "lccc_ms": 166.126984,
+   "gcc_ms": 128.58403600000003,
+   "ratio": 1.2159624068257486,
+   "status": "ok"
+  },
+  {
+   "name": "sqlite_varint",
+   "lccc_ms": 32.371271,
+   "gcc_ms": 26.232318,
+   "ratio": 1.2040888216777286,
+   "status": "ok"
+  },
+  {
+   "name": "sieve",
+   "lccc_ms": 62.058205,
+   "gcc_ms": 55.15448,
+   "ratio": 1.1241040742957504,
+   "status": "ok"
+  },
+  {
+   "name": "zlib_ng_adler32",
+   "lccc_ms": 55.57573,
+   "gcc_ms": 43.781639,
+   "ratio": 1.1223530485005369,
+   "status": "ok"
+  },
+  {
+   "name": "hash_table",
+   "lccc_ms": 12455.551973,
+   "gcc_ms": 11167.042112000001,
+   "ratio": 1.1021109595149343,
+   "status": "ok"
+  },
+  {
+   "name": "ascii_case_fold",
+   "lccc_ms": 2.383565,
+   "gcc_ms": 2.2205150000000002,
+   "ratio": 1.0986550082275885,
+   "status": "ok"
+  },
+  {
+   "name": "binary_trees",
+   "lccc_ms": 1585.442861,
+   "gcc_ms": 1431.766261,
+   "ratio": 1.0791451287033786,
+   "status": "ok"
+  },
+  {
+   "name": "switch_dispatch",
+   "lccc_ms": 533.6414229999999,
+   "gcc_ms": 496.122559,
+   "ratio": 1.0756241846281374,
+   "status": "ok"
+  },
+  {
+   "name": "linux_find_bit",
+   "lccc_ms": 14.465965,
+   "gcc_ms": 13.516672,
+   "ratio": 1.0702312669864298,
+   "status": "ok"
+  },
+  {
+   "name": "struct_copy",
+   "lccc_ms": 28.772615000000002,
+   "gcc_ms": 27.112176,
+   "ratio": 1.062081860667264,
+   "status": "ok"
+  },
+  {
+   "name": "mandelbrot",
+   "lccc_ms": 1549.762761,
+   "gcc_ms": 1491.319815,
+   "ratio": 1.0382033297689104,
+   "status": "ok"
+  },
+  {
+   "name": "strlen_bench",
+   "lccc_ms": 292.420006,
+   "gcc_ms": 268.88604399999997,
+   "ratio": 1.0323691499225394,
+   "status": "ok"
+  },
+  {
+   "name": "histogram",
+   "lccc_ms": 2.495629,
+   "gcc_ms": 2.454654,
+   "ratio": 1.0272224014503624,
+   "status": "ok"
+  },
+  {
+   "name": "ring_fifo",
+   "lccc_ms": 2.1257189999999997,
+   "gcc_ms": 2.122806,
+   "ratio": 1.0004828514711188,
+   "status": "ok"
+  },
+  {
+   "name": "gzip_crc32",
+   "lccc_ms": 167.896487,
+   "gcc_ms": 168.010538,
+   "ratio": 1.000412734003535,
+   "status": "ok"
+  },
+  {
+   "name": "qsort",
+   "lccc_ms": 131.797687,
+   "gcc_ms": 141.011638,
+   "ratio": 0.9935343580009675,
+   "status": "ok"
+  },
+  {
+   "name": "binary_search",
+   "lccc_ms": 2.1414910000000003,
+   "gcc_ms": 2.164369,
+   "ratio": 0.9741912669640419,
+   "status": "ok"
+  },
+  {
+   "name": "tce_sum",
+   "lccc_ms": 2.046709,
+   "gcc_ms": 2.051468,
+   "ratio": 0.9739805061992418,
+   "status": "ok"
+  },
+  {
+   "name": "double_reduction",
+   "lccc_ms": 109.120601,
+   "gcc_ms": 125.22513900000001,
+   "ratio": 0.8835610875200574,
+   "status": "ok"
+  },
+  {
+   "name": "bitops",
+   "lccc_ms": 297.160821,
+   "gcc_ms": 384.32515,
+   "ratio": 0.7735693688722518,
+   "status": "ok"
+  },
+  {
+   "name": "matmul",
+   "lccc_ms": 6.97913,
+   "gcc_ms": 11.778505,
+   "ratio": 0.6387769566367476,
+   "status": "ok"
+  },
+  {
+   "name": "nbody",
+   "lccc_ms": 374.407418,
+   "gcc_ms": 668.534753,
+   "ratio": 0.5616135453926006,
+   "status": "ok"
+  },
+  {
+   "name": "libm_round_family",
+   "lccc_ms": 272.078126,
+   "gcc_ms": 1145.314779,
+   "ratio": 0.2260488394364327,
+   "status": "ok"
+  },
+  {
+   "name": "ackermann",
+   "lccc_ms": 2.285999,
+   "gcc_ms": 155.763431,
+   "ratio": 0.014490242307129529,
+   "status": "ok"
+  },
+  {
+   "name": "constant_recursion",
+   "lccc_ms": 2.118888,
+   "gcc_ms": 155.559752,
+   "ratio": 0.013634445856536068,
+   "status": "ok"
+  },
+  {
+   "name": "fib",
+   "lccc_ms": 2.521185,
+   "gcc_ms": 217.808985,
+   "ratio": 0.012370385863883641,
+   "status": "ok"
+  }
+ ],
+ "after": []
+}

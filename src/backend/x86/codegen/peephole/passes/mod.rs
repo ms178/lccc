@@ -725,6 +725,12 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("spill_deref") {
             global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
         }
+        // ms178: XMM/vector save→clobber→reload round-trips (double_reduction
+        // class): the reload re-executes the original memory load instead of
+        // the frame slot, freeing the slot and the spill store entirely.
+        if !sk("savreload") {
+            global_changed |= spill_deref::fold_save_reload_roundtrip(&mut store, &mut infos);
+        }
         if !sk("copy_prop") {
             global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
         }

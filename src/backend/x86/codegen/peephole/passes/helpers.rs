@@ -252,6 +252,39 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
     None
 }
 
+pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(RegId, RegId)> {
+    if let LineKind::Other { dest_reg } = info.kind {
+        if dest_reg == REG_NONE || dest_reg > REG_GP_MAX {
+            return None;
+        }
+        if let Some(rest) = trimmed.strip_prefix("movl ") {
+            if let Some((src_part, dst_part)) = rest.split_once(',') {
+                let src = src_part.trim();
+                let dst = dst_part.trim();
+                if !src.starts_with('%') || !dst.starts_with('%') {
+                    return None;
+                }
+                let sfam = register_family_fast(src);
+                let dfam = register_family_fast(dst);
+                if sfam == REG_NONE
+                    || sfam > REG_GP_MAX
+                    || sfam == 4
+                    || sfam == 5
+                    || dfam == REG_NONE
+                    || dfam > REG_GP_MAX
+                    || dfam == 4
+                    || dfam == 5
+                    || sfam == dfam
+                {
+                    return None;
+                }
+                return Some((sfam, dfam));
+            }
+        }
+    }
+    None
+}
+
 /// Get the destination register of an instruction (the register it writes to).
 /// Whether `trimmed` is a self-referencing zeroing idiom such as
 /// `xorl %eax, %eax`, `xorq %r12, %r12` or `subl %ecx, %ecx`.
