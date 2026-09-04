@@ -475,11 +475,12 @@ fn parse_dest_reg(s: &str) -> RegId {
     REG_NONE
 }
 
-/// Check if a line references a specific register family.
-/// This includes both explicit register operands and implicit register uses
-/// by instructions like cltd, idivl, rep movsb, etc.
-fn line_references_reg(s: &str, reg: RegId) -> bool {
-    // Check explicit register operands
+/// Explicit-operand mention test: does the TEXT name any spelling of the
+/// family?  This is [`line_references_reg`] WITHOUT the implicit-operand
+/// union — consumers that must distinguish "the instruction names the
+/// register" from "the architecture touches it" (a purely-architectural
+/// redefinition proof must not be vetoed by the oracle's own mentions).
+fn line_references_reg_explicit(s: &str, reg: RegId) -> bool {
     let names: &[&str] = match reg {
         REG_EAX => &["%eax", "%ax", "%al", "%ah"],
         REG_ECX => &["%ecx", "%cx", "%cl", "%ch"],
@@ -491,10 +492,16 @@ fn line_references_reg(s: &str, reg: RegId) -> bool {
         REG_EDI => &["%edi", "%di"],
         _ => return false,
     };
-    for name in names {
-        if s.contains(name) {
-            return true;
-        }
+    names.iter().any(|name| s.contains(name))
+}
+
+/// Check if a line references a specific register family.
+/// This includes both explicit register operands and the architectural
+/// implicit operands ([`classify_implicit_operands`]) of instructions like
+/// cltd, idivl, rep movsb, rdtsc or syscall.
+fn line_references_reg(s: &str, reg: RegId) -> bool {
+    if line_references_reg_explicit(s, reg) {
+        return true;
     }
     // Check implicit register uses by specific instructions
     if implicit_reg_use(s, reg) {
@@ -503,89 +510,231 @@ fn line_references_reg(s: &str, reg: RegId) -> bool {
     false
 }
 
-/// Check if an instruction implicitly uses a register (not mentioned in text).
+/// Check if an instruction implicitly uses a register (not mentioned in
+/// text): the union half of the central implicit-operand oracle.
 fn implicit_reg_use(s: &str, reg: RegId) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() {
+    if !(0..=REG_GP_MAX).contains(&reg) {
         return false;
     }
-    match bytes[0] {
-        b'c' => {
-            // cmpxchg8b (without lock prefix): reads/writes eax, edx, ecx, ebx
-            if s.starts_with("cmpxchg8b") {
-                return reg == REG_EAX || reg == REG_EDX || reg == REG_ECX || reg == REG_EBX;
-            }
-            // cmpxchg{l,w,b} (without lock prefix): implicitly reads eax
-            if s.starts_with("cmpxchg") {
-                return reg == REG_EAX;
-            }
-            // cltd/cdq: reads eax, writes edx
-            if s == "cltd" || s == "cdq" {
-                return reg == REG_EAX || reg == REG_EDX;
-            }
-            // cbw/cwde: reads/writes eax
-            if s == "cbw" || s == "cwde" || s == "cwtl" {
-                return reg == REG_EAX;
-            }
-        }
-        b'i' => {
-            // idivl/idivw: implicitly reads edx:eax, writes eax and edx
-            if s.starts_with("idivl") || s.starts_with("idivw") || s.starts_with("idivb") {
-                return reg == REG_EAX || reg == REG_EDX;
-            }
-            // imull with 1 operand: reads eax, writes edx:eax
-            // imull with 2 or 3 operands has explicit regs
-            if s.starts_with("imull ") && !s.contains(',') {
-                return reg == REG_EAX || reg == REG_EDX;
-            }
-        }
-        b'd' => {
-            // divl/divw: implicitly reads edx:eax, writes eax and edx
-            if s.starts_with("divl") || s.starts_with("divw") || s.starts_with("divb") {
-                return reg == REG_EAX || reg == REG_EDX;
-            }
-        }
-        b'm' => {
-            // mul: reads eax, writes edx:eax
-            if s.starts_with("mull ") || s.starts_with("mulw ") || s.starts_with("mulb ") {
-                return reg == REG_EAX || reg == REG_EDX;
-            }
-        }
-        b'r' => {
-            // rep movsb/movsl: uses esi, edi, ecx
-            // rep stosb/stosl: uses edi, ecx, eax
-            if s.starts_with("rep") {
-                if s.contains("movs") {
-                    return reg == REG_ESI || reg == REG_EDI || reg == REG_ECX;
-                }
-                if s.contains("stos") {
-                    return reg == REG_EAX || reg == REG_EDI || reg == REG_ECX;
-                }
-                if s.contains("scas") || s.contains("cmps") {
-                    return reg == REG_ESI || reg == REG_EDI || reg == REG_ECX || reg == REG_EAX;
-                }
-                // Unknown rep instruction - assume all regs used
-                return true;
-            }
-        }
-        b'l' => {
-            // lock cmpxchg8b: implicitly reads/writes eax, edx, ecx, ebx
-            // cmpxchg8b compares edx:eax with memory, stores ecx:ebx on match
-            if s.starts_with("lock cmpxchg8b") {
-                return reg == REG_EAX || reg == REG_EDX || reg == REG_ECX || reg == REG_EBX;
-            }
-            // lock cmpxchg{l,w,b}: implicitly reads eax (compared with memory)
-            if s.starts_with("lock cmpxchg") {
-                return reg == REG_EAX;
-            }
-            // loop/loope/loopne: reads ecx
-            if s.starts_with("loop") {
-                return reg == REG_ECX;
-            }
-        }
-        _ => {}
+    let (reads, writes) = classify_implicit_operands(s);
+    (reads | writes) & (1 << reg) != 0
+}
+
+/// Families an instruction implicitly READS without naming them in text.
+fn line_implicitly_reads(s: &str, reg: RegId) -> bool {
+    if !(0..=REG_GP_MAX).contains(&reg) {
+        return false;
     }
-    false
+    classify_implicit_operands(s).0 & (1 << reg) != 0
+}
+
+// ── Implicit register operands (central oracle) ─────────────────────────────
+//
+// Single source of truth for every register an instruction touches WITHOUT
+// naming it in its operand text.  Four consumers used to keep four separate
+// hand-rolled tables in sync (`implicit_reg_use` mentions,
+// `line_writes_reg_implicitly` writes, `implicit_reads` reads, and the
+// `line_reg_use_def` use/def table); each had drifted differently — none
+// knew `leave`/`syscall`/`cpuid`/bare string ops, the write table missed
+// every word/byte div-mul form except divl/idivl/mull, and `cmpxchg`'s
+// implicit %eax rewrite (and `lock xadd`'s register RMW) was invisible to
+// copy-propagation invalidation.
+//
+// The table records the implicit READS and the implicit WRITES separately:
+// the union (a set bit only makes a pass more conservative) serves the
+// mention-style checks, while the exact halves serve redefinition checks
+// (writes only) and observation checks (reads only) that must not conflate
+// the two — `cltd` reads %eax and writes %edx, and confusing those halves
+// is exactly how a staging-copy fold deletes a live definition.
+//
+// Prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`) are skipped so
+// the mnemonic that follows is classified; the `rep` family additionally
+// contributes %ecx (count) — and `rep ret` / `rep nop` (pause) contribute
+// nothing.  An UNRECOGNIZED prefixed mnemonic keeps the legacy fail-closed
+// posture ("assume all registers used") — the emitter never produces one,
+// but an unknown rep form must never look clean.
+//
+// Mnemonics are matched EXACTLY, never by prefix: `divsd`/`mulsd` are SSE
+// instructions with fully explicit operands and must not inherit the
+// integer div/mul accumulator pair.  `movsl` is the 32-bit string move;
+// `movsd` is left out of the table entirely (SSE owns that spelling).
+//
+// The emitter today only produces a subset of the table (cltd, idivl/divl,
+// one-operand imull, rep movsb, rdtsc/rdtscp, lock cmpxchg8b, lock
+// cmpxchg*, lock xadd), but the oracle is written against the ISA, so the
+// next new emitter site is covered for free.
+fn classify_implicit_operands(s: &str) -> (u8, u8) {
+    const EAX: u8 = 1 << REG_EAX;
+    const ECX: u8 = 1 << REG_ECX;
+    const EDX: u8 = 1 << REG_EDX;
+    const EBX: u8 = 1 << REG_EBX;
+    const ESP: u8 = 1 << REG_ESP;
+    const EBP: u8 = 1 << REG_EBP;
+    const ESI: u8 = 1 << REG_ESI;
+    const EDI: u8 = 1 << REG_EDI;
+    const ALL: u8 = 0xFF;
+
+    // Callers mostly pass `trimmed(...)` slices, but defensive trimming
+    // keeps every direct call site (and test) correct — the x86-64 oracle
+    // documents the same contract.
+    let s = s.trim_start();
+    fn mnemonic(s: &str) -> (&str, &str) {
+        match s.split_once(' ').or_else(|| s.split_once('\t')) {
+            Some((m, rest)) => (m, rest.trim_start()),
+            None => (s, ""),
+        }
+    }
+
+    if s.is_empty() {
+        return (0, 0);
+    }
+    let (mut m, mut rest) = mnemonic(s);
+    if m.is_empty() || m.starts_with('.') || m.ends_with(':') || m.starts_with('#') {
+        // Labels, directives and comments name no instruction.
+        return (0, 0);
+    }
+    let mut reads: u8 = 0;
+    let mut writes: u8 = 0;
+    // Prefixes.
+    loop {
+        match m {
+            "lock" => {}
+            "rep" | "repe" | "repz" | "repne" | "repnz" => {
+                // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
+                // counted loops: they touch no register at all.
+                let (m2, _) = mnemonic(rest);
+                if m2 == "ret" || m2 == "nop" {
+                    return (0, 0);
+                }
+                reads |= ECX; // count tested for zero
+                writes |= ECX; // count decremented
+                if m2.is_empty() || !is_known_string_mnemonic(m2) {
+                    // Unknown counted form: fail closed on every family.
+                    return (ALL, ALL);
+                }
+            }
+            _ => break,
+        }
+        let (m2, r2) = mnemonic(rest);
+        if m2.is_empty() {
+            return (reads, writes);
+        }
+        m = m2;
+        rest = r2;
+    }
+    let has_comma = rest.contains(',');
+    let table: (u8, u8) = match m {
+        // Sign-extension of the accumulator in place.  GAS's AT&T spellings
+        // (cbtw/cwtl) and Intel's (cbw/cwde) name the same encodings.
+        "cbw" | "cbtw" | "cwde" | "cwtl" | "cdqe" => (EAX, EAX),
+        // Sign-extension into the data register: %eax is the INPUT.
+        "cwd" | "cwtd" | "cltd" | "cdq" | "cqo" => (EAX, EDX),
+        // Byte multiply/divide: the accumulator pair is AX (quotient AL,
+        // remainder AH, product AX) — the %edx family is never touched.
+        "divb" | "idivb" | "mulb" | "imulb" => (EAX, EAX),
+        // Word/long single-operand multiply/divide: edx:eax implicit.
+        "div" | "divw" | "divl" | "idiv" | "idivw" | "idivl" | "mul" | "mulw"
+        | "mull" => (EAX | EDX, EAX | EDX),
+        // imul with a single operand is the widening form (edx:eax); the
+        // two/three-operand forms name every register they touch.
+        "imul" | "imulw" | "imull" if !has_comma => (EAX, EAX | EDX),
+        // BMI2 mulx reads %edx implicitly; both destinations are explicit.
+        "mulx" | "mulxl" | "mulxq" => (EDX, 0),
+        // String instructions: %esi source, %edi destination, %eax data.  The
+        // pointer registers are post-incremented, i.e. also written.
+        "movsb" | "movsw" | "movsl" | "cmpsb" | "cmpsw" | "cmpsl" => (ESI | EDI, ESI | EDI),
+        "stosb" | "stosw" | "stosl" | "scasb" | "scasw" | "scasl" => (EAX | EDI, EDI),
+        "lodsb" | "lodsw" | "lodsl" => (ESI, EAX | ESI),
+        "insb" | "insw" | "insl" | "insd" => (EDX, EDI),
+        "outsb" | "outsw" | "outsl" | "outsd" => (EDX | ESI, ESI),
+        "in" | "inb" | "inw" | "inl" | "ind" => (EDX, EAX),
+        "out" | "outb" | "outw" | "outl" | "outd" => (EAX | EDX, 0),
+        // Serialising / system instructions with fixed register interfaces.
+        "cpuid" => (EAX, EAX | EBX | ECX | EDX),
+        "rdtsc" => (0, EAX | EDX),
+        // rdtscp additionally returns the TSC_AUX in %ecx; rdtsc does not.
+        "rdtscp" => (0, EAX | ECX | EDX),
+        "rdpmc" | "rdmsr" | "xgetbv" => (ECX, EAX | EDX),
+        "wrmsr" | "xsetbv" => (EAX | EDX | ECX, 0),
+        "monitor" | "mwait" => (EAX | ECX | EDX, 0),
+        // The xsave family passes its feature mask in %edx:%eax; state goes
+        // to/from memory, never to a GP register.
+        "xsave" | "xsaveopt" | "xsavec" | "xsaves" | "xrstor" | "xrstors" => (EAX | EDX, 0),
+        // ia32 syscall: number/return in %eax, arguments in
+        // ebx/ecx/edx/esi/edi/ebp; the kernel destroys %ecx (return EIP) and
+        // rewrites %eax.  Fail closed on the argument side.
+        "syscall" | "sysenter" => (EAX | EBX | ECX | EDX | ESI | EDI | EBP, EAX | ECX),
+        "sysexit" => (EAX | ECX | EDX, EAX | ECX | EDX),
+        // Software interrupt: the handler's register contract is unknown
+        // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
+        "int" => (EAX | EBX | ECX | EDX | ESI | EDI | EBP, EAX | EBX | ECX | EDX | ESI | EDI | EBP),
+        // Atomics with an implicit accumulator: %eax holds the compare value
+        // and is reloaded when the exchange fails.
+        "cmpxchg" | "cmpxchgb" | "cmpxchgw" | "cmpxchgl" => (EAX, EAX),
+        // CMPXCHG8B compares %edx:%eax (reloaded on failure) against
+        // memory; %ecx:%ebx are the store payload, read-only.
+        "cmpxchg8b" | "cmpxchg16b" => (EAX | EBX | ECX | EDX, EAX | EDX),
+        // XADD/ADC-style register RMW is explicit-text; only the memory form
+        // has no implicit register half, so nothing is added here.
+        // Misc legacy: table lookup, flags <-> %ah, counted loops.
+        "xlat" | "xlatb" => (EBX, EAX),
+        "lahf" => (0, EAX),
+        "sahf" => (EAX, 0),
+        "loop" | "loope" | "loopz" | "loopne" | "loopnz" => (ECX, ECX),
+        "jecxz" => (ECX, 0),
+        // Frame instructions.
+        "enter" => (0, ESP | EBP),
+        // `leave` copies %ebp into %esp (pure write of %esp) and pops %ebp
+        // (read-modify-write of %ebp, and a read of %esp's memory).
+        "leave" => (EBP, ESP | EBP),
+        // pusha/pushad push all eight GP registers (including %esp's current
+        // value) and decrement %esp; popa/popad pop everything except %esp.
+        "pusha" | "pushad" => (ALL, ESP),
+        "popa" | "popad" => (ESP, ALL & !ESP),
+        _ => (0, 0),
+    };
+    (reads | table.0, writes | table.1)
+}
+
+/// The string primitives the `rep` prefix can legally drive (used to decide
+/// whether an unknown rep form must fail closed).
+fn is_known_string_mnemonic(m: &str) -> bool {
+    matches!(
+        m,
+        "movsb"
+            | "movsw"
+            | "movsl"
+            | "movsd"
+            | "movsq"
+            | "stosb"
+            | "stosw"
+            | "stosl"
+            | "stosd"
+            | "stosq"
+            | "lodsb"
+            | "lodsw"
+            | "lodsl"
+            | "lodsd"
+            | "lodsq"
+            | "scasb"
+            | "scasw"
+            | "scasl"
+            | "scasd"
+            | "scasq"
+            | "cmpsb"
+            | "cmpsw"
+            | "cmpsl"
+            | "cmpsd"
+            | "cmpsq"
+            | "insb"
+            | "insw"
+            | "insl"
+            | "insd"
+            | "outsb"
+            | "outsw"
+            | "outsl"
+            | "outsd"
+    )
 }
 
 // ── Line classifier ──────────────────────────────────────────────────────────
@@ -2577,50 +2726,41 @@ fn line_reads_dest_source(s: &str, reg: RegId) -> bool {
         if let Some(comma) = s.rfind(',') {
             return line_references_reg(&s[..comma], reg);
         }
-        return false;
+        // A comma-less mov-prefixed line is a string primitive (`movsl`),
+        // not a pure write: fall through to the conservative answer
+        // instead of claiming "reads nothing".
     }
     // Everything else: conservatively a read.
     line_references_reg(s, reg)
 }
 
-fn is_implicit_string_op(s: &str) -> bool {
-    let mut words = s.split_ascii_whitespace();
-    let mut mnemonic = words.next().unwrap_or("");
-    if matches!(mnemonic, "rep" | "repe" | "repz" | "repne" | "repnz") {
-        mnemonic = words.next().unwrap_or("");
-    }
-    matches!(
-        mnemonic,
-        "movsb"
-            | "movsw"
-            | "movsl"
-            | "movsq"
-            | "stosb"
-            | "stosw"
-            | "stosl"
-            | "stosq"
-            | "lodsb"
-            | "lodsw"
-            | "lodsl"
-            | "lodsq"
-            | "scasb"
-            | "scasw"
-            | "scasl"
-            | "scasq"
-            | "cmpsb"
-            | "cmpsw"
-            | "cmpsl"
-            | "cmpsq"
-    )
-}
-
 fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
+    // Architectural implicit writes first (central oracle): `cltd`→%edx,
+    // `idivl %ecx`→%eax:%edx, `rep stosb`→%edi:%ecx, `cmpxchg`'s implicit
+    // %eax reload, `rdtscp`→%ecx, `leave`→%esp:%ebp, ...  Exact halves —
+    // see `classify_implicit_operands`.
+    if (0..=REG_GP_MAX).contains(&reg) && classify_implicit_operands(s).1 & (1 << reg) != 0 {
+        return true;
+    }
     let mn = s.split_whitespace().next().unwrap_or("");
-    match mn {
-        "mull" | "imull" if !s.contains(',') => reg == REG_EAX || reg == REG_EDX,
-        "divl" | "idivl" => reg == REG_EAX || reg == REG_EDX,
-        "cltd" | "cdq" => reg == REG_EDX,
-        "xchgl" | "xchgw" | "xchgb" => line_references_reg(s, reg),
+    // The explicit-second-destination arms below must see through the
+    // `lock` prefix: `lock xaddl %ebx, (%eax)` returns the old value in
+    // %ebx — a WRITE the AT&T destination parse never sees (the last
+    // operand is memory).  Missing it let copy propagation rename %ebx
+    // readers across the fetch-add onto a stale pre-add value.
+    let unlocked = match mn {
+        "lock" | "rep" | "repe" | "repz" | "repne" | "repnz" => {
+            s.split_ascii_whitespace().nth(1).unwrap_or("")
+        }
+        _ => mn,
+    };
+    match unlocked {
+        // XCHG writes BOTH named operands; XADD writes the register
+        // operand (it receives the old value).  classify_line only sees
+        // the last operand as the destination.
+        "xchgl" | "xchgw" | "xchgb" | "xaddl" | "xaddw" | "xaddb" => {
+            line_references_reg(s, reg)
+        }
         // Single-operand read-modify-write forms (`negl %eax`, `incl %ecx`,
         // `bswapl %eax`): classify_line derives the destination from the
         // operand AFTER the last comma — these have none, so they classify
@@ -2630,12 +2770,11 @@ fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
         // scenario 7, struct-copy loops): lccc computed 0x10 where gcc
         // computed 0x04.
         "negl" | "negw" | "negb" | "notl" | "notw" | "notb" | "incl" | "incw" | "incb" | "decl"
-        | "decw" | "decb" | "bswapl" | "bswapw" => {
+        | "decw" | "decb" | "bswapl" | "bswapw"
+            if mn == unlocked =>
+        {
             let rest = s[mn.len()..].trim();
             !rest.contains(',') && rest.starts_with('%') && register_family(rest) == reg
-        }
-        _ if is_implicit_string_op(s) => {
-            matches!(reg, REG_ECX | REG_ESI | REG_EDI | REG_EAX)
         }
         _ => false,
     }
@@ -3223,40 +3362,20 @@ fn line_reg_use_def(store: &LineStore, infos: &[LineInfo], idx: usize) -> (u16, 
 
     // Account for architectural operands omitted from AT&T syntax.  Missing a
     // definition is merely pessimistic, but missing a use can make CFG DCE
-    // delete a live dividend or string pointer.  Keep this table paired with
-    // `line_writes_reg_implicitly`, which protects the linear passes.
+    // delete a live dividend or string pointer.  The central oracle supplies
+    // the exact halves (see `classify_implicit_operands`); the XCHG arm below
+    // covers the explicit second destination the oracle knows nothing about.
+    let (imp_reads, imp_writes) = classify_implicit_operands(line);
+    uses |= u16::from(imp_reads);
+    defs |= u16::from(imp_writes);
     let mnemonic = line.split_ascii_whitespace().next().unwrap_or("");
-    match mnemonic {
-        "mull" | "imull" if !line.contains(',') => {
-            uses |= bit(REG_EAX);
-            defs |= bit(REG_EAX) | bit(REG_EDX);
-        }
-        "divl" | "idivl" => {
-            uses |= bit(REG_EAX) | bit(REG_EDX);
-            defs |= bit(REG_EAX) | bit(REG_EDX);
-        }
-        "cltd" | "cdq" => {
-            uses |= bit(REG_EAX);
-            defs |= bit(REG_EDX);
-        }
-        "xchgl" | "xchgw" | "xchgb" => {
-            for reg in 0..=REG_GP_MAX {
-                if line_references_reg(line, reg) {
-                    uses |= bit(reg);
-                    defs |= bit(reg);
-                }
-            }
-        }
-        _ if is_implicit_string_op(line) => {
-            // The exact subset depends on the string opcode and prefixes;
-            // keeping all architectural string registers live is cheap and
-            // conservative for the tiny i686 functions handled here.
-            for reg in [REG_EAX, REG_ECX, REG_ESI, REG_EDI] {
+    if matches!(mnemonic, "xchgl" | "xchgw" | "xchgb") {
+        for reg in 0..=REG_GP_MAX {
+            if line_references_reg(line, reg) {
                 uses |= bit(reg);
                 defs |= bit(reg);
             }
         }
-        _ => {}
     }
     (uses, defs)
 }
@@ -3776,6 +3895,23 @@ fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
 
             // Check if dst is read by this instruction
             let s = trimmed(store, &infos[j], j);
+            // A purely-architectural write redefines dst outright: `cltd`
+            // overwrites %edx (and `rdtsc` %eax, `cpuid` %ebx, ...) without
+            // naming it in the operand text, so a move into the family in
+            // front of it is dead.  Never fired when the instruction also
+            // READS the family (`idivl` consumes %eax:%edx and the string
+            // pointers are post-incremented — those are read-modify-writes,
+            // not redefinitions) or names it in explicit operand text.
+            let (imp_reads, imp_writes) = classify_implicit_operands(s);
+            let dst_bit = 1u8 << dst_reg;
+            if imp_writes & dst_bit != 0
+                && imp_reads & dst_bit == 0
+                && !line_references_reg_explicit(s, dst_reg)
+            {
+                infos[i].kind = LineKind::Nop;
+                changed = true;
+                break;
+            }
             match infos[j].kind {
                 LineKind::StoreEbp { reg, .. } if reg == dst_reg => {
                     // dst is read (stored to stack) - move is alive
@@ -5733,39 +5869,6 @@ fn line_writes_reg_purely(line: &str, reg: RegId) -> bool {
     reg32_name(reg) == dst || format!("{}(%esp)", &reg32_name(reg)[1..]) == dst
 }
 
-/// Linear dead-scan: true when `%reg` is not READ on the fallthrough path
-/// starting at line `from`, up to the next write/call/ret/unconditional-jmp.
-/// A write (or a call clobbering caller-saved regs, or control leaving the
-/// linear path) ends the scan with "dead"; any read ends it with "live".
-/// Labels are transparent: jump entrants at a label never observed the
-/// staging write being deleted, so only the fallthrough path matters.
-/// Registers implicitly READ by instructions whose textual operands do not
-/// mention them.  The staging-copy soundness checker must treat these as
-/// reads of the implicit registers, or deleting an earlier definition would
-/// silently change the values a `rep movs`/`idivl` consumes.
-fn implicit_reads(line: &str) -> &'static [RegId] {
-    let first = line.split_whitespace().next().unwrap_or("");
-    let second = line.split_whitespace().nth(1).unwrap_or("");
-    match first {
-        "rep" => match second {
-            "movsb" | "movsl" => &[REG_ECX, REG_ESI, REG_EDI],
-            "stosb" | "stosl" => &[REG_EAX, REG_ECX, REG_EDI],
-            "lodsb" | "lodsl" => &[REG_ECX, REG_ESI],
-            "scasb" | "scasl" => &[REG_EAX, REG_ECX, REG_EDI],
-            _ => &[],
-        },
-        "movsb" | "movsl" => &[REG_ESI, REG_EDI],
-        "stosb" | "stosl" => &[REG_EAX, REG_EDI],
-        "lodsb" | "lodsl" => &[REG_ESI],
-        "scasb" | "scasl" => &[REG_EAX, REG_EDI],
-        "idivl" | "divl" => &[REG_EAX, REG_EDX],
-        "imull" | "mull" => &[REG_EAX, REG_EDX],
-        "cltd" | "cdq" => &[REG_EAX],
-        "loop" | "loope" | "loopne" | "jecxz" => &[REG_ECX],
-        _ => &[],
-    }
-}
-
 /// Dominance-based dead-proof for a register whose definition is deleted or
 /// rewritten by a staging-copy fold.  Returns true when EVERY read of `reg`
 /// in `[fstart, fend)` is dominated, within its own basic block, by a later
@@ -5822,7 +5925,7 @@ fn staging_reads_safe(
             k += 1;
             continue;
         }
-        if implicit_reads(line).contains(&reg) && !dominated {
+        if line_implicitly_reads(line, reg) && !dominated {
             return false;
         }
         if line_references_reg(line, reg) {
@@ -5830,10 +5933,24 @@ fn staging_reads_safe(
                 dominated = true;
                 pending_excluded = false;
             } else {
-                if !dominated || pending_excluded {
+                // A purely-architectural write is a REDEFINITION, not an
+                // observation: `cltd` overwrites %edx without naming it,
+                // so a staging copy into %edx that it follows can never be
+                // observed by it (the oracle's read half is what makes
+                // this exact — `idivl` both reads and writes %eax and is
+                // correctly treated as an observer).
+                let (imp_r, imp_w) = classify_implicit_operands(line);
+                let bit = 1u8 << reg;
+                let pure_redef = imp_w & bit != 0
+                    && imp_r & bit == 0
+                    && !line_references_reg_explicit(line, reg);
+                if !pure_redef && (!dominated || pending_excluded) {
                     return false;
                 }
                 dominated = true;
+                if pure_redef {
+                    pending_excluded = false;
+                }
             }
         }
         if infos[k].kind == LineKind::Call && matches!(reg, REG_EAX | REG_ECX | REG_EDX) {
@@ -5871,7 +5988,14 @@ fn census_reg_reads(
             continue;
         }
         let line = trimmed(store, &infos[k], k);
-        if line_references_reg(line, reg) && !line_writes_reg_purely(line, reg) {
+        // A read is: an explicit textual mention that is not a pure write
+        // of the family, or an architectural implicit READ (the oracle's
+        // exact read half — `cltd` mentions %edx but does not read it,
+        // while `stosl` genuinely consumes %eax).
+        let explicitly = line_references_reg_explicit(line, reg);
+        if (explicitly || line_implicitly_reads(line, reg))
+            && !line_writes_reg_purely(line, reg)
+        {
             n += 1;
         }
         k += 1;
@@ -9563,7 +9687,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("negl %eax"), "negl must survive:\n{result}");
         // The store must still read the NEGATED register, not %edi.
         assert!(
@@ -9593,7 +9717,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("imull %eax, %edx"),
             "imul not forwarded:\n{result}"
@@ -9621,7 +9745,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains(".loc 1 42 3"),
             "debug metadata lost:\n{result}"
@@ -9654,7 +9778,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("imull 32(%esp), %edx"),
             "imul must stay a memory op when %eax is rewritten:\n{result}"
@@ -9680,7 +9804,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("testl %eax, %edx"),
             "test-through-copy must fold:\n{result}"
@@ -9701,7 +9825,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("movl %eax, %edx"),
             "zero-through-copy must fold:\n{result}"
@@ -9728,7 +9852,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // The immediate byte store forwards straight into the widened
         // reload BECAUSE the adjacent movzbl terminates the widening: the
         // constant materializes directly (`movl $7,%eax`) and the zext of
@@ -9753,7 +9877,7 @@ mod tests {
     ret
 "
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl $3, %eax"),
             "constant slot reload must fold to an immediate move:\n{result}"
@@ -9778,7 +9902,7 @@ mod tests {
     ret
 "
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("8(%esp)"),
             "a call can overwrite the slot; the reload must stay:\n{result}"
@@ -9803,7 +9927,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movzwl 4(%esp), %eax"),
             "widened 16-bit slot load must fold:\n{result}"
@@ -9829,7 +9953,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("cmpl $97, %eax"),
             "compare-through-copy must fold:\n{result}"
@@ -9858,7 +9982,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("subl $48, %eax"),
             "range-check staging must fold:\n{result}"
@@ -9890,7 +10014,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("subl $48, %eax"),
             "live staging subtract must survive:\n{result}"
@@ -9914,7 +10038,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl $512, 76(%esp)"),
             "immediate store must fold:\n{result}"
@@ -9943,7 +10067,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         let xor_count = result.matches("xorl %edx, %edx").count();
         assert!(
             xor_count <= 1,
@@ -9984,7 +10108,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         let stores = result.matches("movl $22, 8(%esp)").count();
         assert!(
             stores == 1,
@@ -10021,7 +10145,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movl %eax, %edx"), "{result}");
         assert!(result.contains("testl %eax, %eax"), "{result}");
     }
@@ -10049,7 +10173,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("imull 12(%esp), %edx"),
             "imul must survive behind a mid-slot reader:\n{result}"
@@ -10076,7 +10200,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("addl %eax, %edx"),
             "addl not forwarded:\n{result}"
@@ -10106,7 +10230,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("cmpl $0, 4(%esp)"), "{result}");
         assert!(!result.contains("movl 4(%esp), %eax"), "{result}");
     }
@@ -10129,7 +10253,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("4(%esp), %eax") || result.contains("testl %eax, %eax"),
             "load must survive while %eax is live:\n{result}"
@@ -10160,7 +10284,7 @@ mod tests {
             ".size f, .-f\\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movzbl 4(%esp), %eax"), "{result}");
         assert!(!result.contains("cmpl $4, 4(%esp)"), "{result}");
     }
@@ -10180,7 +10304,7 @@ mod tests {
             ".size f, .-f\\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movzwl 4(%esp), %ecx"), "{result}");
         assert!(!result.contains("addl 4(%esp), %eax"), "{result}");
     }
@@ -10213,7 +10337,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("movl %edx, 48(%esp)"),
             "stale forwarded %edx must not survive the fstpl overwrite:\n{result}"
@@ -10248,7 +10372,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(result.matches("call *pio_ops+8").count(), 2, "{result}");
         assert!(!result.contains("call *0(%esp)"), "{result}");
         assert!(!result.contains("movl pio_ops+8, %eax"), "{result}");
@@ -10281,7 +10405,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(result.matches("call *pio_ops+4").count(), 2, "{result}");
         assert!(!result.contains("call *0(%esp)"), "{result}");
     }
@@ -10312,7 +10436,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("call *4(%esp)"),
             "must stay staged:\n{result}"
@@ -10338,7 +10462,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("call *0(%esp)"), "{result}");
         assert!(!result.contains("call *pio_ops"), "{result}");
     }
@@ -10361,7 +10485,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("call *0(%esp)"), "{result}");
         assert!(result.contains("movl %ebx, ops_tab"), "{result}");
     }
@@ -10386,7 +10510,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("testl %edx, %edx"), "{result}");
         assert!(!result.contains("movl %edx, %eax"), "{result}");
     }
@@ -10408,7 +10532,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movw $65535, 68(%esp)"), "{result}");
         assert!(result.contains("movl $7, 32(%esp)"), "{result}");
         assert!(!result.contains("%ax,"), "{result}");
@@ -10430,7 +10554,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl $5, %eax") || result.contains("movl $5, (%ecx)"),
             "value must stay in a register path, not round-trip via a fused store:\n{result}"
@@ -10459,7 +10583,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         let stores = result.matches(", 8(%esp)\n").count();
         assert_eq!(
             stores, 1,
@@ -10493,7 +10617,7 @@ mod tests {
             ".size g, .-g\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("movl %eax, 24(%esp)"),
             "f's never-read store must die despite g reading the same offset:\n{result}"
@@ -10524,7 +10648,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl %edx, 20(%esp)"),
             "high-dword store feeding fldl must survive:\n{result}"
@@ -10542,7 +10666,7 @@ mod tests {
             "    ret\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("movl %eax, %edi"));
         assert!(result.contains("addl $12, %esp"));
         assert!(result.contains("popl %edi"));
@@ -10559,7 +10683,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movl %ebx, %eax"), "{result}");
         assert!(result.contains("mull %ecx"), "{result}");
     }
@@ -10582,7 +10706,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("incl %ebx"), "{result}");
         assert!(!result.contains("movl %ebx, %eax\n    incl %eax"));
         assert!(!result.contains("movl %eax, %ebx"));
@@ -10601,7 +10725,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("addl %ebx, %ebx"), "{result}");
         assert!(!result.contains("addl %eax, %ebx"), "{result}");
     }
@@ -10612,7 +10736,7 @@ mod tests {
             let asm = format!(
                 "f:\n    movl %ebx, %eax\n    {op}\n    movl %eax, %ebx\n    xorl %eax, %eax\n    pushl %ebx\n    ret\n.cfi_endproc\n"
             );
-            let result = peephole_optimize(asm);
+            let result = peephole_optimize(asm.to_string());
             assert!(result.contains("movl %ebx, %eax"), "{op}: {result}");
             assert!(result.contains(op), "{op}: {result}");
         }
@@ -10620,10 +10744,19 @@ mod tests {
 
     #[test]
     fn sign_extending_moves_are_not_classified_as_string_ops() {
-        assert!(!is_implicit_string_op("movsbl (%ecx), %eax"));
-        assert!(!is_implicit_string_op("movswl (%ecx), %eax"));
-        assert!(is_implicit_string_op("movsl"));
-        assert!(is_implicit_string_op("rep movsl"));
+        // The central oracle must not confuse the sign-extending MOVs with
+        // the string primitives — they differ by one letter and one
+        // semantic universe.
+        assert_eq!(classify_implicit_operands("movsbl (%ecx), %eax"), (0, 0));
+        assert_eq!(classify_implicit_operands("movswl (%ecx), %eax"), (0, 0));
+        assert_eq!(
+            classify_implicit_operands("movsl"),
+            (1 << REG_ESI | 1 << REG_EDI, 1 << REG_ESI | 1 << REG_EDI)
+        );
+        assert_eq!(
+            classify_implicit_operands("rep movsl").1,
+            1 << REG_ECX | 1 << REG_ESI | 1 << REG_EDI
+        );
     }
 
     #[test]
@@ -10636,7 +10769,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("movl %eax, %ecx"));
         assert!(result.contains("movsbl (%eax), %eax"));
     }
@@ -10654,7 +10787,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movsbl (%esi), %eax"));
         assert!(!result.contains("movsbl %al"), "{result}");
     }
@@ -10675,7 +10808,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("setbe %al"));
         assert!(result.contains("movzbl %al, %eax"));
         assert!(!result.contains("movsbl %al"), "{result}");
@@ -10695,7 +10828,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movzbl (%esi), %eax"));
         assert!(result.contains("movsbl %al"), "{result}");
     }
@@ -10706,7 +10839,7 @@ mod tests {
             let asm = format!(
                 "f:\n.cfi_startproc\n    movsbl (%esi), %eax\n    movsbl %ah, {dst}\n    ret\n.cfi_endproc\n"
             );
-            let result = peephole_optimize(asm);
+            let result = peephole_optimize(asm.to_string());
             assert!(
                 result.contains(&format!("movsbl %ah, {dst}")),
                 "high-byte sign extension must remain:\n{result}"
@@ -10731,7 +10864,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movzbl %ah, %ecx"), "{result}");
         assert!(result.contains("movsbl %cl, %ecx"), "{result}");
     }
@@ -10748,7 +10881,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("movsbl %al"), "{result}");
         // REDUCED CONTRACT: with fallthrough copy propagation the whole
         // chain collapses further — the intermediate copy is propagated into
@@ -10771,7 +10904,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("movsbl %al"), "{result}");
     }
 
@@ -10789,7 +10922,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("movsbl %al"), "{result}");
     }
 
@@ -10808,7 +10941,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movsbl %al"), "{result}");
     }
 
@@ -10826,7 +10959,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movsbl %al"), "{result}");
     }
 
@@ -10847,7 +10980,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("%ecx"));
         assert!(result.contains("je .Lexit"));
         assert!(result.contains("jmp .Ldone"));
@@ -10863,7 +10996,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movl %eax, (%esp)"), "{result}");
     }
 
@@ -10879,7 +11012,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("movl %eax, 4(%esp)"));
         assert!(result.contains("movl 8(%esp), %eax"));
     }
@@ -10931,7 +11064,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl 12(%esp), %eax"),
             "reload must NOT be forwarded across the indexed aliased store:\n{result}"
@@ -10983,7 +11116,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("pushl %edi"));
         assert!(!result.contains("pushl %ebp"));
         assert!(!result.contains("popl %edi"));
@@ -10999,7 +11132,7 @@ mod tests {
         // With a frame-pointer prologue, (%ebp) slots are genuine frame
         // slots: the load is forwarded and the never-read store deleted.
         let asm = "    pushl %ebp\n    movl %esp, %ebp\n    movl %eax, -8(%ebp)\n    movl -8(%ebp), %eax\n    popl %ebp\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("-8(%ebp)"),
             "store/load pair should be fully eliminated, got:\n{}",
@@ -11011,7 +11144,7 @@ mod tests {
     fn test_redundant_zext_removed() {
         // Second movzbl of an already-byte value is a no-op.
         let asm = "f:\n    movzbl (%ecx), %eax\n    movzbl %al, %eax\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(
             result.matches("movzbl").count(),
             1,
@@ -11025,7 +11158,7 @@ mod tests {
         // Byte-ness must not survive a control-flow merge.
         let asm =
             "f:\n    movzbl (%ecx), %eax\n.LBB1:\n    movzbl %al, %eax\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(
             result.matches("movzbl").count(),
             2,
@@ -11040,7 +11173,7 @@ mod tests {
         let asm =
             "f:\n    movzbl (%ecx), %eax\n    addl $200, %eax\n    movzbl %al, %eax\n    ret\n"
                 .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(
             result.matches("movzbl").count(),
             2,
@@ -11055,7 +11188,7 @@ mod tests {
         let asm =
             "f:\n    movzbl (%ecx), %eax\n    andl $127, %eax\n    movzbl %al, %eax\n    ret\n"
                 .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(
             result.matches("movzbl").count(),
             1,
@@ -11070,7 +11203,7 @@ mod tests {
         // equivalent to copying the full EAX value.
         for (src, dst) in [("%ah", "%eax"), ("%ah", "%edx")] {
             let asm = format!("f:\n    movzbl (%ecx), %eax\n    movzbl {src}, {dst}\n    ret\n");
-            let result = peephole_optimize(asm);
+            let result = peephole_optimize(asm.to_string());
             assert!(
                 result.contains(&format!("movzbl {src}, {dst}")),
                 "high-byte extension must remain:\n{result}"
@@ -11088,7 +11221,7 @@ mod tests {
             let asm = format!(
                 "f:\n    movzbl (%ecx), %eax\n    {writer}\n    movzbl %al, %eax\n    ret\n"
             );
-            let result = peephole_optimize(asm);
+            let result = peephole_optimize(asm.to_string());
             assert_eq!(
                 result.matches("movzbl").count(),
                 2,
@@ -11106,7 +11239,7 @@ mod tests {
         let asm =
             "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call target\n    popl %ebx\n    ret\n"
                 .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("jmp target"),
             "expected tail call, got:\n{}",
@@ -11149,7 +11282,7 @@ mod tests {
             "    ret\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("jmp target"),
             "conversion must be suppressed at nonzero depth:\n{}",
@@ -11192,7 +11325,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("jmp inc@PLT"),
             "stack-arg forwarding must not convert:\n{result}"
@@ -11219,7 +11352,7 @@ mod tests {
             ".cfi_endproc\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("jmp target"),
             "post-join calls have unknown depth; must not convert:\n{result}"
@@ -11246,7 +11379,7 @@ mod tests {
             ".size bcmp, .-bcmp\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(!result.contains("pushl"), "{result}");
         assert!(!result.contains("popl"), "{result}");
         assert!(result.contains("jmp memcmp"), "{result}");
@@ -11267,7 +11400,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("pushl %ebx"), "{result}");
         assert!(result.contains("popl %ebx"), "{result}");
     }
@@ -11319,7 +11452,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // EVOLVED CONTRACT: fallthrough copy propagation rewrites the sole
         // `movl %ebx,%eax` reader to %eax (a self-move, nopped), which makes
         // %ebx provably dead — so the callee-save pass now removes BOTH
@@ -11368,7 +11501,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("pushl %ebp") && result.contains("popl %ebp"),
             "pair must survive: interior edge targets pre-alloc label:\n{result}"
@@ -11418,7 +11551,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // EVOLVED CONTRACT: with fallthrough copy propagation the staging
         // pair `movl %eax,%ebx` / `movl %ebx,%eax` collapses (the reader
         // becomes a self-move and both moves die), so %ebx is provably dead
@@ -11468,7 +11601,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // Observed contract on current main: with no internal control flow
         // the envelope gate admits the transform; additionally the synthetic
         // body's dataflow is fully dead (nothing ever consumes %eax), so the
@@ -11525,7 +11658,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // NOTE: the frame is otherwise well-formed (both epilogues restore
         // both pairs), so the ONLY refusal reason is the pre-alloc edge into
         // the interleaved-zone label -- exactly what this pin guards.
@@ -11580,7 +11713,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // The frame is otherwise well-formed (both epilogues restore both
         // pairs), so the only refusal reason is the unresolvable `jmp *`.
         assert!(
@@ -11632,7 +11765,7 @@ mod tests {
             ".size f, .-f\n",
         )
         .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // EVOLVED CONTRACT: propagation proves %ebx dead (its only reader
         // was rewritten to a self-move), so BOTH unused pairs go; the frame
         // grows by 8 and the tail-edge shape is preserved.
@@ -11657,7 +11790,7 @@ mod tests {
         // Address of a frame slot escapes to the callee: converting would
         // hand the callee a dangling pointer after frame release.
         let asm = "f:\n    subl $12, %esp\n    leal 4(%esp), %eax\n    call target\n    addl $12, %esp\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("call target"),
             "must stay a call:\n{}",
@@ -11672,7 +11805,7 @@ mod tests {
         let asm =
             "f:\n    pushl %ebx\n    movl %eax, %ebx\n    call *%ebx\n    popl %ebx\n    ret\n"
                 .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("call *%ebx"),
             "must stay a call:\n{}",
@@ -11686,7 +11819,7 @@ mod tests {
         // data register: `movl %eax, -8(%ebp)` writes through a pointer and
         // must survive even though nothing in this function reads it back.
         let asm = "    movl %eax, -8(%ebp)\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl %eax, -8(%ebp)"),
             "pointer-write through data %ebp must not be deleted, got:\n{}",
@@ -11701,7 +11834,7 @@ mod tests {
         // load before forwarding can see it (nothing in a ret-free
         // snippet observes %ecx).
         let asm = "    movl %eax, -8(%ebp)\n    movl -8(%ebp), %ecx\n    pushl %ecx\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl %eax, %ecx"),
             "should forward: {}",
@@ -11717,7 +11850,7 @@ mod tests {
     #[test]
     fn test_self_move() {
         let asm = "    movl %eax, %eax\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(result.trim(), "");
     }
 
@@ -11730,7 +11863,7 @@ mod tests {
         let asm =
             "    movl %ebx, %eax\n    cltd\n    idivl %ecx\n    movl %eax, %edi\n    pushl %edi\n"
                 .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("movl %ebx, %edi"),
             "quotient consumer must keep reading %eax: {}",
@@ -11744,7 +11877,7 @@ mod tests {
     fn test_copy_prop_stops_at_mull() {
         let asm =
             "    movl %esi, %eax\n    mull %ecx\n    movl %eax, %edi\n    pushl %edi\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("movl %esi, %edi"),
             "product consumer must keep reading %eax: {}",
@@ -11755,7 +11888,7 @@ mod tests {
     #[test]
     fn test_redundant_jump() {
         let asm = "    jmp .Lfoo\n.Lfoo:\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("jmp"),
             "should eliminate redundant jmp: {}",
@@ -11774,7 +11907,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("jge .LBB4"),
             "should invert to jge: {}",
@@ -11798,7 +11931,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
         assert!(
             !result.contains("setl"),
@@ -11822,7 +11955,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("jge .LBB5"),
             "should fuse to jge: {}",
@@ -11859,7 +11992,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // Should NOT fuse because the store has no matching load
         assert!(
             result.contains("setge"),
@@ -11880,7 +12013,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("jge .LBB3"),
             "should fuse to jge (inverted): {}",
@@ -11905,7 +12038,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("%eax, -8(%ebp)"),
             "first store dead: {}",
@@ -11917,7 +12050,7 @@ mod tests {
     #[test]
     fn test_memory_fold() {
         let asm = ["    movl -48(%ebp), %ecx", "    addl %ecx, %eax"].join("\n") + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("addl -48(%ebp), %eax"),
             "should fold: {}",
@@ -12177,7 +12310,7 @@ mod tests {
     #[test]
     fn test_reverse_move_elimination() {
         let asm = ["    movl %eax, %ecx", "    movl %ecx, %eax"].join("\n") + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // The reverse move must be gone: %eax already holds the value the
         // first move staged into %ecx.  In this ret-free fixture the
         // census fallback may additionally delete the now-unread staging
@@ -12196,7 +12329,7 @@ mod tests {
     #[test]
     fn test_addl_1_to_incl() {
         let asm = "    addl $1, %eax\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("incl %eax"),
             "should convert to incl: {}",
@@ -12212,7 +12345,7 @@ mod tests {
     #[test]
     fn test_subl_1_to_decl() {
         let asm = "    subl $1, %ecx\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("decl %ecx"),
             "should convert to decl: {}",
@@ -12228,7 +12361,7 @@ mod tests {
     #[test]
     fn test_movl_0_to_xorl() {
         let asm = "    movl $0, %ebx\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("xorl %ebx, %ebx"),
             "should convert to xorl: {}",
@@ -12244,7 +12377,7 @@ mod tests {
     #[test]
     fn test_redundant_movsbl() {
         let asm = ["    movsbl (%ecx), %eax", "    movsbl %al, %eax"].join("\n") + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert_eq!(
             result.matches("movsbl").count(),
             1,
@@ -12256,7 +12389,7 @@ mod tests {
     #[test]
     fn test_addl_neg1_to_decl() {
         let asm = "    addl $-1, %edx\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("decl %edx"),
             "should convert to decl: {}",
@@ -12267,7 +12400,7 @@ mod tests {
     #[test]
     fn test_subl_neg1_to_incl() {
         let asm = "    subl $-1, %esi\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("incl %esi"),
             "should convert to incl: {}",
@@ -12288,7 +12421,7 @@ mod tests {
         ]
         .join("\n")
             + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("addl $1, %eax"),
             "must keep addl before adcl: {}",
@@ -12306,7 +12439,7 @@ mod tests {
         // subl $1 followed by sbbl must NOT be converted to decl,
         // because decl does not set the carry flag.
         let asm = ["    subl $1, %eax", "    sbbl $0, %edx"].join("\n") + "\n";
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("subl $1, %eax"),
             "must keep subl before sbbl: {}",
@@ -12328,7 +12461,7 @@ mod tests {
         // touched, so both frame adjusts vanish and the body survives.
         let asm = "plain:\n    subl $12, %esp\n    movzwl %ax, %eax\n    incl %eax\n    movzbl %al, %eax\n    addl $12, %esp\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("subl $12, %esp") && !result.contains("addl $12, %esp"),
             "dead frame adjusts must be elided:\n{result}"
@@ -12342,7 +12475,7 @@ mod tests {
         // Two equal deallocs on two return paths are both dropped.
         let asm = "f:\n    subl $8, %esp\n    testl %eax, %eax\n    je .Lbb1\n    movl $1, %eax\n    addl $8, %esp\n    ret\n.Lbb1:\n    xorl %eax, %eax\n    addl $8, %esp\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             !result.contains("subl $8, %esp") && result.matches("addl $8, %esp").count() == 0,
             "alloc and both deallocs must be elided:\n{result}"
@@ -12361,7 +12494,7 @@ mod tests {
         // the frame must be kept.
         let asm = "f:\n    subl $12, %esp\n    testl %edx, %edx\n    je .L1\n    movl %ecx, -4(%esp)\n    jmp .L2\n.L1:\n    movl %ebx, -4(%esp)\n.L2:\n    movl -4(%esp), %eax\n    addl $12, %esp\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("-4(%esp)"),
             "diamond slot access must not be forwarded:\n{result}"
@@ -12377,7 +12510,7 @@ mod tests {
         // A call requires the stack alignment/argument space the frame
         // provides; never elide without proving the ABI unaffected.
         let asm = "f:\n    subl $12, %esp\n    call g\n    addl $12, %esp\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
             "frame across a call must be kept:\n{result}"
@@ -12390,7 +12523,7 @@ mod tests {
         // eliminate_unused_callee_saves; this pass must not renumber them.
         let asm = "f:\n    pushl %ebx\n    subl $16, %esp\n    addl %ebx, %eax\n    addl $16, %esp\n    popl %ebx\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("pushl %ebx") && result.contains("popl %ebx"),
             "callee-save pair must be left intact by this pass:\n{result}"
@@ -12404,7 +12537,7 @@ mod tests {
         // register.
         let asm = "f:\n    pushl %ebp\n    movl %esp, %ebp\n    subl $8, %esp\n    movl %ecx, -4(%ebp)\n    movl -4(%ebp), %eax\n    leave\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         // The guarantee from THIS pass: a frame-pointer function's alloc is
         // never elided (the (%ebp)/push disqualify it). Other passes may
         // forward the slot traffic, so assert only the frame machinery.
@@ -12420,7 +12553,7 @@ mod tests {
         // would re-enter the body without reopening the frame; conservatively
         // keep the frame.
         let asm = "f:\n.Ltop:\n    subl $12, %esp\n    decl %ecx\n    jnz .Ltop\n    addl $12, %esp\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("subl $12, %esp") && result.contains("addl $12, %esp"),
             "backward edge across alloc must keep the frame:\n{result}"
@@ -12441,7 +12574,7 @@ mod tests {
         // bits the original program never had.
         let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl 0(%esp), %eax"),
             "wider reload must keep reading the slot:\n{result}"
@@ -12456,7 +12589,7 @@ mod tests {
     fn test_widen_forward_word_store_to_l_reload_refused() {
         let asm = "f:\n    movw %cx, %ax\n    movw %ax, 0(%esp)\n    movl 0(%esp), %edx\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl 0(%esp), %edx"),
             "wider reload must keep reading the slot:\n{result}"
@@ -12501,7 +12634,7 @@ mod tests {
         //   movb %al,S; movl S,%eax; movzbl %al,%eax  ->  movzbl %al,%eax
         let asm = "f:\n    inb %dx, %al\n    movb %al, 0(%esp)\n    movl 0(%esp), %eax\n    movzbl %al, %eax\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movzbl %al, %eax"),
             "zext-terminated widening must fuse:\n{result}"
@@ -12516,7 +12649,7 @@ mod tests {
     fn test_immediate_forward_same_width_only() {
         // Same-width immediate forward materializes the constant directly.
         let asm = "f:\n    movl $3, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl $3, %eax"),
             "same-width immediate must forward:\n{result}"
@@ -12529,7 +12662,7 @@ mod tests {
         // slot read: the upper three bytes are unwritten stack garbage, not
         // zeros.
         let asm = "f:\n    movb $3, 0(%esp)\n    movl 0(%esp), %eax\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("movl 0(%esp), %eax"),
             "wider reload of a byte store must not materialize:\n{result}"
@@ -12543,7 +12676,7 @@ mod tests {
         // must barrier forwarding windows around it.
         let asm = "f:\n    movl %eax, 0(%esp)\n#APP\n    movl 0(%esp), %ecx\n#NO_APP\n    movl 0(%esp), %edx\n    ret\n"
             .to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("#APP") && result.contains("#NO_APP"),
             "markers must survive:\n{result}"
@@ -12567,10 +12700,336 @@ mod tests {
         // stored byte is not provably still in %al: the slot stays.
         let asm =
             "f:\n    movb %al, 0(%esp)\n    call g\n    movl 0(%esp), %eax\n    ret\n".to_string();
-        let result = peephole_optimize(asm);
+        let result = peephole_optimize(asm.to_string());
         assert!(
             result.contains("0(%esp)"),
             "clobbered source must keep the slot reload:\n{result}"
         );
     }
+    // ── Tests: the central implicit-operand oracle ───────────────────────
+
+    #[test]
+    fn the_widening_branch_writes_edx_and_only_reads_eax() {
+        // The heart of the i686 div/rem lowering: `cltd` rewrote %edx
+        // while being invisible to any textual scan.
+        for m in ["cwd", "cwtd", "cltd", "cdq", "cqo"] {
+            assert_eq!(classify_implicit_operands(m), (1 << REG_EAX, 1 << REG_EDX), "{m}");
+        }
+    }
+
+    #[test]
+    fn in_place_extensions_read_and_write_the_accumulator() {
+        for m in ["cbw", "cbtw", "cwde", "cwtl"] {
+            assert_eq!(classify_implicit_operands(m), (1 << REG_EAX, 1 << REG_EAX), "{m}");
+        }
+    }
+
+    #[test]
+    fn integer_division_names_its_implicit_pair_exactly() {
+        let ax_dx = 1 << REG_EAX | 1 << REG_EDX;
+        assert_eq!(classify_implicit_operands("idivl %ecx"), (ax_dx, ax_dx));
+        assert_eq!(classify_implicit_operands("divl %ecx"), (ax_dx, ax_dx));
+        assert_eq!(classify_implicit_operands("divw %cx"), (ax_dx, ax_dx));
+        // Byte forms divide/multiply AX: quotient AL, remainder AH,
+        // product AX — the %edx family is never touched.
+        assert_eq!(classify_implicit_operands("idivb %cl"), (1 << REG_EAX, 1 << REG_EAX));
+        assert_eq!(classify_implicit_operands("mulb %cl"), (1 << REG_EAX, 1 << REG_EAX));
+        // SSE divides/multiplies have fully explicit operands: a prefix
+        // match against "div"/"mul" would tax every FP loop with a
+        // phantom accumulator pair.
+        assert_eq!(classify_implicit_operands("divsd %xmm0, %xmm1"), (0, 0));
+        assert_eq!(classify_implicit_operands("mulsd %xmm0, %xmm1"), (0, 0));
+        assert_eq!(classify_implicit_operands("mull %ecx"), (ax_dx, ax_dx));
+    }
+
+    #[test]
+    fn single_operand_imul_is_the_widening_form() {
+        let eax = 1 << REG_EAX;
+        let ax_dx = 1 << REG_EAX | 1 << REG_EDX;
+        assert_eq!(classify_implicit_operands("imull %ecx"), (eax, ax_dx));
+        assert_eq!(classify_implicit_operands("imulw %cx"), (eax, ax_dx));
+        // The two/three-operand forms name every register they touch.
+        assert_eq!(classify_implicit_operands("imull %ecx, %eax"), (0, 0));
+        assert_eq!(classify_implicit_operands("imull $5, %ecx, %eax"), (0, 0));
+    }
+
+    #[test]
+    fn system_instructions_have_their_contract() {
+        let eax = 1 << REG_EAX;
+        assert_eq!(classify_implicit_operands("rdtsc").1, eax | 1 << REG_EDX);
+        // rdtscp additionally returns the TSC_AUX in %ecx; rdtsc does not.
+        assert_eq!(classify_implicit_operands("rdtscp").1, eax | 1 << REG_ECX | 1 << REG_EDX);
+        assert_eq!(
+            classify_implicit_operands("cpuid").1,
+            eax | 1 << REG_EBX | 1 << REG_ECX | 1 << REG_EDX
+        );
+        assert_eq!(classify_implicit_operands("cpuid").0, eax);
+        // ia32 int $0x80: the handler's contract is unknown — fail closed.
+        let all_args = 1 << REG_EAX
+            | 1 << REG_EBX
+            | 1 << REG_ECX
+            | 1 << REG_EDX
+            | 1 << REG_ESI
+            | 1 << REG_EDI
+            | 1 << REG_EBP;
+        assert_eq!(classify_implicit_operands("int $0x80"), (all_args, all_args));
+    }
+
+    #[test]
+    fn rep_prefixes_contribute_the_count_register() {
+        let ecx_edi = 1 << REG_ECX | 1 << REG_EDI;
+        let ecx = 1 << REG_ECX;
+        assert_eq!(classify_implicit_operands("rep stosb").0, ecx | 1 << REG_EAX | 1 << REG_EDI);
+        assert_eq!(classify_implicit_operands("rep stosb").1, ecx_edi);
+        assert_eq!(classify_implicit_operands("repne scasl").1, ecx_edi);
+        // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
+        // counted loops: they touch no register at all.
+        assert_eq!(classify_implicit_operands("rep ret"), (0, 0));
+        assert_eq!(classify_implicit_operands("rep nop"), (0, 0));
+        // An unrecognized counted form fails closed on every family.
+        assert_eq!(classify_implicit_operands("rep frobnicate"), (0xFF, 0xFF));
+    }
+
+    #[test]
+    fn string_primitives_post_increment_their_pointers() {
+        let si_di = 1 << REG_ESI | 1 << REG_EDI;
+        // Bare (unrep'd) forms are invisible to a textual scan and were
+        // missing from the legacy mentions table entirely.
+        assert_eq!(classify_implicit_operands("movsl"), (si_di, si_di));
+        assert_eq!(classify_implicit_operands("movsb"), (si_di, si_di));
+        assert_eq!(classify_implicit_operands("lodsl").0, 1 << REG_ESI);
+        assert_eq!(classify_implicit_operands("lodsl").1, 1 << REG_EAX | 1 << REG_ESI);
+        // stos consumes %eax (the stored data) and post-increments %edi;
+        // %esi must NOT be blamed for it.
+        assert_eq!(classify_implicit_operands("stosl").0, 1 << REG_EAX | 1 << REG_EDI);
+        assert_eq!(classify_implicit_operands("stosl").1, 1 << REG_EDI);
+    }
+
+    #[test]
+    fn cmpxchg_reloads_the_accumulator_on_failure() {
+        let eax = 1 << REG_EAX;
+        assert_eq!(classify_implicit_operands("cmpxchgl %ebx, (%edi)"), (eax, eax));
+        assert_eq!(classify_implicit_operands("lock cmpxchgl %ebx, (%edi)"), (eax, eax));
+        // CMPXCHG8B compares edx:eax (reloaded on failure); ecx:ebx are
+        // the read-only payload.
+        let quad = eax | 1 << REG_EBX | 1 << REG_ECX | 1 << REG_EDX;
+        assert_eq!(classify_implicit_operands("lock cmpxchg8b (%edi)").0, quad);
+        assert_eq!(
+            classify_implicit_operands("lock cmpxchg8b (%edi)").1,
+            eax | 1 << REG_EDX
+        );
+    }
+
+    #[test]
+    fn frame_and_stack_instructions_have_their_contract() {
+        let esp = 1 << REG_ESP;
+        let ebp = 1 << REG_EBP;
+        // `leave` copies %ebp into %esp (pure write of %esp — a dead-move
+        // proof may rely on it) and pops %ebp (read-modify-write).
+        assert_eq!(classify_implicit_operands("leave").0, ebp);
+        assert_eq!(classify_implicit_operands("leave").1, esp | ebp);
+        assert_eq!(classify_implicit_operands("enter").1, esp | ebp);
+        // pusha reads all eight (including %esp) and writes %esp only.
+        assert_eq!(classify_implicit_operands("pushad").0, 0xFF);
+        assert_eq!(classify_implicit_operands("pushad").1, esp);
+        assert_eq!(classify_implicit_operands("popad").1, 0xFF & !esp);
+    }
+
+    #[test]
+    fn non_instructions_name_nothing() {
+        assert_eq!(classify_implicit_operands(".LBB1:"), (0, 0));
+        assert_eq!(classify_implicit_operands(".cfi_startproc"), (0, 0));
+        assert_eq!(classify_implicit_operands("#APP"), (0, 0));
+        assert_eq!(classify_implicit_operands(""), (0, 0));
+        assert_eq!(classify_implicit_operands("frobnicate"), (0, 0));
+        // lock alone contributes nothing; the prefixed mnemonic decides.
+        assert_eq!(classify_implicit_operands("lock"), (0, 0));
+    }
+
+    #[test]
+    fn the_union_reaches_line_references_reg() {
+        // The classified mention set of a bare `cltd` used to be empty —
+        // the exact hole behind the div-remainder miscompile class.
+        assert!(line_references_reg("    cltd", REG_EDX));
+        assert!(line_references_reg("    cltd", REG_EAX));
+        assert!(line_references_reg("    idivl %ecx", REG_EDX));
+        assert!(line_references_reg("    syscall", REG_ECX));
+        assert!(line_references_reg("    rep movsb", REG_ECX));
+        assert!(line_references_reg("    movsl", REG_ESI));
+        // The Cmp kind funnels through the same scan (cmpxchg lives there).
+        assert!(line_references_reg("    cmpxchgl %ebx, (%edi)", REG_EAX));
+        // SSE div/mul name their operands and nothing else.
+        assert!(!line_references_reg("    divsd %xmm0, %xmm1", REG_EDX));
+    }
+
+    #[test]
+    fn the_write_half_reaches_line_writes_reg_implicitly() {
+        assert!(line_writes_reg_implicitly("cltd", REG_EDX));
+        assert!(!line_writes_reg_implicitly("cltd", REG_EAX));
+        assert!(line_writes_reg_implicitly("idivl %ecx", REG_EDX));
+        // cmpxchg's implicit %eax reload — the write that copy
+        // propagation must not rename across.
+        assert!(line_writes_reg_implicitly("cmpxchgl %ebx, (%edi)", REG_EAX));
+        // XADD's register operand receives the old value — even under lock.
+        assert!(line_writes_reg_implicitly("lock xaddl %ebx, (%eax)", REG_EBX));
+        assert!(line_writes_reg_implicitly("xaddl %ebx, %eax", REG_EBX));
+        // The explicit RMW single-operand forms still count.
+        assert!(line_writes_reg_implicitly("negl %eax", REG_EAX));
+        assert!(line_writes_reg_implicitly("incl %ecx", REG_ECX));
+        // A pure write of another family stays clean.
+        assert!(!line_writes_reg_implicitly("stosl", REG_EAX));
+        assert!(line_writes_reg_implicitly("stosl", REG_EDI));
+    }
+
+    #[test]
+    fn the_read_half_reaches_line_implicitly_reads() {
+        assert!(line_implicitly_reads("cltd", REG_EAX));
+        assert!(!line_implicitly_reads("cltd", REG_EDX));
+        assert!(line_implicitly_reads("idivl %ecx", REG_EDX));
+        assert!(line_implicitly_reads("rep stosb", REG_EAX));
+        assert!(!line_implicitly_reads("stosl", REG_ECX));
+        assert!(line_implicitly_reads("loop", REG_ECX));
+        assert!(line_implicitly_reads("sahf", REG_EAX));
+    }
+
+    #[test]
+    fn copy_propagation_does_not_rename_across_cmpxchg_eax_reload() {
+        // `cmpxchg` rewrites %eax when the exchange FAILS.  The alias
+        // `esi := eax` must not survive it: renaming the %esi reader onto
+        // %eax would feed it the pre-exchange accumulator.  (The old
+        // write table had no cmpxchg arm — the rename went through.)
+        let asm = concat!(
+            "f:\n",
+            "    movl %eax, %esi\n",
+            "    lock cmpxchgl %ebx, (%edi)\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %esi, %eax"),
+            "cmpxchg's implicit %eax write must break the alias:\n{result}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_does_not_rename_across_xadd_register_result() {
+        // `lock xaddl %ebx, (%eax)` returns the OLD value in %ebx — a
+        // register write invisible to the AT&T destination parse.  The
+        // %esi reader must keep reading %esi, not the post-add %ebx.
+        let asm = concat!(
+            "f:\n",
+            "    movl %ebx, %esi\n",
+            "    lock xaddl %ebx, (%eax)\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %esi, %eax"),
+            "xadd's implicit register write must break the alias:\n{result}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_does_not_rename_dividend_across_cltd() {
+        // The i686 twin of the x86-64 stress-lab intexpr repro: the alias
+        // of the dividend must not survive the sign-extension that
+        // overwrites %edx, or the quotient consumer reads the divisor.
+        let asm = concat!(
+            "f:\n",
+            "    movl %edx, %esi\n",
+            "    cltd\n",
+            "    idivl %ecx\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %esi, %eax"),
+            "cltd's implicit %edx write must break the %edx alias:\n{result}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_still_renames_across_byte_division() {
+        // POSITIVE precision test: the byte forms divide/multiply AX and
+        // never touch %edx — an alias of %edx must survive `divb`.
+        let asm = concat!(
+            "f:\n",
+            "    movl %edx, %esi\n",
+            "    divb %cl\n",
+            "    movl %esi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %edx, %eax"),
+            "%edx alias must survive the byte divide:\n{result}"
+        );
+    }
+
+    #[test]
+    fn dead_move_into_edx_is_deleted_before_cltd() {
+        // `cltd` is a purely-architectural write of %edx: a move into
+        // %edx that it fully shadows is dead.
+        let asm = concat!(
+            "f:\n",
+            "    movl $7, %eax\n",
+            "    movl %ebx, %edx\n",
+            "    cltd\n",
+            "    idivl %ecx\n",
+            "    movl %eax, %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            !result.contains("movl %ebx, %edx"),
+            "cltd redefines %edx without reading it; the move is dead:\n{result}"
+        );
+    }
+
+    #[test]
+    fn dead_move_into_eax_survives_idivl() {
+        // `idivl` READS %eax (the dividend): a move into %eax before it
+        // is alive no matter what follows.
+        let asm = concat!(
+            "f:\n",
+            "    movl %ebx, %eax\n",
+            "    cltd\n",
+            "    idivl %ecx\n",
+            "    movl %eax, %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %ebx, %eax"),
+            "the dividend is consumed by idivl; the move must stay:\n{result}"
+        );
+    }
+
+    #[test]
+    fn dead_move_into_edi_survives_stosl() {
+        // `stosl` post-increments %edi — a read-modify-write of the
+        // pointer, not a redefinition.
+        let asm = concat!(
+            "f:\n",
+            "    movl %ebx, %edi\n",
+            "    stosl\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("movl %ebx, %edi"),
+            "the string pointer is read-modify-write; the move must stay:\n{result}"
+        );
+    }
+
 }

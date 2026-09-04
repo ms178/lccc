@@ -1256,7 +1256,7 @@ impl Driver {
         if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
             if v == "all" {
                 for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
-                    eprint!("{}\n", cpu.tune().dump());
+                    eprintln!("{}", cpu.tune().dump());
                 }
             } else if !v.is_empty() && v != "0" {
                 eprint!("{}", tune.dump());
