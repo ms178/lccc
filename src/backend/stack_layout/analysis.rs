@@ -192,7 +192,22 @@ pub(super) fn find_dead_param_allocas(
                     // `int cmp(const void*a, const void*b){return *(int*)a -
                     // *(int*)b;}` went from 11 instructions with a 24-byte
                     // frame to GCC's 3.
-                    let leaf = !function_makes_calls(func);
+                    // An x86-64 body whose only "calls" are inline-expanded
+                    // fixed-size memcpy/memset is a leaf for this purpose:
+                    // the expansion touches %rdi/%rsi/%rcx/%rax/%xmm0/%xmm1
+                    // only and `x86_param_caller_homes_safe` proves no
+                    // parameter is read after it, so a caller-saved home is
+                    // as stable as in a true leaf.  Without this, the
+                    // parameter kept its (dead) alloca slot and the body
+                    // round-tripped it through memory: `memset(p, c, 40)`
+                    // was `subq $24,%rsp; movq %rsi,8(%rsp); movslq
+                    // 8(%rsp),%rax; …` (FOLLOWUP_CPU_MODEL #1).  The same
+                    // predicate gates the allocator's ordered parameter
+                    // copies, so the two decisions cannot disagree.
+                    let leaf = !function_makes_calls(func)
+                        || (crate::common::types::target_elf_machine()
+                            == 62 // EM_X86_64 (elf::constants is private)
+                            && crate::backend::regalloc::x86_param_caller_homes_safe(func));
                     let has_stable_home = reg_assigned
                         .get(&dest_id)
                         .map(|phys| {

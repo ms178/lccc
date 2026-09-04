@@ -2918,7 +2918,7 @@ impl X86Codegen {
     /// Materialise the fill pattern in %xmm0 (and %ymm0 when `use_ymm`).
     /// Zero and all-ones use the dependency-breaking idioms; other constant
     /// bytes broadcast a 32-bit immediate; a runtime byte broadcasts the
-    /// 64-bit pattern already in %rax.
+    /// byte staged in %ecx (raw under AVX2, 32-bit pattern under SSE2).
     fn emit_memset_vec_pattern(&mut self, const_byte: Option<u8>, use_ymm: bool, vex: bool) {
         match const_byte {
             Some(0) => {
@@ -2955,15 +2955,19 @@ impl X86Codegen {
                 }
             }
             None => {
+                // Runtime byte.  AVX2: %ecx holds the raw value; broadcast
+                // its low byte lane directly (GCC/Clang/ICX shape, 2
+                // instructions).  SSE2: %ecx holds the 32-bit pattern
+                // (imull $0x01010101 in the caller); `pshufd $0` replicates it.
                 if use_ymm {
-                    self.state.emit("    vmovq %rax, %xmm0");
-                    self.state.emit("    vpbroadcastq %xmm0, %ymm0");
+                    self.state.emit("    vmovd %ecx, %xmm0");
+                    self.state.emit("    vpbroadcastb %xmm0, %ymm0");
                 } else if vex {
-                    self.state.emit("    vmovq %rax, %xmm0");
-                    self.state.emit("    vpbroadcastq %xmm0, %xmm0");
+                    self.state.emit("    vmovd %ecx, %xmm0");
+                    self.state.emit("    vpbroadcastb %xmm0, %xmm0");
                 } else {
-                    self.state.emit("    movq %rax, %xmm0");
-                    self.state.emit("    punpcklqdq %xmm0, %xmm0");
+                    self.state.emit("    movd %ecx, %xmm0");
+                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
                 }
             }
         }
@@ -3008,8 +3012,25 @@ impl X86Codegen {
         // in %rdi must be read before %rdi is overwritten, and no allocation
         // is ever homed in %rax, so the destination load cannot disturb it.
         let mut rax_pat = false;
+        let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
+        let strategy = self.tune.memset_strategy(size, vb);
+        // Which expansion consumes a runtime fill byte, decided up front so
+        // the byte is staged where that expansion reads it (see below).
+        let rep = size > 0
+            && (self.no_sse && size > 64
+                || !self.no_sse
+                    && size >= 16
+                    && strategy == CopyStrategy::RepMovsb
+                    && std::env::var_os("CCC_NO_REP_MOVSB").is_none());
+        let vector = !self.no_sse && size >= 16 && !rep;
+        // Vector expansions broadcast from a GPR that is dead afterwards;
+        // %rcx is used (not %rax) so the staging copy is never kept alive by
+        // the peephole's conservative "return value live at ret" rule in a
+        // void function, and the loop counter re-uses it only after the
+        // broadcast.  Scalar tails and `rep stosb` read %rax/%al.
+        let fill_gpr = if vector { "rcx" } else { "rax" };
         if const_byte.is_none() {
-            self.operand_to_reg(value, "rax");
+            self.operand_to_reg(value, fill_gpr);
         }
         self.operand_to_reg(dest, "rdi");
         if result.is_some() {
@@ -3017,20 +3038,45 @@ impl X86Codegen {
         }
         if size == 0 {
             self.store_inline_libc_result(result);
-            self.store_inline_libc_result(result);
             self.state.reg_cache.invalidate_all();
             return;
         }
-        if const_byte.is_none() {
-            // Broadcast the low byte: (uint8)c * 0x0101010101010101.
-            self.state.emit("    movzbl %al, %eax");
-            self.state.emit("    movabsq $0x101010101010101, %rcx");
-            self.state.emit("    imulq %rcx, %rax");
-            rax_pat = true;
-        }
 
-        let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
-        let strategy = self.tune.memset_strategy(size, vb);
+        // Runtime fill byte: broadcast only as wide as the chosen expansion
+        // actually consumes (FOLLOWUP_CPU_MODEL #2).
+        //   * `rep stosb` reads %al only — no broadcast at all.
+        //   * Vector paths under AVX2 broadcast the byte lane directly
+        //     (`vmovd` + `vpbroadcastb`, 2 µops, p5-free on GLC/RPC); the
+        //     GPR multiply chain (movzbl + movabs + 3-cycle imul) is gone.
+        //   * Scalar tails and the SSE2 baseline widen through the integer
+        //     multiplier: a 32-bit `imull $0x01010101` (imm32, one
+        //     instruction) is enough for a `movl` tail or a `pshufd`
+        //     broadcast; only an 8-byte `movq %rax` store needs the 64-bit
+        //     `movabsq` + `imulq` form.
+        // `rax_pat` records that %rax holds the *64-bit* pattern; the
+        // scalar-store helper relies on it only for 8-byte stores.
+        if const_byte.is_none() {
+            let vex = vb == 32;
+            if rep {
+                // %al already is the fill byte.
+            } else if vector && vex {
+                // Consumed by emit_memset_vec_pattern (vpbroadcastb from %ecx).
+            } else if vector {
+                // 32-bit pattern in %ecx for the SSE2 pshufd broadcast.
+                self.state.emit("    movzbl %cl, %ecx");
+                self.state.emit("    imull $0x1010101, %ecx, %ecx");
+            } else if size < 8 {
+                // 32-bit pattern: movl/movw/movb tails.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    imull $0x1010101, %eax, %eax");
+            } else {
+                // 64-bit pattern: (uint8)c * 0x0101010101010101.
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    movabsq $0x101010101010101, %rcx");
+                self.state.emit("    imulq %rcx, %rax");
+                rax_pat = true;
+            }
+        }
 
         if self.no_sse {
             // No vector instruction may be emitted (CR4.OSFXSR may be 0).
