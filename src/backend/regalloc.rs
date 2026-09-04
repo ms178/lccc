@@ -2616,8 +2616,31 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // one taken costs a push/pop pair. Let the hot loop values compete for
     // the volatile pool in Phase 2 first; Phase 2c still hands the overflow
     // a callee-saved home (see `RegAllocConfig::leaf_caller_saved_homes`).
+    //
+    // RA-23 (loop-leaf extension): the same argument holds for a function
+    // whose call points all sit OUTSIDE every loop — `memset` at entry
+    // before the sieve, a `printf` after the loop nest, an `abort` in a
+    // cold depth-0 tail. No hot loop value spans such a call (a spanning
+    // value is `call_spanning` and stays in Phase 1 regardless), so the
+    // Phase-1 promotion again only converts a free volatile home into a
+    // push/pop pair. Measured on the benchmark corpus at -O2: sieve
+    // `count_primes` 5 -> 0 pushes, matmul 6 -> 0, glibc memcmp 6 -> 2,
+    // with the loop bodies unchanged. Calls INSIDE a loop keep the boot-
+    // corpus behaviour (cmdline_find_option: the state machine wants a
+    // dedicated home because the in-loop call fragments the volatile pool).
+    // A/B: `CCC_LEAF_STRICT_CALL_FREE=1` restores the call-free-only rule.
+    let calls_only_outside_loops = !call_points.is_empty()
+        && !env_on("CCC_LEAF_STRICT_CALL_FREE")
+        && call_points.iter().all(|&p| {
+            liveness
+                .block_starts
+                .iter()
+                .zip(liveness.block_ends.iter())
+                .position(|(&s, &e)| s <= p && p <= e)
+                .is_some_and(|b| liveness.block_loop_depth.get(b).copied().unwrap_or(1) == 0)
+        });
     let leaf_prefers_caller_saved = config.leaf_caller_saved_homes
-        && call_points.is_empty()
+        && (call_points.is_empty() || calls_only_outside_loops)
         && !env_on("CCC_NO_LEAF_CALLER_HOME");
     let hot_loop_home = |iv: &LiveInterval| -> bool {
         if env_on("CCC_NO_HOT_LOOP") || leaf_prefers_caller_saved {
