@@ -2332,7 +2332,10 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
 
 /// Defer a vector home-slot store when every def is consumed once from the
 /// last-store peephole by a cache-aware intrinsic in the same block.
-pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
+pub(super) fn compute_vector_defer_values(
+    func: &IrFunction,
+    memfold_values: &FxHashSet<u32>,
+) -> FxHashSet<u32> {
     let mut result = FxHashSet::default();
 
     let mut allocas: FxHashSet<u32> = FxHashSet::default();
@@ -2498,6 +2501,25 @@ pub(super) fn compute_vector_defer_values(func: &IrFunction) -> FxHashSet<u32> {
 
             let mut ok = true;
             for ik in &insts[(i + 1)..u] {
+                // A VLFOLD-elided 256-bit load never materialises: it is
+                // consumed as a memory operand by the SAME consumer `u`
+                // (`vec_load_sink` places it directly before `u`), so it
+                // cannot clobber the deferred %ymm0 value.  Should the
+                // elision bail at emit time, the fallback load flushes the
+                // pending store before touching %ymm0 (intrinsics.rs), so
+                // crossing it here is sound in both outcomes.
+                let elided_load = matches!(
+                    ik,
+                    Instruction::Intrinsic {
+                        dest: Some(ld),
+                        dest_ptr: None,
+                        op: lop,
+                        ..
+                    } if is_memfold_vec_load(lop) && memfold_values.contains(&ld.0)
+                );
+                if elided_load {
+                    continue;
+                }
                 if is_vec_invalidator(ik) || matches!(ik, Instruction::Intrinsic { .. }) {
                     ok = false;
                     break;
