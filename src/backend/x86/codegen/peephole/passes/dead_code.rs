@@ -155,15 +155,16 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
                 break;
             }
 
-            {
-                let trimmed_j = infos[j].trimmed(store.get(j));
-                if has_implicit_reg_usage(trimmed_j) {
-                    break;
-                }
+            let trimmed_j = infos[j].trimmed(store.get(j));
+            if has_implicit_reg_usage(trimmed_j) {
+                break;
             }
 
             let refs_dst = infos[j].reg_refs & dst_mask != 0;
-            let writes_dst = get_dest_reg(&infos[j]) == dst_reg;
+            // Redefinition includes architectural implicit writes: `cqto`
+            // overwrites %rdx, `idivq` rewrites %rax:%rdx — the classified
+            // destination alone answers only half of that.
+            let writes_dst = writes_family(&infos[j], trimmed_j, dst_reg);
 
             if writes_dst {
                 let also_reads = match infos[j].kind {

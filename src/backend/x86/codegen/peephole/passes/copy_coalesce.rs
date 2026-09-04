@@ -48,7 +48,7 @@
 //!    liveness model.
 
 use super::super::types::*;
-use super::helpers::{has_implicit_reg_usage, is_shift_or_rotate, replace_reg_family};
+use super::helpers::{is_shift_or_rotate, replace_reg_family};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     function_range, is_relayable_family, plain_gp_operand, split_two_operands,
@@ -151,12 +151,21 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
                     let target = t.trim_start_matches(|c: char| c != ' ').trim();
                     !target.starts_with('.') && matches!(d_fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10)
                 }
+                // An implicit read OR write of the destination family is an
+                // unrenamable hazard: the textual rewrite cannot touch an
+                // operand the instruction never names. `cqto` overwrites
+                // `%rdx`, `syscall` clobbers `%rsi`/`%rdi`/`%r8`-`%r11`,
+                // `cltq` reads `%rax`, `cpuid` rewrites `%rbx` — none of
+                // these can be renamed and none may be missed. The central
+                // oracle sees all of them; the old
+                // `has_implicit_reg_usage(t) && d_fam <= 2` veto knew only a
+                // hand-picked subset and silently coalesced across the rest.
                 // A shift/rotate takes its variable count in %cl and nowhere
                 // else: renaming that family produces `shlq %sil, %r8`, which
-                // does not exist. `has_implicit_reg_usage` does not cover the
-                // plain shifts, so check them separately.
+                // does not exist. The count is named explicitly, so the
+                // implicit oracle does not cover it; check it separately.
                 _ => {
-                    (has_implicit_reg_usage(t) && d_fam <= 2)
+                    implicit_reg_refs(t.as_bytes()) & d_mask != 0
                         || (d_fam == 1 && is_shift_or_rotate(t))
                 }
             };
@@ -434,5 +443,30 @@ mod tests {
             ".cfi_endproc\n",
         ));
         assert!(out.contains("movq %rdi, %rdx"), "{out}");
+    }
+    #[test]
+    fn rsi_home_is_not_coalesced_across_a_syscall_clobber() {
+        // `syscall` reads its argument registers (among them %rsi) and
+        // returns in %rax while clobbering %rcx/%r11 — all without naming
+        // any of them. Coalescing a %rsi home across one would delete the
+        // copy and leave the kernel's pointer argument reading whatever
+        // %rsi held before it was ever written. The old hand-picked veto
+        // (`has_implicit_reg_usage(t) && d_fam <= 2`) never saw this: it
+        // only protected %rax/%rcx/%rdx.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rsi\n",
+            "    syscall\n",
+            "    movq %rsi, %rbx\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("syscall"), "{out}");
+        assert!(
+            out.contains("movq %r9, %rsi"),
+            "coalescing across syscall is unsound:\n{out}"
+        );
     }
 }

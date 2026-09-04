@@ -162,24 +162,12 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
     {
         return 0;
     }
-    // Explicit implicit-operand instructions.
-    match mnemonic {
-        "cltq" | "cdqe" | "cwtl" | "cbtw" | "cbw" | "cwde" => return RAX,
-        "cqto" | "cqo" | "cltd" | "cdq" | "cwtd" | "cwd" => return RAX | RDX,
-        "rdtsc" | "rdtscp" => return RAX | RCX | RDX,
-        "cpuid" => return RAX | RBX | RCX | RDX,
-        "syscall" | "sysenter" => return RAX | RCX | R11,
-        "leave" | "enter" => return RSP | RBP,
-        "xgetbv" | "rdpmc" | "rdmsr" => return RAX | RDX,
-        _ => {}
-    }
-    if mnemonic.starts_with("div")
-        || mnemonic.starts_with("idiv")
-        || (mnemonic.starts_with("mul") && !mnemonic.starts_with("mulx"))
-        || (mnemonic.starts_with("imul") && !rest.contains(','))
-    {
-        return RAX | RDX;
-    }
+    // Multi-destination / opaque: every mentioned GP family plus the
+    // implicit accumulator pair (cmpxchg16b names no register at all).
+    // These must run BEFORE the implicit oracle: `cmpxchg` has an implicit
+    // accumulator AND a conditionally-written explicit destination, so the
+    // implicit write set alone would under-approximate. (With the central
+    // union, `info.reg_refs` here already includes the implicit bits too.)
     if mnemonic.starts_with("xchg")
         || mnemonic.starts_with("cmpxchg")
         || mnemonic.starts_with("xadd")
@@ -187,9 +175,20 @@ pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
         || mnemonic.starts_with("mulx")
         || mnemonic.starts_with("rep")
     {
-        // Multi-destination / opaque: every mentioned GP family plus the
-        // implicit accumulator pair (cmpxchg16b names no register at all).
         return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
+    }
+    // Explicit implicit-operand instructions: the central oracle in
+    // `types.rs` is the single source of truth for architectural implicit
+    // writes (this used to be a private duplicate that drifted — it knew
+    // nothing of `cmpxchg8b`, conflated rdtsc with rdtscp's %rcx write, and
+    // taxed every SSE `mulsd`/`divsd` with the integer accumulator pair,
+    // blocking load fusions in FP code).  Instructions reaching this arm
+    // either have no GP destination operand (`cqto`, `syscall`, `leave`,
+    // the string primitives) or name only read operands (`divq %r11`), so
+    // the implicit write set alone is the complete answer.
+    let implicit = implicit_write_refs(t.as_bytes());
+    if implicit != 0 {
+        return implicit;
     }
     // String instructions without operands (`movsb`, `stosq`, ...).
     if !rest.contains('%') && !rest.contains('$') {
@@ -1302,5 +1301,24 @@ mod tests {
         assert_eq!(may_write_families(t.trim(), &li(t)), RAX);
         let t = "    cmpxchg16b (%rdi)";
         assert_eq!(may_write_families(t.trim(), &li(t)) & (RAX | RDX), RAX | RDX);
+    }
+    #[test]
+    fn may_write_model_is_exact_for_implicit_operands() {
+        let li = |s: &str| classify_line(s);
+        // The widening branch writes ONLY %rdx: %rax is its input. The old
+        // private table returned RAX | RDX, freezing cache invalidation for
+        // an accumulator it never touched.
+        let t = "    cqto";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RDX);
+        // rdtsc vs rdtscp: only the latter reports the TSC_AUX in %rcx.
+        let t = "    rdtsc";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        let t = "    rdtscp";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RCX | RDX);
+        // SSE arithmetic does not inherit the integer accumulator pair.
+        let t = "    mulsd %xmm0, %xmm1";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    divsd %xmm1, %xmm0";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
     }
 }

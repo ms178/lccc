@@ -17,6 +17,7 @@ use super::super::types::*;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
+    writes_family,
 };
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
@@ -575,9 +576,13 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 && lr != 5
                                 && lr != sr
                             {
-                                // Middle line: writes %S, doesn't read %D, no memory access,
-                                // and is a plain register-dest instruction.
-                                let mid_writes_s = get_dest_reg(&infos[m]) == sr
+                                // Middle line: writes %S (explicitly, or
+                                // implicitly — `cqto` overwrites %rdx without
+                                // naming it), doesn't read %D, no memory
+                                // access, and is a plain register-dest
+                                // instruction.
+                                let mid_t = infos[m].trimmed(store.get(m));
+                                let mid_writes_s = writes_family(&infos[m], mid_t, sr)
                                     && matches!(infos[m].kind, LineKind::Other { .. });
                                 let mid_refs_d = infos[m].reg_refs & (1u16 << lr) != 0;
                                 // leaq is address ARITHMETIC: `leaq 1(%r11), %r11`
@@ -586,7 +591,6 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 // flags any non-frame paren base — for leaq
                                 // that is an arithmetic source, not a load).
                                 // Any other paren operand is a real access.
-                                let mid_t = infos[m].trimmed(store.get(m));
                                 let mid_is_lea =
                                     mid_t.starts_with("leaq ") || mid_t.starts_with("leal ");
                                 let mid_has_mem = infos[m].rbp_offset != RBP_OFFSET_NONE
@@ -1670,11 +1674,13 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             }
             let t = infos[n].trimmed(store.get(n));
 
-            // Base or index redefined => the LEA's value is no longer
-            // reproducible from them; stop (uses collected so far are still
-            // valid only if we fold nothing after this point).
-            let writes = get_dest_reg(&infos[n]);
-            if writes == base_family || writes == index_family {
+            // Base or index redefined (explicitly or implicitly — `cqto`
+            // overwrites %rdx without naming it) => the LEA's value is no
+            // longer reproducible from them; stop (uses collected so far are
+            // still valid only if we fold nothing after this point).
+            if writes_family(&infos[n], t, base_family)
+                || writes_family(&infos[n], t, index_family)
+            {
                 break;
             }
             if infos[n].reg_refs & dst_mask != 0 {
@@ -1702,7 +1708,10 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
                 } else if mentions {
                     // A pure redefinition of %tmp ends its live range cleanly:
                     // everything after belongs to a different value.
-                    if writes == dst_family && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
+                    // `writes_family` also sees architectural implicit writes
+                    // (`cqto` redefining an %rdx temporary).
+                    if writes_family(&infos[n], t, dst_family)
+                        && !t[..t.rfind(',').unwrap_or(t.len())].contains(dst64)
                     {
                         break;
                     }

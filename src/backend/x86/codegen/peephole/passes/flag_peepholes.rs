@@ -23,7 +23,7 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
-use super::helpers::get_dest_reg;
+use super::helpers::{get_dest_reg, writes_family};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
@@ -1204,7 +1204,19 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
                 if mentions_exact_name(tj, name64) {
                     break; // a 64-bit read observes the sign extension
                 }
-                if get_dest_reg(&infos[j]) == dst_fam && !tj.starts_with("cmov") {
+                // An implicit READ of the family observes the extension just
+                // as much as a named 64-bit operand does: `cqto` consumes
+                // all 64 bits of %rax, `idivq` reads %rax:%rdx. The
+                // `reg_refs` union is what routes these lines here at all.
+                if implicit_read_refs(tj.as_bytes()) & mask != 0 {
+                    break;
+                }
+                // "Fully redefined" must mean a real write of the family.
+                // `writes_family` is exact: a `cqto` is classified with %rax
+                // as its primary destination, but %rax is its implicit input
+                // — the only family it writes is %rdx — so it can never
+                // retire a %rax identity here.
+                if writes_family(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
                     ok = true; // fully redefined before any wide read
                     break;
                 }

@@ -468,3 +468,91 @@ fn no_output_line_names_a_nonexistent_register() {
         assert!(ok, "output names unknown register %{}:\n{}", name, out);
     }
 }
+
+// ── Rule 2/3/4: architectural implicit writes (the stress-lab regression) ───
+
+#[test]
+fn a_copy_does_NOT_fold_across_a_division_that_clobbers_its_source() {
+    // SOUNDNESS, stress lab `intexpr` seed 1 at -O1 (the ms178-1 regression):
+    // `cqto`/`idivq %r11` overwrite %rdx without naming it in their operand
+    // text. The window walk used to see "no mention of %rdx" between the
+    // copy and the narrow reload and retargeted `movzbl %r8b, ...` to
+    // `movzbl %dl, ...` — reading the division REMAINDER instead of the
+    // parameter the copy had homed.
+    let out = run(&f(concat!(
+        "    movq %rdx, %r8\n",
+        "    cqto\n",
+        "    idivq %r11\n",
+        "    movzbl %r8b, %eax\n",
+        "    ret\n",
+    )));
+    assert!(
+        out.contains("movzbl %r8b, %eax"),
+        "reload must keep its home register:\n{}",
+        out
+    );
+    assert_eq!(
+        count(&out, "movzbl %dl"),
+        0,
+        "division remainder must not leak into the reload:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_copy_into_rdx_does_NOT_fold_across_an_idiv_that_rewrites_it() {
+    // Rules 3/4 mirrored through the oracle: `idivq %rcx` rewrites
+    // %rax:%rdx but names neither. Pre-union its reg_refs were {%rcx} only,
+    // so the window walk sailed through and retargeted later %rdx uses at
+    // the copy's source — feeding them the stale copy instead of the
+    // remainder the division had just written. The use lands in %rbx so it
+    // survives to the return (a dead use would be deleted, hiding the
+    // defect); the return value must therefore come from the remainder in
+    // %rdx, never from the stale %r9.
+    let out = run(&f(concat!(
+        "    movq %r9, %rdx\n",
+        "    cqto\n",
+        "    idivq %rcx\n",
+        "    movq %rdx, %rbx\n",
+        "    movq %rbx, %rax\n",
+        "    ret\n",
+    )));
+    assert!(out.contains("idivq"), "{out}");
+    assert_eq!(
+        count(&out, "movq %r9, %rbx"),
+        0,
+        "stale copy source must not leak into the reload:\n{}",
+        out
+    );
+    assert_eq!(
+        count(&out, "movq %r9, %rax"),
+        0,
+        "stale copy source must not reach the return value:\n{}",
+        out
+    );
+}
+
+#[test]
+fn a_copy_out_of_rax_folds_across_cqto_which_only_reads_it() {
+    // The oracle is exact, not merely conservative: `cqto` reads %rax and
+    // writes ONLY %rdx. The classified destination (%rax) used to end the
+    // window at Rule 2 (`dest_j == sfam`) even though the instruction never
+    // overwrites the copy source; the exact predicate lets the fold
+    // through. (An `idivq`, which DOES rewrite %rax, still blocks it — see
+    // the Rule 4 oracle. The use's destination is %ecx so the use itself
+    // does not re-write the copy source, which Rule 2 must and does
+    // continue to block.)
+    let out = run(&f(concat!(
+        "    movq %rax, %r8\n",
+        "    cqto\n",
+        "    movzbl %r8b, %bl\n",
+        "    movq %rbx, %rax\n",
+        "    ret\n",
+    )));
+    assert_eq!(count(&out, "movq %rax, %r8"), 0, "copy must fold:\n{}", out);
+    assert!(
+        out.contains("movzbl %al, %bl"),
+        "use must retarget at the copy source:\n{}",
+        out
+    );
+}
