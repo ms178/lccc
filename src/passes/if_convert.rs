@@ -695,10 +695,14 @@ fn detect_diamond(
 
     // Limit the number of instructions in each arm to prevent over-speculation.
     // cmov is only profitable when the arms are cheap (a few instructions).
-    // Allow up to 8 instructions per arm. C's type system generates
-    // Load + Cast chains (parameter loads + sign extensions) that inflate
-    // the count. A typical arm: Load, Cast, Load, Cast, BinOp, Cast = 6 insts.
-    const MAX_ARM_INSTS: usize = 8;
+    // Arm budget from the CPU tuning model: `mispredict_penalty / 2`
+    // (a coin-flip prior on the branch outcome; 8 on the Generic row, which
+    // reproduces the historical constant, 6 on Zen3/Zen4 whose 13-cycle
+    // penalty makes speculation less valuable, 8 on Raptor Lake).  C's type
+    // system generates Load + Cast chains (parameter loads + sign
+    // extensions) that inflate the count; a typical arm: Load, Cast, Load,
+    // Cast, BinOp, Cast = 6 insts.  See docs/CPU_MODEL_AUDIT.md §4.
+    let max_arm_insts: usize = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
     // EFFECTIVE instruction count: address-materialization chains (IV Cast,
     // Shl scaling, base Copy, the GEP itself) are pure address math the
     // backend folds into one SIB operand — they add nothing speculative.
@@ -724,8 +728,8 @@ fn detect_diamond(
             })
             .count()
     };
-    if effective_arm_len(true_block) > MAX_ARM_INSTS
-        || effective_arm_len(false_block) > MAX_ARM_INSTS
+    if effective_arm_len(true_block) > max_arm_insts
+        || effective_arm_len(false_block) > max_arm_insts
     {
         return None;
     }
@@ -915,8 +919,9 @@ fn detect_triangle(
         return None;
     }
 
-    const MAX_ARM_INSTS: usize = 8;
-    if arm_block.instructions.len() > MAX_ARM_INSTS {
+    // Same tuning-model budget as the diamond form above.
+    let max_arm_insts: usize = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+    if arm_block.instructions.len() > max_arm_insts {
         return None;
     }
 

@@ -92,6 +92,35 @@ fn is_pure_write_mnemonic(t: &str) -> bool {
         || t.starts_with("sarx")
 }
 
+/// `true` for the x86 string instructions (`movs*`, `stos*`, `lods*`,
+/// `scas*`, `cmps*`, with or without a `rep`/`repe`/`repne` prefix).  They
+/// name no register in their text yet read and write `%rcx` (count),
+/// `%rsi`/`%rdi` (pointers) and `%rax` (`stos`/`lods`/`scas` data).  Without
+/// this the backward dataflow saw `movq $4096, %rcx; rep movsb; ret` as a
+/// dead write to `%rcx` and deleted the count set-up (observed miscompile of
+/// every block copy lowered to `rep movsb`, including the `-mno-sse` kernel
+/// path).  The suffix test rejects the look-alikes `movsbl %al, %eax`
+/// (sign-extending move) and `movsd %xmm0, ...` (scalar double move).
+pub(crate) fn is_string_instruction(t: &str) -> bool {
+    let mut m = t;
+    for p in ["repne ", "repnz ", "repe ", "repz ", "rep "] {
+        if let Some(rest) = m.strip_prefix(p) {
+            m = rest.trim_start();
+            break;
+        }
+    }
+    let m = m.split_whitespace().next().unwrap_or("");
+    if m.len() != 5 && m.len() != 4 {
+        return false;
+    }
+    let (stem, suffix) = m.split_at(4);
+    let string_stem = matches!(stem, "movs" | "stos" | "lods" | "scas" | "cmps");
+    let size_suffix = suffix.is_empty() || matches!(suffix, "b" | "w" | "l" | "q");
+    // A string op never takes operands in AT&T output of this backend; an
+    // explicit operand list (`movsd %xmm0, ...`) marks a non-string form.
+    string_stem && size_suffix && !t.contains('%')
+}
+
 fn mnemonic_is_known(t: &str) -> bool {
     const KNOWN: &[&str] = &[
         "mov",
@@ -504,6 +533,19 @@ impl FileLiveness {
                 ))
             }
             _ => {
+                if is_string_instruction(t) {
+                    // Implicit operands only; `rep` variants also read and
+                    // update the count.  Treating the data register as both
+                    // read and written is conservative for `lods`/`stos`.
+                    const STRING_REGS: u16 = RAX | RCX | (1 << 6) | (1 << 7);
+                    return Some((
+                        Effect {
+                            reads: STRING_REGS | mentioned,
+                            writes: STRING_REGS,
+                        },
+                        fall,
+                    ));
+                }
                 if !mnemonic_is_known(t) {
                     // Unknown: keep every mentioned register live.
                     return Some((
@@ -589,6 +631,56 @@ mod tests {
         (0..store.len())
             .find(|&i| store.get(i).contains(needle))
             .expect("line")
+    }
+
+    #[test]
+    fn string_instruction_predicate_accepts_only_real_string_ops() {
+        for ok in [
+            "rep movsb", "rep movsq", "rep stosb", "rep stosq", "repne scasb",
+            "repe cmpsb", "movsb", "stosq", "lodsb", "movsl", "rep stosl",
+        ] {
+            assert!(is_string_instruction(ok), "{ok}");
+        }
+        for no in [
+            "movsbl %al, %eax", "movslq %eax, %rax", "movsd %xmm0, (%rdi)",
+            "movss %xmm1, %xmm0", "movsx %al, %eax", "movq %rax, %rcx",
+            "cmpq $1, %rax", "repz ret", "movsxd %eax, %rax",
+        ] {
+            assert!(!is_string_instruction(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn rep_movsb_keeps_count_and_pointers_live() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq $4096, %rcx\n",
+            "    rep movsb\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "movq $4096, %rcx");
+        assert_eq!(lv.live_after(n, 1), Some(true), "%rcx must be live into rep movsb");
+        assert_eq!(lv.live_after(n, 6), Some(true), "%rsi must be live into rep movsb");
+        assert_eq!(lv.live_after(n, 7), Some(true), "%rdi must be live into rep movsb");
+    }
+
+    #[test]
+    fn rep_stosb_keeps_fill_value_live() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %eax, %eax\n",
+            "    movq $512, %rcx\n",
+            "    rep stosb\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let n = line_of(&store, "xorl %eax, %eax");
+        assert_eq!(lv.live_after(n, 0), Some(true), "%rax must be live into rep stosb");
     }
 
     #[test]

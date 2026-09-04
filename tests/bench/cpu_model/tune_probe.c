@@ -24,3 +24,16 @@ uint32_t rot_hash(const uint32_t *p, size_t n, unsigned k) {
     for (size_t i = 0; i < n; i++) h = (h << k) ^ p[i];
     return h;
 }
+
+/* Block copies: the tune row decides between a vector loop (Generic, no
+ * ERMS), `rep movsb` at/above glibc's __x86_rep_movsb_threshold (2112 on
+ * FSRM rows, 8192 on the older ERMS rows) and the vector width (16 B at the
+ * baseline -march, 32 B with AVX2 unless the part splits 256-bit loads). */
+struct blk200 { unsigned char b[200]; };
+struct blk2112 { unsigned char b[2112]; };
+struct blk4096 { unsigned char b[4096]; };
+struct blk8192 { unsigned char b[8192]; };
+void copy_200(struct blk200 *d, const struct blk200 *s) { *d = *s; }
+void copy_2112(struct blk2112 *d, const struct blk2112 *s) { *d = *s; }
+void copy_4096(struct blk4096 *d, const struct blk4096 *s) { *d = *s; }
+void copy_8192(struct blk8192 *d, const struct blk8192 *s) { *d = *s; }
