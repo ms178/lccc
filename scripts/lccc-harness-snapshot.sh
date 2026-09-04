@@ -120,8 +120,12 @@ json.dump(led, open(tmp, "w"), indent=2); os.replace(tmp, path)
 PY
 
 # 5. Bundle docs that must reach the user.
-for d in $DOCS; do
-  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(basename "$d")"
+#    Auto-discover: every Markdown file added or modified in base..HEAD is a
+#    session deliverable (follow-up notes, audits, task files) and is bundled
+#    without manual list maintenance; LCCC_SNAPSHOT_DOCS adds extra paths.
+session_docs=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- '*.md' 2>/dev/null || true)
+for d in $DOCS $session_docs; do
+  [[ -f "$d" ]] && cp -f "$d" "$GEN/docs/$(printf '%s' "$d" | tr '/' '_')"
 done
 ( cd "$GEN/docs" && python3 -c "
 import json,glob,os

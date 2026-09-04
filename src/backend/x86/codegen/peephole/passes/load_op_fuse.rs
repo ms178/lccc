@@ -1,0 +1,1295 @@
+//! Load→ALU memory-operand fusion, symbol-LEA CSE and immediate narrowing.
+//!
+//! Three x86-64 shapes that GCC 16 / Clang 23 / ICX all produce and LCCC did
+//! not (measured on `tests/benchmark/programs/gzip_crc32.c`: 12-insn inner
+//! CRC loop vs GCC's 8; `zlib_ng_adler32`, `hash_table`, `sqlite_varint` show
+//! the same load→scratch→ALU relay everywhere):
+//!
+//! ## 1. Generic load→ALU fusion (`fuse_load_into_alu`)
+//!
+//! ```text
+//!     movl  (%r12,%rsi,4), %r9d        xorl  (%r12,%rsi,4), %ebp
+//!     xorl  %r9d, %ebp            ->
+//! ```
+//!
+//! [`super::memory_fold`] only folds *stack-slot* loads whose scratch is
+//! `%rax/%rcx/%rdx`; this pass folds ANY addressing mode (SIB, RIP-relative,
+//! base+disp, stack) into ANY GP destination when the loaded register is
+//! provably dead afterwards ([`FileLiveness`]).  Supported consumers:
+//! `add/sub/and/or/xor/cmp/test/imul` with the load's exact width.
+//!
+//! The *copy-bridged* variant handles the loop-carried-phi relay the register
+//! allocator emits for `acc = mem OP x` recurrences (gzip CRC, adler, hashes):
+//!
+//! ```text
+//!     movl  (%r12,%rsi,4), %r9d        movl  %edi, %ebp
+//!     ...                              xorl  (%r12,%rsi,4), %ebp
+//!     movq  %r9, %rbp             ->
+//!     xorl  %edi, %ebp
+//! ```
+//!
+//! which is legal for commutative consumers (`B = T op C == C op T`).  The
+//! later `acc_roundtrip`/`copy_shift_back` passes then collapse the remaining
+//! copy into GCC's `shrl $8,%ebp; xorl mem,%ebp` shape.
+//!
+//! ### Soundness argument
+//!
+//! Every line strictly between the load and its consumer must be a plain
+//! `Other`/`Cmp`/`SetCC` instruction that
+//!
+//! * does not mention the loaded register `T` at all (`reg_refs`),
+//! * may-writes none of `T`, the registers named in the memory operand, the
+//!   copy destination `B` and commutative partner `C` ([`may_write_families`]
+//!   is a MAY model: unknown mnemonics write everything),
+//! * performs **no memory access of any kind** (stores would change the loaded
+//!   value; even loads are excluded so a `volatile` access never moves past
+//!   another one — the fused instruction performs exactly one access of the
+//!   original width at the original address, so volatile/MMIO semantics are
+//!   unchanged),
+//! * is not `pinned`, and is not a control-flow, push/pop, call or inline-asm
+//!   line (block boundaries end the window; a window never crosses a label).
+//!
+//! The consumer writes the flags identically with either operand form, the
+//! deleted load never wrote flags, and no width changes: the fused `OPl`
+//! reads a 32-bit `MEM` exactly where `movl MEM` did.
+//!
+//! ## 2. Symbol-LEA CSE for every GPR (`eliminate_redundant_symbol_lea`)
+//!
+//! `local_patterns::eliminate_redundant_leaq` is `%rax`-only.  Unrolled loops
+//! and inlined table lookups re-materialise `leaq table(%rip), %rcx` before
+//! every access (nine times in gzip's CRC self-check).  A RIP-relative source
+//! names no data register, so the only way the cached value can go stale is a
+//! write to the destination family or a control-flow boundary — both tracked
+//! with the MAY-write model.
+//!
+//! ## 3. Immediate narrowing (`narrow_wide_immediates`, BACKLOG PF-16)
+//!
+//! `movabsq $imm, %r` with `0 <= imm <= 0xFFFF_FFFF` and `movq $imm, %r` with
+//! `0 <= imm <= 0x7FFF_FFFF` both produce the same 64-bit value as
+//! `movl $imm, %r32` (zero-extension).  The 32-bit form is 5 bytes instead of
+//! 10 / 7, has no REX.W and is eligible for the renamer's mov elimination.
+//! Negative immediates need the sign-extending forms and are left alone.
+//!
+//! Every pass is individually switchable through `CCC_PEEPHOLE_SKIP=
+//! load_alu_fuse,recurrence_inplace,copy_dying_operand,symbol_lea_cse,narrow_imm` for bisection.
+
+use super::super::types::*;
+use super::liveness::FileLiveness;
+use super::relay_and_lea::{plain_gp_operand, split_two_operands};
+
+const ALL_GPR: u16 = 0xFFFF;
+const RAX: u16 = 1 << 0;
+const RCX: u16 = 1 << 1;
+const RDX: u16 = 1 << 2;
+const RBX: u16 = 1 << 3;
+const RSP: u16 = 1 << 4;
+const RBP: u16 = 1 << 5;
+const R11: u16 = 1 << 11;
+/// `%rcx/%rsi/%rdi` — implicitly updated by every string primitive.
+const ALL_STRING_REGS: u16 = (1 << 1) | (1 << 6) | (1 << 7);
+
+/// Longest straight-line gap (non-NOP, non-directive lines) between a load
+/// and the consumer it is fused into.  Windows are short by construction: the
+/// allocator emits the relay right next to the use; a longer window only adds
+/// scan cost and register-pressure risk (the memory operand extends the
+/// address registers' live ranges to the consumer).
+const MAX_GAP: usize = 12;
+
+// ── MAY-write model ──────────────────────────────────────────────────────────
+
+/// Bitmask of GP families `t` MAY write.  This is the dual of the liveness
+/// model in `liveness.rs` (which under-approximates writes because a missed
+/// write only keeps a value live longer): a cache-invalidation query needs an
+/// OVER-approximation, so anything unrecognised writes everything.
+pub(super) fn may_write_families(t: &str, info: &LineInfo) -> u16 {
+    match info.kind {
+        LineKind::Nop | LineKind::Empty | LineKind::Directive | LineKind::Label => return 0,
+        LineKind::StoreRbp { .. } => return 0,
+        // `Cmp` also covers `cmpxchg*` (writes %rax and its destination), so
+        // it must go through the mnemonic analysis below.
+        LineKind::Cmp => {}
+        LineKind::LoadRbp { reg, .. } | LineKind::SetCC { reg } => {
+            return if reg <= REG_GP_MAX { 1u16 << reg } else { 0 };
+        }
+        LineKind::Push { .. } => return RSP,
+        LineKind::Pop { reg } => {
+            return RSP | if reg <= REG_GP_MAX { 1u16 << reg } else { 0 };
+        }
+        LineKind::Call | LineKind::JmpIndirect | LineKind::InlineAsm => return ALL_GPR,
+        LineKind::Jmp | LineKind::CondJmp | LineKind::Ret => return 0,
+        LineKind::SelfMove => return 0,
+        LineKind::Other { .. } => {}
+    }
+    if info.pinned {
+        return ALL_GPR;
+    }
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    let rest = t[mnemonic.len()..].trim();
+
+    // Flag-only / no-write instructions.
+    if mnemonic.starts_with("cmp") && !mnemonic.starts_with("cmpxchg")
+        || mnemonic.starts_with("test")
+        || mnemonic.starts_with("ucomis")
+        || mnemonic.starts_with("comis")
+        || mnemonic.starts_with("vucomis")
+        || mnemonic.starts_with("vcomis")
+        || mnemonic.starts_with("prefetch")
+        || mnemonic.starts_with("nop")
+        || mnemonic.ends_with("fence")
+        || matches!(
+            mnemonic,
+            "vzeroupper"
+                | "vzeroall"
+                | "pause"
+                | "ud2"
+                | "hlt"
+                | "int3"
+                | "endbr64"
+                | "endbr32"
+                | "cld"
+                | "std"
+                | "clc"
+                | "stc"
+                | "cmc"
+                | "btq"
+                | "btl"
+                | "btw"
+        )
+    {
+        return 0;
+    }
+    // Explicit implicit-operand instructions.
+    match mnemonic {
+        "cltq" | "cdqe" | "cwtl" | "cbtw" | "cbw" | "cwde" => return RAX,
+        "cqto" | "cqo" | "cltd" | "cdq" | "cwtd" | "cwd" => return RAX | RDX,
+        "rdtsc" | "rdtscp" => return RAX | RCX | RDX,
+        "cpuid" => return RAX | RBX | RCX | RDX,
+        "syscall" | "sysenter" => return RAX | RCX | R11,
+        "leave" | "enter" => return RSP | RBP,
+        "xgetbv" | "rdpmc" | "rdmsr" => return RAX | RDX,
+        _ => {}
+    }
+    if mnemonic.starts_with("div")
+        || mnemonic.starts_with("idiv")
+        || (mnemonic.starts_with("mul") && !mnemonic.starts_with("mulx"))
+        || (mnemonic.starts_with("imul") && !rest.contains(','))
+    {
+        return RAX | RDX;
+    }
+    if mnemonic.starts_with("xchg")
+        || mnemonic.starts_with("cmpxchg")
+        || mnemonic.starts_with("xadd")
+        || mnemonic.starts_with("lock")
+        || mnemonic.starts_with("mulx")
+        || mnemonic.starts_with("rep")
+    {
+        // Multi-destination / opaque: every mentioned GP family plus the
+        // implicit accumulator pair (cmpxchg16b names no register at all).
+        return info.reg_refs | RAX | RDX | RCX | ALL_STRING_REGS;
+    }
+    // String instructions without operands (`movsb`, `stosq`, ...).
+    if !rest.contains('%') && !rest.contains('$') {
+        return ALL_GPR;
+    }
+    // AT&T: the destination is the last top-level operand (single-operand
+    // forms — neg/not/inc/dec/setcc/bswap/shift-by-1/rdrand — write their
+    // only operand).  A memory destination writes no GP register.
+    let dest = match split_two_operands(rest) {
+        Some((_, d)) => d,
+        None => rest,
+    };
+    match plain_gp_operand(dest) {
+        Some(fam) => 1u16 << fam,
+        None => 0,
+    }
+}
+
+/// GP families named inside a memory operand such as `8(%rax,%rcx,4)` or
+/// `sym(%rip)` (`%rip` is not a GP family and is ignored).
+fn memory_operand_families(mem: &str) -> u16 {
+    let mut fams = 0u16;
+    let mut rest = mem;
+    while let Some(pct) = rest.find('%') {
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let fam = register_family_fast(&tok[..end]);
+        if fam != REG_NONE && fam <= REG_GP_MAX {
+            fams |= 1u16 << fam;
+        }
+        rest = &rest[pct + 1..];
+    }
+    fams
+}
+
+/// A memory source operand this pass is willing to carry into an ALU op:
+/// contains a parenthesised address, no segment override, no immediate or
+/// register form, no `*` indirection marker.
+fn is_plain_memory_operand(op: &str) -> bool {
+    op.contains('(')
+        && op.ends_with(')')
+        && !op.starts_with('$')
+        && !op.starts_with('%')
+        && !op.starts_with('*')
+        && !op.contains(':')
+}
+
+fn is_reg_or_imm(op: &str) -> bool {
+    op.starts_with('%') || op.starts_with('$')
+}
+
+/// True when `t` (an `Other`/`Cmp`/`SetCC` line) touches memory in any way.
+/// `lea` computes an address without accessing it and is allowed.
+fn accesses_memory(t: &str, info: &LineInfo) -> bool {
+    if matches!(info.kind, LineKind::LoadRbp { .. } | LineKind::StoreRbp { .. }) {
+        return true;
+    }
+    let mnemonic = t.split_whitespace().next().unwrap_or("");
+    if mnemonic.starts_with("lea") {
+        return false;
+    }
+    if info.has_indirect_mem || t.contains('(') || t.contains(':') {
+        return true;
+    }
+    // Absolute-symbol operands (`movl counter, %eax`) carry neither `%` nor
+    // `$`; any such operand is a memory access.
+    let rest = t[mnemonic.len()..].trim();
+    if rest.is_empty() {
+        return false;
+    }
+    match split_two_operands(rest) {
+        Some((a, b)) => !is_reg_or_imm(a) || !is_reg_or_imm(b),
+        None => !is_reg_or_imm(rest),
+    }
+}
+
+/// Kinds that may sit between a load and its consumer.
+fn is_window_kind(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::Other { .. } | LineKind::Cmp | LineKind::SetCC { .. }
+    )
+}
+
+/// Parse `mov{l,q} MEM, %reg` into `(is_q, mem, family)`.
+fn parse_memory_load(t: &str) -> Option<(bool, &str, RegId)> {
+    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (false, r)
+    } else if let Some(r) = t.strip_prefix("movq ") {
+        (true, r)
+    } else {
+        return None;
+    };
+    let (src, dst) = split_two_operands(rest)?;
+    if !is_plain_memory_operand(src) {
+        return None;
+    }
+    let fam = plain_gp_operand(dst)?;
+    // The destination must be the exact width of the load (movq→%r64,
+    // movl→%r32); anything else is not the shape the allocator emits.
+    let expect = if is_q {
+        REG_NAMES[0][fam as usize]
+    } else {
+        REG_NAMES[1][fam as usize]
+    };
+    if dst != expect {
+        return None;
+    }
+    Some((is_q, src, fam))
+}
+
+/// Consumers whose first (source) operand may be a memory operand.
+const FUSIBLE_OPS: &[&str] = &["add", "sub", "and", "or", "xor", "cmp", "test", "imul"];
+/// Subset for which `B = T op C` equals `B = C op T`.
+const COMMUTATIVE_OPS: &[&str] = &["add", "and", "or", "xor", "imul"];
+
+/// Parse `OP{l,q} %src, %dst` where both are plain GP registers of the
+/// suffix width.  Returns `(op, is_q, src_fam, dst_fam)`.
+fn parse_reg_reg_alu(t: &str) -> Option<(&'static str, bool, RegId, RegId)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
+    let is_q = match suffix {
+        "q" => true,
+        "l" => false,
+        _ => return None,
+    };
+    let op = *FUSIBLE_OPS.iter().find(|o| **o == op)?;
+    let rest = t[mnemonic.len()..].trim();
+    let (a, b) = split_two_operands(rest)?;
+    let src = plain_gp_operand(a)?;
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if a != REG_NAMES[width][src as usize] || b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((op, is_q, src, dst))
+}
+
+/// Parse `mov{l,q} %src, %dst` (plain GP register copy).  Returns
+/// `(is_q, src_fam, dst_fam)`.
+fn parse_reg_copy(t: &str) -> Option<(bool, RegId, RegId)> {
+    let (is_q, rest) = if let Some(r) = t.strip_prefix("movl ") {
+        (false, r)
+    } else if let Some(r) = t.strip_prefix("movq ") {
+        (true, r)
+    } else {
+        return None;
+    };
+    let (a, b) = split_two_operands(rest)?;
+    let src = plain_gp_operand(a)?;
+    let dst = plain_gp_operand(b)?;
+    let width = if is_q { 0 } else { 1 };
+    if a != REG_NAMES[width][src as usize] || b != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    Some((is_q, src, dst))
+}
+
+/// Outcome of scanning the lines strictly between two indices.
+struct Window {
+    /// Union of MAY-written families.
+    written: u16,
+    /// Union of mentioned families.
+    mentioned: u16,
+}
+
+/// Scan `(from, to)` exclusive.  `None` when the window is not straight-line
+/// or touches memory.
+fn scan_window(store: &LineStore, infos: &[LineInfo], from: usize, to: usize) -> Option<Window> {
+    let mut w = Window {
+        written: 0,
+        mentioned: 0,
+    };
+    let mut gap = 0usize;
+    for k in from + 1..to {
+        let info = &infos[k];
+        if info.is_nop() || info.kind == LineKind::Directive {
+            continue;
+        }
+        if !is_window_kind(info.kind) || info.pinned {
+            return None;
+        }
+        let t = info.trimmed(store.get(k));
+        if accesses_memory(t, info) {
+            return None;
+        }
+        let wr = may_write_families(t, info);
+        if wr == ALL_GPR {
+            return None;
+        }
+        w.written |= wr;
+        w.mentioned |= info.reg_refs;
+        gap += 1;
+        if gap > MAX_GAP {
+            return None;
+        }
+    }
+    Some(w)
+}
+
+/// Index of the next line that is neither NOP nor directive, or `len`.
+fn next_insn(infos: &[LineInfo], mut j: usize, len: usize) -> usize {
+    while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Directive) {
+        j += 1;
+    }
+    j
+}
+
+/// Fuse `mov MEM, %T ... OP %T, %D` into `OP MEM, %D` (see module docs).
+pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned || !matches!(infos[i].kind, LineKind::Other { .. })
+        {
+            i += 1;
+            continue;
+        }
+        let load = infos[i].trimmed(store.get(i)).to_string();
+        let Some((load_q, mem, t_fam)) = parse_memory_load(&load) else {
+            i += 1;
+            continue;
+        };
+        let t_bit = 1u16 << t_fam;
+        let addr = memory_operand_families(mem);
+
+        // Walk forward to the first line that mentions T; every line before
+        // it must satisfy the window rules.
+        let mut j = next_insn(infos, i + 1, len);
+        let mut consumer = None;
+        let mut gap = 0usize;
+        while j < len {
+            let info = &infos[j];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & t_bit != 0 {
+                consumer = Some(j);
+                break;
+            }
+            let t = info.trimmed(store.get(j));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR || wr & (t_bit | addr) != 0 {
+                break;
+            }
+            gap += 1;
+            if gap > MAX_GAP {
+                break;
+            }
+            j = next_insn(infos, j + 1, len);
+        }
+        let Some(j) = consumer else {
+            i += 1;
+            continue;
+        };
+        let cons = infos[j].trimmed(store.get(j)).to_string();
+        let suffix = if load_q { "q" } else { "l" };
+        let width = if load_q { 0 } else { 1 };
+
+        // ── direct form: OP %T, %D ─────────────────────────────────────────
+        if let Some((op, op_q, src, dst)) = parse_reg_reg_alu(&cons) {
+            if op_q == load_q
+                && src == t_fam
+                && dst != t_fam
+                && lv.live_after(j, t_fam) == Some(false)
+            {
+                let new_line = format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
+                mark_nop(&mut infos[i]);
+                replace_line(store, &mut infos[j], j, new_line);
+                lv.refresh_at(store, infos, j);
+                changed = true;
+                i = j + 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // ── copy-bridged commutative form: mov %T, %B ... OP %C, %B ────────
+        let Some((copy_q, csrc, b_fam)) = parse_reg_copy(&cons) else {
+            i += 1;
+            continue;
+        };
+        // A movl copy of a movq load would truncate; a movq copy of a movl
+        // load is the zero-extension the load already performed.
+        if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
+            i += 1;
+            continue;
+        }
+        let b_bit = 1u16 << b_fam;
+        // Find the consumer of B: first line mentioning B after the copy.
+        let mut k = next_insn(infos, j + 1, len);
+        let mut op_line = None;
+        let mut gap2 = 0usize;
+        while k < len {
+            let info = &infos[k];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & b_bit != 0 {
+                op_line = Some(k);
+                break;
+            }
+            if info.reg_refs & t_bit != 0 {
+                break;
+            }
+            let t = info.trimmed(store.get(k));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
+                break;
+            }
+            gap2 += 1;
+            if gap2 > MAX_GAP {
+                break;
+            }
+            k = next_insn(infos, k + 1, len);
+        }
+        let Some(k) = op_line else {
+            i += 1;
+            continue;
+        };
+        let op_text = infos[k].trimmed(store.get(k)).to_string();
+        let Some((op, op_q, c_fam, dst)) = parse_reg_reg_alu(&op_text) else {
+            i += 1;
+            continue;
+        };
+        if op_q != load_q
+            || dst != b_fam
+            || c_fam == b_fam
+            || c_fam == t_fam
+            || !COMMUTATIVE_OPS.contains(&op)
+        {
+            i += 1;
+            continue;
+        }
+        // C must hold the same value at the copy as at the op (nothing in
+        // (j, k) writes it), and T must be dead once the copy is gone.
+        let Some(w2) = scan_window(store, infos, j, k) else {
+            i += 1;
+            continue;
+        };
+        let c_bit = 1u16 << c_fam;
+        if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, t_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let copy_line = format!(
+            "    mov{suffix} {}, {}",
+            REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
+        );
+        let op_new = format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][b_fam as usize]);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, copy_line);
+        replace_line(store, &mut infos[k], k, op_new);
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+// ── in-place recurrence update ───────────────────────────────────────────────
+
+/// Two-operand ALU forms whose destination may be renamed from the scratch
+/// copy to the accumulator itself (`OP src, %Tm` → `OP src, %A`).
+const INPLACE_OPS: &[&str] = &[
+    "shl", "shr", "sar", "sal", "rol", "ror", "add", "sub", "and", "or", "xor", "imul",
+];
+/// Single-operand forms (`OP %Tm` → `OP %A`).
+const INPLACE_UNARY: &[&str] = &["not", "neg", "inc", "dec"];
+
+/// Parse `OP{l,q} SRC, %dst` / `OP{l,q} %dst` for the in-place whitelist.
+/// Returns `(is_q, dst_fam, src_text, unary)`; SRC is `$imm` or a plain GP
+/// register of the same width.
+fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
+    let mnemonic = t.split_whitespace().next()?;
+    let (op, suffix) = mnemonic.split_at(mnemonic.len().checked_sub(1)?);
+    let is_q = match suffix {
+        "q" => true,
+        "l" => false,
+        _ => return None,
+    };
+    let rest = t[mnemonic.len()..].trim();
+    let width = if is_q { 0 } else { 1 };
+    if INPLACE_UNARY.contains(&op) {
+        let dst = plain_gp_operand(rest)?;
+        if rest != REG_NAMES[width][dst as usize] {
+            return None;
+        }
+        return Some((is_q, dst, "", true));
+    }
+    if !INPLACE_OPS.contains(&op) {
+        return None;
+    }
+    let (src, dst_text) = split_two_operands(rest)?;
+    let dst = plain_gp_operand(dst_text)?;
+    if dst_text != REG_NAMES[width][dst as usize] {
+        return None;
+    }
+    let src_ok = src.starts_with('$')
+        || plain_gp_operand(src).is_some_and(|f| src == REG_NAMES[width][f as usize]);
+    if !src_ok {
+        return None;
+    }
+    Some((is_q, dst, src, false))
+}
+
+/// Compute a loop-carried recurrence in place instead of through a scratch
+/// copy (the shape the allocator emits for `acc = f(acc) OP x` phis):
+///
+/// ```text
+///     movl %ebx, %r9d          shrl $8, %ebx
+///     shrl $8, %r9d       ->   xorl %edi, %ebx
+///     movl %edi, %ebx
+///     xorl %r9d, %ebx
+/// ```
+///
+/// Legal when `OP2` is commutative (`A = Tm OP2 X == X OP2 Tm`), `Tm` is dead
+/// after `OP2`, `OP1` does not read `A`, nothing between `OP1` and the second
+/// copy mentions `A`/`Tm` or writes `X`, and the copies are at least as wide
+/// as the ops (a `movq` copy of a value updated by `l` ops is the same
+/// zero-extension the `l` op performs on `A` directly).  Flags are identical
+/// at every surviving instruction: only flag-neutral `mov`s are removed.
+pub(super) fn fold_recurrence_update(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let copy1 = infos[i].trimmed(store.get(i)).to_string();
+        let Some((c1_q, a_fam, tm_fam)) = parse_reg_copy(&copy1) else {
+            i += 1;
+            continue;
+        };
+        if a_fam == tm_fam {
+            i += 1;
+            continue;
+        }
+        // OP1 must be the very next instruction.
+        let j = next_insn(infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let op1 = infos[j].trimmed(store.get(j)).to_string();
+        let Some((op_q, op1_dst, op1_src, unary)) = parse_inplace_op(&op1) else {
+            i += 1;
+            continue;
+        };
+        if op1_dst != tm_fam || (op_q && !c1_q) {
+            i += 1;
+            continue;
+        }
+        let a_bit = 1u16 << a_fam;
+        let tm_bit = 1u16 << tm_fam;
+        if !unary && op1_src.starts_with('%') && plain_gp_operand(op1_src) == Some(a_fam) {
+            i += 1;
+            continue;
+        }
+        // Find copy2 (`mov %X, %A`): first line after OP1 mentioning A or Tm.
+        let mut k = next_insn(infos, j + 1, len);
+        let mut copy2 = None;
+        let mut gap = 0usize;
+        let mut gap_written = 0u16;
+        while k < len {
+            let info = &infos[k];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & (a_bit | tm_bit) != 0 {
+                copy2 = Some(k);
+                break;
+            }
+            let t = info.trimmed(store.get(k));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR {
+                break;
+            }
+            gap_written |= wr;
+            gap += 1;
+            if gap > MAX_GAP {
+                break;
+            }
+            k = next_insn(infos, k + 1, len);
+        }
+        let Some(k) = copy2 else {
+            i += 1;
+            continue;
+        };
+        let copy2_text = infos[k].trimmed(store.get(k)).to_string();
+        let Some((c2_q, x_fam, c2_dst)) = parse_reg_copy(&copy2_text) else {
+            i += 1;
+            continue;
+        };
+        if c2_dst != a_fam || x_fam == a_fam || x_fam == tm_fam || (op_q && !c2_q) {
+            i += 1;
+            continue;
+        }
+        let x_bit = 1u16 << x_fam;
+        if gap_written & (x_bit | a_bit | tm_bit) != 0 {
+            i += 1;
+            continue;
+        }
+        // OP2 must immediately follow copy2.
+        let m = next_insn(infos, k + 1, len);
+        if m >= len || infos[m].pinned {
+            i += 1;
+            continue;
+        }
+        let op2 = infos[m].trimmed(store.get(m)).to_string();
+        let Some((op2_name, op2_q, op2_src, op2_dst)) = parse_reg_reg_alu(&op2) else {
+            i += 1;
+            continue;
+        };
+        if op2_q != op_q
+            || op2_src != tm_fam
+            || op2_dst != a_fam
+            || !COMMUTATIVE_OPS.contains(&op2_name)
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(m, tm_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let width = if op_q { 0 } else { 1 };
+        let suffix = if op_q { "q" } else { "l" };
+        let a_name = REG_NAMES[width][a_fam as usize];
+        let op1_mnemonic = op1.split_whitespace().next().unwrap_or("");
+        let op1_new = if unary {
+            format!("    {op1_mnemonic} {a_name}")
+        } else {
+            format!("    {op1_mnemonic} {op1_src}, {a_name}")
+        };
+        let op2_new = format!(
+            "    {op2_name}{suffix} {}, {a_name}",
+            REG_NAMES[width][x_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        mark_nop(&mut infos[k]);
+        replace_line(store, &mut infos[j], j, op1_new);
+        replace_line(store, &mut infos[m], m, op2_new);
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = m + 1;
+    }
+    changed
+}
+
+// ── copy + commutative op into the dying operand ─────────────────────────────
+
+/// Rewrite every width-name of family `from` in `text` to family `to`.
+/// Returns `None` when a high-byte alias (`%ah`..`%dh`) is present, because
+/// families 4..15 have no high-byte counterpart.
+fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
+    const HIGH: [&str; 4] = ["%ah", "%ch", "%dh", "%bh"];
+    if HIGH.iter().any(|h| text.contains(h)) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pct) = rest.find('%') {
+        out.push_str(&rest[..pct]);
+        let tok = &rest[pct..];
+        let end = tok[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|e| e + 1)
+            .unwrap_or(tok.len());
+        let reg = &tok[..end];
+        let mut replaced = false;
+        for w in 0..4 {
+            if reg == REG_NAMES[w][from as usize] {
+                out.push_str(REG_NAMES[w][to as usize]);
+                replaced = true;
+                break;
+            }
+        }
+        if !replaced {
+            out.push_str(reg);
+        }
+        rest = &rest[pct + end..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// ```text
+///     movl %ebp, %eax          xorl %ebp, %edi
+///     xorl %edi, %eax     ->   movzbl %dil, %esi
+///     movzbl %al, %esi
+/// ```
+///
+/// A copy feeding a commutative op whose other operand `C` dies at the op:
+/// compute `A op C` into `C` instead and retarget the single reader of the
+/// copy destination `B`.  Sound when `C` is dead after the op, `B` is dead
+/// after its (immediately following) reader, `A`/`B`/`C` are three distinct
+/// families, the reader is a plain instruction with no high-byte alias, and
+/// widths agree (`l` copy with `l` op, `q` with `q`).  The op writes the
+/// same flags in both forms and the copy was flag-neutral.
+pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let copy = infos[i].trimmed(store.get(i)).to_string();
+        let Some((c_q, a_fam, b_fam)) = parse_reg_copy(&copy) else {
+            i += 1;
+            continue;
+        };
+        if a_fam == b_fam {
+            i += 1;
+            continue;
+        }
+        let j = next_insn(infos, i + 1, len);
+        if j >= len || infos[j].pinned || !matches!(infos[j].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        let op = infos[j].trimmed(store.get(j)).to_string();
+        let Some((op_name, op_q, c_fam, dst)) = parse_reg_reg_alu(&op) else {
+            i += 1;
+            continue;
+        };
+        if op_q != c_q
+            || dst != b_fam
+            || c_fam == a_fam
+            || c_fam == b_fam
+            || !COMMUTATIVE_OPS.contains(&op_name)
+        {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, c_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let k = next_insn(infos, j + 1, len);
+        if k >= len || infos[k].pinned || !is_window_kind(infos[k].kind) {
+            i += 1;
+            continue;
+        }
+        let b_bit = 1u16 << b_fam;
+        let c_bit = 1u16 << c_fam;
+        if infos[k].reg_refs & b_bit == 0 || infos[k].reg_refs & c_bit != 0 {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(k, b_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let reader = infos[k].trimmed(store.get(k)).to_string();
+        // Opaque readers (implicit operands, string ops, x87) are refused by
+        // the MAY model; a memory-destination reader is fine (it reads B in
+        // the address or as the stored value, both renamed consistently).
+        if may_write_families(&reader, &infos[k]) == ALL_GPR {
+            i += 1;
+            continue;
+        }
+        let Some(reader_new) = rename_family(&reader, b_fam, c_fam) else {
+            i += 1;
+            continue;
+        };
+        let width = if op_q { 0 } else { 1 };
+        let suffix = if op_q { "q" } else { "l" };
+        let op_new = format!(
+            "    {op_name}{suffix} {}, {}",
+            REG_NAMES[width][a_fam as usize], REG_NAMES[width][c_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, op_new);
+        replace_line(store, &mut infos[k], k, format!("    {reader_new}"));
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+// ── symbol-LEA CSE ───────────────────────────────────────────────────────────
+
+/// Parse `leaq SRC, %r64` where SRC names no data register (RIP-relative
+/// symbol or absolute symbol).  Returns `(src, family)`.
+fn parse_symbol_lea(t: &str) -> Option<(&str, RegId)> {
+    let rest = t.strip_prefix("leaq ")?;
+    let (src, dst) = split_two_operands(rest)?;
+    let fam = plain_gp_operand(dst)?;
+    if dst != REG_NAMES[0][fam as usize] {
+        return None;
+    }
+    if src.starts_with('$') || src.starts_with('%') || src.contains(':') {
+        return None;
+    }
+    if memory_operand_families(src) != 0 {
+        return None; // register-relative address: value can go stale
+    }
+    Some((src, fam))
+}
+
+/// Delete `leaq sym(%rip), %R` when `%R` provably still holds `sym`.
+pub(super) fn eliminate_redundant_symbol_lea(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut cache: [Option<String>; 16] = Default::default();
+    let mut changed = false;
+    for i in 0..len {
+        let info = &infos[i];
+        if info.is_nop() || info.kind == LineKind::Directive {
+            continue;
+        }
+        if !is_window_kind(info.kind)
+            && !matches!(
+                info.kind,
+                LineKind::Push { .. }
+                    | LineKind::Pop { .. }
+                    | LineKind::StoreRbp { .. }
+                    | LineKind::LoadRbp { .. }
+                    | LineKind::SelfMove
+            )
+        {
+            // Label / jump / call / ret / inline asm: nothing survives.
+            cache = Default::default();
+            continue;
+        }
+        let t = info.trimmed(store.get(i));
+        if !info.pinned {
+            if let Some((src, fam)) = parse_symbol_lea(t) {
+                if cache[fam as usize].as_deref() == Some(src) {
+                    mark_nop(&mut infos[i]);
+                    changed = true;
+                    continue;
+                }
+                cache[fam as usize] = Some(src.to_string());
+                continue;
+            }
+        }
+        let wr = may_write_families(t, info);
+        if wr == 0 {
+            continue;
+        }
+        for (fam, slot) in cache.iter_mut().enumerate() {
+            if wr & (1u16 << fam) != 0 {
+                *slot = None;
+            }
+        }
+    }
+    changed
+}
+
+// ── immediate narrowing ──────────────────────────────────────────────────────
+
+fn parse_immediate(s: &str) -> Option<i128> {
+    let s = s.strip_prefix('$')?;
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, s),
+    };
+    let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        i128::from_str_radix(h, 16).ok()?
+    } else {
+        s.parse::<i128>().ok()?
+    };
+    Some(if neg { -v } else { v })
+}
+
+/// `movabsq $imm32u, %r` / `movq $imm31, %r` → `movl $imm, %r32`.
+pub(super) fn narrow_wide_immediates(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() || infos[i].pinned || !matches!(infos[i].kind, LineKind::Other { .. })
+        {
+            continue;
+        }
+        let t = infos[i].trimmed(store.get(i));
+        let (limit, rest) = if let Some(r) = t.strip_prefix("movabsq ") {
+            (0xFFFF_FFFFi128, r)
+        } else if let Some(r) = t.strip_prefix("movq ") {
+            (0x7FFF_FFFFi128, r)
+        } else {
+            continue;
+        };
+        let Some((imm, dst)) = split_two_operands(rest) else {
+            continue;
+        };
+        let Some(fam) = plain_gp_operand(dst) else {
+            continue;
+        };
+        if dst != REG_NAMES[0][fam as usize] {
+            continue;
+        }
+        let Some(v) = parse_immediate(imm) else {
+            continue;
+        };
+        if !(0..=limit).contains(&v) {
+            continue;
+        }
+        let new_line = format!("    movl ${v}, {}", REG_NAMES[1][fam as usize]);
+        replace_line(store, &mut infos[i], i, new_line);
+        changed = true;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run<F: Fn(&mut LineStore, &mut [LineInfo]) -> bool>(asm: &str, f: F) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> =
+            (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        f(&mut store, &mut infos);
+        store.build_result(|i| infos[i].is_nop())
+    }
+
+    fn body(s: &str) -> Vec<String> {
+        s.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn has(out: &[String], needle: &str) -> bool {
+        out.iter().any(|l| l == needle)
+    }
+
+    const PRO: &str =
+        "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
+    const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
+
+    #[test]
+    fn fuses_sib_load_into_xor() {
+        let asm = format!(
+            "{PRO}    movl (%r12,%rsi,4), %r9d\n    xorl %r9d, %ebp\n    movl %ebp, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_across_flag_neutral_gap_and_rip_source() {
+        let asm = format!(
+            "{PRO}    movq tbl(%rip), %rcx\n    movq %rdi, %rdx\n    shrq $3, %rdx\n    addq %rcx, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "addq tbl(%rip), %rdx"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_cmp_and_imul_consumers() {
+        let asm = format!(
+            "{PRO}    movl 8(%rdi), %ecx\n    cmpl %ecx, %esi\n    setl %al\n    movzbl %al, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "cmpl 8(%rdi), %esi"), "{out:?}");
+        let asm = format!("{PRO}    movq (%rdi), %rcx\n    imulq %rcx, %rax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "imulq (%rdi), %rax"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_when_loaded_register_live_after() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    addl %ecx, %esi\n    movl %ecx, %eax\n    addl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_across_store_or_address_write() {
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    movl $1, (%rsi)\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    addq $4, %rdi\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        // Single-operand writer of the address register without a comma.
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    incq %rdi\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_across_label_call_and_width_mismatch() {
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n.LBB1:\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    call g\n    addl %ecx, %eax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!("{PRO}    movl (%rdi), %ecx\n    addq %rcx, %rax\n{EPI}");
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_intervening_load_volatile_order() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movl (%rsi), %edx\n    addl %ecx, %eax\n    addl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_commutative_crc_shape() {
+        let asm = format!(
+            "{PRO}    movl (%r12,%rsi,4), %r9d\n    movq %rbp, %rdi\n    shrl $8, %edi\n    movq %r9, %rbp\n    xorl %edi, %ebp\n    movl %ebp, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl %edi, %ebp"), "{out:?}");
+        assert!(has(&out, "xorl (%r12,%rsi,4), %ebp"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movl (%r12")), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_refuses_non_commutative_and_truncating_copy() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movq %rcx, %rdx\n    subl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movq (%rdi), %rcx\n    movl %ecx, %edx\n    addl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi), %rcx"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_bridged_refuses_when_partner_rewritten() {
+        let asm = format!(
+            "{PRO}    movl (%rdi), %ecx\n    movq %rcx, %rdx\n    addl $1, %esi\n    addl %esi, %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn recurrence_update_in_place_crc_shape() {
+        let asm = format!(
+            "{PRO}    movl (%r8,%r9,4), %edi\n    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "shrl $8, %ebx"), "{out:?}");
+        assert!(has(&out, "xorl %edi, %ebx"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movl %ebx, %r9d")), "{out:?}");
+        // Then the load fuses because %r9 is no longer rewritten.
+        let out2 = body(&run(&out.join("\n"), fuse_load_into_alu));
+        assert!(has(&out2, "xorl (%r8,%r9,4), %ebx"), "{out2:?}");
+    }
+
+    #[test]
+    fn recurrence_update_refuses_live_scratch_and_non_commutative() {
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %r9d, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrl $8, %r9d\n    movl %edi, %ebx\n    subl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        // q ops through l copies would change the upper half: refuse.
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    shrq $8, %r9\n    movl %edi, %ebx\n    xorq %r9, %rbx\n    movq %rbx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+        // OP1 reading A itself is not the accumulator shape.
+        let asm = format!(
+            "{PRO}    movl %ebx, %r9d\n    addl %ebx, %r9d\n    movl %edi, %ebx\n    xorl %r9d, %ebx\n    movl %ebx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movl %ebx, %r9d"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_crc_index_shape() {
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorl %ebp, %edi"), "{out:?}");
+        assert!(has(&out, "movzbl %dil, %esi"), "{out:?}");
+        assert!(!has(&out, "movl %ebp, %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_refusals() {
+        // C live after the op.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    addl %edi, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // B live after the reader.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %al, %esi\n    addl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // Non-commutative op.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    subl %edi, %eax\n    movzbl %al, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // Reader mentions C as well: cannot retarget.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    addl %edi, %eax\n    movl %eax, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+        // High-byte alias in the reader.
+        let asm = format!(
+            "{PRO}    movl %ebp, %eax\n    xorl %edi, %eax\n    movzbl %ah, %esi\n    movl %esi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn symbol_lea_cse_all_gprs_and_invalidation() {
+        let asm = format!(
+            "{PRO}    leaq tbl(%rip), %rcx\n    movl (%rcx,%rdx,4), %eax\n    leaq tbl(%rip), %rcx\n    movl (%rcx,%rsi,4), %edx\n    notq %rcx\n    leaq tbl(%rip), %rcx\n    xorl %ecx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
+        let asm = format!("{PRO}    leaq tbl(%rip), %r8\n.LBB1:\n    leaq tbl(%rip), %r8\n    jmp .LBB1\n{EPI}");
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
+        let asm = format!("{PRO}    leaq 8(%rax), %rcx\n    leaq 8(%rax), %rcx\n{EPI}");
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 8")).count(), 2, "{out:?}");
+        let asm = format!("{PRO}    leaq tbl(%rip), %rcx\n    call g\n    leaq tbl(%rip), %rcx\n{EPI}");
+        let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
+    }
+
+    #[test]
+    fn narrows_wide_immediates_but_keeps_negative_and_large() {
+        let asm = format!(
+            "{PRO}    movabsq $4294967295, %r14\n    movq $2147483647, %rax\n    movq $2147483648, %rcx\n    movq $-1, %rdx\n    movabsq $4294967296, %rsi\n    movabsq $0xff, %r9\n{EPI}"
+        );
+        let out = body(&run(&asm, narrow_wide_immediates));
+        assert!(has(&out, "movl $4294967295, %r14d"), "{out:?}");
+        assert!(has(&out, "movl $2147483647, %eax"), "{out:?}");
+        assert!(has(&out, "movq $2147483648, %rcx"), "{out:?}");
+        assert!(has(&out, "movq $-1, %rdx"), "{out:?}");
+        assert!(has(&out, "movabsq $4294967296, %rsi"), "{out:?}");
+        assert!(has(&out, "movl $255, %r9d"), "{out:?}");
+    }
+
+    #[test]
+    fn may_write_model_is_conservative() {
+        let li = |s: &str| classify_line(s);
+        let t = "    notl %ecx";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RCX);
+        let t = "    divl %ecx";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
+        let t = "    rep stosq";
+        assert_eq!(may_write_families(t.trim(), &li(t)) & ALL_STRING_REGS, ALL_STRING_REGS);
+        let t = "    cmpl %ecx, %eax";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    addl %ecx, (%rax)";
+        assert_eq!(may_write_families(t.trim(), &li(t)), 0);
+        let t = "    frobnicate";
+        assert_eq!(may_write_families(t.trim(), &li(t)), ALL_GPR);
+        let t = "    vmovd %xmm0, %eax";
+        assert_eq!(may_write_families(t.trim(), &li(t)), RAX);
+        let t = "    cmpxchg16b (%rdi)";
+        assert_eq!(may_write_families(t.trim(), &li(t)) & (RAX | RDX), RAX | RDX);
+    }
+}
