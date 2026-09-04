@@ -976,29 +976,43 @@ fn one_round_post_phi(func: &mut IrFunction) -> usize {
     // RESOLVED source. Chained copies (d1=Copy(s1); d2=Copy(d1)) must resolve
     // d2's source to s1 — substituting the intermediate d1 would leave a
     // dangling reference once d1's own copy is removed.
-    let resolved_src: Vec<Operand> = to_remove
-        .iter()
-        .map(|&(_, _, dest, src)| {
-            let mut cur = src;
-            let mut depth = 0;
-            while depth < 32 {
-                match cur {
-                    Operand::Value(v) => {
-                        if let Some(&(_, _, d2, s2)) =
-                            to_remove.iter().find(|&&(_, _, d, _)| d == v)
-                        {
-                            cur = s2;
-                            depth += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-            cur
-        })
-        .collect();
+    //
+    // Resolution is a single memoised sweep in program order.  A removable
+    // copy's src is (by the `src_available` rule above) a constant, or a value
+    // defined in the SAME block at an EARLIER index; and its dest is
+    // single-def.  Hence every chain link points at a strictly earlier entry
+    // of `to_remove` (which is in program order), so `resolved[k]` only ever
+    // needs `resolved[j]` for j < k — O(n) total, exact for chains of any
+    // length.  The previous implementation walked each chain with a linear
+    // `find` and a hard `depth < 32` cap: a 35-link chain (the `fails`
+    // accumulator of a stress-lab `main` after every check block folded to
+    // `Copy`) stopped at an intermediate dest that was itself removed, and
+    // the backend then met `Copy v393 = v359` with v359 undefined (-O1 ICE
+    // "operand_to_rax: value has no register home" in divmod/shifts/builtins
+    // seeds; tests/regression/post_phi_copy_chain_long.c).
+    let resolved_src: Vec<Operand> = {
+        let mut dest_to_idx: crate::common::fx_hash::FxHashMap<u32, usize> =
+            crate::common::fx_hash::FxHashMap::default();
+        let mut resolved: Vec<Operand> = Vec::with_capacity(to_remove.len());
+        for (k, &(_, _, dest, src)) in to_remove.iter().enumerate() {
+            let r = match src {
+                Operand::Value(v) => match dest_to_idx.get(&v.0) {
+                    Some(&j) => resolved[j],
+                    None => src,
+                },
+                Operand::Const(_) => src,
+            };
+            resolved.push(r);
+            dest_to_idx.insert(dest.0, k);
+        }
+        // Invariant: no resolved source may name a dest that is being removed
+        // (that is exactly the dangling-reference failure mode above).
+        debug_assert!(resolved.iter().all(|r| match r {
+            Operand::Value(v) => !dest_to_idx.contains_key(&v.0),
+            Operand::Const(_) => true,
+        }));
+        resolved
+    };
     // Const-resolved removals must not orphan Value-position uses (Load.ptr,
     // Store.ptr, GEP.base, ...): those fields cannot hold a constant, so
     // `replace_value_in_place` would silently skip them and the removed copy's
@@ -1071,6 +1085,87 @@ mod tests {
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst};
+
+    /// Post-phi cleanup must resolve copy chains of ANY length exactly.  The
+    /// old resolver capped the walk at 32 links; a longer chain resolved to
+    /// an intermediate dest that was itself removed and the survivor read an
+    /// undefined value (backend hard gate ICE at -O1).  Chain of 40 links,
+    /// last link consumed by a Cmp in another block (so it is kept) and by a
+    /// Return: after cleanup every remaining operand must be defined.
+    #[test]
+    fn test_post_phi_long_chain_no_dangling_use() {
+        const N: u32 = 40;
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let mut insts = vec![Instruction::Copy {
+            dest: Value(1),
+            src: Operand::Const(IrConst::I32(0)),
+        }];
+        for i in 1..N {
+            insts.push(Instruction::Copy {
+                dest: Value(i + 1),
+                src: Operand::Value(Value(i)),
+            });
+        }
+        // Last link feeds a compare in the same block AND a return in
+        // another block, so it must survive while the chain collapses.
+        insts.push(Instruction::Cmp {
+            dest: Value(N + 1),
+            op: crate::ir::reexports::IrCmpOp::Eq,
+            lhs: Operand::Value(Value(N)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(N + 1)),
+                true_label: BlockId(1),
+                false_label: BlockId(1),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(N)))),
+            source_spans: Vec::new(),
+        });
+
+        let removed = propagate_copies_post_phi(&mut func);
+        assert!(removed >= (N - 1) as usize, "chain should collapse, removed={removed}");
+
+        // Every remaining Value operand must have a definition.
+        let mut defined = std::collections::HashSet::new();
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                if let Some(d) = inst.dest() {
+                    defined.insert(d.0);
+                }
+            }
+        }
+        for b in &func.blocks {
+            for inst in &b.instructions {
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        assert!(defined.contains(&v.0), "dangling use of v{} in {:?}", v.0, inst);
+                    }
+                });
+            }
+            crate::backend::liveness::for_each_operand_in_terminator(&b.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    assert!(defined.contains(&v.0), "dangling use of v{} in terminator", v.0);
+                }
+            });
+        }
+        // The surviving definition of the last link must be the constant.
+        let last = func.blocks[0]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Copy { dest, .. } if dest.0 == N))
+            .expect("last link kept");
+        assert!(matches!(last, Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }), "{last:?}");
+    }
 
     #[test]
     fn test_simple_copy_propagation() {
