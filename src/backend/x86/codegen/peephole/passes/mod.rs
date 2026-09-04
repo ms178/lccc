@@ -32,6 +32,7 @@ mod frame_compact;
 mod helpers;
 mod identical_blocks;
 mod liveness;
+mod load_op_fuse;
 mod local_patterns;
 mod loop_trampoline;
 mod memory_fold;
@@ -565,6 +566,21 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("dead_leaq") {
             changed |= local_patterns::eliminate_redundant_leaq(&store, &mut infos);
         }
+        // Symbol-LEA CSE for every GPR and generic load->ALU memory-operand
+        // fusion (any addressing mode, liveness-proved dead scratch); see
+        // load_op_fuse.rs for the soundness argument.
+        if !sk("symbol_lea_cse") {
+            changed |= load_op_fuse::eliminate_redundant_symbol_lea(&store, &mut infos);
+        }
+        if !sk("recurrence_inplace") {
+            changed |= load_op_fuse::fold_recurrence_update(&mut store, &mut infos);
+        }
+        if !sk("copy_dying_operand") {
+            changed |= load_op_fuse::fold_copy_into_dying_operand(&mut store, &mut infos);
+        }
+        if !sk("load_alu_fuse") {
+            changed |= load_op_fuse::fuse_load_into_alu(&mut store, &mut infos);
+        }
         // Generic move-relay elimination and windowed lea->memory folding.
         // Both are block-local; see relay_and_lea.rs for the two deadness
         // proofs (block-local write-before-read, whole-function uniqueness).
@@ -932,6 +948,13 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Phase 7: Compact stack frames.
     if !skip_phase7 {
         frame_compact::compact_frame(&mut store, &mut infos);
+    }
+
+    // Phase 7b: Narrow `movabsq/movq $imm` to `movl` where zero-extension
+    // yields the identical 64-bit value (BACKLOG PF-16). Runs after every
+    // pattern pass so no earlier matcher has to know both spellings.
+    if !sk("narrow_imm") {
+        load_op_fuse::narrow_wide_immediates(&mut store, &mut infos);
     }
 
     // Phase 8: Merge identical basic blocks (phi trampoline deduplication).
