@@ -62,6 +62,7 @@ pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
 pub(crate) mod vec_load_sink;
+pub(crate) mod vec_interleave;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -1334,6 +1335,29 @@ pub(crate) fn run_passes(
             );
             total_changes += n;
             total_changes_excl_dce += n;
+            // Vector-reduction accumulator interleaving (x86-64 only): split
+            // each latency-bound single-accumulator reduction loop the
+            // vectorizer produced into IF independent chains feeding a
+            // displacement-folded main loop, with the original loop kept
+            // verbatim as the epilogue (ICX's vfmadd231pd YMM accumulator
+            // style, Rule 15).  Runs BEFORE vec_load_sink so the sink's
+            // single-use load relocation sees the interleaved, folded order.
+            // AArch64 is deliberately excluded: its vector-load emitter reads
+            // args[0..2] only and would silently drop a folded displacement
+            // argument.
+            // Pass name for CCC_DISABLE_PASSES: "vec_interleave"
+            if target == crate::backend::Target::X86_64
+                && !pass_disabled(&disabled, "vec_interleave")
+            {
+                let n = timed_pass!(
+                    "vec_interleave",
+                    run_on_visited(module, &dirty, &mut changed, |f| {
+                        vec_interleave::run(f, fp_reassoc)
+                    })
+                );
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
 
             // Single-use vector-load sinking (x86 only): place each stream
             // load directly before its unique consumer so the emitter's
