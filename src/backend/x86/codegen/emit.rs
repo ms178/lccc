@@ -4539,6 +4539,13 @@ impl X86Codegen {
         {
             return false;
         }
+        // Same mirrored gate for the fixed-size memset expansion.
+        if self
+            .inline_memset_len(direct_sym.unwrap_or(""), &info.args, info.is_variadic)
+            .is_some()
+        {
+            return false;
+        }
         // Non-variadic, no sret. Direct calls need a named symbol; indirect
         // calls are admitted through the callee-pointer resolution below.
         if info.is_variadic || info.is_sret {
@@ -5099,6 +5106,19 @@ impl ArchCodegen for X86Codegen {
 
     fn supports_inline_memcpy_call(&self) -> bool {
         true
+    }
+
+    /// Fixed-size `memset` expansion policy (docs/CPU_MODEL_AUDIT.md §4,
+    /// follow-up item "memset lowering").  The shape test is shared with
+    /// the MachInst typed-call gate (`inline_memset_const_len`); the
+    /// profitability test is the tuning row's `memset_strategy`, evaluated
+    /// with the vector width the `-march` contract allows.  `LibCall` (size
+    /// above ¼ L3 on ERMS rows / 8 KiB otherwise) keeps the libc call, whose
+    /// non-temporal path wins there.  Under `-mno-sse` every size that is
+    /// not a libcall is still expanded (scalar stores / `rep stosb`), which
+    /// is also what the kernel build requires (no libc).
+    fn inline_memset_len(&self, func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+        crate::backend::generation::x86_inline_memset_len(func, args, is_variadic)
     }
 
     fn fp_contract(&self) -> crate::common::fp_contract::FpContract {
@@ -6561,8 +6581,9 @@ impl ArchCodegen for X86Codegen {
         fn emit_memcpy_store_dest_from_acc(&mut self) => emit_memcpy_store_dest_from_acc_impl;
         fn emit_memcpy_store_src_from_acc(&mut self) => emit_memcpy_store_src_from_acc_impl;
         fn emit_memcpy_impl(&mut self, size: usize) => emit_memcpy_impl_impl;
-        fn emit_inline_memcpy_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memcpy_call_impl;
+        fn emit_inline_memcpy_call(&mut self, dest: &Operand, src: &Operand, size: usize, result: Option<&Value>) => emit_inline_memcpy_call_impl;
         fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memmove_call_impl;
+        fn emit_inline_memset_call(&mut self, dest: &Operand, value: &Operand, size: usize, result: Option<&Value>) => emit_inline_memset_call_impl;
         fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
         fn emit_seg_load_const_addr(&mut self, dest: &Value, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_const_addr_impl;
         fn emit_seg_store_const_addr(&mut self, val: &Operand, addr: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_store_const_addr_impl;

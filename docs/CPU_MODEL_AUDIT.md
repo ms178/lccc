@@ -157,3 +157,51 @@ scripts/tune_oracle.py compare --flags="-O2 -march=x86-64-v3 -mtune=raptorlake" 
 scripts/uops_info_probe.py DIV_R64 MOVBE_R64_M64 LEA_B_I_D8_R64 SHL_R64_CL
 LCCC_BIN=target/fastbuild/lccc scripts/run_regression_suite.sh cpu_model
 ```
+
+
+## 7. Session `cpu-model-v4` — red-team of v3 and the memset/leaf line
+
+Base: `648fd97` (upstream main after PR #401).  Every number below was
+re-measured this session with `scripts/godbolt.py compare` (GCC 16.2,
+Clang 23.1.0, ICX latest, `-O2 -march=x86-64-v3 -mtune=raptorlake`) and the
+local fastbuild binary; runtime behaviour was A/B'd against GCC 12.2 on the
+suite runner.
+
+### 7.1 Findings
+
+| # | Severity | Finding | Resolution |
+|---|----------|---------|------------|
+| 1 | **codegen defect** | `memset_strategy()` / `rep_stosb_threshold` existed since v2 but had **no consumer**: every constant-size `memset` was `call memset@PLT` (10 instructions incl. a callee-saved spill for `memset(p,0,15)`; Clang: 2 stores). | `emit_inline_memset_call_impl` (`memory.rs`): < 16 B two overlapping scalar stores (Clang shape, one store fewer than GCC's 8/4/2/1 ladder for 3/5/6/7/9–15); ≤ 8 vector stores straight-line with an overlapping tail; counted loop with negative-displacement remainder; `rep stosb` ≥ 2048 B on ERMS rows; libcall above ¼ L3.  VEX-128 forms whenever AVX2 is on so no legacy-SSE op runs on a dirty upper state; `-mno-sse` gets scalar/`rep stosb`.  Runtime fill bytes are broadcast through `imul 0x0101…` (GCC's sequence at baseline). |
+| 2 | **codegen defect** | `struct big b = {0};` (4096 B) lowered to **512 × `movq $0, d(%rsp)`** (≈5.5 KiB of code, 512 µops); GCC: `rep stosq`, Clang: `memset`. | `zero_init_region` emits `memset(p,0,n)` above `ZERO_INIT_STORE_LADDER_MAX = 128` (16 × 8-byte stores = Clang's `MaxStoresPerMemset`); the x86 backend then applies the tuned expansion (`rep stosb` at 4096 on RPL). Below 128 B the store ladder is kept so SROA/DSE/store→load forwarding still see every store. |
+| 3 | **codegen defect** | An inline-expanded `memcpy`/`memset` still counted as a *call* for the parameter-home policy (`x86_param_caller_homes_safe`), the call-argument staging exclusion (`collect_call_arg_values`) and the frame-alignment pad (`has_calls`). Result: `void z(char*p){memset(p,0,15);}` = push/sub/mov/…/pop around two stores — 8 instructions vs 3 for GCC/Clang/ICX. | All three predicates now share the exact expansion decision (`generation::inline_memcpy_len`, `generation::x86_inline_memset_len`, the latter reading `cpu_model::active()` so RA, prologue and emitter can never disagree). The parameter exemption is admitted only when `x86_params_dead_after_inline_libc_calls` proves no parameter is read after an entry-block expansion. |
+| 4 | **bug (introduced by 3, caught by the probe matrix)** | With parameters left in `%rdi/%rsi`, the result copy `p = memcpy(...)` re-read `args[0]` *after* the expansion had clobbered the operand registers: `return memcpy(b, s, 16)` returned `s`. | The result is captured in `%rdx` (untouched by both expansions, never a home across a call point) and stored by the emitter (`store_inline_libc_result`); the trait signature carries `result: Option<&Value>`. |
+| 5 | **bug (latent, exposed by 3)** | `memcpy(d, s)` in `f(char *s, char *d)` staged `d → %rdi` first, destroying `s` homed in `%rdi`. | `stage_copy_operands`: order follows the register homes; the full swap is one `xchgq %rdi, %rsi`. memset stages the fill value into `%rax` (never a home) before the destination. |
+| 6 | **waste** | The `memcpy`/`memset` result was materialised even when unused (`movq %rdi, %rax` in every leaf copy). | Gated on `value_use_counts` (`call_result_is_used`). |
+
+### 7.2 Oracle table (instructions per function, `-O2 -march=x86-64-v3 -mtune=raptorlake`)
+
+| function | lccc before | **lccc now** | GCC 16.2 | Clang 23.1 | ICX | note |
+|----------|------------:|-------------:|---------:|-----------:|----:|------|
+| `memset(p,0,15)` | 8 | **5** | 3 | 3 | 3 | body identical to Clang (2 overlapping `movq $0`); residual `subq/addq $24` — FOLLOWUP #1 |
+| `memset(p,0,64)` | 8 (call) | **7** | — | — | — | `vpxor` + 2 × `vmovdqu %ymm0` + `vzeroupper` |
+| `memset(p,0x5a,200)` | 17 (call) | **14** | 13 | 11 | 11 | `vpbroadcastd` + 7 stores incl. overlapping tail |
+| `memset(p,c,40)` | 17 (call) | **13** | 6 | 9 | 9 | runtime broadcast still `movzbl/movabs/imul` (5) — FOLLOWUP #2 |
+| `memset(p,0,4096)` | 9 (call) | **6** | 3 | 3 | 3 | `xorl/movl/rep stosb`; oracles tail-call `memset` |
+| `struct{char[4096]} b={0}; use(&b)` | 522 (512 stores) | **10** | 9 | 12 | 12 | `rep stosb`; one redundant `movb $0` from the `{0}` element — FOLLOWUP #3 |
+
+At `-mtune=generic` (no ERMS) the 4096-byte fill is the 16-byte `movups`
+loop (10 instructions) — the row decides, as designed.
+
+### 7.3 Validation
+
+* `tests/regression/cpu_model_memset_inline.c` — 74 sizes × {0, 0xFF, 0x5A,
+  runtime 0x1234, runtime −1, swapped-argument, `__builtin_memset`} ×
+  {aligned, +1, +7} destinations with 32-byte canaries on both sides,
+  return-value check, alloca/global/pointer-arithmetic destinations, two
+  fills back to back; `cpu_model_memset_raptorlake.c` re-runs it at
+  `-march=x86-64-v3 -mtune=raptorlake`.  Verified identical to GCC at
+  `-O0/-O1/-O2/-O3`, `generic`, `raptorlake`, `znver1`, `znver4`, `-mno-sse`.
+* Probe matrix `acc.c`/`swap.c`/`pre.c` (accumulator-homed destinations,
+  swapped params, float params, struct copies under the pre-store model) —
+  GCC-identical hashes at every level.
+* Full suite: see FOLLOWUP §"Accomplished".

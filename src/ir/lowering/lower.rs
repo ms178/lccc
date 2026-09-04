@@ -164,6 +164,14 @@ pub struct Lowerer {
     pub(super) gnu89_inline: bool,
 }
 
+/// Largest zero-initialised aggregate region lowered as an explicit store
+/// ladder (see `zero_init_region`).  16 eight-byte stores: Clang's
+/// `MaxStoresPerMemset` at the scalar width; GCC's `clear_by_pieces` gives up
+/// earlier (CLEAR_RATIO 6 at generic tuning), so this is the *larger* of the
+/// two oracles' ladders and never trades a store the passes could fold for a
+/// call they cannot see through.
+pub(crate) const ZERO_INIT_STORE_LADDER_MAX: usize = 128;
+
 impl Lowerer {
     /// Create a new Lowerer with pre-populated state from semantic analysis.
     ///
@@ -2362,6 +2370,44 @@ impl Lowerer {
         ret
     }
 
+    /// Emit `memset(dest, 0, size)` for a large zero-initialised region.
+    /// The x86 backend expands the fixed-size call per CPU tuning row
+    /// (`X86Tune::memset_strategy`: straight-line vector stores, counted
+    /// loop, `rep stosb`); other backends keep the libc call, which is also
+    /// what GCC/Clang emit for aggregates of this size.
+    pub(super) fn emit_memset_zero(&mut self, dest: Value, size: usize) -> Value {
+        let ret = self.fresh_value();
+        let ptr_ty = IrType::Ptr;
+        let size_ty = crate::common::types::target_int_ir_type();
+        self.emit(Instruction::Call {
+            func: "memset".to_string(),
+            info: CallInfo {
+                dest: Some(ret),
+                args: vec![
+                    Operand::Value(dest),
+                    Operand::Const(IrConst::I32(0)),
+                    Operand::Const(IrConst::ptr_int(size as i64)),
+                ],
+                arg_types: vec![ptr_ty, IrType::I32, size_ty],
+                return_type: ptr_ty,
+                is_variadic: false,
+                num_fixed_args: 3,
+                struct_arg_sizes: vec![None, None, None],
+                struct_arg_aligns: vec![None, None, None],
+                struct_arg_classes: vec![Vec::new(), Vec::new(), Vec::new()],
+                struct_arg_riscv_float_classes: Vec::new(),
+                struct_arg_is_f128_sse: vec![false, false, false],
+                is_sret: false,
+                is_fastcall: false,
+                is_pure: false,
+                is_const: false,
+                ret_eightbyte_classes: Vec::new(),
+                ret_is_f128_sse: false,
+            },
+        });
+        ret
+    }
+
     pub(super) fn terminate(&mut self, term: Terminator) {
         let block = BasicBlock {
             label: self.func_mut().current_label,
@@ -2667,12 +2713,36 @@ impl Lowerer {
     }
 
     /// Zero-initialize a region of memory within an alloca at the given byte offset.
+    ///
+    /// Regions up to `ZERO_INIT_STORE_LADDER_MAX` bytes are lowered as a
+    /// ladder of 8-byte (then 1-byte) stores: the IR-level passes (SROA,
+    /// store→load forwarding, DSE of fields that are immediately
+    /// overwritten) see every store.  Larger regions become one
+    /// `memset(p, 0, n)` call.  Before this cut-over a 4096-byte
+    /// `struct big b = {0};` emitted 512 × `movq $0, d(%rsp)` (≈5.5 KiB of
+    /// code, one µop each); the tuned memset expansion is 3–8 instructions.
     pub(super) fn zero_init_region(
         &mut self,
         alloca: Value,
         base_offset: usize,
         region_size: usize,
     ) {
+        if region_size > ZERO_INIT_STORE_LADDER_MAX {
+            let dest = if base_offset == 0 {
+                alloca
+            } else {
+                let addr = self.fresh_value();
+                self.emit(Instruction::GetElementPtr {
+                    dest: addr,
+                    base: alloca,
+                    offset: Operand::Const(IrConst::ptr_int(base_offset as i64)),
+                    ty: IrType::I8,
+                });
+                addr
+            };
+            self.emit_memset_zero(dest, region_size);
+            return;
+        }
         let mut offset = base_offset;
         let end = base_offset + region_size;
         while offset + 8 <= end {

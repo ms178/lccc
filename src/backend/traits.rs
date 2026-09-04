@@ -1834,12 +1834,49 @@ pub trait ArchCodegen {
     /// Inline a fixed-size memcpy call: `dest = memcpy(dest, src, size)` with
     /// `dest`/`src` as generic operands. Only called when
     /// `supports_inline_memcpy_call()` is true.
-    fn emit_inline_memcpy_call(&mut self, _dest: &Operand, _src: &Operand, _size: usize) {}
+    ///
+    /// `result` is the call's result value when it is used (`p = memcpy(...)`);
+    /// the backend must materialise `dest` into it itself, because after the
+    /// expansion the operand registers (%rdi/%rsi/%rcx) no longer hold the
+    /// original arguments and a parameter homed there may have been
+    /// overwritten (regression: `return memcpy(b, s, 16)` returned `s`).
+    fn emit_inline_memcpy_call(
+        &mut self,
+        _dest: &Operand,
+        _src: &Operand,
+        _size: usize,
+        _result: Option<&Value>,
+    ) {
+    }
 
     /// Inline a fixed-size memmove call. Must handle overlapping ranges:
     /// copies forward when dest < src, backward when dest > src.
     /// Only called when `supports_inline_memcpy_call()` is true.
     fn emit_inline_memmove_call(&mut self, _dest: &Operand, _src: &Operand, _size: usize) {}
+
+    /// `Some(n)` when this backend will expand the fixed-size fill call
+    /// `memset(dest, c, n)` / `__memset_chk(dest, c, n, destlen)` inline
+    /// instead of emitting a libc call.  The decision is the backend's
+    /// because it depends on the active CPU tuning row and instruction-set
+    /// contract (`X86Tune::memset_strategy`: straight-line stores, counted
+    /// vector loop, `rep stosb`, or `LibCall` above the L3-derived bound).
+    /// Default: never (non-x86 backends keep the libc call).
+    fn inline_memset_len(&self, _func: &str, _args: &[Operand], _is_variadic: bool) -> Option<usize> {
+        None
+    }
+
+    /// Expand `memset(dest, value, size)` inline.  `value` is the `int`
+    /// argument (only its low byte is used, C11 7.24.6.1); it may be a
+    /// constant or a runtime value.  Only called when `inline_memset_len`
+    /// returned `Some(size)` for this call.
+    fn emit_inline_memset_call(
+        &mut self,
+        _dest: &Operand,
+        _value: &Operand,
+        _size: usize,
+        _result: Option<&Value>,
+    ) {
+    }
 
     // --- Unary operation primitives ---
 
