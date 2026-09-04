@@ -179,14 +179,19 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
     changed
 }
 
-/// Fold a single-use scalar-FP register load into an adjacent VEX arithmetic
-/// instruction.
+/// Fold a single-use scalar-FP register load into an adjacent scalar-FP
+/// arithmetic instruction (VEX 3-operand and legacy 2-operand forms).
 ///
 /// ```text
 /// movsd 8(%rsi), %xmm5
 /// vsubsd %xmm5, %xmm4, %xmm4
 ///   ->
 /// vsubsd 8(%rsi), %xmm4, %xmm4
+///
+/// movsd -40(%rbp), %xmm1
+/// mulsd %xmm1, %xmm0
+///   ->
+/// mulsd -40(%rbp), %xmm0
 /// ```
 ///
 /// This deliberately uses a stronger-than-necessary liveness proof: the loaded
@@ -242,8 +247,14 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             continue;
         };
         let legal_op = match load_op {
-            "movsd" => matches!(arith_op, "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd"),
-            "movss" => matches!(arith_op, "vaddss" | "vsubss" | "vmulss" | "vdivss"),
+            "movsd" => matches!(
+                arith_op,
+                "vaddsd" | "vsubsd" | "vmulsd" | "vdivsd" | "addsd" | "subsd" | "mulsd" | "divsd"
+            ),
+            "movss" => matches!(
+                arith_op,
+                "vaddss" | "vsubss" | "vmulss" | "vdivss" | "addss" | "subss" | "mulss" | "divss"
+            ),
             _ => false,
         };
         if !legal_op {
@@ -251,7 +262,17 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         let ops: Vec<&str> = arith_operands.split(',').map(str::trim).collect();
-        if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
+        // VEX 3-operand form (dst == src2 required, and dst may not be the
+        // loaded register: the removed load also supplies the destructive
+        // destination's old value).  Legacy 2-operand form (mulsd/addsd/
+        // subsd/divsd and the *ss variants): src must be the loaded register
+        // and dst must differ from it for the same reason.
+        if arith_op.starts_with('v') {
+            if ops.len() != 3 || ops[0] != src_reg || ops[1] != ops[2] || ops[1] == src_reg {
+                i += 1;
+                continue;
+            }
+        } else if ops.len() != 2 || ops[0] != src_reg || ops[1] == src_reg {
             i += 1;
             continue;
         }
@@ -308,7 +329,11 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
 
-        let replacement = format!("    {} {}, {}, {}", arith_op, mem, ops[1], ops[2]);
+        let replacement = if arith_op.starts_with('v') {
+            format!("    {} {}, {}, {}", arith_op, mem, ops[1], ops[2])
+        } else {
+            format!("    {} {}, {}", arith_op, mem, ops[1])
+        };
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[i + 1], i + 1, replacement);
         changed = true;

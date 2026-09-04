@@ -2426,8 +2426,27 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // their own callee-saved home (or they spill). Removing them here was
     // how `++i` before `strtol` inherited `%edi` and the latch read garbage
     // (zlib-ng minideflate / loop_iv_across_call).
+    //
+    // A source with consumers other than the latch copy must likewise keep
+    // its own home: apply_phi_coalesce_assignments only hands the phi's
+    // register over when no *other* holder of that register overlaps the
+    // source's interval. When that veto fires, a home-less source degrades
+    // to slot traffic on both sides of the backedge (store at the def,
+    // reload in the latch — `adler_split`'s a-chain regressed exactly this
+    // way once the FP gate came off). Homed, the same veto leaves the latch
+    // copy as a plain register move, and when the veto does not fire the
+    // apply phase moves the source onto the phi's register and the copy
+    // vanishes. A source read only by the latch copy stays home-less: the
+    // apply phase either gives it the phi's register or the def spills, and
+    // no other consumer can observe the difference.
     for candidate in &phi_coalesce {
-        if !phi_window_clobbers_caller_saved(func, candidate) {
+        let src_has_other_consumers = uses_excluding(
+            func,
+            candidate.backedge_src,
+            candidate.block_idx,
+            candidate.copy_idx,
+        ) > 0;
+        if !phi_window_clobbers_caller_saved(func, candidate) && !src_has_other_consumers {
             eligible.remove(&candidate.backedge_src);
         }
     }
@@ -6116,6 +6135,111 @@ fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
     )
 }
 
+/// Count uses of `value` outside the single instruction `(excl_block, excl_idx)`.
+/// Used to tell "the latch copy is the only reader" sources (safe to leave
+/// home-less for apply_phi_coalesce_assignments to inherit the phi's register)
+/// from sources with additional consumers, which must keep their own home.
+fn uses_excluding(func: &IrFunction, value: u32, excl_block: usize, excl_idx: usize) -> usize {
+    let mut n = 0usize;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if bi == excl_block && ii == excl_idx {
+                continue;
+            }
+            for_each_operand_in_instruction(inst, |op| {
+                if matches!(op, Operand::Value(v) if v.0 == value) {
+                    n += 1;
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if v.0 == value {
+                    n += 1;
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if matches!(op, Operand::Value(v) if v.0 == value) {
+                n += 1;
+            }
+        });
+    }
+    n
+}
+
+/// True iff every path from `source_block` (which defines `src` right before
+/// the phi copy of `dest` in `copy_block`) to `use_block` passes through no
+/// block that re-defines `dest`.  The eliminated copy's own block is exempt:
+/// its definition disappears with the coalescing.
+///
+/// Sharing the home of `src` and `dest` is destructive: the source
+/// definition overwrites the phi's home.  A use of `src` reached along a
+/// path that runs some OTHER definition of `dest` (a second backedge copy
+/// of the same loop-carried web, e.g. a `continue` latch in a loop with two
+/// backedges) would then read the clobbered home.  Uses reachable only
+/// through the eliminated copy — or through re-executions of the source
+/// definition itself, which refresh the home with the correct value — are
+/// safe.  This is a conservative search: the `dirty` flag records that the
+/// path crossed a phi re-definition since the last source definition, and
+/// any undetected reachability errs on the safe side.
+fn src_use_path_clear_of_dest_redefs(
+    func: &IrFunction,
+    succs: &analysis::FlatAdj,
+    use_block: usize,
+    source_block: usize,
+    copy_block: usize,
+    dest: u32,
+) -> bool {
+    let mut redef_blocks: FxHashSet<usize> = FxHashSet::default();
+    for (i, b) in func.blocks.iter().enumerate() {
+        if i == copy_block {
+            continue;
+        }
+        if b.instructions
+            .iter()
+            .any(|inst| inst.dest().is_some_and(|d| d.0 == dest))
+        {
+            redef_blocks.insert(i);
+        }
+    }
+    if redef_blocks.is_empty() {
+        return true;
+    }
+    // If the use itself sits in a block that re-defines `dest`, the redef
+    // may precede the use; without instruction-order inspection that is a
+    // hazard.
+    if redef_blocks.contains(&use_block) {
+        return false;
+    }
+    // Two-state reachability from the source definition.  `dirty` means the
+    // path crossed a re-definition of the phi since the last execution of
+    // the source definition; re-entering the source block re-executes the
+    // def and refreshes the home (the def dominates every use in SSA, so a
+    // dirty path reaching a use without a fresh def is the corruption we
+    // must reject).
+    let mut seen: FxHashSet<(usize, bool)> = FxHashSet::default();
+    let mut stack = vec![(source_block, false)];
+    while let Some((cur, dirty)) = stack.pop() {
+        if !seen.insert((cur, dirty)) {
+            continue;
+        }
+        // A use reached while dirty is a corruption site: the home was
+        // re-defined since the last source definition.  Do NOT stop at a
+        // clean use — the loop may re-visit the use block without a fresh
+        // source definition in between (e.g. second latch re-defines the
+        // phi and the header routes back to the use block), so exploration
+        // must continue through it with the dirty state carried along.
+        if cur == use_block && dirty {
+            return false;
+        }
+        let dirty = dirty || (cur != source_block && redef_blocks.contains(&cur));
+        for &s in succs.row(cur) {
+            let s = s as usize;
+            stack.push((s, if s == source_block { false } else { dirty }));
+        }
+    }
+    true
+}
+
 /// The (def, copy) window of a phi-coalesce candidate contains a caller-saved
 /// clobber. Sharing the dest register then means the source is born in that
 /// register *before* the clobber and read after it — illegal for rdi/rsi/…
@@ -6220,6 +6344,34 @@ fn apply_phi_coalesce_assignments(
             continue;
         }
 
+        // A source whose live range spans a call point cannot inherit a
+        // caller-saved home even when the (def, copy) window is call-free:
+        // the uses AFTER the window reload from a register the call
+        // clobbered.  Reproduced by loop_rotate_seq_loops: the rotated
+        // second loop's `s` (backedge source) was re-homed into the phi's
+        // caller-saved register and the post-loop printf + `s != 36` Cmp
+        // read the callee's leftovers.  The value's own allocation path
+        // models the call (callee-saved home or slot save/reload around
+        // the call point); keep that home instead of overwriting it.
+        if let Some(&src_iv) = iv_map.get(&backedge_src) {
+            let src_live = LiveInterval {
+                start: src_iv.0,
+                end: src_iv.1,
+                value_id: backedge_src,
+            };
+            if spans_any_call(&src_live, &liveness.call_points)
+                && !callee_saved.iter().any(|r| r.0 == reg.0)
+            {
+                if env_on("CCC_DEBUG_PHI_COALESCE") {
+                    eprintln!(
+                        "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: source live across a call",
+                        phi_dest, backedge_src, reg.0
+                    );
+                }
+                continue;
+            }
+        }
+
         if let Some(&src_iv) = iv_map.get(&backedge_src) {
             let has_conflict = liveness.intervals.iter().any(|iv| {
                 if iv.value_id == backedge_src || iv.value_id == phi_dest {
@@ -6318,6 +6470,19 @@ pub(crate) fn detect_phi_coalesce_groups(
     // computed from the OLD phi before the destructive update.  A folded GEP
     // (`p = &a[i]`) reads `i`'s register at the Load/Store that absorbs it,
     // so such a value read after the update observes the NEW `i`.
+    //
+    // Propagation is restricted to address-forming instructions (Cast and
+    // GetElementPtr): only those are ever *deferred* by the backend — x86
+    // folds GEP/cast chains into the SIB operand of the consuming
+    // Load/Store, re-reading the chain's root registers at the consumer.
+    // Every other instruction materializes its dest in a register at its
+    // own point (before the update), so its later uses carry no register
+    // dependency on the phi.  Propagating through all instructions was
+    // conservative to the point of deadlocking the common split-latch
+    // loop: in `do { a += buf[n]; s += a; } while (++n < len)` the byte
+    // Load depends on the `n`-indexed GEP, which put `a_next`/`s_next`
+    // into `n`'s derived set, and the latch copies of a/s then counted as
+    // reads of a derived value — vetoing the n-chain copy forever.
     let derived_before = |block: &crate::ir::reexports::BasicBlock,
                           def_idx: usize,
                           phi: u32|
@@ -6325,6 +6490,12 @@ pub(crate) fn detect_phi_coalesce_groups(
         let mut derived: FxHashSet<u32> = FxHashSet::default();
         derived.insert(phi);
         for earlier in &block.instructions[..def_idx] {
+            if !matches!(
+                earlier,
+                Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
+            ) {
+                continue;
+            }
             let mut depends = false;
             for_each_operand_in_instruction(earlier, |op| {
                 if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
@@ -6477,10 +6648,28 @@ pub(crate) fn detect_phi_coalesce_groups(
                     .any(|&v| liveness.is_live_out(source_block, v));
                 read_in_tail || read_by_terminator || phi_escapes || derived_escapes
             };
+            // Uses of the source in *other* blocks used to veto coalescing
+            // outright: after sharing the home, the only hazard is a path
+            // from the source definition to such a use that re-defines the
+            // phi dest (another backedge copy of the same loop-carried web
+            // would clobber the shared home before the use reads it).  A
+            // direct exit successor that reads the freshly computed value
+            // (`return b` after the last iteration) is safe: the def wrote
+            // exactly the value the exit consumes.  Check path cleanliness
+            // per use block instead of rejecting blindly.
             let source_used_elsewhere = src_use_blocks.get(&src.0).is_some_and(|blocks| {
-                blocks
-                    .iter()
-                    .any(|&use_block| use_block != block_idx && use_block != source_block)
+                blocks.iter().any(|&use_block| {
+                    use_block != block_idx
+                        && use_block != source_block
+                        && !src_use_path_clear_of_dest_redefs(
+                            func,
+                            &succs,
+                            use_block as usize,
+                            source_block,
+                            block_idx,
+                            dest.0,
+                        )
+                })
             });
             let source_used_before_copy = !same_block
                 && block.instructions[..copy_idx]
@@ -6892,12 +7081,88 @@ mod phi_coalesce_tests {
 
     #[test]
     fn rejects_split_latch_when_gp_derived_value_escapes() {
-        // Old-phi-derived value `v3 = n1 * 2` carried to the exit block:
-        // after the source def the register holds the NEW value, so v3's
-        // consumer would be corrupted — even though the phi itself does not
-        // escape.  `derived_escapes` must block the candidate.
+        // `p = &a[i]` (derived from the phi) formed before the update and
+        // consumed in a successor: a folded GEP would re-read the phi's
+        // register and observe the NEW i. Only address-forming instructions
+        // (Cast/GEP) keep the register dependency; a BinOp would have been
+        // materialized at its own point and is therefore a legal coalesce
+        // (see `accepts_materialized_binop_escaping_source_block`).
         let mut func =
             IrFunction::new("split_latch_derived_escape".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(10)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::GetElementPtr {
+                        dest: Value(3),
+                        base: Value(1),
+                        offset: Operand::Const(IrConst::I32(2)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(3),
+                    ty: IrType::I32,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                    volatile: false,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        func.next_value_id = 5;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "derived GEP live out of the source block must block coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_materialized_binop_escaping_source_block() {
+        // The adler-style shape: a value computed from the phi BEFORE the
+        // update by a BinOp (materialized into its own register at its own
+        // point — no deferred address re-formation) and consumed in a
+        // successor. Coalescing is legal: the consumer reads the
+        // materialized register, not the phi's home.  (`v3 = n1 * 2`
+        // followed by `return v3` after the exit branch.)
+        let mut func =
+            IrFunction::new("split_latch_binop_escape".to_string(), IrType::I32, vec![], false);
         func.blocks = vec![
             block(
                 0,
@@ -6946,10 +7211,10 @@ mod phi_coalesce_tests {
         let liveness = compute_live_intervals(&func);
         let candidates = detect_phi_coalesce_groups(&func, &liveness);
         assert!(
-            !candidates
+            candidates
                 .iter()
                 .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
-            "derived old-phi value live out of the source block must block coalesce: {candidates:?}"
+            "materialized (non-address) derived values must not veto coalescing: {candidates:?}"
         );
     }
 
@@ -7202,6 +7467,193 @@ mod phi_coalesce_tests {
         );
     }
 
+    /// loop_rotate_seq_loops shape: the rotated loop's backedge source `s`
+    /// is LIVE ACROSS the exit block's printf call, but the (def, copy)
+    /// window itself contains no call.  Re-homing `s` into the phi's
+    /// caller-saved register makes the post-call `s != 36` Cmp read the
+    /// callee's leftovers.  The apply phase must consult the source's full
+    /// interval, not just the window.
+    #[test]
+    fn apply_refuses_caller_saved_home_across_call_outside_window() {
+        let mut func = IrFunction::new("rotate_seq_shape".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![
+                    empty_call(None),
+                    Instruction::Cmp {
+                        dest: Value(4),
+                        op: IrCmpOp::Ne,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I32(36)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        func.next_value_id = 5;
+
+        let liveness = compute_live_intervals(&func);
+        let iv_map = interval_map(&liveness);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 2,
+            source_block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 0,
+        };
+        assert!(
+            !phi_window_clobbers_caller_saved(&func, &cand),
+            "precondition: the call sits in the exit block, outside the (def, copy) window"
+        );
+
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(14)); // %edi — caller-saved
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)], // only rbx is callee-saved
+        );
+        assert_eq!(
+            assignments.get(&2),
+            None,
+            "post-call use of the source must veto the caller-saved home: {assignments:?}"
+        );
+
+        // A callee-saved dest home is still legal: the call preserves it.
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(1));
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)],
+        );
+        assert_eq!(
+            assignments.get(&2).copied(),
+            Some(PhysReg(1)),
+            "callee-saved home may still be shared across the call: {assignments:?}"
+        );
+    }
+
+    /// Same shape minus the call: the source dies in the exit block's
+    /// arithmetic, so the caller-saved home is legal.  The interval guard
+    /// must not over-block when no call point falls inside the source range.
+    #[test]
+    fn apply_accepts_caller_saved_home_when_no_call_in_source_range() {
+        let mut func = IrFunction::new("rotate_seq_nocall".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(3)),
+                    ty: IrType::I32,
+                }],
+                Terminator::Return(Some(Operand::Value(Value(4)))),
+            ),
+        ];
+        func.next_value_id = 5;
+
+        let liveness = compute_live_intervals(&func);
+        let iv_map = interval_map(&liveness);
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 2,
+            source_block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 0,
+        };
+
+        let mut assignments = FxHashMap::default();
+        assignments.insert(1, PhysReg(14)); // %edi — caller-saved
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            &mut assignments,
+            &[PhysReg(1)], // only rbx is callee-saved
+        );
+        assert_eq!(
+            assignments.get(&2).copied(),
+            Some(PhysReg(14)),
+            "call-free source range must still coalesce: {assignments:?}"
+        );
+    }
+
     /// sqlite3 vdbeChangeP4Full: `if (n==0) n = strlen(z); memcpy; p[n]=0`.
     /// The join Copy of I32 `n` is multi-def. `resolve_index` peels the
     /// widening Cast so folded_index_uses keys on that Copy dest, whose last
@@ -7347,5 +7799,274 @@ mod phi_coalesce_tests {
                 home.0
             );
         }
+    }
+
+    /// Split-latch loop helper:
+    ///   0: v1 = 0            (preheader init)
+    ///   1: v2 = v1 + 1; condbr v2 -> 2 (latch) / 3 (exit)
+    ///   2: v1 = v2; branch 1 (single-predecessor split latch)
+    ///   3: exit
+    fn split_latch_func(exit_ret: Terminator) -> IrFunction {
+        let mut func = IrFunction::new("split_latch".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, Vec::new(), exit_ret),
+        ];
+        func.next_value_id = 3;
+        func
+    }
+
+    fn coalesced_pair(candidates: &[PhiCoalesceCandidate]) -> Option<(usize, usize)> {
+        candidates
+            .iter()
+            .find(|c| c.phi_dest == 1 && c.backedge_src == 2)
+            .map(|c| (c.block_idx, c.source_block_idx))
+    }
+
+    #[test]
+    fn accepts_split_latch_int_backedge_coalesce() {
+        // The rotated counted-loop shape with an INTEGER carried value:
+        // the latch is a separate single-predecessor block and the exit
+        // consumes nothing.  This used to be refused for non-FP sources,
+        // leaving 2 movs + a jmp per iteration (zlib-ng adler32 shape).
+        let func = split_latch_func(Terminator::Return(Some(Operand::Const(IrConst::I32(0)))));
+        let liveness = compute_live_intervals(&func);
+        assert!(
+            liveness.block_loop_depth.get(1).copied().unwrap_or(0) > 0,
+            "loop-depth oracle must mark the split-latch loop (test precondition)"
+        );
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert_eq!(
+            coalesced_pair(&candidates),
+            Some((2, 1)),
+            "integer split-latch backedge must coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_exit_block_src_use_when_path_clean() {
+        // `return b` after the last iteration: the exit successor reads the
+        // freshly computed backedge source.  The path def->use passes no
+        // other phi definition, so the shared home holds exactly the value
+        // the exit consumes.
+        let func = split_latch_func(Terminator::Return(Some(Operand::Value(Value(2)))));
+        let liveness = compute_live_intervals(&func);
+        assert!(
+            liveness.block_loop_depth.get(1).copied().unwrap_or(0) > 0,
+            "loop-depth oracle must mark the split-latch loop (test precondition)"
+        );
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert_eq!(
+            coalesced_pair(&candidates),
+            Some((2, 1)),
+            "clean exit-edge use of the source must coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_exit_block_old_phi_use() {
+        // `return i` after `for (...; ++i)`: the exit successor reads the
+        // OLD phi value, which the destructive update would clobber.
+        let func = split_latch_func(Terminator::Return(Some(Operand::Value(Value(1)))));
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            coalesced_pair(&candidates).is_none(),
+            "exit path reading the old phi must not coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_switch_terminator_old_phi_use() {
+        // State-machine shape: `state_next = ...; switch (state) ...`.
+        // The SOURCE block's terminator reads the old phi after the
+        // destructive update; the latch is a real successor (case 0) so
+        // the candidate would otherwise be well-formed.  The
+        // read-by-terminator check must veto it.
+        let mut func = split_latch_func(Terminator::Return(Some(Operand::Const(IrConst::I32(0)))));
+        func.blocks[1].terminator = Terminator::Switch {
+            val: Operand::Value(Value(1)),
+            cases: vec![(0, BlockId(2))],
+            default: BlockId(3),
+            ty: IrType::I32,
+        };
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            coalesced_pair(&candidates).is_none(),
+            "switch reading the old phi must not coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_cast_to_gep_chain_escaping_source_block() {
+        // A Cast of the phi feeding a GEP keeps the address dependency:
+        // the backend folds cast+GEP chains into the SIB operand of the
+        // consuming access, re-reading the phi's register there. Escaping
+        // the source block must veto coalescing even though the GEP's
+        // operand is the cast dest, not the phi itself.
+        let mut func = split_latch_func(Terminator::Return(Some(Operand::Const(IrConst::I32(0)))));
+        func.blocks[1].instructions.insert(
+            0,
+            Instruction::Cast {
+                dest: Value(5),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+        );
+        func.blocks[1].instructions.insert(
+            1,
+            Instruction::GetElementPtr {
+                dest: Value(6),
+                base: Value(2),
+                offset: Operand::Value(Value(5)),
+                ty: IrType::I32,
+            },
+        );
+        func.blocks[3].instructions = vec![Instruction::Load {
+            dest: Value(7),
+            ptr: Value(6),
+            ty: IrType::I32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        }];
+        func.next_value_id = 8;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            coalesced_pair(&candidates).is_none(),
+            "cast->GEP address chain escaping the source block must not coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_src_use_via_second_backedge_copy() {
+        // Two backedges to the same header.  v2 is defined in block 1 and
+        // used in block 4.  The CLEAN path 1 -> 2(eliminated latch copy) ->
+        // 0 -> 4 is safe, but the loop can also take 4 -> 5 (second latch
+        // re-defines v1!) -> 0 -> 4: on that pass block 4 reads the shared
+        // home AFTER the second backedge copy clobbered it, without a fresh
+        // v2 definition in between.  The dirty-path search must veto the
+        // coalescing even though a clean path exists.
+        let mut func = IrFunction::new("two_backedges".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            // 7: preheader — init copies live here and execute ONCE; the
+            //    header (0) must not re-define the phi dest on every pass.
+            block(
+                7,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(9),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                ],
+                Terminator::Branch(BlockId(0)),
+            ),
+            // 0: header.
+            block(
+                0,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(4),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            // 2: first backedge latch — the candidate copy.
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(0)),
+            ),
+            block(3, Vec::new(), Terminator::Branch(BlockId(4))),
+            // 4: uses v2.
+            block(
+                4,
+                vec![Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Mul,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(3)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(6)),
+                    true_label: BlockId(5),
+                    false_label: BlockId(6),
+                },
+            ),
+            // 5: second backedge latch — re-defines the phi dest.
+            block(
+                5,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(9)),
+                }],
+                Terminator::Branch(BlockId(0)),
+            ),
+            block(6, Vec::new(), Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+        ];
+        func.next_value_id = 10;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "second backedge copy of the phi must veto coalescing: {candidates:?}"
+        );
     }
 }

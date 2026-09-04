@@ -193,6 +193,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_fprintf", BuiltinInfo::simple("fprintf"));
     m.insert("__builtin_sprintf", BuiltinInfo::simple("sprintf"));
     m.insert("__builtin_snprintf", BuiltinInfo::simple("snprintf"));
+    m.insert("__builtin_dprintf", BuiltinInfo::simple("dprintf"));
     m.insert("__builtin_puts", BuiltinInfo::simple("puts"));
     m.insert("__builtin_putchar", BuiltinInfo::simple("putchar"));
 
@@ -346,6 +347,10 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "__builtin___vfprintf_chk",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
+    );
+    m.insert(
+        "__builtin___dprintf_chk",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::FortifyChk),
     );
     m.insert(
