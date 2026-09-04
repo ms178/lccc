@@ -1,7 +1,7 @@
 use super::definitions::{LValue, LValueKind};
 use super::lower::Lowerer;
 use crate::common::types::{AddressSpace, CType, IrType};
-use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
+use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl Lowerer {
@@ -265,14 +265,64 @@ impl Lowerer {
             Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
                 self.expr_access_is_volatile(base)
             }
-            Expr::ArraySubscript(base, _, _) => self.expr_access_is_volatile(base),
+            // `p[i]` is `*(p + i)`: volatile when the base is a volatile
+            // array object (`volatile int buf[8]; buf[i]`) OR a pointer to
+            // volatile (`volatile u32 *regs; regs[i]` — the MMIO register
+            // array idiom). The first arm alone returned false for every
+            // pointer-typed identifier, so `regs[STATUS]` spin-waits and
+            // back-to-back register writes were silently non-volatile.
+            // `i[p]` (index/base swapped) is covered symmetrically.
+            Expr::ArraySubscript(base, index, _) => {
+                self.expr_access_is_volatile(base)
+                    || self.pointee_expr_is_volatile(base)
+                    || self.pointee_expr_is_volatile(index)
+            }
             _ => false,
         }
     }
 
     /// Whether dereferencing `ptr_expr` accesses a volatile pointee.
     pub(super) fn pointee_expr_is_volatile(&self, ptr_expr: &Expr) -> bool {
-        let ptr_expr = ptr_expr;
+        // Pointer arithmetic keeps the pointee qualifier: `*(p + i)`,
+        // `*(p - 1)`, `*(i + p)`, `*(cond ? p : q)`, `*(x, p)`. The integer
+        // side of an Add/Sub is never a pointer, so recursing into both
+        // operands is exact.
+        match ptr_expr {
+            Expr::BinaryOp(BinOp::Add, l, r, _) | Expr::BinaryOp(BinOp::Sub, l, r, _) => {
+                return self.pointee_expr_is_volatile(l) || self.pointee_expr_is_volatile(r);
+            }
+            Expr::Conditional(_, t, f, _) => {
+                return self.pointee_expr_is_volatile(t) || self.pointee_expr_is_volatile(f);
+            }
+            Expr::Comma(_, r, _) => return self.pointee_expr_is_volatile(r),
+            // `volatile int *tbl[4]; *tbl[i]` / `tbl[i][j]`: the element of a
+            // volatile-based array of pointers points at volatile T.
+            Expr::ArraySubscript(base, _, _) => {
+                if let Expr::Identifier(name, _) = base.as_ref() {
+                    let (base_volatile, c_type): (bool, Option<&CType>) = if let Some(info) =
+                        self.func_state.as_ref().and_then(|fs| fs.locals.get(name))
+                    {
+                        (info.base_type_volatile, info.var.c_type.as_ref())
+                    } else if let Some(g) = self.globals.get(name) {
+                        (g.base_type_volatile, g.var.c_type.as_ref())
+                    } else {
+                        return false;
+                    };
+                    return base_volatile
+                        && match c_type {
+                            Some(CType::Array(elem, _)) => match elem.as_ref() {
+                                CType::Pointer(pointee, _) => {
+                                    !matches!(pointee.as_ref(), CType::Pointer(..))
+                                }
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                }
+                return false;
+            }
+            _ => {}
+        }
         if let Expr::Identifier(name, _) = ptr_expr {
             let (base_volatile, c_type): (bool, Option<&CType>) =
                 if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {

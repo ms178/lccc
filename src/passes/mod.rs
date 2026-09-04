@@ -42,6 +42,7 @@ pub(crate) mod licm;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_invert;
+pub(crate) mod loop_carried_forward;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
@@ -737,6 +738,12 @@ fn run_inline_phase(module: &mut IrModule, disabled: &str, allow_inline: bool, s
         module.for_each_function(loop_memory_promote::run);
     }
     iphase_dump!("cleanup-loop-memory-promote");
+    // Loop-carried store-to-load forwarding (distance-1 predictive
+    // commoning): `a[i] = f(a[i-1])` keeps the recurrence in a register
+    // instead of a store-forwarding round trip per iteration.
+    loop_carried_forward::run_module(module);
+    verify::verify_after_pass(module, "loop_carried_forward");
+    iphase_dump!("cleanup-loop-carried-forward");
     // Resolve constant branches exposed by inlining before the bounded
     // constant-call evaluator in ipcp examines the surviving call sites.
     //
@@ -1405,6 +1412,29 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Loop-carried store-to-load forwarding — iter 0, AFTER iv_widen
+        // (the `int i` address chains are now pointer-width affine forms)
+        // and BEFORE loop rotation / IVSR (guard-at-top preheader+header+
+        // latch shape, plain `GEP(base, i<<k)` addresses). Turns
+        // `a[i] = f(a[i-1])` into a register recurrence: removes the load
+        // and the L1D store-forwarding round trip from the loop's critical
+        // path (tls_seg_access 2.19× → parity with GCC's tree-predcom).
+        // Kill switch `CCC_NO_LOOP_CARRIED_FWD`. -O2+.
+        if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_carried_forward") {
+            let n = timed_pass!(
+                "loop_carried_forward",
+                loop_carried_forward::run_module(module)
+            );
+            if n > 0 {
+                for c in changed.iter_mut() {
+                    *c = true;
+                }
+                verify::verify_after_pass(module, "loop_carried_forward");
+            }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2b-rot: Loop rotation — iter 0, AFTER iv_widen (so the
         // widened phi flows through the rotated form and emits `addq`
         // directly). Transforms "guard-at-top" loops into "test-at-bottom"
@@ -2011,6 +2041,10 @@ pub(crate) fn run_passes(
         module.for_each_function(loop_memory_promote::run);
         module.for_each_function(loop_memory_promote::mark_f64_add_reduction);
     }
+    // Late loop-carried forwarding: IVSR / CFG cleanup expose marching-pointer
+    // recurrences that the early run could not normalise.
+    loop_carried_forward::run_module(module);
+    verify::verify_after_pass(module, "loop_carried_forward_late");
     // Late redundant-load elimination: post-IVSR field accesses have constant
     // offsets, so same-address loads merge when intervening stores are
     // provably non-aliasing (volatile loads are exempt by construction).
