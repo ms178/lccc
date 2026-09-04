@@ -768,6 +768,130 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
     changed
 }
 
+// ── 4b. copy + mask + flag consumer → test ─────────────────────────────────
+
+/// `movl %A,%D; andl $imm,%D; j{e,ne}/setcc/cmov…` with `%D` dead afterwards
+/// → `testl $imm,%A` (`testb $imm,%Ab` when the mask fits a byte and every
+/// consumer is ZF-only).
+///
+/// The backend lowers `if (!(x & 1))` as a copy, a destructive `and` and a
+/// branch; the copy exists only because `and` clobbers its operand. `test`
+/// computes the same result without writing it, and sets *exactly* the same
+/// flags as `and` (ZF/SF/PF from the result, CF/OF cleared), so at equal width
+/// the rewrite is flag-transparent for every consumer, including `js`/`jp`.
+/// The byte form narrows SF/PF to bit 7, hence the ZF-only requirement.
+///
+/// GCC/Clang/ICX emit `testb $1, %dil` for the `ffs1` kernel where we emitted
+/// `movl %ebx,%esi; andl $1,%esi; jne` (2 instructions + a copy per
+/// iteration of the shift loop).
+///
+/// Soundness: `%D` must be dead after the `and` (whole-function dataflow via
+/// [`FileLiveness`]); `%A` is only read; nothing between the `mov` and the
+/// `and` exists (adjacent real lines). Families 4/5 (`%rsp`/`%rbp`) never take
+/// the byte form.
+pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let mov = infos[i].trimmed(store.get(i));
+        let (wide, rest) = if let Some(r) = mov.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = mov.strip_prefix("movl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((src_text, dst_text)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let (Some(src_fam), Some(dst_fam)) =
+            (plain_gp_operand(src_text), plain_gp_operand(dst_text))
+        else {
+            i += 1;
+            continue;
+        };
+        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
+            i += 1;
+            continue;
+        }
+        let Some(j) = next_real(infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let and = infos[j].trimmed(store.get(j));
+        let (and_wide, arest) = if let Some(r) = and.strip_prefix("andq ") {
+            (true, r)
+        } else if let Some(r) = and.strip_prefix("andl ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // The copy must be at least as wide as the mask: a 32-bit copy zero-
+        // extends, so a 64-bit `and` afterwards reads zeros we would not
+        // reproduce by testing the original 64-bit source.
+        if !wide && and_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, and_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        let Some(imm) = imm_value(imm_text) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(and_dst, dst_fam, and_wide) {
+            i += 1;
+            continue;
+        }
+        // The masked value itself must be dead: only the flags survive.
+        if !matches!(lv.live_after(j, dst_fam), Some(false)) {
+            i += 1;
+            continue;
+        }
+        // Someone must actually consume the flags in this block, otherwise the
+        // pair is dead-code territory, not ours.
+        let Some(k) = next_real(infos, j, len) else {
+            i += 1;
+            continue;
+        };
+        if flags_effect(infos[k].trimmed(store.get(k))) != FlagsEffect::Reads {
+            i += 1;
+            continue;
+        }
+        let zf_only = flag_consumers_are_zf_only(store, infos, j + 1);
+        let byte_form = zf_only && (0..=255).contains(&imm) && src_fam != 4 && src_fam != 5;
+        let new_line = if byte_form {
+            format!("    testb ${}, {}", imm, REG_NAMES[3][src_fam as usize])
+        } else if and_wide {
+            format!("    testq ${}, {}", imm, REG_NAMES[0][src_fam as usize])
+        } else {
+            format!("    testl ${}, {}", imm, REG_NAMES[1][src_fam as usize])
+        };
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        // `%A` now lives up to the `test`; keep the oracle exact for later hits.
+        lv.refresh_at(store, infos, j);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
 // ── 5. redundant self-test after a logical op ────────────────────────────────
 
 /// `andl $1, %esi; testq %rsi, %rsi; je` → `andl $1, %esi; je`.
@@ -1378,4 +1502,87 @@ mod tests {
         ));
         assert!(out.contains("andl $255, %r9d"), "{out}");
     }
+    #[test]
+    fn copy_and_mask_branch_becomes_testb() {
+        // ffs1 kernel shape: `while (!(x & 1))`, mask temp dead after the branch.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            ".LBB4:\n",
+            "    movl %ebx, %esi\n",
+            "    andl $1, %esi\n",
+            "    jne .LBB5\n",
+            "    shrl $1, %ebx\n",
+            "    addl $1, %edi\n",
+            "    movl %ebx, %edx\n",
+            "    andl $1, %edx\n",
+            "    je .LBB4\n",
+            ".LBB5:\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testb $1, %bl"), "{out}");
+        assert!(!out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("andl $1, %edx"), "{out}");
+        assert!(!out.contains("movl %ebx, %esi"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_keeps_and_when_masked_value_is_live() {
+        // The masked value feeds a later add: the `and` must stay.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $1, %esi\n",
+            "    jne .LBB5\n",
+            "    addl %esi, %edi\n",
+            ".LBB5:\n",
+            "    movl %edi, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("andl $1, %esi"), "{out}");
+        assert!(!out.contains("testb"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_sign_consumer_uses_full_width_test() {
+        // `js` reads SF of the 32-bit result: the byte form would be wrong,
+        // the dword `test` is flag-identical to the `and`.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $-2147483648, %esi\n",
+            "    js .LBB5\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl $-2147483648, %ebx"), "{out}");
+        assert!(!out.contains("andl"), "{out}");
+    }
+
+    #[test]
+    fn copy_and_mask_narrow_copy_wide_mask_is_left_alone() {
+        // movl zero-extends; a 64-bit and afterwards tests bits the original
+        // %rbx may have set — no fold.
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andq $255, %rsi\n",
+            "    jne .LBB5\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("andq $255, %rsi"), "{out}");
+    }
+
 }

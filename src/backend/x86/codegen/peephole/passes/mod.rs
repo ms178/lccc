@@ -642,6 +642,9 @@ pub fn peephole_optimize(mut asm: String) -> String {
         if !sk("copy_mask_movz") {
             changed |= flag_peepholes::fold_copy_and_mask_into_movz(&mut store, &mut infos);
         }
+        if !sk("copy_mask_test") {
+            changed |= flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+        }
         if !sk("base_index") {
             changed |= local_patterns::fold_base_index_addressing(&mut store, &mut infos);
         }
@@ -943,6 +946,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
     // Phase 6: Eliminate unused callee-saved register saves/restores.
     if !skip_phase6 {
         callee_saves::eliminate_unused_callee_saves(&mut store, &mut infos);
+        callee_saves::eliminate_unused_callee_saves_fpo(&mut store, &mut infos);
     }
 
     // Phase 7: Compact stack frames.
@@ -3238,4 +3242,78 @@ mod regression_tests {
         let result = peephole_optimize(asm);
         assert!(result.contains("%xmm2"));
     }
+    #[test]
+    fn fpo_dead_callee_save_is_dropped_and_cfa_rewritten() {
+        let asm = concat!(
+            "isort:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r12\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 32\n",
+            "    leaq 4(%rdi), %rbx\n",
+            "    movl $1, %r12d\n",
+            ".LBB1:\n",
+            "    addl %r12d, %ebx\n",
+            "    cmpl %esi, %r12d\n",
+            "    jl .LBB1\n",
+            "    popq %r13\n",
+            "    popq %r12\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size isort, .-isort\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(!out.contains("%r13"), "{out}");
+        assert!(out.contains("pushq %rbx"), "{out}");
+        assert!(out.contains("pushq %r12"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 24"), "{out}");
+        assert_eq!(out.matches("popq").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn fpo_dead_callee_save_kept_when_function_calls() {
+        // A removed push would misalign %rsp at the call site.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbx\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 24\n",
+            "    movl %edi, %ebx\n",
+            "    call g\n",
+            "    addl %ebx, %eax\n",
+            "    popq %r13\n",
+            "    popq %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+        assert!(out.contains("popq %r13"), "{out}");
+        assert!(out.contains(".cfi_def_cfa_offset 24"), "{out}");
+    }
+
+    #[test]
+    fn fpo_dead_callee_save_kept_with_aligned_vector_stack_traffic() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %r13\n",
+            "    .cfi_def_cfa_offset 16\n",
+            "    subq $32, %rsp\n",
+            "    vmovaps %ymm0, (%rsp)\n",
+            "    vmovaps (%rsp), %ymm1\n",
+            "    addq $32, %rsp\n",
+            "    popq %r13\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size f, .-f\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("pushq %r13"), "{out}");
+    }
+
 }

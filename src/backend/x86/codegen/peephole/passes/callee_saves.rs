@@ -4,6 +4,16 @@
 //! referenced in the function body (all uses were optimized away). This pass
 //! detects such registers and removes their prologue save / epilogue restore
 //! instructions. The stack frame is not shrunk (see rationale inside function).
+//!
+//! Two prologue shapes are handled:
+//!
+//! * `pushq %rbp; movq %rsp,%rbp; pushq <callee-saved>…` —
+//!   [`eliminate_unused_callee_saves`].
+//! * frame-pointer-omitted `pushq <callee-saved>…` directly after
+//!   `.cfi_startproc` — [`eliminate_unused_callee_saves_fpo`]. Dropping a push
+//!   there moves `%rsp` by 8, so the FPO variant only fires in call-free
+//!   functions without aligned vector stack traffic or `%rsp` realignment, and
+//!   it rewrites the single `.cfi_def_cfa_offset` the prologue emits.
 
 use super::super::types::*;
 use super::helpers::*;
@@ -225,5 +235,169 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
         // all remaining callee-saved saves/restores to pack them tightly.
 
         i = func_end;
+    }
+}
+
+/// Frame-pointer-omitted variant of [`eliminate_unused_callee_saves`].
+///
+/// Shape (as emitted for `-O2` leaves):
+///
+/// ```text
+/// f:
+/// .cfi_startproc
+///     pushq %rbx
+///     pushq %r12
+///     pushq %r13            <- never referenced in the body
+///     .cfi_def_cfa_offset 32
+///     …
+///     popq %r13
+///     popq %r12
+///     popq %rbx
+///     ret
+/// .cfi_endproc
+/// ```
+///
+/// Soundness gates (all must hold, otherwise the function is left alone):
+///
+/// * no `call` in the body — a removed push changes the 16-byte alignment of
+///   `%rsp` at call sites;
+/// * no `and… %rsp` realignment and no `xmm`/`ymm` operand together with an
+///   `(%rsp` memory operand — aligned spills would move by 8;
+/// * exactly one `.cfi_def_cfa_offset` in the function (the prologue's); it is
+///   rewritten to `old − 8·eliminated` so unwind info stays exact;
+/// * every restore is a `popq` of the same register on an epilogue path.
+///
+/// The kernel corpus `isort` saved `%r13` without a single body use after
+/// the RA's leaf policy moved its loop state into caller-saved registers.
+pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &mut [LineInfo]) {
+    let len = store.len();
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || !infos[i].trimmed(store.get(i)).starts_with(".cfi_startproc") {
+            i += 1;
+            continue;
+        }
+        // Function extent: up to and including `.cfi_endproc`.
+        let mut func_end = len;
+        for k in i + 1..len {
+            if !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with(".cfi_endproc") {
+                func_end = k;
+                break;
+            }
+        }
+        // Leading callee-saved pushes (directives interleaved are allowed).
+        let mut saves: Vec<(RegId, usize)> = Vec::new();
+        let mut j = i + 1;
+        while j < func_end {
+            if infos[j].is_nop() || infos[j].kind == LineKind::Directive {
+                j += 1;
+                continue;
+            }
+            match infos[j].kind {
+                LineKind::Push { reg } if is_callee_saved_reg(reg) => {
+                    saves.push((reg, j));
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        if saves.is_empty() {
+            i = func_end.max(i + 1);
+            continue;
+        }
+        let body_start = j;
+
+        // Gates.
+        let mut cfa_directive: Option<(usize, i64)> = None;
+        let mut safe = true;
+        for k in i + 1..func_end {
+            if infos[k].is_nop() {
+                continue;
+            }
+            let line = infos[k].trimmed(store.get(k));
+            match infos[k].kind {
+                LineKind::Call => {
+                    safe = false;
+                    break;
+                }
+                LineKind::Directive => {
+                    if let Some(v) = line.strip_prefix(".cfi_def_cfa_offset ") {
+                        match (cfa_directive, v.trim().parse::<i64>()) {
+                            (None, Ok(n)) => cfa_directive = Some((k, n)),
+                            _ => {
+                                safe = false;
+                                break;
+                            }
+                        }
+                    } else if line.starts_with(".cfi_offset")
+                        || line.starts_with(".cfi_def_cfa ")
+                        || line.starts_with(".cfi_def_cfa_register")
+                    {
+                        safe = false;
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if line.contains("%rsp") {
+                let is_stack_adjust = matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                    || line.starts_with("subq $")
+                    || line.starts_with("addq $");
+                if !is_stack_adjust
+                    && (line.starts_with("and")
+                        || line.contains("%xmm")
+                        || line.contains("%ymm")
+                        || line.contains("%zmm"))
+                {
+                    safe = false;
+                    break;
+                }
+            }
+        }
+        if !safe {
+            i = func_end.max(i + 1);
+            continue;
+        }
+
+        let mut eliminated = 0usize;
+        for &(reg, save_idx) in &saves {
+            let mut pops: Vec<usize> = Vec::new();
+            let mut referenced = false;
+            for k in body_start..func_end {
+                if infos[k].is_nop() {
+                    continue;
+                }
+                if let LineKind::Pop { reg: pop_reg } = infos[k].kind {
+                    if pop_reg == reg {
+                        if is_near_epilogue(infos, k) {
+                            pops.push(k);
+                            continue;
+                        }
+                        referenced = true;
+                        break;
+                    }
+                }
+                if line_references_reg_fast(&infos[k], reg) {
+                    referenced = true;
+                    break;
+                }
+            }
+            if referenced || pops.is_empty() {
+                continue;
+            }
+            mark_nop(&mut infos[save_idx]);
+            for &p in &pops {
+                mark_nop(&mut infos[p]);
+            }
+            eliminated += 1;
+        }
+        if eliminated > 0 {
+            if let Some((k, old)) = cfa_directive {
+                let new = old - 8 * eliminated as i64;
+                replace_line(store, &mut infos[k], k, format!("    .cfi_def_cfa_offset {}", new));
+            }
+        }
+        i = func_end.max(i + 1);
     }
 }

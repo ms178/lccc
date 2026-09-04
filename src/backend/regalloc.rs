@@ -327,6 +327,24 @@ pub struct RegAllocConfig {
     /// Hints never override `follow_value` and are honored only when the
     /// physical register belongs to the current allocation wave.
     pub reg_hints: FxHashMap<u32, PhysReg>,
+    /// Leaf-function home policy (x86-64 only today).
+    ///
+    /// Session 28's "hot loop-carried values join Phase 1" rule hands every
+    /// heavily-used loop value a *callee-saved* home even when the function
+    /// never calls anything. On a call-free leaf that buys nothing — a
+    /// caller-saved home is exactly as safe — and costs a `push`/`pop` pair
+    /// per register plus a bigger frame (kernel corpus: `maxv` carried
+    /// rbx/r12/r13 = 6 prologue/epilogue instructions for a 4-instruction
+    /// loop body; `cntz`, `bswp32`, `scmp`, `ffs1` likewise). GCC, Clang and
+    /// ICX all allocate such leaves from the volatile pool first.
+    ///
+    /// When set AND the function has no call points, hot loop values skip
+    /// the Phase-1 promotion: they are scanned in Phase 2 (caller-saved,
+    /// priority-evicting — loop depth weights keep them ahead of span-1
+    /// temps) and only the *overflow* takes callee-saved homes in Phase 2c,
+    /// i.e. the prologue saves exactly the registers the loop actually
+    /// needs. Kill switch: `CCC_NO_LEAF_CALLER_HOME`.
+    pub leaf_caller_saved_homes: bool,
 }
 
 fn env_on(name: &'static str) -> bool {
@@ -2513,8 +2531,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // the old def-block check rejected every one of them — gzip
     // `longest_match` then spilled `scan`/`best`/`cur_match`/`len` to the
     // stack while dead entry temps held registers.
+    // Call-free leaf: a callee-saved home is never *required*, and every
+    // one taken costs a push/pop pair. Let the hot loop values compete for
+    // the volatile pool in Phase 2 first; Phase 2c still hands the overflow
+    // a callee-saved home (see `RegAllocConfig::leaf_caller_saved_homes`).
+    let leaf_prefers_caller_saved = config.leaf_caller_saved_homes
+        && call_points.is_empty()
+        && !env_on("CCC_NO_LEAF_CALLER_HOME");
     let hot_loop_home = |iv: &LiveInterval| -> bool {
-        if env_on("CCC_NO_HOT_LOOP") {
+        if env_on("CCC_NO_HOT_LOOP") || leaf_prefers_caller_saved {
             return false;
         }
         if call_spanning.contains(&iv.value_id) {
@@ -6958,6 +6983,7 @@ mod phi_coalesce_tests {
             call_arg_regs: vec![PhysReg(14), PhysReg(15), PhysReg(12), PhysReg(13)],
             indirect_target_regs: vec![PhysReg(11)],
             allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: false,
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: folded,

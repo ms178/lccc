@@ -17,6 +17,7 @@
 #                                                    bundled into index.html)
 #   $SANDBOX/src/generated/ledger.json              (machine-readable ledger)
 #   $SANDBOX/src/generated/docs.json                (follow-up docs, bundled)
+#   $SANDBOX/src/generated/evidence.json            (codegen evidence table)
 #
 # The web app offers the patch as a Blob download, shows its SHA-256, the
 # ledger and the docs, so the deliverable survives even if only the HTML
@@ -132,6 +133,15 @@ done
 ( cd "$GEN/docs" && python3 -c "
 import json,glob,os
 print(json.dumps({os.path.basename(f): open(f, encoding='utf-8', errors='replace').read() for f in sorted(glob.glob('*.md'))}))" ) | atomic_write "$GEN/docs.json"
+
+# 5b. Codegen evidence table for the web console (optional; produced by
+#     scripts/codegen_scoreboard.py --json or hand-curated per session).
+ev=${LCCC_EVIDENCE_JSON:-engineering/evidence/session/evidence.json}
+if [[ -f "$ev" ]]; then
+  atomic_write "$GEN/evidence.json" < "$ev"
+elif [[ ! -f "$GEN/evidence.json" ]]; then
+  printf '{"generated":"n/a","rows":[],"notes":[]}\n' | atomic_write "$GEN/evidence.json"
+fi
 
 rm -f "$patch_tmp"
 
