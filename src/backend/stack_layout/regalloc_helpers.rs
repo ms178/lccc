@@ -369,10 +369,19 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             return_consumes_accumulator: crate::common::types::target_is_32bit(),
         }
     };
+    // x86-64 is the only backend that publishes an indirect-call target
+    // register (`%r10` = PhysReg(11)); it is also the backend whose
+    // caller-saved pool (r11/r10/r8/r9/rdi/rsi) is wide enough for a leaf's
+    // loop state. i686 (3 scratch registers, %eax/%ecx/%edx hazards) keeps
+    // the Phase-1 hot-loop promotion.
+    let leaf_caller_saved_homes = !crate::common::types::target_is_32bit()
+        && indirect_target_regs.iter().any(|r| r.0 == 11)
+        && caller_saved_regs.len() >= 4;
     let config = super::super::regalloc::RegAllocConfig {
         available_regs,
         accumulator_policy,
         caller_saved_regs,
+        leaf_caller_saved_homes,
         call_arg_regs,
         indirect_target_regs,
         allow_inline_asm_regalloc,
