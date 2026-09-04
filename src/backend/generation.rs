@@ -3363,6 +3363,67 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
     }
 }
 
+/// `Some(n)` if this call is a fixed-size `memset` / `__memset_chk` whose
+/// byte count is a compile-time constant.  Whether it is *profitable* to
+/// expand inline is the backend's call (`ArchCodegen::inline_memset_len`
+/// consults the CPU tuning row); this helper only answers the shape
+/// question so the x86 emitter and the MachInst typed-call gate agree on
+/// exactly the same set of calls.  `__memset_chk` is admitted only when the
+/// fortify `destlen` covers `n` (same rule as `inline_memcpy_len`).
+pub(crate) fn inline_memset_const_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+    if is_variadic || args.len() < 3 {
+        return None;
+    }
+    let n = match args.get(2) {
+        Some(Operand::Const(c)) => c.to_i64().filter(|s| *s >= 0)?,
+        _ => return None,
+    };
+    match func {
+        "memset" => Some(n as usize),
+        "__memset_chk" => {
+            if args.len() < 4 {
+                return None;
+            }
+            match args.get(3) {
+                Some(Operand::Const(d)) if destlen_covers_n(d, n) => Some(n as usize),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether the result value of an inline-expanded libc call has any use.
+/// `value_use_counts` is populated per function before instruction
+/// selection; an absent entry means the value was never referenced.  A
+/// conservative `true` is returned when the table is empty (e.g. a backend
+/// that does not compute it) so the copy is never dropped by accident.
+fn call_result_is_used(cg: &dyn ArchCodegen, v: &Value) -> bool {
+    let counts = &cg.state_ref().value_use_counts;
+    if counts.is_empty() {
+        return true;
+    }
+    counts.get(v.0 as usize).copied().unwrap_or(0) != 0
+}
+
+/// x86-64 policy for `inline_memset_const_len`: the fixed-size fill is
+/// expanded inline unless the active tuning row classifies it as `LibCall`
+/// (above ¼ of the shared L3 on ERMS rows, 8 KiB otherwise — glibc's
+/// non-temporal path wins there).  The libcall bound does not depend on the
+/// vector width, so the 16-byte width is a faithful stand-in for the
+/// `-march`-dependent width the emitter uses.  This one function is
+/// consulted by the x86 emitter *and* by the register allocator's
+/// parameter-home policy (`regalloc::x86_param_caller_homes_safe`), so the
+/// two can never disagree about whether a call instruction is a real call.
+pub(crate) fn x86_inline_memset_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+    use crate::backend::x86::cpu_model::{active, CopyStrategy};
+    let n = inline_memset_const_len(func, args, is_variadic)?;
+    match active().memset_strategy(n, 16) {
+        CopyStrategy::LibCall => None,
+        _ => Some(n),
+    }
+}
+
 fn generate_function(
     cg: &mut dyn ArchCodegen,
     func: &IrFunction,
@@ -5055,12 +5116,21 @@ pub(super) fn generate_instruction(
                 None
             };
             if let Some(size) = inline_len {
-                cg.emit_inline_memcpy_call(&info.args[0], &info.args[1], size);
-                // memcpy / __memcpy_chk return dest. Dropping that store
-                // miscompiles `p = memcpy(...)`.
-                if let Some(dest) = info.dest {
-                    cg.emit_copy_value(&dest, &info.args[0]);
-                }
+                // memcpy / __memcpy_chk return dest.  The backend stores it
+                // (it must be captured before the expansion clobbers the
+                // operand registers); an unused result is not materialised.
+                let result = info.dest.filter(|d| call_result_is_used(cg, d));
+                cg.emit_inline_memcpy_call(&info.args[0], &info.args[1], size, result.as_ref());
+                clobber_after_call_like(cg);
+                return;
+            }
+            // Fixed-size memset / __memset_chk: the backend decides per CPU
+            // tuning row (X86Tune::memset_strategy) whether straight-line
+            // stores, a vector loop or `rep stosb` beat the libc call; it
+            // answers None for sizes above the L3-derived libcall bound.
+            if let Some(size) = cg.inline_memset_len(func.as_str(), &info.args, info.is_variadic) {
+                let result = info.dest.filter(|d| call_result_is_used(cg, d));
+                cg.emit_inline_memset_call(&info.args[0], &info.args[1], size, result.as_ref());
                 clobber_after_call_like(cg);
                 return;
             }

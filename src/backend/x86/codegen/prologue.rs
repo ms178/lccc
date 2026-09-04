@@ -360,8 +360,28 @@ impl X86Codegen {
         for block in &func.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::Call { .. } => {
-                        has_calls = true;
+                    Instruction::Call { func: name, info } => {
+                        // Fixed-size memcpy/memset expanded inline are not
+                        // calls: no stack-alignment obligation, no frame pad
+                        // (`aligned_frame_size_impl`), red zone stays usable.
+                        // The same two predicates gate the expansion itself
+                        // (generation.rs) and the parameter-home policy
+                        // (regalloc.rs), so the three can never disagree.
+                        let inline_expanded = crate::backend::generation::inline_memcpy_len(
+                            name,
+                            &info.args,
+                            info.is_variadic,
+                        )
+                        .is_some()
+                            || crate::backend::generation::x86_inline_memset_len(
+                                name,
+                                &info.args,
+                                info.is_variadic,
+                            )
+                            .is_some();
+                        if !inline_expanded {
+                            has_calls = true;
+                        }
                     }
                     Instruction::CallIndirect { .. } => {
                         has_calls = true;

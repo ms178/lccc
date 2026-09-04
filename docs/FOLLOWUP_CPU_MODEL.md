@@ -37,7 +37,90 @@ from `scripts/ensure_swap.sh` on a 4 GiB host).
   (`FastMOVBE` on the P-core; `LoadLatency 4`), the rest is already
   modelled (`CPU_MODEL_AUDIT.md` §5).
 
+
+## Accomplished (session `cpu-model-v4`)
+
+* **memset lowering shipped** (was item 5): `X86Tune::memset_strategy` and
+  `rep_stosb_threshold` finally drive code — overlapping scalar stores,
+  straight-line/looped vector stores, `rep stosb` on ERMS rows, libcall
+  above ¼ L3; `-mno-sse` and `__memset_chk` covered.  Bodies match Clang;
+  `memset(p,0,4096)` is 3 body instructions on Raptor Lake.
+* **Large zero-initialisers** route through the same expansion above
+  128 bytes (`ZERO_INIT_STORE_LADDER_MAX`): 4096-byte `= {0}` went from
+  512 stores to `rep stosb`.
+* **Inline libc expansions no longer poison leaf functions**: parameters
+  keep their ABI registers, no callee-saved push/pop, no alignment pad;
+  the three predicates (emitter, RA, prologue) share one decision function.
+  Two hazards this exposed (result capture after clobber, swapped-operand
+  staging) were fixed and are pinned by the probe matrix; the unused
+  result copy is gone.
+* **Tests**: `cpu_model_memset_inline.c`, `cpu_model_memset_raptorlake.c`
+  (+ `.flags`); AUDIT §7 records the oracle table.
+
+
+## P0 found on the way (pre-existing, NOT introduced here — needs its own session)
+
+* **`tests/regression/vec_alias_versioning.c` mismatches GCC** at
+  `-O3 -march=x86-64-v3 -ffp-contract=off`: `scale_f[+2B]` (destination
+  `y = (float*)((char*)x + 2)`, i.e. a *sub-element* overlap) prints
+  `1.00174087e+24` where GCC prints `2.00264183e+23`; the final hash differs.
+  Bisected this session: the base commit `648fd97` binary produces the
+  identical (wrong) output, so the vectoriser's runtime alias-versioning
+  check treats a 2-byte forward overlap as "no overlap" (distance rounded
+  to whole elements) and runs the vector body.  Fix in
+  `passes/vectorize.rs` (alias check must compare byte ranges, not element
+  indices) and add the +1/+2/+3-byte offsets to the check's unit tests.
+  `asm_cpuid_inline_outputs` also fails the GCC comparison in this sandbox,
+  but only in the initial-APIC-ID byte of EBX (which core ran the process)
+  — a test flake, not a codegen issue; mask bits 31:24 in the test.
+
 ## To do — ordered by (expected gain × breadth × confidence) / cost
+
+1. **Residual frame in inline-libc leaves.**  `void z(char*p){memset(p,0,15);}`
+   is still `subq $24,%rsp … addq $24,%rsp` (5 vs GCC/Clang/ICX 3) and
+   `memcpy(d,s,32)` with swapped params shows a dead `movq %rsi, 8(%rsp)`
+   pre-store.  The parameter gets a stack slot from the prologue's
+   `gpr_prestores` path although it has a register home, and the slot
+   defeats `calculate_stack_space` frame elision.  Reproducers:
+   `tests/regression/cpu_model_memset_inline.c` (`fz15`), `swap.c` shape in
+   AUDIT §7.  Fix in `prologue.rs` (`param_pre_stored` decision) — do not
+   touch the elision rule itself.
+2. **Runtime fill-byte broadcast with AVX2.**  `memset(p,c,40)` spends
+   `movzbl/movabs/imulq/vmovq/vpbroadcastq` (5) where GCC does
+   `vmovd %esi,%xmm0; vpbroadcastb %xmm0,%ymm0` (2).  Use `vpbroadcastb`
+   when `vex && size >= 16`; keep the `imul` form for the scalar tails and
+   the SSE2 baseline (no SSSE3 `pshufb` guarantee).
+3. **memset/memcpy-aware IR passes.**  No pass models `memset`: DSE leaves
+   `movb $0, 8(%rsp)` behind the `rep stosb` in `zinit`, and any later
+   load-forwarding across the call is blocked.  Teach `alias.rs`/`dse.rs`/
+   `load_forward.rs` that `memset(p,c,n)` writes exactly `[p, p+n)` and
+   reads nothing; then lower the `ZERO_INIT_STORE_LADDER_MAX` cut-over to
+   64 B (Clang's behaviour once SROA understands the intrinsic).
+4. **Partial-clobber call points.**  Liveness still treats the expansions
+   as full caller-saved clobbers; only *parameters* are exempt.  A
+   per-point clobber mask ({rdi,rsi,rcx,rax,xmm0,xmm1}) in
+   `liveness::instruction_is_call_point` → `spans_any_call` would let
+   temporaries stay in r8–r11/rdx across the expansion.
+5. **Expansions outside the entry block.**  `x86_params_dead_after_inline_libc_calls`
+   is conservative for loop bodies / conditional paths (falls back to
+   callee-saved homes).  Needs dominance + back-edge reasoning.
+6. **memcpy calls > 32 B.**  `inline_memcpy_len` still caps at 32 B for
+   the *call* form while struct copies use the full strategy; unify on
+   `memcpy_call_strategy` (LibCall above ¼ L3) and reuse
+   `stage_copy_operands`.
+7. **Return-value materialisation after in-place ALU** (was #1) —
+   unchanged; see AUDIT §6.
+8. **Index-only LEA** (was #2), **reduction accumulator splitting** (#3),
+   **3-operand LEA fixup** (#4), **vectoriser VF hook** (#7), **`movbe`**
+   (#8), **branch-probability if-conversion** (#9), **JCC erratum** (#10),
+   **prefetch distance** (#11), **hardware validation** (#12) — unchanged,
+   priorities as before.
+9. **Non-temporal libcall bound** (was #6) — `memset` now honours
+   `LibCall` (keeps the call above ¼ L3); memcpy struct copies still lack
+   the libcall path.
+
+## Previous to-do list (session `cpu-model-v3`, kept for reference)
+
 
 1. **Return-value materialisation after in-place ALU.**  Every
    `long f(long x){return x*10;}` ends in `…, %rdi; movq %rdi, %rax; ret`

@@ -2671,15 +2671,62 @@ impl X86Codegen {
     /// pointer operands; load them into rdi/rsi and run the fixed-size copy.
     /// This turns the bundled SIMD headers' `__builtin_memcpy(&x, &y, 16)`
     /// software fallbacks into a single movdqu pair instead of a libc call.
+    /// Register home of a value operand, if it has one (`None` for constants
+    /// and stack-resident values).
+    fn operand_reg_home(&self, op: &Operand) -> Option<u8> {
+        match op {
+            Operand::Value(v) => self.reg_assignments.get(&v.0).map(|r| r.0),
+            Operand::Const(_) => None,
+        }
+    }
+
+    /// Stage `dest → %rdi`, `src → %rsi` without the read-after-clobber
+    /// hazard: with parameters kept in their ABI registers across inline
+    /// expansions (`regalloc::x86_param_caller_homes_safe`), `memcpy(d, s)`
+    /// called as `f(char *s, char *d)` has `s` homed in %rdi.  Loading `d`
+    /// first would destroy it.  The order follows the homes; the full swap
+    /// (`s` in %rdi *and* `d` in %rsi) is one `xchgq`.
+    fn stage_copy_operands(&mut self, dest: &Operand, src: &Operand) {
+        const RDI: u8 = 14;
+        const RSI: u8 = 15;
+        let src_in_rdi = self.operand_reg_home(src) == Some(RDI);
+        let dest_in_rsi = self.operand_reg_home(dest) == Some(RSI);
+        if src_in_rdi && dest_in_rsi {
+            self.state.emit("    xchgq %rdi, %rsi");
+            self.state.reg_cache.invalidate_all();
+        } else if src_in_rdi {
+            self.operand_to_reg(src, "rsi");
+            self.operand_to_reg(dest, "rdi");
+        } else {
+            self.operand_to_reg(dest, "rdi");
+            self.operand_to_reg(src, "rsi");
+        }
+    }
+
+    /// Materialise the call result (= dest) from the copy kept in %rdx.
+    /// %rdx is untouched by both expansions, is never a home of a value live
+    /// across a call point, and every parameter is dead after the expansion
+    /// whenever the allocator left parameters in caller-saved registers.
+    fn store_inline_libc_result(&mut self, result: Option<&Value>) {
+        if let Some(r) = result {
+            self.state.emit("    movq %rdx, %rax");
+            crate::backend::traits::ArchCodegen::emit_store_result(self, r);
+        }
+    }
+
     pub(super) fn emit_inline_memcpy_call_impl(
         &mut self,
         dest: &Operand,
         src: &Operand,
         size: usize,
+        result: Option<&Value>,
     ) {
-        self.operand_to_reg(dest, "rdi");
-        self.operand_to_reg(src, "rsi");
+        self.stage_copy_operands(dest, src);
+        if result.is_some() {
+            self.state.emit("    movq %rdi, %rdx");
+        }
         self.emit_memcpy_impl_impl(size);
+        self.store_inline_libc_result(result);
     }
 
     pub(super) fn emit_inline_memmove_call_impl(
@@ -2715,6 +2762,369 @@ impl X86Codegen {
         self.state.emit("    rep movsb");
         self.state.emit("    cld");
         self.state.emit_fmt(format_args!("{}:", done));
+    }
+
+    // ------------------------------------------------------------------
+    // Fixed-size memset expansion.
+    //
+    // Every constant-size `memset` used to be a `call memset@PLT`: 10
+    // instructions with a callee-saved spill for `memset(p, 0, 15)` where
+    // Clang emits two overlapping `movq $0` stores and GCC a 8/4/2/1 ladder.
+    // The lowering below is driven by the CPU tuning row
+    // (`X86Tune::memset_strategy`, docs/CPU_MODEL_AUDIT.md §4):
+    //
+    // * size < 16             two overlapping scalar stores of the largest
+    //                         power-of-two width ≤ size (Clang's shape; one
+    //                         store fewer than GCC's ladder for 3/5/6/7/9..15).
+    // * ≤ 8 vector stores     straight-line `movups`/`vmovdqu` (Clang
+    //                         `MaxStoresPerMemset`); the last store overlaps
+    //                         the previous one instead of a narrower ladder.
+    // * ≥ rep_stosb_threshold `rep stosb` on ERMS rows (glibc
+    //   (2048 B)              `__x86_rep_stosb_threshold`; glibc's own memset
+    //                         takes this path at the same size).
+    // * otherwise             counted loop, two vector stores per iteration,
+    //                         vector remainder with one overlapping store.
+    // * above ¼ L3 (ERMS) /   `LibCall` — not expanded (`inline_memset_len`
+    //   8 KiB (no ERMS)       answers None), glibc's non-temporal path wins.
+    // * `-mno-sse`            scalar 8-byte stores ≤ 64 B, `rep stosb` above
+    //                         (kernel boot code, no libc, CR4.OSFXSR=0).
+    //
+    // The vector width follows the `-march` contract exactly like the block
+    // copy path (`block_copy_vector_bytes`): 32-byte YMM only when AVX2 is
+    // enabled and the row does not split 256-bit unaligned accesses; VEX-128
+    // encodings whenever AVX2 is enabled so no legacy-SSE instruction is
+    // issued while an upper YMM half may be dirty.
+    // ------------------------------------------------------------------
+
+    /// Store `width` ∈ {1,2,4,8} bytes of the fill pattern at `off(%rdi)`.
+    /// `rax_pat` tracks whether %rax already holds the 64-bit broadcast of
+    /// the fill byte (constant fills materialise it lazily, at most once).
+    fn emit_memset_scalar_store(
+        &mut self,
+        off: i64,
+        width: usize,
+        const_byte: Option<u8>,
+        rax_pat: &mut bool,
+    ) {
+        let mem = if off == 0 {
+            "(%rdi)".to_string()
+        } else {
+            format!("{}(%rdi)", off)
+        };
+        match (width, const_byte) {
+            (8, Some(b)) => {
+                let pat = (b as u64).wrapping_mul(0x0101_0101_0101_0101);
+                let sx = pat as i64;
+                if i32::try_from(sx).is_ok() {
+                    // 0x00 / 0xFF: sign-extended imm32 form (`movq $0` / `movq $-1`).
+                    self.state
+                        .emit_fmt(format_args!("    movq ${}, {}", sx, mem));
+                } else {
+                    if !*rax_pat {
+                        self.state
+                            .emit_fmt(format_args!("    movabsq $0x{:x}, %rax", pat));
+                        *rax_pat = true;
+                    }
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, {}", mem));
+                }
+            }
+            (8, None) => self
+                .state
+                .emit_fmt(format_args!("    movq %rax, {}", mem)),
+            (4, Some(b)) => self.state.emit_fmt(format_args!(
+                "    movl $0x{:x}, {}",
+                (b as u32).wrapping_mul(0x0101_0101),
+                mem
+            )),
+            (4, None) => self
+                .state
+                .emit_fmt(format_args!("    movl %eax, {}", mem)),
+            (2, Some(b)) => self.state.emit_fmt(format_args!(
+                "    movw $0x{:x}, {}",
+                (b as u16).wrapping_mul(0x0101),
+                mem
+            )),
+            (2, None) => self
+                .state
+                .emit_fmt(format_args!("    movw %ax, {}", mem)),
+            (_, Some(b)) => self
+                .state
+                .emit_fmt(format_args!("    movb $0x{:x}, {}", b, mem)),
+            (_, None) => self
+                .state
+                .emit_fmt(format_args!("    movb %al, {}", mem)),
+        }
+    }
+
+    /// Fill `[base, base+len)` (len < 16) with at most two overlapping
+    /// scalar stores: width w = largest power of two ≤ len at `base`, and a
+    /// second w-byte store ending exactly at `base+len` when len > w.
+    fn emit_memset_scalar_tail(
+        &mut self,
+        base: i64,
+        len: usize,
+        const_byte: Option<u8>,
+        rax_pat: &mut bool,
+    ) {
+        if len == 0 {
+            return;
+        }
+        let w = if len >= 8 {
+            8
+        } else if len >= 4 {
+            4
+        } else if len >= 2 {
+            2
+        } else {
+            1
+        };
+        self.emit_memset_scalar_store(base, w, const_byte, rax_pat);
+        if len > w {
+            self.emit_memset_scalar_store(base + (len - w) as i64, w, const_byte, rax_pat);
+        }
+    }
+
+    /// Fill `[base, base+len)` (len ≥ 16) with straight-line vector stores:
+    /// w = 32 when `use_ymm` and len ≥ 32, else 16; stores at base, base+w,
+    /// …; the final store overlaps so that no narrower ladder is needed.
+    fn emit_memset_vec_region(&mut self, base: i64, len: usize, use_ymm: bool, vex: bool) {
+        debug_assert!(len >= 16);
+        let (w, mv, reg) = if use_ymm && len >= 32 {
+            (32usize, "vmovdqu", "%ymm0")
+        } else if vex {
+            (16usize, "vmovdqu", "%xmm0")
+        } else {
+            (16usize, "movups", "%xmm0")
+        };
+        let store = |this: &mut Self, off: i64| {
+            if off == 0 {
+                this.state.emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+            } else {
+                this.state
+                    .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, off));
+            }
+        };
+        let mut off = 0usize;
+        while off + w <= len {
+            store(self, base + off as i64);
+            off += w;
+        }
+        if off < len {
+            store(self, base + (len - w) as i64);
+        }
+    }
+
+    /// Materialise the fill pattern in %xmm0 (and %ymm0 when `use_ymm`).
+    /// Zero and all-ones use the dependency-breaking idioms; other constant
+    /// bytes broadcast a 32-bit immediate; a runtime byte broadcasts the
+    /// 64-bit pattern already in %rax.
+    fn emit_memset_vec_pattern(&mut self, const_byte: Option<u8>, use_ymm: bool, vex: bool) {
+        match const_byte {
+            Some(0) => {
+                if vex {
+                    // VEX-128 zeroing idiom zeroes the full %ymm0.
+                    self.state.emit("    vpxor %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    pxor %xmm0, %xmm0");
+                }
+            }
+            Some(0xFF) => {
+                if use_ymm {
+                    self.state.emit("    vpcmpeqd %ymm0, %ymm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vpcmpeqd %xmm0, %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    pcmpeqd %xmm0, %xmm0");
+                }
+            }
+            Some(b) => {
+                self.state.emit_fmt(format_args!(
+                    "    movl $0x{:x}, %eax",
+                    (b as u32).wrapping_mul(0x0101_0101)
+                ));
+                if use_ymm {
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    self.state.emit("    vpbroadcastd %xmm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vmovd %eax, %xmm0");
+                    self.state.emit("    vpbroadcastd %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    movd %eax, %xmm0");
+                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                }
+            }
+            None => {
+                if use_ymm {
+                    self.state.emit("    vmovq %rax, %xmm0");
+                    self.state.emit("    vpbroadcastq %xmm0, %ymm0");
+                } else if vex {
+                    self.state.emit("    vmovq %rax, %xmm0");
+                    self.state.emit("    vpbroadcastq %xmm0, %xmm0");
+                } else {
+                    self.state.emit("    movq %rax, %xmm0");
+                    self.state.emit("    punpcklqdq %xmm0, %xmm0");
+                }
+            }
+        }
+    }
+
+    /// `rep stosb`: %al = fill byte, %rcx = count, %rdi = dest (DF = 0 per
+    /// the SysV ABI at every call boundary).
+    fn emit_memset_rep_stosb(&mut self, size: usize, const_byte: Option<u8>) {
+        match const_byte {
+            Some(0) => self.state.emit("    xorl %eax, %eax"),
+            Some(b) => self
+                .state
+                .emit_fmt(format_args!("    movl ${}, %eax", b)),
+            None => {} // %rax already holds the broadcast; %al is the byte.
+        }
+        self.state
+            .out
+            .emit_instr_imm_reg("    movq", size as i64, "rcx");
+        self.state.emit("    rep stosb");
+    }
+
+    /// Inline `memset(dest, value, size)`; see the section comment above.
+    pub(super) fn emit_inline_memset_call_impl(
+        &mut self,
+        dest: &Operand,
+        value: &Operand,
+        size: usize,
+        result: Option<&Value>,
+    ) {
+        use crate::backend::x86::cpu_model::CopyStrategy;
+        // %xmm0 is clobbered: the vector last-store peephole and the
+        // deferred-store cache must not reuse a stale value (same soundness
+        // rule as emit_memcpy_impl_impl).
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+
+        let const_byte: Option<u8> = match value {
+            Operand::Const(c) => c.to_i64().map(|v| v as u8),
+            Operand::Value(_) => None,
+        };
+        // Stage the fill value before the destination: a runtime byte homed
+        // in %rdi must be read before %rdi is overwritten, and no allocation
+        // is ever homed in %rax, so the destination load cannot disturb it.
+        let mut rax_pat = false;
+        if const_byte.is_none() {
+            self.operand_to_reg(value, "rax");
+        }
+        self.operand_to_reg(dest, "rdi");
+        if result.is_some() {
+            self.state.emit("    movq %rdi, %rdx");
+        }
+        if size == 0 {
+            self.store_inline_libc_result(result);
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+        if const_byte.is_none() {
+            // Broadcast the low byte: (uint8)c * 0x0101010101010101.
+            self.state.emit("    movzbl %al, %eax");
+            self.state.emit("    movabsq $0x101010101010101, %rcx");
+            self.state.emit("    imulq %rcx, %rax");
+            rax_pat = true;
+        }
+
+        let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
+        let strategy = self.tune.memset_strategy(size, vb);
+
+        if self.no_sse {
+            // No vector instruction may be emitted (CR4.OSFXSR may be 0).
+            if size > 64 {
+                self.emit_memset_rep_stosb(size, const_byte);
+            } else {
+                let mut off = 0usize;
+                while off + 8 <= size {
+                    self.emit_memset_scalar_store(off as i64, 8, const_byte, &mut rax_pat);
+                    off += 8;
+                }
+                if off < size {
+                    if size >= 8 {
+                        self.emit_memset_scalar_store(
+                            (size - 8) as i64,
+                            8,
+                            const_byte,
+                            &mut rax_pat,
+                        );
+                    } else {
+                        self.emit_memset_scalar_tail(0, size, const_byte, &mut rax_pat);
+                    }
+                }
+            }
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        if size < 16 {
+            self.emit_memset_scalar_tail(0, size, const_byte, &mut rax_pat);
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        if strategy == CopyStrategy::RepMovsb && std::env::var_os("CCC_NO_REP_MOVSB").is_none() {
+            self.emit_memset_rep_stosb(size, const_byte);
+            self.store_inline_libc_result(result);
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        let vex = vb == 32;
+        let use_ymm = vex && size >= 32;
+        self.emit_memset_vec_pattern(const_byte, use_ymm, vex);
+
+        if strategy == CopyStrategy::InlineUnrolled {
+            self.emit_memset_vec_region(0, size, use_ymm, vex);
+        } else {
+            // Counted loop: two vector stores (2 × vb bytes) per iteration,
+            // then the remainder relative to the advanced %rdi.  A remainder
+            // shorter than 16 bytes is covered by one 16-byte store that
+            // overlaps the already-filled prefix (negative displacement).
+            let chunk = 2 * vb;
+            let full_chunks = size / chunk;
+            let remainder = size % chunk;
+            debug_assert!(full_chunks > 0);
+            let (mv, reg) = if use_ymm {
+                ("vmovdqu", "%ymm0")
+            } else if vex {
+                ("vmovdqu", "%xmm0")
+            } else {
+                ("movups", "%xmm0")
+            };
+            self.state
+                .out
+                .emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
+            let loop_label = format!(".Lmset_loop_{}", self.state.next_label_id());
+            self.state.emit_fmt(format_args!("{}:", loop_label));
+            self.state.emit_fmt(format_args!("    {} {}, (%rdi)", mv, reg));
+            self.state
+                .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, vb));
+            self.state
+                .emit_fmt(format_args!("    addq ${}, %rdi", chunk));
+            self.state.emit("    decq %rcx");
+            self.state.emit_fmt(format_args!("    jne {}", loop_label));
+            if remainder >= 16 {
+                self.emit_memset_vec_region(0, remainder, use_ymm, vex);
+            } else if remainder > 0 {
+                let mv16 = if vex { "vmovdqu" } else { "movups" };
+                self.state.emit_fmt(format_args!(
+                    "    {} %xmm0, -{}(%rdi)",
+                    mv16,
+                    16 - remainder
+                ));
+            }
+        }
+        if use_ymm {
+            // Arm the epilogue vzeroupper (upper %ymm0 half is dirty).
+            self.state.dirty_upper_ymm = true;
+        }
+        self.store_inline_libc_result(result);
+        self.state.reg_cache.invalidate_all();
     }
 
     pub(super) fn emit_memcpy_impl_impl(&mut self, size: usize) {

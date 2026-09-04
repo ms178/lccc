@@ -306,6 +306,67 @@ pub fn x86_body_implicitly_clobbers_rdx(func: &IrFunction) -> bool {
     false
 }
 
+/// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in
+/// their incoming registers for the whole body, an inline-expanded
+/// `memcpy`/`memset` (which clobbers %rdi/%rsi/%rcx/%rax/%xmm0/%xmm1) is
+/// harmless exactly when no parameter value is read after it.  Only
+/// expansions in the entry block are admitted; an expansion in any other
+/// block (loop bodies, conditional paths) keeps today's conservative policy
+/// because "after" would need dominance and back-edge reasoning.
+fn x86_params_dead_after_inline_libc_calls(
+    func: &IrFunction,
+    is_inline: &dyn Fn(&Instruction) -> bool,
+) -> bool {
+    let Some(entry) = func.blocks.first() else {
+        return true;
+    };
+    let params: FxHashSet<u32> = entry
+        .instructions
+        .iter()
+        .filter_map(|inst| match inst {
+            Instruction::ParamRef { dest, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    let uses_param = |inst: &Instruction| {
+        let mut used = false;
+        inst.for_each_used_value(|v| used |= params.contains(&v));
+        used
+    };
+    let mut seen_inline = false;
+    for inst in &entry.instructions {
+        if seen_inline && uses_param(inst) {
+            return false;
+        }
+        if is_inline(inst) {
+            seen_inline = true;
+        }
+    }
+    if seen_inline {
+        let mut used = false;
+        entry.terminator.for_each_used_value(|v| used |= params.contains(&v));
+        if used {
+            return false;
+        }
+    }
+    for block in func.blocks.iter().skip(1) {
+        if block.instructions.iter().any(|inst| is_inline(inst)) {
+            return false;
+        }
+        if seen_inline {
+            if block.instructions.iter().any(|inst| uses_param(inst)) {
+                return false;
+            }
+            let mut used = false;
+            block.terminator.for_each_used_value(|v| used |= params.contains(&v));
+            if used {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
     if func.blocks.is_empty() || env_on("CCC_NO_LEAF_PARAM_GPR") {
         return false;
@@ -316,6 +377,21 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
     if func.blocks.len() > 1 && func.params.len() > 6 {
         return false;
     }
+    // Fixed-size `memcpy` / `memset` calls that the x86-64 backend expands
+    // inline are not calls: the expansion touches only %rdi/%rsi/%rcx/%rax/
+    // %xmm0/%xmm1.  They still count as call points for every other value
+    // (liveness), but they must not evict the *parameters* from their ABI
+    // registers — that rule alone made `void z(char *p){memset(p,0,15);}`
+    // 8 instructions (push/sub/mov/add/pop around two stores) where GCC,
+    // Clang and ICX emit 3.  The exemption is sound only when no parameter
+    // is read after the expansion (`x86_params_dead_after_inline_libc_calls`).
+    let is_64 = !crate::common::types::target_is_32bit();
+    let inline_libc = |inst: &Instruction| -> bool {
+        is_64
+            && matches!(inst, Instruction::Call { func: name, info }
+                if crate::backend::generation::inline_memcpy_len(name, &info.args, info.is_variadic).is_some()
+                    || crate::backend::generation::x86_inline_memset_len(name, &info.args, info.is_variadic).is_some())
+    };
     if func.blocks.iter().any(|b| {
         b.instructions.iter().any(|inst| {
             matches!(
@@ -323,9 +399,12 @@ pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
                 Instruction::Call { .. }
                     | Instruction::CallIndirect { .. }
                     | Instruction::InlineAsm { .. }
-            )
+            ) && !inline_libc(inst)
         })
     }) {
+        return false;
+    }
+    if !x86_params_dead_after_inline_libc_calls(func, &inline_libc) {
         return false;
     }
     // The pre-store model parks each register param in its incoming ABI
@@ -4979,6 +5058,19 @@ fn collect_call_arg_values(func: &IrFunction) -> (FxHashSet<u32>, FxHashSet<u32>
     for block in &func.blocks {
         for inst in &block.instructions {
             let (args, is_indirect) = match inst {
+                // Inline-expanded memcpy/memset (x86-64) stage their operands
+                // hazard-free for any home: memset reads the fill value into
+                // %rax (never a home) before the destination; memcpy orders
+                // the two pointer loads by their homes (`stage_copy_operands`).
+                // Excluding their operands from the argument registers only
+                // spilled parameters and bought a frame.
+                Instruction::Call { func: name, info }
+                    if !crate::common::types::target_is_32bit()
+                        && (crate::backend::generation::inline_memcpy_len(name, &info.args, info.is_variadic).is_some()
+                            || crate::backend::generation::x86_inline_memset_len(name, &info.args, info.is_variadic).is_some()) =>
+                {
+                    continue
+                }
                 Instruction::Call { info, .. } => (&info.args, false),
                 Instruction::CallIndirect { info, .. } => (&info.args, true),
                 _ => continue,
