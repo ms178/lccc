@@ -385,8 +385,8 @@ pub fn lower_binop(
 
     // ── Shift operations ─────────────────────────────────────────────
     if let Some(shift_op) = binop_to_shift(op) {
-        emit_mov_operand_r(lhs, dst, size, ra, out);
         if let Some(imm) = const_as_imm32(rhs) {
+            emit_mov_operand_r(lhs, dst, size, ra, out);
             let mask = if size == OpSize::S32 { 31 } else { 63 };
             out.push(MachInst::Shift {
                 op: shift_op,
@@ -394,8 +394,23 @@ pub fn lower_binop(
                 dst,
                 size,
             });
+        } else if try_lower_shiftx(shift_op, lhs, rhs, dst, size, ra, out) {
+            // `shlx count, src, dst`: no %rcx pin, no source copy, 1 µop.
         } else {
-            emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+            // Two-address hazard (same shape as the ALU case above): when
+            // the count's home IS the destination register, `mov lhs,dst`
+            // would overwrite the count before it is copied to %rcx.  Copy
+            // the count out first in that case; otherwise keep lhs first so
+            // a count already sitting in %rcx is not clobbered.
+            let count_home_is_dst = matches!(rhs, Operand::Value(v)
+                if v.0 != dest.0 && value_to_reg(v, ra) == dst && matches!(dst, MachReg::Phys(_)));
+            if count_home_is_dst {
+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+                emit_mov_operand_r(lhs, dst, size, ra, out);
+            } else {
+                emit_mov_operand_r(lhs, dst, size, ra, out);
+                emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+            }
             out.push(MachInst::Shift {
                 op: shift_op,
                 amount: MachOperand::Reg(MachReg::Phys(RCX)),
@@ -977,6 +992,98 @@ pub fn lower_cond_branch(
 /// looks exactly like everything being fine. The counters make the gap
 /// visible and rank it, so work targets the biggest class rather than the
 /// most obvious one.
+/// How eagerly isel selects the BMI2 three-operand shifts.  Set once per
+/// codegen run from `CodegenOptions` (tune row × `-mbmi2`); read by
+/// `lower_binop`.  A process-wide cell because isel is a set of pure free
+/// functions without a target context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShlxMode {
+    /// No BMI2, or an explicit opt-out.
+    Never,
+    /// Cores where `SHL r,cl` is already 1 µop (Zen): the VEX form only
+    /// pays when it removes a copy into %rcx or a copy of the source.
+    WhenItSavesAMove,
+    /// Cores where `SHL r,cl` is 2–3 µops (every Intel core): always.
+    Always,
+}
+
+static SHLX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_shlx_mode(m: ShlxMode) {
+    SHLX_MODE.store(m as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn shlx_mode() -> ShlxMode {
+    match SHLX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => ShlxMode::WhenItSavesAMove,
+        2 => ShlxMode::Always,
+        _ => ShlxMode::Never,
+    }
+}
+
+/// Try to lower a variable-count shift to `ShiftX`.  Returns false (with
+/// `out` untouched) when a required operand has no physical home in a shape
+/// the three-operand form can consume without an extra copy that the
+/// legacy `Shift` would not also need, or when staging would clobber a
+/// source.  Only S32/S64 exist for shlx.
+fn try_lower_shiftx(
+    shift_op: ShiftOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    dst: MachReg,
+    size: OpSize,
+    ra: &FxHashMap<u32, PhysReg>,
+    out: &mut Vec<MachInst>,
+) -> bool {
+    let mode = shlx_mode();
+    if mode == ShlxMode::Never || !matches!(size, OpSize::S32 | OpSize::S64) {
+        return false;
+    }
+    let MachReg::Phys(dst_phys) = dst else {
+        return false;
+    };
+    let phys_home = |op: &Operand| match op {
+        Operand::Value(v) => match value_to_reg(v, ra) {
+            MachReg::Phys(p) => Some(p),
+            MachReg::Vreg(_) => None,
+        },
+        Operand::Const(_) => None,
+    };
+    let count_home = phys_home(rhs);
+    let lhs_home = phys_home(lhs);
+    let saves_move = count_home.is_some() || lhs_home.is_some();
+    if mode == ShlxMode::WhenItSavesAMove && !saves_move {
+        return false;
+    }
+    // Staging through %rcx is impossible when the destination *is* %rcx
+    // and the other operand still has to be copied into it.
+    let needs_rcx = count_home.is_none() || (lhs_home.is_none() && count_home == Some(dst_phys));
+    if needs_rcx && dst_phys == RCX {
+        return false;
+    }
+    let count = if needs_rcx {
+        emit_mov_operand_r(rhs, MachReg::Phys(RCX), size, ra, out);
+        MachReg::Phys(RCX)
+    } else {
+        MachReg::Phys(count_home.expect("checked"))
+    };
+    let src = match lhs_home {
+        Some(p) => MachReg::Phys(p),
+        None => {
+            emit_mov_operand_r(lhs, dst, size, ra, out);
+            dst
+        }
+    };
+    out.push(MachInst::ShiftX {
+        op: shift_op,
+        count,
+        src,
+        dst,
+        size,
+    });
+    true
+}
+
 pub mod stats {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;

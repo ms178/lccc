@@ -170,6 +170,9 @@ fn candidate_uses_32bit_dest(line: &str, dst32: &str) -> bool {
             | "lzcntl"
             | "tzcntl"
             | "andnl"
+            | "shlxl"
+            | "shrxl"
+            | "sarxl"
     )
 }
 
@@ -594,6 +597,9 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
             | "blsrl"
             | "blsil"
             | "bzhil"
+            | "shlxl"
+            | "shrxl"
+            | "sarxl"
     )
 }
 

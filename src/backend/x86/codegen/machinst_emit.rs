@@ -664,6 +664,32 @@ pub fn emit_machinst(inst: &MachInst, out: &mut AsmOutput) {
             }
         }
 
+        MachInst::ShiftX {
+            op,
+            count,
+            src,
+            dst,
+            size,
+        } => {
+            let mnem = match (op, size) {
+                (ShiftOp::Shl, OpSize::S64) => "shlxq",
+                (ShiftOp::Shr, OpSize::S64) => "shrxq",
+                (ShiftOp::Sar, OpSize::S64) => "sarxq",
+                (ShiftOp::Shl, _) => "shlxl",
+                (ShiftOp::Shr, _) => "shrxl",
+                (ShiftOp::Sar, _) => "sarxl",
+            };
+            // shlx has no 8/16-bit form; isel only selects S32/S64.
+            let sz = if *size == OpSize::S64 { OpSize::S64 } else { OpSize::S32 };
+            out.emit_fmt(format_args!(
+                "    {} {}, {}, {}",
+                mnem,
+                fmt_reg(count, sz),
+                fmt_reg(src, sz),
+                fmt_reg(dst, sz)
+            ));
+        }
+
         MachInst::Lea {
             base,
             index,

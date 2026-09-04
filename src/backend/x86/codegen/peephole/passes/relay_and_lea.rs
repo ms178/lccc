@@ -117,7 +117,10 @@ pub(super) fn is_full_write(info: &LineInfo, t: &str, fam: RegId) -> bool {
         || t.starts_with("blsr")
         || t.starts_with("blsi")
         || t.starts_with("blsmsk")
-        || t.starts_with("bzhi");
+        || t.starts_with("bzhi")
+        || t.starts_with("shlx")
+        || t.starts_with("shrx")
+        || t.starts_with("sarx");
     if !is_producer {
         // `xorl %r10d, %r10d` (self-zeroing) is a full write as well.
         let name32 = REG_NAMES[1][fam as usize];

@@ -133,6 +133,13 @@ pub(crate) struct CodegenOptions {
     /// with retpoline (-mindirect-branch=thunk-extern) to avoid indirect jumps that
     /// objtool would reject.
     pub(crate) no_jump_tables: bool,
+    /// Whether the target has BMI2 (`-mbmi2` or an enabling `-march`).
+    /// Gates SHLX/SHRX/SARX selection for variable shifts.
+    pub(crate) bmi2: bool,
+    /// Measured microarchitectural tuning row selected by `-mtune`/`-march`
+    /// (see `backend::x86::cpu_model`).  Drives every decision that depends
+    /// on instruction latency/µop facts rather than ISA availability.
+    pub(crate) tune: crate::backend::x86::cpu_model::X86Tune,
     /// Whether the target has BMI1 (`-mbmi` or an enabling `-march`).
     /// Gates scalar ANDN selection; emitting it without this contract would
     /// introduce SIGILL on baseline x86-64.

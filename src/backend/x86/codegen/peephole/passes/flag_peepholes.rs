@@ -136,6 +136,20 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     if t.starts_with("call") {
         return FlagsEffect::Writes;
     }
+    // BMI2 VEX shifts (`shlx/shrx/sarx`) and the other flag-neutral BMI2
+    // ops leave EFLAGS untouched; they must be classified before the prefix
+    // table below, which would otherwise match them as "shl"/"shr"/"sar"
+    // writers and let a later scan treat an earlier `cmp`'s flags as dead.
+    if t.starts_with("shlx")
+        || t.starts_with("shrx")
+        || t.starts_with("sarx")
+        || t.starts_with("rorx")
+        || t.starts_with("pdep")
+        || t.starts_with("pext")
+        || t.starts_with("mulx")
+    {
+        return FlagsEffect::Neutral;
+    }
     const WRITERS: &[&str] = &[
         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
