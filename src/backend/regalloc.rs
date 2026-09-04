@@ -6205,10 +6205,50 @@ pub(crate) fn detect_phi_coalesce_groups(
     }
 
     let label_to_idx = analysis::build_label_map(func);
-    let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
 
     let debug = env_on("CCC_DEBUG_PHI_COALESCE");
     let mut candidates = Vec::new();
+
+    // Pre-def dataflow closure of `phi` inside `block[..def_idx]`: every value
+    // computed from the OLD phi before the destructive update.  A folded GEP
+    // (`p = &a[i]`) reads `i`'s register at the Load/Store that absorbs it,
+    // so such a value read after the update observes the NEW `i`.
+    let derived_before = |block: &crate::ir::reexports::BasicBlock,
+                          def_idx: usize,
+                          phi: u32|
+     -> FxHashSet<u32> {
+        let mut derived: FxHashSet<u32> = FxHashSet::default();
+        derived.insert(phi);
+        for earlier in &block.instructions[..def_idx] {
+            let mut depends = false;
+            for_each_operand_in_instruction(earlier, |op| {
+                if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
+                    depends = true;
+                }
+            });
+            for_each_value_use_in_instruction(earlier, |v| {
+                if derived.contains(&v.0) {
+                    depends = true;
+                }
+            });
+            if depends {
+                if let Some(d) = earlier.dest() {
+                    derived.insert(d.0);
+                }
+            }
+        }
+        derived
+    };
+    let terminator_uses = |term: &Terminator, set: &FxHashSet<u32>| -> bool {
+        let mut found = false;
+        for_each_operand_in_terminator(term, |op| {
+            if matches!(op, Operand::Value(v) if set.contains(&v.0)) {
+                found = true;
+            }
+        });
+        found
+    };
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         if liveness
@@ -6246,11 +6286,20 @@ pub(crate) fn detect_phi_coalesce_groups(
             };
 
             let same_block = source_block == block_idx;
-            let source_is_fp = func.blocks[source_block].instructions[source_def_idx]
-                .result_type()
-                .is_some_and(|ty| ty.is_float());
+            // Split-latch shape (any type): the loop body ends in a
+            // conditional branch whose loop edge is critical, so phi
+            // elimination parks the copies in a one-predecessor split block
+            // (`do { DO8 } while (--n)`, every rotated counted loop, every
+            // `while` whose latch is also an exit test).  This is the most
+            // common hot-loop shape and it used to be excluded for every
+            // non-FP value, leaving 2 copies per accumulator per iteration in
+            // zlib-ng adler32, expat and the arith_loop webs.  The
+            // destructive-update proof for it is completed below by
+            // `phi_derived_used_in_window`'s cross-block arm: the old phi
+            // (and anything derived from it before the update) may not be
+            // observed after the source's definition along ANY path out of
+            // the source block, not merely along the latch.
             let pred_is_unique = !same_block
-                && source_is_fp
                 && preds.len(block_idx) == 1
                 && preds.row(block_idx)[0] as usize == source_block
                 // Do not coalesce a preheader/init definition into a loop phi:
@@ -6288,31 +6337,41 @@ pub(crate) fn detect_phi_coalesce_groups(
             // formed.  Track the pre-update dataflow closure and reject when a
             // derived old-phi value remains live after the source definition.
             let phi_derived_used_in_window = if same_block {
-                let mut derived: FxHashSet<u32> = FxHashSet::default();
-                derived.insert(dest.0);
-                for earlier in &block.instructions[..source_def_idx] {
-                    let mut depends = false;
-                    for_each_operand_in_instruction(earlier, |op| {
-                        if matches!(op, Operand::Value(v) if derived.contains(&v.0)) {
-                            depends = true;
-                        }
-                    });
-                    for_each_value_use_in_instruction(earlier, |v| {
-                        if derived.contains(&v.0) {
-                            depends = true;
-                        }
-                    });
-                    if depends {
-                        if let Some(d) = earlier.dest() {
-                            derived.insert(d.0);
-                        }
-                    }
-                }
+                let derived = derived_before(block, source_def_idx, dest.0);
                 block.instructions[source_def_idx + 1..copy_idx]
                     .iter()
                     .any(|middle| derived.iter().any(|&v| uses_value(middle, v)))
             } else {
-                false
+                // Cross-block proof.  The register is overwritten at the
+                // source definition inside `source_block`; from that point on
+                // the old phi value is gone on EVERY path, so it (and every
+                // pre-update derived value) must be dead on every path:
+                //   1. not read by the rest of the source block or its
+                //      terminator (`switch (state)` after `state_next = ..`);
+                //   2. not read before the copy in the split latch;
+                //   3. not live into any successor of the source block other
+                //      than the latch — the classic `return i` after a
+                //      `for (...; ++i)` exit branch reads the OLD i;
+                //   4. no derived value live out of the source block at all:
+                //      a folded GEP rooted at the phi is re-formed from the
+                //      phi register wherever it is consumed.
+                let src_blk = &func.blocks[source_block];
+                let derived = derived_before(src_blk, source_def_idx, dest.0);
+                let read_in_tail = src_blk.instructions[source_def_idx + 1..]
+                    .iter()
+                    .chain(block.instructions[..copy_idx].iter())
+                    .any(|middle| derived.iter().any(|&v| uses_value(middle, v)));
+                let read_by_terminator = terminator_uses(&src_blk.terminator, &derived);
+                let phi_escapes = succs
+                    .row(source_block)
+                    .iter()
+                    .any(|&s| s as usize != block_idx && liveness.is_live_in(s as usize, dest.0))
+                    || liveness.is_live_in(block_idx, dest.0);
+                let derived_escapes = derived
+                    .iter()
+                    .filter(|&&v| v != dest.0)
+                    .any(|&v| liveness.is_live_out(source_block, v));
+                read_in_tail || read_by_terminator || phi_escapes || derived_escapes
             };
             let source_used_elsewhere = src_use_blocks.get(&src.0).is_some_and(|blocks| {
                 blocks
@@ -6617,6 +6676,176 @@ mod phi_coalesce_tests {
                 .iter()
                 .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "window use of phi must block coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn coalesces_integer_split_latch_counter() {
+        // `do { ... } while (--n)`: the update `n2 = n1 - 1` ends the body,
+        // the phi-elim copy sits alone in the one-predecessor split latch,
+        // and nothing reads the OLD n after the destructive update (the exit
+        // returns a constant).  Pre-Fable this shape was restricted to FP
+        // sources, leaving 2 copies per iteration in every counted loop.
+        let mut func = IrFunction::new("split_latch_counter".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(10)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, Vec::new(), Terminator::Return(Some(Operand::Const(IrConst::I32(0))))),
+        ];
+        func.next_value_id = 4;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "integer split-latch counter must coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_split_latch_when_old_phi_read_on_exit() {
+        // `for (i = 0; i < n; i++) ...; return i;` — the exit path reads the
+        // phi AFTER the destructive update in the body; sharing the homes
+        // would hand the exit the POST-increment value.  The exit block
+        // reads the phi, so `phi_escapes` must block the candidate.
+        let mut func = IrFunction::new("split_latch_return_phi".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(0)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(1))))),
+        ];
+        func.next_value_id = 4;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "old phi live into the exit block must block coalesce: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_split_latch_when_gp_derived_value_escapes() {
+        // Old-phi-derived value `v3 = n1 * 2` carried to the exit block:
+        // after the source def the register holds the NEW value, so v3's
+        // consumer would be corrupted — even though the phi itself does not
+        // escape.  `derived_escapes` must block the candidate.
+        let mut func =
+            IrFunction::new("split_latch_derived_escape".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(10)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(2)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, Vec::new(), Terminator::Return(Some(Operand::Value(Value(3))))),
+        ];
+        func.next_value_id = 5;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "derived old-phi value live out of the source block must block coalesce: {candidates:?}"
         );
     }
 
