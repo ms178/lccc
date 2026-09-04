@@ -316,21 +316,44 @@ impl Lowerer {
         let builtin_info = builtins::resolve_builtin(name)?;
         match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
-                let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
-                let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let mut arg_types: Vec<IrType> =
+                    args.iter().map(|a| self.get_expr_type(a)).collect();
+                let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let dest = self.fresh_value();
+                // The builtin is callable without a prior libc prototype
+                // (`__builtin_printf("%g", f)` in a TU that never includes
+                // <stdio.h>).  The variadic contract of the printf family is
+                // part of the builtin's own signature, so it must not depend
+                // on whether the user happened to declare the libc symbol:
+                // without it, a `float` argument was passed as a 4-byte F32
+                // in an XMM register and printf read garbage (C11 6.5.2.2p6
+                // requires float->double, char/short->int promotion).
                 let libc_sig = self.func_meta.sigs.get(libc_name.as_str());
-                let variadic = libc_sig.is_some_and(|s| s.is_variadic);
-                let n_fixed = if variadic {
-                    libc_sig
-                        .map(|s| s.param_types.len())
-                        .unwrap_or(arg_vals.len())
-                } else {
-                    arg_vals.len()
+                let (variadic, n_fixed) = match libc_sig {
+                    Some(sig) if sig.is_variadic => (true, sig.param_types.len()),
+                    // Unprototyped declaration (`int printf();`): the default
+                    // argument promotions apply to EVERY argument (C11
+                    // 6.5.2.2p6), and the callee is the real variadic libc
+                    // function — use the builtin's own fixed-arity contract.
+                    Some(sig) if sig.param_types.is_empty() => {
+                        match builtin_variadic_fixed_arity(libc_name.as_str()) {
+                            Some(n) => (true, n),
+                            None => (true, arg_vals.len()),
+                        }
+                    }
+                    Some(_) => (false, arg_vals.len()),
+                    None => match builtin_variadic_fixed_arity(libc_name.as_str()) {
+                        Some(n) => (true, n),
+                        None => (false, arg_vals.len()),
+                    },
                 };
+                let libc_return_type = libc_sig.map(|s| s.return_type);
+                if variadic {
+                    self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
+                }
                 let return_type = self
                     .builtin_return_type(name)
-                    .or_else(|| libc_sig.map(|s| s.return_type))
+                    .or(libc_return_type)
                     .unwrap_or(crate::common::types::target_int_ir_type());
                 let struct_arg_sizes = vec![None; arg_vals.len()];
                 self.emit(Instruction::Call {
@@ -1128,14 +1151,29 @@ impl Lowerer {
         );
 
         // Lower all arguments in order
-        let arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
-        let arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
+        let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let mut arg_types: Vec<IrType> = args.iter().map(|a| self.get_expr_type(a)).collect();
 
         let dest = self.fresh_value();
         let return_type = self
             .builtin_return_type(name)
             .unwrap_or(crate::common::types::target_int_ir_type());
-        let n_fixed = arg_vals.len(); // All explicitly passed args are "fixed" from our perspective
+        // The fortified printf family has a fixed prefix (flag/size/format
+        // operands) followed by `...`.  Everything past the prefix is a
+        // variadic argument and must receive the default argument
+        // promotions, exactly as for the unfortified builtin: glibc's
+        // <stdio.h> rewrites `printf("%g", f)` into
+        // `__builtin___printf_chk(1, "%g", f)` and a float passed as F32
+        // there was read by glibc as a double.  The count also matters for
+        // the SysV `%al` XMM-count and the i686 stack layout.
+        let n_fixed = if is_variadic {
+            builtin_variadic_fixed_arity(libc_chk_name).unwrap_or(arg_vals.len())
+        } else {
+            arg_vals.len()
+        };
+        if is_variadic {
+            self.promote_variadic_args(&mut arg_vals, &mut arg_types, n_fixed);
+        }
         let struct_arg_sizes = vec![None; arg_vals.len()];
         self.emit(Instruction::Call {
             func: libc_chk_name.to_string(),
@@ -1160,6 +1198,32 @@ impl Lowerer {
             },
         });
         Some(Operand::Value(dest))
+    }
+
+    /// Apply the C11 6.5.2.2p6 default argument promotions to every argument at
+    /// index >= `n_fixed` of a variadic call: `float` -> `double`,
+    /// `char`/`short` (any signedness) -> `int`.  `arg_types` is rewritten in
+    /// lock-step so the backend classifies the promoted value (F64 travels in
+    /// an XMM register and is counted in `%al`; I32 is a GPR/stack slot).
+    /// `_Bool` is already materialised as an I8 0/1 and widens to `int` here as
+    /// well, which is what the C standard requires.
+    pub(super) fn promote_variadic_args(
+        &mut self,
+        arg_vals: &mut [Operand],
+        arg_types: &mut [IrType],
+        n_fixed: usize,
+    ) {
+        for i in n_fixed..arg_vals.len() {
+            let ty = arg_types[i];
+            let promoted = match ty {
+                IrType::F32 => IrType::F64,
+                IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 => IrType::I32,
+                _ => continue,
+            };
+            let val = std::mem::replace(&mut arg_vals[i], Operand::Const(IrConst::I64(0)));
+            arg_vals[i] = self.emit_implicit_cast(val, ty, promoted);
+            arg_types[i] = promoted;
+        }
     }
 
     /// Lower __builtin_is{greater,less,unordered,...} float comparison builtins.
@@ -2073,6 +2137,29 @@ enum X86IntrinsicKind {
 }
 
 /// Map a BuiltinIntrinsic to its emission pattern.
+/// Number of fixed (non-variadic) parameters of the variadic libc / glibc
+/// fortification functions reachable through `__builtin_*`.  This is the
+/// builtin's own contract and is consulted when the translation unit never
+/// declared the libc symbol (or declared it without a prototype), so the
+/// trailing arguments still receive the default argument promotions and the
+/// SysV XMM count in `%al` is correct.
+fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
+    Some(match libc_name {
+        "printf" => 1,
+        "fprintf" | "sprintf" | "dprintf" => 2,
+        "snprintf" => 3,
+        // __printf_chk(flag, fmt, ...)
+        "__printf_chk" => 2,
+        // __fprintf_chk(fp, flag, fmt, ...)
+        "__fprintf_chk" => 3,
+        // __sprintf_chk(s, flag, slen, fmt, ...)
+        "__sprintf_chk" => 4,
+        // __snprintf_chk(s, maxlen, flag, slen, fmt, ...)
+        "__snprintf_chk" => 5,
+        _ => return None,
+    })
+}
+
 fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     match intrinsic {
         BuiltinIntrinsic::X86Lfence

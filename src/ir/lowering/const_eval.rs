@@ -345,6 +345,27 @@ impl Lowerer {
 
         let src_val = self.eval_const_expr(inner)?;
 
+        // C11 6.3.1.2p1: conversion to _Bool yields 0 or 1.  The constant
+        // cast must NORMALIZE, not bit-copy: `(_Bool)5` is 1, not 5 (the
+        // runtime path emits `val != 0`; the fold must mirror it, including
+        // NaN -> 1, ±0.0 -> 0, negative integers -> 1).  Decimal constants
+        // are declined so `lower_decimal_truthiness` (+0 == -0) handles them.
+        if target_ct == CType::Bool {
+            let is_nonzero = match &src_val {
+                IrConst::F32(v) => *v != 0.0,
+                IrConst::F64(v) => *v != 0.0,
+                IrConst::LongDouble(v, _) => *v != 0.0,
+                IrConst::I8(v) => *v != 0,
+                IrConst::I16(v) => *v != 0,
+                IrConst::I32(v) => *v != 0,
+                IrConst::I64(v) => *v != 0,
+                IrConst::I128(v) => *v != 0,
+                IrConst::Zero => false,
+                IrConst::D32(_) | IrConst::D64(_) => return None,
+            };
+            return Some(IrConst::I8(if is_nonzero { 1 } else { 0 }));
+        }
+
         // Handle float source types: use value-based conversion, not bit manipulation
         if let IrConst::LongDouble(fv, bytes) = &src_val {
             return IrConst::cast_long_double_to_target(*fv, bytes, target_ir_ty);
