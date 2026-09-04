@@ -1742,7 +1742,207 @@ pub(super) fn scan_register_refs(b: &[u8]) -> u16 {
             i += 1;
         }
     }
-    refs
+    // Architectural implicit operands (`cqto`, `idivq %r11`, `cpuid`, string
+    // primitives, ...) are invisible to the textual scan above; every consumer
+    // of `reg_refs` must see the same instruction as the CPU executes it.
+    refs | implicit_reg_refs(b)
+}
+
+// ── Implicit register operands ───────────────────────────────────────────────
+
+/// Register families an instruction reads or writes WITHOUT naming them in
+/// its operand text.
+///
+/// `reg_refs` is the "does this line mention family F at all" oracle for
+/// every text pass (copy coalescing, copy propagation, relay folding, dead
+/// write elimination, loop trampolines, ...).  A purely textual scan misses
+/// the architectural implicit operands, so `cqto` / `idivq %r11` looked like
+/// lines that never touch `%rdx`, and `coalesce_register_copies` happily
+/// renamed a parameter home `movq %rdx, %r8` back onto `%rdx` across a
+/// division — the reload of the parameter (`movzbl %dl, ...`) then read the
+/// remainder (stress lab `intexpr` seed 1, `-O1`).  `load_op_fuse` used to
+/// add `RAX | RDX | RCX | string regs` privately; folding the knowledge into
+/// the classifier makes every consumer see the same truth.
+///
+/// The table records the implicit READS and the implicit WRITES separately:
+/// [`implicit_reg_refs`] unions both (the "mentions" oracle — a set bit only
+/// makes a pass more conservative), while [`implicit_write_refs`] and
+/// [`implicit_read_refs`] project the exact halves for callers that must not
+/// conflate reading with writing (redefinition checks vs. observation
+/// checks).
+///
+/// Prefixes (`lock`, `rep`, `repe`, `repz`, `repne`, `repnz`) are skipped so
+/// the mnemonic that follows is classified; the `rep` family additionally
+/// contributes `%rcx` (count) — and `rep ret` / `rep nop` (pause) contribute
+/// nothing.
+///
+/// Mnemonics are matched EXACTLY, never by prefix: `divsd`/`mulsd`/`mulpd`
+/// are SSE instructions with fully explicit operands and must not inherit
+/// the integer `div`/`mul` accumulator pair (the local liveness model's
+/// prefix match over-approximates this; the oracle is exact).  The emitter
+/// today only produces a subset of the table, but the oracle is written
+/// against the ISA, so the next new emitter site is covered for free.
+#[inline]
+pub(super) fn implicit_reg_refs(b: &[u8]) -> u16 {
+    let (reads, writes) = classify_implicit_operands(b);
+    reads | writes
+}
+
+/// Families an instruction implicitly READS without naming them in its
+/// operand text.  An implicit read observes the register's current value:
+/// acceptance-style checks ("this use observes the full 64-bit value") must
+/// consult this projection, not [`implicit_reg_refs`], or a pure writer such
+/// as `cqto` would be mistaken for a reader of the `%rax` family it merely
+/// consumes as input... and conversely a redefinition check that used the
+/// combined set would freeze coalescing across `cqto` for `%rax` copies that
+/// are architecturally untouched.
+#[inline]
+pub(super) fn implicit_read_refs(b: &[u8]) -> u16 {
+    classify_implicit_operands(b).0
+}
+
+/// Families an instruction implicitly WRITES without naming them in its
+/// operand text.  This is the exact write half of [`implicit_reg_refs`] —
+/// the counterpart of the classified destination for instructions whose
+/// second (or only) destination is architectural: `cqto` → `%rdx`,
+/// `idivq %r11` → `%rax:%rdx`, `rep stosq` → `%rdi:%rcx`, `syscall` →
+/// `%rax:%rcx:%r11`, ...
+#[inline]
+pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
+    classify_implicit_operands(b).1
+}
+
+/// One instruction's implicit (reads, writes) over the GP family numbering
+/// (0 = %rax .. 15 = %r15), derived from its mnemonic.  Both halves are
+/// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
+/// callers that need a MAY model must add their own conservative fallback
+/// (that is what `load_op_fuse::may_write_families` layers on top).
+fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
+    const RAX: u16 = 1 << 0;
+    const RCX: u16 = 1 << 1;
+    const RDX: u16 = 1 << 2;
+    const RBX: u16 = 1 << 3;
+    const RSP: u16 = 1 << 4;
+    const RBP: u16 = 1 << 5;
+    const RSI: u16 = 1 << 6;
+    const RDI: u16 = 1 << 7;
+    const R8: u16 = 1 << 8;
+    const R9: u16 = 1 << 9;
+    const R10: u16 = 1 << 10;
+    const R11: u16 = 1 << 11;
+
+    // Split "mnemonic [operands]" on the first blank.  Lines are already
+    // trimmed on the left by the caller.
+    fn mnemonic(b: &[u8]) -> (&[u8], &[u8]) {
+        let mut i = 0;
+        while i < b.len() && b[i] != b' ' && b[i] != b'\t' {
+            i += 1;
+        }
+        let m = &b[..i];
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        (m, &b[i..])
+    }
+
+    let (mut m, mut rest) = mnemonic(b);
+    if m.is_empty() || m[0] == b'.' || m[m.len() - 1] == b':' || m[0] == b'#' {
+        // Labels, directives and comments name no instruction.
+        return (0, 0);
+    }
+    let mut reads: u16 = 0;
+    let mut writes: u16 = 0;
+    // Prefixes.
+    loop {
+        match m {
+            b"lock" => {}
+            b"rep" | b"repe" | b"repz" | b"repne" | b"repnz" => {
+                // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
+                // counted loops: they touch no register at all.
+                let (m2, _) = mnemonic(rest);
+                if m2 != b"ret" && m2 != b"retq" && m2 != b"nop" {
+                    reads |= RCX; // count tested for zero
+                    writes |= RCX; // count decremented
+                }
+            }
+            _ => break,
+        }
+        let (m2, r2) = mnemonic(rest);
+        if m2.is_empty() {
+            return (reads, writes);
+        }
+        m = m2;
+        rest = r2;
+    }
+    let has_comma = rest.contains(&b',');
+    let table: (u16, u16) = match m {
+        // Sign-extension of the accumulator in place.
+        b"cbtw" | b"cwtl" | b"cltq" | b"cbw" | b"cwde" | b"cdqe" => (RAX, RAX),
+        // Sign-extension into the data register: %rax is the INPUT.
+        b"cwtd" | b"cltd" | b"cqto" | b"cwd" | b"cdq" | b"cqo" => (RAX, RDX),
+        // Single-operand multiply/divide: rax:rdx implicit.  The byte forms
+        // divide/multiply AX by r/m8 (quotient AL, remainder AH, product AX)
+        // and never touch the %rdx family.
+        b"divb" | b"idivb" | b"mulb" | b"imulb" => (RAX, RAX),
+        b"div" | b"divw" | b"divl" | b"divq" | b"idiv" | b"idivw" | b"idivl" | b"idivq"
+        | b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX | RDX, RAX | RDX),
+        // imul with a single operand is the widening form (rax:rdx); the
+        // two/three-operand forms name every register they touch.
+        b"imul" | b"imulw" | b"imull" | b"imulq" if !has_comma => (RAX, RAX | RDX),
+        // BMI2 mulx reads %rdx implicitly; both destinations are explicit.
+        b"mulx" | b"mulxl" | b"mulxq" => (RDX, 0),
+        // String instructions: %rsi source, %rdi destination, %rax data.  The
+        // pointer registers are post-incremented, i.e. also written.
+        b"movsb" | b"movsw" | b"movsl" | b"movsq" | b"cmpsb" | b"cmpsw" | b"cmpsl" | b"cmpsq" => {
+            (RSI | RDI, RSI | RDI)
+        }
+        b"stosb" | b"stosw" | b"stosl" | b"stosq" | b"scasb" | b"scasw" | b"scasl" | b"scasq" => {
+            (RAX | RDI, RDI)
+        }
+        b"lodsb" | b"lodsw" | b"lodsl" | b"lodsq" => (RSI, RAX | RSI),
+        b"insb" | b"insw" | b"insl" => (RDX, RDI),
+        b"outsb" | b"outsw" | b"outsl" => (RDX | RSI, RSI),
+        b"in" | b"inb" | b"inw" | b"inl" => (RDX, RAX),
+        b"out" | b"outb" | b"outw" | b"outl" => (RAX | RDX, 0),
+        // Serialising / system instructions with fixed register interfaces.
+        b"cpuid" => (RAX, RAX | RBX | RCX | RDX),
+        b"rdtsc" => (0, RAX | RDX),
+        b"rdtscp" => (0, RAX | RCX | RDX),
+        b"rdpmc" | b"rdmsr" | b"xgetbv" => (RCX, RAX | RDX),
+        b"wrmsr" | b"xsetbv" => (RAX | RDX | RCX, 0),
+        b"monitor" | b"mwait" => (RAX | RCX | RDX, 0),
+        // The xsave family passes its feature mask in %edx:%eax; state goes
+        // to/from memory, never to a GP register.
+        b"xsave" | b"xsaveopt" | b"xsavec" | b"xsaves" | b"xrstor" | b"xrstors" | b"xsave64"
+        | b"xsaveopt64" | b"xsavec64" | b"xsaves64" | b"xrstor64" | b"xrstors64" => (RAX | RDX, 0),
+        // syscall: number/return in %rax, arguments in rdi/rsi/rdx/r10/r8/r9,
+        // and the kernel clobbers %rcx/%r11.
+        b"syscall" => (RAX | RDX | RSI | RDI | R8 | R9 | R10, RAX | RCX | R11),
+        b"sysenter" | b"sysexit" | b"sysret" | b"sysretq" => (RAX | RCX | RDX, RAX | RCX | RDX),
+        // Software interrupt: the handler's register contract is unknown
+        // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
+        b"int" => (
+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
+            RAX | RBX | RCX | RDX | RSI | RDI | RBP,
+        ),
+        // Atomics with an implicit accumulator: %rax holds the compare value
+        // and is reloaded when the exchange fails.
+        b"cmpxchg" | b"cmpxchgb" | b"cmpxchgw" | b"cmpxchgl" | b"cmpxchgq" => (RAX, RAX),
+        // CMPXCHG8B/16B compares %edx:%eax (reloaded on failure) against
+        // memory; %ecx:%ebx are the store payload, read-only.
+        b"cmpxchg8b" | b"cmpxchg16b" => (RAX | RBX | RCX | RDX, RAX | RDX),
+        // Misc legacy: table lookup, flags <-> %ah, counted loops.
+        b"xlat" | b"xlatb" => (RBX, RAX),
+        b"lahf" => (0, RAX),
+        b"sahf" => (RAX, 0),
+        b"loop" | b"loope" | b"loopz" | b"loopne" | b"loopnz" => (RCX, RCX),
+        b"jrcxz" | b"jecxz" => (RCX, 0),
+        // Frame instructions.
+        b"enter" => (0, RSP | RBP),
+        b"leave" | b"leaveq" => (RBP, RSP | RBP),
+        _ => (0, 0),
+    };
+    (reads | table.0, writes | table.1)
 }
 
 /// Write an integer and the "(%rbp)" suffix into a buffer without using core::fmt.
@@ -1805,4 +2005,147 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
         MoveSize::B => 3,
     };
     REG_NAMES[row][id as usize]
+}
+
+// ── tests: the implicit-operand oracle ───────────────────────────────────────
+
+#[cfg(test)]
+mod implicit_oracle_tests {
+    use super::*;
+
+    const RAX: u16 = 1 << 0;
+    const RCX: u16 = 1 << 1;
+    const RDX: u16 = 1 << 2;
+    const RBX: u16 = 1 << 3;
+    const RSI: u16 = 1 << 6;
+    const RDI: u16 = 1 << 7;
+    const R8: u16 = 1 << 8;
+    const R9: u16 = 1 << 9;
+    const R10: u16 = 1 << 10;
+    const R11: u16 = 1 << 11;
+
+    fn reads(line: &str) -> u16 {
+        implicit_read_refs(line.trim().as_bytes())
+    }
+    fn writes(line: &str) -> u16 {
+        implicit_write_refs(line.trim().as_bytes())
+    }
+    fn touches(line: &str) -> u16 {
+        implicit_reg_refs(line.trim().as_bytes())
+    }
+
+    #[test]
+    fn the_widening_branch_writes_rdx_and_only_reads_rax() {
+        // The heart of the stress-lab `intexpr` seed 1 miscompile: `cqto`
+        // rewrote %rdx while being invisible to every textual scan.
+        assert_eq!(touches("    cqto"), RAX | RDX);
+        assert_eq!(reads("    cqto"), RAX);
+        assert_eq!(writes("    cqto"), RDX);
+        for m in ["cwtd", "cltd", "cqto", "cwd", "cdq", "cqo"] {
+            assert_eq!(writes(m), RDX, "{m}");
+            assert_eq!(reads(m), RAX, "{m}");
+        }
+    }
+
+    #[test]
+    fn in_place_extensions_read_and_write_the_accumulator() {
+        for m in ["cbtw", "cwtl", "cltq", "cbw", "cwde", "cdqe"] {
+            assert_eq!(touches(m), RAX, "{m}");
+        }
+    }
+
+    #[test]
+    fn integer_division_names_its_implicit_pair_exactly() {
+        assert_eq!(writes("    idivq %r11"), RAX | RDX);
+        assert_eq!(reads("    idivq %r11"), RAX | RDX);
+        assert_eq!(writes("    divl %ecx"), RAX | RDX);
+        // SSE divides/multiplies have fully explicit operands: a prefix
+        // match against "div"/"mul" would tax every FP loop with a
+        // phantom accumulator pair.
+        assert_eq!(touches("    divsd %xmm0, %xmm1"), 0);
+        assert_eq!(touches("    mulsd %xmm0, %xmm1"), 0);
+        assert_eq!(touches("    mulpd %xmm0, %xmm1"), 0);
+        // The byte forms divide/multiply AX: quotient AL, remainder AH,
+        // product AX — the %rdx family is never touched.
+        assert_eq!(writes("    idivb %r11b"), RAX);
+        assert_eq!(writes("    mulb %cl"), RAX);
+    }
+
+    #[test]
+    fn single_operand_imul_is_the_widening_form() {
+        assert_eq!(writes("    imulq %r11"), RAX | RDX);
+        assert_eq!(reads("    imulq %r11"), RAX);
+        // The two/three-operand forms name every register they touch.
+        assert_eq!(touches("    imulq %rcx, %rax"), 0);
+        assert_eq!(touches("    imulq $5, %rcx, %rax"), 0);
+    }
+
+    #[test]
+    fn system_instructions_have_their_contract() {
+        // The kernel returns in %rax and destroys %rcx/%r11; the argument
+        // registers are read-only inputs.
+        assert_eq!(writes("    syscall"), RAX | RCX | R11);
+        assert_eq!(reads("    syscall") & RDI, RDI);
+        assert_eq!(reads("    syscall") & (R8 | R9 | R10), R8 | R9 | R10);
+        assert_eq!(writes("    cpuid"), RAX | RBX | RCX | RDX);
+        assert_eq!(writes("    rdtsc"), RAX | RDX);
+        // rdtscp additionally returns the TSC_AUX in %rcx; rdtsc does not.
+        assert_eq!(writes("    rdtscp"), RAX | RCX | RDX);
+    }
+
+    #[test]
+    fn rep_prefixes_contribute_the_count_register() {
+        assert_eq!(touches("    rep stosq"), RCX | RAX | RDI);
+        assert_eq!(writes("    rep stosq"), RCX | RDI);
+        assert_eq!(writes("    repne scasq"), RCX | RDI);
+        // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
+        // counted loops: they touch no register at all.
+        assert_eq!(touches("    rep ret"), 0);
+        assert_eq!(touches("    rep nop"), 0);
+    }
+
+    #[test]
+    fn string_primitives_post_increment_their_pointers() {
+        assert_eq!(writes("    movsq"), RSI | RDI);
+        assert_eq!(writes("    movsl"), RSI | RDI);
+        assert_eq!(writes("    lodsq"), RAX | RSI);
+        assert_eq!(reads("    lodsq"), RSI);
+        // movslq is a sign-extending move, not a string primitive — the
+        // two differ by exactly one letter and one semantic universe.
+        assert_eq!(touches("    movslq %eax, %rax"), 0);
+    }
+
+    #[test]
+    fn cmpxchg8b_reads_the_payload_and_reloads_the_compare() {
+        assert_eq!(reads("    cmpxchg8b (%rdi)"), RAX | RBX | RCX | RDX);
+        assert_eq!(writes("    cmpxchg8b (%rdi)"), RAX | RDX);
+    }
+
+    #[test]
+    fn non_instructions_name_nothing() {
+        assert_eq!(touches(".LBB1:"), 0);
+        assert_eq!(touches(".cfi_startproc"), 0);
+        assert_eq!(touches("#APP"), 0);
+        assert_eq!(touches(""), 0);
+        assert_eq!(touches("frobnicate"), 0);
+        // lock alone contributes nothing; the prefixed mnemonic decides.
+        assert_eq!(touches("    lock"), 0);
+    }
+
+    #[test]
+    fn the_union_reaches_scan_register_refs() {
+        // The classified `reg_refs` of a bare `cqto` used to be 0 — the
+        // exact hole behind the stress-lab intexpr miscompile.
+        let info = classify_line("    cqto");
+        assert_eq!(info.reg_refs & RDX, RDX);
+        assert_eq!(info.reg_refs & RAX, RAX);
+        let info = classify_line("    idivq %r11");
+        assert_eq!(info.reg_refs & RDX, RDX);
+        assert_eq!(info.reg_refs & R11, R11);
+        let info = classify_line("    syscall");
+        assert_eq!(info.reg_refs & R11, R11);
+        // The Cmp kind funnels through the same scan (cmpxchg lives there).
+        let info = classify_line("    cmpxchgq %rbx, (%rdi)");
+        assert_eq!(info.reg_refs & RAX, RAX);
+    }
 }

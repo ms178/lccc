@@ -17,7 +17,7 @@
 
 use super::super::types::*;
 use super::helpers::{
-    get_dest_reg, implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line,
+    implicit_read_reg_family, is_read_modify_write, is_rsp_shift_line, writes_family,
 };
 
 /// True when a line transfers control or merges paths, so that textual line
@@ -1215,11 +1215,14 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
                 // would test/combine the WRONG slot. (The old code only
                 // checked for stores to the same stack offset, missing
                 // register re-writes such as `movl mem2, %eax` between
-                // `movl mem1, %eax` and `testl %eax, %eax`.) Checking
-                // `get_dest_reg` catches every register-writing instruction.
+                // `movl mem1, %eax` and `testl %eax, %eax`.)
+                // `writes_family` catches every register-writing instruction
+                // — explicitly destination-named ones and architecturally
+                // implicit ones alike (`cqto` overwriting %rdx, `idivq`
+                // rewriting %rax:%rdx).
                 let mut reg_rewritten = false;
                 for k in (i + 1)..j {
-                    if get_dest_reg(&infos[k]) == load_reg {
+                    if writes_family(&infos[k], infos[k].trimmed(store.get(k)), load_reg) {
                         reg_rewritten = true;
                         break;
                     }

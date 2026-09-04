@@ -16,7 +16,7 @@
 //!   to a register the address depends on.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, has_implicit_reg_usage};
+use super::helpers::{has_implicit_reg_usage, writes_family};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
@@ -243,15 +243,17 @@ pub(super) fn reuse_redundant_loads(store: &mut LineStore, infos: &mut [LineInfo
             if line_writes_memory(t) {
                 break;
             }
-            // A write to an address register invalidates the operand.
-            if infos[j].reg_refs & addr_mask != 0 {
-                let w = get_dest_reg(&infos[j]);
-                if w != REG_NONE && addr_fams.contains(&w) {
-                    break;
-                }
+            // A write to an address register invalidates the operand. The
+            // mentions gate keeps the common case O(1); `writes_family`
+            // supplies the exact answer for the lines it admits — including
+            // implicit writes such as `cqto` overwriting an %rdx address.
+            if infos[j].reg_refs & addr_mask != 0
+                && addr_fams.iter().any(|&f| writes_family(&infos[j], t, f))
+            {
+                break;
             }
             // The first load's destination must still hold the value.
-            if infos[j].reg_refs & dst_mask != 0 && get_dest_reg(&infos[j]) == dst_fam {
+            if infos[j].reg_refs & dst_mask != 0 && writes_family(&infos[j], t, dst_fam) {
                 break;
             }
             if let Some((op2, mem2, dst2, _)) = load_operand(t) {

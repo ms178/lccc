@@ -49,7 +49,7 @@
 //! immediately recycled by the next LEA).
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family};
+use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, writes_family};
 use super::liveness::FileLiveness;
 
 /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
@@ -474,8 +474,11 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                 let _ = folded;
                 break;
             }
-            if infos[j].reg_refs & src_mask != 0 && get_dest_reg(&infos[j]) == src_fam {
-                break; // %S redefined before the use: the copy is not a relay
+            // %S redefined (explicitly or implicitly — `cqto` overwrites
+            // %rdx without naming it) before the use: the copy is not a
+            // relay.
+            if writes_family(&infos[j], infos[j].trimmed(store.get(j)), src_fam) {
+                break;
             }
             j += 1;
         }

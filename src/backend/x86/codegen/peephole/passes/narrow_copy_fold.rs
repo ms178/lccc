@@ -51,6 +51,10 @@
 //! 1. **No barrier in `(i, k]`.** A label can be entered on another path where
 //!    `%S` holds something else.
 //! 2. **`%S` is not written in `(i, k]`.** Otherwise the two have diverged.
+//!    Written implicitly counts too: `cqto`/`idivq` overwrite `%rdx` without
+//!    naming it, `cpuid` rewrites `%rbx`, a `syscall` clobbers `%rcx` and
+//!    `%r11` — [`helpers::writes_family`] answers this rule for both the
+//!    classified destination and the architectural implicit write set.
 //! 3. **`%D` is not written in `(i, k)`.** A later write starts a new live
 //!    range that this copy does not feed.
 //! 4. **No use in `(i, k]` writes `%D` while reading it.** `addl %eax, %edx`
@@ -70,7 +74,9 @@
 //! `%dxl` and the assembler rejected the function.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate};
+use super::helpers::{
+    get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family,
+};
 use super::liveness::FileLiveness;
 
 /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
@@ -335,26 +341,32 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             if infos[j].is_barrier() {
                 break;
             }
-            let dest_j = get_dest_reg(&infos[j]);
-            // Rule 2: the source must still hold the copied value.
-            if dest_j == sfam {
+            let line = infos[j].trimmed(store.get(j));
+            // Rule 2: the source must still hold the copied value.  The
+            // implicit second output of `cqto`/`idivq`/`cpuid`/`rep stos`...
+            // counts as a write even though `get_dest_reg` names only `%rax`
+            // (stress lab `intexpr` seed 1, `-O1`: a narrow reload of the
+            // parameter home was folded onto `%dl` and read the division
+            // remainder).
+            if writes_family(&infos[j], line, sfam) {
                 break;
             }
             let mentions_d = infos[j].reg_refs & (1u16 << dfam) != 0;
             if !mentions_d {
                 // Rule 3: a write to %D with no read ends our range; the copy
                 // is then dead and `dead_writes` will retire it.
-                if dest_j == dfam {
+                if writes_family(&infos[j], line, dfam) {
                     break;
                 }
                 continue;
             }
-            // Rule 4: the use must not also write %D.
-            if dest_j == dfam {
+            // Rule 4: the use must not also write %D (explicitly — `addl
+            // %eax, %edx` — or implicitly, e.g. `idivq` overwriting a %rax
+            // copy).
+            if writes_family(&infos[j], line, dfam) {
                 ok = false;
                 break;
             }
-            let line = infos[j].trimmed(store.get(j));
             // Rule 6.
             if has_implicit_reg_usage(line) || is_shift_or_rotate(line) {
                 ok = false;

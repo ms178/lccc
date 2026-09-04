@@ -319,12 +319,29 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             }
         }
 
-        // Instructions with implicit register usage conservatively invalidate all.
+        // Instructions with implicit register usage conservatively invalidate
+        // all. The oracle pass below additionally retires exactly the
+        // identities of implicit writers the boolean veto list does not name
+        // (single-operand `imul`, string primitives, `loop`, ...): those
+        // clobber architectural registers without tripping the blanket.
         {
             let cur_trimmed = infos[i].trimmed(store.get(i));
             if has_implicit_reg_usage(cur_trimmed) {
                 copy_src = [REG_NONE; 16];
                 copy_src32 = [REG_NONE; 16];
+            }
+            let implicit_writes = implicit_write_refs(cur_trimmed.as_bytes());
+            for fam in 0..=REG_GP_MAX {
+                if implicit_writes & (1u16 << fam) != 0 {
+                    for k in 0..16u8 {
+                        if k == fam || copy_src[k as usize] == fam {
+                            copy_src[k as usize] = REG_NONE;
+                        }
+                        if k == fam || copy_src32[k as usize] == fam {
+                            copy_src32[k as usize] = REG_NONE;
+                        }
+                    }
+                }
             }
         }
 

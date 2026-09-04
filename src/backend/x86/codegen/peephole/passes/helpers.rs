@@ -335,6 +335,49 @@ pub(super) fn get_dest_reg(info: &LineInfo) -> RegId {
     }
 }
 
+/// Does the line classified as `info` (text `trimmed`) write ANY part of GP
+/// family `fam`?
+///
+/// `get_dest_reg` yields the single classified destination, which is the
+/// explicit AT&T destination or the primary implicit one (`%rax` for
+/// `cltq`/`cqto`/`div`/`mul`).  Instructions with a SECOND implicit output
+/// (`cqto` → `%rdx`, `idivq` → `%rax:%rdx`, `cpuid`, `rep stos`, `syscall`,
+/// ...) are invisible to that answer, and every copy-rewriting pass that
+/// asked "is the copy source still intact at line j?" via
+/// `get_dest_reg(j) == src` let `movq %rdx, %r8; ...; cqto; idivq; movzbl
+/// %r8b` be rewritten to read the remainder in `%dl`.  Use this predicate for
+/// every redefinition check.
+///
+/// Exactness contract (this predicate is safe to use on ACCEPTANCE paths —
+/// "the register is fully redefined, the old value is unobservable" — where
+/// an over-approximation would wrongly enable a transform):
+///
+/// * the architectural implicit write set ([`implicit_write_refs`]) is exact
+///   and wins over the classified destination;
+/// * the classified destination counts only if the line does not implicitly
+///   READ the family: the classifier reports `%rax` as the primary
+///   destination of `cqto`/`cdq`/`cqo`, but %rax is those instructions'
+///   implicit INPUT — their only output is `%rdx`, which the oracle already
+///   reported.  (An instruction that both reads and writes the family
+///   implicitly — `idivq` on %rax, `cltq` — is decided by its write set, so
+///   the read-guard only ever suppresses a classified answer for a family
+///   the instruction genuinely only reads.)
+#[inline]
+pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    let bit = 1u16 << fam;
+    // 1. Architectural implicit writes: exact.
+    if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
+        return true;
+    }
+    // 2. The classified destination (explicit AT&T destination or the primary
+    //    implicit one), suppressed when the instruction implicitly reads the
+    //    family without writing it (the `cqto`-family %rax misclassification).
+    get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
+}
+
 // ── Label/jump parsing ───────────────────────────────────────────────────────
 
 /// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
@@ -476,4 +519,47 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
 
     // Default: assume read-modify-write (conservative)
     true
+}
+
+// ── tests: the redefinition predicate ────────────────────────────────────────
+
+#[cfg(test)]
+mod writes_family_tests {
+    use super::*;
+
+    #[test]
+    fn is_exact_for_the_widening_branch() {
+        let info = classify_line("    cqto");
+        // The classifier names %rax as cqto's primary destination, but %rax
+        // is the implicit INPUT; the only family written is %rdx.
+        assert!(writes_family(&info, "cqto", 2));
+        assert!(!writes_family(&info, "cqto", 0));
+    }
+
+    #[test]
+    fn covers_the_implicit_second_output() {
+        let info = classify_line("    idivq %r11");
+        assert!(writes_family(&info, "idivq %r11", 0));
+        assert!(writes_family(&info, "idivq %r11", 2));
+        assert!(!writes_family(&info, "idivq %r11", 3));
+    }
+
+    #[test]
+    fn still_answers_explicit_destinations() {
+        let info = classify_line("    movq %rcx, %rax");
+        assert!(writes_family(&info, "movq %rcx, %rax", 0));
+        assert!(!writes_family(&info, "movq %rcx, %rax", 1));
+        // An RMW of another family is not a write of the source family; a
+        // read of a family the instruction never writes must not be one
+        // either.
+        let info = classify_line("    addq %rdx, %rcx");
+        assert!(!writes_family(&info, "addq %rdx, %rcx", 2));
+        assert!(writes_family(&info, "addq %rdx, %rcx", 1));
+    }
+
+    #[test]
+    fn rejects_non_gp_families() {
+        let info = classify_line("    movsd %xmm0, %xmm1");
+        assert!(!writes_family(&info, "movsd %xmm0, %xmm1", 25));
+    }
 }
