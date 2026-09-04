@@ -26,7 +26,7 @@
 #
 # Usage:  scripts/lccc-harness-snapshot.sh "<slug>" "<one-line description>"
 # Env:    LCCC_REPO      (default /home/user/lccc)
-#         LCCC_SANDBOX   (default /home/user/sandbox)
+#         LCCC_SANDBOX   (auto: /home/user/sandbox (Vite) or /app (Next.js))
 #         LCCC_BASE_REF  (upstream commit the session is rebased on; recorded
 #                         once in $GEN/.base_ref and reused afterwards)
 #         LCCC_SNAPSHOT_DOCS  (extra space-separated repo-relative doc paths)
@@ -36,7 +36,15 @@
 set -euo pipefail
 
 REPO=${LCCC_REPO:-/home/user/lccc}
-SANDBOX=${LCCC_SANDBOX:-/home/user/sandbox}
+# Sandbox auto-detection: the Vite harness mounts the web app at
+# /home/user/sandbox, the Next.js harness at /app.  Either way the ONLY
+# user-visible tree is that directory, so the deliverable must land there.
+if [[ -z "${LCCC_SANDBOX:-}" ]]; then
+  if [[ -f /home/user/sandbox/package.json ]]; then LCCC_SANDBOX=/home/user/sandbox
+  elif [[ -f /app/package.json ]]; then LCCC_SANDBOX=/app
+  else LCCC_SANDBOX=/home/user/sandbox; fi
+fi
+SANDBOX=$LCCC_SANDBOX
 GEN="$SANDBOX/src/generated"
 PUB="$SANDBOX/public/patches"
 LEDGER="$GEN/ledger.json"
@@ -159,8 +167,13 @@ rm -f "$patch_tmp"
 
 # 6. Rebuild the single-file web bundle so dist/index.html carries this
 #    snapshot even if the session dies before the harness's final build.
+#    Next.js harness: the platform builds the app itself and serves
+#    public/patches/*.patch statically, so a per-snapshot `next build`
+#    (minutes on a 2-core box) buys nothing; opt in with LCCC_WEB_BUILD=1.
 if [[ "${LCCC_SKIP_WEB_BUILD:-0}" == "1" ]]; then
   web="web build skipped (LCCC_SKIP_WEB_BUILD=1)"
+elif ls "$SANDBOX"/next.config.* >/dev/null 2>&1 && [[ "${LCCC_WEB_BUILD:-0}" != "1" ]]; then
+  web="Next.js harness: static public/patches copy is the deliverable (LCCC_WEB_BUILD=1 to also run next build)"
 elif [[ -f "$SANDBOX/package.json" ]]; then
   ( cd "$SANDBOX" && npm run build >/dev/null 2>&1 ) && web="dist rebuilt" || web="WARN: web build failed"
 else
