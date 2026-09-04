@@ -631,8 +631,11 @@ fn build_layout_context(
             }
         }
     }
-    let vector_defer_values = copy_coalescing::compute_vector_defer_values(func);
+    // VLFOLD candidates first: the defer analysis treats an elided load as
+    // transparent between a deferred def and its consumer.
     let vector_memfold_values = copy_coalescing::compute_vector_memfold_values(func);
+    let vector_defer_values =
+        copy_coalescing::compute_vector_defer_values(func, &vector_memfold_values);
     let x87_defer_values = copy_coalescing::compute_x87_defer_values(func);
 
     // Propagate copy-alias uses into use_blocks_map so that root values account

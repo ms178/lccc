@@ -3134,6 +3134,11 @@ impl X86Codegen {
                     }
                 }
                 if !loaded_home {
+                    // A deferred result may still sit in %ymm0 (the defer
+                    // analysis lets VLFOLD-elided loads be crossed; when the
+                    // elision bails at emit time this load must not clobber
+                    // the pending value): commit it first.
+                    self.flush_pending_vec_store_impl();
                     self.state
                         .emit_fmt(format_args!("    vmovupd {}, %ymm0", mem));
                 }
@@ -3195,6 +3200,9 @@ impl X86Codegen {
             }
             IntrinsicOp::VecLoadI32x8 => {
                 // Defer-aware store; reuse register-allocated base/offset.
+                // Commit a pending deferred %ymm0 result before clobbering
+                // the scratch register (see VecLoadF64x4).
+                self.flush_pending_vec_store_impl();
                 let (base, index) = self.vec_load_addr_regs(&args[0], &args[1]);
                 match &index {
                     Some(ix) => self
@@ -4136,6 +4144,9 @@ impl X86Codegen {
                     }
                 }
                 if !loaded_home {
+                    // Commit a pending deferred %ymm0 result before
+                    // clobbering the scratch register (see VecLoadF64x4).
+                    self.flush_pending_vec_store_impl();
                     if is8 {
                         self.state
                             .emit_fmt(format_args!("    vmovups {}, %ymm0", mem));

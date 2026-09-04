@@ -59,6 +59,7 @@ pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
+pub(crate) mod vec_load_sink;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -1325,6 +1326,25 @@ pub(crate) fn run_passes(
             );
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Single-use vector-load sinking (x86 only): place each stream
+            // load directly before its unique consumer so the emitter's
+            // VLFOLD window folds it as a memory operand instead of staging
+            // it through %ymm0 and a 32-byte spill slot (saxpy-shaped
+            // `y[i] = y[i] OP f(x[i])` bodies at -ffp-contract=off).  Runs
+            // before the post-vectorize unroll so every unrolled copy
+            // inherits the folded order.  Pure reordering of reads; a
+            // "changed" signal is not needed downstream.
+            // Pass name for CCC_DISABLE_PASSES: "vec_load_sink"
+            if target == crate::backend::Target::X86_64
+                && !pass_disabled(&disabled, "vec_load_sink")
+            {
+                let mut scratch = vec![false; module.functions.len()];
+                timed_pass!(
+                    "vec_load_sink",
+                    run_on_visited(module, &dirty, &mut scratch, vec_load_sink::sink_vector_loads)
+                );
+            }
 
             // Post-vectorize unroll: the matmul/map vector body is often a
             // single intrinsic — unrolling it 2–4× exposes independent FMA
