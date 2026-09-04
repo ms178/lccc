@@ -1,0 +1,816 @@
+//! Correlated value propagation (dominance-scoped predicate folding).
+//!
+//! Conditional control flow is a source of facts: on the true edge of
+//! `br (x <u 10)`, `x` is known to lie in `[0, 9]`; on the false edge of
+//! `br (v == 0)`, `v` is known non-zero.  Every block dominated by such an
+//! edge inherits the fact, and any later compare of the same value against a
+//! constant whose outcome is *implied* by the accumulated facts is redundant.
+//!
+//! GCC (VRP / evrp / dom-threading) and LLVM (CorrelatedValuePropagation,
+//! LazyValueInfo) both perform this analysis; LCCC did not, so redundant
+//! checks survived to the backend.  Two concrete shapes motivated the pass:
+//!
+//!  * Linux `find_next_bit`: the `__ffs` tree is recognised as `Ctz`, but the
+//!    recogniser must guard the zero case (`v == 0 ? 63 : ctz(v)`) because
+//!    the C function is well defined for zero.  The tree is only ever reached
+//!    through `while (!value)`, so `value != 0` on that path and the guard
+//!    (`test/sete/movzbl/test/cmov` ×2, ten instructions) is dead.
+//!  * Post-inlining chains such as `if (p) f(p)` with `f` starting `if (!p)`,
+//!    SQLite/Expat byte classifiers that re-test a range already tested by the
+//!    enclosing branch, and `switch` cases that re-compare the selector.
+//!
+//! # Facts
+//!
+//! A fact is `(value, bits, interval-set)`: the value of `value` (interpreted
+//! as a `bits`-wide integer) is contained in the interval set.  Interval sets
+//! are kept in the **unsigned** domain `[0, 2^bits)`; signed comparisons are
+//! mapped by splitting at the sign boundary, so signed and unsigned facts
+//! about the same value compose (`x >s -1 && x <s 100` ⇒ `x <u 100`).
+//!
+//! Edge facts come from `CondBranch` on a `Cmp value-vs-constant` (and from
+//! the boolean condition value itself, so a re-branch on the same `_Bool`
+//! folds) and from `Switch` (`val == case` on a case edge, `val != every
+//! case` on the default edge).
+//!
+//! A fact holds in block `S` when **every** predecessor edge of `S` carries
+//! it (single-predecessor blocks are the common special case; the per-edge
+//! sets are unioned).  Facts of `S` then hold in every block `S` dominates.
+//! The pass walks the dominator tree with an explicit fact stack, so
+//! gathering is `O(blocks + facts)`.
+//!
+//! # Folds
+//!
+//! * `Cmp value-vs-constant` whose truth set contains / is disjoint from the
+//!   fact set → canonical boolean constant (`IrConst::I32(0|1)`, as SCCP).
+//! * `Select` whose condition is a known boolean → the selected arm.
+//! * `CondBranch` whose condition is known → `Branch`, with the dropped
+//!   successor's phi incomings for this block removed.  Removing edges can
+//!   only enlarge dominance, so facts computed before the edit stay valid
+//!   for the rest of the walk; `cfg_simplify` later deletes unreachable
+//!   blocks.
+//!
+//! The pass never invents values, never widens a type, and is idempotent.
+//! Pass name for `CCC_DISABLE_PASSES`: `"cvp"`.
+
+use crate::common::fx_hash::FxHashMap;
+
+use crate::common::types::IrType;
+use crate::ir::analysis::{
+    build_cfg, build_dom_tree_children, build_label_map, compute_dominators,
+};
+use crate::ir::reexports::{
+    BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+};
+
+/// A sorted, disjoint, non-adjacent list of closed intervals in `[0, max]`.
+type Set = Vec<(i128, i128)>;
+
+/// Carrier width used for facts about boolean condition values themselves.
+const BOOL_BITS: u32 = 64;
+
+fn bits_of(ty: IrType) -> Option<u32> {
+    match ty {
+        IrType::I8 | IrType::U8 => Some(8),
+        IrType::I16 | IrType::U16 => Some(16),
+        IrType::I32 | IrType::U32 => Some(32),
+        IrType::I64 | IrType::U64 => Some(64),
+        IrType::Ptr => Some((crate::common::types::target_ptr_size() * 8) as u32),
+        _ => None,
+    }
+}
+
+fn umax(bits: u32) -> i128 {
+    (1i128 << bits) - 1
+}
+
+/// Normalise an integer constant to the unsigned `bits`-wide domain.
+fn to_unsigned(c: i128, bits: u32) -> i128 {
+    c & umax(bits)
+}
+
+fn normalize(mut v: Set) -> Set {
+    v.retain(|(a, b)| a <= b);
+    v.sort_unstable();
+    let mut out: Set = Vec::with_capacity(v.len());
+    for (a, b) in v {
+        if let Some(last) = out.last_mut() {
+            if a <= last.1 + 1 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+fn complement(s: &Set, bits: u32) -> Set {
+    let max = umax(bits);
+    let mut out = Vec::new();
+    let mut cur = 0i128;
+    for &(a, b) in s {
+        if a > cur {
+            out.push((cur, a - 1));
+        }
+        cur = b + 1;
+    }
+    if cur <= max {
+        out.push((cur, max));
+    }
+    out
+}
+
+fn intersect(x: &Set, y: &Set) -> Set {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < x.len() && j < y.len() {
+        let lo = x[i].0.max(y[j].0);
+        let hi = x[i].1.min(y[j].1);
+        if lo <= hi {
+            out.push((lo, hi));
+        }
+        if x[i].1 < y[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+fn is_subset(sub: &Set, sup: &Set) -> bool {
+    // Both normalised: every `sub` interval must sit inside one `sup` interval.
+    let mut j = 0;
+    for &(a, b) in sub {
+        while j < sup.len() && sup[j].1 < a {
+            j += 1;
+        }
+        if j >= sup.len() || sup[j].0 > a || sup[j].1 < b {
+            return false;
+        }
+    }
+    true
+}
+
+/// Signed closed interval → unsigned interval set (split at the sign bit).
+fn signed_interval(a: i128, b: i128, bits: u32) -> Set {
+    if a > b {
+        return Vec::new();
+    }
+    let m = 1i128 << bits;
+    if a >= 0 {
+        vec![(a, b)]
+    } else if b < 0 {
+        vec![(a + m, b + m)]
+    } else {
+        vec![(0, b), (a + m, m - 1)]
+    }
+}
+
+/// The set of `bits`-wide values `x` for which `x OP c` is true.
+fn truth_set(op: IrCmpOp, c: i128, bits: u32) -> Set {
+    let max = umax(bits);
+    let cu = to_unsigned(c, bits);
+    let smin = -(1i128 << (bits - 1));
+    let smax = (1i128 << (bits - 1)) - 1;
+    // Sign-extend the constant for signed orderings.
+    let cs = if cu > smax { cu - (1i128 << bits) } else { cu };
+    let raw = match op {
+        IrCmpOp::Eq => vec![(cu, cu)],
+        IrCmpOp::Ne => return normalize(complement(&vec![(cu, cu)], bits)),
+        IrCmpOp::Ult => vec![(0, cu - 1)],
+        IrCmpOp::Ule => vec![(0, cu)],
+        IrCmpOp::Ugt => vec![(cu + 1, max)],
+        IrCmpOp::Uge => vec![(cu, max)],
+        IrCmpOp::Slt => signed_interval(smin, cs - 1, bits),
+        IrCmpOp::Sle => signed_interval(smin, cs, bits),
+        IrCmpOp::Sgt => signed_interval(cs + 1, smax, bits),
+        IrCmpOp::Sge => signed_interval(cs, smax, bits),
+    };
+    normalize(raw)
+}
+
+fn swap_op(op: IrCmpOp) -> IrCmpOp {
+    match op {
+        IrCmpOp::Eq => IrCmpOp::Eq,
+        IrCmpOp::Ne => IrCmpOp::Ne,
+        IrCmpOp::Slt => IrCmpOp::Sgt,
+        IrCmpOp::Sle => IrCmpOp::Sge,
+        IrCmpOp::Sgt => IrCmpOp::Slt,
+        IrCmpOp::Sge => IrCmpOp::Sle,
+        IrCmpOp::Ult => IrCmpOp::Ugt,
+        IrCmpOp::Ule => IrCmpOp::Uge,
+        IrCmpOp::Ugt => IrCmpOp::Ult,
+        IrCmpOp::Uge => IrCmpOp::Ule,
+    }
+}
+
+/// `value OP const` canonical form of a compare, if exactly one side is an
+/// integer constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Pred {
+    value: Value,
+    op: IrCmpOp,
+    c: i128,
+    bits: u32,
+}
+
+fn canonical_pred(op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType) -> Option<Pred> {
+    let bits = bits_of(ty)?;
+    match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(k)) => Some(Pred {
+            value: *v,
+            op,
+            c: k.to_i128()?,
+            bits,
+        }),
+        (Operand::Const(k), Operand::Value(v)) => Some(Pred {
+            value: *v,
+            op: swap_op(op),
+            c: k.to_i128()?,
+            bits,
+        }),
+        _ => None,
+    }
+}
+
+/// A fact that holds on a CFG edge: `value ∈ set` (as a `bits`-wide integer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Fact {
+    value: Value,
+    bits: u32,
+    set: Set,
+}
+
+impl Fact {
+    fn from_pred(p: Pred, truth: bool) -> Fact {
+        let mut set = truth_set(p.op, p.c, p.bits);
+        if !truth {
+            set = complement(&set, p.bits);
+        }
+        Fact {
+            value: p.value,
+            bits: p.bits,
+            set,
+        }
+    }
+}
+
+/// Facts carried by the edge `from → to_label`.
+fn edge_facts(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    from: usize,
+    to_label: BlockId,
+) -> Vec<Fact> {
+    let mut out = Vec::new();
+    match &func.blocks[from].terminator {
+        Terminator::CondBranch {
+            cond: Operand::Value(cv),
+            true_label,
+            false_label,
+        } => {
+            if true_label == false_label {
+                return out;
+            }
+            let truth = if *true_label == to_label {
+                true
+            } else if *false_label == to_label {
+                false
+            } else {
+                return out;
+            };
+            // The boolean itself is known on this edge (its carrier type
+            // does not matter: the consumer only asks "zero or not").
+            out.push(Fact {
+                value: *cv,
+                bits: BOOL_BITS,
+                set: if truth { vec![(1, umax(BOOL_BITS))] } else { vec![(0, 0)] },
+            });
+            if let Some(&(bi, ii)) = defs.get(cv) {
+                if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
+                    if let Some(p) = canonical_pred(*op, lhs, rhs, *ty) {
+                        out.push(Fact::from_pred(p, truth));
+                    }
+                }
+            }
+        }
+        Terminator::Switch {
+            val: Operand::Value(v),
+            cases,
+            default,
+            ty,
+        } => {
+            let Some(bits) = bits_of(*ty) else { return out };
+            if *default == to_label {
+                // Default edge: val is none of the case values that do not
+                // also target the default block.
+                let excluded: Set = normalize(
+                    cases
+                        .iter()
+                        .filter(|(_, l)| *l != to_label)
+                        .map(|(c, _)| {
+                            let u = to_unsigned(*c as i128, bits);
+                            (u, u)
+                        })
+                        .collect(),
+                );
+                out.push(Fact {
+                    value: *v,
+                    bits,
+                    set: complement(&excluded, bits),
+                });
+            } else {
+                let hits: Set = normalize(
+                    cases
+                        .iter()
+                        .filter(|(_, l)| *l == to_label)
+                        .map(|(c, _)| {
+                            let u = to_unsigned(*c as i128, bits);
+                            (u, u)
+                        })
+                        .collect(),
+                );
+                if !hits.is_empty() {
+                    out.push(Fact {
+                        value: *v,
+                        bits,
+                        set: hits,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Facts that hold on entry to `blk`: for each value, the union over all
+/// incoming edges of that edge's fact — kept only if every edge has one.
+fn block_entry_facts(
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    preds: &[u32],
+    blk: usize,
+) -> Vec<Fact> {
+    if preds.is_empty() {
+        return Vec::new();
+    }
+    let label = func.blocks[blk].label;
+    let mut acc: Option<Vec<Fact>> = None;
+    for &p in preds {
+        let ef = edge_facts(func, defs, p as usize, label);
+        acc = Some(match acc {
+            None => ef,
+            Some(prev) => {
+                let mut merged = Vec::new();
+                for f in prev {
+                    for g in ef.iter().filter(|g| g.value == f.value && g.bits == f.bits) {
+                        let mut u = f.set.clone();
+                        u.extend_from_slice(&g.set);
+                        merged.push(Fact {
+                            value: f.value,
+                            bits: f.bits,
+                            set: normalize(u),
+                        });
+                    }
+                }
+                merged
+            }
+        });
+        if acc.as_ref().is_some_and(Vec::is_empty) {
+            break;
+        }
+    }
+    acc.unwrap_or_default()
+}
+
+/// Known interval set for `value` given the active facts.
+fn known_set(stack: &[Fact], value: Value, bits: u32) -> Option<Set> {
+    let mut acc: Option<Set> = None;
+    for f in stack.iter().filter(|f| f.value == value && f.bits == bits) {
+        acc = Some(match acc {
+            None => f.set.clone(),
+            Some(prev) => intersect(&prev, &f.set),
+        });
+    }
+    acc
+}
+
+/// Decide `value OP c` under the active facts.
+fn decide_pred(stack: &[Fact], p: Pred) -> Option<bool> {
+    let known = known_set(stack, p.value, p.bits)?;
+    if known.is_empty() {
+        // Contradictory facts: the block is unreachable.  Leave it alone —
+        // nothing here is observable, and cfg_simplify owns dead code.
+        return None;
+    }
+    let t = truth_set(p.op, p.c, p.bits);
+    if is_subset(&known, &t) {
+        Some(true)
+    } else if intersect(&known, &t).is_empty() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Decide the truth of a boolean operand under the active facts.
+fn decide_bool(
+    stack: &[Fact],
+    func: &IrFunction,
+    defs: &FxHashMap<Value, (usize, usize)>,
+    cond: &Operand,
+) -> Option<bool> {
+    match cond {
+        Operand::Const(k) => k.to_i128().map(|v| v != 0),
+        Operand::Value(v) => {
+            if let Some(s) = known_set(stack, *v, BOOL_BITS) {
+                if s.as_slice() == [(0, 0)] {
+                    return Some(false);
+                }
+                if !s.is_empty() && s[0].0 >= 1 {
+                    return Some(true);
+                }
+            }
+            let &(bi, ii) = defs.get(v)?;
+            if let Instruction::Cmp { ref op, ref lhs, ref rhs, ref ty, .. } = func.blocks[bi].instructions[ii] {
+                return decide_pred(stack, canonical_pred(*op, lhs, rhs, *ty)?);
+            }
+            None
+        }
+    }
+}
+
+fn bool_const(b: bool) -> Operand {
+    Operand::Const(IrConst::I32(b as i32))
+}
+
+/// Remove `pred_label` from the phi incomings of block `target`.
+fn remove_phi_incoming(func: &mut IrFunction, target: usize, pred_label: BlockId) {
+    for inst in &mut func.blocks[target].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            incoming.retain(|(_, l)| *l != pred_label);
+        }
+    }
+}
+
+/// Run correlated value propagation on one function.  Returns the number of
+/// folded instructions and terminators.
+pub fn run_function(func: &mut IrFunction) -> usize {
+    let n = func.blocks.len();
+    if n < 2 {
+        return 0;
+    }
+    let label_to_idx = build_label_map(func);
+    let (preds, succs) = build_cfg(func, &label_to_idx);
+    let idom = compute_dominators(n, &preds, &succs);
+    let children = build_dom_tree_children(n, &idom);
+
+    // Value → (block, instruction) for Cmp definitions.
+    let mut defs: FxHashMap<Value, (usize, usize)> = FxHashMap::default();
+    for (bi, b) in func.blocks.iter().enumerate() {
+        for (ii, inst) in b.instructions.iter().enumerate() {
+            if let Instruction::Cmp { dest, .. } = inst {
+                defs.insert(*dest, (bi, ii));
+            }
+        }
+    }
+
+    // Entry facts per block, computed on the pristine CFG.
+    let entry_facts: Vec<Vec<Fact>> = (0..n)
+        .map(|b| block_entry_facts(func, &defs, preds.row(b), b))
+        .collect();
+
+    let mut changes = 0usize;
+    let mut stack: Vec<Fact> = entry_facts[0].clone();
+    // Explicit DFS over the dominator tree: (block, next child index).
+    let mut work: Vec<(usize, usize)> = vec![(0, 0)];
+    let mut pushed: Vec<usize> = vec![entry_facts[0].len()];
+
+    while let Some(&mut (blk, ref mut next)) = work.last_mut() {
+        if *next == 0 {
+            // First visit: fold inside this block under the active facts.
+            let mut i = 0;
+            while i < func.blocks[blk].instructions.len() {
+                let repl = match &func.blocks[blk].instructions[i] {
+                    Instruction::Cmp { dest, op, lhs, rhs, ty } => canonical_pred(*op, lhs, rhs, *ty)
+                        .and_then(|p| decide_pred(&stack, p))
+                        .map(|t| Instruction::Copy {
+                            dest: *dest,
+                            src: bool_const(t),
+                        }),
+                    Instruction::Select {
+                        dest,
+                        cond,
+                        true_val,
+                        false_val,
+                        ..
+                    } => decide_bool(&stack, func, &defs, cond).map(|t| Instruction::Copy {
+                        dest: *dest,
+                        src: if t { *true_val } else { *false_val },
+                    }),
+                    _ => None,
+                };
+                if let Some(r) = repl {
+                    // A folded Cmp must no longer be looked through.
+                    if let Instruction::Cmp { dest, .. } = &func.blocks[blk].instructions[i] {
+                        defs.remove(dest);
+                    }
+                    func.blocks[blk].instructions[i] = r;
+                    changes += 1;
+                }
+                i += 1;
+            }
+            let decided = match &func.blocks[blk].terminator {
+                Terminator::CondBranch {
+                    cond,
+                    true_label,
+                    false_label,
+                } if true_label != false_label => decide_bool(&stack, func, &defs, cond)
+                    .map(|t| if t { (*true_label, *false_label) } else { (*false_label, *true_label) }),
+                _ => None,
+            };
+            if let Some((keep, drop)) = decided {
+                let this_label = func.blocks[blk].label;
+                if let Some(&di) = label_to_idx.get(&drop) {
+                    remove_phi_incoming(func, di, this_label);
+                }
+                func.blocks[blk].terminator = Terminator::Branch(keep);
+                changes += 1;
+            }
+        }
+        if *next < children[blk].len() {
+            let child = children[blk][*next];
+            *next += 1;
+            let f = &entry_facts[child];
+            stack.extend(f.iter().cloned());
+            pushed.push(f.len());
+            work.push((child, 0));
+        } else {
+            work.pop();
+            let k = pushed.pop().unwrap_or(0);
+            let new_len = stack.len().saturating_sub(k);
+            stack.truncate(new_len);
+        }
+    }
+    changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::reexports::BasicBlock;
+
+    #[test]
+    fn truth_sets_signed_and_unsigned() {
+        assert_eq!(truth_set(IrCmpOp::Ult, 10, 32), vec![(0, 9)]);
+        assert_eq!(truth_set(IrCmpOp::Ne, 0, 8), vec![(1, 255)]);
+        assert_eq!(truth_set(IrCmpOp::Slt, 0, 8), vec![(128, 255)]);
+        assert_eq!(truth_set(IrCmpOp::Sgt, -1, 8), vec![(0, 127)]);
+        assert_eq!(truth_set(IrCmpOp::Sle, 5, 8), vec![(0, 5), (128, 255)]);
+        assert!(truth_set(IrCmpOp::Ult, 0, 16).is_empty());
+        assert_eq!(truth_set(IrCmpOp::Uge, 0, 16), vec![(0, 65535)]);
+    }
+
+    #[test]
+    fn complement_and_intersection() {
+        let s = truth_set(IrCmpOp::Eq, 7, 8);
+        assert_eq!(complement(&s, 8), vec![(0, 6), (8, 255)]);
+        let a = truth_set(IrCmpOp::Sge, 0, 8);
+        let b = truth_set(IrCmpOp::Ult, 100, 8);
+        assert_eq!(intersect(&a, &b), vec![(0, 99)]);
+        assert!(is_subset(&vec![(3, 4), (10, 10)], &vec![(0, 5), (8, 12)]));
+        assert!(!is_subset(&vec![(3, 6)], &vec![(0, 5), (8, 12)]));
+    }
+
+    fn pred(op: IrCmpOp, c: i128) -> Pred {
+        Pred {
+            value: Value(1),
+            op,
+            c,
+            bits: 64,
+        }
+    }
+
+    #[test]
+    fn nonzero_fact_folds_zero_compare() {
+        let stack = vec![Fact::from_pred(pred(IrCmpOp::Eq, 0), false)];
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Eq, 0)), Some(false));
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ne, 0)), Some(true));
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ugt, 0)), Some(true));
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 5)), None);
+    }
+
+    #[test]
+    fn signed_unsigned_facts_compose() {
+        let stack = vec![
+            Fact::from_pred(pred(IrCmpOp::Sgt, -1), true),
+            Fact::from_pred(pred(IrCmpOp::Slt, 100), true),
+        ];
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Ult, 100)), Some(true));
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Uge, 100)), Some(false));
+        assert_eq!(decide_pred(&stack, pred(IrCmpOp::Eq, 50)), None);
+        // `x <s 100` alone says nothing about `x <u 100` (negatives wrap high).
+        let stack2 = vec![Fact::from_pred(pred(IrCmpOp::Slt, 100), true)];
+        assert_eq!(decide_pred(&stack2, pred(IrCmpOp::Ult, 100)), None);
+    }
+
+    #[test]
+    fn mismatched_width_is_not_used() {
+        let stack = vec![Fact::from_pred(pred(IrCmpOp::Eq, 0), false)];
+        let narrow = Pred {
+            value: Value(1),
+            op: IrCmpOp::Eq,
+            c: 0,
+            bits: 32,
+        };
+        assert_eq!(decide_pred(&stack, narrow), None);
+    }
+
+    fn mk(id: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn cmp0(d: u32, op: IrCmpOp) -> Instruction {
+        Instruction::Cmp {
+            dest: Value(d),
+            op,
+            lhs: Operand::Value(Value(0)),
+            rhs: Operand::Const(IrConst::I64(0)),
+            ty: IrType::U64,
+        }
+    }
+
+    #[test]
+    fn full_function_folds_guard_and_branch() {
+        // b0: c = cmp eq v, 0 ; br c, b1, b2
+        // b1: ret v
+        // b2: g = cmp eq v, 0 ; s = select g, 63, v ; c2 = cmp ne v, 0 ; br c2, b3, b4
+        // b3: ret s      b4: ret 0
+        let v = Value(0);
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![cmp0(1, IrCmpOp::Eq)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(1, vec![], Terminator::Return(Some(Operand::Value(v)))),
+            mk(
+                2,
+                vec![
+                    cmp0(2, IrCmpOp::Eq),
+                    Instruction::Select {
+                        dest: Value(3),
+                        cond: Operand::Value(Value(2)),
+                        true_val: Operand::Const(IrConst::I64(63)),
+                        false_val: Operand::Value(v),
+                        ty: IrType::U64,
+                    },
+                    cmp0(4, IrCmpOp::Ne),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(4)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(4),
+                },
+            ),
+            mk(3, vec![], Terminator::Return(Some(Operand::Value(Value(3))))),
+            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
+        ];
+        f.next_value_id = 5;
+        let n = run_function(&mut f);
+        assert_eq!(n, 4, "guard cmp, select, second cmp, branch");
+        assert!(matches!(
+            f.blocks[2].instructions[0],
+            Instruction::Copy { src: Operand::Const(IrConst::I32(0)), .. }
+        ));
+        assert!(matches!(
+            f.blocks[2].instructions[1],
+            Instruction::Copy { src: Operand::Value(Value(0)), .. }
+        ));
+        assert!(matches!(f.blocks[2].terminator, Terminator::Branch(BlockId(3))));
+        assert_eq!(run_function(&mut f), 0, "idempotent");
+    }
+
+    #[test]
+    fn two_agreeing_edges_carry_the_fact_and_phi_is_maintained() {
+        // b0: c = cmp ne v, 0 ; br c, b3, b1
+        // b1: c1 = cmp ne v, 0 ; br c1, b3, b2      (second edge, same fact)
+        // b2: ret 0
+        // b3: p = phi [1,b0],[2,b1] ; g = cmp eq v,0 ; br g, b4, b5
+        // b4: ret 9   b5: ret p
+        let v = Value(0);
+        let cmpne = |d: u32| cmp0(d, IrCmpOp::Ne);
+        let mut f = IrFunction::new("t".to_string(), IrType::U64, vec![], false);
+        f.blocks = vec![
+            mk(
+                0,
+                vec![cmpne(1)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(1),
+                },
+            ),
+            mk(
+                1,
+                vec![cmpne(2)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(3),
+                    false_label: BlockId(2),
+                },
+            ),
+            mk(2, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(0))))),
+            mk(
+                3,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(3),
+                        ty: IrType::U64,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I64(1)), BlockId(0)),
+                            (Operand::Const(IrConst::I64(2)), BlockId(1)),
+                        ],
+                    },
+                    cmp0(4, IrCmpOp::Eq),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(4)),
+                    true_label: BlockId(4),
+                    false_label: BlockId(5),
+                },
+            ),
+            mk(4, vec![], Terminator::Return(Some(Operand::Const(IrConst::I64(9))))),
+            mk(5, vec![], Terminator::Return(Some(Operand::Value(v)))),
+        ];
+        f.next_value_id = 5;
+        let n = run_function(&mut f);
+        // b1 is on the false edge of (v != 0): v == 0 there, so its own
+        // re-test folds to false and its branch becomes `br b2`; b3's phi
+        // loses the b1 incoming.  b3 is then reached only from b0 with
+        // v != 0, so the guard folds and the branch goes to b5.
+        assert_eq!(n, 4);
+        assert!(matches!(f.blocks[1].terminator, Terminator::Branch(BlockId(2))));
+        assert!(matches!(f.blocks[3].terminator, Terminator::Branch(BlockId(5))));
+        if let Instruction::Phi { incoming, .. } = &f.blocks[3].instructions[0] {
+            assert_eq!(incoming.len(), 1);
+            assert_eq!(incoming[0].1, BlockId(0));
+        } else {
+            panic!("phi expected");
+        }
+    }
+
+    #[test]
+    fn switch_edges_carry_case_facts() {
+        // b0: switch v [1→b1, 2→b2] default b3
+        // b1: c = cmp eq v, 1 ; ret c        (true)
+        // b2: c = cmp eq v, 1 ; ret c        (false)
+        // b3: c = cmp eq v, 2 ; ret c        (false: default excludes 1 and 2)
+        let v = Value(0);
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        let cmpk = |d: u32, k: i32| Instruction::Cmp {
+            dest: Value(d),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(v),
+            rhs: Operand::Const(IrConst::I32(k)),
+            ty: IrType::I32,
+        };
+        f.blocks = vec![
+            mk(
+                0,
+                vec![],
+                Terminator::Switch {
+                    val: Operand::Value(v),
+                    cases: vec![(1, BlockId(1)), (2, BlockId(2))],
+                    default: BlockId(3),
+                    ty: IrType::I32,
+                },
+            ),
+            mk(1, vec![cmpk(1, 1)], Terminator::Return(Some(Operand::Value(Value(1))))),
+            mk(2, vec![cmpk(2, 1)], Terminator::Return(Some(Operand::Value(Value(2))))),
+            mk(3, vec![cmpk(3, 2)], Terminator::Return(Some(Operand::Value(Value(3))))),
+        ];
+        f.next_value_id = 4;
+        assert_eq!(run_function(&mut f), 3);
+        let val = |b: usize| match &f.blocks[b].instructions[0] {
+            Instruction::Copy {
+                src: Operand::Const(IrConst::I32(k)),
+                ..
+            } => *k,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!((val(1), val(2), val(3)), (1, 0, 0));
+    }
+}
