@@ -341,15 +341,17 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
                 _ => {}
             }
             if line.contains("%rsp") {
-                let is_stack_adjust = matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
-                    || line.starts_with("subq $")
-                    || line.starts_with("addq $");
-                if !is_stack_adjust
-                    && (line.starts_with("and")
-                        || line.contains("%xmm")
-                        || line.contains("%ymm")
-                        || line.contains("%zmm"))
-                {
+                let is_stack_adjust =
+                    matches!(infos[k].kind, LineKind::Push { .. } | LineKind::Pop { .. })
+                        || line.starts_with("subq $")
+                        || line.starts_with("addq $");
+                // Removing a leading push changes the runtime %rsp by 8 bytes,
+                // so EVERY %rsp-relative data reference in the body (va-register
+                // save areas, `leaq N(%rsp)` overflow pointers, spill slots,
+                // return-address reads) would point 8 bytes off. Only stack
+                // adjustments are offset-independent; anything else addressing
+                // the stack makes the elimination unsafe.
+                if !is_stack_adjust {
                     safe = false;
                     break;
                 }

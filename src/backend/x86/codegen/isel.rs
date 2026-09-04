@@ -636,6 +636,59 @@ pub fn lower_cmp_branch(
 // ── Cast ─────────────────────────────────────────────────────────────────
 
 /// Lower an IR Cast (integer-to-integer only; float casts go through Raw).
+/// Fold an integer `Cast` whose source is a compile-time constant.
+///
+/// The MachInst layer copy-propagates `Copy dest, Const` into later uses, so a
+/// `Cast` can legitimately see an `Operand::Const` source at any width.  The
+/// result is the exact 64-bit register image C semantics demand:
+///
+/// 1. the raw payload is first interpreted at the SOURCE type (sign- or
+///    zero-extended from `from_ty`'s width by `from_ty`'s signedness), then
+/// 2. truncated to the DESTINATION width and re-extended by `to_ty`'s
+///    signedness (a wider reader of the register must see the same value the
+///    mature path and GCC/Clang produce).
+///
+/// Before this fold existed the lowering picked the move width from the
+/// destination signedness alone, so `Cast I64->U64` of `0x8000000000000000`
+/// was emitted as `movl $0` (gcc.c-torture `20020219-1.c` aborted at -O2),
+/// `Cast I32(300)->U8` kept the 0x100 bit and `Cast U32(0xFFFFFFFF)->I64`
+/// produced -1.
+pub(crate) fn fold_int_cast_const(raw: i64, from_ty: IrType, to_ty: IrType) -> i64 {
+    fn extend(v: i64, bits: u32, signed: bool) -> i64 {
+        if bits >= 64 {
+            return v;
+        }
+        let shift = 64 - bits;
+        if signed {
+            (v << shift) >> shift
+        } else {
+            ((v as u64) << shift >> shift) as i64
+        }
+    }
+    let from_bits = (from_ty.size() as u32).saturating_mul(8).clamp(8, 64);
+    let to_bits = (to_ty.size() as u32).saturating_mul(8).clamp(8, 64);
+    let mathematical = extend(raw, from_bits, from_ty.is_signed());
+    extend(mathematical, to_bits, to_ty.is_signed())
+}
+
+/// Materialise an exact 64-bit register image with the cheapest encoding:
+/// `movl $imm32` (zero-extends, 5-6 bytes) when the image fits in 32 unsigned
+/// bits, `movq $simm32` (sign-extends) or `movabsq` otherwise - decided by the
+/// emitter from the value alone.  Never uses a narrow move, so no reader of
+/// the destination register can observe stale upper bits.
+fn emit_exact_imm64(image: i64, dst: MachReg, out: &mut Vec<MachInst>) {
+    let size = if image >= 0 && image <= u32::MAX as i64 {
+        OpSize::S32
+    } else {
+        OpSize::S64
+    };
+    out.push(MachInst::Mov {
+        src: MachOperand::Imm(image),
+        dst: MachOperand::Reg(dst),
+        size,
+    });
+}
+
 pub fn lower_cast(
     dest: &Value,
     src: &Operand,
@@ -647,6 +700,17 @@ pub fn lower_cast(
     let dst = value_to_reg(dest, ra);
     let from_size = OpSize::from_ir_type(from_ty);
     let to_size = OpSize::from_ir_type(to_ty);
+
+    // Constant source (MachInst const-propagation): fold at compile time
+    // with full C conversion semantics and emit one exact move.  This
+    // covers narrowing, same-size and widening casts uniformly.
+    if let Operand::Const(c) = src {
+        if !from_ty.is_float() && !to_ty.is_float() && from_ty.size() <= 8 && to_ty.size() <= 8 {
+            let image = fold_int_cast_const(const_to_i64(c), from_ty, to_ty);
+            emit_exact_imm64(image, dst, out);
+            return;
+        }
+    }
 
     if to_size as u8 <= from_size as u8 {
         // Narrowing or same-size cast.  A plain truncating move (movb/movw/
