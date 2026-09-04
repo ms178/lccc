@@ -488,9 +488,10 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
 ///
 /// Accepted address forms: `DISP(%base)`, `(%base,%index)` and
 /// `DISP(%base,%index,scale)`, plus the base-less `DISP(,%index,scale)` the
-/// scaled-lea peephole emits. The displacement must be an integer (a symbolic
-/// or `%rip`-relative displacement is left alone: `sym(%rip)` cannot be
-/// combined with an index register at all).
+/// scaled-lea peephole emits and the symbolic `sym(%rip)` form. `sym(%rip)`
+/// reads no register, so it is reproducible at any later use and folds into
+/// a bare `(%T)` memory operand; it must never be combined with an index
+/// (x86-64 `%rip` addressing has no SIB).
 fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     let rest = lea.strip_prefix("leaq ")?;
     let (addr, dst) = rest.rsplit_once(',')?;
@@ -506,13 +507,27 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
         return None;
     }
     let disp = addr[..open].trim();
-    if !disp.is_empty() && disp.parse::<i64>().is_err() {
-        return None; // symbolic displacement
-    }
     let mut fams = Vec::new();
     let fields: Vec<&str> = addr[open + 1..close].split(',').map(str::trim).collect();
     if fields.is_empty() || fields.len() > 3 {
         return None;
+    }
+    // RIP-relative symbolic displacement: `leaq sym(%rip), %T` computes the
+    // address of a local symbol; no register is involved, so the fold is a
+    // pure operand rewrite and the address is reproducible at any later use.
+    // Accept `sym(%rip)` (symbolic or numeric displacement); rip takes no
+    // slot in `fams` (it is not a family).
+    let rip_base = fields.len() > 0 && fields[0] == "%rip";
+    if rip_base && fields.len() == 1 {
+        if disp.contains(',') || disp.contains('(') || disp.contains(' ')
+            || !disp.chars().all(|c| c.is_ascii_alphanumeric() || ".$_+-@".contains(c))
+        {
+            return None;
+        }
+        return Some((addr, dst, fams));
+    }
+    if !rip_base && !disp.is_empty() && disp.parse::<i64>().is_err() {
+        return None; // symbolic displacement (register-based) unsupported
     }
     for (n, f) in fields.iter().enumerate() {
         if n == 2 {
@@ -579,7 +594,11 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
             i += 1;
             continue;
         }
+        // Bare `(%T)` matches the plain-relay case; `(%T,` matches the
+        // indexed-relay case: `leaq table(%rip), %rcx; movq (%rcx, %rbp, 8), %r13`
+        // (hash_table, adler32 unrolled loops).
         let addr_pat = format!("({})", dst_text);
+        let idx_pat = format!("({},", dst_text);
         let folded_addr = addr_text.to_string();
         let mut addr_mask = 0u16;
         for f in &addr_fams {
@@ -610,13 +629,66 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 }
             }
             if infos[j].reg_refs & dst_mask != 0 {
-                // Only a BARE `(%T)` operand can absorb the LEA. `8(%T)` must
-                // not match: splicing would produce `8DISP(%base)`.
-                let bare = t.match_indices(&addr_pat).any(|(pos, _)| {
-                    pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
-                });
-                if bare {
-                    let replacement = t.replacen(&addr_pat, &folded_addr, 1);
+                // Only a BARE `(%T)` operand or a base/offset operand
+                // `(%T, …)` can absorb the LEA. `8(%T)` must not match:
+                // splicing would produce `8DISP(%base)`.
+                let mut matched: Option<(usize, usize, String)> = None;
+                if let Some((pos, _)) = t.match_indices(&addr_pat).find(|(pos, _)| {
+                    *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
+                }) {
+                    matched = Some((pos, pos + addr_pat.len() - 1, folded_addr.clone()));
+                } else if let Some((pos, _)) = t.match_indices(&idx_pat).find(|(pos, _)| {
+                    *pos == 0 || matches!(t.as_bytes()[pos - 1] as char, ' ' | ',' | '\t')
+                }) {
+                    if let Some(cl) = t[pos..].find(')').map(|c| pos + c) {
+                        let inner = &t[pos + 1..cl];
+                        if inner.starts_with(dst_text) {
+                            let tail = &inner[dst_text.len()..];
+                            // The spliced operand may hold at most TWO register
+                            // slots (base + index). The leaq's own address may
+                            // already consume both (e.g. `leaq (%rcx,%r9)`):
+                            // folding that into an indexed use would emit an
+                            // invalid three-register SIB
+                            // (`(%rcx, %r9, %r11, 8)` — vectorize_matmul_tail).
+                            let mut extra_regs = 0usize;
+                            let mut fields_ok = true;
+                            for (n, f) in tail.split(',').skip(1).enumerate() {
+                                let f = f.trim();
+                                if f.starts_with('%') {
+                                    extra_regs += 1;
+                                } else if n == 1 && matches!(f, "1" | "2" | "4" | "8") {
+                                    // scale (only meaningful behind an index)
+                                } else {
+                                    fields_ok = false;
+                                }
+                            }
+                            // x86-64 RIP-relative addressing (`disp(%rip)`)
+                            // cannot carry an index register at all — the
+                            // encoding is ModRM mod=00 r/m=101, no SIB. An
+                            // assembler may silently DROP the index instead of
+                            // erroring (observed: `leaq V(%rip,%r11), %r10`
+                            // encoded as plain `leaq V(%rip), %r10` —
+                            // wide_cond_zero_test wrong-code). So a %rip
+                            // leaq may only fold into a BARE `(%T)` use.
+                            if fields_ok
+                                && !folded_addr.contains("%rip")
+                                && addr_fams.len() + extra_regs <= 2
+                            {
+                                if let Some(aopen) = folded_addr.find('(') {
+                                    let new_operand = format!(
+                                        "{}{}{})",
+                                        &folded_addr[..aopen + 1],
+                                        &folded_addr[aopen + 1..folded_addr.len() - 1],
+                                        tail
+                                    );
+                                    matched = Some((pos, cl, new_operand));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((op, cl, new_operand)) = matched {
+                    let replacement = format!("{}{}{}", &t[..op], new_operand, &t[cl + 1..]);
                     if replacement != t
                         && !line_refs_family(&replacement, dst_fam)
                         && provably_dead_lv(&lv, store, infos, j, dst_fam, &[i, j])
@@ -1224,6 +1296,67 @@ mod tests {
         ));
         assert!(out.contains("movzbl 1(%rbx), %r14d"), "{out}");
         assert!(!out.contains("leaq 1(%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn rip_relative_lea_folds_into_bare_memory_use() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq gv(%rip), %rcx\n",
+            "    movq (%rcx), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq gv(%rip), %rax"), "{out}");
+        assert!(!out.contains("leaq gv(%rip)"), "{out}");
+    }
+
+    #[test]
+    fn rip_relative_lea_never_folds_into_an_indexed_use() {
+        // `%rip` addressing has no SIB: splicing an index would make the
+        // assembler silently drop it (wrong code), so the LEA must survive.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq V(%rip), %rcx\n",
+            "    movq (%rcx, %rsi, 8), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq V(%rip), %rcx"), "{out}");
+        assert!(out.contains("movq (%rcx, %rsi, 8), %rax"), "{out}");
+    }
+
+    #[test]
+    fn register_lea_folds_into_an_indexed_use() {
+        // One base register + one index = a legal SIB.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq (%rbx), %rcx\n",
+            "    movq (%rcx, %rsi, 8), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movq (%rbx, %rsi, 8), %rax"), "{out}");
+        assert!(!out.contains("leaq (%rbx)"), "{out}");
+    }
+
+    #[test]
+    fn two_register_lea_never_folds_into_an_indexed_use() {
+        // Base+index (2 regs) folded into another indexed use would need a
+        // third register slot: invalid SIB (`(%rbx, %rdi, %rsi, 8)`).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq (%rbx, %rdi), %rcx\n",
+            "    movq (%rcx, %rsi, 8), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq (%rbx, %rdi), %rcx"), "{out}");
+        assert!(out.contains("movq (%rcx, %rsi, 8), %rax"), "{out}");
     }
 
     #[test]

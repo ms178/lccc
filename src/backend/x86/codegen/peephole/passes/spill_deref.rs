@@ -446,3 +446,466 @@ fn parse_plain_deref(line: &str, expected_base: u8) -> Option<(&'static str, u8,
     }
     None
 }
+
+// ── Save/reload round-trip elimination (XMM/vector / store→clobber→reload) ─
+//
+// Pattern (the double_reduction class):
+//      vmovdqu (%r15,%rsi), %ymm0        ; L0: pure memory load  REG <- MEM
+//      vmovdqu %ymm0, 232(%rsp)          ; L1: spill REG to a frame slot
+//      vpmulld (%rbp,%rsi), %ymm0, %ymm0 ; REG is clobbered in place...
+//      vpaddd  %ymm0, %ymm6, %ymm6
+//      vmovdqu 232(%rsp), %ymm0          ; L2: reload — REG must regain the
+//                                        ; value it had at L1
+// The slot holds REG's value at L1; nothing else touches it. The reload is
+// therefore exactly "re-execute the L0 load": rewrite L2's memory operand to
+// MEM and delete L1. The clobbered register value is re-obtained from memory
+// instead of the frame slot (which frees the slot entirely).
+//
+// Soundness gates (all verified):
+//  * L0 is the IMMEDIATELY preceding instruction of L1 (REG unchanged between
+//    load and store) and L0 is a pure 2-operand load of the SAME mnemonic into
+//    the SAME register. The clobbering of REG between L1 and L2 is allowed —
+//    that is precisely why the reload exists — so the intermediate use of REG
+//    is irrelevant; only the memory content matters.
+//  * straight-line window: no label/jump/call/ret/barrier between L0 and L2,
+//    no rsp shift, no pinned line, no implicit-register op (div/mul/string
+//    ops/rep/xchg/…) that could hide memory side effects.
+//  * no frame-escape in the function (a leaked frame address could let the
+//    window's data-register derefs alias the slot or MEM).
+//  * no memory WRITE of ANY kind between L0 and L2 (explicit stores, push/
+//    pop, memory-dest instructions incl. indexed forms) — MEM's content is
+//    then unchanged, and the value the slot held is the value MEM had at L0.
+//  * the slot is not accessed between L1 and L2 (any rsp/rbp-anchored
+//    reference bails, indexed forms included).
+//  * MEM's address registers are not written between L0 and L2.
+//  * after L2 the slot is never READ again (until a later exact re-write)
+//    before the function end / any rsp shift. Same-base, different-offset
+//    direct accesses cannot alias the slot (frame functions additionally
+//    treat any opposite-base access as ambiguous), indexed rsp/rbp forms
+//    are ambiguous and bail, and a leaked frame address bails the function.
+//  * neither L0/L1/L2 is pinned (volatile slot / address-taken slot / param).
+//  * the rewrite re-loads the EXACT memory operand text of L0.
+//
+// The gate is text-based because `vmovdqu`/`vmovdqa` slot moves are classified
+// `LineKind::Other` (only scalar-FP movsd/movss/vmovsd/vmovss get the XMM
+// slot kinds); line text is the ground truth for the memory operands.
+
+/// Frame-escape scan: has any instruction leaked the frame pointer or a frame
+/// slot address (leaq of a frame slot, or a raw %rsp/%esp value) — in which
+/// case data-register derefs may alias frame slots and MEM? Mirrors the
+/// discipline of the address-taken-slot pinning and dead-store analysis.
+fn frame_has_escape(store: &LineStore, infos: &[LineInfo], body_start: usize, body_end: usize) -> bool {
+    for k in body_start..body_end.min(store.len()) {
+        if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        if (t.starts_with("leaq ") || t.starts_with("lea "))
+            && (t.contains("(%rsp)") || t.contains("(%rbp)") || t.contains("(%rsp,") || t.contains("(%rbp,"))
+        {
+            return true;
+        }
+        let mentions_sp = t.contains("%rsp") || t.contains("%esp");
+        if mentions_sp && !t.contains("(%rsp") && !t.contains("(%esp") && !is_rsp_shift_line(&t)
+            && t != "movq %rsp, %rbp"
+            && t != "movl %esp, %ebp"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when the line's top-level DESTINATION operand refers to memory.
+/// A register operand never contains '(', so `contains('(')` on the dest
+/// operand catches both `(%rax)` and offset forms `8(%rax,%rcx)` (the latter
+/// defeat a naive starts_with('(') check).
+fn mem_is_dest(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    match last_top_level_comma(bytes) {
+        Some(cpos) => line[cpos + 1..].contains('('),
+        None => false,
+    }
+}
+
+/// Is the RSP-shift at `k` part of an epilogue chain? Mirrors the shape
+/// accepted by dead_code::eliminate_never_read_stores: zero or more of
+/// { `addq $N,%rsp`, `popq` (callee-saved restore), nop, directive } ending
+/// in `ret` or an unconditional `jmp` (tail call). `pushq`/`subq` in the
+/// window, or any other instruction, rejects — those are genuine mid-body
+/// shifts. After the tail nothing can read the frame slot.
+fn is_epilogue_tail(store: &LineStore, infos: &[LineInfo], k: usize, func_end: usize) -> bool {
+    let mut j = k;
+    let limit = (k + 24).min(func_end);
+    while j < limit {
+        if infos[j].is_nop() || infos[j].kind == LineKind::Empty || matches!(infos[j].kind, LineKind::Directive) {
+            j += 1;
+            continue;
+        }
+        match infos[j].kind {
+            LineKind::Ret | LineKind::Jmp => return true,
+            LineKind::Pop { .. } => {
+                j += 1;
+                continue;
+            }
+            _ => {
+                let t = infos[j].trimmed(store.get(j));
+                if let Some(rest) = t.strip_prefix("addq $") {
+                    if rest
+                        .strip_suffix(", %rsp")
+                        .and_then(|v| v.parse::<i64>().ok())
+                        .is_some()
+                    {
+                        j += 1;
+                        continue;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// True for string/implicit-operand instructions whose memory side effects
+/// are invisible to operand parsing (bare `movsb`/`stosq`/…; `rep`-prefixed
+/// forms are already covered by has_implicit_reg_usage).
+fn is_string_op(line: &str) -> bool {
+    const PREFIXES: [&str; 8] = ["movs", "stos", "lods", "scas", "cmps", "ins", "outs", "rep "];
+    PREFIXES.iter().any(|p| line.starts_with(p))
+}
+
+/// Index of the FIRST top-level comma (parenthesis depth 0) in `bytes`.
+fn first_top_level_comma(bytes: &[u8]) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse `MNEM %reg, off(%rsp|%rbp)` (2-operand direct slot store) →
+/// (mnemonic, source register text, memory operand).
+fn parse_2op_store(line: &str) -> Option<(&str, &str, &str)> {
+    let mnem_end = line.find(' ')?;
+    let mnem = &line[..mnem_end];
+    let rest = line[mnem_end..].trim_start();
+    let comma = first_top_level_comma(rest.as_bytes())?;
+    let src = rest[..comma].trim();
+    let mem = rest[comma + 1..].trim();
+    if !src.starts_with('%') || !(mem.ends_with("(%rsp)") || mem.ends_with("(%rbp)")) {
+        return None;
+    }
+    Some((mnem, src, mem))
+}
+
+/// Parse `MNEM mem, %reg` (2-operand load) → (mnemonic, mem, dest register).
+/// Accepts both `(%r15,%rsi)`-style and `232(%rsp)`-style memory operands.
+fn parse_2op_load(line: &str) -> Option<(&str, &str, &str)> {
+    let mnem_end = line.find(' ')?;
+    let mnem = &line[..mnem_end];
+    let rest = line[mnem_end..].trim_start();
+    let comma = first_top_level_comma(rest.as_bytes())?;
+    let mem = rest[..comma].trim();
+    let dst = rest[comma + 1..].trim();
+    let ok_mem = mem.starts_with('(') || mem.ends_with("(%rsp)") || mem.ends_with("(%rbp)");
+    if !ok_mem || !dst.starts_with('%') {
+        return None;
+    }
+    Some((mnem, mem, dst))
+}
+
+/// Parse `off(%rsp)` or `off(%rbp)` → (offset, base) with base 4=rsp 5=rbp.
+fn parse_slot(mem: &str) -> Option<(i32, u8)> {
+    if let Some(rest) = mem.strip_suffix("(%rsp)") {
+        return rest.trim().parse::<i32>().ok().map(|n| (n, 4));
+    }
+    if let Some(rest) = mem.strip_suffix("(%rbp)") {
+        return rest.trim().parse::<i32>().ok().map(|n| (n, 5));
+    }
+    None
+}
+
+/// If `line` references a direct slot `off(%rsp|%rbp)`, return (off, base).
+/// Handles both `%reg, off(%rsp)` store form and `off(%rsp), %reg` load form.
+fn slot_in_line(line: &str) -> Option<(i32, u8)> {
+    if let Some((_m, _s, mem)) = parse_2op_store(line) {
+        return parse_slot(mem);
+    }
+    if let Some((_m, mem, _d)) = parse_2op_load(line) {
+        if let Some((n, b)) = parse_slot(mem) {
+            return Some((n, b));
+        }
+    }
+    None
+}
+
+/// Byte offsets of the `%` register tokens inside a memory operand.
+fn reg_token_offsets(mem: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let bytes = mem.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            out.push(i);
+            i += 1;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    if len == 0 {
+        return false;
+    }
+    let dbg = std::env::var("CCC_DEBUG_SAVRELOAD").is_ok();
+    let mut dbg_stats = [0usize; 6]; // 0=store cands, 1=L0 bad, 2=window bad, 3=no L2, 4=slot live, 5=FIRED
+    let mut changed = false;
+
+    // Function ranges: `.cfi_startproc` … `.size`.
+    let mut funcs: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for k in 0..len {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let t = infos[k].trimmed(store.get(k));
+        if t.starts_with(".cfi_startproc") && start.is_none() {
+            start = Some(k);
+        } else if t.starts_with(".size ") {
+            if let Some(s) = start.take() {
+                funcs.push((s, k));
+            }
+        }
+    }
+
+    for &(fstart, fend) in &funcs {
+        if frame_has_escape(store, infos, fstart, fend) {
+            continue;
+        }
+        // Frame-pointer function? Forward scan: frame setup before the first
+        // ret/.cfi_endproc.
+        let mut rbp_frame = false;
+        for k in (fstart + 1)..fend.min(len) {
+            if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
+                continue;
+            }
+            let t = infos[k].trimmed(store.get(k));
+            if t == "movq %rsp, %rbp" || t == "movl %esp, %ebp" {
+                rbp_frame = true;
+                break;
+            }
+            if t.starts_with(".cfi_endproc") || t.starts_with(".size ")
+                || infos[k].kind == LineKind::Ret
+            {
+                break;
+            }
+        }
+        let mut i = fstart;
+        while i < fend.min(len) {
+            if infos[i].is_nop() || infos[i].pinned {
+                i += 1;
+                continue;
+            }
+            // Candidate L1: a direct slot store of a register (text-based —
+            // vmovdqu/vmovdqa slot moves are LineKind::Other).
+            let line_st = infos[i].trimmed(store.get(i));
+            let Some((store_mnem, src_reg, mem_str)) = parse_2op_store(&line_st) else {
+                i += 1;
+                continue;
+            };
+            let Some((n, base)) = parse_slot(mem_str) else {
+                i += 1;
+                continue;
+            };
+            if base == 5 && !rbp_frame {
+                i += 1;
+                continue;
+            }
+            dbg_stats[0] += 1;
+            // L0: immediately preceding non-nop line must be the pure load.
+            let mut l0 = i - 1;
+            while l0 > fstart && infos[l0].is_nop() {
+                l0 -= 1;
+            }
+            if l0 < fstart || infos[l0].pinned {
+                dbg_stats[1] += 1;
+                i += 1;
+                continue;
+            }
+            let l0_st = infos[l0].trimmed(store.get(l0));
+            let Some((l0_mnem, l0_mem2, l0_reg2)) = parse_2op_load(&l0_st) else {
+                dbg_stats[1] += 1;
+                i += 1;
+                continue;
+            };
+            if l0_mnem != store_mnem || l0_reg2 != src_reg {
+                dbg_stats[1] += 1;
+                i += 1;
+                continue;
+            }
+            // Address families of MEM2 (the re-load target).
+            let mut addr_fams = [false; 16];
+            for off in reg_token_offsets(l0_mem2) {
+                let fam = register_family_fast(&l0_mem2[off..]);
+                if fam != REG_NONE && fam <= REG_GP_MAX {
+                    addr_fams[fam as usize] = true;
+                }
+            }
+            // Window scan: L1+1 … until L2 or a bail condition.
+            let mut ok = true;
+            let mut l2 = None;
+            let mut j = i + 1;
+            while j < fend.min(len) {
+                if infos[j].is_nop() {
+                    j += 1;
+                    continue;
+                }
+                let t = infos[j].trimmed(store.get(j));
+                // Reached L2 (same mnemonic, same register, same slot)? This
+                // must be tested FIRST: the L2 line itself references the
+                // slot, and it is a pure load, exempt from the window bails.
+                if let Some((m2, m2_mem, m2_reg)) = parse_2op_load(&t) {
+                    if m2 == store_mnem && m2_reg == src_reg
+                        && parse_slot(m2_mem).map_or(false, |(n2, b2)| n2 == n && b2 == base)
+                    {
+                        l2 = Some(j);
+                        break;
+                    }
+                }
+                if is_barrier_kind(infos[j].kind) || infos[j].pinned || is_string_op(&t) {
+                    break; // cannot see past the barrier / opaque op
+                }
+                if has_implicit_reg_usage(&t) || is_rsp_shift_line(&t) {
+                    ok = false;
+                    break;
+                }
+                // Memory writes — of ANY kind — invalidate MEM content.
+                if matches!(
+                    infos[j].kind,
+                    LineKind::StoreRbp { .. }
+                        | LineKind::StoreXmmRbp { .. }
+                        | LineKind::Push { .. }
+                        | LineKind::Pop { .. }
+                ) || mem_is_dest(&t)
+                {
+                    ok = false;
+                    break;
+                }
+                // Any slot/frame-anchored access between L1 and L2 could
+                // touch the slot (incl. indexed forms and the opposite frame
+                // base, whose offsets alias through the frame size) — bail.
+                if t.contains("(%rsp") || (rbp_frame && t.contains("(%rbp")) {
+                    ok = false;
+                    break;
+                }
+                // MEM2's address registers must survive.
+                for k in 0..16u8 {
+                    if addr_fams[k as usize] && writes_reg(store, infos, j, k) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                j += 1;
+            }
+            let Some(l2) = l2 else {
+                dbg_stats[3] += 1;
+                i += 1;
+                continue;
+            };
+            if !ok || infos[l2].pinned {
+                dbg_stats[2] += 1;
+                i += 1;
+                continue;
+            }
+            // After L2 the slot must never be read again (before a later
+            // exact re-write) up to the function end; an rsp shift invalidates
+            // offsets entirely.
+            let mut post = l2 + 1;
+            let mut redefined = false;
+            let mut slot_dead = true;
+            while post < fend.min(len) {
+                if infos[post].is_nop() {
+                    post += 1;
+                    continue;
+                }
+                let t = infos[post].trimmed(store.get(post));
+                if is_rsp_shift_line(&t) {
+                    // An epilogue chain (pops/addq → ret/jmp) is a terminal:
+                    // nothing can read the frame slot afterwards.
+                    if is_epilogue_tail(store, infos, post, fend) {
+                        break;
+                    }
+                    slot_dead = false;
+                    break;
+                }
+                let anchored =
+                    t.contains("(%rsp") || (rbp_frame && t.contains("(%rbp"));
+                if !anchored {
+                    post += 1;
+                    continue;
+                }
+                // Indexed rsp/rbp forms: ambiguous slot → bail.
+                if t.contains("(%rsp,") || t.contains("(%rbp,") {
+                    slot_dead = false;
+                    break;
+                }
+                // Opposite base in a frame function: offsets alias through
+                // the frame size → ambiguous → bail.
+                if let Some((m, b)) = slot_in_line(t) {
+                    if b != base && rbp_frame {
+                        slot_dead = false;
+                        break;
+                    }
+                    if m == n {
+                        if let Some((_mn, _sr, _mem)) = parse_2op_store(&t) {
+                            redefined = true;
+                        } else {
+                            slot_dead = false; // read of the deleted value
+                            break;
+                        }
+                    }
+                    // Same-base different offset: different slot, ignore.
+                } else {
+                    slot_dead = false;
+                    break;
+                }
+                post += 1;
+            }
+            if !slot_dead {
+                dbg_stats[4] += 1;
+                i += 1;
+                continue;
+            }
+            // Rewrite: delete L1, re-point L2's memory operand at MEM2.
+            let new_l2 = format!("    {} {}, {}", store_mnem, l0_mem2, src_reg);
+            replace_line(store, &mut infos[l2], l2, new_l2);
+            mark_nop(&mut infos[i]);
+            dbg_stats[5] += 1;
+            changed = true;
+            i = l2 + 1;
+        }
+    }
+
+    if dbg {
+        eprintln!(
+            "[SAVRELOAD] stores={} l0_bad={} window_bad={} no_l2={} slot_live={} FIRED={}",
+            dbg_stats[0], dbg_stats[1], dbg_stats[2], dbg_stats[3], dbg_stats[4], dbg_stats[5]
+        );
+    }
+    changed
+}

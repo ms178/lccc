@@ -140,6 +140,13 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
 
     // copy_src[dst] = src means "dst currently holds the same value as src"
     let mut copy_src: [RegId; 16] = [REG_NONE; 16];
+    // copy_src32 holds the same relation for the LOW 32 bits (from movl
+    // reg-reg chains). Used only to shorten movl chains to their ultimate
+    // 32-bit source — never to propagate into other instructions (the upper
+    // 32 bits of a 32-bit chain are not tracked here) and never to delete
+    // (a movl self-copy zeroes the upper 32 bits, so only the zero-upper
+    // pass may remove it).
+    let mut copy_src32: [RegId; 16] = [REG_NONE; 16];
 
     let mut i = 0;
     while i < len {
@@ -151,6 +158,7 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
         // barrier (jump, conditional jump, call, label, ret, directive).
         if infos[i].is_barrier() {
             copy_src = [REG_NONE; 16];
+            copy_src32 = [REG_NONE; 16];
             i += 1;
             continue;
         }
@@ -179,6 +187,7 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                 }
             }
             copy_src = [REG_NONE; 16];
+            copy_src32 = [REG_NONE; 16];
             i += 1;
             continue;
         }
@@ -212,9 +221,56 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                 }
             }
 
-            // Record the copy
+            // Record the copy (a 64-bit identity implies the low-32 identity)
             copy_src[dst_id as usize] = ultimate_src;
+            copy_src32[dst_id as usize] = ultimate_src;
+            for k in 0..16u8 {
+                if copy_src32[k as usize] == dst_id {
+                    copy_src32[k as usize] = REG_NONE;
+                }
+            }
 
+            i += 1;
+            continue;
+        }
+
+        // 32-bit reg-reg copy: shorten to the ultimate low-32 source. A
+        // `movl %B, %C` where B's low 32 bits provably equal A's rewrites to
+        // `movl %A, %C` — value-identical (both zero the upper half). The
+        // self-reduced `movl %R, %R` is left for the zero-upper pass to
+        // delete when R's upper half is provably zero.
+        if let Some((src_id, dst_id)) = parse_reg_to_reg_movl(&infos[i], trimmed) {
+            let ultimate_src = if copy_src32[src_id as usize] != REG_NONE {
+                copy_src32[src_id as usize]
+            } else {
+                src_id
+            };
+            if ultimate_src != src_id {
+                let new_src_name = REG_NAMES[1][ultimate_src as usize];
+                let dst_name = REG_NAMES[1][dst_id as usize];
+                let new_text = format!("    movl {}, {}", new_src_name, dst_name);
+                replace_line(store, &mut infos[i], i, new_text);
+                changed = true;
+            }
+            // Before recording: invalidate any copies that have dst as their source.
+            for k in 0..16u8 {
+                if copy_src32[k as usize] == dst_id {
+                    copy_src32[k as usize] = REG_NONE;
+                }
+            }
+            copy_src32[dst_id as usize] = ultimate_src;
+            // The movl overwrites only the low 32 bits of dst, so the 64-bit
+            // copy graph through/downstream-of dst is dead — its value is no
+            // longer equal to any tracked register (the upper 32 bits are
+            // preserved, unknown). Failing to invalidate let a later movq
+            // propagate a stale full-width identity (miscompiled
+            // vla_struct_sizeof / small_slot_* / phi tests).
+            copy_src[dst_id as usize] = REG_NONE;
+            for k in 0..16u8 {
+                if copy_src[k as usize] == dst_id {
+                    copy_src[k as usize] = REG_NONE;
+                }
+            }
             i += 1;
             continue;
         }
@@ -255,6 +311,12 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
                     copy_src[k as usize] = REG_NONE;
                 }
             }
+            copy_src32[dest_reg as usize] = REG_NONE;
+            for k in 0..16u8 {
+                if copy_src32[k as usize] == dest_reg {
+                    copy_src32[k as usize] = REG_NONE;
+                }
+            }
         }
 
         // Instructions with implicit register usage conservatively invalidate all.
@@ -262,6 +324,7 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             let cur_trimmed = infos[i].trimmed(store.get(i));
             if has_implicit_reg_usage(cur_trimmed) {
                 copy_src = [REG_NONE; 16];
+                copy_src32 = [REG_NONE; 16];
             }
         }
 
