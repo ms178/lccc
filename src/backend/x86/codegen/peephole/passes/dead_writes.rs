@@ -726,6 +726,12 @@ mod tests {
         // Reduced from gcc.c-torture/execute/20090207-1.c after base-index
         // folding. A raw last-comma split saw `%r8)` as the destination and
         // deleted this observable store as a dead pure register write.
+        //
+        // The base-index LEA fold now rewrites the pair first into the
+        // canonical SIB store `movl $2, 8(%rsp, %r8)` — the SAME address
+        // (rsp + r8 + 8) with the LEA folded away — so accept either the
+        // folded or the pre-fold form: the invariant under guard is that the
+        // observable SIB-destination store SURVIVES the dead-write pass.
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -734,8 +740,9 @@ mod tests {
             "    ret\n",
             ".cfi_endproc\n",
         ));
-        assert!(out.contains("movl $2, (%rcx, %r8)"), "{out}");
-        assert!(out.contains("leaq 8(%rsp), %rcx"), "{out}");
+        let store_survives = out.contains("movl $2, 8(%rsp, %r8)")
+            || out.contains("movl $2, (%rcx, %r8)");
+        assert!(store_survives, "observable SIB store deleted: {out}");
     }
 
     #[test]

@@ -286,20 +286,18 @@ impl Lowerer {
         }
     }
 
-    /// For indirect calls (function pointer calls), determine if the return type is a struct,
-    /// union, or vector and return its size. Returns None if not an aggregate return or if
-    /// the type cannot be determined.
-    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
-        // For indirect calls, extract the return type from the function pointer's CType.
-        // Strip Deref layers since dereferencing function pointers is a no-op in C.
+    /// Resolve the RETURN type of the function designated by `func`, for
+    /// indirect calls (function pointer calls). Strip Deref layers since
+    /// dereferencing function pointers is a no-op in C.
+    ///
+    /// Shared by `get_call_return_struct_size` and
+    /// `get_call_return_struct_align` so the size and alignment queries can
+    /// never disagree about which type they describe.
+    pub(super) fn call_return_ctype(&self, func: &Expr) -> Option<CType> {
         let func_ctype = match func {
             Expr::Identifier(name, _) => {
                 // Could be a function pointer variable
-                if let Some(vi) = self.lookup_var_info(name) {
-                    vi.c_type.clone()
-                } else {
-                    None
-                }
+                self.lookup_var_info(name).and_then(|vi| vi.c_type.clone())
             }
             Expr::Deref(..) => {
                 let mut expr = func;
@@ -310,21 +308,36 @@ impl Lowerer {
             }
             _ => self.get_expr_ctype(func),
         };
+        func_ctype.and_then(|ref ct| ct.func_ptr_return_type(false))
+    }
 
-        if let Some(ref ctype) = func_ctype {
-            // Navigate through CType to find the return type
-            let ret_ctype = ctype.func_ptr_return_type(false);
-            if let Some(ret_ct) = ret_ctype {
-                if ret_ct.is_struct_or_union() {
-                    // Use resolve_ctype_size to look up struct layouts properly;
-                    // CType::size() returns 0 for Struct/Union since they only
-                    // store a key, not the actual layout.
-                    return Some(self.resolve_ctype_size(&ret_ct));
-                }
-                if ret_ct.is_vector() {
-                    return Some(self.resolve_ctype_size(&ret_ct));
-                }
-            }
+    /// For indirect calls (function pointer calls), determine if the return type is a struct,
+    /// union, or vector and return its size. Returns None if not an aggregate return or if
+    /// the type cannot be determined.
+    pub(super) fn get_call_return_struct_size(&self, func: &Expr) -> Option<usize> {
+        let ret_ct = self.call_return_ctype(func)?;
+        if ret_ct.is_struct_or_union() {
+            // Use resolve_ctype_size to look up struct layouts properly;
+            // CType::size() returns 0 for Struct/Union since they only
+            // store a key, not the actual layout.
+            return Some(self.resolve_ctype_size(&ret_ct));
+        }
+        if ret_ct.is_vector() {
+            return Some(self.resolve_ctype_size(&ret_ct));
+        }
+        None
+    }
+
+    /// Natural alignment of the aggregate returned by an indirect call —
+    /// the companion of `get_call_return_struct_size`. The hidden sret
+    /// buffer for such a call must be aligned to the returned type: a
+    /// callee compiled by GCC materialises the return value with aligned
+    /// SSE stores (movaps) whenever the struct's alignment is 16, and an
+    /// 8-mod-16 buffer faults with #GP at runtime.
+    pub(super) fn get_call_return_struct_align(&self, func: &Expr) -> Option<usize> {
+        let ret_ct = self.call_return_ctype(func)?;
+        if ret_ct.is_struct_or_union() || ret_ct.is_vector() {
+            return Some(self.ctype_align(&ret_ct).max(1));
         }
         None
     }

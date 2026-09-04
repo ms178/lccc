@@ -81,7 +81,11 @@ impl Lowerer {
             dest: alloca,
             ty: IrType::Ptr,
             size,
-            align: 0,
+            // Natural alignment of the complex type (16 for _Complex long
+            // double). Alignment-0 allocas land 8-mod-16 in FPO frames and
+            // are unsuitable homes for any value a consumer may move with
+            // aligned SSE loads/stores.
+            align: self.ctype_align(ctype).max(1),
             volatile: false,
             semantic_volatile: false,
         });
