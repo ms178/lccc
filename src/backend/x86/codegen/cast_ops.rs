@@ -888,6 +888,64 @@ impl X86Codegen {
         None
     }
 
+    /// Register-direct cast whose source currently lives in the accumulator
+    /// (see the call site in `try_emit_cast_reg_direct`). Returns false for
+    /// shapes that have no single-instruction extending/truncating move;
+    /// nothing is emitted in that case.
+    fn emit_cast_from_accumulator(
+        &mut self,
+        kind: crate::backend::cast::CastKind,
+        to_ty: IrType,
+        dest_32: &str,
+        dest_64: &str,
+    ) -> bool {
+        use crate::backend::cast::CastKind;
+        match kind {
+            CastKind::IntWiden { from_ty: ft, .. } => {
+                let (insn, src, dst) = match (ft.is_signed(), ft.size()) {
+                    (true, 1) => ("movsbq", "al", dest_64),
+                    (true, 2) => ("movswq", "ax", dest_64),
+                    (true, 4) => ("movslq", "eax", dest_64),
+                    (false, 1) => ("movzbl", "al", dest_32),
+                    (false, 2) => ("movzwl", "ax", dest_32),
+                    (false, 4) => ("movl", "eax", dest_32),
+                    _ => return false,
+                };
+                self.state
+                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
+                true
+            }
+            CastKind::IntNarrow { to_ty: t } => {
+                let (insn, src, dst) = match (t.size(), t.is_unsigned()) {
+                    (4, true) => ("movl", "eax", dest_32),
+                    (4, false) => ("movslq", "eax", dest_64),
+                    (2, _) => ("movzwl", "ax", dest_32),
+                    (1, _) => ("movzbl", "al", dest_32),
+                    _ => return false,
+                };
+                self.state
+                    .emit_fmt(format_args!("    {insn} %{src}, %{dst}"));
+                true
+            }
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {
+                if to_ty.size() <= 4 {
+                    self.state
+                        .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
+                } else {
+                    self.state
+                        .emit_fmt(format_args!("    movq %rax, %{dest_64}"));
+                }
+                true
+            }
+            CastKind::SignedToUnsignedSameSize { to_ty: t } if t.size() == 4 => {
+                self.state
+                    .emit_fmt(format_args!("    movl %eax, %{dest_32}"));
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn try_emit_cast_reg_direct(
         &mut self,
         _dest: &Value,
@@ -915,9 +973,24 @@ impl X86Codegen {
             return false;
         }
 
-        // Need either a source register or a stack slot.
+        // Accumulator-staged source (an immediately-consumed producer with
+        // no register and no slot: `j = (long)(i - 1)` where `i - 1` was
+        // computed straight into %eax). The generic path would emit the
+        // accumulator form and then relay the result (`cltq; movq %rax,%r10`
+        // / `movl %eax,%eax; movq %rax,%r10`); the extending move can
+        // target the destination register directly from %rax's sub-
+        // register (`movslq %eax, %r10`): one instruction and no %rax
+        // write — %rax keeps holding the SOURCE, so the register cache
+        // stays exactly as it was. Bit-identical to the accumulator form:
+        // both read the same low `from_ty` bits and produce the same
+        // extension. Shapes without a one-instruction form fall through to
+        // the generic path (which handles them today).
         if src_phys.is_none() && src_slot.is_none() {
-            return false;
+            let Operand::Value(v) = src else { return false };
+            if !self.state.reg_cache.acc_has(v.0, self.state.is_alloca(v.0)) {
+                return false;
+            }
+            return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);
         }
         // An XMM-homed source is an integer bit-punned in the float domain
         // (fp-select/int-select blending keeps the value in the SSE domain).
