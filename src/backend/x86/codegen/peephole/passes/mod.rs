@@ -39,6 +39,7 @@ mod memory_fold;
 mod narrow_copy_fold;
 mod push_pop;
 mod pushf_elim;
+mod self_zext;
 mod redundant_ext;
 mod relay_and_lea;
 mod spill_deref;
@@ -734,6 +735,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
         }
         if !sk("dead_regs") {
             global_changed |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
         }
         if !sk("dead_stores") {
             global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos);
@@ -807,6 +809,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed2 |= local_patterns::eliminate_fp_spill_around_load(&mut store, &mut infos);
             if !sk("dead_regs") {
                 changed2 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                self_zext::eliminate_redundant_self_zext(&store, &mut infos);
             }
             if !sk("dead_stores") {
                 changed2 |= dead_code::eliminate_dead_stores(&store, &mut infos);
@@ -889,6 +892,7 @@ pub fn peephole_optimize(mut asm: String) -> String {
             changed3 |= local_patterns::fold_ptr_deref_through_stack(&mut store, &mut infos);
             if !sk("dead_regs") {
                 changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+                self_zext::eliminate_redundant_self_zext(&store, &mut infos);
             }
             if !sk("dead_stores") {
                 changed3 |= dead_code::eliminate_dead_stores(&store, &mut infos);

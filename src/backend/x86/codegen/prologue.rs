@@ -905,6 +905,14 @@ impl X86Codegen {
             let replay_scan = super::comparison::compute_cmp_replay_scan(func, &use_counts, &fused);
             self.cmp_replay_operand_links = replay_scan.operand_links;
             self.cmp_replay = replay_scan.replay;
+            // FP-SELECT (S05): float Cmps whose boolean feeds only Selects.
+            // The Cmp emitter skips the ucomisd/setcc boolean entirely; every
+            // select re-derives a vcmpsd/vcmpss mask from the recorded
+            // operands and blends the FP arms with vblendvpd/vblendvps (gcc
+            // emits exactly this). Pruned post-RA like cmp_replay: a select
+            // whose operands became unreadable falls back to re-materializing
+            // the boolean (emit_fp_cmp_boolean) and the ordinary cmov path.
+            self.fp_select_cmps = replay_scan.fp_select;
 
             self.fused_cmp_dests = fused;
             self.fused_forward_dests = fused_forward;
@@ -1338,6 +1346,46 @@ impl X86Codegen {
             }
             for d in prune {
                 self.cmp_replay.remove(&d);
+            }
+            // ── FP-SELECT post-RA prune (S05) ───────────────────────────────
+            // Same readability contract as the replay prune above: a select
+            // can re-derive the blend mask only if both operands are still
+            // readable at the select position (Const, pre-existing slot,
+            // register home with the folded-index extension active, or a
+            // materialized slot; accumulator-only and never-materialized
+            // operands are out). Non-readable → the entry is dropped: the
+            // Cmp then materializes its boolean at its own position and the
+            // select uses the ordinary materialized path (sound, no blend).
+            {
+                let ext_active = std::env::var_os("CCC_NO_FOLDED_INDEX_LIVENESS").is_none();
+                let acc_no_home: crate::common::fx_hash::FxHashSet<u32> =
+                    accumulator_assignments.iter().map(|a| a.value_id).collect();
+                let mut prune_fp: Vec<u32> = Vec::new();
+                for (cdest, (_op, lhs, rhs, _ty)) in self.fp_select_cmps.iter() {
+                    let readable = |op: &Operand| -> bool {
+                        match op {
+                            Operand::Const(_) => true,
+                            Operand::Value(v) => {
+                                if self.state.get_slot(v.0).is_some() {
+                                    return true;
+                                }
+                                if self.reg_assignments.contains_key(&v.0) {
+                                    return ext_active;
+                                }
+                                if acc_no_home.contains(&v.0) {
+                                    return false;
+                                }
+                                !self.state.never_materialized_values.contains(&v.0)
+                            }
+                        }
+                    };
+                    if !readable(lhs) || !readable(rhs) {
+                        prune_fp.push(*cdest);
+                    }
+                }
+                for d in prune_fp {
+                    self.fp_select_cmps.remove(&d);
+                }
             }
         }
 

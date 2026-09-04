@@ -476,6 +476,14 @@ pub struct X86Codegen {
     /// Cleared after the merge; exists only to bridge the pre-RA scan and
     /// the RA invocation inside this very large prepare function.
     pub(super) cmp_replay_operand_links: FxHashMap<u32, Vec<u32>>,
+    /// FP-SELECT (S05): float Cmps whose single use is a Select. The Cmp
+    /// emitter skips the ucomisd/setcc boolean entirely; every select
+    /// re-derives a vcmpsd/vcmpss VEX blend mask from the recorded operands
+    /// and blends the FP arms (vblendvpd/vblendvps) — the gcc shape
+    /// (`vcmpnltsd + vblendvpd`), killing the
+    /// ucomisd/setcc/movzbl/testq/cmov + GPR-shuttle chain per select.
+    /// Keyed by Cmp dest; pruned post-RA in prologue.rs (readability).
+    pub(super) fp_select_cmps: FxHashMap<u32, (IrCmpOp, Operand, Operand, IrType)>,
     /// Number of uses of each SSA value (instructions + terminators).
     pub(super) value_use_counts: FxHashMap<u32, u32>,
     /// W2 Load->Cast fold (2026-08-10): load dest value id -> the register of
@@ -842,6 +850,7 @@ impl X86Codegen {
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             cmp_replay_operand_links: FxHashMap::default(),
+            fp_select_cmps: FxHashMap::default(),
             value_use_counts: FxHashMap::default(),
             load_cast_fold: FxHashMap::default(),
             folded_cast_dests: FxHashSet::default(),

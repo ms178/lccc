@@ -708,7 +708,26 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         break;
                     }
                 }
+                // Scalar-FP / SSE slot stores: an `(%rsp)` store is always a
+                // frame-slot write (the FP value lives in a register; only the
+                // slot base can be rsp). An `(%rbp)` store with %rbp NOT the
+                // frame pointer is a pointer write — bail, exactly like the
+                // GP case above — because such a store could write a frame
+                // slot through a data-register %rbp value.
+                LineKind::StoreXmmRbp { .. } => {
+                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
+                }
                 LineKind::LoadRbp { offset, size, .. } => {
+                    if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
+                        has_unparseable_indirect = true;
+                        break;
+                    }
+                    read_ranges.push((offset, size.byte_size()));
+                }
+                LineKind::LoadXmmRbp { offset, size } => {
                     if !rbp_is_frame && uses_rbp_mem_operand(infos[k].trimmed(store.get(k))) {
                         has_unparseable_indirect = true;
                         break;
@@ -784,6 +803,34 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                 }
                 // SOUNDNESS: never delete an `(%rbp)` store when %rbp is a
                 // data register (pointer store to arbitrary memory).
+                if !rbp_is_frame && uses_rbp_mem_operand(store_text) {
+                    continue;
+                }
+                let store_bytes = size.byte_size();
+                let is_read = read_ranges
+                    .iter()
+                    .any(|&(r_off, r_sz)| ranges_overlap(offset, store_bytes, r_off, r_sz));
+                if !is_read {
+                    mark_nop(&mut infos[k]);
+                }
+            }
+            // Scalar-FP / SSE slot stores: same never-read test. Escape
+            // discipline was already enforced (no leaq/raw-%rsp, and the
+            // %rbp-as-data-register bail above), so an unread FP slot store
+            // is dead — this kills the union/slot roundtrips in FP kernels
+            // (copysign: `movsd %xmm0, 16(%rsp)` + `movq %rdi, 16(%rsp)`
+            // were never reloaded).
+            if let LineKind::StoreXmmRbp { offset, size } = infos[k].kind {
+                let store_text = infos[k].trimmed(store.get(k));
+                // Same architectural stack-top exception as the GP arm:
+                // a store to the current stack top may be an input to an
+                // immediately following pop/ret.
+                if offset == 0
+                    && store_text.ends_with("(%rsp)")
+                    && stack_top_is_consumed_next(store, infos, k + 1, func_end)
+                {
+                    continue;
+                }
                 if !rbp_is_frame && uses_rbp_mem_operand(store_text) {
                     continue;
                 }

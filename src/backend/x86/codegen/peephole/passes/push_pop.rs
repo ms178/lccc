@@ -101,6 +101,8 @@ fn instruction_modifies_stack(line: &str, info: &LineInfo) -> bool {
 fn instruction_modifies_reg_id(info: &LineInfo, reg_id: RegId) -> bool {
     match info.kind {
         LineKind::StoreRbp { .. }
+        | LineKind::StoreXmmRbp { .. }
+        | LineKind::LoadXmmRbp { .. }
         | LineKind::Cmp
         | LineKind::Nop
         | LineKind::Empty
