@@ -23,7 +23,7 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, writes_family};
+use super::helpers::{get_dest_reg, writes_family_full};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
@@ -119,17 +119,17 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // Bare mnemonics (no operand) that are flag-neutral.
     if matches!(
         t,
-        "ret" | "leave" | "cltq" | "cqto" | "cwtl" | "cdqe" | "nop" | "endbr64"
+        "ret" | "leave" | "cltq" | "cqto" | "cwtl" | "cdqe" | "nop" | "endbr64" | "cltd" | "cwtd"
+            | "cdq" | "cwd" | "cbw" | "cwde" | "cbtw"
     ) {
         return FlagsEffect::Neutral;
     }
-    if t.starts_with("push") || t.starts_with("pop") {
-        // pushfq/popfq are handled by the reader list / the catch-all below.
-        return if t.starts_with("popf") {
-            FlagsEffect::Reads
-        } else {
-            FlagsEffect::Neutral
-        };
+    // Plain stack push/pop do not touch EFLAGS.  pushf is a flag READER
+    // (handled above), popf a flag WRITER (handled below).  The token must
+    // END at the mnemonic — `popcntq` is not a stack pop, `pushfq` is not a
+    // plain push.
+    if t == "push" || t.starts_with("push ") || t == "pop" || t.starts_with("pop ") {
+        return FlagsEffect::Neutral;
     }
     // A call clobbers flags (they are not preserved across the SysV boundary),
     // which for our purposes is exactly a write.
@@ -140,6 +140,11 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
     // ops leave EFLAGS untouched; they must be classified before the prefix
     // table below, which would otherwise match them as "shl"/"shr"/"sar"
     // writers and let a later scan treat an earlier `cmp`'s flags as dead.
+    // The BMI1 siblings (andn/bextr/bzhi/blsi/blsmsk/blsr) are equally
+    // VEX-encoded and flag-neutral; the old WRITERS list carried
+    // andn/blsi/blsmsk/blsr as flag writers, which is factually wrong and
+    // lets `flags_dead_after` delete a live producer between a `cmp` and a
+    // later reader (`cmp; andn; je` — andn never touches ZF).
     if t.starts_with("shlx")
         || t.starts_with("shrx")
         || t.starts_with("sarx")
@@ -147,25 +152,124 @@ pub(super) fn flags_effect(t: &str) -> FlagsEffect {
         || t.starts_with("pdep")
         || t.starts_with("pext")
         || t.starts_with("mulx")
+        || t.starts_with("andn")
+        || t.starts_with("bextr")
+        || t.starts_with("bzhi")
+        || t.starts_with("blsi")
+        || t.starts_with("blsmsk")
+        || t.starts_with("blsr")
     {
         return FlagsEffect::Neutral;
     }
+
+    // Everything below classifies on the mnemonic with a leading VEX `v`
+    // stripped, so `vaddps` gets exactly the classification of `addps`.
+    let base = t.strip_prefix('v').unwrap_or(t);
+
+    // Instructions with a fixed flag-writing effect that the generic tables
+    // below would misroute: sahf/stc/clc write flags without reading them;
+    // shld/shrd/bts/btr/btc/ptest write CF (and friends); popf REPLACES the
+    // flags from the stack (a producer, not a consumer); the SSE/AVX compare
+    // family (u)comis{s,d} writes ZF/CF/PF.
+    let mnem = base
+        .split(|c: char| c == ' ' || c == '\t')
+        .next()
+        .unwrap_or(base);
+    if matches!(
+        mnem,
+        "sahf" | "stc" | "clc" | "cld" | "std" | "shld" | "shldl" | "shldq" | "shrd" | "shrdl"
+            | "shrdq" | "bts" | "btsl" | "btsq" | "btsw" | "btr" | "btrl" | "btrq" | "btrw"
+            | "btc" | "btcl" | "btcq" | "btcw" | "ptest" | "popf" | "popfl" | "popfq" | "popfw"
+            | "comiss" | "comisd" | "ucomiss" | "ucomisd"
+    ) {
+        return FlagsEffect::Writes;
+    }
+
+    // SSE/AVX data instructions never touch EFLAGS.  The generic ALU stems
+    // below would otherwise match their scalar/vector spellings as flag
+    // writers (`addsd` -> "add"), which is factually wrong and — far worse —
+    // lets `flags_dead_after` delete a live producer between a `cmp` and a
+    // later `jcc` (`cmp; addsd; je` miscompiled before this list existed).
+    if fp_data_op(base) {
+        return FlagsEffect::Neutral;
+    }
+
+    // Generic flag-writing ALU stems, matched with an exact size suffix
+    // (l/q/w/b), a blank, or end-of-mnemonic — never `sd`/`ss`/`ps`/`pd`
+    // (those are FP forms, handled above) and never sibling mnemonics
+    // (`andn`, `shld`, `cmpxchg` are classified by their own rules).
     const WRITERS: &[&str] = &[
         "add", "sub", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "imul", "mul", "div",
         "idiv", "shl", "shr", "sar", "sal", "rol", "ror", "bt", "bsf", "bsr", "popcnt", "lzcnt",
-        "tzcnt", "andn", "blsr", "blsi", "blsmsk", "ucomis", "comis", "vucomis", "vcomis",
-        "cmpxchg", "xadd", "lock",
+        "tzcnt", "cmpxchg", "xadd", "lock",
     ];
-    if WRITERS.iter().any(|p| t.starts_with(p)) {
+    if WRITERS.iter().any(|p| suffix_exact_writer(base, p)) {
         return FlagsEffect::Writes;
     }
     // Unknown: assume the worst (both).
     FlagsEffect::Reads
 }
 
+/// `stem` is a flag-writing mnemonic when it is followed by nothing, a blank
+/// (operands follow), or an integer size suffix (l/q/w/b).  A suffix that
+/// starts a different mnemonic (`addsd`, `andn`, `shld`, `btc`) is not one.
+#[inline]
+fn suffix_exact_writer(base: &str, stem: &str) -> bool {
+    let Some(rest) = base.strip_prefix(stem) else {
+        return false;
+    };
+    rest.is_empty() || matches!(rest.as_bytes()[0], b' ' | b'l' | b'q' | b'w' | b'b')
+}
+
+/// SSE/AVX data mnemonics (and their VEX `v`-prefixed spellings via the
+/// caller's base) that never read or write EFLAGS.
+#[inline]
+fn fp_data_op(base: &str) -> bool {
+    const FP_NEUTRAL: &[&str] = &[
+        // scalar/vector FP arithmetic, compares, rounding, sqrt, rcps
+        "addsd", "addss", "addps", "addpd", "addsubps", "addsubpd",
+        "subsd", "subss", "subps", "subpd",
+        "mulsd", "mulss", "mulps", "mulpd",
+        "divsd", "divss", "divps", "divpd",
+        "minss", "minsd", "minps", "minpd",
+        "maxss", "maxsd", "maxps", "maxpd",
+        "sqrtss", "sqrtsd", "sqrtps", "sqrtpd",
+        "roundss", "roundsd", "roundps", "roundpd",
+        "rcpss", "rcpps", "rsqrtss", "rsqrtps",
+        "shufps", "shufpd",
+        "andps", "andpd", "andnps", "andnpd", "orps", "orpd", "xorps", "xorpd",
+        "unpcklps", "unpckhps", "unpcklpd", "unpckhpd",
+        "cvt", "cvtt",
+        "hadd", "hsub",
+        // integer SIMD data ops
+        "pshufb", "pshufd", "pshufhw", "pshuflw", "palignr",
+        "padd", "psub", "pmul", "pmadd", "pavg", "psll", "psrl", "psra",
+        "pand", "pandn", "por", "pxor",
+        "pcmpeq", "pcmpgt", "pmins", "pminu", "pmaxs", "pmaxu",
+        "psadbw", "pmuludq", "mpsadbw", "phadd", "phsub", "psign", "pabs",
+        "pmaddubsw", "pack", "punpck", "pinsr", "pextr", "extract", "insert",
+        "insertps", "extractps", "blend", "pblend", "perm", "maskmov",
+        // data movement / mask extraction / broadcasts / gathers / FMA / AES
+        "movdqa", "movdqu", "movaps", "movups", "movapd", "movupd", "movdq",
+        "movhlps", "movlhps", "movnti", "movntq", "movntdqa", "lddqu",
+        "movshdup", "movsldup", "movddup", "movmskps", "movmskpd", "pmovmskb",
+        "broadcast", "pbroadcast", "gather", "pgather",
+        "fmadd", "fmsub", "fnmadd", "fnmsub", "aes", "pclmul",
+        "zero", "ldmxcsr", "stmxcsr",
+        // moves and LEAs (covers v-prefixed data moves too: vmovq, vmovd)
+        "mov", "lea", "xchg", "not",
+    ];
+    FP_NEUTRAL.iter().any(|p| base.starts_with(p))
+}
+
 /// True when the flags written at `from - 1` are dead: scanning forward inside
-/// the block, a flags WRITER is reached before any flags READER.
-fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
+/// the block, a flags WRITER is reached before any flags READER.  The single
+/// oracle every flag-discarding transform must consult — a one-instruction
+/// peek lets an intervening flag-NEUTRAL instruction (`mov`, `lea`, `andn`,
+/// `blsi`, ...) hide a later `jcc`/`setcc`/`adc` that still reads the value
+/// (the `addq $imm` → `leaq` rewrite in local_patterns miscompiled exactly
+/// this shape).
+pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usize) -> bool {
     let mut n = from;
     while n < store.len() {
         if infos[n].is_nop() {
@@ -1211,12 +1315,18 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
                 if implicit_read_refs(tj.as_bytes()) & mask != 0 {
                     break;
                 }
-                // "Fully redefined" must mean a real write of the family.
-                // `writes_family` is exact: a `cqto` is classified with %rax
-                // as its primary destination, but %rax is its implicit input
-                // — the only family it writes is %rdx — so it can never
-                // retire a %rax identity here.
-                if writes_family(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
+                // "Fully redefined" must mean a FULL-WIDTH write of the
+                // family: a `cqto` is classified with %rax as its primary
+                // destination, but %rax is its implicit input — the only
+                // family it writes is %rdx — so it can never retire a %rax
+                // identity here.  And a PARTIAL write (`movb $1, %al`,
+                // `lahf`, `setcc`) leaves the upper bits of the old value
+                // live, so a later 64-bit read would still observe them:
+                // the any-width `writes_family` must not end the search.
+                // `writes_family_full` proves the whole architectural
+                // family rewritten (32-bit writes zero-extend).  cmov is
+                // additionally excluded: its write is conditional.
+                if writes_family_full(&infos[j], tj, dst_fam) && !tj.starts_with("cmov") {
                     ok = true; // fully redefined before any wide read
                     break;
                 }
@@ -1236,6 +1346,7 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
 #[cfg(test)]
 mod tests {
     use super::super::super::peephole_optimize;
+    use super::{flags_effect, FlagsEffect};
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
@@ -1611,4 +1722,279 @@ mod tests {
         assert!(out.contains("andq $255, %rsi"), "{out}");
     }
 
+    #[test]
+    fn bmi1_vex_ops_are_flag_neutral_not_flag_writers() {
+        // BMI1 is VEX-encoded and leaves EFLAGS untouched.  The old WRITERS
+        // list carried andn/blsi/blsmsk/blsr as flag writers; classifying
+        // them as Writes lets `flags_dead_after` delete a live `cmp` that a
+        // later `je` still reads (`cmp; andn; je` miscompiles).
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "andnq %rdx, %rax, %rax",
+            "andnl %edx, %eax, %eax",
+            "blsiq %rcx, %rax",
+            "blsmskq %rcx, %rax",
+            "blsrq %rcx, %rax",
+            "bextrq %rcx, %rax, %rdx",
+            "bzhiq %rcx, %rax, %rdx",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Neutral),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn sse_arith_is_flag_neutral_not_a_flag_writer() {
+        // `addsd` and its FP siblings write only their XMM destination;
+        // classifying them as flag writers lets `flags_dead_after` retire a
+        // live `cmp` between them and a later branch.
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "addsd %xmm1, %xmm2",
+            "addss %xmm1, %xmm2",
+            "addps %xmm1, %xmm2",
+            "addpd %xmm1, %xmm2",
+            "subsd %xmm1, %xmm2",
+            "mulsd %xmm1, %xmm2",
+            "divsd %xmm1, %xmm2",
+            "xorps %xmm1, %xmm2",
+            "andps %xmm1, %xmm2",
+            "orps %xmm1, %xmm2",
+            "minss %xmm1, %xmm2",
+            "maxpd %xmm1, %xmm2",
+            "sqrtss %xmm1, %xmm2",
+            "shufps $27, %xmm1, %xmm2",
+            "paddq %xmm1, %xmm2",
+            "psubw %xmm1, %xmm2",
+            "pmulld %xmm1, %xmm2",
+            "pand %xmm1, %xmm2",
+            "por %xmm1, %xmm2",
+            "pxor %xmm1, %xmm2",
+            "pshufb %xmm1, %xmm2",
+            "pcmpeqd %xmm1, %xmm2",
+            "cvtsi2sd %eax, %xmm1",
+            "roundss $1, %xmm1, %xmm2",
+            "vaesenc %xmm1, %xmm2, %xmm3",
+            "vpand %xmm1, %xmm2, %xmm3",
+            "vaddps %ymm1, %ymm2, %ymm3",
+            "vmulsd %xmm1, %xmm2, %xmm3",
+            "vdivpd %ymm1, %ymm2, %ymm3",
+            "vfmadd231ps %ymm1, %ymm2, %ymm3",
+            "vpclmulqdq $0, %xmm1, %xmm2, %xmm3",
+            "vpxor %ymm1, %ymm2, %ymm3",
+            "vminpd %ymm1, %ymm2, %ymm3",
+            "vblendvps %ymm1, %ymm2, %ymm3, %ymm4",
+            "vperm2f128 $1, %ymm1, %ymm2, %ymm3",
+            "vzeroupper",
+            "vzeroall",
+            "movdqa %xmm1, %xmm2",
+            "vmovups %ymm1, (%rdi)",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Neutral),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn exact_flag_writers_are_writers() {
+        let tag = |e: FlagsEffect| match e {
+            FlagsEffect::Neutral => "neutral",
+            FlagsEffect::Writes => "writes",
+            FlagsEffect::Reads => "reads",
+        };
+        for m in [
+            "sahf",
+            "stc",
+            "clc",
+            "cld",
+            "std",
+            "popfq",
+            "shldl %cl, %eax, %ebx",
+            "shrdq %cl, %rax, %rbx",
+            "btsq %rax, %rbx",
+            "btrq %rax, %rbx",
+            "btcq %rax, %rbx",
+            "ptest %xmm1, %xmm2",
+            "vptest %ymm1, %ymm2",
+            "ucomiss %xmm1, %xmm2",
+            "comisd %xmm1, %xmm2",
+            "vucomisd %xmm1, %xmm2",
+        ] {
+            assert!(
+                matches!(flags_effect(m), FlagsEffect::Writes),
+                "{m} classified {}",
+                tag(flags_effect(m))
+            );
+        }
+    }
+
+    #[test]
+    fn cmp_survives_across_a_bmi1_op_the_branch_reads() {
+        // End-to-end: `copy + add` folds to a scaled LEA only when the add's
+        // flags are dead (`flags_dead_after`).  With `andn` misclassified as
+        // a flags writer the add's flags looked dead although the later
+        // `jne` reads them — the fold then changed control flow.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    andnq %rdx, %rbx, %rbx\n",
+            "    jne .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("addq $5, %rax"),
+            "the add's flags feed the jne through a flag-neutral andn: {out}"
+        );
+        assert!(out.contains("andnq %rdx, %rbx, %rbx"), "{out}");
+    }
+
+    #[test]
+    fn add_survives_across_sse_arith_the_branch_reads() {
+        // The `movq+addq` -> `leaq` fold discards the add's flags; a
+        // flag-NEUTRAL `addsd` in between must not hide the `je` that still
+        // reads them.  (Before the FP classification this folded and the
+        // branch read garbage flags.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    addsd %xmm1, %xmm2\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("addq $5, %rax"),
+            "the add's flags feed the je through a flag-neutral addsd: {out}"
+        );
+        assert!(out.contains("addsd %xmm1, %xmm2"), "{out}");
+    }
+
+    #[test]
+    fn add_folds_across_a_true_flag_writer() {
+        // The positive control: `popcntq` writes the flags the `je` reads,
+        // so the add's flags are dead and the fold is legal.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    addq $5, %rax\n",
+            "    popcntq %rbx, %rbx\n",
+            "    je .LBB4\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("leaq 5(%r9), %rax"),
+            "the add must fold across a real flag writer: {out}"
+        );
+        assert!(!out.contains("addq $5, %rax"), "{out}");
+    }
+
+    #[test]
+    fn move_survives_a_partial_redefinition_of_its_destination() {
+        // `eliminate_dead_reg_moves` must not delete the move across a
+        // PARTIAL write of its destination family: `movb $1, %al` leaves the
+        // upper bits of %rax as the move wrote them, and the final copy
+        // ships them out.  (The any-width `writes_family` acceptance made
+        // this `movq %r9, %rax` disappear — %rbx received garbage.)
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r9, %rax\n",
+            "    movb $1, %al\n",
+            "    movq %rax, %rbx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movq %r9, %rax"),
+            "the move's value survives the byte write: {out}"
+        );
+        assert!(out.contains("movb $1, %al"), "{out}");
+    }
+
+    #[test]
+    fn sign_extension_survives_a_partial_redefinition() {
+        // `movslq` narrows to `movl` only when the 64-bit value is fully
+        // redefined before any wide read.  `movb $1, %al` rewrites just the
+        // low byte; the `ret` still observes the sign extension's upper
+        // bits, so the narrow would corrupt the return value.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    movb $1, %al\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movslq %eax, %rax"),
+            "sign extension must survive a partial redefinition: {out}"
+        );
+        assert!(!out.contains("movl %eax, %eax"), "{out}");
+    }
+
+    #[test]
+    fn sign_extension_survives_a_lahf_partial_write() {
+        // Same hazard through an IMPLICIT partial write: `lahf` sets only AH.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    lahf\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            out.contains("movslq %eax, %rax"),
+            "sign extension must survive lahf: {out}"
+        );
+    }
+
+    #[test]
+    fn sign_extension_narrows_across_a_full_redefinition() {
+        // The positive control: a 32-bit write zero-extends and fully
+        // redefines the family, so the extension may be narrowed away
+        // entirely (`movl $1, %eax` alone is the full %rax value).
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movslq %eax, %rax\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            !out.contains("movslq"),
+            "full redefinition must retire the extension: {out}"
+        );
+        assert!(out.contains("movl $1, %eax"), "{out}");
+    }
+
+    
 }

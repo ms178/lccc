@@ -378,6 +378,42 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool 
     get_dest_reg(info) == fam && implicit_read_refs(trimmed.as_bytes()) & bit == 0
 }
 
+/// Does the line fully REDEFINE GP family `fam` at ≥32 bits (a 32-bit write
+/// zero-extends to the whole 64-bit family)?
+///
+/// This is the ACCEPTANCE-grade counterpart of [`writes_family`]: a true
+/// answer proves every consumer of the old value unreachable, so transforms
+/// that delete a definition (narrow sign-extension removal, the three-line
+/// copy-swap middle, ...) must ask THIS predicate.  [`writes_family`] answers
+/// "any part written" — byte/word partials (`movb %al`, `lahf`, `xlat`,
+/// `divb`, `setcc`) and conditional writes (`cmpxchg`) pass that bar but do
+/// NOT retire the old 64-bit value.
+#[inline]
+pub(super) fn writes_family_full(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
+    if fam > REG_GP_MAX {
+        return false;
+    }
+    let bit = 1u16 << fam;
+    // 1. Architectural implicit writes at full width: exact (see
+    //    `implicit_full_write_refs` for the exclusions).
+    if implicit_full_write_refs(trimmed.as_bytes()) & bit != 0 {
+        return true;
+    }
+    // 2. The explicit destination: full only when the destination token
+    //    names the family at 32 or 64 bits.  A memory destination redefines
+    //    no register; `%ax`/`%al`/`%ah`-style tokens redefine only part.
+    get_dest_reg(info) == fam && dest_operand_is_full_width(trimmed, fam)
+}
+
+/// The explicit destination token (text after the last comma) names `fam` at
+/// 32 or 64 bits.  `REG_NAMES[0]` is the 64-bit row, `REG_NAMES[1]` the
+/// 32-bit row; any other width (or a memory operand) is a partial/no write.
+#[inline]
+fn dest_operand_is_full_width(trimmed: &str, fam: RegId) -> bool {
+    let dest = trimmed.rsplit(',').next().unwrap_or(trimmed).trim();
+    dest == REG_NAMES[0][fam as usize] || dest == REG_NAMES[1][fam as usize]
+}
+
 // ── Label/jump parsing ───────────────────────────────────────────────────────
 
 /// Parse ".LBB<number>:" label into its number, e.g. ".LBB123:" -> Some(123)
@@ -561,5 +597,58 @@ mod writes_family_tests {
     fn rejects_non_gp_families() {
         let info = classify_line("    movsd %xmm0, %xmm1");
         assert!(!writes_family(&info, "movsd %xmm0, %xmm1", 25));
+    }
+
+    // ── the full-width acceptance oracle ─────────────────────────────────────
+
+    #[test]
+    fn full_width_requires_32_or_64_bit_writes() {
+        // movl zero-extends: a full family redefinition.  Byte/word writes
+        // leave the upper bits of the old value observable.
+        let info = classify_line("    movl %ecx, %eax");
+        assert!(writes_family_full(&info, "movl %ecx, %eax", 0));
+        let info = classify_line("    movb $1, %al");
+        assert!(!writes_family_full(&info, "movb $1, %al", 0));
+        let info = classify_line("    movw %cx, %ax");
+        assert!(!writes_family_full(&info, "movw %cx, %ax", 0));
+        let info = classify_line("    sete %al");
+        assert!(!writes_family_full(&info, "sete %al", 0));
+        // A memory destination redefines no register.
+        let info = classify_line("    movq %rax, (%rdi)");
+        assert!(!writes_family_full(&info, "movq %rax, (%rdi)", 0));
+        // 32-bit ALU forms zero-extend too.
+        let info = classify_line("    addl %ecx, %eax");
+        assert!(writes_family_full(&info, "addl %ecx, %eax", 0));
+    }
+
+    #[test]
+    fn implicit_full_writes_exclude_partials_and_conditionals() {
+        // Full-width implicit writes.
+        let info = classify_line("    cqto");
+        assert!(writes_family_full(&info, "cqto", 2));
+        assert!(!writes_family_full(&info, "cqto", 0)); // %rax is the input
+        let info = classify_line("    idivq %r11");
+        assert!(writes_family_full(&info, "idivq %r11", 0));
+        assert!(writes_family_full(&info, "idivq %r11", 2));
+        let info = classify_line("    cltq");
+        assert!(writes_family_full(&info, "cltq", 0));
+        // Partial implicit writes must NOT retire the old value.
+        let info = classify_line("    lahf");
+        assert!(!writes_family_full(&info, "lahf", 0));
+        let info = classify_line("    idivb %cl");
+        assert!(!writes_family_full(&info, "idivb %cl", 0));
+        let info = classify_line("    xlat");
+        assert!(!writes_family_full(&info, "xlat", 0));
+        let info = classify_line("    fnstsw");
+        assert!(!writes_family_full(&info, "fnstsw", 0));
+        // Conditional accumulator reloads are not full redefinitions.
+        let info = classify_line("    cmpxchgq %rbx, (%rdi)");
+        assert!(!writes_family_full(&info, "cmpxchgq %rbx, (%rdi)", 0));
+        let info = classify_line("    xbegin .L1");
+        assert!(!writes_family_full(&info, "xbegin .L1", 0));
+        // The over-approximate `int` row proves nothing.
+        let info = classify_line("    int $0x80");
+        assert!(!writes_family_full(&info, "int $0x80", 0));
+        assert!(!writes_family_full(&info, "int $0x80", 5));
     }
 }

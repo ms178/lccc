@@ -14,10 +14,11 @@
 //!   7. eliminate_redundant_xorl_zero: xorl %eax,%eax when %rax already zero
 
 use super::super::types::*;
+use super::flag_peepholes::flags_dead_after;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
-    writes_family,
+    writes_family, writes_family_full,
 };
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
@@ -576,13 +577,17 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 && lr != 5
                                 && lr != sr
                             {
-                                // Middle line: writes %S (explicitly, or
-                                // implicitly — `cqto` overwrites %rdx without
-                                // naming it), doesn't read %D, no memory
-                                // access, and is a plain register-dest
-                                // instruction.
+                                // Middle line: FULLY redefines %S (explicitly
+                                // at 32/64-bit width, or implicitly — `cqto`
+                                // overwrites %rdx without naming it),
+                                // doesn't read %D, no memory access, and is a
+                                // plain register-dest instruction.  The
+                                // full-width bar matters: a partial write
+                                // (`movb $7, %sl`) leaves the upper bits of
+                                // the copied value live, so deleting the
+                                // copy would corrupt the later full read.
                                 let mid_t = infos[m].trimmed(store.get(m));
-                                let mid_writes_s = writes_family(&infos[m], mid_t, sr)
+                                let mid_writes_s = writes_family_full(&infos[m], mid_t, sr)
                                     && matches!(infos[m].kind, LineKind::Other { .. });
                                 let mid_refs_d = infos[m].reg_refs & (1u16 << lr) != 0;
                                 // leaq is address ARITHMETIC: `leaq 1(%r11), %r11`
@@ -2994,37 +2999,15 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
                 }
 
                 // Sub-pattern: addq $imm, %<dst> → leaq imm(%<src>), %<dst>
-                // Only if flags are not consumed by the next instruction.
+                // Only if the add's flags are dead.  The one-instruction
+                // peek this used to be let an intervening flag-NEUTRAL line
+                // (`mov`, `andn`, `lea`, ...) hide a later `jcc` that still
+                // reads the add's flags — the central `flags_dead_after`
+                // scan walks to the next real reader or writer.
                 let add_suffix = format!(", %{}", dst_reg_str);
                 if line_j.starts_with("addq $") && line_j.ends_with(&add_suffix) {
                     let imm_str = &line_j[6..line_j.len() - add_suffix.len()]; // between "addq $" and ", %dst"
-                                                                               // Check flags safety: next instruction must not read flags.
-                    let mut k = j + 1;
-                    while k < len && infos[k].is_nop() {
-                        k += 1;
-                    }
-                    let flags_safe = if k >= len {
-                        true
-                    } else {
-                        let next = infos[k].trimmed(store.get(k));
-                        // Instructions that consume flags: jCC, setCC, adcq, sbbq, cmovc, etc.
-                        // Conservative: if next instruction starts with any of these, bail.
-                        !(next.starts_with("ja")
-                            || next.starts_with("jb")
-                            || next.starts_with("je")
-                            || next.starts_with("jn")
-                            || next.starts_with("jg")
-                            || next.starts_with("jl")
-                            || next.starts_with("js")
-                            || next.starts_with("jo")
-                            || next.starts_with("jc")
-                            || next.starts_with("jp")
-                            || next.starts_with("set")
-                            || next.starts_with("adc")
-                            || next.starts_with("sbb")
-                            || next.starts_with("cmov"))
-                    };
-                    if flags_safe {
+                    if flags_dead_after(store, infos, j + 1) {
                         let new_text =
                             format!("    leaq {}(%{}), %{}", imm_str, src_reg, dst_reg_str);
                         mark_nop(&mut infos[i]);

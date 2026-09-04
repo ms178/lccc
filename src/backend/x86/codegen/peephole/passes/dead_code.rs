@@ -163,8 +163,14 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             let refs_dst = infos[j].reg_refs & dst_mask != 0;
             // Redefinition includes architectural implicit writes: `cqto`
             // overwrites %rdx, `idivq` rewrites %rax:%rdx — the classified
-            // destination alone answers only half of that.
-            let writes_dst = writes_family(&infos[j], trimmed_j, dst_reg);
+            // destination alone answers only half of that.  A redefinition
+            // that retires a definition must be a FULL-WIDTH write of the
+            // family: `movb $1, %al` rewrites only the low byte, and the
+            // upper bits of the moved value survive into later reads, so
+            // the any-width `writes_family` used here deleted the move and
+            // corrupted them (`movq %r9, %rax; movb $1, %al; movq %rax,
+            // %rbx` shipped %rbx = garbage-high | 1).
+            let writes_dst = writes_family_full(&infos[j], trimmed_j, dst_reg);
 
             if writes_dst {
                 let also_reads = match infos[j].kind {
