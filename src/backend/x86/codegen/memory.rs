@@ -2900,46 +2900,116 @@ impl X86Codegen {
                 self.state.reg_cache.invalidate_all();
                 return;
             }
-            // For copies > 64 bytes, use an unrolled AVX2 loop instead of rep movsb.
-            // This is faster for medium copies (65-512 bytes) because vmovdqu ymm
-            // has higher throughput than rep movsb on modern Intel CPUs without ERMS.
-            // Each iteration copies 64 bytes (2x vmovdqu 32-byte).
-            let full_chunks = size / 64;
-            let remainder = size % 64;
+            // Copies > 64 bytes follow the CPU tuning model
+            // (`X86Tune::memcpy_strategy`, docs/CPU_MODEL_AUDIT.md §4):
+            //
+            // * `rep movsb` at or above glibc's `__x86_rep_movsb_threshold`
+            //   on ERMS/FSRM parts (2112 B with FSRM, 8192 B with 32-byte
+            //   vectors on the older ERMS cores).  Three instructions, no
+            //   call, no loop, byte-granular so no alignment prologue; it is
+            //   the exact path glibc's own memmove-vec-unaligned-erms takes
+            //   for the same size on the same hardware.
+            // * otherwise a counted vector loop whose width follows the
+            //   instruction-set contract: 32-byte `vmovdqu %ymm` ONLY when
+            //   AVX2 is enabled by `-march` (and the part does not split
+            //   256-bit unaligned loads, SNB/IVB), 16-byte SSE2 `movdqu`
+            //   otherwise.  The previous lowering emitted `%ymm` here
+            //   unconditionally, which SIGILLs on any pre-AVX host at plain
+            //   `-march=x86-64` (regression: tests/regression/
+            //   cpu_model_memcpy_raptorlake.c).
+            use crate::backend::x86::cpu_model::CopyStrategy;
+            let vb = self.tune.block_copy_vector_bytes(self.avx2_enabled);
+            let strategy = self.tune.memcpy_strategy(size, vb);
+            if strategy == CopyStrategy::RepMovsb
+                && std::env::var_os("CCC_NO_REP_MOVSB").is_none()
+            {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    movq", size as i64, "rcx");
+                self.state.emit("    rep movsb");
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
+            let use_ymm = vb == 32;
+            let (mv, r0, r1) = if use_ymm {
+                ("vmovdqu", "%ymm0", "%ymm1")
+            } else {
+                ("movdqu", "%xmm0", "%xmm1")
+            };
+            // Up to eight vector stores (Clang `MaxStoresPerMemcpy`, GCC
+            // `move_by_pieces`) are cheaper straight-line than as a 2–4
+            // iteration counted loop: no %rcx/pointer increments, no taken
+            // branches, and every load/store pair is independent so the
+            // OoO core streams them.  Alternate the two scratch registers so
+            // consecutive pairs never serialise on one register.
+            let unrolled = strategy == CopyStrategy::InlineUnrolled;
+            let chunk = if unrolled { vb } else { 2 * vb };
+            let full_chunks = size / chunk;
+            let remainder = size % chunk;
 
-            // Unrolled loop: copy 64 bytes per iteration
-            if full_chunks > 0 {
+            if unrolled {
+                for i in 0..full_chunks {
+                    let reg = if i % 2 == 0 { r0 } else { r1 };
+                    let off = i * vb;
+                    self.state
+                        .emit_fmt(format_args!("    {} {}(%rsi), {}", mv, off, reg));
+                    self.state
+                        .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, reg, off));
+                }
+                if use_ymm && full_chunks > 0 {
+                    self.state.dirty_upper_ymm = true;
+                }
+            } else if full_chunks > 0 {
+                // Counted loop: two vector moves (2 × vb bytes) per iteration.
                 self.state
                     .out
                     .emit_instr_imm_reg("    movq", full_chunks as i64, "rcx");
                 let loop_label = format!(".Lmcpy_loop_{}", self.state.next_label_id());
                 self.state.emit_fmt(format_args!("{}:", loop_label));
-                self.state.emit("    vmovdqu (%rsi), %ymm0");
-                self.state.emit("    vmovdqu %ymm0, (%rdi)");
-                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
-                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
-                self.state.emit("    addq $64, %rsi");
-                self.state.emit("    addq $64, %rdi");
+                self.state
+                    .emit_fmt(format_args!("    {} (%rsi), {}", mv, r0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, (%rdi)", mv, r0));
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rsi), {}", mv, vb, r1));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}(%rdi)", mv, r1, vb));
+                self.state
+                    .emit_fmt(format_args!("    addq ${}, %rsi", chunk));
+                self.state
+                    .emit_fmt(format_args!("    addq ${}, %rdi", chunk));
                 self.state.emit("    decq %rcx");
                 self.state.emit_fmt(format_args!("    jne {}", loop_label));
+                if use_ymm {
+                    // The upper YMM halves are dirty: arm the epilogue
+                    // vzeroupper so later legacy-SSE code (scalar FP in this
+                    // backend) does not pay the AVX/SSE transition.
+                    self.state.dirty_upper_ymm = true;
+                }
             }
 
-            // Handle remainder (0-63 bytes) with scalar/128-bit moves
-            let mut offset = 0usize;
+            // Remainder ladder.  After the counted loop %rsi/%rdi already
+            // point past the copied prefix (offset 0); after the straight-line
+            // form they do not, so the ladder continues at the prefix length.
+            let mut offset = if unrolled { full_chunks * chunk } else { 0usize };
             let mut remaining = remainder;
             while remaining > 0 {
-                if remaining >= 32 {
+                if remaining >= 32 && use_ymm {
                     self.state
                         .emit_fmt(format_args!("    vmovdqu {}(%rsi), %ymm0", offset));
                     self.state
                         .emit_fmt(format_args!("    vmovdqu %ymm0, {}(%rdi)", offset));
+                    self.state.dirty_upper_ymm = true;
                     offset += 32;
                     remaining -= 32;
                 } else if remaining >= 16 && !self.no_sse {
+                    // Stay in the VEX domain once a YMM register is dirty
+                    // (see the small-copy path above for the measurement).
+                    let mv16 = if use_ymm { "vmovdqu" } else { "movdqu" };
                     self.state
-                        .emit_fmt(format_args!("    movdqu {}(%rsi), %xmm0", offset));
+                        .emit_fmt(format_args!("    {} {}(%rsi), %xmm0", mv16, offset));
                     self.state
-                        .emit_fmt(format_args!("    movdqu %xmm0, {}(%rdi)", offset));
+                        .emit_fmt(format_args!("    {} %xmm0, {}(%rdi)", mv16, offset));
                     offset += 16;
                     remaining -= 16;
                 } else if remaining >= 8 {

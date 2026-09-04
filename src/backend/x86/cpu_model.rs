@@ -1277,11 +1277,36 @@ impl X86Tune {
         if size <= 8 * vb {
             return CopyStrategy::InlineUnrolled;
         }
-        if self.erms && self.rep_movsb_threshold != 0 && size >= self.rep_movsb_threshold as usize
-        {
+        let threshold = self.rep_movsb_threshold_for(vb);
+        if threshold != 0 && size >= threshold {
             return CopyStrategy::RepMovsb;
         }
         CopyStrategy::InlineLoop
+    }
+
+    /// `rep movsb` crossover for an inline loop that moves `vector_bytes`
+    /// per instruction.  glibc `dl-cacheinfo.h` derives the threshold from
+    /// the vector width its own memmove uses, because the competitor of
+    /// `rep movsb` is *that* loop: `2048 × (16/16)` with SSE2 vectors,
+    /// `4096 × (32/16) = 8192` with AVX, `4096 × (64/16) = 16384` with
+    /// AVX-512, and a flat 2112 on FSRM parts where the microcode handles
+    /// short copies well.  The row field `rep_movsb_threshold` records the
+    /// 32-byte figure; a 16-byte inline loop (baseline `-march`) moves half
+    /// the bytes per instruction, so its crossover is glibc's SSE2 number.
+    /// 0 = never (no ERMS).
+    #[inline]
+    pub fn rep_movsb_threshold_for(&self, vector_bytes: usize) -> usize {
+        if !self.erms || self.rep_movsb_threshold == 0 {
+            return 0;
+        }
+        if self.fsrm {
+            return self.rep_movsb_threshold as usize;
+        }
+        match vector_bytes {
+            0..=16 => 2048,
+            17..=32 => self.rep_movsb_threshold as usize,
+            _ => 16384,
+        }
     }
 
     /// Byte count above which a constant-size `memcpy`/`memset` *call* is

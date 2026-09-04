@@ -262,10 +262,14 @@ pub(crate) fn run_function(func: &mut IrFunction) -> usize {
         // CCC_REASSOC_ACCUM_FORCE=1 to bypass the model (research / targets
         // where the recurrence, not throughput, dominates).
         if !force_reassoc_accum() {
+            // Throughput bound from the CPU tuning model: the rename width
+            // of the tuned core (4 on Generic/SNB..SKX, 5 on ICL, 6 on
+            // Golden/Raptor Cove and Zen1..4, 8 on Lion Cove / Zen5); the
+            // i686 target keeps its historical 3-wide estimate.
             let width: usize = if crate::common::types::target_is_32bit() {
                 3
             } else {
-                4
+                crate::backend::x86::cpu_model::active().issue_width()
             };
             let body_ops = func.blocks[body_block].instructions.len();
             // N removed adds, N*(shift|mul) + N adds + 2 spliced back in.

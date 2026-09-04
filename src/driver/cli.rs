@@ -1215,11 +1215,25 @@ impl Driver {
                             "znver3" => self.enable_x86_znver3_profile(),
                             "znver4" => self.enable_x86_znver4_profile(),
                             "znver5" => self.enable_x86_znver5_profile(),
-                            "alderlake" | "raptorlake" | "raptor-lake" => {
-                                self.enable_x86_alderlake_profile()
+                            // Alder Lake ISA (the E-core's capability set: AVX2,
+                            // AVX-VNNI, GFNI, VAES, VPCLMULQDQ, no AVX-512):
+                            // shared by Raptor Lake, Meteor Lake, Alder Lake-N
+                            // and the Gracemont-only spelling.  The *tuning* row
+                            // still differs (cpu_model::resolve maps gracemont /
+                            // alderlake-n to the E-core row, meteorlake to the
+                            // Raptor Lake class).
+                            "alderlake" | "raptorlake" | "raptor-lake" | "meteorlake"
+                            | "gracemont" | "alderlake-n" => self.enable_x86_alderlake_profile(),
+                            // Sierra Forest / Grand Ridge (Crestmont E-core): Alder
+                            // Lake ISA + AVX-IFMA, AVX-NE-CONVERT, AVX-VNNI-INT8,
+                            // CMPCCXADD — the same additions Arrow Lake carries
+                            // (GCC `PTA_SIERRAFOREST`, LLVM `SRFFeatures`).
+                            "arrowlake" | "sierraforest" | "grandridge" => {
+                                self.enable_x86_arrowlake_profile()
                             }
-                            "arrowlake" => self.enable_x86_arrowlake_profile(),
-                            "arrowlake-s" | "lunarlake" | "wildcatlake" => {
+                            // Clearwater Forest (Darkmont) adds AVX-VNNI-INT16
+                            // like Arrow Lake-S / Lunar Lake.
+                            "arrowlake-s" | "lunarlake" | "wildcatlake" | "clearwaterforest" => {
                                 self.enable_x86_arrowlake_profile();
                                 self.enable_avxvnniint16 = true;
                             }

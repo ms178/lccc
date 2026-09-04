@@ -3242,24 +3242,75 @@ impl X86Codegen {
         if let Some(imm) = Self::const_as_imm32(rhs) {
             self.operand_to_callee_reg(lhs, dest_phys);
             if op == IrBinOp::Mul {
-                // LEA strength reduction: replace imul by 3/5/9 with lea.
-                if let Some(scale) = Self::lea_scale_for_mul(imm) {
+                // Strength reduction through the CPU tuning model
+                // (`X86Tune::mul_const_plan`): a LEA/SHL/ADD/SUB/NEG chain
+                // replaces `imul $k` when its latency beats IMUL on this
+                // core (budget `imul_latency − 1`: 2 steps on every P-core
+                // and Zen, 4 on Gracemont whose IMUL is 5 cycles).  ×3/×5/×9
+                // stay a single LEA as before; ×10 becomes `lea (r,r,4); add
+                // r,r`, ×7 `lea (,r,8); sub src` (needs the multiplicand in
+                // a second register, so that shape is only taken when the
+                // lhs is register-homed elsewhere), ×12 `lea (r,r,2); shl 2`.
+                // Matches what GCC 16.2 / Clang 23.1 emit for these
+                // constants and goes further only on the E-core row.
+                let plan_k = if use_32bit { imm as i32 as i64 } else { imm };
+                let plan = self.tune.mul_const_plan(plan_k);
+                let lhs_src_reg = self
+                    .operand_reg(lhs)
+                    .filter(|r| !is_xmm_reg(*r) && *r != dest_phys);
+                let plan = plan.filter(|p| !p.needs_distinct_src || lhs_src_reg.is_some());
+                if let Some(plan) = plan {
+                    use crate::backend::x86::cpu_model::MulStep;
+                    let (dst, src, sfx) = if use_32bit {
+                        (
+                            dest_name_32.to_string(),
+                            lhs_src_reg
+                                .map(phys_reg_name_32)
+                                .unwrap_or(dest_name_32)
+                                .to_string(),
+                            "l",
+                        )
+                    } else {
+                        (
+                            dest_name.to_string(),
+                            lhs_src_reg
+                                .map(phys_reg_name)
+                                .unwrap_or(dest_name)
+                                .to_string(),
+                            "q",
+                        )
+                    };
+                    for step in plan.steps() {
+                        match *step {
+                            MulStep::LeaScale(sc) => self.state.emit_fmt(format_args!(
+                                "    lea{} (, %{}, {}), %{}",
+                                sfx, src, sc, dst
+                            )),
+                            MulStep::LeaMul(sc) => self.state.emit_fmt(format_args!(
+                                "    lea{} (%{}, %{}, {}), %{}",
+                                sfx, dst, dst, sc, dst
+                            )),
+                            MulStep::Shl(k) => self
+                                .state
+                                .emit_fmt(format_args!("    shl{} ${}, %{}", sfx, k, dst)),
+                            MulStep::AddSrc => self
+                                .state
+                                .emit_fmt(format_args!("    add{} %{}, %{}", sfx, src, dst)),
+                            MulStep::SubSrc => self
+                                .state
+                                .emit_fmt(format_args!("    sub{} %{}, %{}", sfx, src, dst)),
+                            MulStep::Neg => {
+                                self.state.emit_fmt(format_args!("    neg{} %{}", sfx, dst))
+                            }
+                        }
+                    }
                     if use_32bit {
-                        self.state.emit_fmt(format_args!(
-                            "    leal (%{}, %{}, {}), %{}",
-                            dest_name_32, dest_name_32, scale, dest_name_32
-                        ));
                         self.emit_sext32_for_value(
                             dest_name_32,
                             dest_name,
                             is_unsigned,
                             dest_value_id,
                         );
-                    } else {
-                        self.state.emit_fmt(format_args!(
-                            "    leaq (%{}, %{}, {}), %{}",
-                            dest_name, dest_name, scale, dest_name
-                        ));
                     }
                 } else if use_32bit {
                     // Encode u32 constants as signed imm32 (same bits).
