@@ -1173,6 +1173,11 @@ impl Driver {
                 }
                 arg if arg.starts_with("-march=") => {
                     let march = &arg["-march=".len()..];
+                    if matches!(self.target, Target::X86_64 | Target::I686) {
+                        // Remembered for the tuning-row fallback
+                        // (cpu_model::resolve: -mtune > -march > generic).
+                        self.x86_march = Some(march.to_string());
+                    }
                     match self.target {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
                         Target::X86_64 | Target::I686 => match march {

@@ -1216,13 +1216,28 @@ impl X86Codegen {
                 }
             }
             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
-                let (mnem32, mnem64) = shift_mnemonic(op);
-                if use_32bit {
-                    self.state
-                        .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
+                // Count already in %rcx, lhs in %rax: on Intel the VEX
+                // form is 1 µop against 2–3 for `shl %cl` (uops.info
+                // SHL_R64_CL vs SHLX_R64_R64_R64); on Zen both are 1 µop and
+                // the legacy encoding is shorter (tune row decides).
+                if self.tune.prefer_shlx(self.bmi2_enabled) {
+                    let (x32, x64) = super::emit::shiftx_mnemonic(op);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {} %ecx, %eax, %eax", x32));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} %rcx, %rax, %rax", x64));
+                    }
                 } else {
-                    self.state
-                        .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
+                    let (mnem32, mnem64) = shift_mnemonic(op);
+                    if use_32bit {
+                        self.state
+                            .emit_fmt(format_args!("    {} %cl, %eax", mnem32));
+                    } else {
+                        self.state
+                            .emit_fmt(format_args!("    {} %cl, %rax", mnem64));
+                    }
                 }
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),

@@ -467,6 +467,9 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         || trimmed.starts_with("bextr")
         || trimmed.starts_with("pext")
         || trimmed.starts_with("pdep")
+        || trimmed.starts_with("shlx")
+        || trimmed.starts_with("shrx")
+        || trimmed.starts_with("sarx")
     {
         return false;
     }

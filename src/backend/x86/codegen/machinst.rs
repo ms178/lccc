@@ -276,6 +276,19 @@ pub enum MachInst {
         size: OpSize,
     },
 
+    /// BMI2 three-operand shift: dst = src SHIFT count.  Count may live in
+    /// any GPR, the form is non-destructive and leaves EFLAGS untouched.
+    /// One µop on every core with BMI2 (uops.info SHLX_R64_R64_R64) against
+    /// 2–3 for `Shift` with a CL count on Intel.  Selected by isel only
+    /// when `isel::shlx_mode()` allows it (tune row + `-mbmi2`).
+    ShiftX {
+        op: ShiftOp,
+        count: MachReg,
+        src: MachReg,
+        dst: MachReg,
+        size: OpSize,
+    },
+
     /// LEA: dst = base + index*scale + offset (3-address add).
     /// x86 form: `leaq offset(%base, %index, scale), %dst`
     Lea {

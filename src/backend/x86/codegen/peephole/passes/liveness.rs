@@ -86,6 +86,10 @@ fn is_pure_write_mnemonic(t: &str) -> bool {
         || t.starts_with("lzcnt")
         || t.starts_with("tzcnt")
         || t.starts_with("popcnt")
+        // BMI2 three-operand shifts always write their destination.
+        || t.starts_with("shlx")
+        || t.starts_with("shrx")
+        || t.starts_with("sarx")
 }
 
 fn mnemonic_is_known(t: &str) -> bool {

@@ -854,9 +854,18 @@ impl X86Codegen {
             ("rax", "eax")
         };
 
-        // False-dependency break: only when dest is a different register from
-        // src (xor would otherwise destroy the input).
-        if src_name != dst_name && src_name != dst32 {
+        // False-dependency break, only where the tuning row says the core
+        // architecturally reads the destination (uops.info lat 1->1 = 3:
+        // POPCNT on SNB..CLX, LZCNT/TZCNT on SNB..BDW) and only when dest is
+        // a different register from src (xor would otherwise destroy the
+        // input).  Ice Lake+, Alder/Raptor Lake and every Zen skip it: there
+        // the xor is a pure front-end/code-size cost.  GCC 16.2 still emits
+        // it for tzcnt on Skylake, where uops.info measures no dependency.
+        let needs_break = match mnem {
+            "popcnt" => self.tune.break_popcnt_dep(),
+            _ => self.tune.break_lzcnt_tzcnt_dep(),
+        };
+        if needs_break && src_name != dst_name && src_name != dst32 {
             self.state
                 .emit_fmt(format_args!("    xorl %{0}, %{0}", dst32));
         }

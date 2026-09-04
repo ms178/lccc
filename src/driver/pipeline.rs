@@ -224,6 +224,9 @@ pub struct Driver {
     /// a machine scheduler, so this is deliberately diagnostic-only; ISA
     /// selection belongs to -march= and is never silently conflated with tune.
     pub(super) x86_tune: Option<String>,
+    /// The `-march=` spelling as given (x86 only); the tuning row falls back
+    /// to it when `-mtune` is absent, exactly like GCC.
+    pub(super) x86_march: Option<String>,
     /// Whether to use only general-purpose registers (-mgeneral-regs-only).
     /// On AArch64, this prevents FP/SIMD register usage. The Linux kernel uses
     /// this to avoid touching NEON/FP state. When set, variadic function prologues
@@ -477,6 +480,7 @@ impl Driver {
             enable_amx_bf16: false,
             enable_cmpccxadd: false,
             x86_tune: None,
+            x86_march: None,
             general_regs_only: false,
             code_model_kernel: false,
             no_jump_tables: false,
@@ -1240,10 +1244,26 @@ impl Driver {
     ///
     /// Set `CCC_TIME_PHASES=1` in the environment to print per-phase timing to stderr.
     fn compile_to_assembly(&self, input_file: &str) -> Result<String, String> {
-        if self.verbose {
-            if let Some(tune) = &self.x86_tune {
-                eprintln!("lccc: note: -mtune={} accepted as a scheduling hint; no x86 scheduler model is implemented yet", tune);
+        // Resolve the microarchitectural tuning row once per compilation.
+        // `-mtune` wins over `-march`, `native` goes through CPUID; both
+        // the middle end (process-global accessor) and the backend
+        // (`CodegenOptions::tune`) see the same row.
+        let tune = crate::backend::x86::cpu_model::resolve(
+            self.x86_march.as_deref(),
+            self.x86_tune.as_deref(),
+        );
+        crate::backend::x86::cpu_model::set_active(tune);
+        if let Ok(v) = std::env::var("LCCC_DUMP_TUNE") {
+            if v == "all" {
+                for cpu in crate::backend::x86::cpu_model::X86Cpu::ALL {
+                    eprint!("{}\n", cpu.tune().dump());
+                }
+            } else if !v.is_empty() && v != "0" {
+                eprint!("{}", tune.dump());
             }
+        }
+        if self.verbose {
+            eprintln!("lccc: note: x86 tuning row '{}'", tune.name);
         }
         let source = Self::read_source(input_file)?;
 
@@ -2048,6 +2068,8 @@ impl Driver {
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
             bmi1: self.enable_bmi,
+            bmi2: self.enable_bmi2,
+            tune,
             lzcnt: self.enable_lzcnt,
             popcnt: self.enable_popcnt,
             avx2: self.enable_avx2,

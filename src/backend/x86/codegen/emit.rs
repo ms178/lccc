@@ -329,6 +329,20 @@ pub(super) fn shift_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
     }
 }
 
+/// BMI2 three-operand shift mnemonics (`shlx count, src, dst`).  One µop on
+/// every core that has BMI2 (uops.info SHLX_R64_R64_R64), count in any GPR,
+/// non-destructive; flags are left untouched, which no consumer of a
+/// variable shift relies on (a count of zero already leaves them undefined
+/// for the legacy form).
+pub(super) fn shiftx_mnemonic(op: IrBinOp) -> (&'static str, &'static str) {
+    match op {
+        IrBinOp::Shl => ("shlxl", "shlxq"),
+        IrBinOp::AShr => ("sarxl", "sarxq"),
+        IrBinOp::LShr => ("shrxl", "shrxq"),
+        _ => unreachable!("not a shift op"),
+    }
+}
+
 /// x86-64 code generator. Implements the ArchCodegen trait for the shared framework.
 /// Uses System V AMD64 ABI with linear scan register allocation for callee-saved registers.
 pub struct X86Codegen {
@@ -427,6 +441,10 @@ pub struct X86Codegen {
     /// True when the target has POPCNT (-mpopcnt or an enabling -march).
     /// When false, Popcount lowers to an shr/adc bit loop.
     pub(super) popcnt_enabled: bool,
+    /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
+    pub(super) bmi2_enabled: bool,
+    /// Measured tuning row for the selected `-mtune`/`-march` core.
+    pub(super) tune: crate::backend::x86::cpu_model::X86Tune,
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
@@ -840,6 +858,8 @@ impl X86Codegen {
             bmi1_enabled: false,
             lzcnt_enabled: false,
             popcnt_enabled: false,
+            bmi2_enabled: false,
+            tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
             avx2_enabled: false,
             avx512_enabled: false,
             optimize_for_size: false,
@@ -947,6 +967,15 @@ impl X86Codegen {
         self.bmi1_enabled = opts.bmi1;
         self.lzcnt_enabled = opts.lzcnt;
         self.popcnt_enabled = opts.popcnt;
+        self.bmi2_enabled = opts.bmi2;
+        self.tune = opts.tune;
+        super::isel::set_shlx_mode(if opts.tune.prefer_shlx(opts.bmi2) {
+            super::isel::ShlxMode::Always
+        } else if opts.tune.shlx_saves_move(opts.bmi2) {
+            super::isel::ShlxMode::WhenItSavesAMove
+        } else {
+            super::isel::ShlxMode::Never
+        });
         self.avx2_enabled = opts.avx2;
         self.avx512_enabled = opts.avx512;
         self.state.emit_cfi = opts.emit_cfi;
@@ -3406,27 +3435,115 @@ impl X86Codegen {
                     mnem64, shift_amount, dest_name
                 ));
             }
-        } else {
-            let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
-            if rhs_conflicts {
-                self.operand_to_rcx(rhs);
-                self.operand_to_callee_reg(lhs, dest_phys);
-            } else {
-                self.operand_to_callee_reg(lhs, dest_phys);
-                self.operand_to_rcx(rhs);
-            }
-            if use_32bit {
-                self.state
-                    .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
-                if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
-                    self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+        } else if self.bmi2_enabled {
+            // BMI2 three-operand form.  Both sources are read straight from
+            // their register homes when they have one, so `x << k` with x
+            // and k in argument registers is a single `shlxq %rsi,%rdi,%rax`
+            // (GCC 16.2 / Clang 23.1 / ICX emit exactly this); the legacy
+            // form below needs `mov`+`mov`+`shl %cl` and pins %rcx.  On
+            // Intel the legacy `shl r,cl` is additionally 3 µops (SNB..CLX)
+            // or 2 µops (ICL..RPL) against 1 for shlx (uops.info), so it is
+            // taken whenever a home is missing as well; on Zen (1 µop each)
+            // the VEX form is only used when it saves the copy, otherwise
+            // the 2–3 byte shorter legacy encoding wins.
+            let (xmnem32, xmnem64) = shiftx_mnemonic(op);
+            let gpr_home = |r: Option<PhysReg>| r.filter(|r| !is_xmm_reg(*r));
+            let count_home = gpr_home(self.operand_reg(rhs));
+            let lhs_home = gpr_home(self.operand_reg(lhs));
+            let saves_move = count_home.is_some() || lhs_home.is_some();
+            if self.tune.prefer_shlx(true) || (saves_move && self.tune.shlx_saves_move(true)) {
+                // Count operand: its own home, else staged in %rcx.  Stage
+                // BEFORE the lhs load when the lhs must land in the count's
+                // home register (dest == count home, lhs not homed).
+                let count_name: &str = match count_home {
+                    Some(r) if lhs_home.is_some() || r.0 != dest_phys.0 => phys_reg_name(r),
+                    _ => {
+                        self.operand_to_rcx(rhs);
+                        "rcx"
+                    }
+                };
+                let count_name = if use_32bit {
+                    match count_name {
+                        "rcx" => "ecx".to_string(),
+                        _ => phys_reg_name_32(count_home.unwrap()).to_string(),
+                    }
+                } else {
+                    count_name.to_string()
+                };
+                let src_name: String = match lhs_home {
+                    Some(r) => {
+                        if use_32bit {
+                            phys_reg_name_32(r).to_string()
+                        } else {
+                            phys_reg_name(r).to_string()
+                        }
+                    }
+                    None => {
+                        self.operand_to_callee_reg(lhs, dest_phys);
+                        if use_32bit {
+                            dest_name_32.to_string()
+                        } else {
+                            dest_name.to_string()
+                        }
+                    }
+                };
+                if use_32bit {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}, %{}",
+                        xmnem32, count_name, src_name, dest_name_32
+                    ));
+                    if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                        self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+                    }
+                } else {
+                    self.state.emit_fmt(format_args!(
+                        "    {} %{}, %{}, %{}",
+                        xmnem64, count_name, src_name, dest_name
+                    ));
                 }
             } else {
-                self.state
-                    .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
+                self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
             }
+        } else {
+            self.emit_shift_cl_legacy(op, lhs, rhs, dest_phys, use_32bit, is_unsigned, dest_value_id);
         }
         self.state.reg_cache.invalidate_acc();
+    }
+
+    /// Legacy `shl/shr/sar %cl, %dest` for a variable count: lhs staged in
+    /// `dest`, count staged in `%rcx` (order chosen so neither load clobbers
+    /// the other's source).
+    fn emit_shift_cl_legacy(
+        &mut self,
+        op: IrBinOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        dest_phys: PhysReg,
+        use_32bit: bool,
+        is_unsigned: bool,
+        dest_value_id: u32,
+    ) {
+        let dest_name = phys_reg_name(dest_phys);
+        let dest_name_32 = phys_reg_name_32(dest_phys);
+        let (mnem32, mnem64) = shift_mnemonic(op);
+        let rhs_conflicts = self.operand_reg(rhs).is_some_and(|r| r.0 == dest_phys.0);
+        if rhs_conflicts {
+            self.operand_to_rcx(rhs);
+            self.operand_to_callee_reg(lhs, dest_phys);
+        } else {
+            self.operand_to_callee_reg(lhs, dest_phys);
+            self.operand_to_rcx(rhs);
+        }
+        if use_32bit {
+            self.state
+                .emit_fmt(format_args!("    {} %cl, %{}", mnem32, dest_name_32));
+            if !is_unsigned && matches!(op, IrBinOp::Shl | IrBinOp::AShr) {
+                self.emit_sext32_for_value(dest_name_32, dest_name, false, dest_value_id);
+            }
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {} %cl, %{}", mnem64, dest_name));
+        }
     }
 
     /// Accumulator-based path: try immediate optimizations first.
@@ -3619,6 +3736,13 @@ fn collect_vregs_in_inst(
         MachInst::Shift { amount, dst, .. } => {
             use_op(amount, all);
             use_reg(dst, all);
+            def_reg(dst, all, defs);
+        }
+        MachInst::ShiftX {
+            count, src, dst, ..
+        } => {
+            use_reg(count, all);
+            use_reg(src, all);
             def_reg(dst, all, defs);
         }
         MachInst::Lea {
@@ -3939,6 +4063,19 @@ fn resolve_stack_vregs(
             dst: *dst,
             size: *size,
         },
+        MachInst::ShiftX {
+            op,
+            count,
+            src,
+            dst,
+            size,
+        } => MachInst::ShiftX {
+            op: *op,
+            count: *count,
+            src: *src,
+            dst: *dst,
+            size: *size,
+        },
         MachInst::Div {
             divisor,
             signed,
@@ -3987,6 +4124,9 @@ fn has_unresolvable_vreg(inst: &super::machinst::MachInst, _ra: &FxHashMap<u32, 
         MachInst::Imul3 { src, dst, .. } => check_reg(src) || check_reg(dst),
         MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => check_reg(dst),
         MachInst::Shift { amount, dst, .. } => check_op(amount) || check_reg(dst),
+        MachInst::ShiftX {
+            count, src, dst, ..
+        } => check_reg(count) || check_reg(src) || check_reg(dst),
         MachInst::Lea {
             base, index, dst, ..
         } => {
