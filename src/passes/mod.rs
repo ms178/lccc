@@ -16,6 +16,7 @@ pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
+pub(crate) mod cvp;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
 pub(crate) mod cfg_simplify;
@@ -1459,6 +1460,21 @@ pub(crate) fn run_passes(
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
+
+            // Correlated value propagation: fold compares, selects and
+            // branches whose outcome is implied by dominating conditional
+            // edges (GCC evrp / LLVM CVP).  Runs after bit_idioms so the
+            // zero guards it materializes are folded on paths that already
+            // established non-zero.  Pass name for CCC_DISABLE_PASSES: "cvp".
+            if !pass_disabled(&disabled, "cvp") {
+                let n = timed_pass!(
+                    "cvp",
+                    run_on_visited(module, &dirty, &mut changed, cvp::run_function)
+                );
+                cur_pass_changes[3] += n;
+                total_changes += n;
+                total_changes_excl_dce += n;
+            }
         }
 
         // Phase 3b: Loop-carried accumulator reassociation.
@@ -1625,6 +1641,19 @@ pub(crate) fn run_passes(
                     &mut changed,
                     simplify::remove_redundant_bitop_guards
                 )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        // Correlated value propagation after if-conversion: the post-ifconv
+        // bit_idioms placement (Ctz from the __ffs Select chain) emits a
+        // `v == 0 ? 63 : ctz(v)` guard whose block is dominated by the
+        // `while (!v)` exit edge; only a dominance-scoped fold removes it.
+        if !pass_disabled(&disabled, "cvp") {
+            let n = timed_pass!(
+                "cvp_post_ifconv",
+                run_on_visited(module, &dirty, &mut changed, cvp::run_function)
             );
             total_changes += n;
             total_changes_excl_dce += n;
