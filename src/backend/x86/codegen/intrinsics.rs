@@ -3311,6 +3311,110 @@ impl X86Codegen {
                     }
                 }
             }
+            IntrinsicOp::VecMaskedAddI32x8 => {
+                // dest(I32x8 accumulator) += lanes(load8×I32(base, off))
+                // where lane > guard_rhs.  args = [acc, base, off,
+                // guard_rhs].  Equal-width sibling of the masked widening
+                // path:
+                //   vmovdqu (mem)            → ymm0 = {a0..a7}
+                //   <broadcast rhs → ymm1>
+                //   vpcmpgtd ymm1, ymm0 → ymm1 = {m0..m7} (0/-1 per lane)
+                //   vpand ymm1, ymm0 → ymm0   = {a&m}  (zero for lanes ≤ rhs)
+                //   vpaddd ymm0, acc → dest
+                // Scratch confined to ymm0/ymm1 so a register-homed I32x8
+                // accumulator (ymm2..ymm15) is never clobbered — the same
+                // discipline as the widening masked path.  Masking at I32 is
+                // exact: the mask is 0/-1 from vpcmpgtd (lanes > rhs), and
+                // vpand zero-masks strictly-below lanes before the fold, so
+                // the guarded scalar semantics (skip lane when lane ≤ rhs)
+                // hold bit-for-bit.
+                self.flush_pending_vec_store_impl();
+                self.state.invalidate_vec_peephole();
+                let (base, index) = self.vec_load_addr_regs(&args[1], &args[2]);
+                match index {
+                    Some(idx) => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{},%{}), %ymm0", base, idx)),
+                    None => self
+                        .state
+                        .emit_fmt(format_args!("    vmovdqu (%{}), %ymm0", base)),
+                }
+                // Build the mask in ymm1 = broadcast(guard_rhs).
+                match &args[3] {
+                    Operand::Const(c) if c.to_i64() == Some(0) => {
+                        self.state.emit("    vpxor %ymm1, %ymm1, %ymm1");
+                    }
+                    Operand::Const(c) => {
+                        if let Some(v) = c.to_i64() {
+                            self.state
+                                .emit_fmt(format_args!("    movl ${}, %eax", v as i32));
+                        } else {
+                            self.state.emit("    xorl %eax, %eax");
+                        }
+                        self.state.emit("    vmovd %eax, %xmm1");
+                        self.state.emit("    vpbroadcastd %xmm1, %ymm1");
+                    }
+                    op => {
+                        // Scalar value operand: materialize into %eax.
+                        self.operand_to_reg(op, "rax");
+                        self.state.emit("    vmovd %eax, %xmm1");
+                        self.state.emit("    vpbroadcastd %xmm1, %ymm1");
+                    }
+                }
+                // mask = lanes > rhs (AT&T: vpcmpgtd src2=rhs, src1=lanes).
+                self.state.emit("    vpcmpgtd %ymm1, %ymm0, %ymm1");
+                // Apply mask to the loaded lanes in-place, then fold.
+                self.state.emit("    vpand %ymm1, %ymm0, %ymm0");
+                if let (Some(d), Operand::Value(acc)) = (dest, &args[0]) {
+                    let acc_reg = self
+                        .reg_assignments
+                        .get(&acc.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name_256(r));
+                    let dst_reg = self
+                        .reg_assignments
+                        .get(&d.0)
+                        .copied()
+                        .filter(|r| is_xmm_reg(*r))
+                        .map(|r| phys_reg_name_256(r));
+                    match (acc_reg, dst_reg) {
+                        (Some(a), Some(dst)) => {
+                            if dst != a {
+                                self.state
+                                    .emit_fmt(format_args!("    vmovdqa %{}, %{}", a, dst));
+                            }
+                            self.state
+                                .emit_fmt(format_args!("    vpaddd %ymm0, %{}, %{}", dst, dst));
+                            self.state.vector_values.insert(d.0);
+                            self.state.vec_live_regs.insert(d.0, dst);
+                            self.state.vec_last_store_val = Some(d.0);
+                            self.state.vec_last_store_reg = true;
+                            self.state.vec_last_store_reg_name = Some(dst);
+                        }
+                        _ => {
+                            // Slot-homed: ymm0 holds the masked lanes; load the
+                            // accumulator into ymm1 (mask consumed), fold,
+                            // round-trip through the slot.
+                            if let Some(slot) = self.state.get_slot(acc.0) {
+                                self.state
+                                    .out
+                                    .emit_instr_rbp_reg("    vmovdqu", slot.0, "ymm1");
+                                self.state.emit("    vpaddd %ymm0, %ymm1, %ymm1");
+                                if let Some(dslot) = self.state.get_slot(d.0) {
+                                    self.state.out.emit_instr_reg_rbp(
+                                        "    vmovdqu",
+                                        "ymm1",
+                                        dslot.0,
+                                    );
+                                }
+                            } else {
+                                self.state.emit("    vpaddd %ymm0, %ymm0, %ymm0");
+                            }
+                        }
+                    }
+                }
+            }
             IntrinsicOp::VecMulI64x2 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();

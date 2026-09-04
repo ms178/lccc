@@ -265,6 +265,142 @@ fn analyze_loop(
         }
     }
 
+    // 5b. Body connectivity: every body block must be reachable from the
+    // header WITHOUT taking the back edge.  This is an inherent property of
+    // a natural loop, so a violation means the "body" contains a detached
+    // cycle — e.g. the clone chain a complete unroller left behind when it
+    // rewrote an inner loop and the CFG simplifier has not run yet.  Such a
+    // cycle has no entry from the preheader, evades the nested-loop check
+    // (unreachable blocks are not merged into `all_headers`), and do_unroll
+    // would clone it into a garbage 4x structure whose exit guards fall
+    // through to the wrong accumulator.  Rejecting here is purely
+    // conservative: the loop simply stays rolled.
+    // NOTE: this guard does NOT trigger on red-team cfg 1765/3169 (their
+    // bodies are reachable and connected); those two were fixed elsewhere
+    // (the strict Add-only partial-IV split and the do_unroll Step 5b
+    // terminator rewrite below).
+    {
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut stack: Vec<usize> = vec![header];
+        while let Some(bi) = stack.pop() {
+            if !seen.insert(bi) {
+                continue;
+            }
+            let label = func.blocks[bi].label;
+            let mut succs: Vec<BlockId> = match &func.blocks[bi].terminator {
+                Terminator::Branch(l) => vec![*l],
+                Terminator::CondBranch {
+                    true_label,
+                    false_label,
+                    ..
+                } => vec![*true_label, *false_label],
+                Terminator::Switch { default, cases, .. } => {
+                    let mut v = vec![*default];
+                    v.extend(cases.iter().map(|(_, l)| *l));
+                    v
+                }
+                _ => vec![],
+            };
+            succs.retain(|l| *l != header_label);
+            for l in succs {
+                if let Some(next) = func.blocks.iter().position(|b| b.label == l) {
+                    if lp.body.contains(&next) {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+        if seen.len() != lp.body.len() {
+            return None;
+        }
+    }
+
+    // 5c. body_work must be a simple linear chain header -> work -> latch.
+    // `do_unroll` emits, per clone, ONE guard that decides whether to enter
+    // the next clone or branch to the exit, and it threads the loop-carried
+    // value through the clones under the assumption that control always
+    // flows work[0] -> work[1] -> ... -> latch.  A body_work with branches,
+    // merges or sub-cycles violates that: the clone-local guard exits jump
+    // to the exit block with whatever the value carried from the PREVIOUS
+    // iteration, doubling the accumulator.  Requiring a linear chain is the
+    // exact precondition the guard arithmetic was derived for; anything else
+    // simply stays rolled (fail-closed).
+    // NOTE: unlike the general shape above, the chain in red-team cfg 1765
+    // IS linear and passes this check — 1765 was fixed by the Step 5b
+    // terminator rewrite in do_unroll, not by this guard.  The guard covers
+    // the wider class of non-linear bodies; those shapes are exercised
+    // exhaustively by scripts/unroll_stress.py.
+    {
+        let mut chain_ok = true;
+        let mut seen_work: FxHashSet<usize> = FxHashSet::default();
+        let mut entry_preds = 0usize;
+        for &bi in &body_work {
+            let inner_preds: Vec<usize> = cfg
+                .preds
+                .row(bi)
+                .iter()
+                .map(|&p| p as usize)
+                .filter(|p| lp.body.contains(p))
+                .collect();
+            // Exactly one predecessor inside the loop; it must be the header
+            // (the body entry) or another body_work block.
+            if inner_preds.len() != 1 {
+                chain_ok = false;
+                break;
+            }
+            let p = inner_preds[0];
+            if !(p == header || body_work.contains(&p)) {
+                chain_ok = false;
+                break;
+            }
+            if p == header {
+                entry_preds += 1;
+            }
+            if !seen_work.insert(p) {
+                // two work blocks share a predecessor -> merge, not a chain
+                chain_ok = false;
+                break;
+            }
+        }
+        if !chain_ok || entry_preds != 1 {
+            return None;
+        }
+        // Exactly one work block must terminate by branching to the latch
+        // (the chain tail); every other work block's successor lies in
+        // body_work (checked below via the chain walk).
+        let latch_label = func.blocks[latch].label;
+        let mut tails = 0usize;
+        for &bi in &body_work {
+            if let Terminator::Branch(l) = &func.blocks[bi].terminator {
+                if *l == latch_label {
+                    tails += 1;
+                }
+            }
+        }
+        if tails != 1 {
+            return None;
+        }
+        // And every work block must branch only to body_work or the latch
+        // (no jump out of the loop, no CondBranch in the chain).
+        for &bi in &body_work {
+            let succ_labels: Vec<BlockId> = match &func.blocks[bi].terminator {
+                Terminator::Branch(l) => vec![*l],
+                Terminator::CondBranch { .. } => vec![],
+                _ => vec![],
+            };
+            for l in succ_labels {
+                if l != latch_label {
+                    let idx = func.blocks.iter().position(|b| b.label == l);
+                    if let Some(idx) = idx {
+                        if !body_work.contains(&idx) {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Cloning currently re-plumbs only the header exit. Reject body exits
     // until exit-phi remapping is implemented.
     {
@@ -512,12 +648,13 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
 ///   header's CondBranch; every body block's successors stay inside
 ///   body ∪ {header}; body terminators are Branch/CondBranch/Switch only.
 /// - constant IV init (after const-chain resolution) and constant limit,
-///   trip inside `trip_range` (callers pass `1..=16`; a trip of exactly 1
-///   deletes the loop — header phis become copies of their init values, the
-///   latch falls through to the exit — with zero code growth, which is what
-///   the last row of a triangular nest `for (j = i+1; j < n; …)` becomes
-///   after the outer loop is straightened), and (header non-phi + body)
-///   instructions × trip within the expansion budget.
+///   trip inside `trip_range` (callers pass `1..=1` for the tiny-loop
+///   deletion pass — trip 1 folds every header phi to its init value and the
+///   latch falls straight through to the exit, which is what the last row of
+///   a triangular nest `for (j = i+1; j < n; …)` becomes after the outer loop
+///   is straightened — and `1..=16` for the general complete unroll), and
+///   (header non-phi + body) instructions × trip within the expansion
+///   budget.
 /// - no calls / inline asm / dynamic allocas in body or header; intrinsics
 ///   only when pure (sqrt/FMA-class loop bodies stay eligible — the nbody
 ///   `advance`/`energy` shapes).
@@ -763,7 +900,6 @@ fn complete_unroll_trip(
     }
     i64::try_from(trip).ok()
 }
-
 /// True when `op` denotes a value that depends only on integer constants and
 /// (possibly) `iv`.  Complete unrolling substitutes the OUTER IV with a
 /// per-clone constant, so once such an operand is used in an inner loop's own
@@ -849,7 +985,7 @@ fn body_contains_persisting_inner_loop(
             continue;
         }
         // Clean counted inner loop: IV, exit condition, and its initial value.
-        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop(func, inner.header, latch, latch_label)
+        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop_ext(func, inner.header, latch, latch_label)
         else {
             continue;
         };
@@ -1194,7 +1330,7 @@ fn try_complete_unroll_general(
     // be any non-zero constant; complete_unroll_trip rejects degenerate
     // stride/comparison combinations.
     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
-        find_iv_in_loop(func, header, latch, latch_label)
+        find_iv_in_loop_ext(func, header, latch, latch_label)
     else {
         return false;
     };
@@ -1216,7 +1352,10 @@ fn try_complete_unroll_general(
         return false;
     };
     // The compare must be in the IV's own type, and its operator is put into
-    // the canonical "continue while iv OP limit" form before any arithmetic.
+    // the canonical "continue while iv OP limit" form before any arithmetic
+    // (the IV may be the RIGHT operand and the CondBranch may send `true` to
+    // the EXIT; feeding the raw operator into the closed form computes the
+    // trip count of a different loop).
     if cmp_ty != iv_ty {
         return false;
     }
@@ -1475,19 +1614,16 @@ fn try_complete_unroll_general(
     // live-out values of those header instructions (e.g. `cnt` after a
     // `for (i=0; cnt++, i<N; i++)` is N+1, not the value at the last clone's
     // entry).
-    // The failing evaluation's environment: after the LAST clone (or, for a
-    // single-trip loop, after iteration 0's original body).  `plans` is empty
-    // when `trip == 1` (the single-trip deletion path), in which case there are
-    // no renamed values and the original body's defs are used verbatim.
-    let last: Option<&ClonePlan> = plans.last();
-    let last_vmap: FxHashMap<u32, u32> = last.map(|l| l.vmap.clone()).unwrap_or_default();
-    let env_fg = model.env_next(
-        trip,
-        last.map(|l| &l.env).unwrap_or(&env_prev),
-        last.map(|l| &l.vmap).unwrap_or(&rename_prev),
-    );
     let mut extra_final: FxHashMap<u32, u32> = FxHashMap::default();
     let mut final_guard: Option<BlockId> = None;
+    // Failing (trip-th) evaluation environment: derived from the LAST
+    // executed iteration — the last clone when trip >= 2, iteration 0 (the
+    // original, un-renamed body) when the loop runs exactly once.
+    let empty_vmap: FxHashMap<u32, u32> = FxHashMap::default();
+    let (env_fg, last_vmap) = match plans.last() {
+        Some(last) => (model.env_next(trip, &last.env, &last.vmap), &last.vmap),
+        None => (model.env_next(trip, &model.env_entry(), &empty_vmap), &empty_vmap),
+    };
     if has_header_extra {
         let fg_label = BlockId(next_label);
         next_label += 1;
@@ -1505,7 +1641,7 @@ fn try_complete_unroll_general(
             // last clone's values, then substitute the header phis with the
             // failing-entry environment.
             replace_values_in_inst(&mut cloned, &fg_vmap);
-            replace_values_in_inst(&mut cloned, &last_vmap);
+            replace_values_in_inst(&mut cloned, last_vmap);
             rename_inst_dest(&mut cloned, &fg_vmap);
             apply_env_inst(&mut cloned, &env_fg);
             fg_insts.push(cloned);
@@ -1616,11 +1752,13 @@ fn try_complete_unroll_general(
     // becomes an unconditional Branch into the body entry.
     func.blocks[header].terminator = Terminator::Branch(body_entry);
     // The original latch's back-edge flows into clone 1's header copy — or
-    // straight to the exit when the loop runs exactly once (no clones).
+    // straight to the exit (final guard when the header carries extra
+    // instructions) when the loop runs exactly once and no clone exists.
     func.blocks[latch].terminator = Terminator::Branch(match plans.first() {
         Some(first) => first.header_copy,
-        None => exit_target,
+        None => final_guard.unwrap_or(exit_target),
     });
+
     // ── Post-loop substitution for blocks outside the loop ──────────────────
     // The failing-entry environment holds the live-out value of every ordinary
     // carried value (an accumulator `sum` is its value after the last body).
@@ -1663,16 +1801,13 @@ fn try_complete_unroll_general(
     // block that branches to the exit).
     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
         if exit_bi != header && !lp.body.contains(&exit_bi) {
-            let new_pred = final_guard.unwrap_or_else(|| {
-                match plans.last() {
-                    Some(last) => last.block_labels[body_blocks
-                        .iter()
-                        .position(|&b| b == latch)
-                        .expect("latch is a body block")],
-                    // Single-trip deletion: the original latch now branches
-                    // straight to the exit, so it IS the predecessor.
-                    None => latch_label,
-                }
+            let new_pred = final_guard.unwrap_or_else(|| match plans.last() {
+                Some(last) => last.block_labels[body_blocks
+                    .iter()
+                    .position(|&b| b == latch)
+                    .expect("latch is a body block")],
+                // trip == 1: no clone; the latch itself branches to the exit.
+                None => latch_label,
             });
             relabel_exit_phis(func, exit_target, header_label, new_pred);
         }
@@ -1731,7 +1866,7 @@ fn try_complete_unroll_two_block(
         _ => return false,
     }
     let Some((iv_phi, iv_ty, iv_step, latch_iv_incr_idx)) =
-        find_iv_in_loop(func, header, latch, latch_label)
+        find_iv_in_loop_ext(func, header, latch, latch_label)
     else {
         return false;
     };
@@ -2029,29 +2164,27 @@ fn try_complete_unroll_two_block(
     func.blocks[header].terminator = Terminator::Branch(labels[0]);
     // The latch is now UNREACHABLE: the header branches into the clone chain
     // and the chain's last block branches straight to `exit_target`, so no
-    // edge reaches the latch any more.
-    //
-    // This used to be `Branch(exit_target)`, which fabricated a control-flow
-    // edge latch->exit that the *program* does not have.  The latch was only
-    // ever a predecessor of the header (its terminator is checked to be
-    // `Branch(header_label)` above), never of the exit, so any phi in the
-    // exit block acquired a predecessor it had no incoming for.  That is a
-    // hard SSA violation, and it is exactly what the IR verifier reported on
-    // linux-cachymod 6.18.47 `drivers/gpu/drm/i915/display/intel_sprite.c`:
-    //
-    //   after `loop_unroll_post_vec` in `vlv_sprite_update_arm`:
-    //     phi v904 has an incoming from BlockId(94080), which is not a
-    //     predecessor (real predecessors: [93725, 94081, 94090])
-    //     phi v904 has no incoming for predecessor BlockId(94090)
-    //
-    // Downstream, v904 reached x86 codegen with no register home and no stack
-    // slot, and `operand_to_rax`'s hard gate aborted the compile ("refusing to
-    // fabricate a value").  Before that gate existed this same shape silently
-    // emitted `xorl %eax,%eax` — i.e. a miscompile.  Marking the block
-    // `Unreachable` states the truth; DCE/CFG-simplify then delete it.
+    // edge reaches the latch any more.  (This used to be
+    // `Branch(exit_target)`, which fabricated a control-flow edge latch->exit
+    // the program does not have: the latch was only ever a predecessor of the
+    // header, never of the exit, so any phi in the exit block acquired a
+    // predecessor it had no incoming for — a hard SSA violation the verifier
+    // reported on linux-cachymod drivers/gpu/drm/i915/display/intel_sprite.c
+    // and which silently emitted `xorl %eax,%eax` before the hard gate
+    // existed.  Marking the block Unreachable states the truth; DCE/CFG-
+    // simplify then delete it.)
     func.blocks[latch].terminator = Terminator::Unreachable;
-    let _ = (body_entry, exit_cond_positive);
+    let _ = body_entry;
 
+    // Repair the exit block's phis (the exit may be a JOIN carrying phis:
+    // `if (cond) { for (...) ... }` merges the loop exit with the skip path).
+    // The `header -> exit_target` edge is gone; the block that reaches the
+    // exit is the LAST CLONE.  Every phi incoming still labelled
+    // `header_label` must be relabelled to that clone (label only — the
+    // operands are rewritten to the final values by the substitution sweep
+    // below).  A phi incoming labelled `latch_label` cannot exist here (the
+    // latch's terminator was verified to be `Branch(header_label)`), but drop
+    // any such entry defensively rather than leave a dangling predecessor.
     {
         let last_clone = labels[(trip - 1) as usize];
         if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
@@ -2068,6 +2201,7 @@ fn try_complete_unroll_two_block(
             }
         }
     }
+
     // Live-out substitution. The failing (`trip`-th) environment holds the
     // value each carried phi has after the final cloned iteration: a body
     // accumulator's computed total, a constant back value, a loop-invariant
@@ -2274,18 +2408,6 @@ fn operand_has_pointer_origin(func: &IrFunction, op: &Operand) -> bool {
     false
 }
 
-/// Evaluate `op` to a constant when it is a constant or a short chain of
-/// `Copy` / integer `Cast` / `Add` / `Sub` / `Mul` over constants — the shape
-/// an inner loop's `j = i + 1` init takes once the outer loop has been
-/// completely unrolled and `i` substituted by a per-clone constant.
-///
-/// Every intermediate result is normalised to the canonical `IrConst`
-/// representation of the instruction's result type via
-/// [`normalize_to_type`], so unsigned arithmetic zero-extends and narrowing
-/// casts truncate exactly as the constant folder would.  Values are only ever
-/// compared by [`complete_unroll_trip`] after a second normalisation to the
-/// IV type, which makes the whole chain representation-stable regardless of
-/// which pass produced the constants.
 fn resolve_const_operand(func: &IrFunction, op: &Operand, depth: usize) -> Option<i64> {
     if depth > 6 {
         return None;
@@ -2357,6 +2479,20 @@ fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
     }
 }
 
+
+/// STRICT induction-variable detector for the partial-unroll path.
+///
+/// `do_unroll` was written for Add-form induction; its guard arithmetic and
+/// back-edge offset assume `step` is the additive constant of an `Add` in the
+/// latch.  The extended detector used by the COMPLETE unrollers also accepts
+/// `Sub(phi, k)` countdowns and re-materials unsigned constants through
+/// `IrConst::from_i64`, which can turn a U32 `0xFFFFFFFE` step into `-2`.
+/// Feeding either to `do_unroll` produces guards the unroller cannot express
+/// and silently drops/adds iterations (red-team cfg 3169: `lim != i; i -= 1`
+/// with a nested body lost exactly half the accumulator).  Keeping this
+/// Add-only detector here restores the baseline acceptance set for the
+/// partial path; the extended detector stays confined to the complete
+/// unrollers, whose closed-form trip count re-verifies every step.
 fn find_iv_in_loop(
     func: &IrFunction,
     header: usize,
@@ -2380,13 +2516,61 @@ fn find_iv_in_loop(
                     None
                 }
             });
-        // A phi whose back-edge value is a constant (a first-iteration flag
-        // such as `first = 0`) is simply not the IV. It used to abort the
-        // whole search (`?`), which silently disabled unrolling for every
-        // loop whose FIRST header phi happened to be such a flag.
-        let Some(back_val) = back_val else {
-            continue;
+        let back_val = back_val?;
+
+        // Look for `Add(phi_dest, const_step)` or `Add(const_step, phi_dest)`
+        // in the latch that produces `back_val`.
+        let phi_id = phi_dest.0;
+        for (idx, latch_inst) in func.blocks[latch].instructions.iter().enumerate() {
+            if let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } = latch_inst
+            {
+                if *dest != back_val {
+                    continue;
+                }
+                let step = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(c)) if v.0 == phi_id => c.to_i64(),
+                    (Operand::Const(c), Operand::Value(v)) if v.0 == phi_id => c.to_i64(),
+                    _ => None,
+                };
+                if let Some(step) = step {
+                    return Some((*phi_dest, *ty, step, idx));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_iv_in_loop_ext(
+    func: &IrFunction,
+    header: usize,
+    latch: usize,
+    latch_label: BlockId,
+) -> Option<(Value, IrType, i64, usize)> {
+    for inst in &func.blocks[header].instructions {
+        let (phi_dest, ty, incoming) = match inst {
+            Instruction::Phi { dest, ty, incoming } if ty.is_integer() => (dest, ty, incoming),
+            _ => continue,
         };
+
+        // Value flowing into the header from the latch (the back-edge value).
+        let back_val = incoming
+            .iter()
+            .find(|(_, lbl)| *lbl == latch_label)
+            .and_then(|(op, _)| {
+                if let Operand::Value(v) = op {
+                    Some(*v)
+                } else {
+                    None
+                }
+            });
+        let back_val = back_val?;
 
         // Look for `Add(phi_dest, const_step)` / `Add(const_step, phi_dest)`
         // or `Sub(phi_dest, const_step)` in the latch that produces
@@ -3142,6 +3326,19 @@ fn do_unroll(func: &mut IrFunction, c: UnrollCandidate) -> bool {
                         }
                         subst_value_with_operand(inst, dest.0, &Operand::Value(new_phi));
                     }
+                    // The terminator can also USE the carried value: a
+                    // `Return(H)` after a counted loop is the canonical
+                    // late-exit reader, and its operand is not covered by
+                    // the instruction loop above (red-team cfg 1765:
+                    // `i <= lim; i += 7` with an inlined chain body returned
+                    // the phi's PREHEADER value — 0 instead of 30 — because
+                    // every early exit-check edge read the un-updated
+                    // header phi).
+                    subst_value_in_terminator(
+                        &mut func.blocks[bi].terminator,
+                        dest.0,
+                        &Operand::Value(new_phi),
+                    );
                 }
                 let succs: Vec<BlockId> = match &func.blocks[bi].terminator {
                     Terminator::Branch(l) => vec![*l],
@@ -4178,12 +4375,12 @@ mod tests {
         // must refuse rather than produce a wrapped trip count.
         assert_eq!(trip_i64(-1, i64::MAX, Slt, 1), None);
         assert_eq!(trip_i64(i64::MIN, 0, Sgt, -1), None);
-        // `i > i64::MIN` with step i64::MIN: the loop runs exactly once
-        // (0 -> i64::MIN -> exit test fails).  The typed closed form computes
-        // step_abs in i128, which does NOT overflow for i64::MIN, so it returns
-        // Some(1) instead of the old checked_abs-based None.  (Some(1) is the
-        // correct count; the old None rejected a shape the loop genuinely
-        // executes once.)
+        // `-iv_step` used to overflow for iv_step = i64::MIN (checked_abs
+        // refused).  The typed closed form computes |step| in i128, so the
+        // true answer emerges: `for (i = 0; i > MIN; i += MIN)` runs exactly
+        // ONCE (0 > MIN, then i = MIN, MIN > MIN is false) and the final IV
+        // stays in range — Some(1).  trip == 1 is below the unroll gate, so
+        // the loop stays rolled; the count only feeds the caller's gate.
         assert_eq!(trip_i64(0, i64::MIN, Sgt, i64::MIN), Some(1));
         assert_eq!(trip_i64(0, i64::MAX, Slt, i64::MIN), None);
         // Huge stride: 0, 2^62 are < MAX (2 body executions) but the exit

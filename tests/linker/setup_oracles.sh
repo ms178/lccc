@@ -2,7 +2,7 @@
 # ============================================================================
 # LCCC linker oracle provisioning
 #
-# Builds the reference linkers that `run_linker_tests.py`, `bench_linker.py`
+# Builds the reference linkers that `run_linker_tests.py`
 # and `real_workloads.py` compare against.  Project policy, encoded here so it
 # is honoured automatically instead of remembered:
 #
@@ -183,7 +183,7 @@ Then:
 
     tests/linker/run_linker_tests.py
     tests/linker/real_workloads.py
-    tests/linker/bench_linker.py
+
 
 Resolved revisions: $BIN/ORACLE_REVISIONS.txt
 EOF
