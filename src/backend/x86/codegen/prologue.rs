@@ -2484,20 +2484,32 @@ impl X86Codegen {
                         .and_then(|(dest, _)| self.state.alloca_over_align(dest.0))
                         .filter(|&a| a > 16);
                     if let Some(a) = over_align {
-                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "rcx");
+                        // The aligned-address scratch MUST NOT be %rcx: with
+                        // three or more register-class integer parameters the
+                        // third SysV integer argument LIVES in %rcx at this
+                        // point (fn4 stress repro: `long a3` arrived in %rcx,
+                        // the lea/add/and overwrote it with the aligned-home
+                        // address, and every later read of a3 consumed a
+                        // stack pointer).  %r11 is the only GP register with
+                        // no incoming role on SysV — it is not one of the six
+                        // argument registers (rdi,rsi,rdx,rcx,r8,r9) and it
+                        // does not carry the nested-function static chain
+                        // (%r10) — so it is dead by construction here, and
+                        // the parallel-copy pass below reserves only %rax.
+                        self.state.out.emit_instr_rbp_reg("    leaq", slot.0, "r11");
                         self.state
                             .out
-                            .emit_instr_imm_reg("    addq", (a - 1) as i64, "rcx");
+                            .emit_instr_imm_reg("    addq", (a - 1) as i64, "r11");
                         self.state
                             .out
-                            .emit_instr_imm_reg("    andq", -(a as i64), "rcx");
+                            .emit_instr_imm_reg("    andq", -(a as i64), "r11");
                         for qi in 0..n_qwords {
                             let src_off = src + (qi as i64 * 8);
                             self.state
                                 .out
                                 .emit_instr_rbp_reg("    movq", src_off, "rax");
                             self.state
-                                .emit_fmt(format_args!("    movq %rax, {}(%rcx)", qi * 8));
+                                .emit_fmt(format_args!("    movq %rax, {}(%r11)", qi * 8));
                         }
                     } else {
                         for qi in 0..n_qwords {

@@ -132,6 +132,10 @@ fn mnemonic_is_known(t: &str) -> bool {
         "cltq",
         "cdq",
         "cwtl",
+        "cltd",
+        "cwtd",
+        "cwd",
+        "cqo",
         "cdqe",
         "bswap",
         "bt",
@@ -173,6 +177,11 @@ fn mnemonic_is_known(t: &str) -> bool {
         "xgetbv",
     ];
     KNOWN.iter().any(|k| t.starts_with(k))
+        // The central implicit-operand oracle doubles as a knowledge base:
+        // any instruction whose implicit register contract it knows is as
+        // trustworthy as the explicit list (this is what lets `cltd` —
+        // emitted for every 32-bit division — take the precise path).
+        || implicit_reg_refs(t.trim().as_bytes()) != 0
 }
 
 impl FileLiveness {
@@ -532,25 +541,25 @@ impl FileLiveness {
                         }
                     }
                 }
-                // Implicit operands.
-                if t.starts_with("div")
-                    || t.starts_with("idiv")
-                    || t.starts_with("mul") && !t.starts_with("mulx")
-                {
-                    reads |= RAX | RDX;
-                    writes |= RAX | RDX;
-                }
-                if t.starts_with("cltq") || t.starts_with("cdqe") {
-                    reads |= RAX;
-                    writes |= RAX;
-                }
-                if t.starts_with("cqto") || t.starts_with("cdq") || t.starts_with("cwtl") {
-                    reads |= RAX;
-                    writes |= RAX | RDX;
-                }
-                if t.starts_with("shld") || t.starts_with("shrd") {
-                    reads |= RCX;
-                }
+                // Implicit operands — one source of truth (types.rs oracle).
+                // The old hand arms missed `cltd` entirely (its RAX read is
+                // load-bearing: deleting a dividend definition because
+                // liveness could not see the consumption was a live bug),
+                // taxed every SSE `divsd`/`mulsd` through a starts_with
+                // ("div") prefix match, claimed a phantom `cqto` write of
+                // %rax, and knew nothing of syscall/string/loop kills.
+                //
+                // `mentioned` is the UNION oracle (reads ∪ writes), which is
+                // the right "does this line touch F" answer for the folding
+                // passes but the WRONG read set here: an implicit write is
+                // not an observation, and reading every written register
+                // would cancel every kill this module exists to compute
+                // (`syscall` would never retire %r11, `cltd` never %rdx).
+                // The exact read set is: explicit mentions, minus the
+                // implicit write half, plus the implicit read half.
+                reads &= !implicit_write_refs(t.as_bytes());
+                reads |= implicit_read_refs(t.as_bytes());
+                writes |= implicit_write_refs(t.as_bytes());
                 if t.starts_with("xchg") || t.starts_with("cmpxchg") || t.starts_with("xadd") {
                     reads |= mentioned;
                     writes |= mentioned;
@@ -672,4 +681,68 @@ mod tests {
         let idx = line_of(&store, "movl $7, %eax");
         assert_eq!(lv.live_after(idx, 0), None);
     }
+    #[test]
+    fn syscall_kill_from_the_oracle_ends_a_loop_carried_def() {
+        // `syscall` destroys %r11 — knowledge only the central oracle has
+        // (the old hand arms wrote nothing for it).  Without the kill, the
+        // definition flows around the back edge to the read at the loop
+        // top and looks live; with it, the definition is provably dead.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    cmpl %edi, %ebx\n",
+            "    jae .LBB3\n",
+            ".LBB2:\n",
+            "    movl %r11d, %ecx\n",
+            "    movl $7, %r11d\n",
+            "    syscall\n",
+            "    addl $1, %ebx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "movl $7, %r11d");
+        assert_eq!(
+            lv.live_after(idx, 11),
+            Some(false),
+            "syscall's implicit %r11 write must kill the loop-carried def"
+        );
+    }
+
+    #[test]
+    fn cltd_kill_from_the_oracle_cuts_the_loop_carried_def() {
+        // `cltd` (emitted for every 32-bit division on x86-64) was absent
+        // from the hand arms: its RDX write was never modelled as a kill.
+        // The definition below can only reach the loop-top read by flowing
+        // through `cltd` — with the oracle's kill it is provably dead;
+        // without it, the back edge makes it look live.
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    xorl %ebx, %ebx\n",
+            ".LBB1:\n",
+            "    cmpl %edi, %ebx\n",
+            "    jae .LBB3\n",
+            "    movl %edx, %r10d\n",
+            "    movl %esi, %edx\n",
+            "    cltd\n",
+            "    addl $1, %ebx\n",
+            "    jmp .LBB1\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let idx = line_of(&store, "movl %esi, %edx");
+        assert_eq!(
+            lv.live_after(idx, 2),
+            Some(false),
+            "cltd's implicit %rdx write must kill the loop-carried def"
+        );
+    }
+
 }

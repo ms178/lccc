@@ -125,6 +125,102 @@ fn parse_reg(name: &str) -> u8 {
     REG_NONE
 }
 
+// ── Implicit register operands (central oracle) ─────────────────────────────
+
+/// One A64 instruction's implicit (reads, writes) over the family numbering
+/// of `parse_reg` (0..=30 = x0..x30, 31 = sp).
+///
+/// AArch64 names almost every register it touches; exactly three effects are
+/// invisible to a textual scan:
+///   * `bl sym` links through x30 — a WRITE of family 30 with no `x30`
+///     token anywhere in the text (`blr xN` likewise links x30, while
+///     reading the branch-target register xN it names).
+///   * `ret` returns through x30 — an implicit READ of family 30 (or of the
+///     register the `ret xN` form names explicitly).
+///   * pre-indexed (`[xN, #imm]!`) and post-indexed (`[xN], #imm`) memory
+///     forms WRITE their base register after the access — the emitter
+///     produces them (`strb w12, [x9], #1` in the byte-copy loops,
+///     `ldp x29, x30, [sp], #frame` in every epilogue), but the base token
+///     sits inside the address operand where every destination-oriented
+///     scan ignores it.  The base read (addressing) is already visible as
+///     an explicit mention; the WRITE is what passes miss.
+/// Everything else (`svc`/`dmb`/`dsb`/`isb`/`msr`/`nop`/hint) touches no GP
+/// register.  Unknown mnemonics yield (0, 0) — callers keep their own
+/// conservative fallbacks for those, exactly as the x86-64 oracle's
+/// consumers do.
+fn classify_implicit_operands_a64(line: &str) -> (u64, u64) {
+    const X30: u64 = 1 << 30;
+    let t = line.trim();
+    if t.is_empty() {
+        return (0, 0);
+    }
+    let (mnem, rest) = match t.split_once(char::is_whitespace) {
+        Some((m, r)) => (m, r.trim()),
+        None => (t, ""),
+    };
+    if mnem.starts_with('.') || mnem.starts_with('#') || mnem.starts_with('/') {
+        // Directives, comments and labels name no instruction.
+        return (0, 0);
+    }
+    match mnem {
+        "bl" => (0, X30),
+        "blr" => {
+            let r = parse_reg(rest);
+            let reads = if r <= 30 { 1u64 << r } else { 0 };
+            (reads, X30)
+        }
+        "br" => {
+            let r = parse_reg(rest);
+            (if r <= 30 { 1u64 << r } else { 0 }, 0)
+        }
+        "ret" => {
+            // Bare `ret` returns through the link register; `ret xN` names
+            // its target explicitly (and is then not an implicit read).
+            if rest.is_empty() {
+                (X30, 0)
+            } else {
+                (0, 0)
+            }
+        }
+        _ => {
+            let writes = match writeback_base(rest) {
+                Some(b) if b <= 31 => 1u64 << b,
+                _ => 0,
+            };
+            (0, writes)
+        }
+    }
+}
+
+/// The base register of a pre-indexed (`…]!`) or post-indexed (`…], #imm`)
+/// memory operand in the operand text `rest`, if any.
+///
+/// The closing bracket decides the form: `!` right after it is a pre-index,
+/// a `,` right after it is a post-index; anything else leaves the base
+/// untouched.  Only the FIRST bracketed address is examined — A64 addressing
+/// modes never contain a second bracket pair, and `.cfi`/data directives do
+/// not reach this parser (their lines are filtered by mnemonic above).
+fn writeback_base(rest: &str) -> Option<u8> {
+    let open = rest.find('[')?;
+    let close = open + rest[open..].find(']')?;
+    let after = rest[close + 1..].trim_start();
+    if !(after.starts_with('!') || after.starts_with(',')) {
+        return None;
+    }
+    let inner = &rest[open + 1..close];
+    let base = inner.split(',').next()?.trim();
+    match parse_reg(base) {
+        REG_NONE => None,
+        r => Some(r),
+    }
+}
+
+/// True when the line implicitly writes family `num` (the write half of
+/// [`classify_implicit_operands_a64`]).
+fn implicitly_writes_a64(line: &str, num: u8) -> bool {
+    num <= 31 && (classify_implicit_operands_a64(line).1 >> num) & 1 != 0
+}
+
 /// Return the x-register name for a given ID.
 fn xreg_name(id: u8) -> &'static str {
     match id {
@@ -709,6 +805,15 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
                             provably_dead = true;
                             break;
                         }
+                        // A pre/post-indexed writeback WRITES the base:
+                        // renaming this address use onto src would redirect
+                        // the post-increment onto the alias source and
+                        // corrupt it (`mov x1,x5; str x9,[x1],#8` must not
+                        // become `str x9,[x5],#8`).
+                        if implicitly_writes_a64(&lines[j], dst) {
+                            valid = false;
+                            break;
+                        }
                         let address = format!("[{}", xreg_name(dst));
                         if src_alive
                             && mention_count(&lines[j], dst) == 1
@@ -1285,7 +1390,6 @@ fn fp_reg_written(line: &str, num: u8) -> bool {
             | "fcmp"
             | "fcmpe"
             | "b"
-            | "bl"
             | "ret"
             | "cbz"
             | "cbnz"
@@ -1300,6 +1404,10 @@ fn fp_reg_written(line: &str, num: u8) -> bool {
     rest.split(',')
         .next()
         .is_some_and(|first| fp_token_reg(first) == Some(num))
+        // Writeback bases are GP registers, but the family numbering is
+        // shared with the v-registers: a false positive here only drops
+        // forwarding state (the documented, sound direction).
+        || implicitly_writes_a64(t, num)
 }
 
 /// Does this line write GP register `num` (x or w form)? Checks the first two
@@ -1327,7 +1435,6 @@ fn gp_reg_written_broad(line: &str, num: u8) -> bool {
             | "fcmp"
             | "fcmpe"
             | "b"
-            | "bl"
             | "ret"
             | "cbz"
             | "cbnz"
@@ -1342,7 +1449,7 @@ fn gp_reg_written_broad(line: &str, num: u8) -> bool {
     rest.split(',').take(2).any(|op| {
         let op = op.trim();
         op == xreg_name(num) || op == wreg_name(num)
-    })
+    }) || implicitly_writes_a64(t, num)
 }
 
 // ── Adjacent FP field pair fusion (ldp/stp) ─────────────────────────────────
@@ -3157,6 +3264,16 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
         {
             continue;
         }
+        // A pre/post-indexed writeback rewrites the BASE register after the
+        // access.  Renaming the alias into such a line would redirect the
+        // increment onto the copy's source (`mov x1, x5; str x9, [x1], #8`
+        // → `str x9, [x5], #8` clobbers x5, which the alias promised to
+        // preserve) or leave the copy's destination un-incremented for its
+        // later readers.  The oracle supplies the base write the
+        // destination-oriented operand parse cannot see.
+        if implicitly_writes_a64(trimmed_j, src) || implicitly_writes_a64(trimmed_j, dst) {
+            continue;
+        }
 
         // Try to replace references to dst with src in line j
         let old_line = &lines[j];
@@ -3825,7 +3942,15 @@ fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
     if ops.is_empty() {
         return false; // labels, directives, ret, bare branches
     }
-    // Stores and comparisons have no register destination.
+    // Architectural implicit writes decide first: a pre/post-indexed base
+    // register is rewritten even by the store/load mnemonics excluded
+    // below (`strb w12, [x9], #1` clobbers x9 — the store exclusion is
+    // only correct for the DATA operand), and bl/blr link through x30.
+    if implicitly_writes_a64(trimmed, num) {
+        return true;
+    }
+    // Stores and comparisons have no register destination (modulo the
+    // writeback handled above).
     if mnem.starts_with("st")
         || mnem.starts_with("cmp")
         || mnem.starts_with("cmn")
@@ -3834,17 +3959,20 @@ fn instr_clobbers_reg(trimmed: &str, num: u8) -> bool {
     {
         return false;
     }
-    // Branches.
+    // Branches never write a register — except the linking ones, whose
+    // x30 write was reported by the oracle above.
     if mnem == "b"
         || mnem.starts_with("b.")
-        || mnem == "bl"
-        || mnem == "blr"
         || mnem == "br"
         || mnem == "cbz"
         || mnem == "cbnz"
         || mnem == "tbz"
         || mnem == "tbnz"
     {
+        return false;
+    }
+    if mnem == "bl" || mnem == "blr" {
+        // The target operand is a pure read (blr) or a symbol (bl).
         return false;
     }
     let mut operands = ops.split(", ");
@@ -4634,6 +4762,12 @@ fn line_defines_gp(line: &str, kind: LineKind, reg: u8) -> Option<bool> {
     if let Some(d) = written_gp_register(line, kind) {
         return Some(d == reg);
     }
+    // Architectural implicit writes decide first: a pre/post-indexed base
+    // register is redefined even when the mnemonic is a store (`str x0,
+    // [x9], #8` writes x9), and `bl`/`blr` redefine x30.
+    if implicitly_writes_a64(line, reg) {
+        return Some(true);
+    }
     match kind {
         // Coarse kinds whose def behaviour the textual allowlist below
         // decides; written_gp_register already handled the precise ones.
@@ -4662,8 +4796,20 @@ fn line_defines_gp(line: &str, kind: LineKind, reg: u8) -> Option<bool> {
         return Some(false);
     }
     if DEF_FIRST.contains(&mnem) {
-        let first = rest.split(',').next()?.trim();
-        return Some(parse_reg(first) == reg);
+        let mut ops = rest.split(',');
+        let first = ops.next()?.trim();
+        if parse_reg(first) == reg {
+            return Some(true);
+        }
+        // A pair load defines BOTH registers; checking only the first
+        // operand lied `Some(false)` for the second — exactly the lie a
+        // hoist/remat must never hear about the register it moves.
+        if (mnem == "ldp" || mnem == "ldnp")
+            && ops.next().is_some_and(|second| parse_reg(second.trim()) == reg)
+        {
+            return Some(true);
+        }
+        return Some(false);
     }
     None // unknown: kill all
 }
@@ -6666,4 +6812,102 @@ f:
             result
         );
     }
+    // ── Tests: the implicit-operand oracle ───────────────────────────────
+
+    #[test]
+    fn oracle_bl_blr_ret_have_their_link_register_contract() {
+        // `bl sym` links through x30 without naming it.
+        assert_eq!(classify_implicit_operands_a64("bl printf"), (0, 1u64 << 30));
+        // `blr x3` READS the branch target and links through x30.
+        assert_eq!(classify_implicit_operands_a64("blr x3"), (1 << 3, 1u64 << 30));
+        // `br x3` reads the target and writes nothing.
+        assert_eq!(classify_implicit_operands_a64("br x3"), (1 << 3, 0));
+        // Bare `ret` returns through the link register: an implicit read.
+        assert_eq!(classify_implicit_operands_a64("ret"), (1u64 << 30, 0));
+        // `ret x4` names its target: nothing implicit left.
+        assert_eq!(classify_implicit_operands_a64("ret x4"), (0, 0));
+    }
+
+    #[test]
+    fn oracle_writeback_forms_write_their_base() {
+        // The byte-copy loop registers: post-index writes the base the
+        // destination-oriented scans never see.
+        assert_eq!(classify_implicit_operands_a64("strb w12, [x9], #1").1, 1 << 9);
+        assert_eq!(classify_implicit_operands_a64("ldrb w12, [x10], #1").1, 1 << 10);
+        assert_eq!(classify_implicit_operands_a64("str x0, [x1, #8]!").1, 1 << 1);
+        // Every epilogue: `ldp x29, x30, [sp], #frame` writes sp.
+        assert_eq!(classify_implicit_operands_a64("ldp x29, x30, [sp], #16").1, 1 << 31);
+        assert_eq!(classify_implicit_operands_a64("stp x29, x30, [sp, #-16]!").1, 1 << 31);
+        // Plain offset forms do NOT write the base.
+        assert_eq!(classify_implicit_operands_a64("ldr x0, [x1, #8]").1, 0);
+        assert_eq!(classify_implicit_operands_a64("str x0, [sp, #8]").1, 0);
+        // The base is the register inside the brackets, not the data reg.
+        assert_eq!(classify_implicit_operands_a64("ldr x0, [x5], #8").1, 1 << 5);
+        // Scaled register offsets do not confuse the bracket parse.
+        assert_eq!(classify_implicit_operands_a64("ldr x0, [x1, x2, lsl #3]").1, 0);
+    }
+
+    #[test]
+    fn oracle_non_instructions_name_nothing() {
+        assert_eq!(classify_implicit_operands_a64(".LBB1:"), (0, 0));
+        assert_eq!(classify_implicit_operands_a64(".cfi_startproc"), (0, 0));
+        assert_eq!(classify_implicit_operands_a64(""), (0, 0));
+        // Branches, compares and barriers touch no GP register implicitly.
+        assert_eq!(classify_implicit_operands_a64("cmp x0, x1"), (0, 0));
+        assert_eq!(classify_implicit_operands_a64("b.ne .LBB2"), (0, 0));
+        assert_eq!(classify_implicit_operands_a64("dmb ish"), (0, 0));
+        assert_eq!(classify_implicit_operands_a64("svc #0"), (0, 0));
+    }
+
+    #[test]
+    fn instr_clobbers_reg_sees_the_post_index_base_write() {
+        // The store exclusion is correct for the DATA operand but lied
+        // about the base: sinking a store past this line with x9 as the
+        // data register read the incremented pointer.
+        assert!(instr_clobbers_reg("strb w12, [x9], #1", 9));
+        assert!(instr_clobbers_reg("ldrb w12, [x10], #1", 10));
+        assert!(!instr_clobbers_reg("strb w12, [x9], #1", 12));
+        assert!(!instr_clobbers_reg("str x0, [x1, #8]", 1));
+        // bl/blr redefine x30.
+        assert!(instr_clobbers_reg("bl printf", 30));
+        assert!(instr_clobbers_reg("blr x3", 30));
+        // blr's operand is a read, not a clobber.
+        assert!(!instr_clobbers_reg("blr x3", 3));
+    }
+
+    #[test]
+    fn line_defines_gp_tells_the_truth_about_pair_loads_and_writeback() {
+        // ldp defines BOTH registers — the second one used to be `Some(false)`.
+        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 9), Some(true));
+        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 10), Some(true));
+        assert_eq!(line_defines_gp("ldp x9, x10, [sp]", LineKind::LoadPairSp, 11), Some(false));
+        // A post-index store defines its base despite the store mnemonic.
+        assert_eq!(
+            line_defines_gp("str x0, [x9], #8", LineKind::MemOther, 9),
+            Some(true)
+        );
+        assert_eq!(
+            line_defines_gp("str x0, [x9], #8", LineKind::MemOther, 0),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn copy_propagation_does_not_redirect_writeback_onto_the_alias_source() {
+        // `mov x1, x5` + post-index store: renaming [x1] to [x5] would
+        // increment x5 and corrupt every later x5 reader.
+        let asm = concat!(
+            "f:\n",
+            "    mov x1, x5\n",
+            "    str x9, [x1], #8\n",
+            "    add x0, x5, x5\n",
+            "    ret\n",
+        );
+        let result = peephole_optimize(asm.to_string());
+        assert!(
+            result.contains("str x9, [x1], #8"),
+            "the writeback base must keep the copy's destination:\n{result}"
+        );
+    }
+
 }

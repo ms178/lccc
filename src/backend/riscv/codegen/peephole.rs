@@ -187,6 +187,68 @@ fn reg_name(id: u8) -> &'static str {
     }
 }
 
+
+// ── Implicit register operands (central oracle) ─────────────────────────────
+//
+// RISC-V names nearly every operand explicitly, so its implicit surface is
+// small — but it is exactly the surface a textual scan misses: the link
+// register.  `ret` jumps through `ra` (implicit READ), `call sym` and the
+// bare `jal target` pseudo write `ra` (jal's rd defaults to ra), and the
+// one-operand `jalr rs1` / two-operand `jalr rs1, imm` forms read rs1 and
+// write ra while naming neither half of that contract.  `jr rs1` reads its
+// target and writes nothing; `ecall`/`ebreak`/`fence` touch no GP register;
+// `jalr rd, rs1, imm` names everything it touches.
+//
+// Like the x86-64/x86/A64 oracles this is written against the ISA, not the
+// emitter's current subset: the next emitter site (an indirect tail call,
+// a computed jump) is covered the day it appears, and the conservative
+// fallbacks the passes keep for unclassified lines stay as the safety net.
+fn classify_implicit_operands_rv(line: &str) -> (u64, u64) {
+    const RA: u64 = 1 << REG_RA;
+    let t = line.trim();
+    if t.is_empty() {
+        return (0, 0);
+    }
+    let (mnem, rest) = match t.split_once(char::is_whitespace) {
+        Some((m, r)) => (m, r.trim()),
+        None => (t, ""),
+    };
+    if mnem.starts_with('.') || mnem.starts_with('#') || mnem.starts_with('/') {
+        // Directives, comments and labels name no instruction.
+        return (0, 0);
+    }
+    match mnem {
+        "ret" => (RA, 0),
+        "call" | "tail" => (0, RA),
+        // `jal target` — the rd defaults to ra.  With a comma the rd is
+        // named (`jal ra, label` / `jal x0, label`) and nothing is implicit.
+        "jal" if !rest.contains(',') => (0, RA),
+        // `jalr rs1` / `jalr rs1, imm` — reads the target, writes ra.
+        "jalr" if !rest.contains(',') => {
+            let r = parse_reg(rest);
+            (if r != REG_NONE { 1u64 << r } else { 0 }, RA)
+        }
+        // `jalr rs1, imm` — the FIRST operand is the target register.
+        "jalr" if rest.split(',').count() == 2 => {
+            let rs1 = rest.split(',').next().unwrap_or("").trim();
+            let r = parse_reg(rs1);
+            (if r != REG_NONE { 1u64 << r } else { 0 }, RA)
+        }
+        "jalr" => (0, 0), // `jalr rd, rs1, imm` — fully explicit
+        "jr" => {
+            let r = parse_reg(rest);
+            (if r != REG_NONE { 1u64 << r } else { 0 }, 0)
+        }
+        _ => (0, 0),
+    }
+}
+
+/// True when the line implicitly writes register `id` (the write half of
+/// [`classify_implicit_operands_rv`]).
+fn implicitly_writes_rv(line: &str, id: u8) -> bool {
+    id < NUM_REGS as u8 && (classify_implicit_operands_rv(line).1 >> id) & 1 != 0
+}
+
 // ── Line classification ──────────────────────────────────────────────────────
 
 /// Classify a single assembly line into a LineKind.
@@ -1166,6 +1228,14 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
             | LineKind::LoadAddr { .. } => continue,
             _ => {}
         }
+        // A line that implicitly writes the copy's source or destination
+        // (a bare `jal` overwriting ra, an indirect `jalr`) must break the
+        // alias: renaming a reader onto a register the intervening
+        // instruction redefined feeds it the wrong value, and redirecting
+        // an implicit write onto the alias source corrupts it.
+        if implicitly_writes_rv(&lines[j], src) || implicitly_writes_rv(&lines[j], dst) {
+            continue;
+        }
 
         let dst_name = reg_name(dst);
         if !lines[j].contains(dst_name) {
@@ -1769,4 +1839,55 @@ mod jump_near_tests {
         let out = peephole_optimize(input.to_string());
         assert!(out.contains("sext.w t2, t0"), "\n{}", out);
     }
+    // ── Tests: the implicit-operand oracle ───────────────────────────────
+
+    #[test]
+    fn oracle_link_register_contract() {
+        let ra = 1u64 << REG_RA;
+        // `ret` jumps through ra: an implicit read.
+        assert_eq!(classify_implicit_operands_rv("ret"), (ra, 0));
+        // `call sym` and the bare `jal target` pseudo write ra.
+        assert_eq!(classify_implicit_operands_rv("call printf"), (0, ra));
+        assert_eq!(classify_implicit_operands_rv("jal .Ltail"), (0, ra));
+        // With a named rd nothing is implicit (`jal x0` is a plain jump).
+        assert_eq!(classify_implicit_operands_rv("jal ra, .Ltail"), (0, 0));
+        assert_eq!(classify_implicit_operands_rv("jal x0, .LBB2"), (0, 0));
+    }
+
+    #[test]
+    fn oracle_indirect_jump_forms() {
+        let ra = 1u64 << REG_RA;
+        let t2 = 1u64 << REG_T2;
+        // `jr rs1` reads the target, writes nothing.
+        assert_eq!(classify_implicit_operands_rv("jr t2"), (t2, 0));
+        // `jalr rs1` — one operand: reads the target AND writes ra.
+        assert_eq!(classify_implicit_operands_rv("jalr t2"), (t2, ra));
+        // `jalr rs1, imm` — two operands: reads the target, writes ra.
+        assert_eq!(classify_implicit_operands_rv("jalr t2, 0"), (t2, ra));
+        // `jalr rd, rs1, imm` — the form the emitter produces: fully
+        // explicit, nothing implicit (the copy-propagation guard must not
+        // over-bail on it).
+        assert_eq!(classify_implicit_operands_rv("jalr ra, t2, 0"), (0, 0));
+    }
+
+    #[test]
+    fn oracle_non_instructions_name_nothing() {
+        assert_eq!(classify_implicit_operands_rv(".LBB1:"), (0, 0));
+        assert_eq!(classify_implicit_operands_rv(".cfi_startproc"), (0, 0));
+        assert_eq!(classify_implicit_operands_rv(""), (0, 0));
+        assert_eq!(classify_implicit_operands_rv("ecall"), (0, 0));
+        assert_eq!(classify_implicit_operands_rv("fence iorw, iorw"), (0, 0));
+        assert_eq!(classify_implicit_operands_rv("add t0, t1, t2"), (0, 0));
+    }
+
+    #[test]
+    fn implicitly_writes_rv_projection() {
+        let ra = 1u64 << REG_RA;
+        assert!(implicitly_writes_rv("call printf", REG_RA));
+        assert!(implicitly_writes_rv("jal .Ltail", REG_RA));
+        assert!(!implicitly_writes_rv("jal ra, .Ltail", REG_RA));
+        assert!(!implicitly_writes_rv("ret", REG_RA));
+        assert_eq!(classify_implicit_operands_rv("ret").0, ra);
+    }
+
 }

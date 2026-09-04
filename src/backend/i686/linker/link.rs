@@ -25,7 +25,15 @@ pub fn link_builtin(
     crt_objects_after: &[&str],
 ) -> Result<(), String> {
     let is_nostdlib = user_args.iter().any(|a| a == "-nostdlib");
-    let is_static = user_args.iter().any(|a| a == "-static");
+    // The driver normalizes `-static` to the single-letter token `n`
+    // (cli.rs: `"n" => self.static_link = true`) before the backend sees
+    // it; accept both spellings.  Missing the `n` form made every
+    // `-static` i686 link emit a DYNAMIC executable (PT_INTERP pointing
+    // at /lib/ld-linux.so.2) — the exact failure of the i686 regression
+    // cluster on loader-less hosts.
+    let is_static = user_args
+        .iter()
+        .any(|a| a == "-static" || a == "n" || a == "-n");
 
     // Phase 1: Parse arguments and collect file lists
     let (extra_libs, extra_lib_files, extra_lib_paths, extra_objects, defsym_defs) =
