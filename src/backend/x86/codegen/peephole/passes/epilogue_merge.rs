@@ -55,12 +55,16 @@
 //!   nothing downstream re-reads the removed instructions.
 
 use super::super::types::*;
+use crate::common::fx_hash::FxHashMap;
 
 /// One exit site: `[start, ret_idx]` is the epilogue run plus its `ret`.
 struct Exit {
     start: usize,
     ret_idx: usize,
-    key: String,
+    /// Epilogue instruction texts in program order, excluding the `ret`.
+    parts: Vec<String>,
+    /// Line index of each entry in `parts`.
+    line_of: Vec<usize>,
 }
 
 /// Whether `t` is an epilogue-only instruction: it restores frame state and
@@ -140,6 +144,7 @@ fn merge_one_function(
         // Walk backwards over the epilogue run, skipping nops.
         let mut start = k;
         let mut parts: Vec<String> = Vec::new();
+        let mut lines: Vec<usize> = Vec::new();
         let mut j = k;
         while j > fn_start + 1 {
             j -= 1;
@@ -155,65 +160,84 @@ fn merge_one_function(
                 break;
             }
             parts.push(tj.to_string());
+            lines.push(j);
             start = j;
         }
         if parts.len() < 2 {
             continue;
         }
         parts.reverse();
-        let key = parts.join(";");
+        lines.reverse();
         exits.push(Exit {
             start,
             ret_idx: k,
-            key,
+            parts,
+            line_of: lines,
         });
     }
     if exits.len() < 2 {
         return false;
     }
 
-    // Group by identical epilogue text, keeping source order.
+    // Group by longest common SUFFIX, not exact text.
+    //
+    // Exact matching only merges exits that restore the same registers in the
+    // same way. Real functions also produce exits that differ only in how
+    // much they restore — a path that never touched `%r15` pops one fewer
+    // register — and the shorter epilogue is then a strict SUFFIX of the
+    // longer one. Jumping into the middle of the longer copy merges those
+    // too, which exact matching cannot.
+    //
+    // Longest first, so every shorter exit finds the deepest host available.
+    let mut order: Vec<usize> = (0..exits.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(exits[i].parts.len()));
+
     let mut changed = false;
-    let mut handled: Vec<bool> = vec![false; exits.len()];
-    for a in 0..exits.len() {
-        if handled[a] {
+    let mut consumed: Vec<bool> = vec![false; exits.len()];
+    // Label already planted inside a host, keyed by (host index, suffix len).
+    let mut host_labels: FxHashMap<(usize, usize), String> = FxHashMap::default();
+    // Per host, the line index at which each suffix length begins.
+    for hi in 0..order.len() {
+        let h = order[hi];
+        if consumed[h] {
             continue;
         }
-        let mut group: Vec<usize> = vec![a];
-        for b in (a + 1)..exits.len() {
-            if !handled[b] && exits[b].key == exits[a].key {
-                group.push(b);
+        for &g in order.iter().skip(hi + 1) {
+            if consumed[g] || g == h {
+                continue;
             }
-        }
-        if group.len() < 2 {
-            continue;
-        }
-        for &g in &group {
-            handled[g] = true;
-        }
-        *label_seq += 1;
-        let label = format!(".Lepi{}", *label_seq);
-
-        // Label the first member in the group (the shared copy).
-        let head = &exits[group[0]];
-        let head_start = head.start;
-        store.replace(
-            head_start,
-            format!("{}:\n{}", label, store.get(head_start).trim_end()),
-        );
-        infos[head_start] = classify_line(store.get(head_start));
-
-        // Replace every other member's whole run with one `jmp`.
-        for &g in &group[1..] {
-            let e = &exits[g];
-            let (s, r) = (e.start, e.ret_idx);
-            store.replace(s, format!("    jmp {}", label));
-            infos[s] = classify_line(store.get(s));
-            for k in (s + 1)..=r {
+            let (hp, gp) = (&exits[h].parts, &exits[g].parts);
+            if gp.len() > hp.len() || gp.len() < 2 {
+                continue;
+            }
+            // `g`'s epilogue must be a suffix of `h`'s.
+            if hp[hp.len() - gp.len()..] != gp[..] {
+                continue;
+            }
+            let key = (h, gp.len());
+            let label = if let Some(l) = host_labels.get(&key) {
+                l.clone()
+            } else {
+                *label_seq += 1;
+                let l = format!(".Lepi{}", *label_seq);
+                // Plant the label at the instruction where the shared suffix
+                // begins inside the host.
+                let at = exits[h].line_of[hp.len() - gp.len()];
+                store.replace(at, format!("{}:\n{}", l, store.get(at).trim_end()));
+                infos[at] = classify_line(store.get(at));
+                host_labels.insert(key, l.clone());
+                l
+            };
+            let (s0, r0) = (exits[g].start, exits[g].ret_idx);
+            store.replace(s0, format!("    jmp {}", label));
+            infos[s0] = classify_line(store.get(s0));
+            for k in (s0 + 1)..=r0 {
                 mark_nop(&mut infos[k]);
             }
+            consumed[g] = true;
             changed = true;
         }
     }
     changed
 }
+

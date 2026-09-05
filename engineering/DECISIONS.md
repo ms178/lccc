@@ -1160,3 +1160,182 @@ Verification: `cargo test --lib` 1956/1956; regression suite 626 PASS /
 0 FAIL / 15 SKIP (ELF32 — no runner on this host); map_sub emits `vpsubd`,
 4×4 matmul 16× `vfmadd`, i64 reduction `paddq`; int map lanes hashes
 identical to GCC at -O3 -march=x86-64-v3.
+## Session 10 — expression sinking LANDED after three defects and a wrong cost model
+
+Shipped enabled. Corpus static: **−4 instructions, −4 reg-reg moves**, zero
+stack refs / pushes regression. Dynamic (minimum of 13 interleaved rounds):
+`hash_table` **1.6 % faster**, `expat_xml_scan` and `sieve` neutral,
+`glibc_memcmp` +1.1 %. No output mismatch anywhere.
+
+The previous two attempts failed because three separate things were wrong.
+All are fixed and each is now pinned by the measurement that found it.
+
+### Defect 1 — stale indices when a block is a destination then a source
+
+Moves were planned against one IR snapshot and applied in sequence. A block
+that received an insertion had every later index shifted, so a subsequent
+move *out* of that block took the wrong instruction. The old guard rejected
+"source already used" and "destination already used" but not "source is a
+previous destination". Now: at most one move per block per round, either
+direction; the fixpoint picks up the rest.
+
+### Defect 2 — operands that are not single-def (the `nbody` miscompile)
+
+This IR is not strict SSA after accumulator forwarding: a value can be
+assigned in several blocks. Sinking `t = a + b` past a *redefinition* of `a`
+changes what it computes, and `nbody`'s FP accumulators are exactly that
+shape. Every operand must now be single-def, and no operand may be redefined
+anywhere in the traversed region. `nbody` output is now byte-identical with
+the pass on and off.
+
+### Wrong cost model — sinking a k-operand op costs k−1 registers
+
+The premise "sinking shortens a live range" is only true for one-operand
+computations. Sinking moves the boundary crossing from the RESULT to the
+OPERANDS:
+
+```
+  t = load p     ->  p crosses instead of t      : 1 for 1
+  t = a + b      ->  a AND b cross instead of t  : +1 register
+```
+
+Unguarded, the corpus went **+62 instructions, +28 reg-reg moves, +14
+callee-saved pushes**. Requiring at most one operand's range to be extended
+brought that to +14; requiring **zero** (every operand already live for other
+reasons, so the sink purely frees the result) turned it into −22 insns / −7
+rrmov / −2 push.
+
+### Missing guard — execution FREQUENCY, not loop depth
+
+Equal loop depth does not mean equal execution count. Sinking into a
+frequently-taken conditional adds work to the hot path even though it
+shortens a live range: `expat_xml_scan` went **51.9 ms → 67.4 ms (+30 %)**,
+reproducibly, and identically with load sinking separately disabled — so it
+was the motion itself, not a memory effect.
+
+Requiring the target to **post-dominate** the source makes the sink
+frequency-neutral by construction: every execution of the source reaches the
+target exactly once, so the computation runs neither more nor less often and
+the only change is the shorter live range. expat returned to 51.8 ms.
+
+This also supersedes the session-9 conclusion. The −1.76 % measured then was
+real, but it was the cost model and the missing frequency guard, not an
+intrinsic property of sinking — and it was measured with a MEDIAN, which on
+this noisy shared VM is biased upward by neighbour interference. Noise here
+is strictly additive, so the minimum of N interleaved rounds is the correct
+estimator; `scripts/perf_ab.py` now uses it.
+
+### Load sinking
+
+Kept enabled but separately switchable (`CCC_NO_LOAD_SINK`). With the
+frequency guard in place it no longer shows the memory-level-parallelism
+penalty that session 9 attributed to it — that penalty was the frequency
+effect in disguise.
+
+## Session 11 — expression sinking: the guard is LOOP ENTRY, not post-dominance
+
+The session-10 pass shipped with a post-dominance guard I flagged as a
+conservative proxy. It is replaced with the correct invariant, and two further
+relaxations were measured and rejected. Final state: corpus **-4 instructions,
+-4 reg-reg moves**, no pressure or timing regression anywhere.
+
+### Post-dominance was the wrong invariant — for the opposite reason
+
+Post-dominance says every path from the source reaches the target, i.e.
+`freq(target) >= freq(source)`. That is the *reverse* of what a sink needs.
+What actually bounds the cost is **dominance**, which the pass already
+required: if the source dominates the target then every execution of the
+target arrived through the source, so within one loop nest
+`freq(target) <= freq(source)` for free.
+
+### So why did `expat_xml_scan` regress 30 %?
+
+Not frequency. A static block-frequency model (reverse-postorder propagation,
+uniform branch probability, trip-count factor per nesting level) was built and
+the guard replaced with `freq(target) <= freq(source)`. It admitted more sinks
+— corpus -22 insns — and `expat` went straight back to **+30.8 %**, with
+`hash_table` +8 %.
+
+The cause is a **loop boundary the depth counter cannot see**. Comparing loop
+*depths* passes a move that leaves one loop and enters another: the count is
+equal, the execution multiplier is not. Replacing the guard with
+
+> reject if any natural loop contains the target but not the source
+
+fixes it exactly: `expat` 51.9 ms -> 51.9 ms (1.007), `sieve` 1.000,
+`glibc_memcmp` 1.003. This is strictly better motivated than post-dominance
+and, in principle, strictly more permissive — it allows the branch-guarded
+sink that post-dominance forbids.
+
+### Two relaxations measured and rejected
+
+| relaxation | corpus insns | rrmov | push | verdict |
+|---|---|---|---|---|
+| frequency guard only (no loop-entry rule) | **-22** | -7 | -2 | REJECT — expat +30.8 %, hash_table +8 % |
+| allow one extended operand when it is a sinkable CHAIN link | **+75** | +27 | +15 | REJECT — `glibc_memcmp` 197 -> 206 |
+
+The chain relaxation is the interesting failure. `v = load p` with
+`p = gep base, k` used only by that load extends `p`, but `p` is itself
+sinkable and follows on the next round, so the chain *should* migrate as a
+unit at no net cost. It does migrate — and it still loses, because the
+intermediate rounds hold both ends live simultaneously and the allocator
+commits to the worse shape before the chain lands. Sinking a whole chain
+atomically in one round is the only way this could pay; a fixpoint of
+single-instruction moves is not equivalent.
+
+### Why `glibc_memcmp` still shows 6 callee-saved pushes
+
+Its loads are exactly the rejected chain shape: each `load` extends its
+single-use `gep`. The pressure win there needs atomic chain motion, which the
+data above says must be built as one transaction rather than approximated by
+iteration. That is the remaining lever and it now has a measured cost to beat
+(+75 insns for the naive version).
+
+## Session 12 — OPT-42 rejected with data; CG-09 landed (-109 instructions)
+
+### CG-09 LANDED — epilogue merging by longest common SUFFIX
+
+`epilogue_merge.rs` grouped exits by *identical* epilogue text, which only
+catches paths that restore exactly the same registers. Real functions also
+produce exits differing only in how much they restore — a path that never
+touched `%r15` pops one fewer register — and the shorter epilogue is then a
+strict **suffix** of the longer one. Jumping into the middle of the longer
+copy merges those too.
+
+Longest host first, so every shorter exit finds the deepest available host; a
+label is planted once per (host, suffix length) and reused.
+
+**Corpus: 6551 -> 6442 instructions, -109 (-1.7 %)** — up from the -30 that
+exact matching achieved. No pressure or correctness change: the transform only
+ever replaces a whole `pop*/addq %rsp/ret` run with one `jmp`, and the
+soundness argument is unchanged (no `%rax` pop, no label inside a run,
+per-function, bails on CFI in the body).
+
+### OPT-42 REJECTED — atomic chain sinking
+
+Implemented exactly as session 11 specified: collect the maximal set of
+instructions in the block that feed the candidate and have no other consumer,
+judge profitability on the CHAIN's external inputs rather than one
+instruction's operands, and move the whole set as one transaction (remove
+highest-index-first, re-insert in original relative order, never observable
+partially migrated).
+
+| | corpus insns | rrmov | stkref | push |
+|---|---|---|---|---|
+| atomic chain sinking | **+22** | +1 | +2 | **+11** |
+
+And `glibc_memcmp` was unchanged at 197 instructions / 6 pushes — the chain
+still does not fire there, so the +22 is pure cost from chains that do fire
+elsewhere.
+
+This closes the hypothesis carried since session 11. The chain reasoning —
+"external inputs are live anyway, one result is freed, so the move is free" —
+is correct about *pressure* and still loses, for the same reason the earlier
+relaxation did: moving several instructions at once lengthens the region over
+which the chain's external inputs must stay live, and that cost is not
+captured by counting boundary crossings at a single point. A model that only
+counts values crossing one edge cannot decide multi-instruction motion.
+**Do not retry chain sinking without a live-range-length cost model.**
+
+The single-instruction pass with the loop-entry guard (session 11) remains the
+shipped configuration: corpus -4 instructions, -4 reg-reg moves, no regression.
