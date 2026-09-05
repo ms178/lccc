@@ -1345,6 +1345,36 @@ pub(super) fn resolve_copy_aliases(
         // its old linear interval guard when explicitly selected for bisection.
         let cfg_proven = std::env::var("CCC_NO_CFG_COPY_COALESCE").is_err()
             && phi_web_aliases.contains(&dest_id);
+        // Width-class UNIFICATION for a web whose root already owns the wider
+        // slot.
+        //
+        // A copy/phi web carries one C type, yet its members can land in
+        // different width classes: `is_small` requires `!wide_typed`, and a
+        // Copy/Phi dest is `wide_typed` because its emitter moves it with
+        // `movq`, while the BinOp feeding it has a narrow `result_type()` and
+        // is classified small. Every member is then rejected below as a width
+        // mismatch and the web never coalesces.
+        //
+        // Measured cost of that rejection on `arith_loop` (32 loop-carried
+        // ints): the CFG coalescer proved all 21 phi pairs non-interfering and
+        // `resolve=0, blocked_width_mismatch=21`. Each rejected pair keeps two
+        // slots and a latch copy, so `c += d*e` compiled to
+        // `movl slot_old,%eax; imull; addl slot_other,%eax; movl %eax,slot_new`
+        // — three stack references where GCC emits one in-place
+        // `addl %r15d, slot`. Hot-loop stack refs: lccc 123, GCC 50.
+        //
+        // Unify toward the WIDER class, and only when the root is the wide
+        // one: the dest then stores through `movq` into the root's 8-byte
+        // slot, so every access to the shared slot is 8 bytes wide and no
+        // stale upper half can survive. (A 32-bit x86-64 ALU result is
+        // zero-extended into the full register, so the `movq` store of a
+        // narrow value writes a well-defined zero-extended image.) The
+        // opposite direction — a wide dest into a 4-byte root slot — would
+        // overrun the slot and is still refused.
+        if state.small_slot_values.contains(&dest_id) && !state.small_slot_values.contains(&root_id)
+        {
+            state.small_slot_values.remove(&dest_id);
+        }
         // Width-class guard: never share a slot across 4-byte/8-byte classes.
         // A small value storing movl into an 8-byte root's slot leaves the
         // root's stale upper half for later 64-bit readers; conversely an
