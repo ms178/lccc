@@ -75,6 +75,8 @@
 //! `LCCC_DEBUG_VECTORIZE=1` / `LCCC_WHY_NOT_VECTORIZE=1`.
 //!
 //! Pass name for CCC_DISABLE_PASSES: "vec_interleave".
+#[allow(unused_imports)]
+use crate::backend::x86::cpu_model::{ReductionOp, ReductionShape, X86Tune};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
@@ -103,29 +105,30 @@ struct AccOp {
     zero: Option<IntrinsicOp>,
     /// Whether the element type is floating point (needs `fp_reassoc`).
     is_fp: bool,
-    /// Preferred number of independent chains for this op's latency class.
-    preferred_if: u32,
+    /// Loop-carried operation class for the CPU model's roofline.
+    red_op: ReductionOp,
+    /// Accumulator register width in bits (128 = XMM, 256 = YMM).
+    bits: u16,
 }
 
 fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
     use IntrinsicOp as O;
     // Note: `VecAddI64x4` is deliberately absent — the x86 emitter has no
     // lowering for it (unimplemented no-op), so nothing may ever select it.
-    let (kind, combine, zero, is_fp, preferred_if) = match op {
-        O::VecFmaF64x4 | O::VecAddF64x4 => {
-            (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, 4)
-        }
-        O::VecFmaF32x8 | O::VecAddF32x8 => {
-            (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, 4)
-        }
-        O::VecAddF64x2 => (AccKind::Add, O::VecAddF64x2, Some(O::VecZeroF64x2), true, 4),
-        O::VecAddF32x4 => (AccKind::Add, O::VecAddF32x4, Some(O::VecZeroF32x4), true, 4),
-        O::VecAddI32x8 => (AccKind::Add, O::VecAddI32x8, Some(O::VecZeroI32x8), false, 4),
-        O::VecAddI32x4 => (AccKind::Add, O::VecAddI32x4, Some(O::VecZeroI32x4), false, 4),
+    use ReductionOp as R;
+    let (kind, combine, zero, is_fp, red_op, bits) = match op {
+        O::VecFmaF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::Fma, 256),
+        O::VecAddF64x4 => (AccKind::Add, O::VecAddF64x4, Some(O::VecZeroF64x4), true, R::FAdd, 256),
+        O::VecFmaF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::Fma, 256),
+        O::VecAddF32x8 => (AccKind::Add, O::VecAddF32x8, Some(O::VecZeroF32x8), true, R::FAdd, 256),
+        O::VecAddF64x2 => (AccKind::Add, O::VecAddF64x2, Some(O::VecZeroF64x2), true, R::FAdd, 128),
+        O::VecAddF32x4 => (AccKind::Add, O::VecAddF32x4, Some(O::VecZeroF32x4), true, R::FAdd, 128),
+        O::VecAddI32x8 => (AccKind::Add, O::VecAddI32x8, Some(O::VecZeroI32x8), false, R::IntAdd, 256),
+        O::VecAddI32x4 => (AccKind::Add, O::VecAddI32x4, Some(O::VecZeroI32x4), false, R::IntAdd, 128),
         O::VecAddI64x2 | O::VecWidenAddI32x4ToI64x2 => {
-            (AccKind::Add, O::VecAddI64x2, Some(O::VecZeroI64x2), false, 4)
+            (AccKind::Add, O::VecAddI64x2, Some(O::VecZeroI64x2), false, R::IntAdd, 128)
         }
-        O::VecMaxI32x8 => (AccKind::Max, O::VecMaxI32x8, None, false, 2),
+        O::VecMaxI32x8 => (AccKind::Max, O::VecMaxI32x8, None, false, R::IntMax, 256),
         _ => return None,
     };
     Some(AccOp {
@@ -133,7 +136,8 @@ fn acc_op_info(op: IntrinsicOp) -> Option<AccOp> {
         combine,
         zero,
         is_fp,
-        preferred_if,
+        red_op,
+        bits,
     })
 }
 
@@ -538,10 +542,15 @@ fn operand_mentions_any(insts: &[Instruction], id: u32) -> bool {
     insts.iter().any(|i| operand_mentions(i, &|x| x == id))
 }
 
-/// Interleave factor: forced by `CCC_VEC_INTERLEAVE`, else the latency class
-/// of the accumulator ops, halved for two-accumulator loops (register
-/// pressure: 2×4 YMM accumulators plus load temporaries would spill).
-fn choose_factor(c: &Candidate) -> u32 {
+/// Interleave factor: forced by `CCC_VEC_INTERLEAVE`, else the active CPU
+/// row's roofline ([`X86Tune::reduction_interleave`]) evaluated on the
+/// measured body shape (vector loads and vector µops per iteration).  The
+/// op class is the *slowest* accumulator's (FMA > FADD > integer), so a
+/// mixed loop is provisioned for its longest chain.  Two-accumulator loops
+/// are capped at 2 (the register cap in the model would allow 4, but the
+/// allocator spilled the 2 × 4 YMM accumulators plus load temporaries when
+/// this pass was first measured — see `docs/FOLLOWUP_CPU_MODEL.md`).
+fn choose_factor(func: &IrFunction, c: &Candidate) -> u32 {
     if let Some(forced) = std::env::var("CCC_VEC_INTERLEAVE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
@@ -549,17 +558,100 @@ fn choose_factor(c: &Candidate) -> u32 {
     {
         return forced;
     }
-    let base = c
-        .accs
-        .iter()
-        .map(|a| a.info.preferred_if)
-        .min()
-        .unwrap_or(2);
+    let shape = body_shape(func, c);
+    let model = crate::backend::x86::cpu_model::active().reduction_interleave(shape);
+    let factor = model.min(X86_VEC_CHAIN_REG_CAP);
+    if why_not() && factor != model {
+        eprintln!(
+            "[VEC-IL] roofline wants x{model} for {:?}, clamped to x{factor} by \
+             X86_VEC_CHAIN_REG_CAP (vector RA capability)",
+            shape
+        );
+    }
     match c.accs.len() {
-        1 => base,
-        2 => base.min(2),
+        1 => factor,
+        2 => factor.min(2),
         _ => 1,
     }
+}
+
+/// Backend capability cap on chains per accumulator, independent of the
+/// CPU model.  Measured this session (`dot1.c`, `-O3 -ffast-math
+/// -march=x86-64-v3 -mtune=raptorlake`, `CCC_VEC_INTERLEAVE=8`): the x86
+/// vector allocator homes six loop-carried YMM chains in `%ymm2..%ymm7`
+/// and sends the seventh and eighth FMA results through stack slots
+/// (`vmovdqu %ymm0, -32(%rbp)` … reload at the back edge), which puts a
+/// store-forwarding round trip on two of the eight chains: T ≈ 9 cycles
+/// per group of 8 (0.9 FMA/cycle) versus 4 cycles per group of 4 (1.0
+/// FMA/cycle).  Until the allocator keeps eight chains resident (see
+/// `docs/FOLLOWUP_CPU_MODEL.md`, item 1), 4 is the largest factor that is
+/// a pure win; the roofline in [`X86Tune::reduction_interleave`] already
+/// asks for 8 on Raptor Lake/Alder Lake/Sapphire Rapids and on every
+/// Skylake-class FADD reduction, so raising this constant is the only
+/// change needed once the allocator is fixed.
+const X86_VEC_CHAIN_REG_CAP: u32 = 4;
+
+/// Reduction shape of the candidate's body for the CPU model: vector loads
+/// and vector µops per original iteration (the IV increment and the
+/// header compare are loop control, modelled separately by the row).
+fn body_shape(func: &IrFunction, c: &Candidate) -> ReductionShape {
+    let mut loads = 0u32;
+    let mut uops = 0u32;
+    for (i, inst) in func.blocks[c.body].instructions.iter().enumerate() {
+        if i == c.iv_inc_idx {
+            continue;
+        }
+        match inst {
+            Instruction::Intrinsic { op, .. } => {
+                uops += 1;
+                if is_vector_load_op(*op) {
+                    loads += 1;
+                }
+            }
+            Instruction::BinOp { .. } => uops += 1,
+            _ => {}
+        }
+    }
+    // Every x86 vector ALU op folds one memory operand, so one load per
+    // accumulator op disappears into the op's fused µop; count it once.
+    let uops = uops.saturating_sub(loads.min(c.accs.len() as u32));
+    // Rank: FMA (longest chain) > FADD > integer add > integer max.
+    let rank = |r: ReductionOp| match r {
+        ReductionOp::Fma => 3,
+        ReductionOp::FAdd => 2,
+        ReductionOp::IntAdd => 1,
+        ReductionOp::IntMax => 0,
+    };
+    let op = c
+        .accs
+        .iter()
+        .map(|a| a.info.red_op)
+        .max_by_key(|r| rank(*r))
+        .unwrap_or(ReductionOp::IntAdd);
+    let bits = c.accs.iter().map(|a| a.info.bits).max().unwrap_or(256);
+    ReductionShape {
+        op,
+        vector_bits: bits,
+        accumulators: c.accs.len() as u32,
+        loads_per_iter: loads,
+        uops_per_iter: uops,
+    }
+}
+
+fn is_vector_load_op(op: IntrinsicOp) -> bool {
+    use IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadF64x4
+            | O::VecLoadF64x2
+            | O::VecLoadF32x8
+            | O::VecLoadF32x4
+            | O::VecLoadI32x8
+            | O::VecLoadI32x4
+            | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecLoadWidenI32ToI64x2
+    )
 }
 
 fn set_dest(inst: &mut Instruction, new: Value) {
@@ -965,7 +1057,7 @@ pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
     // blocks and rewires its own preheader, so the others stay valid.
     let mut n = 0;
     for c in cands {
-        let factor = choose_factor(&c);
+        let factor = choose_factor(func, &c);
         if factor >= 2 && transform(func, &c, factor, debug) {
             n += 1;
         }
