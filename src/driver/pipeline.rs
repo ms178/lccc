@@ -1666,6 +1666,28 @@ impl Driver {
                     }
                 }
             }
+            // RA-06: pressure-driven reload-at-next-use. Unlike the call
+            // splitter above, this targets CALL-FREE high-pressure blocks —
+            // the shape the measurement showed the call splitter can never
+            // reach (`CCC_SPLIT_MAX=200` moved exactly zero counters on the
+            // benchmark corpus because the loops that spill contain no
+            // calls). Opt-in until the A/B census says otherwise.
+            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() {
+                let pmax = std::env::var("CCC_PRESSURE_SPLIT_MAX")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(64);
+                for func in &mut module.functions {
+                    if !func.is_declaration && !func.blocks.is_empty() {
+                        let n = crate::backend::split_ranges::split_high_pressure_ranges(
+                            func, pmax,
+                        );
+                        if n > 0 {
+                            did_split = true;
+                        }
+                    }
+                }
+            }
             // Loop-transparent splitting (spill values live across a hot loop
             // but unused inside it). NOTE: measured as a net loss on the
             // benchmark suite — the store/reload round-trips cost more than the

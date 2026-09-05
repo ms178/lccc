@@ -809,3 +809,68 @@ corpus bugs; the 28 Regehr tests now pass and the full lccc suite is
 
 No fork-specific risk: all fixes are upstream-compatible and validated by the
 full regression suite + A/B harness.
+
+## RA-06 (2026-09-05) — pressure-driven reload-at-next-use: measured NEGATIVE as an IR pre-pass
+
+**Decision: implemented, validated correct, and shipped OFF by default
+(`CCC_PRESSURE_SPLIT=1` to enable). Do not turn it on without first adding
+cross-block SSA repair — see the mechanism below.**
+
+### What was built
+
+`split_ranges::split_high_pressure_ranges` — decoupled spill-then-color in the
+Braun & Hack sense (CGO 2009), as an IR pre-pass:
+
+* per-block program-point pressure over the GPR-eligible values;
+* at each point where pressure exceeds the budget, Belady MIN — evict the
+  value whose NEXT USE is farthest;
+* materialise the eviction as a store at the free point and a reload as a
+  **fresh SSA name** immediately before the next use, renaming from there on
+  (plus successor phi operands from that block). The fresh name is what buys
+  two locations for one logical value inside a backend whose assignment result
+  is a single `value -> location` map.
+
+It is correct: the full regression suite is **633 PASS / 0 FAIL / 0 A/B diffs**
+with the pass forced on, and the torture corpus is clean with it on.
+
+### Why it does not pay
+
+| config (budget / min-gap) | kernel stkref | kernel insns |
+|---|---|---|
+| 12 / 4  | +119 | +121 |
+| 13 / 12 | +87  | +98  |
+| 14 / 20 | +87  | +98  |
+| 16 / 30 | +57  | +58  |
+
+Monotone toward zero, and **not one function in the corpus improves** — the
+best-3 list is three regressions. `arith_loop` goes 165 -> 367 stack refs at
+the aggressive setting.
+
+The mechanism is not tuning. Braun–Hack pays because its spill phase
+*guarantees* MAXLIVE <= k at **every** program point, so the colorer never
+spills again and the store/reload traffic is the whole cost. An
+**intra-block** splitter cannot provide that guarantee here: the dominant
+candidates in these loops are loop-header phi values consumed in a *different*
+block, and renaming those needs real cross-block SSA repair (dominance
+frontiers, phi insertion). They are therefore rejected, residual pressure
+stays above k, the colorer demotes anyway — and the program pays for **both**
+the split traffic and the demotions.
+
+Instrumented rejection counts for `arith_loop` block 1 at the peak: 32 of the
+live values were rejected as "consumers outside this block are not successor
+phi operands", which is exactly that class.
+
+### What would change the answer
+
+Cross-block SSA repair, so the spill phase can reach MAXLIVE <= k globally.
+Until that exists this transform is strictly worse than lifetime demotion, and
+the honest reading of the numbers above is that partial spill-then-color is
+worse than either endpoint. Recorded here so the next attempt starts from the
+guarantee rather than from the heuristic.
+
+### Also invalidated
+
+The earlier RA-28b hypothesis ("mode 6 loses only because of lifetime
+demotion; splitting will flip its sign") cannot be tested with this pass: with
+the pass on, mode 6's kernel deltas move in the same direction, because the
+pass does not remove the demotions it was meant to remove.
