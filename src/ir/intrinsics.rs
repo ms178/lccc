@@ -452,6 +452,32 @@ pub enum IntrinsicOp {
     VecLoadI64x2,
     VecAddI64x2,
     VecMulI64x2,
+    /// Integer map-loop lane ops (x86; produced by the vectorizer's map
+    /// analyzer for `d[i] = a[i] OP b[i]` and `d[i] = a[i] OP c`).
+    /// I32/U32: AVX2 `vp{sub,and,or,xor}d` (x8) and SSE2 `p{sub,and,or,xor}`
+    /// (x4). I64/U64: SSE2 `psubq` (x2).
+    ///
+    /// Operand contract, identical to `VecAdd*`/`VecMul*`: args[0] = src1,
+    /// args[1] = src2, dest = result. `Sub` is `src1 - src2` lane-wise and
+    /// **non-commutative** — the emitter passes `commutative = false`, so a
+    /// folded memory operand is only legal in the src2 position
+    /// (`vpsubd mem, %ymm_src1, %ymm_dst`). And/Or/Xor are bit-exact,
+    /// commutative and element-type agnostic; they carry `I32` in the name
+    /// only so the allocator's per-family register classes stay consistent
+    /// with the loads and stores around them.
+    ///
+    /// Two's-complement wraparound of `psubd`/`psubq` matches the scalar IR
+    /// `Sub` for both signednesses: `unsigned` wraps by definition, and
+    /// signed overflow is UB in C so wrapping is a valid refinement.
+    VecSubI32x4,
+    VecSubI32x8,
+    VecSubI64x2,
+    VecAndI32x4,
+    VecAndI32x8,
+    VecOrI32x4,
+    VecOrI32x8,
+    VecXorI32x4,
+    VecXorI32x8,
     VecStoreI64x2,
     VecBroadcastI64x2,
     VecLoadI64x4,
@@ -1209,6 +1235,7 @@ impl IntrinsicOp {
             | FmaF64x4 | FmaF64x4Hoisted | BroadcastLoadF64 | FmaF64x4SIB | FmaF64x4HoistedSIB
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
+            | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
             | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4
             | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
@@ -1281,6 +1308,7 @@ impl IntrinsicOp {
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
+            | VecSubI32x4 | VecSubI64x2 | VecAndI32x4 | VecOrI32x4 | VecXorI32x4
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
@@ -1382,6 +1410,15 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
                 | IntrinsicOp::VecAddI32x4
+                | IntrinsicOp::VecSubI32x8
+                | IntrinsicOp::VecSubI32x4
+                | IntrinsicOp::VecSubI64x2
+                | IntrinsicOp::VecAndI32x8
+                | IntrinsicOp::VecAndI32x4
+                | IntrinsicOp::VecOrI32x8
+                | IntrinsicOp::VecOrI32x4
+                | IntrinsicOp::VecXorI32x8
+                | IntrinsicOp::VecXorI32x4
                 | IntrinsicOp::VecAddF32x8
                 | IntrinsicOp::VecAddF32x4
                 | IntrinsicOp::VecMulF64x4
@@ -1540,6 +1577,15 @@ mod vector_result_width_tests {
             (IntrinsicOp::VecAddF64x2, "VecAddF64x2"),
             (IntrinsicOp::VecAddF32x4, "VecAddF32x4"),
             (IntrinsicOp::VecAddI64x2, "VecAddI64x2"),
+            (IntrinsicOp::VecSubI32x4, "VecSubI32x4"),
+            (IntrinsicOp::VecSubI32x8, "VecSubI32x8"),
+            (IntrinsicOp::VecSubI64x2, "VecSubI64x2"),
+            (IntrinsicOp::VecAndI32x4, "VecAndI32x4"),
+            (IntrinsicOp::VecAndI32x8, "VecAndI32x8"),
+            (IntrinsicOp::VecOrI32x4, "VecOrI32x4"),
+            (IntrinsicOp::VecOrI32x8, "VecOrI32x8"),
+            (IntrinsicOp::VecXorI32x4, "VecXorI32x4"),
+            (IntrinsicOp::VecXorI32x8, "VecXorI32x8"),
         ];
         for (op, name) in narrow {
             assert_eq!(
