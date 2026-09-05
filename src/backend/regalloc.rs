@@ -3955,6 +3955,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         };
         if !env_on("CCC_NO_MAP_VECREG") {
             values.extend(collect_x86_map_broadcast_values(func));
+            values.extend(collect_x86_map_intermediate_values(func));
         }
         values
     } else {
@@ -5502,13 +5503,64 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             _ => None,
         }
     };
+    // Every consumer listed here must read a homed operand through the
+    // register (avx_load_arg_to / sse_load_arg consult reg_assignments and
+    // vec_live_regs first) or through vec_home_256/vec_home_128 — never raw
+    // from the home slot.  A non-listed consumer strands the broadcast on
+    // the stack (correct, just slower).
     let legal_consumer = |op: &O, class: u8| -> bool {
         match class {
-            1 => matches!(op, O::VecMulF32x8 | O::VecAddF32x8 | O::VecMaddF32x8),
-            2 => matches!(op, O::VecMulF64x4 | O::VecAddF64x4 | O::VecMaddF64x4),
+            1 => matches!(
+                op,
+                O::VecMulF32x8
+                    | O::VecAddF32x8
+                    | O::VecSubF32x8
+                    | O::VecDivF32x8
+                    | O::VecSqrtF32x8
+                    | O::VecMaddF32x8
+                    | O::VecCmpF32x8
+                    | O::VecBlendvF32x8
+                    | O::VecMinF32x8
+                    | O::VecMaxF32x8
+            ),
+            2 => matches!(
+                op,
+                O::VecMulF64x4
+                    | O::VecAddF64x4
+                    | O::VecSubF64x4
+                    | O::VecDivF64x4
+                    | O::VecSqrtF64x4
+                    | O::VecMaddF64x4
+                    | O::VecCmpF64x4
+                    | O::VecBlendvF64x4
+                    | O::VecMinF64x4
+                    | O::VecMaxF64x4
+            ),
             3 => matches!(op, O::VecMulI32x8 | O::VecAddI32x8),
-            4 => matches!(op, O::VecMulF32x4 | O::VecAddF32x4),
-            5 => matches!(op, O::VecMulF64x2 | O::VecAddF64x2),
+            4 => matches!(
+                op,
+                O::VecMulF32x4
+                    | O::VecAddF32x4
+                    | O::VecSubF32x4
+                    | O::VecDivF32x4
+                    | O::VecSqrtF32x4
+                    | O::VecCmpF32x4
+                    | O::VecBlendvF32x4
+                    | O::VecMinF32x4
+                    | O::VecMaxF32x4
+            ),
+            5 => matches!(
+                op,
+                O::VecMulF64x2
+                    | O::VecAddF64x2
+                    | O::VecSubF64x2
+                    | O::VecDivF64x2
+                    | O::VecSqrtF64x2
+                    | O::VecCmpF64x2
+                    | O::VecBlendvF64x2
+                    | O::VecMinF64x2
+                    | O::VecMaxF64x2
+            ),
             6 => matches!(op, O::VecMulI32x4 | O::VecAddI32x4),
             _ => false,
         }
@@ -5546,15 +5598,169 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
             });
             for_each_value_use_in_instruction(inst, |v| {
                 if candidates.contains_key(&v.0) {
-                    // Address-side / pointer-only use: not a packed consumer.
-                    let legal = matches!(
-                        inst,
-                        Instruction::Intrinsic { op, .. }
-                            if candidates.get(&v.0).is_some_and(|&c| legal_consumer(op, c))
-                    );
-                    if !legal {
-                        bad.insert(v.0);
-                    }
+                    // Address-side / pointer-only position (intrinsic
+                    // dest_ptr, Store/Load ptr, GEP base, ...): never a
+                    // packed register consumer.  Unconditional, fail-closed.
+                    bad.insert(v.0);
+                }
+            });
+        }
+        for_each_operand_in_terminator(&block.terminator, |operand| {
+            if let Operand::Value(value) = operand {
+                if candidates.contains_key(&value.0) {
+                    bad.insert(value.0);
+                }
+            }
+        });
+    }
+    candidates.retain(|value, _| !bad.contains(value));
+    candidates.into_keys().collect()
+}
+
+/// Map-loop intermediates (OP-05a and the FP min/max/select extension):
+/// stream loads, packed compares, blends, min/max and arithmetic results
+/// whose EVERY consumer reads them through a home-aware path.  Same
+/// fail-closed discipline as `collect_x86_map_broadcast_values`: one
+/// non-listed consumer (or an address-side / terminator use) strands the
+/// value on the stack.  Multi-use intermediates — the clamp body's stream
+/// load feeding a min and a compare — are the values this collector exists
+/// for: the deferral machinery can only serve single-use windows, so
+/// without a register home every one of their consumers pays a slot
+/// round trip per iteration.
+fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+
+    // Class = element family (mirrors the broadcast/reduction classing so
+    // the Copy-web and phi-merge machinery treats them uniformly).
+    let class_of = |op: &O| -> Option<u8> {
+        match op {
+            O::VecLoadF32x8
+            | O::VecSubF32x8
+            | O::VecDivF32x8
+            | O::VecSqrtF32x8
+            | O::VecMaddF32x8
+            | O::VecCmpF32x8
+            | O::VecBlendvF32x8
+            | O::VecMinF32x8
+            | O::VecMaxF32x8 => Some(1),
+            O::VecLoadF64x4
+            | O::VecSubF64x4
+            | O::VecDivF64x4
+            | O::VecSqrtF64x4
+            | O::VecMaddF64x4
+            | O::VecCmpF64x4
+            | O::VecBlendvF64x4
+            | O::VecMinF64x4
+            | O::VecMaxF64x4 => Some(2),
+            O::VecLoadF32x4
+            | O::VecSubF32x4
+            | O::VecDivF32x4
+            | O::VecSqrtF32x4
+            | O::VecCmpF32x4
+            | O::VecBlendvF32x4
+            | O::VecMinF32x4
+            | O::VecMaxF32x4 => Some(4),
+            O::VecLoadF64x2
+            | O::VecSubF64x2
+            | O::VecDivF64x2
+            | O::VecSqrtF64x2
+            | O::VecCmpF64x2
+            | O::VecBlendvF64x2
+            | O::VecMinF64x2
+            | O::VecMaxF64x2 => Some(5),
+            _ => None,
+        }
+    };
+    // Every consumer must be home-aware (see the broadcast collector).  The
+    // final VecStore reads its source through vec_store_source_256/128.
+    let legal_consumer = |op: &O, class: u8| -> bool {
+        match class {
+            1 => matches!(
+                op,
+                O::VecSubF32x8
+                    | O::VecDivF32x8
+                    | O::VecSqrtF32x8
+                    | O::VecMaddF32x8
+                    | O::VecCmpF32x8
+                    | O::VecBlendvF32x8
+                    | O::VecMinF32x8
+                    | O::VecMaxF32x8
+                    | O::VecStoreF32x8
+            ),
+            2 => matches!(
+                op,
+                O::VecSubF64x4
+                    | O::VecDivF64x4
+                    | O::VecSqrtF64x4
+                    | O::VecMaddF64x4
+                    | O::VecCmpF64x4
+                    | O::VecBlendvF64x4
+                    | O::VecMinF64x4
+                    | O::VecMaxF64x4
+                    | O::VecStoreF64x4
+            ),
+            4 => matches!(
+                op,
+                O::VecSubF32x4
+                    | O::VecDivF32x4
+                    | O::VecSqrtF32x4
+                    | O::VecCmpF32x4
+                    | O::VecBlendvF32x4
+                    | O::VecMinF32x4
+                    | O::VecMaxF32x4
+                    | O::VecStoreF32x4
+            ),
+            5 => matches!(
+                op,
+                O::VecSubF64x2
+                    | O::VecDivF64x2
+                    | O::VecSqrtF64x2
+                    | O::VecCmpF64x2
+                    | O::VecBlendvF64x2
+                    | O::VecMinF64x2
+                    | O::VecMaxF64x2
+                    | O::VecStoreF64x2
+            ),
+            _ => false,
+        }
+    };
+
+    let mut candidates: FxHashMap<u32, u8> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d), op, ..
+            } = inst
+            {
+                if let Some(class) = class_of(op) {
+                    candidates.insert(d.0, class);
+                }
+            }
+        }
+    }
+
+    let mut bad = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for_each_operand_in_instruction(inst, |operand| {
+                let Operand::Value(value) = operand else {
+                    return;
+                };
+                let Some(&class) = candidates.get(&value.0) else {
+                    return;
+                };
+                let legal =
+                    matches!(inst, Instruction::Intrinsic { op, .. } if legal_consumer(op, class));
+                if !legal {
+                    bad.insert(value.0);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| {
+                if candidates.contains_key(&v.0) {
+                    // Address-side / pointer-only position (intrinsic
+                    // dest_ptr, Store/Load ptr, GEP base, ...): never a
+                    // packed register consumer.  Unconditional, fail-closed.
+                    bad.insert(v.0);
                 }
             });
         }
@@ -5652,6 +5858,18 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
                         | O::RoundScalarF32(_)
                         | O::CopysignF64
                         | O::CopysignF32
+                        // Horizontal FP reductions produce scalar F32/F64
+                        // SSA values in the SSE domain (store_xmm_to); admit
+                        // them so Phase 3 can home the results in XMM
+                        // registers instead of bouncing them through GPRs
+                        // and stack slots between the combine and the
+                        // remainder loop / return.
+                        | O::HorizontalAddF64x4
+                        | O::HorizontalAddF64x2
+                        | O::VecHorizontalAddF64x4
+                        | O::VecHorizontalAddF64x2
+                        | O::VecHorizontalAddF32x8
+                        | O::VecHorizontalAddF32x4
                 ) =>
                 {
                     f64_values.insert(d.0);
@@ -8160,5 +8378,168 @@ mod phi_coalesce_tests {
             !candidates.iter().any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "second backedge copy of the phi must veto coalescing: {candidates:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod map_collector_tests {
+    use super::*;
+    use crate::ir::instruction::{Instruction, Terminator};
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    use crate::ir::reexports::{BasicBlock, BlockId, Value};
+
+    fn intrinsic(op: O, dest: u32, args: Vec<Operand>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    fn store(op: O, src: u32, ptr: Option<u32>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op,
+            dest_ptr: ptr.map(Value),
+            args: vec![Operand::Value(Value(src))],
+        }
+    }
+
+    fn func(insts: Vec<Instruction>, term: Terminator) -> IrFunction {
+        let mut f = IrFunction::new("map_collector".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }];
+        f
+    }
+
+    #[test]
+    fn admits_multi_use_load_min_and_cmp_webs() {
+        // Clamp body: %1 = load; %2 = min(%1, %1); %3 = cmp(%1, %1);
+        // %4 = blendv(%3, %2, %2); %5 = store(%4).
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(O::VecCmpF32x8, 3, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecBlendvF32x8,
+                    4,
+                    vec![
+                        Operand::Value(Value(3)),
+                        Operand::Value(Value(2)),
+                        Operand::Value(Value(2)),
+                    ],
+                ),
+                store(O::VecStoreF32x8, 4, Some(101)),
+            ],
+            Terminator::Return(None),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert_eq!(set.len(), 4, "load/min/cmp/blendv all admitted: {set:?}");
+        for v in [1, 2, 3, 4] {
+            assert!(set.contains(&v), "missing value {v}");
+        }
+    }
+
+    #[test]
+    fn rejects_terminator_consumers() {
+        // The load feeds a Return in addition to the min chain.
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                store(O::VecStoreF32x8, 2, Some(101)),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(!set.contains(&1), "terminator consumer must strand the load");
+        assert!(set.contains(&2), "min still admissible");
+    }
+
+    #[test]
+    fn rejects_address_side_consumers() {
+        // The min result is used as the VecStore DESTINATION POINTER
+        // (address-side use) — must strand it even though the op is listed.
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                store(O::VecStoreF32x8, 9, Some(2)),
+            ],
+            Terminator::Return(None),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(!set.contains(&2), "dest_ptr use must strand the value");
+    }
+
+    #[test]
+    fn rejects_unlisted_consumers() {
+        // The min feeds a load address (VecLoadF32x8 is not a listed
+        // consumer of class 1): fail-closed.
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(1)), Operand::Value(Value(1))]),
+                intrinsic(O::VecLoadF32x8, 3, vec![Operand::Value(Value(2))]),
+                store(O::VecStoreF32x8, 3, Some(101)),
+            ],
+            Terminator::Return(None),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(!set.contains(&2), "load-address consumer must strand the min");
+    }
+
+    #[test]
+    fn broadcast_admits_min_cmp_blend_consumers() {
+        // Loop-invariant broadcast feeding the 16 new ops (follow-up #1):
+        // the widened legal_consumer must admit each class.
+        let f = func(
+            vec![
+                intrinsic(O::VecBroadcastF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
+                intrinsic(O::VecCmpF32x8, 3, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
+                intrinsic(O::VecBlendvF32x8, 4, vec![
+                    Operand::Value(Value(3)),
+                    Operand::Value(Value(2)),
+                    Operand::Value(Value(1)),
+                ]),
+                store(O::VecStoreF32x8, 4, Some(101)),
+            ],
+            Terminator::Return(None),
+        );
+        let set = collect_x86_map_broadcast_values(&f);
+        assert!(set.contains(&1), "broadcast feeding min/cmp/blendv admitted: {set:?}");
+    }
+
+    #[test]
+    fn broadcast_still_stranded_by_unlisted_consumer() {
+        // Same web, but the broadcast also feeds VecWidenMaskedAddI32x4ToI64x2
+        // (never a packed FP consumer): fail-closed.
+        let f = func(
+            vec![
+                intrinsic(O::VecBroadcastF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(O::VecMinF32x8, 2, vec![Operand::Value(Value(9)), Operand::Value(Value(1))]),
+                intrinsic(
+                    O::VecWidenMaskedAddI32x4ToI64x2,
+                    3,
+                    vec![
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(1)),
+                        Operand::Value(Value(1)),
+                    ],
+                ),
+                store(O::VecStoreF32x8, 2, Some(101)),
+            ],
+            Terminator::Return(None),
+        );
+        let set = collect_x86_map_broadcast_values(&f);
+        assert!(!set.contains(&1), "unlisted consumer must strand the broadcast");
     }
 }

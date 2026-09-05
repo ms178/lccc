@@ -131,6 +131,47 @@ NOINLINE void p31_sign_apply_f32(float *restrict d, const float *restrict a,
     for (int i = 0; i < n; i++) d[i] = sign[i] < 0.0f ? -a[i] : a[i];
 }
 
+/* 24b-27d: exactness-critical min/max/select shapes.  These are the shapes
+ * that must NOT fold to VMINPS/VMAXPS (swapped arms, <=) and the shapes
+ * that MUST (nested ternary clamp, min/max chains, the F64 twins) — the
+ * operand-order contract of MINPS/MAXPS (second source returned on
+ * unordered and both-zero lanes) makes each fold a bit-exact decision. */
+NOINLINE void p24b_min_swapped_f32(float *restrict d, const float *restrict a,
+                                   const float *restrict b, int n) {
+    /* `a < b ? b : a` is NOT max(a,b) for +-0 lanes: blendv lowering. */
+    for (int i = 0; i < n; i++) d[i] = a[i] < b[i] ? b[i] : a[i];
+}
+NOINLINE void p24c_min_le_f32(float *restrict d, const float *restrict a,
+                              const float *restrict b, int n) {
+    /* `a <= b ? a : b` is NOT min(a,b) for +-0 lanes: blendv lowering. */
+    for (int i = 0; i < n; i++) d[i] = a[i] <= b[i] ? a[i] : b[i];
+}
+NOINLINE void p27b_clamp_ternary_f32(float *restrict d, const float *restrict a,
+                                     int n) {
+    for (int i = 0; i < n; i++)
+        d[i] = a[i] < 0.0f ? 0.0f : (a[i] > 1.0f ? 1.0f : a[i]);
+}
+NOINLINE void p27c_minmax_chain_f32(float *restrict d, const float *restrict a,
+                                    int n) {
+    for (int i = 0; i < n; i++) {
+        float x = a[i] < 0.0f ? 0.0f : a[i];
+        d[i] = x > 1.0f ? 1.0f : x;
+    }
+}
+NOINLINE void p24d_min_f64(double *restrict d, const double *restrict a,
+                           const double *restrict b, int n) {
+    for (int i = 0; i < n; i++) d[i] = a[i] < b[i] ? a[i] : b[i];
+}
+NOINLINE void p27d_clamp_f64(double *restrict d, const double *restrict a,
+                             int n) {
+    for (int i = 0; i < n; i++) {
+        double x = a[i];
+        if (x < 0.0) x = 0.0;
+        else if (x > 1.0) x = 1.0;
+        d[i] = x;
+    }
+}
+
 /* 32-37: expensive FP operations and algebraic instruction selection. */
 NOINLINE void p32_sqrt_f32(float *restrict d, const float *restrict a, int n) {
     for (int i = 0; i < n; i++) d[i] = __builtin_sqrtf(a[i]);
