@@ -4363,6 +4363,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 assignments.len(),
                 scan_ivs.len()
             );
+            // Assignment dump (CCC_RA_EXPLAIN_HOMES=1): every register-homed
+            // value with its physical register, fat interval and hole-aware
+            // segments. This is the primary tool for diagnosing "two values
+            // share a register while both are live" classes of miscompile:
+            // the segments printed here are exactly what the scan and the
+            // verifier reason about, so a read the IR does not show (folded
+            // SIB index, replayed cmp operand) is visible as a segment gap.
+            if std::env::var_os("CCC_RA_EXPLAIN_HOMES").is_some() {
+                let mut homes: Vec<(u32, PhysReg)> =
+                    assignments.iter().map(|(&v, &r)| (v, r)).collect();
+                homes.sort_unstable_by_key(|&(v, _)| v);
+                for (v, reg) in homes {
+                    let fat = iv_map.get(&v).copied();
+                    let mut segs: Vec<(u32, u32)> = liveness
+                        .segments
+                        .iter()
+                        .filter(|s| s.value_id == v)
+                        .map(|s| (s.start, s.end))
+                        .collect();
+                    segs.sort_unstable();
+                    eprintln!(
+                        "[RA-EXPLAIN] home v{} reg={} fat={:?} segments={:?}",
+                        v, reg.0, fat, segs
+                    );
+                }
+            }
             for iv in spills {
                 let reason = if call_spanning.contains(&iv.value_id) {
                     "callee-pressure"
@@ -6800,10 +6826,35 @@ pub(crate) fn detect_phi_coalesce_groups(
         let mut derived: FxHashSet<u32> = FxHashSet::default();
         derived.insert(phi);
         for earlier in &block.instructions[..def_idx] {
+            // Mirror the backend's SIB `resolve_index` peel set exactly:
+            // widening Cast, GEP, and the constant-operand scale/offset
+            // arithmetic (`Shl`/`Mul` by a constant → SIB scale,
+            // `Add`/`Sub` a constant → SIB displacement). Each of these is
+            // folded away when the access absorbs the chain, so the root
+            // register is re-read at the Load/Store. Missing the `Shl` arm
+            // let `xs[i] = 1.0/(i+1)` share `i`'s register with `i+1`: the
+            // folded `(%base,%i,8)` store then indexed with the incremented
+            // value (fpweb_dot_and_sum / init_shift_index regression).
+            let peelable_binop = matches!(
+                earlier,
+                Instruction::BinOp {
+                    op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
+                    ..
+                }
+            ) && {
+                let mut has_const = false;
+                for_each_operand_in_instruction(earlier, |op| {
+                    if matches!(op, Operand::Const(_)) {
+                        has_const = true;
+                    }
+                });
+                has_const
+            };
             if !matches!(
                 earlier,
                 Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
-            ) {
+            ) && !peelable_binop
+            {
                 continue;
             }
             let mut depends = false;
@@ -6981,24 +7032,66 @@ pub(crate) fn detect_phi_coalesce_groups(
                         )
                 })
             });
+            // Liveness-model veto (the authoritative one): the source's
+            // definition overwrites the phi's home, so the phi may not be
+            // live at ANY program point strictly inside the update window
+            // (after the source def, before the latch copy). The hole-aware
+            // segments consulted here already include every RA-invisible
+            // read the backend performs at a later position — folded SIB
+            // index/base reads and replayed compare operands are stretched
+            // into the segment union by the folded-index extension in
+            // allocate_registers — so a read the syntactic window walk
+            // cannot see (a Store whose address chain was peeled through
+            // `Shl`/`Add` arithmetic) still shows up as a covering segment.
+            // The syntactic closure above remains as a cheap first filter
+            // and as coverage for the CCC_NO_FOLDED_INDEX_LIVENESS debug
+            // configuration, where the extension is off.
+            let phi_live_in_window = {
+                let def_point = liveness.block_starts[source_block] + source_def_idx as u32;
+                let copy_point = liveness.block_starts[block_idx] + copy_idx as u32;
+                // Closed point ranges that make up the window.
+                let mut windows: [(u32, u32); 2] = [(1, 0), (1, 0)];
+                if same_block {
+                    if copy_point > def_point + 1 {
+                        windows[0] = (def_point + 1, copy_point - 1);
+                    }
+                } else {
+                    let src_end = liveness.block_ends[source_block];
+                    if src_end > def_point {
+                        windows[0] = (def_point + 1, src_end);
+                    }
+                    let latch_start = liveness.block_starts[block_idx];
+                    if copy_point > latch_start {
+                        windows[1] = (latch_start, copy_point - 1);
+                    }
+                }
+                liveness.segments.iter().any(|seg| {
+                    seg.value_id == dest.0
+                        && windows
+                            .iter()
+                            .any(|&(lo, hi)| lo <= hi && seg.start <= hi && lo <= seg.end)
+                })
+            };
             let source_used_before_copy = !same_block
                 && block.instructions[..copy_idx]
                     .iter()
                     .any(|middle| uses_value(middle, src.0));
             if phi_used_in_window
                 || phi_derived_used_in_window
+                || phi_live_in_window
                 || source_used_elsewhere
                 || source_used_before_copy
             {
                 if debug {
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} cross_block={} src_before_copy={}",
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} live_in_window={} cross_block={} src_before_copy={}",
                         dest.0,
                         src.0,
                         block_idx,
                         source_block,
                         phi_used_in_window,
                         phi_derived_used_in_window,
+                        phi_live_in_window,
                         source_used_elsewhere,
                         source_used_before_copy
                     );
