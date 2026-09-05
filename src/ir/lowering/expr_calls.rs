@@ -797,7 +797,32 @@ impl Lowerer {
             .enumerate()
             .map(|(i, a)| {
                 let mut val = self.lower_expr(a);
-                let mut arg_ty = self.get_expr_type(a);
+                // A call argument is a **conversion boundary**, so the source
+                // type must be the type of the value `lower_expr` actually
+                // produced, not the storage-level query.
+                //
+                // `get_expr_type` widens an arithmetic `BinaryOp` to the
+                // target's storage int (`I64` on LP64) because an `IntLiteral`
+                // operand reports `I64`. The emitted `BinOp` however carries
+                // the true C operation type (`i + 1` is `int`, `ty: I32`), so
+                // the two disagree and the disagreement is a *width lie*:
+                //
+                //   __builtin_memcmp(p, "abcdefg", i + 1)
+                //     -> Call memcmp, args [.., v8:I32], arg_types [.., I64]
+                //
+                // At -O0 `v8` lives in a 4-byte slot and the 8-byte argument
+                // load pulled the neighbouring slot in as the high half, so
+                // `%rdx` became `0x1_00000007` and memcmp ran off the end of
+                // both buffers (gcc.c-torture `pr59229.c`). With a prototype
+                // in scope the same lie produced `Cast { from_ty: I64,
+                // to_ty: U64 }` — a same-width no-op where C requires the
+                // **sign extension** of a negative `int` to `size_t`.
+                //
+                // `value_ir_type` is the query documented for exactly this
+                // (it differs from `get_expr_type` only for `BinaryOp` and
+                // `!x`, which are precisely the expressions whose materialised
+                // width can be narrower than their storage width).
+                let mut arg_ty = self.value_ir_type(a);
 
                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
                 // __builtin_shufflevector, ...) yields its vector BY VALUE as a

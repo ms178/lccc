@@ -63,6 +63,8 @@ use std::sync::OnceLock;
 ///   back to the fat envelope and the allocator behaves exactly as before
 ///   this field existed. Populated by `regalloc.rs` for GPR/XMM scans from
 ///   `liveness.segments` (coalesce-owner unions for phi webs).
+/// - `use_weights` / `suffix_cost`: the **position-relative cost model**
+///   (see [`LiveRange::remaining_cost`]).
 #[derive(Debug, Clone)]
 pub struct LiveRange {
     pub value_id: u32,
@@ -89,7 +91,43 @@ pub struct LiveRange {
     /// Hole-aware live coverage: sorted, disjoint, CLOSED intervals of
     /// program points. Always a subset of `[start, end]`. See the struct doc.
     pub segments: Vec<(u32, u32)>,
+    /// Per-use execution frequency, parallel to `uses`.
+    ///
+    /// `use_weights[i]` is the estimated execution count of the block that
+    /// contains `uses[i]` — `10^min(depth(block(uses[i])), 4)` scaled by the
+    /// PGO factor of that point. **Not** a single scalar for the whole range:
+    /// `priority` multiplies every use by `10^max_depth`, which values a
+    /// range with one inner-loop use exactly like a range with twenty.
+    /// GCC (`REG_FREQ_FROM_BB`) and LLVM (`MachineBlockFrequencyInfo`) both
+    /// weight per use site; this field is that model.
+    ///
+    /// Empty = no per-use data. Every accessor then degrades to the
+    /// unit-weight count, i.e. exactly the pre-existing behaviour, so
+    /// hand-built ranges (unit tests, synthetic vector intervals, phase-2b
+    /// span ranges) are bit-identical.
+    pub use_weights: Vec<u64>,
+    /// Suffix sums of `use_weights`: `suffix_cost[i] == Σ_{j≥i} use_weights[j]`,
+    /// with a terminating `0`. Length is `use_weights.len() + 1` whenever
+    /// `use_weights` is non-empty. Makes [`LiveRange::remaining_cost`] a
+    /// binary search plus one index.
+    pub suffix_cost: Vec<u64>,
+    /// Policy multiplier applied on top of the measured use costs.
+    ///
+    /// The allocator's policy layer (`regalloc.rs`) boosts values whose real
+    /// read frequency is invisible in the IR use chain — folded SIB indices,
+    /// GEP bases folded into addressing, coalesce-group leaders. Those
+    /// boosts historically only touched `priority`; the cost model needs the
+    /// same information, and multiplying is the composable way to express
+    /// "this value is read k× more often than the IR shows".
+    pub cost_boost: u64,
+    /// Number of program points actually covered by `segments` (Σ of
+    /// `e - s + 1`). `0` = unknown, use the fat envelope. The *occupied*
+    /// length, not the envelope, is the correct denominator for a
+    /// density-style spill weight: a value with a huge envelope but a tiny
+    /// live coverage barely occupies the register.
+    pub occupancy_len: u32,
 }
+
 
 impl LiveRange {
     /// Create a placeholder range. [`build_live_ranges`] overwrites uses,
@@ -108,6 +146,10 @@ impl LiveRange {
             spill_weight: loop_weight as f64 / live_span(interval.start, interval.end),
             cascade: 0,
             segments: Vec::new(),
+            use_weights: Vec::new(),
+            suffix_cost: Vec::new(),
+            cost_boost: 1,
+            occupancy_len: 0,
         }
     }
 
@@ -116,15 +158,129 @@ impl LiveRange {
     /// must lie within `[start, end]` — the interference tests rely on the
     /// fat envelope as a conservative superset for mixed fat/segment pairs.
     pub fn set_segments(&mut self, segments: Vec<(u32, u32)>) {
+        self.occupancy_len = segments
+            .iter()
+            .map(|&(s, e)| e.saturating_sub(s).saturating_add(1))
+            .fold(0u32, |a, b| a.saturating_add(b));
         self.segments = segments;
+    }
+
+    /// Install `uses` together with their per-site execution frequencies.
+    ///
+    /// `weights[i]` belongs to `uses[i]` *before* sorting; the pair is sorted
+    /// jointly and duplicate points are merged by **summing** their weights
+    /// (an instruction reading the same value twice really does pay twice).
+    /// Then the suffix-cost prefix table is built.
+    pub fn set_uses_weighted(&mut self, uses: Vec<u32>, weights: Vec<u64>) {
+        debug_assert_eq!(
+            uses.len(),
+            weights.len(),
+            "set_uses_weighted: uses and weights must be parallel"
+        );
+        let mut pairs: Vec<(u32, u64)> = uses.into_iter().zip(weights).collect();
+        pairs.sort_unstable_by_key(|&(p, _)| p);
+        let mut pts: Vec<u32> = Vec::with_capacity(pairs.len());
+        let mut wts: Vec<u64> = Vec::with_capacity(pairs.len());
+        for (p, w) in pairs {
+            if pts.last() == Some(&p) {
+                let last = wts.last_mut().expect("pts and wts stay parallel");
+                *last = last.saturating_add(w);
+            } else {
+                pts.push(p);
+                wts.push(w);
+            }
+        }
+        self.uses = pts;
+        self.rebuild_cost_table(wts);
+    }
+
+    /// Recompute `suffix_cost` from `weights` (which becomes `use_weights`).
+    fn rebuild_cost_table(&mut self, weights: Vec<u64>) {
+        let n = weights.len();
+        let mut suffix = vec![0u64; n + 1];
+        for i in (0..n).rev() {
+            suffix[i] = suffix[i + 1].saturating_add(weights[i]);
+        }
+        self.use_weights = weights;
+        self.suffix_cost = suffix;
+    }
+
+    /// Weighted cost of every use **strictly after** `pos`.
+    ///
+    /// This is the quantity a spill decision at scan position `pos` actually
+    /// trades away: uses at or before `pos` are sunk cost, already paid as
+    /// register reads. Comparing two ranges by their *global* totals (what
+    /// `priority` does) systematically over-protects a victim whose uses are
+    /// nearly all behind the scan point — the exact pathology the repo
+    /// previously papered over with a bolted-on "zero-future-use dead
+    /// victim" override (measured, reverted twice: see the note on
+    /// `select_evict_victim`). Making the cost *position-relative* subsumes
+    /// that special case inside one consistent order.
+    ///
+    /// Falls back to the unweighted future-use count when no per-use data is
+    /// attached, so unenriched ranges behave exactly as before.
+    pub fn remaining_cost(&self, pos: u32) -> u64 {
+        debug_assert_uses_sorted(&self.uses);
+        let i = self.uses.partition_point(|&u| u <= pos);
+        if self.suffix_cost.len() == self.uses.len() + 1 {
+            self.suffix_cost[i]
+        } else {
+            (self.uses.len() - i) as u64
+        }
+    }
+
+    /// Weighted cost of every use in the range (the `pos = 0`-exclusive
+    /// total). Equals `uses.len()` when no per-use data is attached.
+    pub fn total_cost(&self) -> u64 {
+        if let Some(&total) = self.suffix_cost.first() {
+            if self.suffix_cost.len() == self.uses.len() + 1 {
+                return total;
+            }
+        }
+        self.uses.len() as u64
+    }
+
+    /// The value the allocator loses by demoting this range at `pos`:
+    /// the remaining weighted use cost, scaled by the policy multiplier.
+    ///
+    /// Saturating so a pathological boost cannot wrap into a *low* cost and
+    /// make a hot value look free to spill.
+    pub fn spill_cost_at(&self, pos: u32) -> u64 {
+        self.remaining_cost(pos)
+            .saturating_mul(self.cost_boost.max(1))
+    }
+
+    /// Multiply the policy cost boost (see [`LiveRange::cost_boost`]).
+    /// Idempotent-safe under repeated calls only in the sense that the
+    /// caller decides the factor; the allocator never calls this twice for
+    /// the same reason.
+    pub fn boost_cost(&mut self, factor: u64) {
+        self.cost_boost = self.cost_boost.saturating_mul(factor.max(1));
+    }
+
+    /// Number of program points this range actually occupies a register for.
+    /// Segment coverage when known, the fat envelope otherwise.
+    pub fn occupied_points(&self) -> u32 {
+        if self.occupancy_len > 0 {
+            self.occupancy_len
+        } else {
+            self.end.saturating_sub(self.start).saturating_add(1)
+        }
     }
 
     /// Install `uses`, enforcing the sorted+unique invariant that the
     /// binary-search helpers depend on.
+    ///
+    /// Drops any attached per-use cost table: the new use list invalidates
+    /// it, and a stale parallel array would silently mis-price the range.
+    /// Callers that have frequencies should use
+    /// [`LiveRange::set_uses_weighted`].
     pub fn set_uses(&mut self, mut uses: Vec<u32>) {
         uses.sort_unstable();
         uses.dedup();
         self.uses = uses;
+        self.use_weights.clear();
+        self.suffix_cost.clear();
     }
 
     /// Recalculate spill weight from the current priority and span.
@@ -787,28 +943,42 @@ impl LinearScanAllocator {
     /// Guards (all must pass, unless the victim is already dead at the scan
     /// point — see below):
     /// - steal-safe
-    /// - `incoming.priority > victim.priority` (never evict a hotter value)
+    /// - the incoming must be *strictly more expensive to spill* than the
+    ///   victim (never evict a hotter value)
     /// - mode 1 only: `victim.loop_depth < incoming.loop_depth`
     /// - mode ≥ 3: victim's next use is strictly after `incoming.end`
     ///
-    /// Note (session 41): a "zero-future-use dead victim" search was
-    /// prototyped here twice — as a ranking override and as a last resort
-    /// when the guarded search finds nothing — and both variants were
-    /// measured and REVERTED. The free demotion is real (the victim has no
-    /// uses left), but firing it perturbs the eviction cascade in unrolled
-    /// kernels: the zlib-ng Adler DO8 loop regressed 59.9 → 70.4 ms
-    /// (+15%, 1.51× → 1.78× vs GCC) because byte temps that grabbed the
-    /// freed registers shifted pressure onto the later partial-sum temps,
-    /// which then spilled. The gzip `longest_match` preheader pathology is
-    /// better served by Phase-1 hot-loop candidacy (see `regalloc.rs`
-    /// `hot_loop_home`), which keeps the loop-carried values in
-    /// callee-saved registers without touching the eviction ranking.
-    /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only
-    /// for the documented experiment trail.
+    /// # Cost order (mode 6 vs modes 1–3)
+    ///
+    /// Modes 1–3 rank by the **global** `priority`
+    /// (`Σ uses × 10^max_loop_depth`). Mode 6 ranks by
+    /// [`LiveRange::spill_cost_at`] at the scan point: the *remaining*
+    /// per-use-frequency-weighted cost. Two independent corrections:
+    ///
+    /// 1. **Per-use frequency.** `priority` multiplies every use by
+    ///    `10^max_depth`, so one inner-loop use makes a range as expensive
+    ///    as twenty. The cost model weights each use by its own block.
+    /// 2. **Position relativity.** A victim's uses before the scan point are
+    ///    sunk cost — they were served from a register. Comparing global
+    ///    totals over-protects a nearly-dead victim.
+    ///
+    /// Correction (2) is what the twice-reverted "zero-future-use dead
+    /// victim" experiments were groping for. Both attempts bolted a special
+    /// case on top of the *unchanged* global order (as a ranking override,
+    /// then as a last resort), which perturbed the eviction cascade in
+    /// unrolled kernels: the zlib-ng Adler DO8 loop regressed 59.9 → 70.4 ms.
+    /// Mode 6 instead makes the whole order consistent, so a dead victim is
+    /// simply the cheapest one rather than an out-of-band override, and the
+    /// profitability guard uses the same currency as the ranking.
+    /// `CCC_NO_DEAD_EVICT` no longer changes behaviour and is kept only for
+    /// the documented experiment trail.
     fn select_evict_victim(&self, incoming: &LiveRange, mode: i32) -> Option<usize> {
         if self.active.is_empty() || mode <= 0 {
             return None;
         }
+        let cost_order = mode >= 6;
+        let pos = incoming.start;
+        let incoming_cost = incoming.spill_cost_at(pos);
         let mut best_idx: Option<usize> = None;
         let mut best_priority = u64::MAX;
         let mut best_next_use = 0u32;
@@ -829,7 +999,19 @@ impl LinearScanAllocator {
             if interval.range.reg_hint.is_some() {
                 continue;
             }
-            if incoming.priority <= interval.range.priority {
+            // Rank key. Mode 6: position-relative weighted spill cost.
+            // Modes 1-3: the historical global priority.
+            let priority = if cost_order {
+                interval.range.spill_cost_at(pos)
+            } else {
+                interval.range.priority
+            };
+            let bar = if cost_order {
+                incoming_cost
+            } else {
+                incoming.priority
+            };
+            if bar <= priority {
                 continue;
             }
             if mode < 2 && interval.range.loop_depth >= incoming.loop_depth {
@@ -839,7 +1021,6 @@ impl LinearScanAllocator {
             if mode >= 3 && nxt <= incoming.end {
                 continue;
             }
-            let priority = interval.range.priority;
             let sw = interval.range.spill_weight;
             let better = best_idx.is_none()
                 || priority < best_priority
@@ -1277,6 +1458,21 @@ fn allocstats_enabled() -> bool {
 
 /// Cached `CCC_EVICT_MODE`. First parse wins for the process so a large TU
 /// cannot observe a mid-compile env change as two different allocators.
+/// Eviction policy selector (`CCC_EVICT_MODE`).
+///
+/// | mode | victim search | rank key |
+/// |------|---------------|----------|
+/// | 0 | disabled (always demote the incoming) | — |
+/// | 1 | strictly-colder loop depth required | global `priority` |
+/// | 2 | no loop-depth guard | global `priority` |
+/// | 3 | **default** — victim's next use must be past `incoming.end` | global `priority` |
+/// | 5 | exchange ([`LinearScanAllocator::find_exchange_candidate`]) | future-use count |
+/// | 6 | same guards as 3 | **position-relative weighted spill cost** |
+///
+/// Mode 6 is the cost-model-correct order (see
+/// [`LinearScanAllocator::select_evict_victim`]). Mode 3 remains the default
+/// until mode 6 has a measured win on the benchmark corpus; mode 5 lost gzip
+/// and stays opt-in.
 fn evict_mode() -> i32 {
     static MODE: OnceLock<Option<i32>> = OnceLock::new();
     let parsed = *MODE.get_or_init(|| {
@@ -1295,6 +1491,7 @@ pub fn build_live_ranges(
 ) -> Vec<LiveRange> {
     let meta = collect_range_metadata(func, loop_depth);
     let pgo_point_weights = pgo_point_weights(func);
+    let point_depths = point_loop_depths(func, loop_depth);
 
     let mut ranges: Vec<LiveRange> = intervals
         .iter()
@@ -1315,12 +1512,24 @@ pub fn build_live_ranges(
 
     for range in &mut ranges {
         if let Some(uses) = meta.uses.get(&range.value_id) {
-            range.set_uses(
-                uses.iter()
-                    .copied()
-                    .filter(|&u| u >= range.start && u <= range.end)
-                    .collect(),
-            );
+            let kept: Vec<u32> = uses
+                .iter()
+                .copied()
+                .filter(|&u| u >= range.start && u <= range.end)
+                .collect();
+            // Per-use execution frequency: the loop depth of the block that
+            // contains THIS use, times its PGO factor. `point_depths` is the
+            // program-point -> block-depth table built alongside the same
+            // dense numbering `collect_range_metadata` walks.
+            let weights: Vec<u64> = kept
+                .iter()
+                .map(|&u| {
+                    let d = point_depths.get(u as usize).copied().unwrap_or(0);
+                    loop_depth_weight(d)
+                        .saturating_mul(pgo_point_weights.get(&u).copied().unwrap_or(1))
+                })
+                .collect();
+            range.set_uses_weighted(kept, weights);
         }
 
         let loop_weight = loop_depth_weight(range.loop_depth);
@@ -1341,6 +1550,32 @@ pub fn build_live_ranges(
             .then_with(|| a.value_id.cmp(&b.value_id))
     });
     ranges
+}
+
+/// Loop depth of the block owning each program point, in the dense numbering
+/// shared by [`build_live_ranges`], [`collect_range_metadata`] and
+/// [`pgo_point_weights`] (one point per instruction, then one per terminator,
+/// in block order).
+///
+/// This is the block-frequency table the per-use cost model needs. Keeping it
+/// as a flat `Vec` indexed by point makes the per-use lookup a bounds-checked
+/// index instead of a hash probe, and makes the numbering contract explicit
+/// in one place instead of implicit in three walks.
+fn point_loop_depths(func: &IrFunction, loop_depth: &[u32]) -> Vec<u32> {
+    let total: usize = func
+        .blocks
+        .iter()
+        .map(|b| b.instructions.len().saturating_add(1))
+        .sum();
+    let mut out = Vec::with_capacity(total);
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let d = loop_depth.get(block_idx).copied().unwrap_or(0);
+        for _ in &block.instructions {
+            out.push(d);
+        }
+        out.push(d); // terminator point
+    }
+    out
 }
 
 struct RangeMetadata {
@@ -1620,6 +1855,10 @@ mod tests {
             spill_weight: priority as f64 / live_span(start, end),
             cascade: 0,
             segments: Vec::new(),
+            use_weights: Vec::new(),
+            suffix_cost: Vec::new(),
+            cost_boost: 1,
+            occupancy_len: 0,
         };
         r.set_uses(uses);
         r
@@ -2073,5 +2312,258 @@ mod tests {
             LinearScanAllocator::future_uses(&incoming, incoming.start),
             2
         );
+    }
+
+    // ======================================================================
+    // Position-relative cost model (per-use frequency + suffix costs)
+    // ======================================================================
+
+    /// Build a range whose uses carry explicit per-site frequencies.
+    fn lr_weighted(
+        value_id: u32,
+        start: u32,
+        end: u32,
+        uses_weights: Vec<(u32, u64)>,
+    ) -> LiveRange {
+        let mut r = lr(value_id, start, end, Vec::new(), 1);
+        let (u, w): (Vec<u32>, Vec<u64>) = uses_weights.into_iter().unzip();
+        r.set_uses_weighted(u, w);
+        r
+    }
+
+    /// With no per-use data attached every accessor must reproduce the
+    /// pre-existing unit-weight behaviour exactly. This is the compatibility
+    /// contract that keeps synthetic/hand-built ranges bit-identical.
+    #[test]
+    fn cost_model_degrades_to_use_counts_without_weights() {
+        let r = lr(1, 0, 100, vec![10, 20, 30, 40], 7);
+        assert!(r.use_weights.is_empty());
+        assert_eq!(r.total_cost(), 4);
+        assert_eq!(r.remaining_cost(0), 4);
+        assert_eq!(r.remaining_cost(10), 3);
+        assert_eq!(r.remaining_cost(30), 1);
+        assert_eq!(r.remaining_cost(40), 0);
+        assert_eq!(r.remaining_cost(999), 0);
+        // Identical to the historical future-use count at every position.
+        for pos in 0..=45u32 {
+            assert_eq!(
+                r.remaining_cost(pos),
+                u64::from(LinearScanAllocator::future_uses(&r, pos)),
+                "remaining_cost must equal future_uses at pos {pos}"
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_costs_are_exact_and_position_relative() {
+        let r = lr_weighted(1, 0, 100, vec![(10, 1), (20, 10), (30, 100), (40, 1)]);
+        assert_eq!(r.use_weights, vec![1, 10, 100, 1]);
+        assert_eq!(r.suffix_cost, vec![112, 111, 101, 1, 0]);
+        assert_eq!(r.total_cost(), 112);
+        assert_eq!(r.remaining_cost(0), 112);
+        assert_eq!(r.remaining_cost(10), 111);
+        assert_eq!(r.remaining_cost(19), 111);
+        assert_eq!(r.remaining_cost(20), 101);
+        assert_eq!(r.remaining_cost(30), 1);
+        assert_eq!(r.remaining_cost(40), 0);
+    }
+
+    /// Two reads of the same value by one instruction really do cost twice.
+    #[test]
+    fn duplicate_use_points_sum_their_weights() {
+        let r = lr_weighted(1, 0, 50, vec![(10, 3), (10, 4), (20, 5)]);
+        assert_eq!(r.uses, vec![10, 20]);
+        assert_eq!(r.use_weights, vec![7, 5]);
+        assert_eq!(r.total_cost(), 12);
+        assert_eq!(r.remaining_cost(10), 5);
+    }
+
+    #[test]
+    fn unsorted_weighted_uses_are_sorted_jointly() {
+        let r = lr_weighted(1, 0, 50, vec![(30, 100), (10, 1), (20, 10)]);
+        assert_eq!(r.uses, vec![10, 20, 30]);
+        assert_eq!(r.use_weights, vec![1, 10, 100]);
+        assert_eq!(r.remaining_cost(15), 110);
+    }
+
+    #[test]
+    fn set_uses_invalidates_a_stale_cost_table() {
+        let mut r = lr_weighted(1, 0, 50, vec![(10, 1000)]);
+        assert_eq!(r.total_cost(), 1000);
+        r.set_uses(vec![10, 20, 30]);
+        assert!(r.use_weights.is_empty(), "stale weights must be dropped");
+        assert_eq!(r.total_cost(), 3, "falls back to the unit-weight count");
+        assert_eq!(r.remaining_cost(10), 2);
+    }
+
+    #[test]
+    fn cost_boost_scales_and_saturates() {
+        let mut r = lr_weighted(1, 0, 50, vec![(10, 2), (20, 3)]);
+        assert_eq!(r.spill_cost_at(0), 5);
+        r.boost_cost(64);
+        assert_eq!(r.cost_boost, 64);
+        assert_eq!(r.spill_cost_at(0), 320);
+        assert_eq!(r.spill_cost_at(10), 192);
+        // A zero factor must not zero out the cost.
+        r.boost_cost(0);
+        assert_eq!(r.cost_boost, 64);
+        // Saturation, never wraparound into a bogus *low* cost.
+        r.boost_cost(u64::MAX);
+        assert_eq!(r.spill_cost_at(0), u64::MAX);
+    }
+
+    #[test]
+    fn occupied_points_prefers_segment_coverage() {
+        let mut r = lr(1, 0, 1000, vec![5, 900], 1);
+        assert_eq!(r.occupied_points(), 1001, "no segments -> fat envelope");
+        r.set_segments(vec![(0, 9), (900, 909)]);
+        assert_eq!(r.occupancy_len, 20);
+        assert_eq!(r.occupied_points(), 20);
+    }
+
+    // ======================================================================
+    // Mode 6: position-relative eviction order
+    // ======================================================================
+
+    /// The defect mode-6 exists to fix.
+    ///
+    /// `victim` is a value with many uses that are ALL behind the scan point:
+    /// at position 50 it is dead, so demoting it is free. `incoming` has two
+    /// live uses ahead of it. The global-priority order (modes 1-3) protects
+    /// the victim because its *lifetime total* is larger, and spills the
+    /// incoming instead. The position-relative order sees the victim's
+    /// remaining cost is 0 and takes the register.
+    #[test]
+    fn mode6_evicts_the_value_that_is_dead_at_the_scan_point() {
+        let regs = vec![PhysReg(0)];
+        let mut victim = lr_weighted(1, 0, 200, vec![(1, 100), (2, 100), (3, 100)]);
+        victim.priority = 300;
+        let mut incoming = lr_weighted(2, 50, 120, vec![(60, 1), (110, 1)]);
+        incoming.priority = 2;
+
+        assert_eq!(victim.remaining_cost(50), 0, "victim is dead at the scan point");
+        assert_eq!(incoming.remaining_cost(50), 2);
+
+        // Global-priority order (mode 3): 2 <= 300, so the victim is immune
+        // and the incoming is demoted.
+        let mut a3 = LinearScanAllocator::new(vec![], regs.clone());
+        a3.init_registers();
+        a3.allocate_range(victim.clone());
+        assert_eq!(a3.select_evict_victim(&incoming, 3), None);
+
+        // Position-relative order (mode 6): the victim costs 0 to demote.
+        let mut a6 = LinearScanAllocator::new(vec![], regs);
+        a6.init_registers();
+        a6.allocate_range(victim);
+        assert_eq!(a6.select_evict_victim(&incoming, 6), Some(0));
+    }
+
+    /// Mode 6 must still refuse to evict a value that is genuinely hotter
+    /// from the scan point onward: the profitability guard is a strict
+    /// comparison in the same currency as the ranking.
+    #[test]
+    fn mode6_never_evicts_a_hotter_remaining_value() {
+        let regs = vec![PhysReg(0)];
+        // Victim keeps a hot inner-loop use ahead of the scan point.
+        let victim = lr_weighted(1, 0, 200, vec![(10, 1), (150, 1000)]);
+        let incoming = lr_weighted(2, 50, 190, vec![(60, 1), (70, 1)]);
+        assert!(victim.remaining_cost(50) > incoming.remaining_cost(50));
+
+        let mut a = LinearScanAllocator::new(vec![], regs);
+        a.init_registers();
+        a.allocate_range(victim);
+        assert_eq!(a.select_evict_victim(&incoming, 6), None);
+    }
+
+    /// Per-use frequency, not one scalar for the whole range: a value with a
+    /// single inner-loop use must not outrank a value with many.
+    #[test]
+    fn mode6_ranks_by_per_use_frequency_not_max_depth() {
+        let regs = vec![PhysReg(0), PhysReg(1)];
+        // `one_hot`: one use at depth 2 (weight 100) plus cold uses.
+        let mut one_hot = lr_weighted(1, 0, 300, vec![(100, 100), (101, 1), (102, 1)]);
+        // `many_hot`: four uses at depth 2.
+        let mut many_hot =
+            lr_weighted(2, 0, 300, vec![(100, 100), (101, 100), (102, 100), (103, 100)]);
+        // The legacy scalar model gives BOTH `10^2 * n_uses`, and `one_hot`
+        // (3 uses) would even look comparable to `many_hot` (4 uses).
+        one_hot.priority = 300;
+        many_hot.priority = 400;
+
+        let mut a = LinearScanAllocator::new(vec![], regs);
+        a.init_registers();
+        a.allocate_range(one_hot.clone());
+        a.allocate_range(many_hot.clone());
+
+        // An incoming hotter than `one_hot` but colder than `many_hot` must
+        // pick `one_hot` as the victim.
+        let incoming = lr_weighted(3, 50, 60, vec![(55, 200)]);
+        let pick = a.select_evict_victim(&incoming, 6).expect("a victim exists");
+        assert_eq!(
+            a.active[pick].range.value_id, 1,
+            "must evict the range with the lower REMAINING weighted cost"
+        );
+    }
+
+    /// Mode 6 keeps every soundness guard of mode 3: ABI-hinted values are
+    /// never evicted, and the victim's next use must be past `incoming.end`.
+    #[test]
+    fn mode6_keeps_the_mode3_soundness_guards() {
+        let regs = vec![PhysReg(0)];
+
+        // (a) ABI-hinted victim is immune even at zero remaining cost.
+        let mut hinted = lr_weighted(1, 0, 200, vec![(1, 100)]);
+        hinted.reg_hint = Some(PhysReg(0));
+        let incoming = lr_weighted(2, 50, 120, vec![(60, 1000)]);
+        let mut a = LinearScanAllocator::new(vec![], regs.clone());
+        a.init_registers();
+        a.allocate_range(hinted);
+        assert_eq!(a.select_evict_victim(&incoming, 6), None);
+
+        // (b) A victim needed DURING the incoming's lifetime is refused.
+        let victim = lr_weighted(3, 0, 200, vec![(1, 100), (80, 1)]);
+        let incoming2 = lr_weighted(4, 50, 120, vec![(60, 1000), (119, 1000)]);
+        assert!(victim.remaining_cost(50) < incoming2.remaining_cost(50));
+        let mut b = LinearScanAllocator::new(vec![], regs);
+        b.init_registers();
+        b.allocate_range(victim);
+        assert_eq!(
+            b.select_evict_victim(&incoming2, 6),
+            None,
+            "next use 80 lies inside [50,120]: reload thrash, refuse"
+        );
+    }
+
+    /// Modes 1-3 must be untouched by the cost model: same victim, same
+    /// refusal, whether or not per-use weights happen to be attached.
+    #[test]
+    fn legacy_modes_are_unaffected_by_attached_weights() {
+        let regs = vec![PhysReg(0)];
+        let build = |weighted: bool| {
+            let mut victim = if weighted {
+                lr_weighted(1, 0, 200, vec![(1, 1), (2, 1)])
+            } else {
+                lr(1, 0, 200, vec![1, 2], 2)
+            };
+            victim.priority = 2;
+            let mut incoming = if weighted {
+                lr_weighted(2, 50, 120, vec![(130, 1), (140, 1), (150, 1)])
+            } else {
+                lr(2, 50, 120, vec![130, 140, 150], 3)
+            };
+            incoming.priority = 3;
+            (victim, incoming)
+        };
+        for weighted in [false, true] {
+            let (victim, incoming) = build(weighted);
+            let mut a = LinearScanAllocator::new(vec![], regs.clone());
+            a.init_registers();
+            a.allocate_range(victim);
+            assert_eq!(
+                a.select_evict_victim(&incoming, 3),
+                Some(0),
+                "mode 3 decision must not depend on the cost table (weighted={weighted})"
+            );
+        }
     }
 }

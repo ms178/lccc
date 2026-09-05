@@ -1229,7 +1229,28 @@ impl IntrinsicOp {
             | Pmovzxbw256 | Pmovzxbd256 | Pmovzxwd256
             | Pmovsxbw256 | Pmovsxbd256 | Pmovsxwd256
             | Psrawi256 | Psradi256 | Packssdw256 | Packuswb256
-            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256 => Some(32),
+            | Phaddw256 | Phaddd256 | Pabsd256 | Pmuludq256
+            // `VecMaskedAddI32x8` folds eight I32 lanes into an I32x8
+            // accumulator: a 256-bit result, emitted with `vpaddd %ymm`.
+            // It was grouped with its 128-bit WIDENING sibling
+            // (`VecWidenMaskedAddI32x4ToI64x2`, whose I64x2 result really is
+            // 128-bit), which made every copy of the accumulator a legacy
+            // `movdqa %xmm`. That preserves bits 255:128 of the destination,
+            // so the upper four lanes of the accumulator never advanced and
+            // the guarded sum silently dropped half its terms
+            // (tests/regression/vector_guard_sum.c: 279 instead of 651). It
+            // also handed the value a 16-byte protected slot for 32 bytes of
+            // data.
+            | VecMaskedAddI32x8
+            // The `I64x4` family (4 x i64 = 32 bytes) was appended to the
+            // 128-bit list together with `VecHorizontalAddI64x4`. x86 has no
+            // lowering for them today (`intrinsics.rs` matches them to a
+            // no-op and `vec_interleave` keeps them out of the accumulator
+            // set), so the mistake is latent -- but a 256-bit shape declaring
+            // 16 bytes is a loaded gun: it hands the value a half-size
+            // protected slot and makes every copy a legacy `movdqa %xmm`
+            // that silently freezes the upper lanes. Classify by shape.
+            | VecLoadI64x4 | VecAddI64x4 | VecZeroI64x4 => Some(32),
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
@@ -1259,8 +1280,7 @@ impl IntrinsicOp {
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
-            | VecMaskedAddI32x8
-            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2 | VecLoadI64x4 | VecAddI64x4 | VecHorizontalAddI64x4 | VecZeroI64x4
+            | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
             | VecMulI32x4 | VecBroadcastI32x4 | VecSmaxI32x4
             | Paddusb128 | Paddsb128 | Paddusw128 | Paddsw128 | Psubsw128
             | Pandn128 | Pcmpeqw128 | Pcmpgtd128 | Pavgb128 | Pavgw128
@@ -1427,5 +1447,106 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBlendvF64x4
                 | IntrinsicOp::VecBlendvF64x2
         )
+    }
+}
+
+#[cfg(test)]
+mod vector_result_width_tests {
+    use super::IntrinsicOp;
+
+    /// `vector_result_width` is the single authority that decides a vector
+    /// value's slot size AND the width of every copy the backend emits for it
+    /// (`vmovdqa %ymm` vs legacy `movdqa %xmm`). A too-narrow answer is a
+    /// silent miscompile, not merely a missed optimisation: a legacy
+    /// `movdqa %xmm` PRESERVES bits 255:128 of the destination, so a
+    /// loop-carried 256-bit accumulator stops advancing in its upper lanes.
+    ///
+    /// `VecMaskedAddI32x8` (I32x8 accumulator, `vpaddd %ymm`) was grouped with
+    /// its 128-bit widening sibling `VecWidenMaskedAddI32x4ToI64x2` (I64x2
+    /// accumulator) and reported 16. `tests/regression/vector_guard_sum.c`
+    /// summed 279 instead of 651 — exactly the low four lanes plus the scalar
+    /// remainder.
+    #[test]
+    fn masked_reduction_steps_report_their_real_accumulator_width() {
+        assert_eq!(
+            IntrinsicOp::VecMaskedAddI32x8.vector_result_width(),
+            Some(32),
+            "I32x8 accumulator is 256-bit"
+        );
+        assert_eq!(
+            IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2.vector_result_width(),
+            Some(16),
+            "I64x2 accumulator is 128-bit"
+        );
+        assert_eq!(
+            IntrinsicOp::VecWidenAddI32x4ToI64x2.vector_result_width(),
+            Some(16)
+        );
+    }
+
+    /// Every `*I32x8` / `*F64x4` / `*F32x8` / `*I64x4` reduction or arithmetic
+    /// op names its lane count in its identifier; the declared width must
+    /// agree with that name. This catches the copy-paste class of defect
+    /// generally instead of pinning one operation.
+    #[test]
+    fn declared_width_agrees_with_the_lane_count_in_the_name() {
+        // (op, name) pairs for the 256-bit auto-vectorizer family.
+        let wide: &[(IntrinsicOp, &str)] = &[
+            (IntrinsicOp::VecMaskedAddI32x8, "VecMaskedAddI32x8"),
+            (IntrinsicOp::VecAddI32x8, "VecAddI32x8"),
+            (IntrinsicOp::VecLoadI32x8, "VecLoadI32x8"),
+            (IntrinsicOp::VecZeroI32x8, "VecZeroI32x8"),
+            (IntrinsicOp::VecAddF64x4, "VecAddF64x4"),
+            (IntrinsicOp::VecMulF64x4, "VecMulF64x4"),
+            (IntrinsicOp::VecLoadF64x4, "VecLoadF64x4"),
+            (IntrinsicOp::VecAddF32x8, "VecAddF32x8"),
+            (IntrinsicOp::VecAddI64x4, "VecAddI64x4"),
+            (IntrinsicOp::VecLoadI64x4, "VecLoadI64x4"),
+            (IntrinsicOp::VecZeroI64x4, "VecZeroI64x4"),
+        ];
+        for (op, name) in wide {
+            assert_eq!(
+                op.vector_result_width(),
+                Some(32),
+                "{name}: a 256-bit lane shape must declare 32 bytes"
+            );
+        }
+        // `VecHorizontalAdd*` reduces to a SCALAR. The doc comment on
+        // `vector_result_width` states this explicitly ("ops whose result is
+        // a SCALAR must never be listed here even if their name sounds
+        // vector-ish"), yet `VecHorizontalAddI64x4` was listed as 128-bit --
+        // the only member of its family in the table. Misclassifying a scalar
+        // as a vector switches its codegen from value-load to `leaq`
+        // addressing (the volatile_access regression named in that comment).
+        for (op, name) in [
+            (IntrinsicOp::VecHorizontalAddI64x4, "VecHorizontalAddI64x4"),
+            (IntrinsicOp::VecHorizontalAddI64x2, "VecHorizontalAddI64x2"),
+            (IntrinsicOp::VecHorizontalAddI32x8, "VecHorizontalAddI32x8"),
+            (IntrinsicOp::VecHorizontalAddI32x4, "VecHorizontalAddI32x4"),
+            (IntrinsicOp::VecHorizontalAddF64x4, "VecHorizontalAddF64x4"),
+            (IntrinsicOp::VecHorizontalAddF64x2, "VecHorizontalAddF64x2"),
+            (IntrinsicOp::VecHorizontalAddF32x8, "VecHorizontalAddF32x8"),
+            (IntrinsicOp::VecHorizontalAddF32x4, "VecHorizontalAddF32x4"),
+        ] {
+            assert_eq!(
+                op.vector_result_width(),
+                None,
+                "{name} reduces to a scalar and must not claim a vector width"
+            );
+        }
+
+        let narrow: &[(IntrinsicOp, &str)] = &[
+            (IntrinsicOp::VecAddI32x4, "VecAddI32x4"),
+            (IntrinsicOp::VecAddF64x2, "VecAddF64x2"),
+            (IntrinsicOp::VecAddF32x4, "VecAddF32x4"),
+            (IntrinsicOp::VecAddI64x2, "VecAddI64x2"),
+        ];
+        for (op, name) in narrow {
+            assert_eq!(
+                op.vector_result_width(),
+                Some(16),
+                "{name}: a 128-bit lane shape must declare 16 bytes"
+            );
+        }
     }
 }

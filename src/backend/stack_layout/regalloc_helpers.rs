@@ -352,6 +352,41 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         Vec::new()
     };
     let reg_hints = collect_abi_reg_hints(func, &available_regs, &caller_saved_regs);
+
+    // ── Static-chain register reservation (GNU C nested functions) ───────
+    //
+    // `SetStaticChain` is lowered as a DIRECT write of the ABI chain register
+    // (`%r10` on x86-64, `%ecx` on i686) immediately before the call, outside
+    // the allocator's model: it has no IR dest, so nothing tells the scan that
+    // the register dies there. Any value the scan homed in the chain register
+    // and that is still live across the call is silently destroyed.
+    //
+    // gcc.c-torture/execute/920501-7.c hit exactly this at -O1..-Os. In the
+    // recursive nested function `y`, the argument `a - 1` was homed in `%r10`:
+    //
+    //     movl 48(%rsp), %r10d
+    //     subl $1, %r10d          # a-1 lives in %r10
+    //     movq %r11, %r10         # SetStaticChain -- clobbers a-1
+    //     movq %r11, %rdi         # arg0 <- (relayed through the now-equal r11)
+    //     call x.y                # y(chain) instead of y(a-1): infinite
+    //                             # recursion -> SIGSEGV at ANY depth
+    //
+    // Reserving the register for functions that actually make nested calls is
+    // the right trade: the construct is rare, and per-point modelling of one
+    // hard register would add interference surface to every ordinary function
+    // for no benefit. Functions with only `GetStaticChain` (a nested callee
+    // that never calls a sibling) are unaffected — the chain is read once at
+    // entry into a normal home, and reserving there would cost a register for
+    // nothing.
+    let (available_regs, caller_saved_regs, call_arg_regs, indirect_target_regs) =
+        reserve_static_chain_reg(
+            func,
+            available_regs,
+            caller_saved_regs,
+            call_arg_regs,
+            indirect_target_regs,
+        );
+
     let accumulator_policy = if caller_saved_regs.iter().any(|r| r.0 == 10)
         || (caller_saved_regs.is_empty() && available_regs.iter().any(|r| r.0 == 1))
         // riscv64 with the caller-saved a0–a7 pool open (s11 + a0 in the
@@ -459,4 +494,139 @@ pub fn find_param_alloca(func: &IrFunction, param_idx: usize) -> Option<(Value, 
             _ => None,
         })
     })
+}
+
+/// PhysReg id of the ABI static-chain register, or `None` when this target's
+/// chain register is not in any allocatable pool.
+///
+/// | target  | chain register | allocator id |
+/// |---------|----------------|--------------|
+/// | x86-64  | `%r10`         | `PhysReg(11)` |
+/// | i686    | `%ecx`         | `PhysReg(4)`  |
+/// | AArch64 | `x18`          | not allocatable |
+/// | RISC-V  | `t2`           | not allocatable |
+///
+/// AArch64 and RISC-V keep their chain register outside the allocator's
+/// register file entirely, so they need no reservation.
+pub fn static_chain_phys_reg() -> Option<PhysReg> {
+    if crate::common::types::target_is_32bit() {
+        // i686 `%ecx`. (The 32-bit ARM/RISC-V configurations do not reach the
+        // x86 pools; the caller only removes ids that are actually present.)
+        Some(PhysReg(4))
+    } else {
+        // x86-64 `%r10`.
+        Some(PhysReg(11))
+    }
+}
+
+/// Whether `func` performs a direct call to a nested function, i.e. contains a
+/// `SetStaticChain` that writes the ABI chain register before a call.
+///
+/// `GetStaticChain` alone (a nested callee reading its own chain at entry) is
+/// deliberately NOT a trigger: that is an ordinary def with a normal home.
+pub fn func_sets_static_chain(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|b| {
+        b.instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::SetStaticChain { .. }))
+    })
+}
+
+/// Remove the static-chain register from every allocatable pool when `func`
+/// makes a direct nested-function call. See the call site for the miscompile
+/// this prevents (gcc.c-torture/execute/920501-7.c).
+fn reserve_static_chain_reg(
+    func: &IrFunction,
+    available: Vec<PhysReg>,
+    caller_saved: Vec<PhysReg>,
+    call_arg: Vec<PhysReg>,
+    indirect_target: Vec<PhysReg>,
+) -> (Vec<PhysReg>, Vec<PhysReg>, Vec<PhysReg>, Vec<PhysReg>) {
+    if !func_sets_static_chain(func) {
+        return (available, caller_saved, call_arg, indirect_target);
+    }
+    let Some(chain) = static_chain_phys_reg() else {
+        return (available, caller_saved, call_arg, indirect_target);
+    };
+    let drop = |v: Vec<PhysReg>| -> Vec<PhysReg> {
+        v.into_iter().filter(|r| r.0 != chain.0).collect()
+    };
+    (
+        drop(available),
+        drop(caller_saved),
+        drop(call_arg),
+        drop(indirect_target),
+    )
+}
+
+#[cfg(test)]
+mod static_chain_reservation_tests {
+    use super::*;
+    use crate::ir::instruction::{BasicBlock, Operand, Terminator};
+    use crate::ir::reexports::{BlockId, Value};
+
+    fn func_with(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        f
+    }
+
+    #[test]
+    fn set_static_chain_is_detected_get_alone_is_not() {
+        assert!(!func_sets_static_chain(&func_with(vec![])));
+        assert!(!func_sets_static_chain(&func_with(vec![
+            Instruction::GetStaticChain { dest: Value(1) }
+        ])));
+        assert!(func_sets_static_chain(&func_with(vec![
+            Instruction::SetStaticChain {
+                src: Operand::Value(Value(1))
+            }
+        ])));
+    }
+
+    #[test]
+    fn chain_register_is_removed_from_every_pool() {
+        let chain = static_chain_phys_reg().expect("x86 targets publish a chain reg");
+        let pool = vec![PhysReg(1), chain, PhysReg(12)];
+        let f = func_with(vec![Instruction::SetStaticChain {
+            src: Operand::Value(Value(1)),
+        }]);
+        let (a, c, ca, it) = reserve_static_chain_reg(
+            &f,
+            pool.clone(),
+            pool.clone(),
+            pool.clone(),
+            pool.clone(),
+        );
+        for (name, v) in [
+            ("available", &a),
+            ("caller_saved", &c),
+            ("call_arg", &ca),
+            ("indirect_target", &it),
+        ] {
+            assert!(
+                !v.iter().any(|r| r.0 == chain.0),
+                "{name} pool must not keep the static-chain register"
+            );
+            assert_eq!(v.len(), 2, "{name} pool must keep every other register");
+        }
+    }
+
+    #[test]
+    fn pools_are_untouched_without_a_nested_call() {
+        let chain = static_chain_phys_reg().expect("x86 targets publish a chain reg");
+        let pool = vec![PhysReg(1), chain, PhysReg(12)];
+        let f = func_with(vec![Instruction::GetStaticChain { dest: Value(1) }]);
+        let (a, c, ca, it) =
+            reserve_static_chain_reg(&f, pool.clone(), pool.clone(), pool.clone(), pool.clone());
+        assert_eq!(a, pool);
+        assert_eq!(c, pool);
+        assert_eq!(ca, pool);
+        assert_eq!(it, pool);
+    }
 }

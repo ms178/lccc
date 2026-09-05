@@ -39,10 +39,35 @@ Default eviction mode 3. Mode 5 lost gzip and stays opt-in.
 `enable_splitting` is retained as the RA-06 gate; in-scan reload-at-next-use
 remains the top open item.
 
+**Mode 6 (opt-in): position-relative cost.** Modes 1–3 rank victims by the
+global `priority` = `(Σ_uses pgo_weight) × 10^min(max_loop_depth, 4)` — one
+scalar per range, so a single inner-loop use prices a range like twenty, and
+uses already behind the scan point still count. Mode 6 ranks by
+`LiveRange::spill_cost_at(incoming.start)`: per-use block frequency
+(`use_weights` / `suffix_cost`, the `MachineBlockFrequencyInfo` analogue),
+summed only over uses **strictly after** the scan point, times `cost_boost`
+(the policy multiplier the three `bump_*_priority` helpers maintain for reads
+invisible in the IR use chain). Same soundness guards as mode 3; only the
+currency changes. Ranges with no attached `use_weights` degrade exactly to
+the historical unit-weight `future_uses` count, so unenriched scans are
+bit-identical.
+
+The position-relative order subsumes the twice-reverted "zero-future-use
+dead victim" experiments (see [`../DECISIONS.md`](../DECISIONS.md)): those
+bolted a special case onto an unchanged global order, whereas here a dead
+victim is simply the cheapest one under one consistent order.
+
 `RegAllocConfig` includes call/indirect exclusions, XMM regs, folded index
 uses, and ABI physical hints.
 
 PhysReg **(11) = %r10** (static chain), (10) = %r11.
+
+The static-chain register is **removed from every allocatable pool** in a
+function containing `SetStaticChain` (`reserve_static_chain_reg` in
+`stack_layout/regalloc_helpers.rs`): that instruction writes `%r10` / `%ecx`
+directly with no IR dest, so a value homed there and live across the nested
+call was silently clobbered (gcc.c-torture `920501-7.c`). `GetStaticChain`
+alone is not a trigger.
 
 ## Open quality gaps
 

@@ -3469,3 +3469,128 @@ pub fn normalize_atomic_size_suffix(name: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Parameter types of the libc functions that `BuiltinKind::LibcAlias` maps to,
+/// for the families whose signature contains a **`size_t`** (or another
+/// parameter wider than `int`).
+///
+/// # Why this table exists
+///
+/// A `__builtin_memcmp(p, q, n)` call is legal in a translation unit that never
+/// declares `memcmp`, so the lowering cannot rely on a user prototype to supply
+/// the parameter conversions. Without them the `int`-typed length expression
+/// `i + 1` was handed to the callee as a raw 32-bit value in a `size_t` slot:
+///
+///   * at `-O0` the value lives in a 4-byte stack slot, and the 8-byte argument
+///     load pulled the adjacent slot in as the high half — `%rdx` became
+///     `0x1_00000007` and `memcmp` ran off the end of both buffers
+///     (gcc.c-torture/execute/`pr59229.c`);
+///   * a *negative* `int` length was zero-extended where C requires the
+///     `int -> size_t` conversion to sign-extend first.
+///
+/// # Scope
+///
+/// Only the entries whose parameters are genuinely wider than `int` are listed;
+/// families where every parameter is `int`/`double`/pointer need no conversion
+/// and are deliberately absent so the table stays reviewable. `Ptr` entries are
+/// placeholders that keep the positional index aligned — the lowering skips
+/// pointer slots (a pointer argument is never arithmetically converted).
+///
+/// `size_t` / `ssize_t` are pointer-width, so the table is target-dependent and
+/// must be queried, not cached.
+pub fn libc_alias_param_types(libc_name: &str) -> Option<Vec<crate::common::types::IrType>> {
+    use crate::common::types::{target_ptr_size, IrType};
+    // size_t: unsigned, pointer-width (LP64 -> U64, ILP32 -> U32).
+    let size_t = if target_ptr_size() == 8 {
+        IrType::U64
+    } else {
+        IrType::U32
+    };
+    let p = IrType::Ptr;
+    let i32t = IrType::I32;
+    let out: Vec<IrType> = match libc_name {
+        // void *memcpy(void *, const void *, size_t)
+        "memcpy" | "mempcpy" | "memmove" => vec![p, p, size_t],
+        // void *memset(void *, int, size_t)
+        "memset" => vec![p, i32t, size_t],
+        // int memcmp(const void *, const void *, size_t)
+        "memcmp" | "bcmp" => vec![p, p, size_t],
+        // void *memchr(const void *, int, size_t)
+        "memchr" | "rawmemchr" | "memrchr" => vec![p, i32t, size_t],
+        // char *strncpy/strncat(char *, const char *, size_t)
+        "strncpy" | "strncat" | "stpncpy" => vec![p, p, size_t],
+        // int strncmp(const char *, const char *, size_t)
+        "strncmp" | "strncasecmp" => vec![p, p, size_t],
+        // size_t strnlen(const char *, size_t)
+        "strnlen" => vec![p, size_t],
+        // void *__builtin___memcpy_chk(void *, const void *, size_t, size_t)
+        "__memcpy_chk" | "__mempcpy_chk" | "__memmove_chk" => vec![p, p, size_t, size_t],
+        "__memset_chk" => vec![p, i32t, size_t, size_t],
+        "__strncpy_chk" | "__strncat_chk" | "__stpncpy_chk" => vec![p, p, size_t, size_t],
+        "__strcpy_chk" | "__strcat_chk" | "__stpcpy_chk" => vec![p, p, size_t],
+        _ => return None,
+    };
+    Some(out)
+}
+
+#[cfg(test)]
+mod libc_alias_param_type_tests {
+    use super::libc_alias_param_types;
+    use crate::common::types::{target_ptr_size, IrType};
+
+    fn size_t() -> IrType {
+        if target_ptr_size() == 8 {
+            IrType::U64
+        } else {
+            IrType::U32
+        }
+    }
+
+    #[test]
+    fn size_taking_families_are_covered() {
+        // The regression that motivated the table.
+        assert_eq!(
+            libc_alias_param_types("memcmp"),
+            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
+        );
+        // memset's second parameter is `int`, NOT the char being stored.
+        assert_eq!(
+            libc_alias_param_types("memset"),
+            Some(vec![IrType::Ptr, IrType::I32, size_t()])
+        );
+        assert_eq!(
+            libc_alias_param_types("memcpy"),
+            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
+        );
+        assert_eq!(
+            libc_alias_param_types("strncmp"),
+            Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
+        );
+        assert_eq!(libc_alias_param_types("strnlen"), Some(vec![IrType::Ptr, size_t()]));
+        // Both _chk length parameters are size_t.
+        assert_eq!(
+            libc_alias_param_types("__memcpy_chk"),
+            Some(vec![IrType::Ptr, IrType::Ptr, size_t(), size_t()])
+        );
+    }
+
+    #[test]
+    fn size_t_is_unsigned_so_int_lengths_sign_extend_then_widen() {
+        // A signed source converted to an UNSIGNED wider type must go through
+        // a sign extension (C11 6.3.1.3): `(size_t)(int)-1 == SIZE_MAX`. The
+        // table must therefore say `U64`, not `I64`; the cast emitter keys the
+        // extension off the SOURCE signedness.
+        let st = size_t();
+        assert!(!st.is_signed(), "size_t must be unsigned");
+        assert_eq!(st.size(), target_ptr_size(), "size_t must be pointer-width");
+    }
+
+    #[test]
+    fn families_without_wide_parameters_are_absent() {
+        // Everything here is int/double/pointer only: no conversion needed,
+        // and listing them would be unreviewable noise.
+        for n in ["strlen", "strcmp", "strcpy", "abs", "sqrt", "abort", "printf"] {
+            assert_eq!(libc_alias_param_types(n), None, "{n} must not be listed");
+        }
+    }
+}

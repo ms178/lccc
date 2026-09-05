@@ -316,9 +316,39 @@ impl Lowerer {
         let builtin_info = builtins::resolve_builtin(name)?;
         match &builtin_info.kind {
             BuiltinKind::LibcAlias(libc_name) => {
+                // Source types must describe the values `lower_expr` really
+                // produces (see the long note in `expr_calls.rs`):
+                // `get_expr_type` reports the storage-level width and lies
+                // about `i + 1`, which is an `int`.
                 let mut arg_types: Vec<IrType> =
-                    args.iter().map(|a| self.get_expr_type(a)).collect();
+                    args.iter().map(|a| self.value_ir_type(a)).collect();
                 let mut arg_vals: Vec<Operand> = args.iter().map(|a| self.lower_expr(a)).collect();
+                // A `__builtin_*` call carries the libc function's signature
+                // whether or not the TU declared the libc symbol, so the
+                // parameter conversions are part of the builtin's contract.
+                // Without them `__builtin_memcmp(p, q, i + 1)` passed a raw
+                // 32-bit `int` where `size_t` was expected: at -O0 the 8-byte
+                // argument load read the neighbouring 4-byte slot as the high
+                // half (gcc.c-torture `pr59229.c`), and a negative length was
+                // zero-extended instead of sign-extended.
+                if let Some(params) = builtins::libc_alias_param_types(libc_name.as_str()) {
+                    for (i, &param_ty) in params.iter().enumerate() {
+                        if i >= arg_vals.len() {
+                            break;
+                        }
+                        let from = arg_types[i];
+                        if from == param_ty
+                            || from == IrType::Ptr
+                            || param_ty == IrType::Ptr
+                            || !from.is_integer()
+                            || !param_ty.is_integer()
+                        {
+                            continue;
+                        }
+                        arg_vals[i] = self.emit_implicit_cast(arg_vals[i].clone(), from, param_ty);
+                        arg_types[i] = param_ty;
+                    }
+                }
                 let dest = self.fresh_value();
                 // The builtin is callable without a prior libc prototype
                 // (`__builtin_printf("%g", f)` in a TU that never includes

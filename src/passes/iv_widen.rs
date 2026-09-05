@@ -244,7 +244,28 @@ fn type_max_i128(ty: IrType) -> i128 {
 /// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
 /// previous revision used `to_i64()` which sign-extends the raw bit pattern
 /// and silently flipped such constants.
-fn widen_const(c: IrConst, from_ty: IrType) -> IrConst {
+/// Widen an integer constant from `from_ty` to 64 bits with the extension
+/// kind implied by `from_ty`. Critical for unsigned: a `U32` constant whose
+/// bit 31 is set must become `0xFFFFFFFF` (4294967295), **not** `-1` — the
+/// previous revision used `to_i64()` which sign-extends the raw bit pattern
+/// and silently flipped such constants.
+///
+/// Returns `None` for a non-integer constant. A floating-point constant here
+/// means an *integer* closure member was admitted from a float-typed
+/// operation, which is a classifier bug: `to_i64()` on `F32(11.0)` yields
+/// `0`, which is how `11.0f * (float) i` once became a hard zero. Callers
+/// must decline the member rather than silently widen garbage.
+fn widen_const(c: IrConst, from_ty: IrType) -> Option<IrConst> {
+    if !matches!(
+        c,
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
+    ) {
+        debug_assert!(
+            false,
+            "iv_widen: non-integer constant {c:?} reached widen_const (from_ty {from_ty:?})"
+        );
+        return None;
+    }
     let raw = c.to_i64().unwrap_or(0) as u64;
     let bits = narrow_bit_width(from_ty);
     let val = if is_unsigned_ty(from_ty) {
@@ -259,7 +280,7 @@ fn widen_const(c: IrConst, from_ty: IrType) -> IrConst {
         let shift = 64 - bits;
         ((raw << shift) as i64 >> shift) as u64
     };
-    IrConst::I64(val as i64)
+    Some(IrConst::I64(val as i64))
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +849,21 @@ fn analyze_iv(
                     let cur_rhs = matches!(rhs, Operand::Value(v) if v.0 == cur.0);
                     let other = if cur_lhs { rhs } else { lhs };
 
+                    // **Integer-closure invariant.** Every widening identity
+                    // in this pass (`ext(x op c) == ext(x) op ext(c)`, the
+                    // signed-overflow-is-UB theorem, the bitwise theorem) is
+                    // stated over *integers*. A float/decimal-typed operation
+                    // reading the member would need a value CONVERSION, not a
+                    // bit-level reinterpretation, and `widen_const` would turn
+                    // its FP constant into a garbage integer. Note the
+                    // wide-chain shortcut below keys off `ty.size() >= 8`,
+                    // which `F64`/`D64` also satisfy — so this gate must come
+                    // first, not after it.
+                    if !ty.is_integer() {
+                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
+                        continue;
+                    }
+
                     // Wide-type chain ops (already 64-bit): pure pass-through,
                     // nothing to widen — classify their uses.
                     if ty.size() >= 8 {
@@ -1074,6 +1110,11 @@ fn analyze_iv(
                     if !matches!(src, Operand::Value(v) if v.0 == cur.0) {
                         continue;
                     }
+                    // `is_unsigned_ty` answers `false` for every non-integer
+                    // type, so a bare `same_sign` test cannot distinguish
+                    // `I32 -> I64` (a widening extension) from `I32 -> F32`
+                    // (a value *conversion*). Establish integer-ness first.
+                    let to_is_int = to_ty.is_integer();
                     let same_sign = is_unsigned_ty(*to_ty) == is_unsigned_ty(*from_ty);
                     // Cross-sign widening cast (U32→I64 / I32→U64). Members
                     // are always 32-bit, so these two pairs are the complete
@@ -1100,10 +1141,20 @@ fn analyze_iv(
                         queue.push((*dest, false));
                         continue;
                     }
-                    if to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
-                        // Widening cast (i8→i32, i32→i64, ...): the dest
-                        // becomes wide; drop it and alias its uses to the
+                    if to_is_int && to_ty.size() >= 4 && *to_ty != IrType::Ptr && same_sign {
+                        // Widening *integer* cast (i8→i32, i32→i64, ...): the
+                        // dest becomes wide; drop it and alias its uses to the
                         // underlying member.
+                        //
+                        // `to_is_int` is load-bearing. Without it `F32`
+                        // (size 4, `is_unsigned_ty` == false, hence
+                        // "same sign" as `I32`) was admitted here, so
+                        // `(float) i` was dropped and its consumers were
+                        // re-classified as *integer* members of the closure.
+                        // `11.0f * (float) i` then became
+                        // `Mul(i:I64, widen_const(F32(11.0)) = I64(0))`
+                        // — every such product silently evaluated to zero
+                        // (gcc.c-torture `20060420-1.c`).
                         members.push(Member::of(
                             *dest,
                             MemberKind::WidenCast { operand: cur },
@@ -1148,6 +1199,14 @@ fn analyze_iv(
                     let lhs_is_cur = matches!(lhs, Operand::Value(v) if v.0 == cur.0);
                     let rhs_is_cur = matches!(rhs, Operand::Value(v) if v.0 == cur.0);
                     if !lhs_is_cur && !rhs_is_cur {
+                        continue;
+                    }
+                    // Integer-closure invariant (see the `BinOp` arm): an
+                    // FP-typed compare of an integer member is ill-typed IR
+                    // and neither widening nor the `Trunc` repair (which
+                    // would emit an int→float conversion) preserves it.
+                    if !ty.is_integer() {
+                        narrow_escape_or_bail(lp, bi, cur, narrow, &mut escapes)?;
                         continue;
                     }
                     let other = if lhs_is_cur { rhs } else { lhs };
@@ -1208,7 +1267,7 @@ fn analyze_iv(
                 } => {
                     let cur_is_true = matches!(true_val, Operand::Value(v) if v.0 == cur.0);
                     let cur_is_false = matches!(false_val, Operand::Value(v) if v.0 == cur.0);
-                    if cur_is_true || cur_is_false {
+                    if (cur_is_true || cur_is_false) && ty.is_integer() {
                         // A member used as select *data*: admissible when the
                         // other data operand is a const or an admitted member.
                         let other_op = if cur_is_true { false_val } else { true_val };
@@ -1323,7 +1382,7 @@ fn member_range(members: &[Member], v: Value) -> Option<Range> {
 }
 
 fn const_as_range(c: IrConst, ty: IrType) -> Option<Range> {
-    let v = widen_const(c, ty).to_i64()? as i128;
+    let v = widen_const(c, ty)?.to_i64()? as i128;
     Some(Range { lo: v, hi: v })
 }
 
@@ -1467,7 +1526,96 @@ fn prove_counted_bound(
 /// any mutation. Analysis and apply run back-to-back so this always passes;
 /// it exists to make the provenance explicit and to fail atomically if the IR
 /// ever drifts from what the analysis saw.
+/// Integer-closure invariant over a whole plan.
+///
+/// Every widening identity used by this pass — `ext(x op c) == ext(x) op
+/// ext(c)`, the signed-overflow-is-UB theorem, the bitwise theorem, and the
+/// order-preservation of `sext`/`zext` — is a statement about *integers*.
+/// A member that is not integer-typed (or a constant that is not an integer
+/// constant) means the classifier admitted a value conversion as if it were
+/// a bit-level extension, and `widen_const` would fabricate a garbage
+/// integer for it. Reject the entire plan; the loop simply stays narrow.
+///
+/// Regression anchor: `Cast { I32 -> F32 }` used to pass the `WidenCast`
+/// test (`F32.size() == 4`, and `is_unsigned_ty` is `false` for both sides,
+/// so the "same sign" test succeeded), after which `11.0f * (float) i` was
+/// retyped to `Mul(i:I64, I64(0))` — a silent hard zero.
+fn plan_is_integral(func: &IrFunction, plan: &WidenPlan) -> bool {
+    let integral_const =
+        |c: &IrConst| matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero);
+    if !plan.phi_ty.is_integer() || !plan.wide_ty.is_integer() {
+        return false;
+    }
+    if let Operand::Const(c) = &plan.init {
+        if !integral_const(c) {
+            return false;
+        }
+    }
+    if let Operand::Const(c) = &plan.step {
+        if !integral_const(c) {
+            return false;
+        }
+    }
+    for m in &plan.members {
+        // A `NarrowCast` member is deliberately RETAINED as a conversion of
+        // the wide value (`Cast { from_ty: wide_ty, to_ty: m.orig_ty }`), so
+        // its `orig_ty` is the conversion *target* and may legitimately be
+        // non-integer (`(float) i` lands here). Every other member kind
+        // names a value that must physically hold the widened integer.
+        if matches!(m.kind, MemberKind::NarrowCast { .. }) {
+            continue;
+        }
+        if !m.orig_ty.is_integer() {
+            return false;
+        }
+        match &m.kind {
+            MemberKind::BinOpConst { c, .. } if !integral_const(c) => return false,
+            MemberKind::Select { b, .. } => {
+                if let Operand::Const(c) = b {
+                    if !integral_const(c) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        // The live IR must agree: the defining instruction's operating type
+        // is what the retype will overwrite with `wide_ty`.
+        if let Some((_, inst)) = find_def(func, m.value) {
+            let op_ty = match inst {
+                Instruction::BinOp { ty, .. } | Instruction::Select { ty, .. } => Some(*ty),
+                _ => None,
+            };
+            if let Some(t) = op_ty {
+                if !t.is_integer() {
+                    return false;
+                }
+            }
+        }
+    }
+    for c in &plan.cmps {
+        if let CmpAction::Widen { cmp_ty, other, .. } = c {
+            if !cmp_ty.is_integer() {
+                return false;
+            }
+            if let CmpOther::Const(k) = other {
+                if !integral_const(k) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 fn verify_plan(func: &IrFunction, plan: &WidenPlan) -> bool {
+    // Integer-closure invariant, re-checked on the *plan* right before any
+    // mutation: every widening identity this pass relies on is stated over
+    // integers, and `widen_const` cannot represent an FP constant. A single
+    // float-typed member is therefore a hard reject, not a partial apply.
+    if !plan_is_integral(func, plan) {
+        return false;
+    }
     // Latch shape: the step operand must still be what we recorded.
     let Some(step) = plan_step_operand(func, plan.phi_dest, plan.latch_dest) else {
         return false;
@@ -1658,7 +1806,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
 
     // 1. Preheader: wide init.
     let wide_init: Operand = match plan.init {
-        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty)),
+        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
         Operand::Value(v) => {
             let d = fresh();
             push_inst(
@@ -1676,7 +1824,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
 
     // 2. Preheader: wide step (invariant value only — consts fold inline).
     let wide_step: Operand = match plan.step {
-        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty)),
+        Operand::Const(c) => Operand::Const(widen_const(c, phi_ty).unwrap_or(c)),
         Operand::Value(v) => {
             let d = fresh();
             push_inst(
@@ -1735,7 +1883,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
                     {
                         *ty = wide_ty;
                         let cop = if *const_is_lhs { lhs } else { rhs };
-                        *cop = Operand::Const(widen_const(*c, m.orig_ty));
+                        *cop = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
                     }
                 }
             }
@@ -1766,10 +1914,10 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
                     {
                         *ty = wide_ty;
                         if let Operand::Const(c) = true_val {
-                            *true_val = Operand::Const(widen_const(*c, m.orig_ty));
+                            *true_val = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
                         }
                         if let Operand::Const(c) = false_val {
-                            *false_val = Operand::Const(widen_const(*c, m.orig_ty));
+                            *false_val = Operand::Const(widen_const(*c, m.orig_ty).unwrap_or(*c));
                         }
                     }
                 }
@@ -1833,7 +1981,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
                 cmp_ty,
             } => {
                 let wide_other = match other {
-                    CmpOther::Const(c) => Operand::Const(widen_const(*c, *cmp_ty)),
+                    CmpOther::Const(c) => Operand::Const(widen_const(*c, *cmp_ty).unwrap_or(*c)),
                     CmpOther::InvariantValue { value, from_ty } => {
                         match find_hoisted_cast(func, preheader_idx, *value, *from_ty, wide_ty) {
                             Some(d) => Operand::Value(d),
@@ -1934,7 +2082,7 @@ fn apply_widen(func: &mut IrFunction, plan: &WidenPlan, preheader_idx: usize, de
         // wide value: rewriting them would put a 32-bit truncation into a
         // 64-bit slot.
         for inst in func.blocks[bi].instructions.iter_mut() {
-            if escape_read_needs_narrow(inst, member) {
+            if escape_read_needs_narrow(inst, member, wide_ty) {
                 rewrite_operand_value(inst, member, Operand::Value(narrow));
             }
         }
@@ -2177,14 +2325,42 @@ fn replace_all_uses_of_value(func: &mut IrFunction, old_val: Value, new_op: Oper
 ///
 /// Everything else (narrow binops, narrow select data, store values, call
 /// arguments, return/switch values) is a narrow consumer and gets the trunc.
-fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
+/// Whether an operand slot declared as `slot_ty` may read the **widened**
+/// member directly instead of the re-truncated narrow value.
+///
+/// After widening, the member's SSA value physically holds `wide_ty`
+/// (`I64`/`U64` on LP64). A reader is only type-correct when its declared
+/// operand type is an integer/pointer slot of exactly that width: anything
+/// narrower would silently drop the upper half, and anything of a *different
+/// kind* (floating point, vector, `Void`) would reinterpret the bits.
+///
+/// The last case is not hypothetical. `for (i = 0; i < n; ++i) f((float) i)`
+/// lowers to `Cast { src: i, from_ty: I32, to_ty: F32 }`, which is **not** a
+/// closure member (an int→float conversion is not extension-transparent), so
+/// the plan never retypes its `from_ty`. Letting it read the widened `i`
+/// produced an `I32`-typed read of an `I64` value; the folder then collapsed
+/// the whole conversion to `0.0f` and `K * (float) i` silently evaluated to
+/// zero for every loop-carried `i` (gcc.c-torture `20060420-1.c`, and every
+/// `sum += a[i] * (float) i` shape).
+#[inline]
+fn wide_read_is_type_correct(slot_ty: IrType, wide_ty: IrType) -> bool {
+    matches!(slot_ty, IrType::Ptr) || (slot_ty.is_integer() && slot_ty.size() == wide_ty.size())
+}
+
+fn escape_read_needs_narrow(inst: &Instruction, member: Value, wide_ty: IrType) -> bool {
     let reads = |op: &Operand| matches!(op, Operand::Value(v) if v.0 == member.0);
+    let narrow_slot = |ty: &IrType| !wide_read_is_type_correct(*ty, wide_ty);
     match inst {
-        // GEP offsets and intrinsic index arguments are address arithmetic.
+        // GEP offsets and intrinsic index arguments are address arithmetic:
+        // the backend types those slots at pointer width by construction.
         Instruction::GetElementPtr { .. } | Instruction::Intrinsic { .. } => false,
-        Instruction::BinOp { ty, lhs, rhs, .. } => ty.size() < 8 && (reads(lhs) || reads(rhs)),
-        Instruction::Cmp { .. } => false,
-        Instruction::Cast { .. } => false,
+        Instruction::BinOp { ty, lhs, rhs, .. } => narrow_slot(ty) && (reads(lhs) || reads(rhs)),
+        // `Cmp`/`Cast`/`Phi` used to be unconditionally wide-read. They are
+        // only wide-read when their own declared type says so; a `CmpAction`
+        // has already retyped (or re-truncated) every cmp the plan owns, so
+        // whatever still reads the member here was not retyped.
+        Instruction::Cmp { ty, lhs, rhs, .. } => narrow_slot(ty) && (reads(lhs) || reads(rhs)),
+        Instruction::Cast { from_ty, src, .. } => narrow_slot(from_ty) && reads(src),
         // A Copy of a narrow member carries a narrow dest: it must read the
         // truncation, not the wide value.
         Instruction::Copy { .. } => true,
@@ -2193,8 +2369,10 @@ fn escape_read_needs_narrow(inst: &Instruction, member: Value) -> bool {
             true_val,
             false_val,
             ..
-        } => ty.size() < 8 && (reads(true_val) || reads(false_val)),
-        Instruction::Phi { .. } => false,
+        } => narrow_slot(ty) && (reads(true_val) || reads(false_val)),
+        Instruction::Phi { ty, incoming, .. } => {
+            narrow_slot(ty) && incoming.iter().any(|(op, _)| reads(op))
+        }
         // Load reads a pointer, not the member; store values, calls, atomics
         // and everything else are narrow consumers.
         _ => true,
@@ -3256,22 +3434,22 @@ mod tests {
     fn test_unsigned_const_widen() {
         assert_eq!(
             widen_const(IrConst::I32(-1), IrType::U32),
-            IrConst::I64(0xFFFF_FFFF),
+            Some(IrConst::I64(0xFFFF_FFFF)),
             "U32 0xFFFFFFFF must zero-extend"
         );
         assert_eq!(
             widen_const(IrConst::I32(-1), IrType::I32),
-            IrConst::I64(-1),
+            Some(IrConst::I64(-1)),
             "I32 -1 must sign-extend"
         );
         assert_eq!(
             widen_const(IrConst::I8(-8), IrType::U8),
-            IrConst::I64(0xF8),
+            Some(IrConst::I64(0xF8)),
             "U8 0xF8 must zero-extend"
         );
         assert_eq!(
             widen_const(IrConst::I8(-8), IrType::I8),
-            IrConst::I64(-8),
+            Some(IrConst::I64(-8)),
             "I8 -8 must sign-extend"
         );
     }
