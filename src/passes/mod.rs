@@ -39,6 +39,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod licm;
+pub(crate) mod expr_sink;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
 pub(crate) mod loop_invert;
@@ -1788,6 +1789,16 @@ pub(crate) fn run_passes(
         // the values stored by eliminated instructions feed the next DCE
         // round. Like DCE, its change count is excluded from the
         // diminishing-returns comparison (pure cleanup pass).
+        // Expression sinking: move a pure computation (and, transitively, the
+        // address chain feeding it) to the deepest block dominating all its
+        // uses. Late, after the CFG has settled, so dominance and the
+        // memory-path test see the final shape.
+        if !pass_disabled(&disabled, "expr_sink") && should_run!(9, 5, 6, 7, 8) {
+            total_changes += timed_pass!(
+                "expr_sink",
+                run_on_visited(module, &dirty, &mut changed, expr_sink::sink_expressions)
+            );
+        }
         if !dis.dse && !dis.dce && should_run!(9, 5, 6, 7, 8) {
             let n = timed_pass!(
                 "dse",
