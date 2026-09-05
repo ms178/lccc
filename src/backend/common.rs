@@ -1929,11 +1929,18 @@ fn emit_init_data(
                     const_ty
                 };
 
-                if val.is_zero() {
+                // `is_all_zero_bits`, NOT `is_zero`: the latter is C
+                // truthiness, under which `-0.0` is zero. Collapsing a
+                // `-0.0f` element into `.zero 4` drops its sign bit (a real
+                // miscompile: `static const float t[] = {-0.0f}` read back
+                // as `+0.0f`, so `1/t[0]` gave `+inf` and `signbit` said 0).
+                if val.is_all_zero_bits() {
                     // Count consecutive zero elements and emit as a single .zero
                     let elem_size = elem_ty.size();
                     let mut zero_count = 1usize;
-                    while i + zero_count < values.len() && values[i + zero_count].is_zero() {
+                    while i + zero_count < values.len()
+                        && values[i + zero_count].is_all_zero_bits()
+                    {
                         zero_count += 1;
                     }
                     let zero_bytes = zero_count * elem_size;

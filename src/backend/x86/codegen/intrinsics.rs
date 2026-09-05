@@ -3837,6 +3837,58 @@ impl X86Codegen {
                     self.emit_sse_binary_128(d, args, "pmulld");
                 }
             }
+            // Integer map lane ops. Sub is `src1 - src2` and NON-commutative:
+            // the VLFOLD memory operand is only legal in the src2 slot, and
+            // `emit_sse_binary_128` keeps args[0] as the destination-side
+            // operand of the two-operand SSE form. And/Or/Xor are bit-exact
+            // and commutative; `vpand`/`vpor`/`vpxor` and their SSE2 forms
+            // are 1-cycle, 3/cycle on p015 — the cheapest 256-bit ops the
+            // machine has.
+            IntrinsicOp::VecSubI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsubd", false);
+                }
+            }
+            IntrinsicOp::VecSubI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "psubd");
+                }
+            }
+            IntrinsicOp::VecSubI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "psubq");
+                }
+            }
+            IntrinsicOp::VecAndI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpand", true);
+                }
+            }
+            IntrinsicOp::VecAndI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pand");
+                }
+            }
+            IntrinsicOp::VecOrI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpor", true);
+                }
+            }
+            IntrinsicOp::VecOrI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "por");
+                }
+            }
+            IntrinsicOp::VecXorI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpxor", true);
+                }
+            }
+            IntrinsicOp::VecXorI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_sse_binary_128(d, args, "pxor");
+                }
+            }
             IntrinsicOp::VecMulI32x8 => {
                 if let Some(d) = dest {
                     self.emit_avx_binary_256(d, args, "vpmulld", true);

@@ -173,6 +173,30 @@ impl IrConst {
         }
     }
 
+    /// Whether every BYTE of this constant's object representation is zero —
+    /// the predicate a data emitter needs before collapsing a value into
+    /// `.zero N`.
+    ///
+    /// Deliberately NOT [`IrConst::is_zero`]: that answers "compares equal to
+    /// zero" (C truthiness), which is the right question for the simplifier
+    /// and for comparison lowering, and under which `-0.0 == 0.0` is true.
+    /// Emitting a `-0.0f` array element as `.zero 4` drops the sign bit, and
+    /// every IEEE sign-sensitive consumer then observes the wrong value:
+    /// `1/x` yields `+inf` instead of `-inf`, `signbit`/`copysign` invert,
+    /// and MINPS/MAXPS lane selection changes. Integers have a single zero
+    /// encoding so the two predicates agree there; floats differ exactly on
+    /// negative zero.
+    pub fn is_all_zero_bits(&self) -> bool {
+        match self {
+            IrConst::F32(v) => v.to_bits() == 0,
+            IrConst::F64(v) => v.to_bits() == 0,
+            IrConst::D32(bits) => *bits == 0,
+            IrConst::D64(bits) => *bits == 0,
+            IrConst::LongDouble(_, bytes) => bytes.iter().all(|b| *b == 0),
+            other => other.is_zero(),
+        }
+    }
+
     /// Create a LongDouble constant from an f64 value (low precision - bytes derived from f64).
     /// Use this when no full-precision source text is available.
     pub fn long_double(v: f64) -> IrConst {

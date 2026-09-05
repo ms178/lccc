@@ -3843,6 +3843,25 @@ fn analyze_map_pattern(
         return None;
     };
 
+    // The packed body runs ONE iteration per W elements and keeps no scalar
+    // recurrence alive, so any loop-carried value other than the counter
+    // would leave the loop holding its value after n/W steps instead of n.
+    // Measured before this guard, at -O2/-O3 with a 8-lane body:
+    //   `for (i) { d[i] = a[i]*2; acc += 3; } return acc;`  -> 0 for n = 1
+    //   `for (i) { d[i] = *p++ * 2; }       return p - a;`  -> n/8
+    // A secondary affine recurrence could be re-derived from the byte IV
+    // (acc0 + n*step, base + n*stride) and reconstructed in the epilogue;
+    // until that exists the shape stays scalar. Fail closed.
+    if header
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, Instruction::Phi { dest, .. } if *dest != iv))
+    {
+        set_reject("map loop carries a value other than its induction variable");
+        if debug { eprintln!("[VEC-MAP] BAIL: non-IV header phi"); }
+        return None;
+    }
+
     // IV-derived values across the loop (casts/copies), fixed-point.
     let mut iv_derived = FxHashSet::default();
     iv_derived.insert(iv);
@@ -4211,6 +4230,16 @@ fn parse_map_expr(
                 // Sub/Div (and Sqrt below) lower to VecSub/VecDiv/VecSqrt,
                 // which only the x86 backend implements today.
                 IrBinOp::Sub | IrBinOp::SDiv if fp && allow_ext_fp_ops => {}
+                // Integer subtract and the bitwise lane ops lower to
+                // VecSub/VecAnd/VecOr/VecXor (x86 only, same gate). They are
+                // exact for every element type this path admits: psubd/psubq
+                // wrap in two's complement (the definition for unsigned, a
+                // valid refinement of signed-overflow UB), and pand/por/pxor
+                // are bit-for-bit. The per-target op table in
+                // `transform_map_vector` decides which element widths
+                // actually have a lowering, and fails closed.
+                IrBinOp::Sub | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
+                    if !fp && allow_ext_fp_ops => {}
                 _ => return None,
             }
             let l = parse_map_operand(
@@ -4364,14 +4393,30 @@ fn parse_map_expr(
                 depth + 1,
                 allow_ext_fp_ops,
             )?;
-            // Exact min/max fold, checked on the UNNORMALIZED comparison:
-            //   l < r ? l : r  ->  min(l, r)      (MINPS/MAXPS return the
-            //   l > r ? l : r  ->  max(l, r)       second source on
-            // unordered and both-zero lanes — precisely the folded C
-            // ternary's result for every NaN/+-0 lane).  Swapped-arm forms
-            // (`l < r ? r : l`) are NOT max/min for +-0 (maxps(l, r) picks
-            // r on both-zero lanes where the ternary picks l) and fall
-            // through to the exact compare+select lowering.
+            // Exact min/max fold, checked on the UNNORMALIZED comparison.
+            // Intel's packed MIN/MAX contract is, lane for lane,
+            //     MIN(src1, src2) = (src1 <  src2) ? src1 : src2
+            //     MAX(src1, src2) = (src1 >  src2) ? src1 : src2
+            // where EVERY special case — either operand NaN, or both
+            // operands zero of any sign — returns src2, i.e. "the false
+            // arm".  A strict-ordered ternary therefore folds exactly
+            // whenever its FALSE arm is placed in src2.  `MapExpr::MinMax
+            // { l, r }` emits args `[l, r]`, so `r` IS src2 (see the
+            // vector emitter); that operand order is the whole proof.
+            //
+            // All four strict forms qualify, because IEEE `<` and `>` are
+            // exact mirrors under operand swap (both false on unordered):
+            //   l < r ? l : r  ->  min(l, r)   src1=l, src2=r
+            //   l > r ? l : r  ->  max(l, r)   src1=l, src2=r
+            //   l > r ? r : l  ->  min(r, l)   src1=r, src2=l  (`l>r` == `r<l`)
+            //   l < r ? r : l  ->  max(r, l)   src1=r, src2=l  (`l<r` == `r>l`)
+            // The only exactness hazard is putting the false arm in src1 —
+            // e.g. max(l, r) for `l < r ? r : l` returns r on a +0/-0 lane
+            // where the ternary returns l — which none of these do.
+            //
+            // Non-strict `<=`/`>=` forms differ from MIN/MAX on +0/-0 (and
+            // `<= ? r : l` also on NaN) and keep the exact compare+blend
+            // lowering.
             let fold = match op {
                 IrCmpOp::Slt => {
                     let l = parse_map_operand(
@@ -4397,10 +4442,34 @@ fn parse_map_expr(
                         allow_ext_fp_ops,
                     )?;
                     if t == l && f == r {
+                        // `l < r ? l : r` == min(l, r): MINPS returns the
+                        // second source (r) on unordered and both-zero
+                        // lanes, matching the ternary lane for lane.
                         Some(MapExpr::MinMax {
                             is_max: false,
                             l: Box::new(l),
                             r: Box::new(r),
+                        })
+                    } else if t == r && f == l {
+                        // `l < r ? r : l` == max(r, l) exactly, with the
+                        // ARMS SWAPPED relative to the compare operands
+                        // (mirror of the `l > r ? r : l` -> min(r, l) fold
+                        // below).  `l < r` is `r > l`, so this is
+                        // `(r > l) ? r : l` = MAX(src1 = r, src2 = l):
+                        //   NaN            -> ternary takes F = l; MAX
+                        //                     returns src2 = l          ok
+                        //   +-0 both zero  -> `l < r` is false so the
+                        //                     ternary takes F = l; MAX
+                        //                     returns src2 = l          ok
+                        //   equal non-zero -> F = l == src2             ok
+                        // This is the canonical clamp HEAD `a < 0 ? 0 : a`
+                        // (one vmaxps instead of cmp+blendv), and it is what
+                        // lets a full clamp `a < lo ? lo : (a > hi ? hi : a)`
+                        // lower to vmaxps+vminps the way GCC/Clang/ICX do.
+                        Some(MapExpr::MinMax {
+                            is_max: true,
+                            l: Box::new(r),
+                            r: Box::new(l),
                         })
                     } else {
                         None
@@ -4949,6 +5018,22 @@ fn analyze_stencil_pattern(
         }
     }
     let (iv, iv_ty, cmp_k, limit, exit_cmp_op) = iv_info?;
+
+    // Same fail-closed rule as `analyze_map_pattern`: the packed body runs
+    // one iteration per W elements and reconstructs no scalar recurrence, so
+    // a second loop-carried value would end the loop holding its value after
+    // n/W steps instead of n. This path is reached when the map analyzer
+    // declines, so without the guard here the rejected shape simply arrived
+    // at the same miscompile one analyzer later
+    // (`for (i) { d[i] = a[i]*2; acc += 3; } return acc;` returned 3*(n/8)).
+    if header
+        .instructions
+        .iter()
+        .any(|inst| matches!(inst, Instruction::Phi { dest, .. } if *dest != iv))
+    {
+        set_reject("stencil loop carries a value other than its induction variable");
+        return None;
+    }
 
     // IV start: the phi's non-latch incoming must be a constant.
     let latch_label = func.blocks[latch_idx].label;
@@ -12247,8 +12332,17 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Or) => Some(IntrinsicOp::VecOrI32x4),
+            (IrType::I32 | IrType::U32, true, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x8),
+            (IrType::I32 | IrType::U32, false, IrBinOp::Xor) => Some(IntrinsicOp::VecXorI32x4),
             (IrType::I64 | IrType::U64, _, IrBinOp::Add) => Some(IntrinsicOp::VecAddI64x2),
             (IrType::I64 | IrType::U64, _, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI64x2),
+            (IrType::I64 | IrType::U64, _, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI64x2),
             _ => None,
         }
     };
@@ -13870,13 +13964,20 @@ mod map_fp_select_tests {
     }
 
     #[test]
-    fn swapped_slt_arms_do_not_fold() {
-        // a < b ? b : a  is NOT max(a, b) for +-0 lanes: stays compare+blendv.
+    fn fold_max_from_slt_swapped_arms() {
+        // a < b ? b : a  ->  max(b, a).  The OPERAND ORDER is the proof:
+        // MAX(src1 = b, src2 = a) returns src2 = a on NaN and on both-zero
+        // lanes, which is exactly the ternary's false arm.  max(a, b) would
+        // be wrong on a +0/-0 lane.  This is the clamp head `a < 0 ? 0 : a`.
         let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Slt, b, a));
-        assert!(matches!(
+        assert_eq!(
             analyze(&f),
-            MapExpr::Select(_, _, _)
-        ));
+            MapExpr::MinMax {
+                is_max: true,
+                l: Box::new(load_of(1)),
+                r: Box::new(load_of(0)),
+            }
+        );
     }
 
     #[test]
