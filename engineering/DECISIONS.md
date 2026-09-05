@@ -1009,3 +1009,73 @@ inlined byte-compare helper, **not** a register-allocation problem, so it does
 not belong to any RA item. `rrmov` and `push` are the two buckets where RA
 work still has headroom (RA-07 callee-saved policy, RA-08 affinity
 coalescing).
+
+## Codegen (2026-09-05, session 7) — epilogue cross-jumping; fresh timing baseline
+
+### Landed: epilogue tail merging (`epilogue_merge.rs`)
+
+Every `return` site in a function that uses callee-saved registers received
+its own full epilogue. `glibc_memcmp_common_alignment` had **six byte-identical
+copies** of `addq $120,%rsp; popq %rbp; popq %r15; popq %r14; popq %r13;
+popq %r12; popq %rbx; ret` — 48 instructions, 40 redundant. GCC cross-jumps.
+
+The pass groups exit sites by their exact epilogue text, labels the first, and
+replaces the rest with one `jmp`. Only `popq %reg` (never `%rax`),
+`addq $imm,%rsp` and `leave` are collected, so the return value — materialised
+before the run — is never touched; a run containing a label is rejected; the
+pass is per-function and bails on any function with CFI inside the body.
+
+| | before | after |
+|---|---|---|
+| `glibc_memcmp_common_alignment` insns | 224 | **197** |
+| its `popq` count | 36 | **6** |
+| corpus instructions (67 fns) | 2060 | **2030** |
+
+Corpus opportunity measured before implementing: 15 functions, 119 redundant
+instructions.
+
+### `glibc_memcmp` root cause — the remaining 197 vs GCC's 87
+
+Diagnosed, not yet fixed. Two independent causes, both confirmed by
+measurement:
+
+1. **Inlining the byte-compare helper.** `CCC_INLINE_SKIP=glibc_memcmp_bytes`
+   drops the function from 224 to 133 instructions. GCC also inlines it but
+   keeps the 8-iteration byte loop **rolled** (7 instructions, one copy);
+   lccc replicates it. Oracle check: GCC 16.2 = 112 instructions,
+   ICX = 152, **Clang 23 = 238** — lccc at 225 was mid-field, not last.
+2. **Six callee-saved registers where GCC uses zero.** The source loads all
+   eight words up front; GCC *sinks* each load to its compare
+   (`movq 8(%rax),%rdi; movq 8(%rcx),%rsi; cmpq; jne`), keeping two values
+   live instead of eight. lccc has no scalar load-sinking pass — only
+   `vec_load_sink` for vectors — so pressure forces six callee-saved pushes
+   and a 120-byte frame.
+
+**Scalar load sinking is the high-value item this exposes** (filed OPT-40): it
+is the difference between two and eight simultaneously live values in every
+"load a batch, compare with early exit" loop.
+
+### Fresh timing baseline (paired median, 9 reps, VM screening, no PMU)
+
+Worst ten vs GCC 14.2:
+
+| # | benchmark | LCCC/GCC |
+|---|---|---|
+| 1 | spectral_norm | **1.635×** |
+| 2 | nbody | 1.320× |
+| 3 | fannkuch | 1.278× |
+| 4 | expat_xml_scan | 1.259× |
+| 5 | glibc_memcmp | 1.258× |
+| 6 | hash_table | 1.190× |
+| 7 | double_reduction | 1.179× |
+| 8 | sqlite_varint | 1.125× |
+| 9 | sieve | 1.122× |
+| 10 | arith_loop | 1.113× |
+
+Large wins on the other side: fib 23.8× faster, ackermann 19.3×,
+constant_recursion 18.1×, libm_round_family 4.16×, bitops 1.22×,
+loop_patterns 1.11×.
+
+`spectral_norm` at 1.635× is the single worst result and the correct next
+target; `nbody` (1.32×) and `double_reduction` (1.18×) are the same FP-kernel
+family and are likely to share a root cause with it.

@@ -27,6 +27,7 @@ mod copy_coalesce;
 mod copy_propagation;
 mod dead_code;
 mod dead_writes;
+mod epilogue_merge;
 mod flag_peepholes;
 mod frame_compact;
 mod helpers;
@@ -737,6 +738,12 @@ fn peephole_optimize_inner(mut asm: String) -> String {
         }
         if !sk("spill_deref") {
             global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
+        }
+        // Cross-jump identical function epilogues. Runs with the other global
+        // passes; it only rewrites whole `pop*/addq %rsp/ret` runs, so no
+        // later pass can observe a half-merged exit.
+        if !sk("epilogue_merge") {
+            global_changed |= epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
         }
         // ms178: XMM/vector save→clobber→reload round-trips (double_reduction
         // class): the reload re-executes the original memory load instead of
