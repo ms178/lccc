@@ -124,22 +124,47 @@ fn canonical_addr_key_impl(
                     }
                 };
                 match defs.get(&vid) {
-                    // A WIDENING cast is value-preserving, so the walk may
-                    // descend through it (and must: the frontend materializes
-                    // a fresh cast per source mention, which is what lets two
-                    // arms' `d[i]` GEPs match at all). A TRUNCATING cast is
-                    // NOT: `d[(int) big]` and `d[big]` are different addresses
-                    // and must not collapse to one key, or one arm's access is
-                    // rewritten to the other's address. Stop the walk there and
-                    // key on the cast's own value id.
+                    // A cast may be descended through only when the composite
+                    // root->offset function it contributes is RECORDED in the
+                    // key, so that equal keys still mean equal ADDRESSES.
+                    //
+                    // * int->int, same size: a bit-identical reinterpretation
+                    //   — transparent. The signedness change matters only for
+                    //   a LATER widening, and that widening records its own
+                    //   `from_ty` below.
+                    // * int->int, widening: value-preserving, but `sext` and
+                    //   `zext` of the same source DIFFER for negative inputs.
+                    //   `d[i]` and `d[(unsigned char) i]` with `signed char
+                    //   i = -1` are `d - 1` and `d + 255`; collapsing them
+                    //   into one key made the arm rewrite forward a load
+                    //   across 256 bytes and made `sink_conditional_stores`
+                    //   merge two stores to different addresses (a
+                    //   wrong-address WRITE). The extension kind and both
+                    //   widths therefore go into the key. The walk must still
+                    //   descend, because the frontend materializes a fresh
+                    //   cast per source mention and that is what lets two
+                    //   arms' `d[i]` GEPs match at all.
+                    // * int->int, truncating: `d[(int) big]` and `d[big]` are
+                    //   different addresses. Stop and key on the cast itself.
+                    // * anything touching a floating-point type: not
+                    //   injective over the integer offset — `(long)(float) i`
+                    //   rounds for |i| > 2^24 with no UB. Stop.
                     Some(Instruction::Cast {
                         src: Operand::Value(v),
                         from_ty,
                         to_ty,
                         ..
                     }) => {
-                        if to_ty.size() < from_ty.size() {
+                        if from_ty.is_float() || to_ty.is_float() {
                             break;
+                        }
+                        let (fs, ts) = (from_ty.size(), to_ty.size());
+                        if ts < fs {
+                            break;
+                        }
+                        if ts > fs {
+                            let kind = if from_ty.is_unsigned() { "zx" } else { "sx" };
+                            scale_suffix = format!("{}{}>{}{}", kind, fs, ts, scale_suffix);
                         }
                         off_root = Operand::Value(*v);
                     }
@@ -153,11 +178,17 @@ fn canonical_addr_key_impl(
                         op: IrBinOp::Shl,
                         lhs: Operand::Value(v),
                         rhs: rhs @ Operand::Const(_),
+                        ty,
                         ..
                     }) => {
                         // Value-preserving only in the key sense if the
                         // constant is recorded; keep walking below it.
-                        scale_suffix = format!("<<{:?}{}", rhs, scale_suffix);
+                        // The shift WIDTH is part of the function too: a shift
+                        // wraps at its own type width, so `(long)(u << 1)`
+                        // (32-bit shift, then widen) and `((long) u) << 1`
+                        // (widen, then 64-bit shift) differ for `u >= 2^31`
+                        // with no UB on the unsigned form.
+                        scale_suffix = format!("<<{:?}:{}{}", rhs, ty.size(), scale_suffix);
                         off_root = Operand::Value(*v);
                     }
                     _ => break,
@@ -262,9 +293,16 @@ fn rewrite_covered_arm_loads(
                 ptr,
                 ty,
                 seg_override,
-                ..
+                volatile,
             } = inst
             {
+                // A volatile access is an observable event in its own right
+                // (C11 5.1.2.3): it neither substitutes for another access
+                // nor may be substituted by one. Keep it out of the covering
+                // set entirely.
+                if *volatile {
+                    continue;
+                }
                 let key = canonical_addr_key(ptr);
                 // On a duplicate, keep the last load (same value either way).
                 if let Some(entry) = pred_loads
@@ -303,9 +341,19 @@ fn rewrite_covered_arm_loads(
                     ptr,
                     ty,
                     seg_override,
-                    ..
+                    volatile,
                 } = inst
                 {
+                    // `volatile int g; if (g > 0) return g;` must read `g`
+                    // TWICE. Replacing the arm's volatile load with the
+                    // pred's value deletes an observable access. Measured
+                    // before this guard: lccc emitted ONE `g(%rip)` load at
+                    // -O2 where GCC and Clang emit two. The speculation and
+                    // store-sink paths were already volatile-aware; this
+                    // pattern matched `Load { .. }` and was blind to the flag.
+                    if *volatile {
+                        continue;
+                    }
                     let key = canonical_addr_key(ptr);
                     if let Some((_, _, _, covering)) = pred_loads
                         .iter()

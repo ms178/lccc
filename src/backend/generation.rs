@@ -917,6 +917,15 @@ fn build_indexed_gep_map(
     }
 
     let defs = index_single_defs(func, stab);
+    // Static type of every defined value (multi-def accumulator-flow values
+    // included: all defs of one value share a type). The cast peel below
+    // needs the SOURCE value's own type, not merely the cast's `from_ty`.
+    let val_ty: FxHashMap<u32, IrType> = func
+        .blocks
+        .iter()
+        .flat_map(|b| b.instructions.iter())
+        .filter_map(|i| Some((i.dest()?.0, i.result_type()?)))
+        .collect();
     // Must be captured by `resolve_index`: when set, add/sub peeling is
     // skipped so the SIB index stays the add's RESULT (the pre-PF-06
     // behaviour). The later `iv_in_add = None` rewrite only dropped the
@@ -967,6 +976,23 @@ fn build_indexed_gep_map(
                 break;
             };
             match inst {
+                // Cast peel. The peeled index is later extended to 64 bits
+                // by `ensure_sib_index_form` according to ITS OWN type, so
+                // the peel is sound only when that extension reproduces the
+                // cast chain's value exactly:
+                //   * `from_ty` must really be the source value's type (a
+                //     cast whose `from_ty` disagrees with the def is a width
+                //     lie the peel must not trust);
+                //   * a same-signedness widening keeps the extension domain
+                //     (sext.sext == sext, zext.zext == zext);
+                //   * an unsigned->signed WIDENING is also fine: the zero
+                //     extended value is non-negative in the wider type, so
+                //     any later extension of it equals zext of the root.
+                // Everything else changes the meaning of the root's bits.
+                // `I32 -> U32 -> I64` (i.e. `t[(unsigned) i]`) peeled to the
+                // I32 root and was SIGN-extended: `t[(unsigned char) c]` with
+                // `c = -1` addressed `t[-1]` instead of `t[255]`. That shape
+                // is every character/CRC/tolower table lookup.
                 Instruction::Cast {
                     src: Operand::Value(v),
                     from_ty,
@@ -974,7 +1000,10 @@ fn build_indexed_gep_map(
                     ..
                 } if from_ty.is_integer()
                     && to_ty.is_integer()
-                    && to_ty.size() >= from_ty.size() =>
+                    && to_ty.size() >= from_ty.size()
+                    && val_ty.get(&v.0) == Some(&from_ty)
+                    && (from_ty.is_unsigned() == to_ty.is_unsigned()
+                        || (from_ty.is_unsigned() && to_ty.size() > from_ty.size())) =>
                 {
                     id = v.0;
                 }

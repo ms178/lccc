@@ -1385,3 +1385,746 @@ mod edge_layout_tests {
         assert_eq!(labels, vec![0, 1, 2]);
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// RA-06 — pressure-driven reload-at-next-use (intra-block Belady MIN)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// The allocator's only spill model is LIFETIME DEMOTION: a value that loses
+// the eviction contest is homed in a stack slot for its whole live range, so
+// every one of its uses becomes a memory operand. In a loop body whose
+// MAXLIVE exceeds the register file that is quadratically wrong — the
+// measured case is `tests/benchmark/programs/arith_loop.c`, 32 simultaneously
+// live loop-carried integers on a 13-register file, **165 stack references
+// against GCC's 92**.
+//
+// The classical fix is to decouple SPILLING from COLORING (Braun & Hack,
+// "Register Spilling and Live-Range Splitting for SSA-form Programs", CGO
+// 2009) rather than to bolt splitting into the colorer the way LLVM's greedy
+// allocator does with its last-chance recoloring. Spilling is solved first,
+// on the IR, with Belady's MIN rule: at a point where more values are live
+// than there are registers, evict the one whose NEXT USE is farthest away.
+// The colorer then runs on IR that is approximately k-colorable.
+//
+// Why this is an IR rewrite and not a change inside the scan: the backend's
+// assignment result is a single `value -> location` map, so one value cannot
+// be in a register at one program point and in a slot at another. Introducing
+// a FRESH SSA name for the reloaded value is exactly what buys two locations
+// for one logical value inside that model, and it is what LLVM's SplitKit
+// does at MIR level for the same reason.
+//
+// Scope of this implementation: intra-block. That is not a simplification
+// for its own sake — it is where the pressure is. A vectorizable or
+// arithmetic loop body is a single basic block, and the measurement that
+// motivated this pass (`CCC_SPLIT_MAX=200` moving exactly zero counters on
+// the benchmark corpus) showed that the pre-existing CALL-site splitter can
+// never fire on such loops because they contain no calls. Cross-block
+// splitting needs SSA repair with dominance frontiers and is a separate
+// change; this pass fails closed for every shape it cannot rename exactly.
+
+/// Default number of GPRs the pass assumes are available for the scan.
+///
+/// Deliberately a little BELOW the true allocatable pool (x86-64 publishes
+/// 13 general homes, i686 about 7): splitting is only profitable when the
+/// block is genuinely over-subscribed, and a budget equal to the pool would
+/// churn on blocks that the colorer can already satisfy. Tunable through
+/// `CCC_PRESSURE_BUDGET` for A/B measurement.
+fn pressure_budget() -> usize {
+    static B: OnceLock<usize> = OnceLock::new();
+    *B.get_or_init(|| {
+        if let Ok(v) = std::env::var("CCC_PRESSURE_BUDGET") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.clamp(2, 64);
+            }
+        }
+        if crate::common::types::target_is_32bit() {
+            6
+        } else {
+            12
+        }
+    })
+}
+
+/// Minimum number of instructions a split must span to be worth a
+/// store/reload pair. A short gap frees a register for too few cycles to pay
+/// for the two memory operations.
+fn pressure_min_gap() -> usize {
+    static G: OnceLock<usize> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CCC_PRESSURE_MIN_GAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 256)
+    })
+}
+
+/// One planned split of `vid` inside a block: store after `store_after`,
+/// reload before `reload_before`, rename from the reload onward.
+#[derive(Clone, Copy, Debug)]
+struct PressureSplit {
+    vid: u32,
+    ty: IrType,
+    /// Instruction index AT which the store is inserted (the store executes
+    /// just before the instruction currently at this index).
+    store_at: usize,
+    /// Instruction index BEFORE which the reload is inserted. `usize::MAX`
+    /// means "immediately before the terminator" (a live-out value whose
+    /// only remaining consumer is a successor phi).
+    reload_before: usize,
+}
+
+/// Per-block local liveness for the GPR-eligible values, expressed as the
+/// half-open point range each value occupies inside the block.
+struct BlockLive {
+    /// value -> (first point it is live at, last point it is live at),
+    /// where point `i` is instruction `i` and point `n` is the terminator.
+    span: FxHashMap<u32, (usize, usize)>,
+    /// value -> sorted list of points at which it is READ inside the block.
+    uses: FxHashMap<u32, Vec<usize>>,
+    /// value -> point at which it is defined inside the block, if any.
+    def: FxHashMap<u32, usize>,
+    /// Values live-out of the block.
+    live_out: FxHashSet<u32>,
+}
+
+/// Whether every consumer of `vid` OUTSIDE `block` is a successor phi
+/// operand paired with `block`, so that rewriting those operands completes
+/// the rename.
+///
+/// Note what this is and is not. Leaving a use un-renamed is always
+/// SEMANTICALLY safe: the store does not kill `vid`, whose definition is
+/// untouched, so an un-renamed reader still sees the original value. What an
+/// un-renamed use costs is the whole point of the split — `vid` stays live
+/// to that use and the register is never actually freed. This predicate is
+/// therefore a PROFITABILITY test that happens to also bound the rename.
+///
+/// It is deliberately syntactic rather than `is_live_in`-based: this IR
+/// models a phi operand as a use inside the phi's own block, so a value
+/// feeding a loop-header phi is reported live-in to the header and an
+/// `is_live_in` test would reject every loop-carried value — i.e. exactly
+/// the values a high-pressure loop body needs split.
+fn uses_outside_are_only_phis_from(func: &IrFunction, block: usize, vid: u32) -> bool {
+    let label = func.blocks[block].label;
+    for (bi, b) in func.blocks.iter().enumerate() {
+        if bi == block {
+            continue;
+        }
+        for inst in &b.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                // Only an incoming pair from THIS block may reference `vid`.
+                if incoming
+                    .iter()
+                    .any(|(op, pred)| *pred != label && matches!(op, Operand::Value(v) if v.0 == vid))
+                {
+                    return false;
+                }
+                continue;
+            }
+            if instruction_uses_value(inst, vid) {
+                return false;
+            }
+        }
+        if terminator_uses_value(&b.terminator, vid) {
+            return false;
+        }
+    }
+    true
+}
+
+fn analyze_block_liveness(
+    func: &IrFunction,
+    liveness: &crate::backend::liveness::LivenessResult,
+    bi: usize,
+    types: &FxHashMap<u32, IrType>,
+) -> BlockLive {
+    let block = &func.blocks[bi];
+    let term_pt = block.instructions.len();
+    let mut uses: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+    let mut def: FxHashMap<u32, usize> = FxHashMap::default();
+
+    for (ii, inst) in block.instructions.iter().enumerate() {
+        // Phi operands are EDGE uses, not uses at the top of this block;
+        // counting them here would pin every incoming value live from
+        // point 0 and defeat the whole analysis.
+        if !matches!(inst, Instruction::Phi { .. }) {
+            let mut seen: FxHashSet<u32> = FxHashSet::default();
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    if seen.insert(v.0) {
+                        uses.entry(v.0).or_default().push(ii);
+                    }
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                if seen.insert(v.0) {
+                    uses.entry(v.0).or_default().push(ii);
+                }
+            });
+        }
+        if let Some(d) = inst.dest() {
+            def.entry(d.0).or_insert(ii);
+        }
+    }
+    {
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                if seen.insert(v.0) {
+                    uses.entry(v.0).or_default().push(term_pt);
+                }
+            }
+        });
+    }
+
+    let mut live_out: FxHashSet<u32> = FxHashSet::default();
+    for (&v, _) in types.iter() {
+        if liveness.is_live_out(bi, v) {
+            live_out.insert(v);
+        }
+    }
+
+    let mut span: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut candidates: FxHashSet<u32> = FxHashSet::default();
+    candidates.extend(uses.keys().copied());
+    candidates.extend(def.keys().copied());
+    candidates.extend(live_out.iter().copied());
+    for v in candidates {
+        if !types.get(&v).copied().is_some_and(is_simple_gpr_type) {
+            continue;
+        }
+        let start = match def.get(&v) {
+            // Defined here: live from its def onward.
+            Some(&d) => d,
+            // Not defined here: live from the top if live-in, else it is a
+            // value this block neither defines nor receives — skip.
+            None => {
+                if liveness.is_live_in(bi, v) {
+                    0
+                } else {
+                    continue;
+                }
+            }
+        };
+        let last_use = uses.get(&v).and_then(|u| u.last().copied()).unwrap_or(start);
+        let end = if live_out.contains(&v) {
+            term_pt
+        } else {
+            last_use
+        };
+        if end > start {
+            span.insert(v, (start, end));
+        }
+    }
+
+    BlockLive {
+        span,
+        uses,
+        def,
+        live_out,
+    }
+}
+
+/// Plan the splits for one block. Pure analysis: no mutation.
+fn plan_block_splits(
+    func: &IrFunction,
+    liveness: &crate::backend::liveness::LivenessResult,
+    bi: usize,
+    types: &FxHashMap<u32, IrType>,
+    budget: usize,
+    remaining: &mut usize,
+) -> Vec<PressureSplit> {
+    let mut plan = Vec::new();
+    if *remaining == 0 {
+        return plan;
+    }
+    let block = &func.blocks[bi];
+    let n_pts = block.instructions.len() + 1;
+    if n_pts < pressure_min_gap() + 2 {
+        return plan;
+    }
+    let bl = analyze_block_liveness(func, liveness, bi, types);
+    if split_debug_enabled() {
+        eprintln!(
+            "[SPLIT-PRESSURE] {} block {} pts={} live_spans={} budget={}",
+            func.name, bi, n_pts, bl.span.len(), budget
+        );
+    }
+    if bl.span.len() <= budget {
+        return plan;
+    }
+
+    // Pressure histogram over the block's points.
+    let mut pressure = vec![0usize; n_pts];
+    for (_, &(s, e)) in bl.span.iter() {
+        for p in pressure.iter_mut().take(e.min(n_pts - 1) + 1).skip(s) {
+            *p += 1;
+        }
+    }
+    // Values already split in this block: never split the same value twice
+    // (the second store would capture the reloaded name, not the original).
+    let mut done: FxHashSet<u32> = FxHashSet::default();
+    let min_gap = pressure_min_gap();
+
+    loop {
+        let (peak_pt, peak) = pressure
+            .iter()
+            .enumerate()
+            .max_by_key(|&(i, &p)| (p, std::cmp::Reverse(i)))
+            .map(|(i, &p)| (i, p))
+            .unwrap_or((0, 0));
+        if peak <= budget || *remaining == 0 {
+            break;
+        }
+
+        // Belady MIN: among the values live across the peak that this pass
+        // can rename exactly, evict the one whose next use is FARTHEST.
+        let mut best: Option<(usize, u32, usize, usize)> = None; // (next_use, vid, store_after, reload_before)
+        for (&v, &(s, e)) in bl.span.iter() {
+            if done.contains(&v) || s > peak_pt || e < peak_pt {
+                continue;
+            }
+            let empty: Vec<usize> = Vec::new();
+            let vuses = bl.uses.get(&v).unwrap_or(&empty);
+            // A value read AT the peak cannot be evicted there: it needs a
+            // register exactly now.
+            if vuses.contains(&peak_pt) || bl.def.get(&v) == Some(&peak_pt) {
+                continue;
+            }
+            // Last read at or before the peak; the store goes after it (or
+            // after the def when the peak precedes every read).
+            // Store as early as the value permits: just after its last read
+            // at or before the peak, just after its def when the peak
+            // precedes every read, and at the very TOP of the block when it
+            // is live-in and not read before the peak. That last case is not
+            // an edge case — in a loop body every loop-carried value arrives
+            // live-in and is read late, and treating "no earlier read" as
+            // "unsplittable" rejected 31 of 36 candidates at the peak.
+            let store_at = vuses
+                .iter()
+                .copied()
+                .filter(|&u| u <= peak_pt)
+                .next_back()
+                .or_else(|| bl.def.get(&v).copied())
+                .map_or(0, |p| p + 1);
+
+            // First read strictly after the peak.
+            let next_use = vuses.iter().copied().find(|&u| u > peak_pt);
+            let (next_use, reload_before) = match next_use {
+                Some(u) => (u, u),
+                None => {
+                    // No further read inside the block. Only worth splitting
+                    // when the value survives the block, and only when every
+                    // outside consumer is a successor phi operand.
+                    if !bl.live_out.contains(&v) || !uses_outside_are_only_phis_from(func, bi, v)
+                    {
+                        continue;
+                    }
+                    (n_pts - 1, usize::MAX)
+                }
+            };
+            if next_use.saturating_sub(store_at) < min_gap {
+                continue;
+            }
+            // A live-out value whose next read is inside the block still has
+            // its phi/terminator consumers after that read; the rename from
+            // the reload onward covers them, but only if the outside
+            // consumers are phi operands we may rewrite.
+            if bl.live_out.contains(&v) && !uses_outside_are_only_phis_from(func, bi, v) {
+                continue;
+            }
+            let key = (next_use, v, store_at, reload_before);
+            match best {
+                // Farthest next use wins; ties break on value id so the plan
+                // is deterministic across runs.
+                Some((bn, bv, _, _)) if (next_use, v) <= (bn, bv) => {}
+                _ => best = Some(key),
+            }
+        }
+
+        if split_debug_enabled() && best.is_none() {
+            let mut r_used = 0; let mut r_noprev = 0; let mut r_gap = 0; let mut r_out = 0; let mut r_span = 0;
+            for (&v, &(sp0, e)) in bl.span.iter() {
+                if done.contains(&v) || sp0 > peak_pt || e < peak_pt { r_span += 1; continue; }
+                let empty: Vec<usize> = Vec::new();
+                let vu = bl.uses.get(&v).unwrap_or(&empty);
+                if vu.contains(&peak_pt) || bl.def.get(&v) == Some(&peak_pt) { r_used += 1; continue; }
+                let prev = vu.iter().copied().filter(|&u| u <= peak_pt).next_back().or_else(|| bl.def.get(&v).copied()).map_or(0, |p| p + 1);
+                let _ = &mut r_noprev;
+                match vu.iter().copied().find(|&u| u > peak_pt) {
+                    Some(u) => { if u.saturating_sub(prev) < min_gap { r_gap += 1; } }
+                    None => { if !bl.live_out.contains(&v) || !uses_outside_are_only_phis_from(func, bi, v) { r_out += 1; } }
+                }
+            }
+            eprintln!("[SPLIT-PRESSURE] {} blk{} peak_pt={} peak={} REJECT span={} used_at_peak={} noprev={} gap={} outside={}",
+                func.name, bi, peak_pt, peak, r_span, r_used, r_noprev, r_gap, r_out);
+        }
+        let Some((_, vid, store_at, reload_before)) = best else {
+            // Nothing further is splittable here; leave the rest to the
+            // colorer rather than spinning.
+            break;
+        };
+        let ty = match types.get(&vid) {
+            Some(&t) => t,
+            None => break,
+        };
+        plan.push(PressureSplit {
+            vid,
+            ty,
+            store_at,
+            reload_before,
+        });
+        done.insert(vid);
+        *remaining -= 1;
+
+        // The register is free from just after the store to just before the
+        // reload; drop the pressure there so the next iteration targets a
+        // different value.
+        let hi = if reload_before == usize::MAX {
+            n_pts - 1
+        } else {
+            reload_before
+        };
+        for p in pressure.iter_mut().take(hi.min(n_pts - 1)).skip(store_at) {
+            *p = p.saturating_sub(1);
+        }
+    }
+    plan
+}
+
+/// Apply one block's plan.
+///
+/// Rebuilt in ONE linear pass rather than by repeated `insert` calls: every
+/// insertion shifts the indices of every later split in the same block, and
+/// patching them incrementally is how the first revision produced wrong code
+/// (a split whose reload index had been shifted by an earlier, lower-indexed
+/// split reloaded before its own store). Planning indices stay in ORIGINAL
+/// coordinates throughout, and the rename is expressed in the same
+/// coordinates.
+fn apply_block_splits(
+    func: &mut IrFunction,
+    bi: usize,
+    plan: &[PressureSplit],
+    next_val: &mut u32,
+) -> usize {
+    if plan.is_empty() {
+        return 0;
+    }
+    let n = func.blocks[bi].instructions.len();
+    // A store may never precede the block's phi prefix: phis must remain the
+    // first instructions of their block.
+    let phi_end = first_non_phi(&func.blocks[bi]);
+
+    struct Materialized {
+        vid: u32,
+        new_val: Value,
+        ty: IrType,
+        alloca: Value,
+        store_at: usize,
+        /// Original index the reload is inserted BEFORE; `n` = before the
+        /// terminator.
+        reload_at: usize,
+    }
+    let mut mats: Vec<Materialized> = Vec::new();
+    for sp in plan {
+        let Some(alloca) = next_value(next_val) else { break };
+        let Some(new_val) = next_value(next_val) else { break };
+        let reload_at = if sp.reload_before == usize::MAX {
+            n
+        } else {
+            sp.reload_before.min(n)
+        };
+        let store_at = sp.store_at.max(phi_end).min(reload_at);
+        if reload_at.saturating_sub(store_at) < pressure_min_gap() {
+            // The clamp past the phi prefix can shrink a gap below the
+            // profitability floor; drop the split rather than pay for it.
+            continue;
+        }
+        mats.push(Materialized {
+            vid: sp.vid,
+            new_val,
+            ty: sp.ty,
+            alloca,
+            store_at,
+            reload_at,
+        });
+    }
+    if mats.is_empty() {
+        return 0;
+    }
+
+    // Rename map per ORIGINAL instruction index: an instruction at original
+    // index `i` reads the reloaded name of every split whose reload sits at
+    // or before `i`.
+    let old = std::mem::take(&mut func.blocks[bi].instructions);
+    let mut out: Vec<Instruction> = Vec::with_capacity(old.len() + 2 * mats.len());
+    let mut active: FxHashMap<u32, u32> = FxHashMap::default();
+
+    for (i, mut inst) in old.into_iter().enumerate() {
+        // Stores first: they must read the ORIGINAL value, so they are
+        // emitted before any reload at the same index can rename it.
+        for m in mats.iter().filter(|m| m.store_at == i) {
+            out.push(Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(m.vid)),
+                ptr: m.alloca,
+                ty: m.ty,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        for m in mats.iter().filter(|m| m.reload_at == i) {
+            out.push(Instruction::Load {
+                volatile: false,
+                dest: m.new_val,
+                ptr: m.alloca,
+                ty: m.ty,
+                seg_override: AddressSpace::Default,
+            });
+            active.insert(m.vid, m.new_val.0);
+        }
+        if !active.is_empty() {
+            // `rewrite_phi = false`: a phi in THIS block reads on the
+            // incoming edge, never at the top of the body.
+            replace_values_in_inst(&mut inst, &active, false);
+        }
+        out.push(inst);
+    }
+    // Trailing stores/reloads that belong just before the terminator.
+    for m in mats.iter().filter(|m| m.store_at == n) {
+        out.push(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(Value(m.vid)),
+            ptr: m.alloca,
+            ty: m.ty,
+            seg_override: AddressSpace::Default,
+        });
+    }
+    for m in mats.iter().filter(|m| m.reload_at == n) {
+        out.push(Instruction::Load {
+            volatile: false,
+            dest: m.new_val,
+            ptr: m.alloca,
+            ty: m.ty,
+            seg_override: AddressSpace::Default,
+        });
+        active.insert(m.vid, m.new_val.0);
+    }
+    func.blocks[bi].instructions = out;
+    if !active.is_empty() {
+        replace_values_in_terminator(&mut func.blocks[bi].terminator, &active);
+    }
+
+    // Successor phi operands coming from THIS block: the reload dominates
+    // the edge, so rewriting them completes the rename.
+    let block_label = func.blocks[bi].label;
+    for b in func.blocks.iter_mut() {
+        for inst in b.instructions.iter_mut() {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, pred) in incoming.iter_mut() {
+                    if *pred != block_label {
+                        continue;
+                    }
+                    if let Operand::Value(v) = op {
+                        if let Some(&nv) = active.get(&v.0) {
+                            *op = Operand::Value(Value(nv));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for m in &mats {
+        // A volatile slot: copy-prop, DCE and store-to-load forwarding all
+        // run after this pass and a plain alloca would simply be forwarded
+        // back into one value, undoing the split. To stack layout it is an
+        // ordinary frame home.
+        insert_entry_alloca(func, m.alloca, m.ty, true);
+        if split_debug_enabled() {
+            eprintln!(
+                "[SPLIT-PRESSURE] {} block {} value {} store@{} reload@{}",
+                func.name, bi, m.vid, m.store_at, m.reload_at
+            );
+        }
+    }
+    mats.len()
+}
+
+/// RA-06 entry point: split high-pressure intra-block live ranges so the
+/// colorer sees an approximately k-colorable block.
+///
+/// Returns the number of splits applied. Fails closed everywhere: a value
+/// whose consumers this pass cannot rename exactly is left alone.
+pub fn split_high_pressure_ranges(func: &mut IrFunction, max_splits: usize) -> usize {
+    if func.blocks.is_empty() || max_splits == 0 {
+        return 0;
+    }
+    let types = collect_value_types(func);
+    let alloca_ids = collect_alloca_ids(func);
+
+    // Eligibility. A split re-materialises the value through an 8-byte-or-
+    // narrower GPR slot, so anything that does not actually live in a GPR —
+    // or whose home the backend pins for its own reasons — must be excluded.
+    // `is_simple_gpr_type` alone is not enough: a 256-bit vector intrinsic
+    // result can carry a scalar-looking IR type (the width lives in the
+    // intrinsic, not the type), and storing one through an I64 slot
+    // truncates it to its low lane. That is what the first revision did, and
+    // the vectorize_* oracle tests caught it.
+    let mut ineligible: FxHashSet<u32> = alloca_ids.clone();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            match inst {
+                // Intrinsics own their operand and result register classes
+                // (XMM/YMM, fixed pairs, accumulator-pinned forms).
+                Instruction::Intrinsic { dest, .. } => {
+                    if let Some(d) = dest {
+                        ineligible.insert(d.0);
+                    }
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            ineligible.insert(v.0);
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        ineligible.insert(v.0);
+                    });
+                }
+                // Inline asm binds values to constraint-named registers.
+                Instruction::InlineAsm { .. } => {
+                    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                        if let Operand::Value(v) = op {
+                            ineligible.insert(v.0);
+                        }
+                    });
+                    crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                        ineligible.insert(v.0);
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    let types: FxHashMap<u32, IrType> = types
+        .into_iter()
+        .filter(|(v, _)| !ineligible.contains(v))
+        .collect();
+    if types.is_empty() {
+        return 0;
+    }
+
+    let liveness = crate::backend::liveness::compute_live_intervals(func);
+    let budget = pressure_budget();
+    let mut remaining = max_splits;
+    let mut total = 0usize;
+    let mut next_val = func.next_value_id;
+
+    // Innermost-first is irrelevant for an intra-block pass; visit in block
+    // order for determinism.
+    let mut plans: Vec<(usize, Vec<PressureSplit>)> = Vec::new();
+    for bi in 0..func.blocks.len() {
+        let plan = plan_block_splits(func, &liveness, bi, &types, budget, &mut remaining);
+        if !plan.is_empty() {
+            plans.push((bi, plan));
+        }
+    }
+    for (bi, plan) in plans {
+        total += apply_block_splits(func, bi, &plan, &mut next_val);
+    }
+    func.next_value_id = next_val;
+    total
+}
+
+#[cfg(test)]
+mod pressure_split_tests {
+    use super::*;
+
+    fn f_with(blocks: Vec<BasicBlock>) -> IrFunction {
+        let mut f = IrFunction::new("t".to_string(), IrType::Void, Vec::new(), false);
+        f.blocks = blocks;
+        f.next_value_id = 1000;
+        f
+    }
+    fn blk(label: u32, instructions: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+    fn add(dest: u32, a: u32, b: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(a)),
+            rhs: Operand::Value(Value(b)),
+            ty: IrType::I64,
+        }
+    }
+
+    /// A value whose consumers all live in another block must NOT be split:
+    /// renaming them needs cross-block SSA repair. This is the guard that
+    /// keeps the pass fail-closed, and it is also the reason the pass cannot
+    /// reach MAXLIVE <= k (see engineering/DECISIONS.md).
+    #[test]
+    fn outside_consumer_that_is_not_a_phi_blocks_the_split() {
+        let f = f_with(vec![
+            blk(0, vec![add(1, 900, 901)], Terminator::Branch(BlockId(1))),
+            blk(1, vec![add(2, 1, 1)], Terminator::Return(None)),
+        ]);
+        assert!(!uses_outside_are_only_phis_from(&f, 0, 1));
+    }
+
+    /// A value consumed only by a successor phi paired with this block IS
+    /// renameable: the reload sits at the end of the block and dominates the
+    /// edge.
+    #[test]
+    fn successor_phi_operand_from_this_block_is_renameable() {
+        let f = f_with(vec![
+            blk(0, vec![add(1, 900, 901)], Terminator::Branch(BlockId(1))),
+            blk(
+                1,
+                vec![Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I64,
+                    incoming: vec![(Operand::Value(Value(1)), BlockId(0))],
+                }],
+                Terminator::Return(None),
+            ),
+        ]);
+        assert!(uses_outside_are_only_phis_from(&f, 0, 1));
+    }
+
+    /// The same value reaching a phi from a DIFFERENT predecessor cannot be
+    /// renamed by this block's reload (the reload does not dominate that
+    /// edge), so the split is refused.
+    #[test]
+    fn phi_operand_from_another_predecessor_blocks_the_split() {
+        let f = f_with(vec![
+            blk(0, vec![add(1, 900, 901)], Terminator::Branch(BlockId(2))),
+            blk(1, vec![], Terminator::Branch(BlockId(2))),
+            blk(
+                2,
+                vec![Instruction::Phi {
+                    dest: Value(2),
+                    ty: IrType::I64,
+                    incoming: vec![
+                        (Operand::Value(Value(1)), BlockId(0)),
+                        (Operand::Value(Value(1)), BlockId(1)),
+                    ],
+                }],
+                Terminator::Return(None),
+            ),
+        ]);
+        assert!(!uses_outside_are_only_phis_from(&f, 0, 1));
+    }
+
+    /// The budget and gap knobs must stay inside sane bounds however they are
+    /// set, so a stray environment value cannot make the pass split every
+    /// value (budget 0) or none (huge gap silently disabling it).
+    #[test]
+    fn tuning_knobs_are_clamped() {
+        assert!((2..=64).contains(&pressure_budget()));
+        assert!((1..=256).contains(&pressure_min_gap()));
+    }
+}
