@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static uint32_t hb(const void *p, size_t n) {
     const uint8_t *b = (const uint8_t *) p;
@@ -42,6 +43,9 @@ static int32_t A32[N], B32[N], D32[N];
 static uint32_t AU[N], BU[N], DU[N];
 static int64_t A64[N], B64[N], D64[N];
 static uint64_t AU64[N], BU64[N], DU64[N];
+/* FP min/max fold coverage: strict forms fold to MINPS/MAXPS, the
+ * non-strict <=/>= forms must stay compare+blend and stay lane-exact. */
+static float AF[N], DF[N];
 
 static void fill(void) {
     static const int32_t iv[16] = {
@@ -60,6 +64,14 @@ static void fill(void) {
         AU64[i] = (uint64_t) A64[i] ^ 0xdeadbeefcafef00dULL;
         BU64[i] = (uint64_t) B64[i] * 3u;
     }
+    static const float fv[22] = {
+        0.0f,    -0.0f,     1.0f,       -1.0f,      2.5f,        -2.5f,
+        0.5f,    -0.5f,     INFINITY,   -INFINITY,  1e-45f,      -1e-45f,
+        3.5f,    -3.5f,     NAN,        -NAN,       100.0f,      -100.0f,
+        0.25f,   -0.25f,    7.0f,       -7.0f,
+    };
+    for (int i = 0; i < N; i++)
+        AF[i] = fv[(i * 7 + 3) % 22];
 }
 
 #define K3(nm, T, expr)                                                                  \
@@ -115,6 +127,16 @@ static const long S[] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
         }                                                                                \
         printf("%s %08x\n", #nm, h);                                                     \
     } while (0)
+#define R2A(nm, D, A)                                                                    \
+    do {                                                                                 \
+        uint32_t h = 0;                                                                  \
+        for (size_t s = 0; s < sizeof S / sizeof *S; s++) {                              \
+            memset(D, 0xa5, sizeof D);                                                   \
+            nm(D, A, S[s]);                                                              \
+            h = h * 31u + hb(D, sizeof D);                                               \
+        }                                                                                \
+        printf("%s %08x\n", #nm, h);                                                     \
+    } while (0)
 #define R2(nm, D, A, C)                                                                  \
     do {                                                                                 \
         uint32_t h = 0;                                                                  \
@@ -125,6 +147,57 @@ static const long S[] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
         }                                                                                \
         printf("%s %08x\n", #nm, h);                                                     \
     } while (0)
+
+/* Exact FP min/max folds: the four strict ternary forms fold to
+ * MINPS/MAXPS exactly because every special case (NaN, both-zero lanes)
+ * returns the second source — i.e. the ternary's false arm.  The
+ * non-strict <=/>= forms differ on +-0 (and `<= ? r : l` on NaN) and must
+ * keep the compare+blend lowering while remaining lane-exact. */
+__attribute__((noinline)) static void k_clamp_head(float *restrict d,
+                                                   const float *restrict a,
+                                                   long n) {
+    for (long i = 0; i < n; i++) {
+        float x = a[i];
+        d[i] = x < 0.0f ? 0.0f : x; /* clamp head: max(0, x), src2 = x */
+    }
+}
+__attribute__((noinline)) static void k_clamp01_seq(float *restrict d,
+                                                    const float *restrict a,
+                                                    long n) {
+    for (long i = 0; i < n; i++) {
+        float x = a[i];
+        x = x < 0.0f ? 0.0f : x;    /* max(0, x)  */
+        d[i] = x > 1.0f ? 1.0f : x; /* min(1, ..) */
+    }
+}
+__attribute__((noinline)) static void k_max_swapped(float *restrict d,
+                                                    const float *restrict a,
+                                                    const float *restrict b,
+                                                    long n) {
+    for (long i = 0; i < n; i++)
+        d[i] = a[i] < b[i] ? b[i] : a[i]; /* max(b, a): false arm = src2 */
+}
+__attribute__((noinline)) static void k_min_swapped(float *restrict d,
+                                                    const float *restrict a,
+                                                    const float *restrict b,
+                                                    long n) {
+    for (long i = 0; i < n; i++)
+        d[i] = a[i] > b[i] ? b[i] : a[i]; /* min(b, a): false arm = src2 */
+}
+__attribute__((noinline)) static void k_le_nofold(float *restrict d,
+                                                  const float *restrict a,
+                                                  const float *restrict b,
+                                                  long n) {
+    for (long i = 0; i < n; i++)
+        d[i] = a[i] <= b[i] ? a[i] : b[i]; /* must NOT fold (+-0 differs) */
+}
+__attribute__((noinline)) static void k_ge_nofold(float *restrict d,
+                                                  const float *restrict a,
+                                                  const float *restrict b,
+                                                  long n) {
+    for (long i = 0; i < n; i++)
+        d[i] = a[i] >= b[i] ? b[i] : a[i]; /* must NOT fold (+-0 differs) */
+}
 
 int main(void) {
     fill();
@@ -158,5 +231,18 @@ int main(void) {
         }
         printf("k_inplace %08x\n", h);
     }
+    /* FP min/max: AF against a rotated copy of itself so every
+     * (NaN, x), (x, NaN), (+0, -0), (-0, +0), (x, x) pairing occurs. */
+    {
+        static float BF[N];
+        for (int i = 0; i < N; i++)
+            BF[i] = AF[(i + 5) % N];
+        R3(k_max_swapped, DF, AF, BF);
+        R3(k_min_swapped, DF, AF, BF);
+        R3(k_le_nofold, DF, AF, BF);
+        R3(k_ge_nofold, DF, AF, BF);
+    }
+    R2A(k_clamp_head, DF, AF);
+    R2A(k_clamp01_seq, DF, AF);
     return 0;
 }

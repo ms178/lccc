@@ -1079,3 +1079,84 @@ loop_patterns 1.11×.
 `spectral_norm` at 1.635× is the single worst result and the correct next
 target; `nbody` (1.32×) and `double_reduction` (1.18×) are the same FP-kernel
 family and are likely to share a root cause with it.
+
+## Audit (2026-09-05, session 8) — red-team of #412–#419; width-test fix; i686 liveness oracle
+
+### Upstream defect fixed: width unit test contradicted the width table
+
+`declared_width_agrees_with_the_lane_count_in_the_name` asserted
+`VecSubI32x8 / VecAndI32x8 / VecOrI32x8 / VecXorI32x8 == Some(16)` — the four
+ops were pasted into the 128-bit `narrow` list by the same commit that added
+them, while `vector_result_width` correctly reports `Some(32)` (8 lanes × 4 B;
+codegen lowers them via `emit_avx_binary_256` on `%ymm`). Implementation
+right, test data wrong. The test is now exhaustive by construction: it
+extracts every `Vec*` variant from the enum via `include_str!` at compile
+time and derives the expected width from the name's last `<Type>x<Lanes>`
+token. Documented divergences: `Horizontal*` -> None, `VecStore*` -> None
+except the deliberate `VecStoreI64x2` (slot sizing), unlowered
+`Sadalp/Smlal` -> None. A mechanical sweep of the full enum found no other
+table/name disagreement, and a future op is checked automatically instead of
+relying on a hand-pasted list.
+
+### Guard placement: the per-analyzer form is load-bearing
+
+Hoisting the non-IV-phi carried-value guard from `analyze_map_pattern` /
+`analyze_stencil_pattern` into `analyze_loop_pattern` looks like
+deduplication but is a latent miscompile: `analyze_loop_pattern` is the
+matmul analyzer, not a shared entry, and its `None` falls through the
+dispatcher's else-if chain to analyzers without the guard. Reproduced as
+`k_acc(1) = 0` (want 3) on `vectorize_carried_value_and_negzero`. The
+per-analyzer guards stay.
+
+### Ported (A/B-measured against current main)
+
+1. `memfold_consumer_256`: order-correct memory-operand fold gates for the
+   four integer lane ops (And/Or/Xor commutative, Sub src2-only, matching
+   the packed min/max contract). Without the gates the xor map kernel emits
+   `vmovdqu` loads plus stack round-trips; with them the consumer folds as
+   `vpxor (mem), %ymm, %ymm`. `is_vec_ssa_producer` gains the same four
+   families for classification consistency; on current main the omission is
+   correctness-neutral (the deferred-store path was reorganized in #413 /
+   #416 — the historical segfault claim does not reproduce at -O2/-O3,
+   v3/SSE2, stack or static storage, or under CCC_NO_SMALL_SLOTS), so the
+   entries are hardening, not a live fix.
+2. i686 whole-function GPR liveness oracle for `fold_memory_operands`:
+   the bounded forward scan stopped at the first barrier and ASSUMED
+   deadness, which is unsound for register-allocated values —
+   `maxi(a,b){return a>b?a:b;}` folded its param home
+   `movl 20(%esp),%esi` into `cmpl 20(%esp),%ebx` across the select's
+   conditional jump and the fall-through arm read a never-written `%esi`.
+   The oracle is the same backward dataflow `optimize_cfg_register_liveness`
+   already used, factored out; computed once per sweep, sound across folds
+   (deleting a dead definition can only make the deleted register's cached
+   liveness conservative). Spot-verified: maxi keeps its param homes across
+   the select; divmod's `cltd`/`idivl` implicit `edx:eax` handling survives
+   every rename.
+3. Tests: `vex_promote_semantic.c` (VEX promotion semantics: remainder
+   tails, jump-table dispatch, live-128-bit-half soundness, self-zeroing
+   idioms, conversions) and `vectorize_int_map_lanes.c` extended ADDITIVELY
+   with the exact FP min/max family (four strict folds + two non-strict
+   no-folds over NaN/+-0 pairings; verified `vminps`/`vmaxps` fire for the
+   strict forms while the no-fold forms keep compare+blend).
+
+### Adopted as-is (audited, no defects found)
+
+#412 five miscompiles + RA cost model; #413 if-convert deref coverage, C23
+`va_start`, `folded_read_points`, vex BFS, xmm2 confinement; #414 lane ops +
+carried-value guard + `-0.0` data emission + clamp fold; #415 cast-peel
+injectivity + RA-06 (off by default, documented); #416 wider slot roots;
+#417 docs; #418 epilogue cross-jumping (soundness gates audited: runs
+rejected on labels, whole-run replacement, per-function CFI bail, return
+regs untouched; known trade-off — exact-text merging can grow byte size for
+2–3-insn epilogues since `jmp rel32` is 5 bytes; insn count is the canonical
+metric here; LCS extension is CG-09); #419 latch-segment footprints
+(`BlockTouches` closes the phi-eliminated latch hole that corrupted
+ZSTD `HUF_decompress4X2`'s `endSignal`) and LEA invalidation routed through
+the shared may-write oracle — the same over-approximation contract the x86
+implicit-write oracle established; `sete %al` after a cached `leaq` is the
+canonical one-operand writer the hand list missed.
+
+Verification: `cargo test --lib` 1956/1956; regression suite 626 PASS /
+0 FAIL / 15 SKIP (ELF32 — no runner on this host); map_sub emits `vpsubd`,
+4×4 matmul 16× `vfmadd`, i64 reduction `paddq`; int map lanes hashes
+identical to GCC at -O3 -march=x86-64-v3.

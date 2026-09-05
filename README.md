@@ -134,6 +134,55 @@ excluded): **1.096**. The workload-derived codec/parser subset (7 pairs) sits
 at **1.381**. All 33 checksums byte-identical to GCC. Frozen raw JSON:
 [`engineering/evidence/benchmarks/2026-09-01b-2e434473/`](engineering/evidence/benchmarks/2026-09-01b-2e434473/README.md).
 
+### Refresh — 2026-09-05, `rebased` @ `f9899f30` (post #419)
+
+Same protocol family, screening-grade cadence: 3 paired reps + 1 warmup,
+two same-window batches of 16 kernels, `-O2`, all 32 x86 outputs
+byte-identical to GCC. Raw samples:
+[`engineering/evidence/benchmarks/2026-09-05-f9899f30/`](engineering/evidence/benchmarks/2026-09-05-f9899f30/results.json).
+
+**Aggregate: geometric mean 0.7390 over 32 pairs; conventional code
+(recursion folds excluded) 1.0416.**
+
+| Kernel | LCCC (ms) | GCC (ms) | LCCC/GCC |
+|---|---:|---:|---:|
+| `fib` | 1.10 | 130.43 | **0.008** (118.07× faster) |
+| `ackermann` | 1.11 | 61.66 | **0.018** (55.42× faster) |
+| `constant_recursion` | 8.06 | 63.72 | **0.126** (7.9× faster) |
+| `libm_round_family` | 202.2 | 490.7 | **0.412** (2.43× faster) |
+| `bitops` | 201.6 | 302.1 | **0.667** (1.50× faster) |
+| `matmul` | 4.19 | 5.65 | **0.741** (1.35× faster) |
+| `gzip_crc32` | 135.8 | 155.3 | **0.874** (1.14× faster) |
+| `double_reduction` | 110.1 | 118.8 | **0.927** (1.08× faster) |
+| `switch_dispatch` | 467.4 | 478.5 | **0.977** (1.02× faster) |
+| `arith_loop` | 92.9 | 92.7 | 1.002 |
+| `qsort` | 112.5 | 111.9 | 1.006 |
+| `tls_seg_access` | 9.26 | 9.07 | 1.021 |
+| `zlib_ng_adler32` | 38.0 | 37.3 | 1.021 |
+| `histogram` | 1.63 | 1.57 | 1.042 (1.04× slower) |
+| `struct_copy` | 23.0 | 21.9 | 1.053 (1.05× slower) |
+| `strlen_bench` | 223.8 | 212.4 | 1.053 (1.05× slower) |
+| `loop_patterns` | 49.2 | 46.7 | 1.054 (1.05× slower) |
+| `binary_trees` | 2004.2 | 1879.3 | 1.066 (1.07× slower) |
+| `sieve` | 52.1 | 48.1 | 1.082 (1.08× slower) |
+| `hash_table` | 21868.2 | 19590.8 | 1.116 (1.12× slower) |
+| `sqlite_varint` | 25.9 | 21.2 | 1.219 (1.22× slower) |
+| `mandelbrot` | 1105.7 | 893.6 | 1.237 (1.24× slower) |
+| `nbody` | 272.5 | 214.6 | 1.270 (1.27× slower) |
+| `expat_xml_scan` | 47.1 | 34.7 | 1.359 (1.36× slower) |
+| `linux_find_bit` | 14.6 | 10.2 | 1.424 (1.42× slower) |
+| `fannkuch` | 3209.0 | 2252.1 | 1.425 (1.43× slower) |
+| `glibc_memcmp` | 9.11 | 5.91 | 1.542 (1.54× slower) |
+| `spectral_norm` | 291.8 | 182.0 | **1.603** (1.60× slower) |
+
+Not shown: `binary_search`, `ring_fifo`, `tce_sum` and
+`ascii_case_fold` (near-parity; sub-2 ms medians are wall-timer-bound). Movement vs 2026-09-01 (directional, different window):
+expat 2.07→1.36, tls_seg_access 2.20→1.02, arith_loop 1.41→1.00,
+struct_copy 1.44→1.05, double_reduction 1.14→0.93. The tracked P0 targets
+remain `spectral_norm` (PERF-41) and the scalar-load-sinking family
+(OPT-40: glibc_memcmp, linux_find_bit). † sub-2 ms medians are indicative
+only.
+
 ## Where LCCC wins
 
 - **Recursion folding**: `fib` 73.1×, `constant_recursion` and `ackermann`

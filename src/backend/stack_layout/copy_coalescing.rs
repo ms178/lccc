@@ -2047,6 +2047,21 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecBlendvF32x4
             | O::VecBlendvF64x4
             | O::VecBlendvF64x2
+            // Integer map lane ops: their results are SSA temporaries that
+            // live in the SIMD scratch pair until the adjacent VecStore —
+            // without this they miss the deferred-store contract and
+            // avx_store_dest dereferences the (uninitialized) value's slot
+            // content as a pointer (segfault; repro: any
+            // `d[i] = a[i] - b[i]` map loop at -march=x86-64-v3).
+            | O::VecSubI32x8
+            | O::VecSubI32x4
+            | O::VecSubI64x2
+            | O::VecAndI32x8
+            | O::VecAndI32x4
+            | O::VecOrI32x8
+            | O::VecOrI32x4
+            | O::VecXorI32x8
+            | O::VecXorI32x4
     )
 }
 
@@ -2216,6 +2231,12 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // source on unordered/equal lanes), so a fold is only order-safe in
         // the args[1] (src2) position — exactly what Some(false) gates.
         O::VecMinF32x8 | O::VecMaxF32x8 | O::VecMinF64x4 | O::VecMaxF64x4 => Some(false),
+        // Integer map lane ops: And/Or/Xor are bit-exact commutative; Sub is
+        // `src1 - src2` — a fold is only order-safe in the args[1] (src2)
+        // position (`vpsubd mem, %ymm_src1, %ymm_dst`), exactly like the
+        // packed min/max contract above.
+        O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
+        O::VecSubI32x8 => Some(false),
         _ => None,
     }
 }

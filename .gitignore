@@ -80,3 +80,4 @@ zlib-ng-validation/
 # scripts/qemu_icount_plugin/build.sh; never vendored into this permissive tree.
 /scripts/qemu_icount_plugin/qemu-plugin.h
 /scripts/qemu_icount_plugin/*.so
+ms178-1.patch

@@ -3394,6 +3394,220 @@ fn direct_jump_target(line: &str) -> Option<&str> {
     }
 }
 
+/// Whole-function GPR liveness oracle shared by every peephole that must
+/// prove a register DEAD before deleting or retargeting a definition.
+///
+/// The bounded forward scans (`fold_memory_operands` and friends) used to
+/// stop at the first control-flow barrier and *assume* deadness there. That
+/// assumption is only valid for accumulator scratch loads whose value the
+/// emitter re-materialises after every label; it is unsound for
+/// register-allocated values (`%ebx/%esi/%edi/%ebp`, and `%eax/%ecx/%edx`
+/// when the allocator hands them out), which are live across labels,
+/// conditional jumps and loop back-edges. `maxi(a,b){return a>b?a:b;}`
+/// miscompiled exactly this way: the param load `movl 20(%esp),%esi` was
+/// folded into `cmpl 20(%esp),%ebx`, and the select's fall-through arm then
+/// read a never-written `%esi` (reproduced on 4927a774: the emitted `maxi`
+/// returned caller garbage for `a <= b`).
+///
+/// Two further holes of the same barrier-scan class are closed as a side
+/// effect, because the oracle models the architectural reads the scan never
+/// saw: a regparm `call` READS `%eax/%ecx/%edx` (a load feeding such an
+/// argument survived the fold only by luck of the barrier), and `ret` READS
+/// `%eax` (+ `%edx` via the `lccc-i686-return-uses-edx` marker), so a load
+/// feeding the return value is retained.
+///
+/// This is the same eight-register backward dataflow used by
+/// `optimize_cfg_register_liveness`, factored out so every pass can ask the
+/// precise question "is `reg` dead after line `i`?" instead of guessing.
+/// Deleting a definition whose value is provably dead never invalidates the
+/// cached answer for any *other* register, and can only make the deleted
+/// register's cached liveness conservative (live-where-dead); folds rewrite
+/// lines in place / nop them (never Vec::remove), so line indices — and the
+/// cached vectors — stay aligned for a whole sweep. One computation per pass
+/// invocation is therefore sound.
+struct GprLiveness {
+    /// Live-out bitmask per line (`bit(reg)`), indexed by absolute line.
+    live_out: Vec<u16>,
+    /// Lines outside any recognised function body are conservatively
+    /// treated as "everything live".
+    covered: Vec<bool>,
+}
+
+impl GprLiveness {
+    const ALL: u16 = (1u16 << (REG_GP_MAX + 1)) - 1;
+
+    /// Compute liveness for every function in the line store.
+    fn compute(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let len = infos.len();
+        let mut lv = GprLiveness {
+            live_out: vec![Self::ALL; len],
+            covered: vec![false; len],
+        };
+        let extents = function_extents(store, infos);
+        for &(start, end) in &extents {
+            let return_uses_edx = (start..end).any(|i| {
+                !infos[i].is_nop()
+                    && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
+            });
+            let lo = compute_gpr_live_out(store, infos, start, end, return_uses_edx);
+            for local in 0..(end - start) {
+                lv.live_out[start + local] = lo[local];
+                lv.covered[start + local] = true;
+            }
+        }
+        // Bare-fragment fallback: line stores without any global label (only
+        // unit-test fragments in practice — the real pipeline always feeds
+        // whole files whose functions carry `name:` labels). Dataflow over
+        // the fragment is exact for its own content; there is no external
+        // continuation that could keep a register live past the fragment end,
+        // so an empty live-out at EOF is sound here. Without this fallback
+        // every fold would be refused on uncovered lines (conservative ALL).
+        if extents.is_empty() && len > 0 {
+            let return_uses_edx = (0..len).any(|i| {
+                !infos[i].is_nop()
+                    && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
+            });
+            let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx);
+            for i in 0..len {
+                lv.live_out[i] = lo[i];
+                lv.covered[i] = true;
+            }
+        }
+        lv
+    }
+
+    /// True when `reg`'s value is provably dead after line `i` executes.
+    #[inline]
+    fn dead_after(&self, i: usize, reg: RegId) -> bool {
+        reg <= REG_GP_MAX && self.covered[i] && self.live_out[i] & (1u16 << reg) == 0
+    }
+}
+
+/// `[start, end)` line ranges of every function body: from the global label
+/// (`name:` not starting with `.`) up to its `.cfi_endproc`/`.size`.
+/// Identical to the per-function walk in `optimize_cfg_register_liveness`.
+fn function_extents(store: &LineStore, infos: &[LineInfo]) -> Vec<(usize, usize)> {
+    let len = infos.len();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < len {
+        while start < len {
+            if infos[start].kind == LineKind::Label {
+                let line = trimmed(store, &infos[start], start);
+                if line.ends_with(':') && !line.starts_with('.') {
+                    break;
+                }
+            }
+            start += 1;
+        }
+        if start >= len {
+            break;
+        }
+        let mut end = start + 1;
+        while end < len {
+            let line = trimmed(store, &infos[end], end);
+            if line == ".cfi_endproc" || line.starts_with(".size ") {
+                break;
+            }
+            end += 1;
+        }
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Backward GPR liveness over `[start, end)`; returns the live-out bitmask
+/// per line, indexed by `line - start`. Direct jumps to unknown labels are
+/// treated as "all registers live" (tail calls — their ABI arguments may
+/// occupy any regparm register). Indirect jumps get an ALL live-out as well:
+/// `line_reg_use_def` already makes one read every GPR (jump-table index and
+/// tail-call arguments), so pre-dispatch queries are fully conservative, and
+/// giving the dispatch line itself an ALL live-out keeps even a query placed
+/// *at* the dispatch on the sound side of the jump-table edge.
+fn compute_gpr_live_out(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+    return_uses_edx: bool,
+) -> Vec<u16> {
+    let n = end - start;
+    let mut labels = std::collections::HashMap::<&str, usize>::new();
+    for i in start..end {
+        if infos[i].kind == LineKind::Label {
+            labels.insert(
+                trimmed(store, &infos[i], i).trim_end_matches(':'),
+                i - start,
+            );
+        }
+    }
+    let mut live_in = vec![0u16; n];
+    let mut live_out = vec![0u16; n];
+    let mut progress = true;
+    while progress {
+        progress = false;
+        for local in (0..n).rev() {
+            let i = start + local;
+            if infos[i].is_nop() {
+                let out = if local + 1 < n { live_in[local + 1] } else { 0 };
+                if out != live_out[local] || out != live_in[local] {
+                    live_out[local] = out;
+                    live_in[local] = out;
+                    progress = true;
+                }
+                continue;
+            }
+            let fallthrough = (local + 1 < n).then_some(local + 1);
+            let target = direct_jump_target(trimmed(store, &infos[i], i))
+                .and_then(|name| labels.get(name).copied());
+            let mut out = 0u16;
+            match infos[i].kind {
+                LineKind::Ret => {}
+                LineKind::JmpIndirect => {
+                    // See above: jump tables / tail calls — stay conservative.
+                    out = GprLiveness::ALL;
+                }
+                LineKind::Jmp => {
+                    if let Some(target) = target {
+                        out |= live_in[target];
+                    } else {
+                        // External direct jumps are tail calls.  Their ABI
+                        // arguments may occupy any regparm register.
+                        out = GprLiveness::ALL;
+                    }
+                }
+                LineKind::CondJmp => {
+                    if let Some(target) = target {
+                        out |= live_in[target];
+                    } else {
+                        out = GprLiveness::ALL;
+                    }
+                    if let Some(next) = fallthrough {
+                        out |= live_in[next];
+                    }
+                }
+                _ => {
+                    if let Some(next) = fallthrough {
+                        out |= live_in[next];
+                    }
+                }
+            }
+            let (mut uses, defs) = line_reg_use_def(store, infos, i);
+            if return_uses_edx && infos[i].kind == LineKind::Ret {
+                uses |= 1u16 << REG_EDX;
+            }
+            let input = uses | (out & !defs);
+            if out != live_out[local] || input != live_in[local] {
+                live_out[local] = out;
+                live_in[local] = input;
+                progress = true;
+            }
+        }
+    }
+    live_out
+}
+
 /// Use whole-function GPR liveness to remove dead moves and retarget safe
 /// accumulator update/copy-back chains.  The earlier bounded scans intentionally
 /// stop at branches, so they cannot reason about loop backedges or both sides of
@@ -3431,74 +3645,7 @@ fn optimize_cfg_register_liveness(
         let return_uses_edx = (start..end).any(|i| {
             !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
         });
-        let mut labels = std::collections::HashMap::<&str, usize>::new();
-        for i in start..end {
-            if infos[i].kind == LineKind::Label {
-                labels.insert(
-                    trimmed(store, &infos[i], i).trim_end_matches(':'),
-                    i - start,
-                );
-            }
-        }
-        let mut live_in = vec![0u16; n];
-        let mut live_out = vec![0u16; n];
-        let mut progress = true;
-        while progress {
-            progress = false;
-            for local in (0..n).rev() {
-                let i = start + local;
-                if infos[i].is_nop() {
-                    let out = if local + 1 < n { live_in[local + 1] } else { 0 };
-                    if out != live_out[local] || out != live_in[local] {
-                        live_out[local] = out;
-                        live_in[local] = out;
-                        progress = true;
-                    }
-                    continue;
-                }
-                let fallthrough = (local + 1 < n).then_some(local + 1);
-                let target = direct_jump_target(trimmed(store, &infos[i], i))
-                    .and_then(|name| labels.get(name).copied());
-                let mut out = 0u16;
-                match infos[i].kind {
-                    LineKind::Ret | LineKind::JmpIndirect => {}
-                    LineKind::Jmp => {
-                        if let Some(target) = target {
-                            out |= live_in[target];
-                        } else {
-                            // External direct jumps are tail calls.  Their ABI
-                            // arguments may occupy any regparm register.
-                            out = (1u16 << (REG_GP_MAX + 1)) - 1;
-                        }
-                    }
-                    LineKind::CondJmp => {
-                        if let Some(target) = target {
-                            out |= live_in[target];
-                        } else {
-                            out = (1u16 << (REG_GP_MAX + 1)) - 1;
-                        }
-                        if let Some(next) = fallthrough {
-                            out |= live_in[next];
-                        }
-                    }
-                    _ => {
-                        if let Some(next) = fallthrough {
-                            out |= live_in[next];
-                        }
-                    }
-                }
-                let (mut uses, defs) = line_reg_use_def(store, infos, i);
-                if return_uses_edx && infos[i].kind == LineKind::Ret {
-                    uses |= 1u16 << REG_EDX;
-                }
-                let input = uses | (out & !defs);
-                if out != live_out[local] || input != live_in[local] {
-                    live_out[local] = out;
-                    live_in[local] = input;
-                    progress = true;
-                }
-            }
-        }
+        let live_out = compute_gpr_live_out(store, infos, start, end, return_uses_edx);
         // Retarget accumulator update/copy-back chains when EAX is dead after
         // the copy.  The accumulator backend naturally emits
         //
@@ -5405,6 +5552,9 @@ fn is_full_width_load(s: &str) -> bool {
 fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Computed lazily (first fold candidate) and reused for the whole sweep:
+    // see `GprLiveness` for why one computation stays sound across folds.
+    let mut liveness_cache: Option<GprLiveness> = None;
 
     let mut i = 0;
     while i < len {
@@ -5450,51 +5600,33 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 // must be DEAD after the folded consumer. Copy propagation can
                 // extend a slot load's register across several consumers
                 // (`movl SLOT,%eax; movl %eax,%edx; cmpl %edx,%edi; subl
-                // %edx,%ebp` -> `...; cmpl %eax,%edi; subl %eax,%ebp`), so a
-                // later read of load_reg would see a stale value once the load
-                // is gone. Scan forward: a read of load_reg (explicit or
-                // implicit) before the next pure write to it is unsafe. A
-                // label/call/ret invalidates the accumulator cache (the emitter
-                // reloads afterwards), so the loaded value is provably dead
-                // there — but a CONDITIONAL jump does NOT invalidate: its
-                // fallthrough (e.g. a select arm) may still read the register.
-                let mut safe = true;
-                let mut k = j + 1;
-                while k < len {
-                    if infos[k].is_nop() || is_debug_location(store, infos, k) {
-                        k += 1;
-                        continue;
-                    }
-                    let lk = trimmed(store, &infos[k], k);
-                    if infos[k].is_barrier() {
-                        break;
-                    }
-                    // A pure write to load_reg ends its liveness. `movl $imm,%reg`
-                    // and `leal ADDR,%reg` write without reading %reg; a generic
-                    // read-modify-write (addl/subl/…) READS its destination and
-                    // is correctly treated as a read below.
-                    let pure_write = match infos[k].kind {
-                        LineKind::Move { dst, src } => dst == load_reg && src != load_reg,
-                        LineKind::LoadEbp { reg, .. } => reg == load_reg,
-                        LineKind::Pop { reg } => reg == load_reg,
-                        LineKind::SetCC { reg } => reg == load_reg,
-                        LineKind::Other { dest_reg } => {
-                            dest_reg == load_reg
-                                && (lk.starts_with("movl $") || lk.starts_with("leal "))
-                        }
-                        _ => false,
-                    } || (line_writes_reg_implicitly(lk, load_reg)
-                        && !line_references_reg(lk, load_reg));
-                    if pure_write {
-                        break;
-                    }
-                    if line_references_reg(lk, load_reg) {
-                        safe = false;
-                        break;
-                    }
-                    k += 1;
+                // %edx,%ebp` -> `...; cmpl %eax,%edi; subl %eax,%ebp`), and a
+                // register-allocated param/phi home (`movl 20(%esp),%esi`) is
+                // live across labels, conditional jumps and back-edges. The
+                // whole-function liveness oracle (`GprLiveness`) answers
+                // exactly; the former bounded scan stopped at the first
+                // barrier (label/call/ret/jump) and *assumed* deadness there,
+                // which miscompiled `a > b ? a : b` (the select's fall-through
+                // arm read a never-written %esi) and, less visibly, let a fold
+                // delete a load that a following regparm call read from
+                // %eax/%ecx/%edx or a `ret` read from %eax (the return value).
+                //
+                // The oracle is computed lazily (first fold candidate) and
+                // reused for the whole sweep: folds nop lines in place instead
+                // of removing them, so indices stay aligned, and deleting a
+                // dead definition only makes that register's cached answer
+                // conservative — see `GprLiveness`.
+                let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
+                if !liveness.dead_after(j, load_reg) {
+                    i += 1;
+                    continue;
                 }
-                if !safe {
+                // Belt-and-braces: the consumer must not write load_reg in a
+                // way the folded form cannot reproduce (`try_fold_memory_operand`
+                // already refuses an explicit dest==load_reg; this catches an
+                // architectural write such as `cltd` overwriting %edx). A pure
+                // refusal here is always safe.
+                if line_writes_reg_implicitly(s, load_reg) {
                     i += 1;
                     continue;
                 }
@@ -13032,4 +13164,218 @@ mod tests {
         );
     }
 
+    // ── Whole-function GPR liveness oracle (GprLiveness) ────────────────────
+    //
+    // `fold_memory_operands` used to prove the loaded register dead with a
+    // bounded forward scan that stopped at the first barrier and *assumed*
+    // deadness there. Every test below contains a fold candidate whose
+    // register is live PAST the barrier the old scan stopped at; the fold
+    // must be refused. The positive controls at the end prove the oracle
+    // still folds genuinely dead loads (exactness, not blanket conservatism).
+
+    #[test]
+    fn memfold_load_live_across_conditional_not_folded() {
+        // The reproduced `maxi(a,b){return a>b?a:b;}` miscompile on 4927a774:
+        // `movl 20(%esp),%esi` was folded into `cmpl 20(%esp),%ebx` and the
+        // select's fall-through arm read a never-written %esi.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 16(%esp), %ebx\n",
+            "    movl 20(%esp), %esi\n",
+            "    cmpl %esi, %ebx\n",
+            "    jg .Lsel_true_0\n",
+            "    movl %esi, %eax\n",
+            "    jmp .Lsel_end_0\n",
+            ".Lsel_true_0:\n",
+            "    movl %ebx, %eax\n",
+            ".Lsel_end_0:\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cmpl 16(%esp), %ebx"),
+            "fold must be refused: %esi is read by the fall-through arm:\n{result}"
+        );
+        assert!(
+            result.contains("movl 20(%esp), %esi"),
+            "the param home load must survive:\n{result}"
+        );
+        assert!(
+            result.contains("cmpl %esi, %ebx"),
+            "the consumer must keep the register operand:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_load_live_at_branch_target_not_folded() {
+        // Same class, but the read sits behind the CONDITIONAL JUMP TARGET,
+        // not the fall-through: the old scan stopped at the `je` and folded.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl $0, %ecx\n",
+            ".Lloop:\n",
+            "    movl 16(%esp), %esi\n",
+            "    cmpl %esi, %ebx\n",
+            "    je .Ldone\n",
+            "    incl %ecx\n",
+            "    cmpl $10, %ecx\n",
+            "    jl .Lloop\n",
+            ".Ldone:\n",
+            "    addl %esi, %edi\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cmpl 16(%esp), %ebx"),
+            "fold must be refused: %esi is live at .Ldone:\n{result}"
+        );
+        assert!(
+            result.contains("movl 16(%esp), %esi"),
+            "the load must survive:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_load_feeding_regparm_call_not_folded() {
+        // A regparm callee may read %eax/%ecx/%edx as incoming arguments. The
+        // old scan treated `call` as an opaque barrier and folded, deleting a
+        // value the call consumes.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 16(%esp), %ecx\n",
+            "    cmpl %ecx, %ebx\n",
+            "    call g\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cmpl 16(%esp), %ebx"),
+            "fold must be refused: the call may read %ecx as an argument:\n{result}"
+        );
+        assert!(
+            result.contains("movl 16(%esp), %ecx"),
+            "the load feeding the call argument must survive:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_load_feeding_ret_not_folded() {
+        // `ret` reads %eax (the scalar return value). The old scan stopped
+        // there and folded, leaving the return value undefined.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 16(%esp), %eax\n",
+            "    cmpl %eax, %ebx\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cmpl 16(%esp), %ebx"),
+            "fold must be refused: %eax is observed by the caller at ret:\n{result}"
+        );
+        assert!(
+            result.contains("movl 16(%esp), %eax"),
+            "the load feeding the return value must survive:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_load_before_jump_table_dispatch_not_folded() {
+        // `jmp *table(,%eax,4)` (emit_switch_jump_table) reads every GPR (the
+        // index, and any of them as a tail-call argument register); case
+        // labels may read arbitrary register-allocated values. The dispatch
+        // must act as a full liveness barrier.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 16(%esp), %esi\n",
+            "    cmpl %esi, %ebx\n",
+            "    jmp *jt(, %eax, 4)\n",
+            ".L0:\n",
+            "    addl %esi, %edi\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            !result.contains("cmpl 16(%esp), %ebx"),
+            "fold must be refused before an indirect dispatch:\n{result}"
+        );
+        assert!(
+            result.contains("movl 16(%esp), %esi"),
+            "the load must survive:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_dead_after_both_arms_still_folds() {
+        // Positive control: %esi is read by NEITHER arm after the compare, so
+        // the whole-function oracle must still fold (precision, not just
+        // safety).
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 16(%esp), %ebx\n",
+            "    movl 20(%esp), %esi\n",
+            "    cmpl %esi, %ebx\n",
+            "    jg .Lsel_true_0\n",
+            "    movl %ebx, %eax\n",
+            "    jmp .Lsel_end_0\n",
+            ".Lsel_true_0:\n",
+            "    movl %ebx, %eax\n",
+            ".Lsel_end_0:\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("cmpl 20(%esp), %ebx"),
+            "dead load must fold into the compare:\n{result}"
+        );
+        assert!(
+            !result.contains("movl 20(%esp), %esi"),
+            "the dead load must be gone:\n{result}"
+        );
+    }
+
+    #[test]
+    fn memfold_dead_load_before_label_still_folds() {
+        // Positive control across a label: the load is dead at the label (the
+        // continuation re-materialises %ebx), so folding is exact even though
+        // labels ended the old scan — the oracle distinguishes dead-at-label
+        // from live-across-label precisely.
+        let asm = concat!(
+            "f:\n",
+            "    subl $8, %esp\n",
+            "    movl 20(%esp), %esi\n",
+            "    cmpl %esi, %ebx\n",
+            ".Lnext:\n",
+            "    movl %ebx, %eax\n",
+            "    addl $8, %esp\n",
+            "    ret\n",
+        )
+        .to_string();
+        let result = peephole_optimize(asm);
+        assert!(
+            result.contains("cmpl 20(%esp), %ebx"),
+            "dead load must fold (dead-at-label is provable):\n{result}"
+        );
+        assert!(
+            !result.contains("movl 20(%esp), %esi"),
+            "the dead load must be gone:\n{result}"
+        );
+    }
 }

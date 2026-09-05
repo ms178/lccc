@@ -1521,78 +1521,212 @@ mod vector_result_width_tests {
         );
     }
 
-    /// Every `*I32x8` / `*F64x4` / `*F32x8` / `*I64x4` reduction or arithmetic
-    /// op names its lane count in its identifier; the declared width must
-    /// agree with that name. This catches the copy-paste class of defect
-    /// generally instead of pinning one operation.
+    /// Every `Vec*` op whose identifier ends in a `<Type><Lanes>` shape token
+    /// (`I32x4`, `I32x8`, `I64x2`, `I64x4`, `F32x4`, `F32x8`, `F64x2`,
+    /// `F64x4`) names its result shape; the declared width must agree with
+    /// that name.
+    ///
+    /// The op list is extracted from THIS source file's `pub enum
+    /// IntrinsicOp` block at compile time (`include_str!`), so the check is
+    /// exhaustive by construction: an op added to the enum tomorrow is
+    /// checked the next time the tests run, with no hand-maintained list to
+    /// forget. That failure mode is not hypothetical: the four x8 lane ops
+    /// (`VecSubI32x8`, `VecAndI32x8`, `VecOrI32x8`, `VecXorI32x8`) were
+    /// originally asserted against `Some(16)` here — pasted into the wrong
+    /// list by the same commit that added them — while the width table
+    /// correctly said `Some(32)`.
+    ///
+    /// Name grammar: take the LAST `<Type>x<Lanes>` token in the identifier
+    /// (`VecWiden*ToI64x2` results are the final shape) and expect
+    /// lanes * sizeof(Type) bytes. Documented divergences between name and
+    /// result, all asserted as `None`:
+    /// - `VecHorizontal*` reduce pairwise to a narrower shape or a scalar.
+    /// - `VecStore*` write memory and produce no value — except
+    ///   `VecStoreI64x2`, which is deliberately listed (slot sizing) and
+    ///   agrees with its name.
+    /// - `VecSadalpI32x4` / `VecSmlal{Hi,Lo}I32x4` are unlowered NEON-shaped
+    ///   variants with no registered result; exempt until a lowering lands.
     #[test]
     fn declared_width_agrees_with_the_lane_count_in_the_name() {
-        // (op, name) pairs for the 256-bit auto-vectorizer family.
-        let wide: &[(IntrinsicOp, &str)] = &[
-            (IntrinsicOp::VecMaskedAddI32x8, "VecMaskedAddI32x8"),
-            (IntrinsicOp::VecAddI32x8, "VecAddI32x8"),
-            (IntrinsicOp::VecLoadI32x8, "VecLoadI32x8"),
-            (IntrinsicOp::VecZeroI32x8, "VecZeroI32x8"),
-            (IntrinsicOp::VecAddF64x4, "VecAddF64x4"),
-            (IntrinsicOp::VecMulF64x4, "VecMulF64x4"),
-            (IntrinsicOp::VecLoadF64x4, "VecLoadF64x4"),
-            (IntrinsicOp::VecAddF32x8, "VecAddF32x8"),
-            (IntrinsicOp::VecAddI64x4, "VecAddI64x4"),
-            (IntrinsicOp::VecLoadI64x4, "VecLoadI64x4"),
-            (IntrinsicOp::VecZeroI64x4, "VecZeroI64x4"),
-        ];
-        for (op, name) in wide {
-            assert_eq!(
-                op.vector_result_width(),
-                Some(32),
-                "{name}: a 256-bit lane shape must declare 32 bytes"
-            );
+        const SRC: &str = include_str!("intrinsics.rs");
+        let enum_start = SRC.find("pub enum IntrinsicOp").expect("enum block present");
+        let enum_body = &SRC[enum_start..];
+        let enum_body = &enum_body[..enum_body.find("\n}\n").expect("enum block terminated")];
+        let mut names: Vec<&str> = Vec::new();
+        for line in enum_body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with("pub enum") {
+                continue;
+            }
+            // Variant entries: `Name,` / `Name | Name2,` — capture Vec* tokens
+            // that sit in variant position, never inside doc text.
+            for tok in t.split([',', '|']) {
+                let tok = tok.trim();
+                if tok.starts_with("Vec") && tok.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    names.push(tok);
+                }
+            }
         }
-        // `VecHorizontalAdd*` reduces to a SCALAR. The doc comment on
-        // `vector_result_width` states this explicitly ("ops whose result is
-        // a SCALAR must never be listed here even if their name sounds
-        // vector-ish"), yet `VecHorizontalAddI64x4` was listed as 128-bit --
-        // the only member of its family in the table. Misclassifying a scalar
-        // as a vector switches its codegen from value-load to `leaq`
-        // addressing (the volatile_access regression named in that comment).
-        for (op, name) in [
-            (IntrinsicOp::VecHorizontalAddI64x4, "VecHorizontalAddI64x4"),
-            (IntrinsicOp::VecHorizontalAddI64x2, "VecHorizontalAddI64x2"),
-            (IntrinsicOp::VecHorizontalAddI32x8, "VecHorizontalAddI32x8"),
-            (IntrinsicOp::VecHorizontalAddI32x4, "VecHorizontalAddI32x4"),
-            (IntrinsicOp::VecHorizontalAddF64x4, "VecHorizontalAddF64x4"),
-            (IntrinsicOp::VecHorizontalAddF64x2, "VecHorizontalAddF64x2"),
-            (IntrinsicOp::VecHorizontalAddF32x8, "VecHorizontalAddF32x8"),
-            (IntrinsicOp::VecHorizontalAddF32x4, "VecHorizontalAddF32x4"),
-        ] {
-            assert_eq!(
-                op.vector_result_width(),
-                None,
-                "{name} reduces to a scalar and must not claim a vector width"
-            );
-        }
+        assert!(
+            names.len() >= 100,
+            "variant extraction broke (found {} Vec* ops); fix the parser, not the count",
+            names.len()
+        );
 
-        let narrow: &[(IntrinsicOp, &str)] = &[
-            (IntrinsicOp::VecAddI32x4, "VecAddI32x4"),
-            (IntrinsicOp::VecAddF64x2, "VecAddF64x2"),
-            (IntrinsicOp::VecAddF32x4, "VecAddF32x4"),
-            (IntrinsicOp::VecAddI64x2, "VecAddI64x2"),
-            (IntrinsicOp::VecSubI32x4, "VecSubI32x4"),
-            (IntrinsicOp::VecSubI32x8, "VecSubI32x8"),
-            (IntrinsicOp::VecSubI64x2, "VecSubI64x2"),
-            (IntrinsicOp::VecAndI32x4, "VecAndI32x4"),
-            (IntrinsicOp::VecAndI32x8, "VecAndI32x8"),
-            (IntrinsicOp::VecOrI32x4, "VecOrI32x4"),
-            (IntrinsicOp::VecOrI32x8, "VecOrI32x8"),
-            (IntrinsicOp::VecXorI32x4, "VecXorI32x4"),
-            (IntrinsicOp::VecXorI32x8, "VecXorI32x8"),
+        // (name suffix token) -> (type bytes, lanes). Searched as exact
+        // substrings; the LAST occurrence in the name wins.
+        const SHAPES: [(&str, u32, u32); 8] = [
+            ("I32x8", 4, 8), ("I32x4", 4, 4),
+            ("I64x4", 8, 4), ("I64x2", 8, 2),
+            ("F32x8", 4, 8), ("F32x4", 4, 4),
+            ("F64x4", 8, 4), ("F64x2", 8, 2),
         ];
-        for (op, name) in narrow {
+        let mut checked = 0usize;
+        for name in names {
+            // Divergence classes: name sounds shaped but the result is not.
+            let exempt_none = name.contains("Horizontal")
+                || (name.starts_with("VecStore") && name != "VecStoreI64x2")
+                || name.starts_with("VecSadalp")
+                || name.starts_with("VecSmlal");
+            let last = SHAPES
+                .iter()
+                .filter_map(|(tok, ty, lanes)| name.rfind(tok).map(|p| (p, tok, ty, lanes)))
+                .max_by_key(|(p, tok, _, _)| (*p, tok.len()));
+            let Some((_, tok, ty, lanes)) = last else {
+                continue; // no shape token: grammar cannot judge (VecAdd, ...)
+            };
+            let expected = if exempt_none {
+                None
+            } else {
+                Some(ty * lanes)
+            };
+            let op: IntrinsicOp = names_to_op(name)
+                .unwrap_or_else(|| panic!("unhandled Vec* variant {name}: add it to names_to_op"));
             assert_eq!(
                 op.vector_result_width(),
-                Some(16),
-                "{name}: a 128-bit lane shape must declare 16 bytes"
+                expected,
+                "{name} ends in {tok}: name promises {expected:?}"
             );
+            checked += 1;
         }
+        assert!(
+            checked >= 90,
+            "only {checked} shape-conforming ops checked; variant extraction regressed"
+        );
+    }
+
+    /// Map a `Vec*` variant name (as it appears in the enum) to its value.
+    /// Exhaustive over the shape-bearing families; extended only when a new
+    /// family is added to the enum, at which point the test above fails
+    /// loudly for the unknown name instead of silently skipping it.
+    fn names_to_op(name: &str) -> Option<IntrinsicOp> {
+        Some(match name {
+            "VecAddF32x4" => IntrinsicOp::VecAddF32x4,
+            "VecAddF32x8" => IntrinsicOp::VecAddF32x8,
+            "VecAddF64x2" => IntrinsicOp::VecAddF64x2,
+            "VecAddF64x4" => IntrinsicOp::VecAddF64x4,
+            "VecAddI32x4" => IntrinsicOp::VecAddI32x4,
+            "VecAddI32x8" => IntrinsicOp::VecAddI32x8,
+            "VecAddI64x2" => IntrinsicOp::VecAddI64x2,
+            "VecAddI64x4" => IntrinsicOp::VecAddI64x4,
+            "VecAndI32x4" => IntrinsicOp::VecAndI32x4,
+            "VecAndI32x8" => IntrinsicOp::VecAndI32x8,
+            "VecBlendvF32x4" => IntrinsicOp::VecBlendvF32x4,
+            "VecBlendvF32x8" => IntrinsicOp::VecBlendvF32x8,
+            "VecBlendvF64x2" => IntrinsicOp::VecBlendvF64x2,
+            "VecBlendvF64x4" => IntrinsicOp::VecBlendvF64x4,
+            "VecBroadcastF32x4" => IntrinsicOp::VecBroadcastF32x4,
+            "VecBroadcastF32x8" => IntrinsicOp::VecBroadcastF32x8,
+            "VecBroadcastF64x2" => IntrinsicOp::VecBroadcastF64x2,
+            "VecBroadcastF64x4" => IntrinsicOp::VecBroadcastF64x4,
+            "VecBroadcastI32x4" => IntrinsicOp::VecBroadcastI32x4,
+            "VecBroadcastI32x8" => IntrinsicOp::VecBroadcastI32x8,
+            "VecBroadcastI64x2" => IntrinsicOp::VecBroadcastI64x2,
+            "VecCmpF32x4" => IntrinsicOp::VecCmpF32x4,
+            "VecCmpF32x8" => IntrinsicOp::VecCmpF32x8,
+            "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
+            "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
+            "VecDivF32x4" => IntrinsicOp::VecDivF32x4,
+            "VecDivF32x8" => IntrinsicOp::VecDivF32x8,
+            "VecDivF64x2" => IntrinsicOp::VecDivF64x2,
+            "VecDivF64x4" => IntrinsicOp::VecDivF64x4,
+            "VecFmaF32x8" => IntrinsicOp::VecFmaF32x8,
+            "VecFmaF64x4" => IntrinsicOp::VecFmaF64x4,
+            "VecHorizontalAddF32x4" => IntrinsicOp::VecHorizontalAddF32x4,
+            "VecHorizontalAddF32x8" => IntrinsicOp::VecHorizontalAddF32x8,
+            "VecHorizontalAddF64x2" => IntrinsicOp::VecHorizontalAddF64x2,
+            "VecHorizontalAddF64x4" => IntrinsicOp::VecHorizontalAddF64x4,
+            "VecHorizontalAddI32x4" => IntrinsicOp::VecHorizontalAddI32x4,
+            "VecHorizontalAddI32x8" => IntrinsicOp::VecHorizontalAddI32x8,
+            "VecHorizontalAddI64x2" => IntrinsicOp::VecHorizontalAddI64x2,
+            "VecHorizontalAddI64x4" => IntrinsicOp::VecHorizontalAddI64x4,
+            "VecHorizontalMaxI32x4" => IntrinsicOp::VecHorizontalMaxI32x4,
+            "VecHorizontalMaxI32x8" => IntrinsicOp::VecHorizontalMaxI32x8,
+            "VecLoadF32x4" => IntrinsicOp::VecLoadF32x4,
+            "VecLoadF32x8" => IntrinsicOp::VecLoadF32x8,
+            "VecLoadF64x2" => IntrinsicOp::VecLoadF64x2,
+            "VecLoadF64x4" => IntrinsicOp::VecLoadF64x4,
+            "VecLoadI32x4" => IntrinsicOp::VecLoadI32x4,
+            "VecLoadI32x8" => IntrinsicOp::VecLoadI32x8,
+            "VecLoadI64x2" => IntrinsicOp::VecLoadI64x2,
+            "VecLoadI64x4" => IntrinsicOp::VecLoadI64x4,
+            "VecLoadWidenI32ToI64x2" => IntrinsicOp::VecLoadWidenI32ToI64x2,
+            "VecMaddF32x8" => IntrinsicOp::VecMaddF32x8,
+            "VecMaddF64x4" => IntrinsicOp::VecMaddF64x4,
+            "VecMaskedAddI32x8" => IntrinsicOp::VecMaskedAddI32x8,
+            "VecMaxF32x4" => IntrinsicOp::VecMaxF32x4,
+            "VecMaxF32x8" => IntrinsicOp::VecMaxF32x8,
+            "VecMaxF64x2" => IntrinsicOp::VecMaxF64x2,
+            "VecMaxF64x4" => IntrinsicOp::VecMaxF64x4,
+            "VecMaxI32x8" => IntrinsicOp::VecMaxI32x8,
+            "VecMinF32x4" => IntrinsicOp::VecMinF32x4,
+            "VecMinF32x8" => IntrinsicOp::VecMinF32x8,
+            "VecMinF64x2" => IntrinsicOp::VecMinF64x2,
+            "VecMinF64x4" => IntrinsicOp::VecMinF64x4,
+            "VecMulF32x4" => IntrinsicOp::VecMulF32x4,
+            "VecMulF32x8" => IntrinsicOp::VecMulF32x8,
+            "VecMulF64x2" => IntrinsicOp::VecMulF64x2,
+            "VecMulF64x4" => IntrinsicOp::VecMulF64x4,
+            "VecMulI32x4" => IntrinsicOp::VecMulI32x4,
+            "VecMulI32x8" => IntrinsicOp::VecMulI32x8,
+            "VecMulI64x2" => IntrinsicOp::VecMulI64x2,
+            "VecOrI32x4" => IntrinsicOp::VecOrI32x4,
+            "VecOrI32x8" => IntrinsicOp::VecOrI32x8,
+            "VecSadalpI32x4" => IntrinsicOp::VecSadalpI32x4,
+            "VecSmaxI32x4" => IntrinsicOp::VecSmaxI32x4,
+            "VecSmlalHiI32x4" => IntrinsicOp::VecSmlalHiI32x4,
+            "VecSmlalLoI32x4" => IntrinsicOp::VecSmlalLoI32x4,
+            "VecSqrtF32x4" => IntrinsicOp::VecSqrtF32x4,
+            "VecSqrtF32x8" => IntrinsicOp::VecSqrtF32x8,
+            "VecSqrtF64x2" => IntrinsicOp::VecSqrtF64x2,
+            "VecSqrtF64x4" => IntrinsicOp::VecSqrtF64x4,
+            "VecStoreF32x4" => IntrinsicOp::VecStoreF32x4,
+            "VecStoreF32x8" => IntrinsicOp::VecStoreF32x8,
+            "VecStoreF64x2" => IntrinsicOp::VecStoreF64x2,
+            "VecStoreF64x4" => IntrinsicOp::VecStoreF64x4,
+            "VecStoreI32x4" => IntrinsicOp::VecStoreI32x4,
+            "VecStoreI32x8" => IntrinsicOp::VecStoreI32x8,
+            "VecStoreI64x2" => IntrinsicOp::VecStoreI64x2,
+            "VecSubF32x4" => IntrinsicOp::VecSubF32x4,
+            "VecSubF32x8" => IntrinsicOp::VecSubF32x8,
+            "VecSubF64x2" => IntrinsicOp::VecSubF64x2,
+            "VecSubF64x4" => IntrinsicOp::VecSubF64x4,
+            "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
+            "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
+            "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
+            "VecWidenAddI32x4ToI64x2" => IntrinsicOp::VecWidenAddI32x4ToI64x2,
+            "VecWidenMaskedAddI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
+            "VecXorI32x4" => IntrinsicOp::VecXorI32x4,
+            "VecXorI32x8" => IntrinsicOp::VecXorI32x8,
+            "VecZeroF32x4" => IntrinsicOp::VecZeroF32x4,
+            "VecZeroF32x8" => IntrinsicOp::VecZeroF32x8,
+            "VecZeroF64x2" => IntrinsicOp::VecZeroF64x2,
+            "VecZeroF64x4" => IntrinsicOp::VecZeroF64x4,
+            "VecZeroI32x4" => IntrinsicOp::VecZeroI32x4,
+            "VecZeroI32x8" => IntrinsicOp::VecZeroI32x8,
+            "VecZeroI64x2" => IntrinsicOp::VecZeroI64x2,
+            "VecZeroI64x4" => IntrinsicOp::VecZeroI64x4,
+            _ => return None,
+        })
     }
 }
