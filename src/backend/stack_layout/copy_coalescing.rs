@@ -1883,6 +1883,13 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecZeroI32x8
             | O::VecZeroF32x4
             | O::VecZeroF32x8
+            // VecMin/VecMax/VecCmp/VecBlendv read their operands through the
+            // register cache (avx_load_arg / vec_home / mem_source_after_
+            // flush), never raw from a slot — classifying them as raw readers
+            // forces a needless flush of the deferred value at every consumer
+            // (a dead stack store + reload per iteration in min/max/select
+            // loops).  They must NOT be listed here; the cache-aware checks
+            // (VDEFER pos0/pos1/pos2, is_cache_aware_3op) cover them.
     )
 }
 
@@ -1980,6 +1987,14 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAddI32x4
             | O::VecAddF32x4
             | O::VecMulF32x4
+            | O::VecMinF32x8
+            | O::VecMinF32x4
+            | O::VecMinF64x4
+            | O::VecMinF64x2
+            | O::VecMaxF32x8
+            | O::VecMaxF32x4
+            | O::VecMaxF64x4
+            | O::VecMaxF64x2
     )
 }
 
@@ -2016,6 +2031,22 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecZeroI32x8
             | O::VecZeroF32x4
             | O::VecZeroF32x8
+            | O::VecMinF32x8
+            | O::VecMinF32x4
+            | O::VecMinF64x4
+            | O::VecMinF64x2
+            | O::VecMaxF32x8
+            | O::VecMaxF32x4
+            | O::VecMaxF64x4
+            | O::VecMaxF64x2
+            | O::VecCmpF32x8
+            | O::VecCmpF32x4
+            | O::VecCmpF64x4
+            | O::VecCmpF64x2
+            | O::VecBlendvF32x8
+            | O::VecBlendvF32x4
+            | O::VecBlendvF64x4
+            | O::VecBlendvF64x2
     )
 }
 
@@ -2145,6 +2176,28 @@ pub(crate) fn memfold_consumer_madd_256(op: &crate::ir::intrinsics::IntrinsicOp)
     matches!(op, O::VecMaddF64x4 | O::VecMaddF32x8)
 }
 
+/// Three-operand vector consumers (packed FP compare / lane-mask select)
+/// whose emitters resolve the rhs/mask (argument positions 1 and 2)
+/// through the register cache — a deferred value still held in the scratch
+/// register is consumed in place (moved aside when the later load needs
+/// that register), never re-read from a possibly-stale slot.  Both the AVX
+/// and the SSE2-baseline emitters share this contract, so a deferred def
+/// of any of their operands keeps its store pending safely.
+pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecCmpF32x8
+            | O::VecCmpF32x4
+            | O::VecCmpF64x4
+            | O::VecCmpF64x2
+            | O::VecBlendvF32x8
+            | O::VecBlendvF32x4
+            | O::VecBlendvF64x4
+            | O::VecBlendvF64x2
+    )
+}
+
 /// Two-operand 256-bit VEX arithmetic intrinsics that go through
 /// `emit_avx_binary_256` and therefore can take a memory operand.
 /// Returns `Some(commutative)`.
@@ -2159,6 +2212,10 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         | O::VecMulI32x8
         | O::VecMaxI32x8 => Some(true),
         O::VecSubF64x4 | O::VecSubF32x8 | O::VecDivF64x4 | O::VecDivF32x8 => Some(false),
+        // Packed min/max are NON-commutative (MINPS/MAXPS return the second
+        // source on unordered/equal lanes), so a fold is only order-safe in
+        // the args[1] (src2) position — exactly what Some(false) gates.
+        O::VecMinF32x8 | O::VecMaxF32x8 | O::VecMinF64x4 | O::VecMaxF64x4 => Some(false),
         _ => None,
     }
 }
@@ -2547,8 +2604,12 @@ pub(super) fn compute_vector_defer_values(
             // no-op for the deferred value (positions 1 and 2 of VecMadd*).
             let cache_aware = match pos {
                 Some(0) => !is_raw_reader_intrinsic(cop),
-                Some(1) => is_two_operand_binary(cop) || memfold_consumer_madd_256(cop),
-                Some(2) => memfold_consumer_madd_256(cop),
+                Some(1) => {
+                    is_two_operand_binary(cop)
+                        || memfold_consumer_madd_256(cop)
+                        || is_cache_aware_3op(cop)
+                }
+                Some(2) => memfold_consumer_madd_256(cop) || is_cache_aware_3op(cop),
                 _ => false,
             };
             if !cache_aware {

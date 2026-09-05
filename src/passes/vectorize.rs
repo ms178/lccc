@@ -3532,14 +3532,17 @@ struct MapPattern {
 
 /// Elementwise map expression tree (OP-05a). Leaves are loop loads (by
 /// stream index) or loop-invariant scalars; internal nodes are FP Add/Sub/
-/// Mul/Div, integer Add/Mul, or FP Sqrt. The legacy affine family
-/// (`src[i]`, `src[i]*s`, `src[i]+o`, `src[i]*s+o`) is the depth-1 subset of
-/// this tree. Lane-exact by construction: every vector intrinsic computes
-/// the same IEEE operation per lane as the scalar original; the only
-/// semantics-affecting rewrite is the optional mul+add -> fused madd
-/// contraction under `-ffp-contract=fast` (same contract as the affine
-/// path).
-#[derive(Debug, Clone)]
+/// Mul/Div, integer Add/Mul, FP Sqrt, FP compares, lane-mask selects, and
+/// the exact min/max fold of a select over its own comparison. The legacy
+/// affine family (`src[i]`, `src[i]*s`, `src[i]+o`, `src[i]*s+o`) is the
+/// depth-1 subset of this tree. Lane-exact by construction: every vector
+/// intrinsic computes the same IEEE operation per lane as the scalar
+/// original; the only semantics-affecting rewrites are the optional
+/// mul+add -> fused madd contraction under `-ffp-contract=fast` (same
+/// contract as the affine path) and the min/max select-fold, which is
+/// exact because MINPS/MAXPS return the SECOND source operand on
+/// unordered and both-zero lanes, exactly like the folded C ternary.
+#[derive(Debug, Clone, PartialEq)]
 enum MapExpr {
     /// Load from source stream `i` (index into `MapPattern::src_geps`).
     Load(usize),
@@ -3549,6 +3552,20 @@ enum MapExpr {
     BinOp(IrBinOp, Box<MapExpr>, Box<MapExpr>),
     /// Scalar sqrt over a subexpression (FP only).
     Sqrt(Box<MapExpr>),
+    /// FP comparison `lhs op rhs`. The parser normalizes the predicate to
+    /// the EQ/LT/LE/NE ordered subset (GT/GE enter with swapped operands),
+    /// the exact subset the packed compare emitters accept as immediates.
+    Cmp(IrCmpOp, Box<MapExpr>, Box<MapExpr>),
+    /// Lane-mask select `cond ? true_val : false_val`; `cond` is always a
+    /// `Cmp` node (the parser only accepts comparison-produced masks).
+    Select(Box<MapExpr>, Box<MapExpr>, Box<MapExpr>),
+    /// min(l, r) / max(l, r): the exact fold of `l < r ? l : r` resp.
+    /// `l > r ? l : r` (see the enum docs for the IEEE argument).
+    MinMax {
+        is_max: bool,
+        l: Box<MapExpr>,
+        r: Box<MapExpr>,
+    },
 }
 
 impl MapExpr {
@@ -3557,6 +3574,9 @@ impl MapExpr {
             MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
             MapExpr::BinOp(_, l, r) => 1 + l.node_count() + r.node_count(),
             MapExpr::Sqrt(x) => 1 + x.node_count(),
+            MapExpr::Cmp(_, l, r) => 1 + l.node_count() + r.node_count(),
+            MapExpr::Select(c, t, f) => 1 + c.node_count() + t.node_count() + f.node_count(),
+            MapExpr::MinMax { l, r, .. } => 1 + l.node_count() + r.node_count(),
         }
     }
 }
@@ -3572,7 +3592,13 @@ struct MapEmitCtx<'a> {
     sqrt_op: Option<IntrinsicOp>,
     madd_op: Option<IntrinsicOp>,
     bin_op: &'a dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
-    broadcast_cache: Vec<(String, Value)>,
+    cmp_op: &'a dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
+    minmax_op: &'a dyn Fn(bool) -> Option<IntrinsicOp>,
+    blendv_op: Option<IntrinsicOp>,
+    /// Every emitted node, keyed by its tree shape: identical subexpressions
+    /// (reused loads, shared compares) emit exactly once — free CSE keeps
+    /// e.g. a clamp tree at one load instead of three.
+    node_cache: Vec<(String, Value)>,
     preheader_insts: Vec<Instruction>,
     vec_insts: Vec<Instruction>,
     next_val_id: u32,
@@ -3586,7 +3612,18 @@ impl<'a> MapEmitCtx<'a> {
         v
     }
 
+    /// Cached entry point: identical subtrees emit once and share the value.
     fn emit(&mut self, expr: &MapExpr) -> Option<Value> {
+        let key = format!("{:?}", expr);
+        if let Some(&(_, cached)) = self.node_cache.iter().find(|(k, _)| *k == key) {
+            return Some(cached);
+        }
+        let dest = self.emit_uncached(expr)?;
+        self.node_cache.push((key, dest));
+        Some(dest)
+    }
+
+    fn emit_uncached(&mut self, expr: &MapExpr) -> Option<Value> {
         match expr {
             MapExpr::Load(stream) => {
                 let dest = self.fresh();
@@ -3602,20 +3639,15 @@ impl<'a> MapEmitCtx<'a> {
                 Some(dest)
             }
             MapExpr::Invariant(operand) => {
-                let key = format!("{:?}", operand);
-                if let Some(&(_, cached)) = self.broadcast_cache.iter().find(|(k, _)| *k == key) {
-                    return Some(cached);
-                }
-                let dest = self.fresh();
                 // Broadcasts live in the PREHEADER so they are hoisted out
                 // of the packed loop (register-allocated once).
+                let dest = self.fresh();
                 self.preheader_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
                     op: self.broadcast_op,
                     dest_ptr: None,
                     args: vec![operand.clone()],
                 });
-                self.broadcast_cache.push((key, dest));
                 Some(dest)
             }
             MapExpr::Sqrt(x) => {
@@ -3627,6 +3659,57 @@ impl<'a> MapEmitCtx<'a> {
                     op: sqrt_op,
                     dest_ptr: None,
                     args: vec![Operand::Value(inner)],
+                });
+                Some(dest)
+            }
+            MapExpr::Cmp(op, l, r) => {
+                let lv = self.emit(l)?;
+                let rv = self.emit(r)?;
+                let (cmp_op, imm) = (self.cmp_op)(op)?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: cmp_op,
+                    dest_ptr: None,
+                    args: vec![
+                        Operand::Value(lv),
+                        Operand::Value(rv),
+                        Operand::Const(IrConst::I32(imm)),
+                    ],
+                });
+                Some(dest)
+            }
+            MapExpr::Select(cond, t, f) => {
+                // False, then true, then the mask LAST: the mask is usually a
+                // just-emitted compare whose result still lives in %ymm0 —
+                // the blendv emitter resolves the mask first (cache hit) and
+                // only then loads the other operands around it.
+                let fv = self.emit(f)?;
+                let tv = self.emit(t)?;
+                let cv = self.emit(cond)?;
+                let blendv_op = self.blendv_op?;
+                let dest = self.fresh();
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: blendv_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(fv), Operand::Value(tv), Operand::Value(cv)],
+                });
+                Some(dest)
+            }
+            MapExpr::MinMax { is_max, l, r } => {
+                let lv = self.emit(l)?;
+                let rv = self.emit(r)?;
+                let vec_op = (self.minmax_op)(*is_max)?;
+                let dest = self.fresh();
+                // args [l, r] lower to `op r, l, dst` / in-place `op r, l`:
+                // r is the SECOND source operand, returned on unordered and
+                // both-zero lanes — exactly the folded ternary's semantics.
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: vec_op,
+                    dest_ptr: None,
+                    args: vec![Operand::Value(lv), Operand::Value(rv)],
                 });
                 Some(dest)
             }
@@ -3682,15 +3765,34 @@ fn analyze_map_pattern(
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
     let header = &func.blocks[header_idx];
+    if debug {
+        eprintln!(
+            "[VEC-MAP] ENTER: header={}, body={:?}",
+            header_idx, loop_info.body
+        );
+    }
 
-    let exit_idx = find_exit(func, loop_info)?;
-    let latch_idx = find_latch(func, loop_info)?;
+    let exit_idx = match find_exit(func, loop_info) {
+        Some(e) => e,
+        None => {
+            if debug { eprintln!("[VEC-MAP] BAIL: no exit"); }
+            return None;
+        }
+    };
+    let latch_idx = match find_latch(func, loop_info) {
+        Some(l) => l,
+        None => {
+            if debug { eprintln!("[VEC-MAP] BAIL: no latch"); }
+            return None;
+        }
+    };
     // The transform redirects the false edge to the scalar remainder.  Require
     // the canonical while-loop shape rather than guessing branch polarity.
     if !matches!(header.terminator,
         Terminator::CondBranch { false_label, .. }
             if false_label == func.blocks[exit_idx].label)
     {
+        if debug { eprintln!("[VEC-MAP] BAIL: header shape"); }
         return None;
     }
 
@@ -3702,6 +3804,7 @@ fn analyze_map_pattern(
                 Terminator::CondBranch { .. }
             )
     }) {
+        if debug { eprintln!("[VEC-MAP] BAIL: internal condbranch"); }
         return None;
     }
 
@@ -3735,7 +3838,10 @@ fn analyze_map_pattern(
             break;
         }
     }
-    let (iv, iv_ty) = iv?;
+    let Some((iv, iv_ty)) = iv else {
+        if debug { eprintln!("[VEC-MAP] BAIL: no IV phi"); }
+        return None;
+    };
 
     // IV-derived values across the loop (casts/copies), fixed-point.
     let mut iv_derived = FxHashSet::default();
@@ -3787,17 +3893,22 @@ fn analyze_map_pattern(
             }
         }
     }
-    let (exit_cmp_op, limit) = exit_cmp_info?;
+    let Some((exit_cmp_op, limit)) = exit_cmp_info else {
+        if debug { eprintln!("[VEC-MAP] BAIL: no exit cmp"); }
+        return None;
+    };
     if matches!(&limit, Operand::Value(v)
         if find_inst_in_loop(func, &loop_info.body, *v).is_some())
     {
         set_reject("map trip count is not loop-invariant");
+        if debug { eprintln!("[VEC-MAP] BAIL: trip count not invariant"); }
         return None;
     }
 
     // Constant trip counts of 4 or fewer are better left scalar.
     if let Operand::Const(c) = &limit {
         if c.to_i64().map_or(false, |n| n <= 4) {
+            if debug { eprintln!("[VEC-MAP] BAIL: const trip <= 4"); }
             return None;
         }
     }
@@ -3810,6 +3921,7 @@ fn analyze_map_pattern(
                 && matches!(rhs, Operand::Const(c) if c.to_i64() == Some(1)))
     });
     if !has_unit_increment {
+        if debug { eprintln!("[VEC-MAP] BAIL: no unit increment"); }
         return None;
     }
 
@@ -3829,6 +3941,7 @@ fn analyze_map_pattern(
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
                         || load_infos.len() >= MAP_MAX_STREAMS
                     {
+                        if debug { eprintln!("[VEC-MAP] BAIL: bad load ty/streams"); }
                         return None;
                     }
                     load_infos.push((block_idx, *dest, *ptr, *ty));
@@ -3837,14 +3950,17 @@ fn analyze_map_pattern(
                     if !matches!(*ty, IrType::I32 | IrType::U32 | IrType::F32 | IrType::F64)
                         || store_info.is_some()
                     {
+                        if debug { eprintln!("[VEC-MAP] BAIL: bad store ty/dup"); }
                         return None;
                     }
                     let Operand::Value(store_val) = val else {
+                        if debug { eprintln!("[VEC-MAP] BAIL: store val not value"); }
                         return None;
                     };
                     store_info = Some((block_idx, *ptr, *store_val, *ty));
                 }
                 Instruction::BinOp { op, ty, .. } if op.can_trap() && !ty.is_float() => {
+                    if debug { eprintln!("[VEC-MAP] BAIL: trapping binop"); }
                     return None;
                 }
                 // Scalar sqrt lowers to a pure intrinsic; the map tree
@@ -3857,21 +3973,30 @@ fn analyze_map_pattern(
                 | Instruction::BinOp { .. }
                 | Instruction::UnaryOp { .. }
                 | Instruction::Cmp { .. }
+                | Instruction::Select { .. }
                 | Instruction::Cast { .. }
                 | Instruction::Copy { .. }
                 | Instruction::GetElementPtr { .. }
                 | Instruction::GlobalAddr { .. } => {}
-                _ => return None,
+                _ => {
+                    if debug { eprintln!("[VEC-MAP] BAIL: unwhitelisted inst in scan"); }
+                    return None;
+                }
             }
         }
     }
-    let (body_idx, dst_gep, store_val, elem_ty) = store_info?;
+    let Some((body_idx, dst_gep, store_val, elem_ty)) = store_info else {
+        if debug { eprintln!("[VEC-MAP] BAIL: no store info"); }
+        return None;
+    };
     // At least one source stream is required (a pure store of a loop
     // invariant is not a map).
     if load_infos.is_empty() {
+        if debug { eprintln!("[VEC-MAP] BAIL: no loads"); }
         return None;
     }
     if load_infos.iter().any(|&(_, _, _, ty)| ty != elem_ty) {
+        if debug { eprintln!("[VEC-MAP] BAIL: load/store ty mismatch"); }
         return None;
     }
 
@@ -3892,6 +4017,7 @@ fn analyze_map_pattern(
     }
     if find_reduction_byte_iv(func, &loop_info.body, dst_gep, elem_size).is_none() {
         set_reject("map access is not a contiguous element-size stride");
+        if debug { eprintln!("[VEC-MAP] BAIL: dst not contiguous"); }
         return None;
     }
     // Every source stream must be IV-indexed and contiguous as well.
@@ -3900,6 +4026,7 @@ fn analyze_map_pattern(
             || find_reduction_byte_iv(func, &loop_info.body, src_gep, elem_size).is_none()
         {
             set_reject("map source access is not a contiguous element-size stride");
+            if debug { eprintln!("[VEC-MAP] BAIL: src not contiguous"); }
             return None;
         }
     }
@@ -3940,7 +4067,14 @@ fn analyze_map_pattern(
     let expr = if load_dests.len() == 1 && store_val == load_dests[0] {
         MapExpr::Load(0)
     } else {
-        parse_tree(store_val, 0)?
+        let parsed = parse_tree(store_val, 0);
+        if debug {
+            eprintln!(
+                "[VEC-MAP]   parse store_val={} -> {:?}",
+                store_val.0, parsed
+            );
+        }
+        parsed?
     };
     const MAP_MAX_NODES: usize = 12;
     if expr.node_count() > MAP_MAX_NODES {
@@ -4143,6 +4277,214 @@ fn parse_map_expr(
                 allow_ext_fp_ops,
             )?)))
         }
+        Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } if ty.is_float() && *ty == *elem_ty && allow_ext_fp_ops => {
+            // Normalize to the ordered EQ/LT/LE/NE subset the packed
+            // compare emitters accept as immediates; GT/GE enter with
+            // swapped operands (identical IEEE semantics: FP compares are
+            // symmetric under operand swap for strict ordered predicates).
+            let (norm_op, norm_lhs, norm_rhs) = match op {
+                IrCmpOp::Eq | IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sle => {
+                    (*op, lhs.clone(), rhs.clone())
+                }
+                IrCmpOp::Sgt => (IrCmpOp::Slt, rhs.clone(), lhs.clone()),
+                IrCmpOp::Sge => (IrCmpOp::Sle, rhs.clone(), lhs.clone()),
+                // Integer predicates never appear on FP compare operands.
+                _ => return None,
+            };
+            let l = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &norm_lhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            let r = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &norm_rhs,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            Some(MapExpr::Cmp(norm_op, Box::new(l), Box::new(r)))
+        }
+        Instruction::Select {
+            cond,
+            true_val,
+            false_val,
+            ..
+        } if allow_ext_fp_ops => {
+            // Only comparison-produced masks are vectorizable: any other
+            // mask source (a loaded bool, a bit test) has no lane-mask
+            // lowering and keeps the loop scalar (fail closed).
+            let Operand::Value(cond_val) = cond else {
+                return None;
+            };
+            let Some((_, Instruction::Cmp {
+                op,
+                lhs,
+                rhs,
+                ty,
+                ..
+            })) = find_inst_in_loop(func, loop_blocks, *cond_val)
+            else {
+                return None;
+            };
+            if !(ty.is_float() && *ty == *elem_ty) {
+                return None;
+            }
+            let t = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                true_val,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            let f = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                false_val,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            // Exact min/max fold, checked on the UNNORMALIZED comparison:
+            //   l < r ? l : r  ->  min(l, r)      (MINPS/MAXPS return the
+            //   l > r ? l : r  ->  max(l, r)       second source on
+            // unordered and both-zero lanes — precisely the folded C
+            // ternary's result for every NaN/+-0 lane).  Swapped-arm forms
+            // (`l < r ? r : l`) are NOT max/min for +-0 (maxps(l, r) picks
+            // r on both-zero lanes where the ternary picks l) and fall
+            // through to the exact compare+select lowering.
+            let fold = match op {
+                IrCmpOp::Slt => {
+                    let l = parse_map_operand(
+                        func,
+                        loop_blocks,
+                        load_dests,
+                        iv_derived,
+                        is_invariant,
+                        elem_ty,
+                        lhs,
+                        depth + 1,
+                        allow_ext_fp_ops,
+                    )?;
+                    let r = parse_map_operand(
+                        func,
+                        loop_blocks,
+                        load_dests,
+                        iv_derived,
+                        is_invariant,
+                        elem_ty,
+                        rhs,
+                        depth + 1,
+                        allow_ext_fp_ops,
+                    )?;
+                    if t == l && f == r {
+                        Some(MapExpr::MinMax {
+                            is_max: false,
+                            l: Box::new(l),
+                            r: Box::new(r),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                IrCmpOp::Sgt => {
+                    let l = parse_map_operand(
+                        func,
+                        loop_blocks,
+                        load_dests,
+                        iv_derived,
+                        is_invariant,
+                        elem_ty,
+                        lhs,
+                        depth + 1,
+                        allow_ext_fp_ops,
+                    )?;
+                    let r = parse_map_operand(
+                        func,
+                        loop_blocks,
+                        load_dests,
+                        iv_derived,
+                        is_invariant,
+                        elem_ty,
+                        rhs,
+                        depth + 1,
+                        allow_ext_fp_ops,
+                    )?;
+                    if t == l && f == r {
+                        // `l > r ? l : r` == max(l, r) exactly: MAXPS returns
+                        // the second source (r) on unordered and both-zero
+                        // lanes, matching the ternary lane for lane.
+                        Some(MapExpr::MinMax {
+                            is_max: true,
+                            l: Box::new(l),
+                            r: Box::new(r),
+                        })
+                    } else if t == r && f == l {
+                        // `l > r ? r : l` == min(r, l) exactly, with the
+                        // ARMS SWAPPED relative to the compare operands:
+                        //   NaN  -> false arm l;  MINPS(x=r, y=l) -> y=l   ok
+                        //   +-0  -> both-zero lanes return y = l, and the
+                        //           ternary returns T=r on `l>r` (impossible
+                        //           for equal-magnitude zeros) else F=l   ok
+                        //   equal non-zero -> false arm l == second source
+                        // The canonical clamp tail `a > 1 ? 1 : a` hits this
+                        // fold (min(1, a)) — the exact GCC lowering.
+                        Some(MapExpr::MinMax {
+                            is_max: false,
+                            l: Box::new(r),
+                            r: Box::new(l),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(folded) = fold {
+                return Some(folded);
+            }
+            // General shape: keep the (normalized) compare as the mask and
+            // lower the ternary as a lane blend.  Re-parse the cond through
+            // the Cmp arm for the normalized EQ/LT/LE/NE predicate form.
+            let cond_expr = parse_map_expr(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                *cond_val,
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            if !matches!(cond_expr, MapExpr::Cmp(_, _, _)) {
+                return None;
+            }
+            Some(MapExpr::Select(
+                Box::new(cond_expr),
+                Box::new(t),
+                Box::new(f),
+            ))
+        }
         _ => None,
     }
 }
@@ -4178,21 +4520,44 @@ fn parse_map_operand(
     )
 }
 
-/// Every BinOp/Sqrt node in the tree must have a lowering before the
-/// transform starts mutating the function (fail-closed pre-validation).
+/// Every BinOp/Sqrt/Cmp/Select/MinMax node in the tree must have a lowering
+/// before the transform starts mutating the function (fail-closed
+/// pre-validation).
 fn map_tree_ops_available(
     expr: &MapExpr,
     bin_op: &dyn Fn(&IrBinOp) -> Option<IntrinsicOp>,
     sqrt_op: Option<IntrinsicOp>,
+    cmp_op: &dyn Fn(&IrCmpOp) -> Option<(IntrinsicOp, i32)>,
+    minmax_op: &dyn Fn(bool) -> Option<IntrinsicOp>,
+    blendv_op: Option<IntrinsicOp>,
 ) -> bool {
     match expr {
         MapExpr::Load(_) | MapExpr::Invariant(_) => true,
         MapExpr::BinOp(op, l, r) => {
             bin_op(op).is_some()
-                && map_tree_ops_available(l, bin_op, sqrt_op)
-                && map_tree_ops_available(r, bin_op, sqrt_op)
+                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
         }
-        MapExpr::Sqrt(x) => sqrt_op.is_some() && map_tree_ops_available(x, bin_op, sqrt_op),
+        MapExpr::Sqrt(x) => {
+            sqrt_op.is_some()
+                && map_tree_ops_available(x, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+        }
+        MapExpr::Cmp(op, l, r) => {
+            cmp_op(op).is_some()
+                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+        }
+        MapExpr::Select(c, t, f) => {
+            blendv_op.is_some()
+                && map_tree_ops_available(c, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(t, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(f, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+        }
+        MapExpr::MinMax { is_max, l, r } => {
+            minmax_op(*is_max).is_some()
+                && map_tree_ops_available(l, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+                && map_tree_ops_available(r, bin_op, sqrt_op, cmp_op, minmax_op, blendv_op)
+        }
     }
 }
 
@@ -4202,6 +4567,15 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
         MapExpr::Invariant(_) => false,
         MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
         MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
+        MapExpr::Cmp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
+        MapExpr::Select(c, t, f) => {
+            expr_uses_stream(c, stream)
+                || expr_uses_stream(t, stream)
+                || expr_uses_stream(f, stream)
+        }
+        MapExpr::MinMax { l, r, .. } => {
+            expr_uses_stream(l, stream) || expr_uses_stream(r, stream)
+        }
     }
 }
 
@@ -6432,9 +6806,38 @@ fn find_reduction_byte_iv(
                     Operand::Value(v) => *v,
                     _ => return None, // constant offset: not IV-based
                 };
+                // Resolve Copy/Cast chains to the underlying index value.
+                // The frontend and later passes (store sinking among them)
+                // introduce per-block copies of a shared scaled index; the
+                // scale check below must see through them.
+                let mut resolved_off = off_val;
+                for _ in 0..8 {
+                    let mut next = None;
+                    for &b2 in loop_blocks {
+                        for inst2 in &func.blocks[b2].instructions {
+                            if inst2.dest() == Some(resolved_off) {
+                                if let Instruction::Copy {
+                                    src: Operand::Value(v),
+                                    ..
+                                }
+                                | Instruction::Cast {
+                                    src: Operand::Value(v),
+                                    ..
+                                } = inst2
+                                {
+                                    next = Some(*v);
+                                }
+                            }
+                        }
+                    }
+                    match next {
+                        Some(v) => resolved_off = v,
+                        None => break,
+                    }
+                }
                 for &b2 in loop_blocks {
                     for inst2 in &func.blocks[b2].instructions {
-                        if inst2.dest() != Some(off_val) {
+                        if inst2.dest() != Some(resolved_off) {
                             continue;
                         }
                         match inst2 {
@@ -11867,12 +12270,59 @@ fn transform_map_vector(
     } else {
         None
     };
+    // Packed compare lowers to vcmpps/vcmppd (cmpps/cmppd on the SSE path);
+    // the predicate immediate is the encoder's EQ_OQ/LT_OS/LE_OS/NEQ_UQ
+    // subset — the parser normalized GT/GE by operand swap.
+    let cmp_op = |op: &IrCmpOp| -> Option<(IntrinsicOp, i32)> {
+        let vec_op = match (pattern.elem_ty, avx2) {
+            (IrType::F64, true) => IntrinsicOp::VecCmpF64x4,
+            (IrType::F64, false) => IntrinsicOp::VecCmpF64x2,
+            (IrType::F32, true) => IntrinsicOp::VecCmpF32x8,
+            (IrType::F32, false) => IntrinsicOp::VecCmpF32x4,
+            _ => return None,
+        };
+        let imm = match op {
+            IrCmpOp::Eq => 0,  // EQ_OQ
+            IrCmpOp::Slt => 1, // LT_OS
+            IrCmpOp::Sle => 2, // LE_OS
+            IrCmpOp::Ne => 4,  // NEQ_UQ
+            _ => return None,
+        };
+        Some((vec_op, imm))
+    };
+    let blendv_op = match (pattern.elem_ty, avx2) {
+        (IrType::F64, true) => Some(IntrinsicOp::VecBlendvF64x4),
+        (IrType::F64, false) => Some(IntrinsicOp::VecBlendvF64x2),
+        (IrType::F32, true) => Some(IntrinsicOp::VecBlendvF32x8),
+        (IrType::F32, false) => Some(IntrinsicOp::VecBlendvF32x4),
+        _ => None,
+    };
+    let minmax_op = |is_max: bool| -> Option<IntrinsicOp> {
+        match (pattern.elem_ty, avx2, is_max) {
+            (IrType::F64, true, false) => Some(IntrinsicOp::VecMinF64x4),
+            (IrType::F64, false, false) => Some(IntrinsicOp::VecMinF64x2),
+            (IrType::F32, true, false) => Some(IntrinsicOp::VecMinF32x8),
+            (IrType::F32, false, false) => Some(IntrinsicOp::VecMinF32x4),
+            (IrType::F64, true, true) => Some(IntrinsicOp::VecMaxF64x4),
+            (IrType::F64, false, true) => Some(IntrinsicOp::VecMaxF64x2),
+            (IrType::F32, true, true) => Some(IntrinsicOp::VecMaxF32x8),
+            (IrType::F32, false, true) => Some(IntrinsicOp::VecMaxF32x4),
+            _ => None,
+        }
+    };
 
     // Fail-closed BEFORE any mutation: every operation the tree needs must
     // have a lowering. A mid-transform bail after the preheader/byte-IV
     // rewrite would leave `func.next_value_id` stale and corrupt every
     // later pass (bit_idioms indexed out of bounds on exactly this).
-    if !map_tree_ops_available(&pattern.expr, &bin_op, sqrt_op) {
+    if !map_tree_ops_available(
+        &pattern.expr,
+        &bin_op,
+        sqrt_op,
+        &cmp_op,
+        &minmax_op,
+        blendv_op,
+    ) {
         if debug {
             eprintln!("[VEC-MAP]   Tree requires an op with no vector lowering");
         }
@@ -11890,7 +12340,10 @@ fn transform_map_vector(
             sqrt_op,
             madd_op,
             bin_op: &bin_op,
-            broadcast_cache: Vec::new(),
+            cmp_op: &cmp_op,
+            minmax_op: &minmax_op,
+            blendv_op,
+            node_cache: Vec::new(),
             preheader_insts: Vec::new(),
             vec_insts: Vec::new(),
             next_val_id,
@@ -12506,6 +12959,125 @@ fn emit_map_scalar_tree(
             });
             Some(Operand::Value(dest))
         }
+        MapExpr::Cmp(op, l, r) => {
+            let lhs = emit_map_scalar_tree(
+                l,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let rhs = emit_map_scalar_tree(
+                r,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            remainder_insts.push(Instruction::Cmp {
+                dest,
+                op: *op,
+                lhs,
+                rhs,
+                ty: pattern.elem_ty,
+            });
+            Some(Operand::Value(dest))
+        }
+        MapExpr::Select(cond, t, f) => {
+            let cv = emit_map_scalar_tree(
+                cond,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let tv = emit_map_scalar_tree(
+                t,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let fv = emit_map_scalar_tree(
+                f,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let Operand::Value(cond_val) = cv else {
+                return None;
+            };
+            remainder_insts.push(Instruction::Select {
+                dest,
+                cond: Operand::Value(cond_val),
+                true_val: tv,
+                false_val: fv,
+                ty: pattern.elem_ty,
+            });
+            Some(Operand::Value(dest))
+        }
+        MapExpr::MinMax { is_max, l, r } => {
+            // Mirror of the pre-fold scalar ternary: the exact comparison the
+            // fold consumed plus the select over the same arms.
+            let lv = emit_map_scalar_tree(
+                l,
+                src_bases,
+                pattern,
+                byte_offset.clone(),
+                remainder_insts,
+                next_val_id,
+            )?;
+            let rv = emit_map_scalar_tree(
+                r,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let cmp_dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            let cmp_op = if *is_max { IrCmpOp::Sgt } else { IrCmpOp::Slt };
+            remainder_insts.push(Instruction::Cmp {
+                dest: cmp_dest,
+                op: cmp_op,
+                lhs: lv.clone(),
+                rhs: rv.clone(),
+                ty: pattern.elem_ty,
+            });
+            let dest = {
+                let v = Value(*next_val_id);
+                *next_val_id += 1;
+                v
+            };
+            remainder_insts.push(Instruction::Select {
+                dest,
+                cond: Operand::Value(cmp_dest),
+                true_val: lv,
+                false_val: rv,
+                ty: pattern.elem_ty,
+            });
+            Some(Operand::Value(dest))
+        }
     }
 }
 
@@ -13050,5 +13622,332 @@ mod fixed_distance_slp_tests {
     fn fixed_distance_does_not_sink_loads_across_store() {
         let mut func = make_f64x4(AddressSpace::Default, true);
         assert_eq!(transform_fixed_distance_slp(&mut func), 0);
+    }
+}
+
+/// FP min/max/select map-parsing tests: the exact-ternary folds into
+/// VecMin/VecMax and the general compare+blendv shape must be recognized by
+/// analyze_map_pattern from a canonical post-if-convert loop.
+#[cfg(test)]
+mod map_fp_select_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+
+    fn blk(label: u32, insts: Vec<Instruction>, term: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions: insts,
+            terminator: term,
+            source_spans: Vec::new(),
+        }
+    }
+
+    /// Canonical vectorizer loop around `d[i] = <store_value_inst>`:
+    /// entry (params d,a,b,n) -> header (U64 iv phi + exit test) -> body ->
+    /// backedge -> exit.  `body_tail` builds the store-value computation on
+    /// top of the two stream loads (loads at value ids 20/21).
+    fn build_loop(
+        two_streams: bool,
+        body_tail: impl FnOnce(&mut u32, u32, u32) -> Vec<Instruction>,
+    ) -> IrFunction {
+        let mut next = 40u32;
+        let mut f = IrFunction::new("map".into(), IrType::I32, vec![], false);
+        // Entry: params d,a,b,n (ids 0..3), branch to header.
+        f.blocks.push(blk(
+            0,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::F32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::F32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 2,
+                    ty: IrType::F32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(3),
+                    param_idx: 3,
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::Branch(BlockId(1)),
+        ));
+        // Header: iv phi + Ult(iv, n) + CondBranch(body, exit).
+        f.blocks.push(blk(
+            1,
+            vec![
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (Operand::Value(Value(11)), BlockId(2)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Value(Value(3)),
+                    ty: IrType::U64,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(12)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        // Body: stream loads (a[i], plus b[i] for two-stream shapes), the
+        // store-value computation, the store to d[i], the iv increment, and
+        // the backedge.
+        let mut body = Vec::new();
+        let streams: Vec<(u32, u32)> = if two_streams {
+            vec![(1, 20), (2, 21)]
+        } else {
+            vec![(1, 20)]
+        };
+        for (base, id) in streams {
+            let shl = Value(next);
+            next += 1;
+            let gep = Value(next);
+            next += 1;
+            body.push(Instruction::BinOp {
+                dest: shl,
+                op: IrBinOp::Shl,
+                lhs: Operand::Value(Value(10)),
+                rhs: Operand::Const(IrConst::I32(2)),
+                ty: IrType::I64,
+            });
+            body.push(Instruction::GetElementPtr {
+                dest: gep,
+                base: Value(base),
+                offset: Operand::Value(shl),
+                ty: IrType::F32,
+            });
+            body.push(Instruction::Load {
+                volatile: false,
+                dest: Value(id),
+                ptr: gep,
+                ty: IrType::F32,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        body.extend(body_tail(&mut next, 20, 21));
+        let shl = Value(next);
+        next += 1;
+        let gep = Value(next);
+        next += 1;
+        body.push(Instruction::BinOp {
+            dest: shl,
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Const(IrConst::I32(2)),
+            ty: IrType::I64,
+        });
+        body.push(Instruction::GetElementPtr {
+            dest: gep,
+            base: Value(0),
+            offset: Operand::Value(shl),
+            ty: IrType::F32,
+        });
+        body.push(Instruction::Store {
+            volatile: false,
+            val: Operand::Value(Value(30)), // the select/select-fold result
+            ptr: gep,
+            ty: IrType::F32,
+            seg_override: AddressSpace::Default,
+        });
+        body.push(Instruction::BinOp {
+            dest: Value(11),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(10)),
+            rhs: Operand::Const(IrConst::I64(1)),
+            ty: IrType::U64,
+        });
+        f.blocks.push(blk(2, body, Terminator::Branch(BlockId(1))));
+        // Exit.
+        f.blocks.push(blk(3, vec![], Terminator::Return(None)));
+        f.next_value_id = next;
+        f
+    }
+
+    fn analyze(func: &IrFunction) -> MapExpr {
+        let cfg = CfgAnalysis::build(func);
+        let loops = loop_analysis::find_natural_loops(
+            func.blocks.len(),
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        );
+        let loop_info = &loops[0];
+        let pattern = analyze_map_pattern(func, loop_info, false)
+            .expect("canonical select loop must parse");
+        pattern.expr
+    }
+
+    /// `cond` compares stream x against stream y; the Select takes arms
+    /// (t, f) from the same two streams.  Produces value 30 (the store val).
+    fn select_body(
+        next: &mut u32,
+        a: u32,
+        b: u32,
+        cond_op: IrCmpOp,
+        arm_t: u32,
+        arm_f: u32,
+    ) -> Vec<Instruction> {
+        let cmp = Value(*next);
+        *next += 1;
+        vec![
+            Instruction::Cmp {
+                dest: cmp,
+                op: cond_op,
+                lhs: Operand::Value(Value(a)),
+                rhs: Operand::Value(Value(b)),
+                ty: IrType::F32,
+            },
+            Instruction::Select {
+                dest: Value(30),
+                cond: Operand::Value(cmp),
+                true_val: Operand::Value(Value(arm_t)),
+                false_val: Operand::Value(Value(arm_f)),
+                ty: IrType::F32,
+            },
+        ]
+    }
+
+    fn load_of(stream: usize) -> MapExpr {
+        MapExpr::Load(stream)
+    }
+
+    #[test]
+    fn fold_min_from_slt() {
+        // a < b ? a : b  ->  min(a, b)
+        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Slt, a, b));
+        assert_eq!(
+            analyze(&f),
+            MapExpr::MinMax {
+                is_max: false,
+                l: Box::new(load_of(0)),
+                r: Box::new(load_of(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn fold_max_from_sgt() {
+        // a > b ? a : b  ->  max(a, b)
+        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sgt, a, b));
+        assert_eq!(
+            analyze(&f),
+            MapExpr::MinMax {
+                is_max: true,
+                l: Box::new(load_of(0)),
+                r: Box::new(load_of(1)),
+            }
+        );
+    }
+
+    #[test]
+    fn fold_min_from_sgt_swapped_arms() {
+        // a > b ? b : a  ->  min(b, a)  (clamp tail: a > 1 ? 1 : a)
+        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sgt, b, a));
+        assert_eq!(
+            analyze(&f),
+            MapExpr::MinMax {
+                is_max: false,
+                l: Box::new(load_of(1)),
+                r: Box::new(load_of(0)),
+            }
+        );
+    }
+
+    #[test]
+    fn swapped_slt_arms_do_not_fold() {
+        // a < b ? b : a  is NOT max(a, b) for +-0 lanes: stays compare+blendv.
+        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Slt, b, a));
+        assert!(matches!(
+            analyze(&f),
+            MapExpr::Select(_, _, _)
+        ));
+    }
+
+    #[test]
+    fn sle_select_does_not_fold() {
+        // a <= b ? a : b  is NOT min(a, b) for +-0 lanes: compare+blendv.
+        let f = build_loop(true, |next, a, b| select_body(next, a, b, IrCmpOp::Sle, a, b));
+        assert!(matches!(
+            analyze(&f),
+            MapExpr::Select(box_, _, _) if matches!(*box_, MapExpr::Cmp(IrCmpOp::Sle, _, _))
+        ));
+    }
+
+    #[test]
+    fn nested_clamp_parses() {
+        // a < 0 ? 0 : (a > 1 ? 1 : a) — nested Select tree with the inner
+        // fold to Min(1, a).
+        let f = build_loop(false, |next, a, _b| {
+            let inner_cmp = Value(*next);
+            *next += 1;
+            let inner_sel = Value(*next);
+            *next += 1;
+            let outer_cmp = Value(*next);
+            *next += 1;
+            vec![
+                Instruction::Cmp {
+                    dest: inner_cmp,
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(Value(a)),
+                    rhs: Operand::Const(IrConst::F32(1.0)),
+                    ty: IrType::F32,
+                },
+                Instruction::Select {
+                    dest: inner_sel,
+                    cond: Operand::Value(inner_cmp),
+                    true_val: Operand::Const(IrConst::F32(1.0)),
+                    false_val: Operand::Value(Value(a)),
+                    ty: IrType::F32,
+                },
+                Instruction::Cmp {
+                    dest: outer_cmp,
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(a)),
+                    rhs: Operand::Const(IrConst::F32(0.0)),
+                    ty: IrType::F32,
+                },
+                Instruction::Select {
+                    dest: Value(30),
+                    cond: Operand::Value(outer_cmp),
+                    true_val: Operand::Const(IrConst::F32(0.0)),
+                    false_val: Operand::Value(inner_sel),
+                    ty: IrType::F32,
+                },
+            ]
+        });
+        match analyze(&f) {
+            MapExpr::Select(cond, t, f) => {
+                assert!(matches!(*t, MapExpr::Invariant(_)), "true arm is 0.0");
+                assert_eq!(
+                    *f,
+                    MapExpr::MinMax {
+                        is_max: false,
+                        l: Box::new(MapExpr::Invariant(Operand::Const(IrConst::F32(
+                            1.0
+                        )))),
+                        r: Box::new(load_of(0)),
+                    },
+                    "inner a > 1 ? 1 : a must fold to min(1, a)"
+                );
+                assert!(matches!(*cond, MapExpr::Cmp(IrCmpOp::Slt, _, _)));
+            }
+            other => panic!("expected outer Select, got {:?}", other),
+        }
     }
 }
