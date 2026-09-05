@@ -339,18 +339,22 @@ pub(crate) fn run_with_aliases_tls(
     let site_local = classify_site_local_indexed(func);
 
     // Group every movable materialization by canonical symbol and use class.
-    // Site-local indexed bases deliberately keep distinct webs.
+    // Site-local indexed bases deliberately keep distinct webs. TLS is the
+    // sole safe exception to the class split: unlike a normal GlobalAddr it
+    // cannot become a RIP/SIB memory operand, so both classes must materialize
+    // the same thread-relative base. Sharing it avoids repeated `%fs:0` reads.
     let mut groups: FxHashMap<(String, bool), Vec<(usize, usize, Value)>> = FxHashMap::default();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Instruction::GlobalAddr { dest, name } = inst {
-                if site_local.contains(&dest.0) && !tls_symbols.contains(name) {
+                let is_tls = tls_symbols.contains(name);
+                if site_local.contains(&dest.0) && !is_tls {
                     continue;
                 }
                 groups
                     .entry((
                         canon_name(name, aliases).to_string(),
-                        must_mat.contains(&dest.0),
+                        !is_tls && must_mat.contains(&dest.0),
                     ))
                     .or_default()
                     .push((bi, ii, *dest));
@@ -840,6 +844,63 @@ mod tests {
         });
         assert_eq!(run(&mut func), 0);
         assert_eq!(func.blocks[0].instructions.len(), 4);
+    }
+
+    #[test]
+    fn tls_can_merge_foldable_and_materialized_uses() {
+        // Normal globals must retain the class split above because a Load can
+        // become RIP-relative. TLS always needs a `%fs`-relative base in a
+        // register, so duplicate materializations only add thread-pointer
+        // reads and live ranges.
+        let mut func = empty_func();
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "tls_g".to_string(),
+                },
+                load(3, 1),
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "tls_g".to_string(),
+                },
+                Instruction::Call {
+                    func: "use_ptr".to_string(),
+                    info: crate::ir::reexports::CallInfo {
+                        dest: None,
+                        args: vec![Operand::Value(Value(2))],
+                        arg_types: vec![IrType::Ptr],
+                        return_type: IrType::Void,
+                        is_variadic: false,
+                        num_fixed_args: 1,
+                        struct_arg_sizes: vec![],
+                        struct_arg_aligns: vec![],
+                        struct_arg_classes: vec![],
+                        struct_arg_riscv_float_classes: vec![],
+                        struct_arg_is_f128_sse: Vec::new(),
+                        is_sret: false,
+                        is_fastcall: false,
+                        is_pure: false,
+                        is_const: false,
+                        ret_eightbyte_classes: vec![],
+                        ret_is_f128_sse: false,
+                    },
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        let tls = FxHashSet::from_iter(["tls_g".to_string()]);
+        assert_eq!(
+            run_with_aliases_tls(&mut func, &FxHashMap::default(), &tls),
+            1
+        );
+        assert_eq!(func.blocks[0].instructions.len(), 3);
+        match &func.blocks[0].instructions[2] {
+            Instruction::Call { info, .. } => assert_eq!(info.args, vec![Operand::Value(Value(1))]),
+            other => panic!("expected rewritten call, got {other:?}"),
+        }
     }
 
     #[test]

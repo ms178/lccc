@@ -327,6 +327,33 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
         }
     }
 
+    // Exact use counts for widening-cast consumers.  The generic
+    // reassociation counter above is intentionally optional at -O2+ because
+    // it controls historical canonicalisation, but these two rewrites are a
+    // profitability transform: require the cast to die after its only use.
+    // Replacing a one-use widened carrier with its narrow source is then
+    // live-range-neutral in cardinality (one live value before and after),
+    // and never leaves an additional long-lived raw source alongside a still
+    // needed wide result.  `for_each_used_value` covers every opaque/asm/
+    // atomic operand too, so an unfamiliar instruction can only veto a fold.
+    let mut cast_use_counts = vec![0u32; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|id| {
+                let idx = id as usize;
+                if idx < cast_use_counts.len() && cast_defs[idx].is_some() {
+                    cast_use_counts[idx] = cast_use_counts[idx].saturating_add(1);
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|id| {
+            let idx = id as usize;
+            if idx < cast_use_counts.len() && cast_defs[idx].is_some() {
+                cast_use_counts[idx] = cast_use_counts[idx].saturating_add(1);
+            }
+        });
+    }
+
     // Second pass: propagate boolean-ness through And/Or/Xor of boolean values.
     // A single pass is sufficient for most patterns since And/Or/Xor of Cmp results
     // are the dominant case. For deeply nested boolean expressions, this misses some
@@ -403,8 +430,29 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 &is_boolean,
                 &value_types,
                 &use_counts,
+                &cast_use_counts,
             ) {
                 *inst = simplified;
+                total += 1;
+            }
+        }
+    }
+
+    // A widening integer conversion preserves exactly the zero/nonzero
+    // partition: for every source value x, widen(x) == 0 iff x == 0.  A
+    // CondBranch consumes only that partition, not the converted numerical
+    // value, so branch directly on the narrow source.  Besides deleting a
+    // dead extension this lets x86 use `testb`/`testw` rather than making a
+    // 32/64-bit temporary.  The helper rejects truncations (e.g. 0x100 -> u8
+    // is zero) and float/pointer conversions with target-specific exceptional
+    // semantics.
+    if !simplify_skip("widened_cond") && std::env::var_os("CCC_NO_WIDENED_COND").is_none() {
+        for block in &mut func.blocks {
+            let Terminator::CondBranch { cond, .. } = &mut block.terminator else {
+                continue;
+            };
+            if let Some(narrow) = widened_cond_replacement(*cond, &cast_defs, &cast_use_counts) {
+                *cond = narrow;
                 total += 1;
             }
         }
@@ -714,6 +762,7 @@ fn try_simplify_with_types(
     is_boolean: &[bool],
     value_types: &[Option<IrType>],
     use_counts: &[u32],
+    cast_use_counts: &[u32],
 ) -> Option<Instruction> {
     match inst {
         Instruction::BinOp {
@@ -743,7 +792,17 @@ fn try_simplify_with_types(
             lhs,
             rhs,
             ty,
-        } => simplify_cmp(*dest, *op, lhs, rhs, *ty, cmp_defs, cast_defs, is_boolean),
+        } => simplify_cmp(
+            *dest,
+            *op,
+            lhs,
+            rhs,
+            *ty,
+            cmp_defs,
+            cast_defs,
+            is_boolean,
+            cast_use_counts,
+        ),
         Instruction::Load {
             dest,
             ptr,
@@ -862,6 +921,7 @@ fn try_simplify(
         neg_defs,
         &[],
         is_boolean,
+        &[],
         &[],
         &[],
     )
@@ -1181,6 +1241,100 @@ fn swap_cmp_op(op: IrCmpOp) -> IrCmpOp {
     }
 }
 
+/// Return the narrow source for a condition that only observes whether a
+/// widened integer result is zero.  See the caller in `simplify_function` for
+/// the zero-ness proof and why truncating/non-integer casts are refused.
+fn widened_cond_replacement(
+    cond: Operand,
+    cast_defs: &[Option<CastDef>],
+    cast_use_counts: &[u32],
+) -> Option<Operand> {
+    let Operand::Value(v) = cond else {
+        return None;
+    };
+    // An empty count slice is the direct unit-test API: production always
+    // supplies exact counts, while the pure proof tests intentionally exercise
+    // the type predicate independently of an enclosing function.
+    if !cast_use_counts.is_empty() && cast_use_counts.get(v.0 as usize).copied() != Some(1) {
+        return None;
+    }
+    let cast = cast_defs.get(v.0 as usize).and_then(|d| d.as_ref())?;
+    (cast.from_ty.is_integer()
+        && cast.to_ty.is_integer()
+        && cast.from_ty.size() < cast.to_ty.size())
+    .then_some(cast.src)
+}
+
+/// Narrow a comparison whose two operands are identically widened integer
+/// values back to their original carrier type.
+///
+/// Sign extension preserves signed ordering, so signed relational predicates
+/// (plus equality) may use the narrow carrier.  The two casts must agree on
+/// both source and destination types; mixed extensions are intentionally left
+/// alone because e.g. sext(0xff) and zext(0xff) are different values.
+///
+/// This IR rewrite is deliberately limited to signed roots.  The existing
+/// backend PF-15 path still folds an *adjacent* zero-extend pair, where no
+/// liveness/RA reshaping is needed.  Extending that transformation across an
+/// intervening instruction rewrites the value web; a 101-round interleaved
+/// Expat measurement found the U8 quote-scan form slower despite a static
+/// instruction saving, due to its changed hot-loop layout.  Keep unsigned
+/// non-adjacent pairs on the mature backend path until a profitability model
+/// includes layout/placement costs.
+///
+/// Unlike a backend peephole this rewrites the SSA uses themselves.  The
+/// original narrow values then remain live until the compare, so register
+/// allocation sees the real lifetime rather than relying on a deferred move
+/// surviving an intervening load or branch.
+fn narrow_widened_cmp_pair(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    cast_defs: &[Option<CastDef>],
+    cast_use_counts: &[u32],
+) -> Option<Instruction> {
+    let (Operand::Value(lv), Operand::Value(rv)) = (lhs, rhs) else {
+        return None;
+    };
+    if !cast_use_counts.is_empty()
+        && (cast_use_counts.get(lv.0 as usize).copied() != Some(1)
+            || cast_use_counts.get(rv.0 as usize).copied() != Some(1))
+    {
+        return None;
+    }
+    let left = cast_defs.get(lv.0 as usize).and_then(|d| d.as_ref())?;
+    let right = cast_defs.get(rv.0 as usize).and_then(|d| d.as_ref())?;
+    let narrow_ty = left.from_ty;
+    if !narrow_ty.is_integer()
+        || !narrow_ty.is_signed()
+        || !left.to_ty.is_integer()
+        || left.to_ty != ty
+        || right.from_ty != narrow_ty
+        || right.to_ty != left.to_ty
+        || narrow_ty.size() >= ty.size()
+    {
+        return None;
+    }
+
+    let narrow_op = match op {
+        IrCmpOp::Eq | IrCmpOp::Ne | IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge => op,
+        // An unsigned compare of sign-extended negatives observes their high
+        // extension bits and cannot be expressed as a narrow signed compare
+        // without a different proof.
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge => return None,
+    };
+
+    Some(Instruction::Cmp {
+        dest,
+        op: narrow_op,
+        lhs: left.src,
+        rhs: right.src,
+        ty: narrow_ty,
+    })
+}
+
 /// Simplify a Cmp instruction.
 ///
 /// Handles:
@@ -1204,9 +1358,17 @@ fn simplify_cmp(
     cmp_defs: &[Option<CmpDef>],
     cast_defs: &[Option<CastDef>],
     is_boolean: &[bool],
+    cast_use_counts: &[u32],
 ) -> Option<Instruction> {
     if simplify_skip("cmp") {
         return None;
+    }
+    if std::env::var_os("CCC_NO_WIDENED_CMP_PAIR").is_none() {
+        if let Some(narrowed) =
+            narrow_widened_cmp_pair(dest, op, lhs, rhs, ty, cast_defs, cast_use_counts)
+        {
+            return Some(narrowed);
+        }
     }
     // Self-comparison: Cmp(op, x, x) => constant
     if same_value_operands(lhs, rhs) && ty.is_integer() {
@@ -3605,6 +3767,219 @@ mod tests {
     }
 
     // === Cmp simplification tests ===
+
+    fn widening_pair_defs(from_ty: IrType, to_ty: IrType) -> Vec<Option<CastDef>> {
+        let mut defs = vec![None; 8];
+        defs[1] = Some(CastDef {
+            src: Operand::Value(Value(5)),
+            from_ty,
+            to_ty,
+        });
+        defs[2] = Some(CastDef {
+            src: Operand::Value(Value(6)),
+            from_ty,
+            to_ty,
+        });
+        defs
+    }
+
+    #[test]
+    fn test_cmp_widen_pair_signed_keeps_signed_predicates() {
+        let defs = widening_pair_defs(IrType::I8, IrType::I32);
+        for op in [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+        ] {
+            let result = narrow_widened_cmp_pair(
+                Value(7),
+                op,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &[],
+            )
+            .expect("signed widened byte pair should narrow");
+            match result {
+                Instruction::Cmp {
+                    dest,
+                    op: got_op,
+                    lhs: Operand::Value(lhs),
+                    rhs: Operand::Value(rhs),
+                    ty,
+                } => {
+                    assert_eq!(dest, Value(7));
+                    assert_eq!(got_op, op);
+                    assert_eq!(lhs, Value(5));
+                    assert_eq!(rhs, Value(6));
+                    assert_eq!(ty, IrType::I8);
+                }
+                other => panic!("expected narrowed Cmp, got {other:?}"),
+            }
+        }
+        // Sign-extended negative bytes compare differently under an unsigned
+        // wide predicate, so this must remain wide.
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Ult,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_cmp_widen_pair_unsigned_is_left_to_adjacent_backend_fold() {
+        // The IR rewrite may cross an intervening instruction and reshape RA.
+        // Keep U8/U16 pairs for the backend's already-proven adjacent PF-15
+        // fold; see the helper's profitability contract.
+        let defs = widening_pair_defs(IrType::U16, IrType::I32);
+        for op in [
+            IrCmpOp::Eq,
+            IrCmpOp::Ne,
+            IrCmpOp::Slt,
+            IrCmpOp::Sle,
+            IrCmpOp::Sgt,
+            IrCmpOp::Sge,
+            IrCmpOp::Ult,
+            IrCmpOp::Ule,
+            IrCmpOp::Ugt,
+            IrCmpOp::Uge,
+        ] {
+            assert!(
+                narrow_widened_cmp_pair(
+                    Value(7),
+                    op,
+                    &Operand::Value(Value(1)),
+                    &Operand::Value(Value(2)),
+                    IrType::I32,
+                    &defs,
+                    &[],
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn test_widened_rewrites_require_the_dead_cast_carrier() {
+        let defs = widening_pair_defs(IrType::I8, IrType::I32);
+        let mut uses = vec![0; 8];
+        uses[1] = 1;
+        uses[2] = 2; // An additional consumer keeps this widened value live.
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &uses,
+            )
+            .is_none()
+        );
+
+        uses[2] = 1;
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &defs,
+                &uses,
+            )
+            .is_some()
+        );
+
+        uses[1] = 2;
+        assert!(widened_cond_replacement(Operand::Value(Value(1)), &defs, &uses).is_none());
+    }
+
+    #[test]
+    fn test_cmp_widen_pair_refuses_mixed_or_nonwidening_types() {
+        let mut mixed = widening_pair_defs(IrType::I8, IrType::I32);
+        mixed[2] = Some(CastDef {
+            src: Operand::Value(Value(6)),
+            from_ty: IrType::U8,
+            to_ty: IrType::I32,
+        });
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::I32,
+                &mixed,
+                &[],
+            )
+            .is_none()
+        );
+
+        let same_width = widening_pair_defs(IrType::I32, IrType::U32);
+        assert!(
+            narrow_widened_cmp_pair(
+                Value(7),
+                IrCmpOp::Eq,
+                &Operand::Value(Value(1)),
+                &Operand::Value(Value(2)),
+                IrType::U32,
+                &same_width,
+                &[],
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_widened_cond_replacement_preserves_only_widening_integer_zero_test() {
+        let signed = widening_pair_defs(IrType::I8, IrType::I32);
+        assert!(matches!(
+            widened_cond_replacement(Operand::Value(Value(1)), &signed, &[]),
+            Some(Operand::Value(Value(5)))
+        ));
+
+        // 0x100 truncates to zero in U8, so replacing that condition with its
+        // source would be wrong.
+        let trunc = widening_pair_defs(IrType::I32, IrType::U8);
+        assert!(widened_cond_replacement(Operand::Value(Value(1)), &trunc, &[]).is_none());
+        assert!(widened_cond_replacement(Operand::Const(IrConst::I32(1)), &signed, &[]).is_none());
+    }
+
+    #[test]
+    fn test_cmp_widen_pair_enters_generic_simplify_dispatch() {
+        let defs = widening_pair_defs(IrType::I8, IrType::I32);
+        let inst = Instruction::Cmp {
+            dest: Value(7),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        };
+        let result = try_simplify(&inst, &defs, &[], &[], &[], &[], &[])
+            .expect("generic simplify should dispatch the widened pair rule");
+        assert!(matches!(
+            result,
+            Instruction::Cmp {
+                ty: IrType::I8,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Value(Value(6)),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn test_cmp_self_eq() {
