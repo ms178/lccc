@@ -698,6 +698,38 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
+                // Shift counts are the one operand whose *value* (not just its
+                // low bits) decides whether narrowing is exact.  The width
+                // argument above ("same low T bits") holds only for counts in
+                // [0, T.width): `zext(x:U32):U64 >> 40` is 0 for every x, but
+                // the narrowed `x >> 40` is out of range in U32 (x86 masks the
+                // count to 8).  Likewise `Shl` by >= T.width has all-zero low
+                // T bits.  Decide per count:
+                //   * constant in range         -> narrow as usual
+                //   * constant >= width (< 64)  -> fold: LShr/Shl to 0,
+                //                                  AShr to `x >> (width-1)`
+                //   * variable count            -> narrow only when the count
+                //                                  is provably masked below
+                //                                  the width (`n & c`, c<width)
+                let mut shift_rhs_override: Option<Operand> = None;
+                let mut fold_to_zero = false;
+                if matches!(binop_info.op, IrBinOp::Shl | IrBinOp::LShr | IrBinOp::AShr) {
+                    let width_bits = (to_ty.size() * 8) as i64;
+                    match shift_count_class(&binop_info.rhs, width_bits, binop_map) {
+                        ShiftCount::InRange => {}
+                        ShiftCount::ConstOutOfRange => match binop_info.op {
+                            IrBinOp::AShr => {
+                                shift_rhs_override = Some(Operand::Const(IrConst::from_i64(
+                                    width_bits - 1,
+                                    *to_ty,
+                                )));
+                            }
+                            _ => fold_to_zero = true,
+                        },
+                        ShiftCount::Unknown => continue,
+                    }
+                }
+
                 // BinOp result must only be used by this narrowing cast
                 if use_counts[src_id] != 1 {
                     continue;
@@ -713,10 +745,30 @@ fn narrow_binops_with_cast(
                     continue;
                 }
 
+                if fold_to_zero {
+                    // The 64-bit shift produced a value whose low T bits are
+                    // all zero; the truncating cast is therefore a constant.
+                    // (The original BinOp becomes dead and DCE removes it.)
+                    let narrow_dest = *dest;
+                    let narrow_ty = *to_ty;
+                    *inst = Instruction::Copy {
+                        dest: narrow_dest,
+                        src: Operand::Const(IrConst::zero(narrow_ty)),
+                    };
+                    changes += 1;
+                    let dest_id = narrow_dest.0 as usize;
+                    if dest_id <= max_id {
+                        narrowed_map[dest_id] = Some(narrow_ty);
+                    }
+                    continue;
+                }
+
                 let narrow_lhs =
                     try_narrow_operand(&binop_info.lhs, *to_ty, None, widen_map, narrowed_map);
-                let narrow_rhs =
-                    try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map);
+                let narrow_rhs = match &shift_rhs_override {
+                    Some(o) => Some(o.clone()),
+                    None => try_narrow_operand(&binop_info.rhs, *to_ty, None, widen_map, narrowed_map),
+                };
 
                 if let (Some(new_lhs), Some(new_rhs)) = (narrow_lhs, narrow_rhs) {
                     let narrow_dest = *dest;
@@ -1023,6 +1075,67 @@ fn is_widened_from_matching_type(
         }
     }
     false
+}
+
+/// Classification of a shift count against a narrow width.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShiftCount {
+    /// Provably in `[0, width)`: the narrow shift is exact.
+    InRange,
+    /// A constant in `[width, 64)`: the wide shift is a known fill
+    /// (zero for Shl/LShr, sign for AShr), so the result can be folded.
+    ConstOutOfRange,
+    /// Anything else (negative/huge constants, unbounded variables):
+    /// narrowing would change the value; leave the wide shift alone.
+    Unknown,
+}
+
+/// Classify a shift count operand for narrowing to `width_bits`.
+///
+/// A variable count is `InRange` only when its defining instruction is
+/// `And(_, c)` / `And(c, _)` with a non-negative constant `c < width_bits`
+/// (the C idiom `x >> (n & 31)`); every other variable count is `Unknown`
+/// because the wide shift and the narrow shift disagree for counts in
+/// `[width, 64)`.
+fn shift_count_class(
+    rhs: &Operand,
+    width_bits: i64,
+    binop_map: &[Option<BinOpDef>],
+) -> ShiftCount {
+    let const_val = |c: &IrConst| -> Option<i64> {
+        match c {
+            IrConst::I64(v) => Some(*v),
+            IrConst::I32(v) => Some(*v as i64),
+            IrConst::I16(v) => Some(*v as i64),
+            IrConst::I8(v) => Some(*v as i64),
+            IrConst::Zero => Some(0),
+            _ => None,
+        }
+    };
+    match rhs {
+        Operand::Const(c) => match const_val(c) {
+            Some(v) if (0..width_bits).contains(&v) => ShiftCount::InRange,
+            Some(v) if (width_bits..64).contains(&v) => ShiftCount::ConstOutOfRange,
+            _ => ShiftCount::Unknown,
+        },
+        Operand::Value(v) => {
+            let id = v.0 as usize;
+            let Some(Some(def)) = binop_map.get(id) else {
+                return ShiftCount::Unknown;
+            };
+            if def.op != IrBinOp::And {
+                return ShiftCount::Unknown;
+            }
+            let mask = match (&def.lhs, &def.rhs) {
+                (_, Operand::Const(c)) | (Operand::Const(c), _) => const_val(c),
+                _ => None,
+            };
+            match mask {
+                Some(m) if (0..width_bits).contains(&m) => ShiftCount::InRange,
+                _ => ShiftCount::Unknown,
+            }
+        }
+    }
 }
 
 /// Try to narrow an operand from I64 to a target type.
@@ -1640,6 +1753,211 @@ mod tests {
                 ));
             }
             other => panic!("Expected narrowed BinOp LShr U32, got {:?}", other),
+        }
+    }
+    /// Build `Cast(U32->U64) ; BinOp(op, zext, count, U64) ; Cast(U64->U32)`
+    /// for the out-of-range shift-count tests below.
+    fn shift_through_zext(op: IrBinOp, count: Operand, extra: Vec<Instruction>) -> IrFunction {
+        let mut insts = vec![Instruction::Cast {
+            dest: Value(1),
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::U32,
+            to_ty: IrType::U64,
+        }];
+        insts.extend(extra);
+        insts.push(Instruction::BinOp {
+            dest: Value(2),
+            op,
+            lhs: Operand::Value(Value(1)),
+            rhs: count,
+            ty: IrType::U64,
+        });
+        insts.push(Instruction::Cast {
+            dest: Value(3),
+            src: Operand::Value(Value(2)),
+            from_ty: IrType::U64,
+            to_ty: IrType::U32,
+        });
+        make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn test_narrow_lshr_count_ge_width_folds_to_zero() {
+        // Stress-lab finding (narrow family, seed 3): `(uint32_t)(zext(x) >> 56)`
+        // was narrowed to `x >> 56` in U32, which x86 executes as `x >> 24`.
+        // The 64-bit shift of a zero-extended 32-bit value by >= 32 is 0.
+        let mut func =
+            shift_through_zext(IrBinOp::LShr, Operand::Const(IrConst::I64(56)), Vec::new());
+        let changes = narrow_function(&mut func);
+        assert!(changes > 0, "out-of-range count must be folded, not narrowed");
+        match &func.blocks[0].instructions[2] {
+            Instruction::Copy { dest: Value(3), src: Operand::Const(c) } => {
+                assert_eq!(c.to_i64(), Some(0), "fold value must be zero, got {:?}", c);
+            }
+            other => panic!("expected Copy of zero, got {:?}", other),
+        }
+        // The pass must never have produced a U32 shift by 56.
+        for inst in &func.blocks[0].instructions {
+            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
+                panic!("narrowed shift with out-of-range count {:?}", rhs);
+            }
+        }
+    }
+
+    #[test]
+    fn test_narrow_shl_count_ge_width_folds_to_zero() {
+        // `(uint32_t)(zext(x) << 40)`: low 32 bits are all zero for every x.
+        let mut func =
+            shift_through_zext(IrBinOp::Shl, Operand::Const(IrConst::I64(40)), Vec::new());
+        narrow_function(&mut func);
+        assert!(
+            matches!(
+                &func.blocks[0].instructions[2],
+                Instruction::Copy { src: Operand::Const(c), .. } if c.to_i64() == Some(0)
+            ),
+            "got {:?}",
+            func.blocks[0].instructions[2]
+        );
+    }
+
+    #[test]
+    fn test_narrow_ashr_count_ge_width_clamps() {
+        // `(int32_t)(sext(x) >> 45)` equals `x >> 31` in I32 (sign fill).
+        let mut func = make_func_with_blocks(vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::AShr,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(45)),
+                    ty: IrType::I64,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(2)),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }]);
+        narrow_function(&mut func);
+        match &func.blocks[0].instructions[2] {
+            Instruction::BinOp { op: IrBinOp::AShr, ty: IrType::I32, rhs, .. } => {
+                assert_eq!(
+                    match rhs {
+                        Operand::Const(c) => c.to_i64(),
+                        _ => None,
+                    },
+                    Some(31),
+                    "AShr count must clamp to width-1, got {:?}",
+                    rhs
+                );
+            }
+            other => panic!("expected clamped I32 AShr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_narrow_shift_variable_count_declined_unless_masked() {
+        // Unbounded variable count: the wide and narrow shifts disagree for
+        // counts in [32, 64), so narrowing must be declined.
+        let mut func = shift_through_zext(
+            IrBinOp::LShr,
+            Operand::Value(Value(4)),
+            vec![Instruction::Cast {
+                dest: Value(4),
+                src: Operand::Value(Value(5)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            }],
+        );
+        narrow_function(&mut func);
+        assert!(
+            matches!(
+                &func.blocks[0].instructions[3],
+                Instruction::Cast { from_ty: IrType::U64, to_ty: IrType::U32, .. }
+            ),
+            "unbounded variable count must not be narrowed: {:?}",
+            func.blocks[0].instructions[3]
+        );
+
+        // Masked count (`n & 31`): the classifier proves the count in range.
+        // Whether the shift is then narrowed depends on the count operand
+        // itself being narrowable (Phase 4 only narrows values that feed a
+        // truncating cast), so the end-to-end check is the soundness one: no
+        // U32 shift may ever carry a count operand that is not itself U32.
+        let binop_map: Vec<Option<BinOpDef>> = vec![
+            None,
+            None,
+            None,
+            None,
+            Some(BinOpDef {
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Const(IrConst::I64(31)),
+            }),
+        ];
+        assert_eq!(
+            shift_count_class(&Operand::Value(Value(4)), 32, &binop_map),
+            ShiftCount::InRange
+        );
+        let wide_mask: Vec<Option<BinOpDef>> = vec![
+            None,
+            None,
+            None,
+            None,
+            Some(BinOpDef {
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Const(IrConst::I64(63)),
+            }),
+        ];
+        assert_eq!(
+            shift_count_class(&Operand::Value(Value(4)), 32, &wide_mask),
+            ShiftCount::Unknown
+        );
+        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(31)), 32, &[]), ShiftCount::InRange);
+        assert_eq!(
+            shift_count_class(&Operand::Const(IrConst::I64(32)), 32, &[]),
+            ShiftCount::ConstOutOfRange
+        );
+        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(64)), 32, &[]), ShiftCount::Unknown);
+        assert_eq!(shift_count_class(&Operand::Const(IrConst::I64(-1)), 32, &[]), ShiftCount::Unknown);
+
+        let mut func = shift_through_zext(
+            IrBinOp::LShr,
+            Operand::Value(Value(4)),
+            vec![Instruction::BinOp {
+                dest: Value(4),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(5)),
+                rhs: Operand::Const(IrConst::I64(31)),
+                ty: IrType::U64,
+            }],
+        );
+        narrow_function(&mut func);
+        for inst in &func.blocks[0].instructions {
+            if let Instruction::BinOp { op: IrBinOp::LShr, ty: IrType::U32, rhs, .. } = inst {
+                assert!(
+                    matches!(rhs, Operand::Const(_)),
+                    "a narrowed shift must not carry a wide count operand: {:?}",
+                    rhs
+                );
+            }
         }
     }
 }

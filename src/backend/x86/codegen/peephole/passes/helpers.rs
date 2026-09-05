@@ -367,6 +367,15 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool 
     if fam > REG_GP_MAX {
         return false;
     }
+    // Inline asm is opaque: an `"=r"` output or a clobber may land in ANY
+    // family, and nothing in the classified `LineInfo` names it (the kind is
+    // `InlineAsm`, not `Other { dest_reg }`).  The only sound answer to
+    // "may this line write `fam`?" is yes.  (The stress lab's framecall
+    // family caught `movq 32(%rsp), %r11` being forwarded from a `%rcx`
+    // that an intervening `#APP` block had redefined.)
+    if info.kind == LineKind::InlineAsm {
+        return true;
+    }
     let bit = 1u16 << fam;
     // 1. Architectural implicit writes: exact.
     if implicit_write_refs(trimmed.as_bytes()) & bit != 0 {
@@ -391,6 +400,12 @@ pub(super) fn writes_family(info: &LineInfo, trimmed: &str, fam: RegId) -> bool 
 #[inline]
 pub(super) fn writes_family_full(info: &LineInfo, trimmed: &str, fam: RegId) -> bool {
     if fam > REG_GP_MAX {
+        return false;
+    }
+    // Opaque inline asm can never PROVE a full redefinition (it may read the
+    // old value first); acceptance paths must treat it as "unknown", i.e.
+    // false, while `writes_family` above treats it as "may write".
+    if info.kind == LineKind::InlineAsm {
         return false;
     }
     let bit = 1u16 << fam;

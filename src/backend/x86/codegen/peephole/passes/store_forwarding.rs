@@ -573,6 +573,16 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             // valid (a later GP reload of the same slot may still forward).
             LineKind::LoadXmmRbp { .. } => {}
 
+            // Inline asm is opaque: its outputs and clobbers may redefine any
+            // register and it may store through any pointer.  Every
+            // slot<->register mapping is stale afterwards.  (Stress-lab
+            // framecall family: `p2` spilled to 32(%rsp) from %rcx, a later
+            // `#APP` block wrote a different value into %rcx, and the reload
+            // was forwarded as `movq %rcx, %r11`.)
+            LineKind::InlineAsm => {
+                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+            }
+
             _ => {}
         }
     }
