@@ -52,6 +52,10 @@ const MAX_MEDIUM_STATIC_INLINE_BLOCKS: usize = 16;
 /// preventing medium-sized search loops from duplicating into every caller.
 const MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 40;
 const MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS: usize = 8;
+// The fifth clone of a non-explicit static loop helper was materially worse
+// than an outlined call in the measured glibc memcmp shape. Keep a narrow
+// hard cap until profile data can replace this conservative pressure proxy.
+const MAX_SMALL_STATIC_LOOP_INLINE_CLONES: usize = 4;
 const MAX_STATIC_LOOP_INLINE_INSTRUCTIONS: usize = 128;
 const MAX_STATIC_LOOP_INLINE_BLOCKS: usize = 16;
 const MAX_STATIC_LOOP_INLINE_CALLS: usize = 2;
@@ -353,6 +357,35 @@ fn select_inline_site(
             callee_inst_count <= MAX_TINY_INLINE_INSTRUCTIONS && callee_data.blocks.len() <= 1;
         let is_small = callee_inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
             && callee_data.blocks.len() <= MAX_SMALL_INLINE_BLOCKS;
+        // A seemingly tiny ordinary static wrapper can call a clonable loop
+        // helper.  If the wrapper has several module-wide callers, selecting
+        // it here duplicates that loop in every caller on later rounds.  The
+        // source `spectral_norm` shape made this a 19% VM-screen regression;
+        // retain the outlined wrapper so its loop owner is expanded once.
+        // Attribute/section/PGO cases keep their stronger correctness or
+        // profile-driven policy.
+        if multisite_loop_wrapper_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) || nested_loop_multisite_static_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            loop_blocks.contains(&site.block_idx),
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) || repeated_small_loop_clone_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) {
+            continue;
+        }
         // Static inline functions that fit within normal limits should
         // always be inlined, matching GCC behavior. This is critical for
         // functions like ror32 (35 instructions) called from blake2s: without
@@ -421,6 +454,28 @@ fn select_inline_site(
             .iter()
             .map(|b| b.instructions.len())
             .sum();
+        if multisite_loop_wrapper_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) || nested_loop_multisite_static_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            loop_blocks.contains(&site.block_idx),
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) || repeated_small_loop_clone_should_stay_outlined(
+            callee_data,
+            callee_inst_count,
+            caller_has_section,
+            site.pgo_force,
+            size_optimized,
+        ) {
+            continue;
+        }
         // Cost loop-body cloning after accounting for tiny/static-inline
         // descendants that the fixed-point inliner will necessarily expand
         // in the caller.  The raw snapshot can be misleadingly small: Linux's
@@ -1750,6 +1805,22 @@ struct CalleeData {
     /// (glibc rtld links -nostdlib: `__bsearch` in intel_check_word was a
     /// hard undefined-symbol error). Eligibility uses dedicated relaxed caps.
     is_gnu_inline_def: bool,
+    /// An ordinary `static` definition, rather than a static-inline or an
+    /// attribute-constrained inline definition. It has a valid outlined body,
+    /// so profitability policy may deliberately retain a call to it.
+    is_plain_static: bool,
+    /// Module-wide direct calls (including a redirected asm label) observed
+    /// before inlining.  Multi-site wrappers duplicate their descendants.
+    direct_call_count: usize,
+    /// Whether recursively expanding ordinary eligible callees reaches a loop.
+    /// A tiny wrapper can otherwise conceal a large loop nest from the raw
+    /// tiny/small threshold used by the fixed-point inliner.
+    has_inlineable_loop_descendant: bool,
+    /// A prior inliner invocation has already expanded a descendant into this
+    /// body. This persists across pipeline invocations, unlike a fresh raw
+    /// call-graph snapshot, and identifies wrappers that have acquired a loop
+    /// body after their initial tiny/small eligibility decision.
+    has_inlined_calls: bool,
     /// Whether this callee is a `static` (non-`inline`) function with exactly
     /// one call site in the whole module. Such callees are dead after inlining
     /// (net code shrink), so they are exempt from the caller-size caps and the
@@ -2336,6 +2407,13 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
                 exceeds_normal_limits: exceeds_normal,
                 is_static_inline: func.is_static && func.is_inline,
                 is_gnu_inline_def: func.is_gnu_inline_def,
+                is_plain_static: func.is_static
+                    && !func.is_inline
+                    && !is_always_inline
+                    && !func.is_gnu_inline_def,
+                direct_call_count: total_calls,
+                has_inlineable_loop_descendant: false,
+                has_inlined_calls: func.has_inlined_calls,
                 // Any static (non-inline) callee with a single call site is
                 // dead after inlining, so it is exempt from the soft caller-
                 // size cap and the per-caller budget in select_inline_site
@@ -2390,8 +2468,150 @@ fn build_callee_map(module: &IrModule) -> FxHashMap<String, CalleeData> {
             data.size_inline_cost = cost;
         }
     }
+    let names: Vec<String> = map.keys().cloned().collect();
+    let loop_descendants: Vec<(String, bool)> = names
+        .into_iter()
+        .map(|name| {
+            let mut visiting = FxHashSet::default();
+            let has_loop = inlineable_loop_descendant(&name, &map, &mut visiting, 0);
+            (name, has_loop)
+        })
+        .collect();
+    for (name, has_loop) in loop_descendants {
+        if let Some(data) = map.get_mut(&name) {
+            data.has_inlineable_loop_descendant = has_loop;
+        }
+    }
 
     map
+}
+
+/// A recursively reachable callee which normal -O2/-O3 policy may expand and
+/// which contains a loop.  This is deliberately a one-bit diagnostic, not a
+/// speculative profitability estimate: its sole job is to prevent a tiny
+/// *multi-site* wrapper from bypassing every existing loop-nest guard.
+fn inlineable_loop_descendant(
+    name: &str,
+    map: &FxHashMap<String, CalleeData>,
+    visiting: &mut FxHashSet<String>,
+    depth: usize,
+) -> bool {
+    let Some(data) = map.get(name) else {
+        return false;
+    };
+    if depth >= 16 || !visiting.insert(name.to_string()) {
+        return false;
+    }
+    let mut found = false;
+    for block in &data.blocks {
+        for inst in &block.instructions {
+            let Instruction::Call {
+                func: child_name, ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some(child) = map.get(child_name) else {
+                continue;
+            };
+            // Recursive normal callees are rejected by select_inline_site,
+            // and a relaxed-only body cannot expand in the ordinary path.
+            if (child.is_recursive && !child.is_always_inline)
+                || (child.exceeds_normal_limits && !child.is_always_inline)
+            {
+                continue;
+            }
+            if child.has_loops || inlineable_loop_descendant(child_name, map, visiting, depth + 1) {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            break;
+        }
+    }
+    visiting.remove(name);
+    found
+}
+
+/// Preserve an ordinary tiny/small static wrapper when inlining it would
+/// replicate a reachable loop body at multiple sites.  A custom-section caller
+/// may require inlining for section correctness and PGO force-inlining has
+/// better hotness information, so neither is overridden here.
+fn multisite_loop_wrapper_should_stay_outlined(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    caller_has_section: bool,
+    pgo_force: bool,
+    size_optimized: bool,
+) -> bool {
+    let fresh_small_wrapper = data.has_inlineable_loop_descendant
+        && raw_inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+        && data.blocks.len() <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS;
+    // A later pipeline invocation sees the expanded body, not the original
+    // wrapper.  Preserve the decision when the function itself now contains
+    // the acquired loop; otherwise it would escape the first-pass guard just
+    // because inlining made it larger than the small-wrapper limits.
+    let previously_expanded_wrapper = data.has_loops && data.has_inlined_calls;
+    !size_optimized
+        && data.is_plain_static
+        && !data.is_single_call_site_static
+        && data.direct_call_count > 1
+        // A fresh small loop helper can still be a worthwhile multi-site
+        // inline. This guard is narrowly for a wrapper that either hides a
+        // loop descendant now, or acquired one in an earlier pipeline pass.
+        && (fresh_small_wrapper || previously_expanded_wrapper)
+        && !caller_has_section
+        && !pgo_force
+}
+
+/// An ordinary static loop body called at several syntactic sites from an
+/// enclosing loop.  LCCC's current allocator often loses more to the merged
+/// live sets than it saves in call overhead: the workload-derived `lookup`
+/// loop became 16.8% faster when it remained outlined.  This deliberately
+/// does not apply at -Os (whose size policy has separately measured bounded
+/// hash-loop exceptions), to explicit inline forms, custom-section callers,
+/// profile-forced sites, or a single owner.
+fn nested_loop_multisite_static_should_stay_outlined(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    call_is_in_loop: bool,
+    caller_has_section: bool,
+    pgo_force: bool,
+    size_optimized: bool,
+) -> bool {
+    !size_optimized
+        && data.is_plain_static
+        && !data.is_single_call_site_static
+        && data.direct_call_count > 1
+        && data.has_loops
+        && raw_inst_count > MAX_TINY_INLINE_INSTRUCTIONS
+        && call_is_in_loop
+        && !caller_has_section
+        && !pgo_force
+}
+
+/// Cap repeated cloning of an ordinary small loop helper even when its calls
+/// are in distinct branches rather than syntactically inside a caller loop.
+/// At five 27-instruction clones, the glibc memcmp decision grew its caller
+/// from 93 to 183 instructions, introduced 18 stack references, and was
+/// 7.1% slower in an alternating runtime screen.
+fn repeated_small_loop_clone_should_stay_outlined(
+    data: &CalleeData,
+    raw_inst_count: usize,
+    caller_has_section: bool,
+    pgo_force: bool,
+    size_optimized: bool,
+) -> bool {
+    !size_optimized
+        && data.is_plain_static
+        && data.has_loops
+        && data.direct_call_count > MAX_SMALL_STATIC_LOOP_INLINE_CLONES
+        && raw_inst_count > MAX_TINY_INLINE_INSTRUCTIONS
+        && raw_inst_count <= MAX_SMALL_STATIC_LOOP_INLINE_INSTRUCTIONS
+        && data.blocks.len() <= MAX_SMALL_STATIC_LOOP_INLINE_BLOCKS
+        && !caller_has_section
+        && !pgo_force
 }
 
 /// Return whether a descendant is selected by the inliner's unconditional
@@ -4060,6 +4280,124 @@ mod inline_limit_tests {
         assert!(!fits_normal_inline_limits(201, 12, true, true, true, 6));
         assert!(!fits_normal_inline_limits(150, 25, true, true, true, 6));
         assert!(!fits_normal_inline_limits(150, 12, true, true, false, 6));
+    }
+
+    fn wrapper_policy_data(block_count: usize) -> CalleeData {
+        CalleeData {
+            blocks: (0..block_count)
+                .map(|index| BasicBlock {
+                    label: BlockId(index as u32),
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return(None),
+                    source_spans: Vec::new(),
+                })
+                .collect(),
+            param_struct_sizes: Vec::new(),
+            return_type: IrType::Void,
+            num_params: 0,
+            next_value_id: 0,
+            max_block_id: 0,
+            is_always_inline: false,
+            exceeds_normal_limits: false,
+            is_static_inline: false,
+            is_gnu_inline_def: false,
+            is_plain_static: true,
+            direct_call_count: 2,
+            has_inlineable_loop_descendant: false,
+            has_inlined_calls: false,
+            is_single_call_site_static: false,
+            has_loops: false,
+            is_recursive: false,
+            has_vector_intrinsics: false,
+            size_inline_cost: 0,
+            va_arg_pack: None,
+        }
+    }
+
+    #[test]
+    fn multisite_loop_wrapper_policy_survives_a_later_inline_invocation() {
+        let mut fresh = wrapper_policy_data(1);
+        fresh.has_inlineable_loop_descendant = true;
+        assert!(multisite_loop_wrapper_should_stay_outlined(
+            &fresh, 5, false, false, false
+        ));
+        assert!(!multisite_loop_wrapper_should_stay_outlined(
+            &fresh, 5, false, false, true
+        ));
+        // A later pipeline invocation sees an expanded loop body rather than
+        // the original wrapper. It must retain the earlier policy decision.
+        let mut expanded = wrapper_policy_data(13);
+        expanded.has_loops = true;
+        expanded.has_inlined_calls = true;
+        assert!(multisite_loop_wrapper_should_stay_outlined(
+            &expanded, 101, false, false, false
+        ));
+        assert!(!multisite_loop_wrapper_should_stay_outlined(
+            &expanded, 101, true, false, false
+        ));
+        assert!(!multisite_loop_wrapper_should_stay_outlined(
+            &expanded, 101, false, true, false
+        ));
+        // An original loop helper has no acquired descendant; it retains the
+        // established multi-site loop-inline policy.
+        expanded.has_inlined_calls = false;
+        assert!(!multisite_loop_wrapper_should_stay_outlined(
+            &expanded, 101, false, false, false
+        ));
+    }
+
+    #[test]
+    fn nested_loop_multisite_plain_static_policy_is_o2_only() {
+        let mut helper = wrapper_policy_data(7);
+        helper.has_loops = true;
+        assert!(nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, true, false, false, false
+        ));
+        assert!(!nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, true, false, false, true
+        ));
+        assert!(!nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, false, false, false, false
+        ));
+        assert!(!nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, true, true, false, false
+        ));
+        assert!(!nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, true, false, true, false
+        ));
+        helper.direct_call_count = 1;
+        helper.is_single_call_site_static = true;
+        assert!(!nested_loop_multisite_static_should_stay_outlined(
+            &helper, 20, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn repeated_small_loop_clone_cap_is_narrow_and_respects_overrides() {
+        let mut helper = wrapper_policy_data(8);
+        helper.has_loops = true;
+        helper.direct_call_count = MAX_SMALL_STATIC_LOOP_INLINE_CLONES + 1;
+        assert!(repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, false, false, false
+        ));
+        helper.direct_call_count = MAX_SMALL_STATIC_LOOP_INLINE_CLONES;
+        assert!(!repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, false, false, false
+        ));
+        helper.direct_call_count = MAX_SMALL_STATIC_LOOP_INLINE_CLONES + 1;
+        assert!(!repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, false, false, true
+        ));
+        assert!(!repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, true, false, false
+        ));
+        assert!(!repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, false, true, false
+        ));
+        helper.is_plain_static = false;
+        assert!(!repeated_small_loop_clone_should_stay_outlined(
+            &helper, 27, false, false, false
+        ));
     }
 }
 

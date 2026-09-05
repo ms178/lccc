@@ -739,12 +739,6 @@ fn peephole_optimize_inner(mut asm: String) -> String {
         if !sk("spill_deref") {
             global_changed |= spill_deref::fold_spill_deref_roundtrip(&mut store, &mut infos);
         }
-        // Cross-jump identical function epilogues. Runs with the other global
-        // passes; it only rewrites whole `pop*/addq %rsp/ret` runs, so no
-        // later pass can observe a half-merged exit.
-        if !sk("epilogue_merge") {
-            global_changed |= epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
-        }
         // ms178: XMM/vector save→clobber→reload round-trips (double_reduction
         // class): the reload re-executes the original memory load instead of
         // the frame slot, freeing the slot and the spill store entirely.
@@ -1002,6 +996,16 @@ fn peephole_optimize_inner(mut asm: String) -> String {
             "[PEEPHOLE-TIME] total: {:.1} ms",
             s.elapsed().as_secs_f64() * 1e3
         );
+    }
+
+    // Phase 8b: terminal epilogue cross-jumping.  Every frame/callee-save,
+    // trampoline, tail-call, and identical-block rewrite has now settled, so
+    // the pass sees the largest set of compatible suffixes.  It deliberately
+    // runs after all structured LineStore passes: its synthetic `label +\n\
+    // instruction` replacement is assembler text, not an input for another
+    // line classifier.
+    if !sk("epilogue_merge") {
+        let _ = epilogue_merge::merge_epilogue_tails(&mut store, &mut infos);
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early
@@ -3345,5 +3349,4 @@ mod regression_tests {
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("pushq %r13"), "{out}");
     }
-
 }

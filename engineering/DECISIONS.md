@@ -1339,3 +1339,83 @@ counts values crossing one edge cannot decide multi-instruction motion.
 
 The single-instruction pass with the loop-entry guard (session 11) remains the
 shipped configuration: corpus -4 instructions, -4 reg-reg moves, no regression.
+
+## Session 13 — OP-42 length model supersedes the earlier rejection
+
+The Session 12 rejection remains valid for its **boundary-only** atomic-chain
+cost model, not for atomic motion in principle.  `89adb5c3` adds the missing
+full live-range-length, call-crossing, and live-point accounting and commits a
+chain only as a complete transaction after a strict Pareto check.  The targeted
+unit cases and verifier-enabled corpus gate pass; the exact implementation and
+negative controls are recorded in
+`engineering/FOLLOWUP-2026-09-05e-op42-cg09-inline-policy.md`.
+
+## Session 13 — normal `-O2` inline pressure is measurable, not a size-only choice
+
+Three independent workload shapes show that the existing unconditional small
+static-inline path can inflate the merged function's live set more than it
+saves in call overhead.  The policy is deliberately narrow: plain static
+functions only; `static inline`, GNU inline, always-inline, custom-section,
+PGO-forced and single-owner cases retain their stronger existing contracts;
+`-Os` keeps its separately measured policy.
+
+1. A two-site tiny wrapper around an inlineable loop (`spectral_norm`'s
+   `mul_AtAv`) must remain outlined even after a later inliner invocation has
+   expanded its descendant.  Persisting `has_inlined_calls` closes that
+   fixed-point hole: same-window minimum `250.28 -> 205.50 ms` (`0.821`).
+2. A multi-site plain loop callee called from an enclosing loop (`lookup` in
+   `hash_table`) remains outlined.  The exact old/new screen is `9071.38 ->
+   7632.42 ms` (`0.841`) and emits `228 -> 174` assembly instructions.
+3. A 27-instruction small loop cloned five times into glibc memcmp branch
+   exits stays out of line after a cap of four clones.  The mechanically
+   amplified source has low-5 `78.155 -> 69.889 ms` (`0.8942`), while its
+   caller falls `183 -> 93` instructions and `18 -> 0` stack references.
+
+The decision is based on interleaved, CPU-pinned VM screens and retained raw
+samples, not cross-run comparison.  The normal inline policy should evolve to
+profile-aware benefit versus post-allocation pressure feedback; direct-call
+count is a deliberately conservative interim proxy.  Full rationale,
+exceptions, and validation are in
+`engineering/FOLLOWUP-2026-09-05e-op42-cg09-inline-policy.md`.
+
+## Session 13 — TLS GlobalAddr CSE class unification
+
+The global-address CSE previously kept foldable and must-materialize TLS uses
+in separate webs.  That distinction is essential for ordinary globals (a
+foldable use may become RIP-relative), but false for TLS: every TLS address
+must materialize a thread-relative `%fs` base.  Merging TLS use classes removes
+a redundant address sequence in `tls_pass` (three to two) without a measured
+runtime regression (low-7 `0.9947`).  A unit test pins the normal-global
+non-merge and TLS-only merge distinction.
+
+## Session 14 — PF-15 signed byte-carrier fold landed; broad U8 pair rejected
+
+The obvious `strcmp` repair is not merely a late peephole: a source byte can
+be promoted to a wide temporary for a zero test, then independently promoted
+again for a comparison after another load.  The simplifier now exposes the
+narrow integer sources before allocation, but only after exact cast-result use
+counting proves the wide carrier dies at that consumer.  This is a genuine
+live-range-length argument: `source→cast + cast→consumer` equals
+`source→consumer`; existing later source uses only make deleting the carrier
+better.  Conditions use the injective-zero fact; pairs accept signed equality
+and signed relational predicates only.
+
+The first version also admitted zero-extended U8 pairs.  It was semantically
+correct, static Expat was smaller, and runtime was **worse**: 101 alternating
+rounds had broad default `41.89 ms` vs both-folds-disabled `40.14 ms`;
+pair-only isolation had default `41.84 ms` vs pair-disabled `40.46 ms`.
+A one-NOP controlled layout move at the affected quote-loop header erased and
+reversed the loss, proving placement/RA sensitivity rather than a simple
+`cmpb` throughput conclusion.  Therefore it is not shipped.
+
+The final signed-root policy keeps the designed hot carrier win (a CPU-pinned,
+AB/BA-balanced 101-sample `strcmp_signed` kernel: default `43.179 ms`,
+pair-disabled `53.406 ms`, B/A `1.237`) while making final Expat neutral
+(`40.17/40.27 ms`, B/A `1.003`) and strlen neutral within the 1% VM threshold
+(`185.94/187.30 ms`, B/A `1.007`).  Kernel count falls `277→273`; the
+55-source census falls `6864→6850` instructions with no stack-reference or
+push increase.  Exhaustive signed-byte equality/termination and all-six-relop
+C regressions, focused IR tests, the structural lowering checks, and the full
+suite (`638 pass, 0 fail`) all pass.  The complete evidence, compiler-oracle
+gap, and follow-up guardrails are in
+`engineering/FOLLOWUP-2026-09-06-pf15-widened-byte-carriers.md`.
