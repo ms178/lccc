@@ -65,6 +65,18 @@ from families import Case, Param  # noqa: E402
 import abi_family  # noqa: E402
 
 REPO = HERE.parents[1]
+
+# The peephole-hazard families (flags / narrow / memalias / tailcall /
+# framecall / speculate / shiftchain) live next to the other codegen tooling
+# in scripts/ and register themselves into ``families.FAMILIES`` on import.
+# They were shipped without this import, so ``--families`` never knew them
+# and the whole battery silently never ran.  Import is best-effort so a
+# trimmed checkout without scripts/ still runs the generic families.
+sys.path.insert(0, str(REPO / "scripts"))
+try:
+    import peephole_families  # noqa: E402,F401  (registers on import)
+except ImportError as _e:  # pragma: no cover - trimmed checkout
+    print(f"note: peephole families unavailable ({_e})", file=sys.stderr)
 DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
 
 

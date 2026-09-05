@@ -219,7 +219,13 @@ impl LineInfo {
             // logical slot offsets consistent across pushfq/popfq, but the
             // barrier only costs a little optimization locality, never
             // correctness.
-            LineKind::Push { .. } | LineKind::Pop { .. }
+            LineKind::Push { .. } | LineKind::Pop { .. } |
+            // Inline asm is opaque (outputs/clobbers may redefine any register,
+            // memory may be written through any pointer).  Making it a barrier
+            // keeps every copy/slot/flag-tracking pass sound without each pass
+            // having to know the kind (three of them did not: store_forwarding,
+            // copy_propagation and `writes_family`).
+            LineKind::InlineAsm
         )
     }
     #[inline]

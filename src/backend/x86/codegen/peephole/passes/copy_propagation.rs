@@ -275,6 +275,17 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
             continue;
         }
 
+        // Inline asm is opaque: `"=r"` outputs and clobbers may redefine any
+        // register and the text is pinned (never rewritten).  Every recorded
+        // copy is stale afterwards; the classified `dest_reg` is REG_NONE for
+        // this kind, so the generic invalidation below would keep them alive.
+        if infos[i].kind == LineKind::InlineAsm {
+            copy_src = [REG_NONE; 16];
+            copy_src32 = [REG_NONE; 16];
+            i += 1;
+            continue;
+        }
+
         // Not a copy instruction. Try to propagate active copies into this instruction.
         let dest_reg = get_dest_reg(&infos[i]);
 
