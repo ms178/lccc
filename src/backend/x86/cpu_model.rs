@@ -334,7 +334,40 @@ pub struct X86Tune {
     pub fma_latency: u8,
     pub fadd_latency: u8,
     pub fmul_latency: u8,
+    /// Physical FMA-capable SIMD pipes.  Each pipe is `simd_datapath_bits`
+    /// wide, so a 256-bit op on a 128-bit machine (Zen1, Gracemont) holds a
+    /// pipe for two cycles — see [`X86Tune::simd_pipes_for`].
     pub fma_pipes: u8,
+    /// Physical packed-FP *add* pipes.  `[uops.info]` VADDPS ymm port
+    /// usage: SNB/IVB/HSW/BDW **p1 only** (one adder); SKL..RKL p01 (adds
+    /// run on both FMA units); ADL-P/RPL/SPR/ARL p15 (two dedicated
+    /// adders); Gracemont two 128-bit FP pipes; every Zen FP2+FP3.  The
+    /// prior version of this file assumed two adders on every row, which
+    /// over-provisioned Haswell/Broadwell FADD reductions by 2×.
+    pub fadd_pipes: u8,
+    /// Vector integer ALU pipes for VPADDD-class ops.  `[uops.info]`
+    /// VPADDD ymm: HSW..ADL-P/ARL-P p015 (3); SNB/IVB p15 on 128-bit only
+    /// (no AVX2 → 2); Gracemont two 128-bit pipes; Zen1..Zen5 FP0..FP3
+    /// (4, rTP 0.25).
+    pub vec_int_alu_pipes: u8,
+    /// Native SIMD execution width in bits.  `[Agner microarchitecture]`
+    /// / `[AMD SOG]`: SNB..ADL/RPL/ARL client 256 (AVX-512 fused off on
+    /// ADL/RPL), SKX/ICL/SPR 512, Gracemont 128 (two 128-bit FP pipes;
+    /// 256-bit ops are double-pumped), Zen1 128, Zen2/3/4 256 (Zen4
+    /// double-pumps AVX-512), Zen5 desktop 512.  LLVM encodes the same
+    /// fact as `TuningPrefer128Bit`/`Prefer256Bit`, GCC as
+    /// `-mprefer-vector-width`; here it is data the decisions derive from
+    /// ([`X86Tune::prefer_vector_bits`], [`X86Tune::simd_pipes_for`]).
+    pub simd_datapath_bits: u16,
+    /// Load pipes that can feed SIMD registers per cycle, and the width of
+    /// each.  `[Intel ORM]`/`[Agner]`: SNB/IVB 2 × 128 (a 256-bit load
+    /// occupies both ports); HSW/BDW/SKL 2 × 256; SKX/ICL 2 × 512; GLC/RPC
+    /// (ADL/RPL) 3 × 256 (three load AGUs p2/p3/p11); SPR 3 × 256; LNC
+    /// 3 × 256; Gracemont 2 × 128.  `[AMD SOG]`: Zen1 2 × 128; Zen2 2 ×
+    /// 256; Zen3/Zen4 2 × 256 vector loads per cycle (the third AGU is
+    /// scalar-only); Zen5 2 × 512.
+    pub vec_load_ports: u8,
+    pub vec_load_port_bits: u16,
 
     // ------------------------------------------------------------------
     // Memory.  `[cpuid]` ERMS (Enhanced REP MOVSB): IVB+ Intel, all Zen.
@@ -361,6 +394,36 @@ pub struct X86Tune {
     pub cache: CacheModel,
     /// E-core column of hybrid rows; `None` for homogeneous parts.
     pub ecore: Option<ECoreTune>,
+}
+
+/// Loop-carried operation class of a vectorised reduction, for
+/// [`X86Tune::reduction_interleave`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReductionOp {
+    /// `acc = fma(a, b, acc)` — FMA latency, FMA pipes (or add units where
+    /// FMA is absent).
+    Fma,
+    /// `acc = acc + x` in floating point.
+    FAdd,
+    /// `acc = acc + x` on integer lanes (latency 1).
+    IntAdd,
+    /// `acc = max(acc, x)` on integer lanes (latency 1, two pipes).
+    IntMax,
+}
+
+/// Shape of one vectorised reduction loop body (one original iteration).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReductionShape {
+    pub op: ReductionOp,
+    /// Vector register width of the accumulator (128 or 256).
+    pub vector_bits: u16,
+    /// Accumulator phis in the loop (each performs one `op` per iteration).
+    pub accumulators: u32,
+    /// Vector loads per iteration.
+    pub loads_per_iter: u32,
+    /// Vector µops per iteration including the loads and the accumulator
+    /// ops, excluding loop control (modelled as 2: IV add + fused cmp/jcc).
+    pub uops_per_iter: u32,
 }
 
 /// How a constant-size block copy / fill should be lowered.
@@ -667,6 +730,13 @@ impl X86Cpu {
                 fadd_latency: 3,
                 fmul_latency: 5,
                 fma_pipes: 0,
+                // [uops.info] VADDPS ymm SNB: p1 only; 256-bit loads take both
+                // 128-bit load ports; no AVX2 → 128-bit integer SIMD on p15.
+                fadd_pipes: 1,
+                vec_int_alu_pipes: 2,
+                simd_datapath_bits: 256,
+                vec_load_ports: 2,
+                vec_load_port_bits: 128,
                 erms,
                 fsrm: false,
                 avx256_unaligned_split: true,
@@ -700,6 +770,11 @@ impl X86Cpu {
                 pmulld_latency: 10,
                 fma_latency: 5,
                 fma_pipes: 2,
+                // [uops.info] HSW: VADDPS still p1 only (the two FMA units do
+                // not add until SKL); VPADDD ymm p015; two 256-bit load ports.
+                fadd_pipes: 1,
+                vec_int_alu_pipes: 3,
+                vec_load_port_bits: 256,
                 avx256_unaligned_split: false,
                 // [Intel ARK] i7-4790K: 32K/8w, 256K/8w, 8M/16w; [Agner] L2
                 // 11, L3 ~34; 4.4 GHz × ~80 ns.
@@ -726,6 +801,8 @@ impl X86Cpu {
                 div64_rtp_x100: 825,
                 fma_latency: 4,
                 fadd_latency: 4,
+                // [uops.info] SKL: VADDPS on p01 (both FMA units).
+                fadd_pipes: 2,
                 fmul_latency: 4,
                 rob_entries: 224,
                 lsd_uops: 0,
@@ -741,12 +818,20 @@ impl X86Cpu {
                 // [Intel ARK] Xeon Platinum 8280: 32K/8w, 1M/16w, 1.375M/core
                 // (38.5M/11w); [Agner] L2 14, L3 ~70 (mesh); 4.0 GHz × 90 ns.
                 cache: cache(32, 8, 4, 1024, 16, 14, 39424, 11, 70, 360),
+                // [Intel ORM] SKX: 512-bit FMA on p0+p1 fused (+p5 on the
+                // 2-FMA SKUs); two 64-byte loads per cycle.
+                simd_datapath_bits: 512,
+                vec_load_port_bits: 512,
                 ..Skylake.tune()
             },
             IceLake => X86Tune {
                 cpu: IceLake,
                 name: "icelake-client",
                 dispatch_width: 5,
+                // [Intel ORM] Sunny Cove: 512-bit FMA on p01 fused, two
+                // 64-byte loads per cycle.
+                simd_datapath_bits: 512,
+                vec_load_port_bits: 512,
                 mispredict_penalty: 16,
                 popcnt_false_dep: false,
                 shift_cl_uops: 2,
@@ -771,6 +856,12 @@ impl X86Cpu {
                 cpu: AlderLake,
                 name: "alderlake",
                 dispatch_width: 6,
+                // [Intel ORM] Golden Cove: three load AGUs (p2/p3/p11), each
+                // 256-bit; AVX-512 fused off → 256-bit datapath; VADDPS on the
+                // dedicated p15 adders (fadd_pipes stays 2).
+                simd_datapath_bits: 256,
+                vec_load_ports: 3,
+                vec_load_port_bits: 256,
                 mispredict_penalty: 17,
                 lea3_rtp_x100: 20,
                 // [uops.info] VADDPS ymm on ADL-P: latency 2 (p15 adders).
@@ -801,6 +892,9 @@ impl X86Cpu {
                 // (105M/15w); mesh L3 ~80 cycles; 3.8 GHz × ~110 ns.
                 cache: cache(48, 12, 5, 2048, 16, 16, 107520, 15, 80, 420),
                 ecore: None,
+                // [Intel ORM] Golden Cove server: AVX-512 enabled, two FMA
+                // units; 512-bit loads at 2/cycle (= 3 × 256 / 512 rounded).
+                simd_datapath_bits: 512,
                 ..AlderLake.tune()
             },
             ArrowLake => X86Tune {
@@ -850,6 +944,13 @@ impl X86Cpu {
                 pmulld_latency: 4,
                 fma_latency: 6,
                 fadd_latency: 3,
+                // [Agner] Gracemont: two 128-bit FP/FMA pipes, two 128-bit
+                // load pipes; 256-bit ops and loads are double-pumped.
+                fadd_pipes: 2,
+                vec_int_alu_pipes: 2,
+                simd_datapath_bits: 128,
+                vec_load_ports: 2,
+                vec_load_port_bits: 128,
                 fmul_latency: 4,
                 fma_pipes: 2,
                 erms: true,
@@ -889,7 +990,16 @@ impl X86Cpu {
                 fma_latency: 5,
                 fadd_latency: 3,
                 fmul_latency: 4,
-                fma_pipes: 1,
+                // [AMD SOG] Zen1: FP0/FP1 FMA and FP2/FP3 ADD, all 128-bit;
+                // VPADDD on all four pipes; two 128-bit load pipes.  256-bit
+                // ops are split, which `simd_datapath_bits: 128` expresses
+                // (the previous row folded that into `fma_pipes: 1`).
+                fma_pipes: 2,
+                fadd_pipes: 2,
+                vec_int_alu_pipes: 4,
+                simd_datapath_bits: 128,
+                vec_load_ports: 2,
+                vec_load_port_bits: 128,
                 erms: true,
                 fsrm: false,
                 avx256_unaligned_split: false,
@@ -905,6 +1015,9 @@ impl X86Cpu {
                 cpu: Znver2,
                 name: "znver2",
                 fma_pipes: 2,
+                // [AMD SOG] Zen2: 256-bit FP datapath, two 256-bit loads/cycle.
+                simd_datapath_bits: 256,
+                vec_load_port_bits: 256,
                 fmul_latency: 3,
                 rob_entries: 224,
                 uop_cache_uops: 4096,
@@ -943,6 +1056,10 @@ impl X86Cpu {
                 cpu: Znver5,
                 name: "znver5",
                 dispatch_width: 8,
+                // [AMD SOG Zen5] full 512-bit FP datapath on the desktop/
+                // server dies (mobile Strix Point is 256); two 512-bit loads.
+                simd_datapath_bits: 512,
+                vec_load_port_bits: 512,
                 mispredict_penalty: 14,
                 div64_latency_min: 10,
                 // [uops.info] VADDPS ymm on Zen 5: latency 2.
@@ -988,6 +1105,13 @@ impl X86Cpu {
                 fadd_latency: 4,
                 fmul_latency: 5,
                 fma_pipes: 1,
+                // Envelope: one FP adder (SNB..BDW), 128-bit datapath and
+                // 2 × 128-bit loads (SNB/Zen1/Gracemont), 2 vector ALUs.
+                fadd_pipes: 1,
+                vec_int_alu_pipes: 2,
+                simd_datapath_bits: 128,
+                vec_load_ports: 2,
+                vec_load_port_bits: 128,
                 erms: false,
                 fsrm: false,
                 avx256_unaligned_split: false,
@@ -1110,18 +1234,129 @@ impl X86Tune {
         bmi2
     }
 
-    /// Independent accumulators needed to saturate the FMA pipes on a
-    /// reduction (Little's law: latency × pipes).  0 = no FMA.
+    /// Effective number of `pipes` available to one `vector_bits`-wide
+    /// operation per cycle: a 256-bit op on a 128-bit datapath (Zen1,
+    /// Gracemont) holds its pipe for two cycles, so two physical pipes
+    /// sustain one such op per cycle.
     #[inline]
-    pub fn fma_reduction_accumulators(&self) -> u8 {
-        self.fma_latency.saturating_mul(self.fma_pipes.max(1))
+    pub fn simd_pipes_for(&self, pipes: u8, vector_bits: u16) -> f64 {
+        let dp = self.simd_datapath_bits.max(128) as f64;
+        let scale = (dp / vector_bits.max(128) as f64).min(1.0);
+        pipes as f64 * scale
     }
 
-    /// Independent accumulators for an FADD reduction (two adders on every
-    /// row).
+    /// Sustained `vector_bits`-wide loads per cycle from L1D.
+    #[inline]
+    pub fn vector_loads_per_cycle(&self, vector_bits: u16) -> f64 {
+        let w = self.vec_load_port_bits.max(128) as f64;
+        let scale = (w / vector_bits.max(128) as f64).min(1.0);
+        self.vec_load_ports.max(1) as f64 * scale
+    }
+
+    /// Vector width (bits) that runs at full rate on this part — the
+    /// number GCC exposes as `-mprefer-vector-width` and LLVM as
+    /// `TuningPrefer128Bit/256Bit`.  Hybrid rows follow the P-core: the
+    /// E-core double-pumps but does not *penalise* 256-bit code beyond
+    /// the halved rate, and the hot code is scheduled on the P-core.
+    #[inline]
+    pub fn prefer_vector_bits(&self) -> u16 {
+        self.simd_datapath_bits.clamp(128, 512)
+    }
+
+    /// Independent accumulators needed to saturate the FMA pipes on a
+    /// 256-bit reduction (Little's law: latency × effective pipes).
+    /// 0 = no FMA.
+    #[inline]
+    pub fn fma_reduction_accumulators(&self) -> u8 {
+        (self.fma_latency as f64 * self.simd_pipes_for(self.fma_pipes, 256).max(1.0)).ceil()
+            as u8
+    }
+
+    /// Independent accumulators for a 256-bit FADD reduction (latency ×
+    /// effective adder pipes; one adder on SNB..BDW, two elsewhere).
     #[inline]
     pub fn fadd_reduction_accumulators(&self) -> u8 {
-        self.fadd_latency.saturating_mul(2)
+        (self.fadd_latency as f64 * self.simd_pipes_for(self.fadd_pipes, 256).max(1.0)).ceil()
+            as u8
+    }
+
+    /// Interleave factor (independent accumulator chains per reduction
+    /// phi) for a vectorised reduction loop, from a roofline of the loop
+    /// body on this row.
+    ///
+    /// With `k` chains per accumulator one *group* iteration (k original
+    /// iterations) takes
+    ///
+    /// ```text
+    /// T(k) = max( latency,                          // each chain: 1 op / iteration
+    ///             (k·uops + 2) / dispatch_width,    // front end (+ IV add, fused cmp/jcc)
+    ///             k·loads / loads_per_cycle,         // L1D load ports
+    ///             k·accs  / eff_pipes )              // execution pipes of the op
+    /// ```
+    ///
+    /// cycles, i.e. `T(k)/k` cycles per original iteration, which is
+    /// non-increasing in `k`.  The smallest `k ∈ {1,2,4,8}` within 5 % of
+    /// the cost at the register cap is chosen; the cap keeps
+    /// `k × accs ≤ 8` so eight of the sixteen SIMD registers stay free for
+    /// loads, broadcasts and the address temporaries the allocator needs.
+    ///
+    /// Two floors, both LLVM parity (`X86TTIImpl::getMaxInterleaveFactor`
+    /// returns 4 with AVX, 2 without): a 256-bit loop never interleaves
+    /// below 4 and a 128-bit loop never below 2 when the cap allows.  The
+    /// nominal `dispatch_width` in `T(k)` assumes ideal µop delivery; the
+    /// floor covers the sustained-below-nominal reality (DSB/LSD bandwidth,
+    /// taken-branch bubbles) that the roofline does not see, exactly the
+    /// loop-overhead amortisation LLVM's constant buys.
+    ///
+    /// Worked examples (see the unit tests): FMA dot product, 2 loads/op,
+    /// 256-bit — Skylake (lat 4, 2 × 256-bit loads, 4-wide) → 4: the loop
+    /// is load-bound at 1 FMA/cycle and 4 chains already reach it; Raptor
+    /// Lake (3 loads/cycle, 6-wide) → 8: 4 chains leave the third load
+    /// port idle (1.0 vs 1.5 FMA/cycle).  Integer add reductions stay at
+    /// 4 everywhere (latency 1).
+    pub fn reduction_interleave(&self, shape: ReductionShape) -> u32 {
+        let bits = shape.vector_bits.max(128);
+        let accs = shape.accumulators.max(1);
+        let (latency, pipes) = match shape.op {
+            ReductionOp::Fma if self.fma_latency > 0 => (self.fma_latency, self.fma_pipes),
+            // No FMA on this row (SNB/IVB): the reduction is mul + add on
+            // separate units; the add is the loop-carried op.
+            ReductionOp::Fma => (self.fadd_latency, self.fadd_pipes),
+            ReductionOp::FAdd => (self.fadd_latency, self.fadd_pipes),
+            ReductionOp::IntAdd => (1, self.vec_int_alu_pipes),
+            // PMAXSD runs on p01 (SKL+) / p1 (HSW) / two Zen pipes.
+            ReductionOp::IntMax => (1, self.vec_int_alu_pipes.min(2)),
+        };
+        let latency = latency.max(1) as f64;
+        let eff_pipes = self.simd_pipes_for(pipes.max(1), bits).max(0.5);
+        let loads_per_cycle = self.vector_loads_per_cycle(bits).max(0.5);
+        let width = self.issue_width() as f64;
+        let uops = shape.uops_per_iter.max(accs) as f64;
+        let loads = shape.loads_per_iter as f64;
+        let accs_f = accs as f64;
+        let t = |k: u32| -> f64 {
+            let k = k as f64;
+            latency
+                .max((k * uops + 2.0) / width)
+                .max(k * loads / loads_per_cycle)
+                .max(k * accs_f / eff_pipes)
+        };
+        const REG_BUDGET: u32 = 8;
+        let cap = (REG_BUDGET / accs).max(1);
+        let cap_pow2 = if cap >= 8 { 8 } else if cap >= 4 { 4 } else if cap >= 2 { 2 } else { 1 };
+        let best = t(cap_pow2) / cap_pow2 as f64;
+        let mut chosen = cap_pow2;
+        for k in [1u32, 2, 4] {
+            if k > cap_pow2 {
+                break;
+            }
+            if t(k) / k as f64 <= best * 1.05 {
+                chosen = k;
+                break;
+            }
+        }
+        let floor = if bits >= 256 { 4 } else { 2 };
+        chosen.max(floor.min(cap_pow2))
     }
 
     /// Instruction budget per arm for branch → select (if-)conversion when
@@ -1396,6 +1631,45 @@ impl X86Tune {
         kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
         kv("lzcnt_tzcnt_false_dep", self.lzcnt_tzcnt_false_dep.to_string());
         kv("shift_cl_uops", self.shift_cl_uops.to_string());
+        kv("fadd_pipes", self.fadd_pipes.to_string());
+        kv("vec_int_alu_pipes", self.vec_int_alu_pipes.to_string());
+        kv("simd_datapath_bits", self.simd_datapath_bits.to_string());
+        kv("vec_load_ports", self.vec_load_ports.to_string());
+        kv("vec_load_port_bits", self.vec_load_port_bits.to_string());
+        kv("derived.prefer_vector_bits", self.prefer_vector_bits().to_string());
+        kv(
+            "derived.reduction_interleave_fma_dot_256",
+            self.reduction_interleave(ReductionShape {
+                op: ReductionOp::Fma,
+                vector_bits: 256,
+                accumulators: 1,
+                loads_per_iter: 2,
+                uops_per_iter: 2,
+            })
+            .to_string(),
+        );
+        kv(
+            "derived.reduction_interleave_fadd_sum_256",
+            self.reduction_interleave(ReductionShape {
+                op: ReductionOp::FAdd,
+                vector_bits: 256,
+                accumulators: 1,
+                loads_per_iter: 1,
+                uops_per_iter: 1,
+            })
+            .to_string(),
+        );
+        kv(
+            "derived.reduction_interleave_iadd_sum_256",
+            self.reduction_interleave(ReductionShape {
+                op: ReductionOp::IntAdd,
+                vector_bits: 256,
+                accumulators: 1,
+                loads_per_iter: 1,
+                uops_per_iter: 1,
+            })
+            .to_string(),
+        );
         kv("lea3_latency", self.lea3_latency.to_string());
         kv("lea3_rtp_x100", self.lea3_rtp_x100.to_string());
         kv("lea3_uops", self.lea3_uops.to_string());
@@ -1752,6 +2026,15 @@ mod tests {
             assert!(g.uop_cache_uops <= t.uop_cache_uops, "{:?}", cpu);
             assert!(g.dispatch_width <= t.dispatch_width, "{:?}", cpu);
             assert!(g.fma_pipes <= t.fma_pipes.max(1), "{:?}", cpu);
+            assert!(g.fadd_pipes <= t.fadd_pipes, "{:?}", cpu);
+            assert!(g.vec_int_alu_pipes <= t.vec_int_alu_pipes, "{:?}", cpu);
+            assert!(g.simd_datapath_bits <= t.simd_datapath_bits, "{:?}", cpu);
+            assert!(
+                u32::from(g.vec_load_ports) * u32::from(g.vec_load_port_bits)
+                    <= u32::from(t.vec_load_ports) * u32::from(t.vec_load_port_bits),
+                "{:?}",
+                cpu
+            );
             assert!(g.fma_latency >= t.fma_latency, "{:?}", cpu);
             assert!(g.load_latency >= t.load_latency, "{:?}", cpu);
             assert!(g.cache.l2.kib <= t.cache.l2.kib, "{:?}", cpu);
@@ -2006,9 +2289,144 @@ mod tests {
         assert_eq!(X86Cpu::Znver1.tune().fma_reduction_accumulators(), 5);
         assert_eq!(X86Cpu::Znver3.tune().fma_reduction_accumulators(), 8);
         assert_eq!(X86Cpu::SandyBridge.tune().fma_reduction_accumulators(), 0);
+        // Gracemont: two 128-bit FMA pipes → one 256-bit FMA per cycle.
+        assert_eq!(X86Cpu::Gracemont.tune().fma_reduction_accumulators(), 6);
         // Golden Cove's 2-cycle adders halve the FADD chain split vs SKL.
         assert_eq!(X86Cpu::AlderLake.tune().fadd_reduction_accumulators(), 4);
         assert_eq!(X86Cpu::Skylake.tune().fadd_reduction_accumulators(), 8);
+        // [uops.info] VADDPS ymm on HSW/BDW is p1 only: one adder, not two.
+        assert_eq!(X86Cpu::Haswell.tune().fadd_reduction_accumulators(), 3);
+        assert_eq!(X86Cpu::Broadwell.tune().fadd_reduction_accumulators(), 3);
+        assert_eq!(X86Cpu::SandyBridge.tune().fadd_reduction_accumulators(), 3);
+        // Zen1 physical pipes are 2 × 128: 256-bit FADD → 3 × 1.
+        assert_eq!(X86Cpu::Znver1.tune().fadd_reduction_accumulators(), 3);
+        assert_eq!(X86Cpu::Znver3.tune().fadd_reduction_accumulators(), 6);
+    }
+
+    #[test]
+    fn simd_datapath_and_load_ports_are_consistent() {
+        for cpu in X86Cpu::ALL {
+            let t = cpu.tune();
+            assert!(matches!(t.simd_datapath_bits, 128 | 256 | 512), "{:?}", cpu);
+            assert!(matches!(t.vec_load_port_bits, 128 | 256 | 512), "{:?}", cpu);
+            assert!((1..=4).contains(&t.vec_load_ports), "{:?}", cpu);
+            assert!((1..=4).contains(&t.fadd_pipes), "{:?}", cpu);
+            assert!((2..=4).contains(&t.vec_int_alu_pipes), "{:?}", cpu);
+            // A load port is never narrower than the datapath it feeds by
+            // more than one halving (SNB: 256-bit FP, 128-bit load ports).
+            assert!(t.vec_load_port_bits * 2 >= t.simd_datapath_bits, "{:?}", cpu);
+        }
+        let rpl = X86Cpu::RaptorLake.tune();
+        assert_eq!(rpl.vector_loads_per_cycle(256), 3.0);
+        assert_eq!(rpl.simd_pipes_for(2, 256), 2.0);
+        assert_eq!(rpl.prefer_vector_bits(), 256);
+        let gm = X86Cpu::Gracemont.tune();
+        assert_eq!(gm.vector_loads_per_cycle(256), 1.0);
+        assert_eq!(gm.simd_pipes_for(2, 256), 1.0);
+        assert_eq!(gm.prefer_vector_bits(), 128);
+        let z1 = X86Cpu::Znver1.tune();
+        assert_eq!(z1.prefer_vector_bits(), 128);
+        assert_eq!(z1.simd_pipes_for(2, 256), 1.0);
+        assert_eq!(X86Cpu::SkylakeAvx512.tune().prefer_vector_bits(), 512);
+        assert_eq!(X86Cpu::Znver4.tune().prefer_vector_bits(), 256);
+        assert_eq!(X86Cpu::Znver5.tune().prefer_vector_bits(), 512);
+        assert_eq!(X86Cpu::Generic.tune().prefer_vector_bits(), 128);
+    }
+
+    #[test]
+    fn reduction_interleave_follows_the_roofline() {
+        let dot = ReductionShape {
+            op: ReductionOp::Fma,
+            vector_bits: 256,
+            accumulators: 1,
+            loads_per_iter: 2,
+            uops_per_iter: 2,
+        };
+        let sum_f = ReductionShape {
+            op: ReductionOp::FAdd,
+            vector_bits: 256,
+            accumulators: 1,
+            loads_per_iter: 1,
+            uops_per_iter: 1,
+        };
+        let sum_i = ReductionShape {
+            op: ReductionOp::IntAdd,
+            ..sum_f
+        };
+        let max_i = ReductionShape {
+            op: ReductionOp::IntMax,
+            ..sum_f
+        };
+        // FMA dot product: Skylake is load-port bound (2 loads/cycle, 2 per
+        // FMA → 1 FMA/cycle) and 4 chains cover a 4-cycle latency exactly.
+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(dot), 4);
+        // Haswell's FMA is 5 cycles: 4 chains reach only 0.8 FMA/cycle of
+        // the same 1.0 load bound, so it needs 5 → 8 chains (Broadwell too).
+        assert_eq!(X86Cpu::Haswell.tune().reduction_interleave(dot), 8);
+        assert_eq!(X86Cpu::Broadwell.tune().reduction_interleave(dot), 8);
+        // Raptor Lake / Alder Lake / Sapphire Rapids: three load ports lift
+        // the bound to 1.5 FMA/cycle, which needs 6 → 8 chains.
+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot), 8);
+        assert_eq!(X86Cpu::AlderLake.tune().reduction_interleave(dot), 8);
+        assert_eq!(X86Cpu::SapphireRapids.tune().reduction_interleave(dot), 8);
+        // Zen3/4: two 256-bit loads/cycle → 1 FMA/cycle at latency 4 → 4.
+        assert_eq!(X86Cpu::Znver3.tune().reduction_interleave(dot), 4);
+        assert_eq!(X86Cpu::Znver4.tune().reduction_interleave(dot), 4);
+        // Zen1: 256-bit loads at 1/cycle → 0.5 FMA/cycle × latency 5 → 4.
+        assert_eq!(X86Cpu::Znver1.tune().reduction_interleave(dot), 4);
+        // SNB (no FMA): mul + add chains on one adder, one 256-bit load per
+        // cycle → the LLVM floor of 4.
+        assert_eq!(X86Cpu::SandyBridge.tune().reduction_interleave(dot), 4);
+        // FP sum: one load per add.  SKL adds at latency 4 on two pipes with
+        // two loads/cycle → 8 chains; Golden Cove's 2-cycle adders need 4.
+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(sum_f), 8);
+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(sum_f), 4);
+        assert_eq!(X86Cpu::Znver3.tune().reduction_interleave(sum_f), 8);
+        // Haswell: a single adder → 1 add/cycle × latency 3 → the floor 4.
+        assert_eq!(X86Cpu::Haswell.tune().reduction_interleave(sum_f), 4);
+        // Integer add / max (latency 1): never above the floor.
+        for cpu in X86Cpu::ALL {
+            assert_eq!(cpu.tune().reduction_interleave(sum_i), 4, "{:?}", cpu);
+            assert_eq!(cpu.tune().reduction_interleave(max_i), 4, "{:?}", cpu);
+        }
+        // 128-bit shapes: floor 2, SKL FP sum still wants 8 (lat 4 × 2 pipes
+        // = 8 at 2 loads/cycle).
+        let sum_f128 = ReductionShape {
+            vector_bits: 128,
+            ..sum_f
+        };
+        assert_eq!(X86Cpu::Skylake.tune().reduction_interleave(sum_f128), 8);
+        // Generic: one adder on a 128-bit datapath → 1 add/cycle × lat 4 → 4.
+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_f128), 4);
+        let sum_i128 = ReductionShape {
+            vector_bits: 128,
+            ..sum_i
+        };
+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_i128), 2);
+        // Raptor Lake: three 128-bit loads and three vector ALUs per cycle
+        // sustain 3 adds/cycle, so 2 chains leave a third of it idle → 4.
+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(sum_i128), 4);
+        // Register cap: two accumulator phis share the 8-register budget.
+        let dot2 = ReductionShape {
+            accumulators: 2,
+            loads_per_iter: 4,
+            uops_per_iter: 4,
+            ..dot
+        };
+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot2), 4);
+        let dot4 = ReductionShape {
+            accumulators: 4,
+            loads_per_iter: 8,
+            uops_per_iter: 8,
+            ..dot
+        };
+        assert_eq!(X86Cpu::RaptorLake.tune().reduction_interleave(dot4), 2);
+        // Generic (no -mtune): the envelope sustains one 256-bit load per
+        // cycle (2 × 128-bit ports), so every 256-bit shape is load-bound by
+        // 4 chains — the historical constant is reproduced exactly.
+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_f), 4);
+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(dot), 4);
+        assert_eq!(X86Cpu::Generic.tune().reduction_interleave(sum_i), 4);
     }
 
     #[test]
