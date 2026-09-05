@@ -1,0 +1,481 @@
+//! Legacy-SSE → VEX promotion inside functions that use 256-bit registers.
+//!
+//! # Why
+//!
+//! The vectoriser emits its loop bodies in VEX-256 (`vmulps … %ymm`), but the
+//! scalar remainder, the reduction epilogue and every other scalar FP
+//! instruction in the same function still come out of the text emitters in
+//! *legacy* SSE encoding (`movss`, `cvtsi2sdq`, `ucomisd`, …).  The function
+//! runs its `vzeroupper` only in the epilogue, so that scalar code executes
+//! with **dirty upper YMM state**.  Measured consequences (Intel ORM §15.3,
+//! Agner Fog "Mixing AVX and SSE"; uops.info):
+//!
+//! * Skylake and every later P-core (SKL/ICL/GLC/RPC, i.e. the Raptor Lake
+//!   target): each legacy-SSE instruction that writes an XMM register gets a
+//!   merge µop and a *false dependency on the previous value of that
+//!   register*.  A remainder loop `movss (%rdi),%xmm4; vmulss …,%xmm4` thus
+//!   serialises on `xmm4` at FP latency (≈5 cycles/element instead of 1).
+//! * Sandy/Ivy Bridge, Haswell, Broadwell: a state transition of ~70 cycles
+//!   on *every* legacy→VEX and VEX→legacy boundary — a mixed remainder loop
+//!   pays two per iteration.
+//! * Zen: no penalty (documented; the rewrite is still a no-op there).
+//!
+//! GCC and Clang avoid this by encoding *everything* VEX once `-mavx` is on.
+//! lccc has ~60 scalar-FP emission sites in six files; rewriting them one
+//! by one is neither robust nor reviewable, and the peephole framework's
+//! own `fuse_mov_scalar_fp_into_vex_op` already depends on seeing the
+//! legacy spelling.  This pass therefore runs **last**, on the final text.
+//!
+//! # Soundness
+//!
+//! A legacy SSE instruction with an XMM destination leaves bits 255:128 of
+//! the register untouched; its VEX form zeroes them.  The rewrite is exact
+//! for bits 127:0 in every case, so the only observable difference is the
+//! upper half, and that is only observable if the function *reads*
+//! `%ymmN` after writing `%xmmN` legacy-style.  Rules:
+//!
+//! 1. Only functions that mention `%ymm` at all are touched (no 256-bit use
+//!    → no dirty state → legacy encodings are shorter and cost nothing).
+//! 2. An instruction whose destination is `%xmmN` is rewritten only if
+//!    `%ymmN` is referenced **nowhere** in the function (read or write).
+//!    Then no instruction can observe the upper half, and the SysV ABI
+//!    makes the upper halves undefined across calls anyway.
+//! 3. Instructions without an XMM destination (stores, compares, GPR
+//!    destinations) are always exact and always rewritten.
+//! 4. Functions containing inline asm (`#APP`) are skipped wholesale.
+//! 5. Register-to-register `movss`/`movsd` keep their merge semantics via
+//!    the three-operand VEX form `vmovss %a, %b, %b` (dst = b[127:32] ∪
+//!    a[31:0]), identical to the legacy instruction for bits 127:0.
+//! 6. Every VEX mnemonic emitted here was assembled by lccc's integrated
+//!    assembler and compared byte-for-byte against GAS (see the unit tests
+//!    and `tests/regression/vex_promote_remainder.c`).
+//!
+//! Anything the table does not list is left alone; an unknown legacy
+//! instruction merely keeps its (already correct) encoding.
+
+/// How the operand list changes between the legacy and the VEX spelling.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Form {
+    /// Same operand list (`movdqu m, x` → `vmovdqu m, x`; `pshufd $i, a, b`
+    /// → `vpshufd $i, a, b`; GPR/flags destinations).
+    Two,
+    /// Destructive two-address op → non-destructive three-address with the
+    /// destination duplicated as the first source (`addss a, b` →
+    /// `vaddss a, b, b`; `shufps $i, a, b` → `vshufps $i, a, b, b`).
+    Three,
+    /// `movss`/`movsd`: `Two` for memory forms, `Three` register-to-register.
+    MovScalar,
+    /// `cvt(t)s[sd]2si[lq]`: GPR destination; the operand-size suffix is
+    /// dropped because the VEX spelling takes the width from the GPR.
+    CvtToInt,
+    /// `cvtsi2s[sd][lq]`: `Three`; an unsuffixed spelling gets its suffix
+    /// from the GPR name so the assembler never has to guess.
+    CvtFromInt,
+}
+
+/// Legacy mnemonic → operand form.  The VEX mnemonic is `v` + legacy.
+fn lookup(mnemonic: &str) -> Option<Form> {
+    use Form::*;
+    Some(match mnemonic {
+        "movss" | "movsd" => MovScalar,
+        "cvttss2si" | "cvttss2sil" | "cvttss2siq" | "cvttsd2si" | "cvttsd2sil"
+        | "cvttsd2siq" | "cvtss2si" | "cvtss2sil" | "cvtss2siq" | "cvtsd2si" | "cvtsd2sil"
+        | "cvtsd2siq" => CvtToInt,
+        "cvtsi2ss" | "cvtsi2ssl" | "cvtsi2ssq" | "cvtsi2sd" | "cvtsi2sdl" | "cvtsi2sdq" => {
+            CvtFromInt
+        }
+        // Moves, shuffles with immediate, conversions, extracts, flag
+        // writers: operand list unchanged.
+        "movdqu" | "movdqa" | "movaps" | "movups" | "movapd" | "movupd" | "movd" | "movq"
+        | "lddqu" | "movddup" | "movshdup" | "movsldup" | "pshufd" | "pshufhw" | "pshuflw"
+        | "cvtdq2ps" | "cvtps2pd" | "cvtpd2ps" | "cvttps2dq" | "cvtps2dq" | "cvtdq2pd"
+        | "cvttpd2dq" | "cvtpd2dq" | "ptest" | "ucomiss" | "ucomisd" | "comiss" | "comisd"
+        | "pextrb" | "pextrw" | "pextrd" | "pextrq" | "pmovmskb" | "movmskps" | "movmskpd"
+        | "pabsb" | "pabsw" | "pabsd" | "sqrtps" | "sqrtpd" | "rcpps" | "rsqrtps"
+        | "roundps" | "roundpd" | "pmovzxbw" | "pmovzxbd" | "pmovzxbq" | "pmovzxwd"
+        | "pmovzxwq" | "pmovzxdq" | "pmovsxbw" | "pmovsxbd" | "pmovsxbq" | "pmovsxwd"
+        | "pmovsxwq" | "pmovsxdq" | "phminposuw" | "aesimc" => Two,
+        // Destructive binary ops: destination becomes the first source.
+        "addss" | "addsd" | "subss" | "subsd" | "mulss" | "mulsd" | "divss" | "divsd"
+        | "minss" | "minsd" | "maxss" | "maxsd" | "sqrtss" | "sqrtsd" | "rcpss" | "rsqrtss"
+        | "cvtss2sd" | "cvtsd2ss" | "addps" | "addpd" | "subps" | "subpd" | "mulps"
+        | "mulpd" | "divps" | "divpd" | "minps" | "minpd" | "maxps" | "maxpd" | "xorps"
+        | "xorpd" | "andps" | "andpd" | "andnps" | "andnpd" | "orps" | "orpd" | "pxor"
+        | "pand" | "pandn" | "por" | "paddb" | "paddw" | "paddd" | "paddq" | "psubb"
+        | "psubw" | "psubd" | "psubq" | "paddusb" | "paddusw" | "paddsb" | "paddsw"
+        | "psubusb" | "psubusw" | "psubsb" | "psubsw" | "pminsw" | "pmaxsw" | "pminub"
+        | "pmaxub" | "pminsb" | "pmaxsb" | "pminsd" | "pmaxsd" | "pminud" | "pmaxud"
+        | "pminuw" | "pmaxuw" | "pcmpeqb" | "pcmpeqw" | "pcmpeqd" | "pcmpeqq" | "pcmpgtb"
+        | "pcmpgtw" | "pcmpgtd" | "pcmpgtq" | "punpcklbw" | "punpcklwd" | "punpckldq"
+        | "punpcklqdq" | "punpckhbw" | "punpckhwd" | "punpckhdq" | "punpckhqdq"
+        | "packsswb" | "packssdw" | "packuswb" | "packusdw" | "pmulld" | "pmullw"
+        | "pmulhw" | "pmulhuw" | "pmuludq" | "pmuldq" | "pmaddwd" | "pmaddubsw" | "psadbw"
+        | "pavgb" | "pavgw" | "pshufb" | "palignr" | "pclmulqdq" | "aesenc" | "aesenclast"
+        | "aesdec" | "aesdeclast" | "pinsrb" | "pinsrw" | "pinsrd" | "pinsrq" | "shufps"
+        | "shufpd" | "unpcklps" | "unpckhps" | "unpcklpd" | "unpckhpd" | "movhlps"
+        | "movlhps" | "roundss" | "roundsd" | "psllw" | "pslld" | "psllq" | "psrlw"
+        | "psrld" | "psrlq" | "psraw" | "psrad" | "pslldq" | "psrldq" | "addsubps"
+        | "addsubpd" | "haddps" | "haddpd" | "hsubps" | "hsubpd" | "blendps" | "blendpd"
+        | "pblendw" | "insertps" | "dpps" | "dppd" | "mpsadbw" | "cmpps" | "cmppd" | "cmpss"
+        | "cmpsd" | "cmpeqss" | "cmpltss" | "cmpless" | "cmpunordss" | "cmpneqss"
+        | "cmpnltss" | "cmpnless" | "cmpordss" | "cmpeqsd" | "cmpltsd" | "cmplesd"
+        | "cmpunordsd" | "cmpneqsd" | "cmpnltsd" | "cmpnlesd" | "cmpordsd" | "cmpeqps"
+        | "cmpltps" | "cmpleps" | "cmpunordps" | "cmpneqps" | "cmpnltps" | "cmpnleps"
+        | "cmpordps" | "cmpeqpd" | "cmpltpd" | "cmplepd" | "cmpunordpd" | "cmpneqpd"
+        | "cmpnltpd" | "cmpnlepd" | "cmpordpd" => Three,
+        _ => return None,
+    })
+}
+
+/// Split an AT&T operand list at top-level commas (parentheses of a memory
+/// operand are never split).
+fn split_operands(s: &str) -> Vec<&str> {
+    let mut out = Vec::with_capacity(3);
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last);
+    }
+    out
+}
+
+/// `%xmmN` → `N` (0..=15); `None` for anything else.
+fn xmm_index(op: &str) -> Option<u32> {
+    let rest = op.strip_prefix("%xmm")?;
+    let n: u32 = rest.parse().ok()?;
+    (n < 16).then_some(n)
+}
+
+/// Bitmask of every `%ymmN` mentioned in `text`.
+fn ymm_mask(text: &str) -> u32 {
+    let mut mask = 0u32;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(pos) = text[i..].find("%ymm") {
+        let mut j = i + pos + 4;
+        let mut n = 0u32;
+        let mut digits = 0;
+        while j < bytes.len() && bytes[j].is_ascii_digit() {
+            n = n * 10 + (bytes[j] - b'0') as u32;
+            j += 1;
+            digits += 1;
+        }
+        if digits > 0 && n < 16 {
+            mask |= 1 << n;
+        }
+        i = j.max(i + pos + 4);
+    }
+    mask
+}
+
+fn is_gpr32(op: &str) -> bool {
+    op.starts_with("%e")
+        || matches!(
+            op,
+            "%r8d" | "%r9d" | "%r10d" | "%r11d" | "%r12d" | "%r13d" | "%r14d" | "%r15d"
+        )
+}
+
+/// Rewrite one instruction line (already known to be an instruction, not a
+/// label/directive/comment).  Returns the new text or `None` to keep it.
+fn rewrite_line(line: &str, ymm_used: u32) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent = &line[..line.len() - trimmed.len()];
+    // Lines with comments are left alone: the emitter's annotated lines are
+    // rare and never in hot scalar tails.
+    if trimmed.contains('#') || !trimmed.contains("%xmm") {
+        return None;
+    }
+    let (mnemonic, rest) = match trimmed.find(|c: char| c.is_ascii_whitespace()) {
+        Some(p) => (&trimmed[..p], trimmed[p..].trim()),
+        None => return None,
+    };
+    if mnemonic.starts_with('v') {
+        return None;
+    }
+    let form = lookup(mnemonic)?;
+    let ops = split_operands(rest);
+    if ops.is_empty() || ops.len() > 3 {
+        return None;
+    }
+    let dst = *ops.last().unwrap();
+    // Rule 2: an XMM destination whose YMM alias is live anywhere in the
+    // function must keep the upper-half-preserving legacy encoding.
+    if let Some(n) = xmm_index(dst) {
+        if ymm_used & (1 << n) != 0 {
+            return None;
+        }
+    }
+    // Reject anything unusual defensively (masking syntax, x87 operands).
+    if ops
+        .iter()
+        .any(|o| o.is_empty() || o.contains('{') || o.contains("%st"))
+    {
+        return None;
+    }
+    let reg_reg = ops.len() == 2 && ops.iter().all(|o| o.starts_with("%xmm"));
+    let (vmn, three) = match form {
+        Form::Two => (format!("v{mnemonic}"), false),
+        Form::Three => (format!("v{mnemonic}"), true),
+        Form::MovScalar => (format!("v{mnemonic}"), reg_reg),
+        Form::CvtToInt => {
+            if xmm_index(dst).is_some() {
+                return None; // malformed for this form
+            }
+            // Drop the `l`/`q` suffix; the GPR operand carries the width.
+            let base = mnemonic
+                .strip_suffix('q')
+                .or_else(|| mnemonic.strip_suffix('l'))
+                .unwrap_or(mnemonic);
+            (format!("v{base}"), false)
+        }
+        Form::CvtFromInt => {
+            let src = ops.first().copied().unwrap_or("");
+            let suffixed = mnemonic.ends_with('l') || mnemonic.ends_with('q');
+            let mn = if suffixed {
+                mnemonic.to_string()
+            } else if is_gpr32(src) {
+                format!("{mnemonic}l")
+            } else if src.starts_with("%r") {
+                format!("{mnemonic}q")
+            } else {
+                return None; // memory source without suffix: width unknown
+            };
+            (format!("v{mn}"), true)
+        }
+    };
+    if three && xmm_index(dst).is_none() {
+        // Three-operand forms need an XMM destination to duplicate.
+        return None;
+    }
+    let mut out = String::with_capacity(line.len() + 12);
+    out.push_str(indent);
+    out.push_str(&vmn);
+    out.push(' ');
+    for (i, op) in ops.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(op);
+    }
+    if three {
+        out.push_str(", ");
+        out.push_str(dst);
+    }
+    Some(out)
+}
+
+fn is_function_label(line: &str) -> bool {
+    let t = line.trim_end();
+    if !t.ends_with(':') || t.starts_with(".L") || t.starts_with(' ') || t.starts_with('\t') {
+        return false;
+    }
+    let name = &t[..t.len() - 1];
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'@')
+}
+
+/// Promote legacy SSE to VEX in every function that uses `%ymm`.  Returns
+/// the number of rewritten lines.
+pub fn promote_legacy_sse_to_vex(asm: &mut String) -> usize {
+    let lines: Vec<&str> = asm.split_inclusive('\n').collect();
+    // Function ranges: [start, end) line indices.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cur = 0usize;
+    for (i, l) in lines.iter().enumerate() {
+        if is_function_label(l) {
+            if i > cur {
+                ranges.push((cur, i));
+            }
+            cur = i;
+        }
+    }
+    if lines.len() > cur {
+        ranges.push((cur, lines.len()));
+    }
+
+    let mut out = String::with_capacity(asm.len() + 1024);
+    let mut rewritten = 0usize;
+    for (start, end) in ranges {
+        let body = &lines[start..end];
+        let mut ymm_used = 0u32;
+        let mut has_asm = false;
+        for l in body {
+            if l.contains("%ymm") {
+                ymm_used |= ymm_mask(l);
+            }
+            if l.trim() == "#APP" {
+                has_asm = true;
+            }
+        }
+        if ymm_used == 0 || has_asm {
+            for l in body {
+                out.push_str(l);
+            }
+            continue;
+        }
+        for l in body {
+            let content = l.strip_suffix('\n').unwrap_or(l);
+            let t = content.trim_start();
+            let is_insn =
+                !t.is_empty() && !t.starts_with('.') && !t.ends_with(':') && !t.starts_with('#');
+            if is_insn {
+                if let Some(new) = rewrite_line(content, ymm_used) {
+                    out.push_str(&new);
+                    if l.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    rewritten += 1;
+                    continue;
+                }
+            }
+            out.push_str(l);
+        }
+    }
+    if rewritten > 0 {
+        *asm = out;
+    }
+    rewritten
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(src: &str) -> (String, usize) {
+        let mut s = src.to_string();
+        let n = promote_legacy_sse_to_vex(&mut s);
+        (s, n)
+    }
+
+    #[test]
+    fn scalar_tail_after_ymm_loop_is_promoted() {
+        let src = "\
+f:
+\tvmulps (%rsi,%r10), %ymm2, %ymm0
+\tvmovups %ymm0, (%rdi,%r10)
+\tmovss .LCFP_0(%rip), %xmm3
+\tmovss (%rdi), %xmm4
+\tvmulss %xmm3, %xmm4, %xmm4
+\tmovss %xmm4, (%r10)
+\tcvtsi2sdq %rax, %xmm5
+\tcvttsd2siq %xmm5, %rax
+\tucomisd %xmm5, %xmm6
+\taddsd %xmm5, %xmm6
+\tmovsd %xmm6, %xmm7
+\tvzeroupper
+\tret
+";
+        let (out, n) = run(src);
+        assert_eq!(n, 8, "{out}");
+        assert!(out.contains("\tvmovss .LCFP_0(%rip), %xmm3\n"));
+        assert!(out.contains("\tvmovss (%rdi), %xmm4\n"));
+        assert!(out.contains("\tvmovss %xmm4, (%r10)\n"));
+        assert!(out.contains("\tvcvtsi2sdq %rax, %xmm5, %xmm5\n"));
+        assert!(out.contains("\tvcvttsd2si %xmm5, %rax\n"));
+        assert!(out.contains("\tvucomisd %xmm5, %xmm6\n"));
+        assert!(out.contains("\tvaddsd %xmm5, %xmm6, %xmm6\n"));
+        assert!(out.contains("\tvmovsd %xmm6, %xmm7, %xmm7\n"));
+        // Already-VEX lines are untouched.
+        assert!(out.contains("\tvmulss %xmm3, %xmm4, %xmm4\n"));
+    }
+
+    #[test]
+    fn xmm_dest_aliasing_a_used_ymm_is_kept_legacy() {
+        let src = "\
+g:
+\tvmovdqa %ymm0, %ymm2
+\tmovss (%rdi), %xmm2
+\tmovss (%rdi), %xmm0
+\tmovss %xmm2, (%rsi)
+\tpaddd %xmm1, %xmm2
+\tpaddd %xmm1, %xmm3
+\tret
+";
+        let (out, n) = run(src);
+        // xmm2/xmm0 destinations alias ymm2/ymm0 → kept; the store and the
+        // xmm3-destination op are promoted.
+        assert_eq!(n, 2, "{out}");
+        assert!(out.contains("\tmovss (%rdi), %xmm2\n"));
+        assert!(out.contains("\tmovss (%rdi), %xmm0\n"));
+        assert!(out.contains("\tvmovss %xmm2, (%rsi)\n"));
+        assert!(out.contains("\tpaddd %xmm1, %xmm2\n"));
+        assert!(out.contains("\tvpaddd %xmm1, %xmm3, %xmm3\n"));
+    }
+
+    #[test]
+    fn functions_without_ymm_or_with_inline_asm_are_untouched() {
+        let plain = "h:\n\tmovss (%rdi), %xmm0\n\taddss %xmm1, %xmm0\n\tret\n";
+        let (out, n) = run(plain);
+        assert_eq!(n, 0);
+        assert_eq!(out, plain);
+        let asm =
+            "k:\n\tvpxor %ymm0, %ymm0, %ymm0\n#APP\n\tnop\n#NO_APP\n\tmovss (%rdi), %xmm1\n\tret\n";
+        let (out, n) = run(asm);
+        assert_eq!(n, 0);
+        assert_eq!(out, asm);
+    }
+
+    #[test]
+    fn per_function_scoping_and_immediate_forms() {
+        let src = "\
+a:
+\tvxorps %ymm0, %ymm0, %ymm0
+\tpshufd $85, %xmm1, %xmm2
+\tshufps $27, %xmm1, %xmm2
+\tpinsrd $1, %eax, %xmm2
+\tpextrd $1, %xmm2, %eax
+\tpsllq $3, %xmm2
+\tcvtsi2sd %eax, %xmm2
+\tcvtsi2sd %rax, %xmm2
+\tcvtsi2sd (%rdi), %xmm2
+\tret
+b:
+\tmovss (%rdi), %xmm0
+\tret
+";
+        let (out, n) = run(src);
+        assert_eq!(n, 7, "{out}");
+        assert!(out.contains("\tvpshufd $85, %xmm1, %xmm2\n"));
+        assert!(out.contains("\tvshufps $27, %xmm1, %xmm2, %xmm2\n"));
+        assert!(out.contains("\tvpinsrd $1, %eax, %xmm2, %xmm2\n"));
+        assert!(out.contains("\tvpextrd $1, %xmm2, %eax\n"));
+        assert!(out.contains("\tvpsllq $3, %xmm2, %xmm2\n"));
+        assert!(out.contains("\tvcvtsi2sdl %eax, %xmm2, %xmm2\n"));
+        assert!(out.contains("\tvcvtsi2sdq %rax, %xmm2, %xmm2\n"));
+        // Unsuffixed memory-source conversion: width unknown → kept.
+        assert!(out.contains("\tcvtsi2sd (%rdi), %xmm2\n"));
+        // Function `b` has no ymm use → untouched.
+        assert!(out.contains("b:\n\tmovss (%rdi), %xmm0\n"));
+    }
+
+    #[test]
+    fn string_cmpsd_and_comments_are_never_touched() {
+        let src =
+            "c:\n\tvpxor %ymm0, %ymm0, %ymm0\n\trep cmpsd\n\tmovss (%rdi), %xmm1 # note\n\tret\n";
+        let (out, n) = run(src);
+        assert_eq!(n, 0);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn ymm_mask_parses_all_registers() {
+        assert_eq!(ymm_mask("vaddps %ymm15, %ymm1, %ymm0"), (1 << 15) | (1 << 1) | 1);
+        assert_eq!(ymm_mask("vmovups %ymm7, (%rdi)"), 1 << 7);
+        assert_eq!(ymm_mask("nothing"), 0);
+    }
+}

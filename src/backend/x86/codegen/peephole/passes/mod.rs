@@ -45,6 +45,7 @@ mod relay_and_lea;
 mod spill_deref;
 mod store_forwarding;
 mod tail_call;
+mod vex_promote;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -306,7 +307,19 @@ fn line_count_estimate(asm: &str) -> usize {
     asm.as_bytes().iter().filter(|&&b| b == b'\n').count()
 }
 
-pub fn peephole_optimize(mut asm: String) -> String {
+/// Full peephole pipeline followed by the final VEX promotion.  The
+/// promotion runs on whatever text the pipeline returns — including the
+/// early-return paths (huge inputs, `-O0`) — because the AVX/SSE transition
+/// penalty it removes is independent of the optimisation level.
+pub fn peephole_optimize(asm: String) -> String {
+    let mut out = peephole_optimize_inner(asm);
+    if std::env::var("CCC_NO_VEX_PROMOTE").is_err() {
+        let _ = vex_promote::promote_legacy_sse_to_vex(&mut out);
+    }
+    out
+}
+
+fn peephole_optimize_inner(mut asm: String) -> String {
     // ms178 debug: dump pre-peephole asm
     if let Ok(path) = std::env::var("CCC_DUMP_ASM") {
         let _ = std::fs::write(path, &asm);
