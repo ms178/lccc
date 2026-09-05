@@ -43,7 +43,6 @@ use crate::ir::analysis;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
 };
-use crate::passes::loop_analysis;
 
 /// Run if-conversion on a single function.
 pub(crate) fn if_convert_function(func: &mut IrFunction) -> usize {
@@ -103,31 +102,68 @@ fn canonical_addr_key_impl(
                 Some(Instruction::GlobalAddr { name, .. }) => format!("sym({})", name),
                 _ => format!("val({})", base_root.0),
             };
+            // Offset canonicalization must be INJECTIVE over addresses: two
+            // GEPs get the same key iff they denote the same address. The
+            // walk descends through value-preserving links (Copy, and Cast —
+            // the frontend materializes a fresh cast per source mention, so
+            // the trace is what lets two arms' `d[i]` GEPs match at all).
+            // A `Shl(v, k)` scales the offset by 2^k: the shift constant is
+            // part of the ADDRESS, so it is recorded in the key. Collapsing
+            // through Shl without recording k (the original code) mapped
+            // `d[i]` (off = i<<2) and `d[2*i]` (off = i<<3) to the SAME key —
+            // rewrite_covered_arm_loads then replaced the arm's `d[2*i]`
+            // load with the pred's `d[i]` value, and sink_conditional_stores
+            // merged stores to the two DIFFERENT addresses into one store.
             let mut off_root = offset.clone();
+            let mut scale_suffix = String::new();
             for _ in 0..16 {
                 let vid = match &off_root {
                     Operand::Value(v) => v.0,
-                    Operand::Const(c) => return format!("gep({}@{:?})", base_key, c),
+                    Operand::Const(c) => {
+                        return format!("gep({}@{:?}{})", base_key, c, scale_suffix)
+                    }
                 };
-                let next = match defs.get(&vid) {
+                match defs.get(&vid) {
+                    // A WIDENING cast is value-preserving, so the walk may
+                    // descend through it (and must: the frontend materializes
+                    // a fresh cast per source mention, which is what lets two
+                    // arms' `d[i]` GEPs match at all). A TRUNCATING cast is
+                    // NOT: `d[(int) big]` and `d[big]` are different addresses
+                    // and must not collapse to one key, or one arm's access is
+                    // rewritten to the other's address. Stop the walk there and
+                    // key on the cast's own value id.
                     Some(Instruction::Cast {
                         src: Operand::Value(v),
+                        from_ty,
+                        to_ty,
                         ..
-                    })
-                    | Some(Instruction::Copy {
+                    }) => {
+                        if to_ty.size() < from_ty.size() {
+                            break;
+                        }
+                        off_root = Operand::Value(*v);
+                    }
+                    Some(Instruction::Copy {
                         src: Operand::Value(v),
                         ..
-                    })
-                    | Some(Instruction::BinOp {
+                    }) => {
+                        off_root = Operand::Value(*v);
+                    }
+                    Some(Instruction::BinOp {
                         op: IrBinOp::Shl,
                         lhs: Operand::Value(v),
+                        rhs: rhs @ Operand::Const(_),
                         ..
-                    }) => *v,
+                    }) => {
+                        // Value-preserving only in the key sense if the
+                        // constant is recorded; keep walking below it.
+                        scale_suffix = format!("<<{:?}{}", rhs, scale_suffix);
+                        off_root = Operand::Value(*v);
+                    }
                     _ => break,
-                };
-                off_root = Operand::Value(next);
+                }
             }
-            format!("gep({}@{:?})", base_key, off_root)
+            format!("gep({}@{:?}{})", base_key, off_root, scale_suffix)
         }
         _ => format!("val({})", root.0),
     }
@@ -721,13 +757,12 @@ fn is_side_effect_free(block: &BasicBlock) -> bool {
 }
 
 /// Analysis context shared by the diamond/triangle detectors for one pass
-/// over the function: the CFG bundle (with dominators), the natural loops,
-/// and the SSA def/copy maps for address canonicalization.
+/// over the function: the CFG bundle, and the SSA def/copy maps for address
+/// canonicalization.
 struct IfConvCtx<'a> {
     func: &'a IrFunction,
     label_to_idx: FxHashMap<BlockId, usize>,
     preds: analysis::FlatAdj,
-    loops: Vec<loop_analysis::NaturalLoop>,
     /// Dest -> defining instruction (cloned; stable across the pass).
     defs: FxHashMap<u32, Instruction>,
     /// Copy chains dest -> src.
@@ -736,11 +771,8 @@ struct IfConvCtx<'a> {
 
 impl<'a> IfConvCtx<'a> {
     fn build(func: &'a IrFunction) -> Self {
-        let num_blocks = func.blocks.len();
         let label_to_idx = analysis::build_label_map(func);
         let cfg = analysis::CfgAnalysis::build(func);
-        let loops =
-            loop_analysis::find_natural_loops(num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
         let defs = func
             .blocks
             .iter()
@@ -763,7 +795,6 @@ impl<'a> IfConvCtx<'a> {
             func,
             label_to_idx,
             preds: cfg.preds,
-            loops,
             defs,
             copy_of,
         }
@@ -783,113 +814,131 @@ impl<'a> IfConvCtx<'a> {
 }
 
 /// Whether a load in an arm block may be executed unconditionally (hoisted
-/// into the branch pred).  Loads trap on invalid addresses, so the general
-/// answer is NO — but a load inside a natural loop whose address is that
-/// loop's own induction variable scaled against a loop-invariant base is the
-/// exact shape every vectorizing compiler predicates (GCC/Clang make these
-/// loads unconditional in the vector loop): the address is walked by the
-/// loop itself, the converted form executes at the same iterations, and a
-/// zero-trip loop executes neither form.  The load never moves out of the
-/// loop (its address is IV-derived, so LICM cannot hoist it), and the only
-/// behavioral difference is a trap on an iteration where the scalar form
-/// took the other arm — an address in the same range the loop itself walks.
-fn speculative_load_ok(ctx: &IfConvCtx<'_>, block_idx: usize, ptr: Value) -> bool {
-    let root = ctx.resolve(&ptr);
-    let Some(Instruction::GetElementPtr { base, offset, .. }) = ctx.defs.get(&root.0) else {
-        return false;
-    };
-    // The innermost natural loop containing the arm block (nested loops:
-    // the innermost one owns the induction variable).
-    let mut containing: Option<&loop_analysis::NaturalLoop> = None;
-    for l in &ctx.loops {
-        if l.contains(block_idx) {
-            let better = match containing {
-                Some(cur) => l.body.len() < cur.body.len(),
-                None => true,
-            };
-            if better {
-                containing = Some(l);
-            }
-        }
+/// into the branch pred).  Loads trap on invalid addresses, so speculation
+/// changes observable behavior unless the address is touched on EVERY path
+/// the scalar could take.  The exact, target-independent rule:
+///
+/// a load of canonical address key K in arm A of a decision (pred P, arms
+/// T/F, merge M) may be speculated iff K is dereferenced on every path
+/// P→M:
+///   - diamond:  K ∈ derefs(P) ∪ derefs(other arm)   (the two paths are
+///     P→T→M and P→F→M; the arm's own derefs cover the path through it)
+///   - triangle: K ∈ derefs(P)                        (the direct P→M edge
+///     touches only P's memory operations)
+///
+/// Under this rule the converted form executes exactly the addresses some
+/// scalar path already executed, the same number of times, in the same
+/// per-path order (apply_diamond appends the arm's instructions to P, so no
+/// memory operation is reordered within a path) — trap-for-trap equivalent,
+/// value-for-value equivalent on the consuming path and discarded elsewhere.
+///
+/// This is also precisely the reference compilers' contract.  GCC 14 (-O3,
+/// x86-64-v3), measured: `d[i] = s[i] < 0 ? -a[i] : a[i]` loads `a[i]`
+/// unconditionally in the vector loop (K covered by both arms), while
+/// `d[i] = a[i] > t ? 1.0f : c[i]` keeps `c[i]` behind a `vmaskmovps`
+/// (K uncovered — GCC masks the load instead of speculating it).  The
+/// previous shape-based gate here ("IV-addressed inside a loop") accepted
+/// the second form and read addresses the scalar never would — a fault the
+/// source program cannot produce (e.g. a condition that is always true with
+/// a short/invalid `c`).  Uncovered shapes stay branchy, which is exactly
+/// what the non-vectorized lowering does.
+fn arm_load_speculation_ok(
+    ctx: &IfConvCtx<'_>,
+    pred_idx: usize,
+    sibling_idx: Option<usize>,
+    ptr: &Value,
+    load_width: usize,
+) -> bool {
+    let key = canonical_addr_key_impl(&ctx.defs, &ctx.copy_of, ptr);
+    // The key names an ADDRESS; dereferenceability is about an EXTENT. A
+    // covering access that is narrower than the speculated load proves
+    // nothing about the bytes past its own end:
+    //
+    //     if (c) x = *(long *)p;  else  y = *(char *)p;
+    //
+    // with `p` on the last byte of a mapping, the char arm is fine and the
+    // speculated 8-byte load faults. Require the covering dereference to be
+    // at least as wide, which is the extent half of LLVM's
+    // `isDereferenceableAndAlignedPointer`.
+    let need = load_width;
+    // derefs(P): every memory operation in the pred executes before the
+    // branch, on both paths.
+    if block_deref_keys(ctx, pred_idx)
+        .get(&key)
+        .is_some_and(|&w| w >= need)
+    {
+        return true;
     }
-    let Some(loop_) = containing else {
-        return false;
-    };
-    // Base must be loop-invariant: defined outside the loop body
-    // (parameters, globals, and allocas all qualify).
-    let base_root = ctx.resolve(base);
-    let base_def_in_loop = ctx.func.blocks.iter().enumerate().any(|(bi, b)| {
-        loop_.body.contains(&bi) && b.instructions.iter().any(|i| i.dest() == Some(base_root))
-    });
-    if base_def_in_loop {
-        return false;
-    }
-    // Offset must be derived from the loop's induction variable (or be a
-    // constant): fixed point from the header phis through Cast/Copy/Shl/
-    // Add/Mul inside the loop body.
-    let mut iv_derived = FxHashSet::default();
-    for inst in &ctx.func.blocks[loop_.header].instructions {
-        if let Instruction::Phi { dest, ty, .. } = inst {
-            if matches!(*ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
-                iv_derived.insert(*dest);
-            }
-        }
-    }
-    if iv_derived.is_empty() {
-        return false;
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &bi in &loop_.body {
-            for inst in &ctx.func.blocks[bi].instructions {
-                let derived = match inst {
-                    Instruction::Cast { dest, src, .. } | Instruction::Copy { dest, src } => {
-                        matches!(src, Operand::Value(v) if iv_derived.contains(v))
-                            .then_some(*dest)
-                    }
-                    Instruction::BinOp {
-                        dest,
-                        op: IrBinOp::Shl | IrBinOp::Add | IrBinOp::Mul,
-                        lhs,
-                        rhs,
-                        ..
-                    } => {
-                        let l = matches!(lhs, Operand::Value(v) if iv_derived.contains(v));
-                        let r = matches!(rhs, Operand::Value(v) if iv_derived.contains(v));
-                        (l || r).then_some(*dest)
-                    }
-                    _ => None,
-                };
-                if let Some(d) = derived {
-                    if iv_derived.insert(d) {
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    match offset {
-        Operand::Const(_) => true,
-        Operand::Value(v) => iv_derived.contains(&ctx.resolve(v)),
+    // derefs(sibling): the OTHER arm covers the other path (diamonds only;
+    // triangles pass None and fail closed here).
+    match sibling_idx {
+        Some(s) => block_deref_keys(ctx, s)
+            .get(&key)
+            .is_some_and(|&w| w >= need),
+        None => false,
     }
 }
 
-/// Arm-block convertibility with the speculative-load extension: the pure
-/// whitelist above plus loads whose address passes `speculative_load_ok`.
-fn arm_is_speculatable(ctx: &IfConvCtx<'_>, block: &BasicBlock, block_idx: usize) -> bool {
+/// Canonical-address dereference map of one block: for every non-volatile,
+/// default-address-space Load/Store pointer, the WIDEST access made through
+/// that address key.
+///
+/// The width is the coverage evidence: a key present with width `w` proves
+/// that `w` bytes at that address are dereferenceable on this path, and
+/// nothing about byte `w + 1`.
+fn block_deref_keys(ctx: &IfConvCtx<'_>, block_idx: usize) -> FxHashMap<String, usize> {
+    let mut keys: FxHashMap<String, usize> = FxHashMap::default();
+    for inst in &ctx.func.blocks[block_idx].instructions {
+        let (ptr, volatile, seg, ty) = match inst {
+            Instruction::Load {
+                ptr,
+                volatile,
+                seg_override,
+                ty,
+                ..
+            }
+            | Instruction::Store {
+                ptr,
+                volatile,
+                seg_override,
+                ty,
+                ..
+            } => (ptr, volatile, seg_override, ty),
+            _ => continue,
+        };
+        if !*volatile && *seg == AddressSpace::Default {
+            let key = canonical_addr_key_impl(&ctx.defs, &ctx.copy_of, ptr);
+            let w = ty.size();
+            keys.entry(key)
+                .and_modify(|cur| *cur = (*cur).max(w))
+                .or_insert(w);
+        }
+    }
+    keys
+}
+
+/// Arm-block convertibility with the speculation extension: the pure
+/// whitelist above plus loads whose address passes the path-coverage rule
+/// (`arm_load_speculation_ok`).
+fn arm_is_speculatable(
+    ctx: &IfConvCtx<'_>,
+    block: &BasicBlock,
+    pred_idx: usize,
+    sibling_idx: Option<usize>,
+) -> bool {
     for inst in &block.instructions {
         match inst {
             Instruction::Load {
                 ptr,
                 volatile,
                 seg_override,
+                ty,
                 ..
             } => {
                 if *volatile || *seg_override != AddressSpace::Default {
                     return false;
                 }
-                if !speculative_load_ok(ctx, block_idx, *ptr) {
+                if !arm_load_speculation_ok(ctx, pred_idx, sibling_idx, ptr, ty.size()) {
                     return false;
                 }
             }
@@ -1195,9 +1244,9 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     }
 
     // Both arms must be side-effect-free.  Loads qualify only through the
-    // speculative gate (loop-scoped, IV-addressed — see speculative_load_ok).
-    if !arm_is_speculatable(ctx, true_block, true_idx)
-        || !arm_is_speculatable(ctx, false_block, false_idx)
+    // path-coverage speculation gate (see arm_load_speculation_ok).
+    if !arm_is_speculatable(ctx, true_block, pred_idx, Some(false_idx))
+        || !arm_is_speculatable(ctx, false_block, pred_idx, Some(true_idx))
     {
         return None;
     }
@@ -1423,8 +1472,10 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
 
     let arm_block = &func.blocks[arm_idx];
 
-    // arm must be side-effect-free (speculative gate for loads)
-    if !arm_is_speculatable(ctx, arm_block, arm_idx) {
+    // arm must be side-effect-free (path-coverage gate for loads: a triangle
+    // arm load may only be speculated when the pred already dereferences the
+    // same address — the direct P→M edge touches nothing else)
+    if !arm_is_speculatable(ctx, arm_block, pred_idx, None) {
         return None;
     }
 
@@ -2120,10 +2171,14 @@ mod tests {
     }
 
     /// A canonical loop: entry -> header(iv phi + exit test) -> body -> latch,
-    /// with a ternary diamond inside the body whose TRUE arm loads c[i].
-    /// The load is IV-addressed, so it is speculatable and the diamond must
-    /// convert to a Select.
-    fn iv_load_diamond_loop(offset_src: u32) -> IrFunction {
+    /// with a ternary diamond inside the body whose arms load `c[i]`.
+    /// `sibling_covered = true` loads c[i] in BOTH arms (the p31-sign-apply
+    /// shape): every path P→M dereferences the c[i] address, so the path-
+    /// coverage gate admits the load and the diamond converts.  `false`
+    /// loads c[i] only in the true arm — the scalar never touches c[i] on
+    /// the false path, so speculating it could fault where the source
+    /// cannot, and the gate must refuse.
+    fn arm_load_diamond_loop(sibling_covered: bool) -> IrFunction {
         let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
         // b0: entry — params d,a,b,c,n + branch to header.
         f.blocks.push(block(
@@ -2201,7 +2256,7 @@ mod tests {
                 false_label: BlockId(4),
             },
         ));
-        // b3: true arm — load c[i] (IV-addressed: speculatable).
+        // b3: true arm — load c[i].
         f.blocks.push(block(
             3,
             vec![
@@ -2217,8 +2272,29 @@ mod tests {
             ],
             Terminator::Branch(BlockId(5)),
         ));
-        // b4: false arm — value is b[i] (already loaded in the pred).
-        f.blocks.push(block(4, vec![], Terminator::Branch(BlockId(5))));
+        // b4: false arm — covered: load c[i] again (fresh SSA); uncovered:
+        // reuse the pred's b[i] value.
+        let false_incoming = if sibling_covered {
+            f.blocks.push(block(
+                4,
+                vec![
+                    shl2(33, 10),
+                    gep(34, 3, 33),
+                    Instruction::Load {
+                        dest: Value(35),
+                        ptr: Value(34),
+                        ty: IrType::F32,
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                    },
+                ],
+                Terminator::Branch(BlockId(5)),
+            ));
+            Operand::Value(Value(35))
+        } else {
+            f.blocks.push(block(4, vec![], Terminator::Branch(BlockId(5))));
+            Operand::Value(Value(25))
+        };
         // b5: merge — phi for d[i], store d[i], iv increment, backedge.
         f.blocks.push(block(
             5,
@@ -2228,7 +2304,7 @@ mod tests {
                     ty: IrType::F32,
                     incoming: vec![
                         (Operand::Value(Value(32)), BlockId(3)),
-                        (Operand::Value(Value(25)), BlockId(4)),
+                        (false_incoming, BlockId(4)),
                     ],
                 },
                 shl2(41, 10),
@@ -2253,22 +2329,16 @@ mod tests {
         // b6: exit.
         f.blocks.push(block(6, vec![], Terminator::Return(None)));
         f.next_value_id = 50;
-        // The negative test swaps the arm GEP offset to a non-IV value.
-        if offset_src != 10 {
-            for inst in &mut f.blocks[3].instructions {
-                if let Instruction::GetElementPtr { offset, .. } = inst {
-                    *offset = Operand::Value(Value(offset_src));
-                }
-            }
-        }
         f
     }
 
     #[test]
-    fn test_iv_addressed_arm_load_converts() {
-        let mut f = iv_load_diamond_loop(10);
+    fn test_sibling_covered_arm_load_converts() {
+        // Both arms dereference c[i]: every P→M path touches the address,
+        // so the unconditional hoist is trap-equivalent and must convert.
+        let mut f = arm_load_diamond_loop(true);
         let converted = if_convert_function(&mut f);
-        assert!(converted > 0, "IV-addressed arm load diamond must convert");
+        assert!(converted > 0, "covered arm load diamond must convert");
         assert!(
             f.blocks[2]
                 .instructions
@@ -2286,18 +2356,93 @@ mod tests {
     }
 
     #[test]
-    fn test_non_iv_arm_load_does_not_convert() {
-        // The arm's GEP offset is the loop bound (a parameter), not an
-        // IV-derived value: the load cannot be proven to walk the loop's
-        // own range and must stay behind the branch.
-        let mut f = iv_load_diamond_loop(4);
+    fn test_uncovered_arm_load_does_not_convert() {
+        // c[i] is dereferenced ONLY on the true path. Speculating it would
+        // read addresses the source program never touches on the false path
+        // (a fault the scalar cannot produce) — the gate must refuse and the
+        // loop must stay branchy. This is GCC's vmaskmovps shape.
+        let mut f = arm_load_diamond_loop(false);
         let converted = if_convert_function(&mut f);
-        assert_eq!(converted, 0, "non-IV arm load must not be speculated");
+        assert_eq!(converted, 0, "uncovered arm load must not be speculated");
         assert!(!f
             .blocks
             .iter()
             .flat_map(|b| &b.instructions)
             .any(|i| matches!(i, Instruction::Select { .. })));
+    }
+
+    /// R2 regression at unit level: the canonical address key must be
+    /// INJECTIVE over addresses. The original offset walk collapsed through
+    /// `Shl` without recording the shift constant, mapping `d[i]`
+    /// (offset iv<<2) and `d[2*i]` (offset iv<<3) to the SAME key —
+    /// rewrite_covered_arm_loads then replaced the arm's `d[2*i]` load with
+    /// the pred's `d[i]` value, and sink_conditional_stores merged stores
+    /// to the two different addresses into one.
+    #[test]
+    fn canonical_addr_key_distinguishes_shift_scales() {
+        let mut f = IrFunction::new("t".to_string(), IrType::I32, vec![], false);
+        f.blocks.push(block(
+            0,
+            vec![
+                float_param(0, 0), // d
+                float_param(1, 1), // d2 (same base via distinct param refs below)
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 2,
+                    ty: IrType::U64,
+                }, // iv
+                // off2 = iv << 2
+                shl2(10, 2),
+                // off3 = iv << 3 (same root, different scale)
+                Instruction::BinOp {
+                    dest: Value(11),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I32(3)),
+                    ty: IrType::I64,
+                },
+                // off2b = iv << 2 again (fresh SSA — the two-arms shape)
+                shl2(12, 2),
+                Instruction::GetElementPtr {
+                    dest: Value(20),
+                    base: Value(0),
+                    offset: Operand::Value(Value(10)),
+                    ty: IrType::F32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(21),
+                    base: Value(0),
+                    offset: Operand::Value(Value(11)),
+                    ty: IrType::F32,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(22),
+                    base: Value(0),
+                    offset: Operand::Value(Value(12)),
+                    ty: IrType::F32,
+                },
+            ],
+            Terminator::Return(None),
+        ));
+        f.next_value_id = 30;
+        let defs: FxHashMap<u32, Instruction> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.instructions.iter())
+            .filter_map(|i| i.dest().map(|d| (d.0, i.clone())))
+            .collect();
+        let copy_of = FxHashMap::default();
+        let k_i = canonical_addr_key_impl(&defs, &copy_of, &Value(20));
+        let k_2i = canonical_addr_key_impl(&defs, &copy_of, &Value(21));
+        let k_i_again = canonical_addr_key_impl(&defs, &copy_of, &Value(22));
+        assert_ne!(
+            k_i, k_2i,
+            "d[i] and d[2*i] must NOT share a canonical key"
+        );
+        assert_eq!(
+            k_i, k_i_again,
+            "two arms' d[i] GEPs (fresh Shl SSAs, same scale) must share the key"
+        );
     }
 
     /// Nested clamp: outer `a < 0` diamond whose false arm holds the inner

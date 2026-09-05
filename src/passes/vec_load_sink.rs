@@ -239,6 +239,18 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes every test that reaches the pass entry: `sink_vector_loads`
+    /// reads CCC_NO_VEC_LOAD_SINK and environment variables are
+    /// PROCESS-GLOBAL, so the kill-switch test's set/remove window otherwise
+    /// races with the other tests' env reads under cargo's default test
+    /// parallelism.  Every call below goes through sink_locked.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sink_locked(f: &mut IrFunction) -> usize {
+        let _g = ENV_LOCK.lock().unwrap();
+        sink_vector_loads(f)
+    }
     use crate::common::source::Span;
     use crate::common::types::{AddressSpace, IrType};
     use crate::ir::intrinsics::IntrinsicOp as O;
@@ -329,7 +341,7 @@ mod tests {
                 vstore(41, 4, 35),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 1);
+        assert_eq!(sink_locked(&mut f), 1);
         assert_eq!(
             ops(&f, 0),
             vec![
@@ -341,7 +353,7 @@ mod tests {
             ]
         );
         // Idempotent: nothing left to move.
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// `add(load_a, load_b)`: `load_b` is adjacent already; `load_a` sits at
@@ -359,7 +371,7 @@ mod tests {
                 vstore(42, 4, 38),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 1);
+        assert_eq!(sink_locked(&mut f), 1);
         assert_eq!(
             ops(&f, 0),
             vec!["VecLoadF32x8:41", "VecLoadF32x8:40", "VecAddI32x8:42", "VecStoreF32x8:-1"]
@@ -386,7 +398,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
         assert_eq!(ops(&f, 0)[0], "VecLoadF32x8:37");
     }
 
@@ -403,7 +415,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// A call is opaque (may write the loaded memory): blocks.
@@ -423,7 +435,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// A volatile scalar load is an observable side effect: blocks.
@@ -439,7 +451,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// Non-volatile scalar loads and scalar arithmetic are transparent.
@@ -462,7 +474,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 1);
+        assert_eq!(sink_locked(&mut f), 1);
         assert_eq!(ops(&f, 0)[3], "VecLoadF32x8:37");
         assert_eq!(ops(&f, 0)[4], "VecAddF32x8:41");
     }
@@ -480,7 +492,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 42, 37, 41),
             ],
         ));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// A use in another block disqualifies the load (no cross-block motion).
@@ -492,7 +504,7 @@ mod tests {
             vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)],
         ));
         f.blocks.push(block(1, vec![vbin(O::VecAddF32x8, 41, 37, 40)]));
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// A use by a non-intrinsic (e.g. a terminator operand) never sinks.
@@ -502,12 +514,15 @@ mod tests {
         let mut b = block(0, vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)]);
         b.terminator = Terminator::Return(Some(Operand::Value(Value(37))));
         f.blocks.push(b);
-        assert_eq!(sink_vector_loads(&mut f), 0);
+        assert_eq!(sink_locked(&mut f), 0);
     }
 
     /// Kill switch honoured.
     #[test]
     fn kill_switch_disables_pass() {
+        // Hold ENV_LOCK across the whole set/run/remove window: the env var
+        // is process-global and every other sink_locked() caller reads it.
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("CCC_NO_VEC_LOAD_SINK", "1");
         let mut f = mkfunc();
         f.blocks.push(block(
@@ -518,6 +533,7 @@ mod tests {
                 vbin(O::VecAddF32x8, 41, 37, 40),
             ],
         ));
+        // Direct call: the guard above already serializes us.
         let n = sink_vector_loads(&mut f);
         std::env::remove_var("CCC_NO_VEC_LOAD_SINK");
         assert_eq!(n, 0);
@@ -541,7 +557,7 @@ mod tests {
         );
         b.source_spans = (0..6u32).map(|k| Span::new(100 + k, 100 + k, 0)).collect();
         f.blocks.push(b);
-        assert_eq!(sink_vector_loads(&mut f), 2);
+        assert_eq!(sink_locked(&mut f), 2);
         assert_eq!(
             ops(&f, 0),
             vec![

@@ -1069,6 +1069,19 @@ pub(crate) fn run(func: &mut IrFunction, fp_reassoc: bool) -> usize {
 mod tests {
     use super::*;
 
+    /// Serializes every test that reaches the pass entry: `run` reads
+    /// CCC_NO_VEC_INTERLEAVE and environment variables are PROCESS-GLOBAL,
+    /// so the kill-switch test's set/remove window otherwise races with the
+    /// other tests' env reads under cargo's default test parallelism and
+    /// randomly disables the pass mid-test (observed as interleave_dot
+    /// returning 0).  Every run() call below goes through run_locked.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_locked(f: &mut IrFunction, fp_reassoc: bool) -> usize {
+        let _g = ENV_LOCK.lock().unwrap();
+        run(f, fp_reassoc)
+    }
+
     /// Build the canonical post-vectorizer dot-product loop (4×F64 FMA,
     /// byte IV step 32) as a synthetic IrFunction: 4 blocks (entry, header,
     /// body, exit).  The limit math sits in the header (as the vectorizer
@@ -1226,7 +1239,7 @@ mod tests {
     #[test]
     fn interleave_dot_f64_transforms_and_verifies() {
         let (mut f, _base) = build_dot_func();
-        let n = run(&mut f, true);
+        let n = run_locked(&mut f, true);
         assert_eq!(n, 1, "the canonical dot loop must interleave");
         // 4 new blocks: NP, MH, MB, C.
         assert_eq!(f.blocks.len(), 8);
@@ -1286,14 +1299,18 @@ mod tests {
     #[test]
     fn fp_interleave_requires_reassoc() {
         let (mut f, _base) = build_dot_func();
-        let n = run(&mut f, false);
+        let n = run_locked(&mut f, false);
         assert_eq!(n, 0, "FP interleave without -fassociative-math must bail");
     }
 
     #[test]
     fn kill_switch_disables_the_pass() {
         let (mut f, _base) = build_dot_func();
+        // Hold ENV_LOCK across the whole set/run/remove window: the env var
+        // is process-global and every other run_locked() caller reads it.
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("CCC_NO_VEC_INTERLEAVE", "1");
+        // Direct call: the guard above already serializes us.
         let n = run(&mut f, true);
         std::env::remove_var("CCC_NO_VEC_INTERLEAVE");
         assert_eq!(n, 0);

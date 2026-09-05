@@ -4054,7 +4054,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             }
         }
 
-        let f64_intervals: Vec<LiveInterval> = liveness
+        let mut f64_intervals: Vec<LiveInterval> = liveness
             .intervals
             .iter()
             .filter(|iv| non_gpr_values.contains(&iv.value_id))
@@ -4068,6 +4068,64 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .copied()
             .collect();
 
+        // Follow-up #3: merge copy-connected scalar FP webs (combine → entry
+        // copy → carry value → latch copy) into single leader intervals so
+        // the linear scan homes the whole web in one XMM register and the
+        // transport copies become same-register no-ops.  A group only
+        // merges when at least two members carry real intervals (a lone
+        // interval is left untouched); members are dropped from the scan
+        // and later inherit the leader's register.
+        // x86-only: the horizontal-add admission and direct-emit live in the
+        // x86 SSE domain; the AArch64 NEON pool keeps its existing behavior.
+        let fp_web_groups = if x86_fp_pool {
+            fp_copy_web_groups(func, &f64_value_set, &real_use, &assignments, &liveness.segments)
+        } else {
+            FxHashMap::default()
+        };
+        let mut fp_web_member_of: FxHashMap<u32, u32> = FxHashMap::default();
+        if !fp_web_groups.is_empty() {
+            let member_intervals: FxHashMap<u32, (u32, u32)> = f64_intervals
+                .iter()
+                .map(|iv| (iv.value_id, (iv.start, iv.end)))
+                .collect();
+            let mut dropped: FxHashSet<u32> = FxHashSet::default();
+            let mut leaders: Vec<LiveInterval> = Vec::new();
+            for (leader, members) in &fp_web_groups {
+                let mut start = u32::MAX;
+                let mut end = 0u32;
+                let mut counted = 0u32;
+                for &m in members {
+                    if let Some(&(s, e)) = member_intervals.get(&m) {
+                        start = start.min(s);
+                        end = end.max(e);
+                        counted += 1;
+                    }
+                }
+                if counted >= 2 && start < end {
+                    leaders.push(LiveInterval {
+                        value_id: *leader,
+                        start,
+                        end,
+                    });
+                    // Only members that actually carried a scan interval may
+                    // inherit the leader's register: a member filtered out of
+                    // the scan (call-spanning, zero-length, not in
+                    // non_gpr_values) keeps its existing home and the copy
+                    // stays a real move.  Register-homing a call-spanning
+                    // value into a caller-saved pool register would let the
+                    // call clobber it.
+                    for &m in members {
+                        if m != *leader && member_intervals.contains_key(&m) {
+                            fp_web_member_of.insert(m, *leader);
+                            dropped.insert(m);
+                        }
+                    }
+                }
+            }
+            f64_intervals.retain(|iv| !dropped.contains(&iv.value_id));
+            f64_intervals.extend(leaders);
+        }
+
         if !f64_intervals.is_empty() {
             let mut f64_ranges =
                 live_range::build_live_ranges(&f64_intervals, &liveness.block_loop_depth, func);
@@ -4077,8 +4135,15 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             attach_scan_segments(&mut f64_ranges, &liveness, &coalesce_member_of);
             let mut xmm_allocator = LinearScanAllocator::new(f64_ranges, config.xmm_regs.clone());
             xmm_allocator.run();
-            for (vid, reg) in xmm_allocator.assignments {
+            for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);
+            }
+            // Spread the leader's register over every merged web member so
+            // the copies between them vanish.
+            for (member, leader) in &fp_web_member_of {
+                if let Some(&reg) = xmm_allocator.assignments.get(leader) {
+                    assignments.insert(*member, reg);
+                }
             }
         }
 
@@ -5230,6 +5295,20 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                             | IntrinsicOp::CopysignF32
                             | IntrinsicOp::FixedDistanceF32x8
                             | IntrinsicOp::FixedDistanceF64x4
+                            // FP horizontal reductions produce scalar
+                            // F32/F64 SSA values in the SSE domain
+                            // (store_xmm_to).  They must reach the XMM scan
+                            // (f64_intervals filters on this set BEFORE
+                            // f64_value_set): without a non-GPR admission
+                            // the combine result falls back to a slot home
+                            // and the reduction tail pays a store+reload
+                            // pair (p16/p23 slot bounce — follow-up #3).
+                            | IntrinsicOp::HorizontalAddF64x4
+                            | IntrinsicOp::HorizontalAddF64x2
+                            | IntrinsicOp::VecHorizontalAddF64x4
+                            | IntrinsicOp::VecHorizontalAddF64x2
+                            | IntrinsicOp::VecHorizontalAddF32x8
+                            | IntrinsicOp::VecHorizontalAddF32x4
                     ) || op.produces_vector_value()
                     {
                         non_gpr_values.insert(d.0);
@@ -5945,6 +6024,131 @@ fn collect_f64_values(func: &IrFunction) -> FxHashSet<u32> {
     let succs = copy_successors(func);
     propagate_copy_web(&succs, &mut f64_values);
     f64_values
+}
+
+/// Copy-connected scalar FP webs (follow-up #3).  After phi elimination a
+/// loop-carried scalar FP accumulator is transported by Copy instructions:
+///
+/// ```text
+/// %r = VecHorizontalAddF64x4(%acc)  // combine
+/// %c = Copy(%r)                     // entry handoff
+/// %n = Add(%c, %term)               // loop step
+/// %c = Copy(%n)                     // latch
+/// ```
+///
+/// Without web knowledge the XMM scan homes %r, %c and %n independently
+/// (their intervals touch at the copies, so a linear scan reuses one
+/// register but never the combine result's), and the combine pays a
+/// store/copy move on loop entry — the p16/p23 slot bounce.  Union-find
+/// the Copy edges among scan-eligible values; the scan then allocates ONE
+/// merged interval per web and every member shares the register, turning
+/// the copies into same-register no-ops.  Only values that will actually
+/// reach the scan (f64_value_set ∩ real_use, no existing assignment) may
+/// join: a member pinned to an out-of-pool register (param xmm0, scratch)
+/// must not drag the web into a register the scan does not own.
+fn fp_copy_web_groups(
+    func: &IrFunction,
+    f64_value_set: &FxHashSet<u32>,
+    real_use: &FxHashSet<u32>,
+    assignments: &FxHashMap<u32, PhysReg>,
+    segments: &[LiveInterval],
+) -> FxHashMap<u32, Vec<u32>> {
+    fn find(parent: &mut FxHashMap<u32, u32>, x: u32) -> u32 {
+        let mut root = x;
+        while parent.get(&root).copied().is_some_and(|p| p != root) {
+            root = parent[&root];
+        }
+        let mut c = x;
+        while parent.get(&c).copied().is_some_and(|p| p != root) {
+            let next = parent[&c];
+            parent.insert(c, root);
+            c = next;
+        }
+        root
+    }
+    let mut parent: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Copy {
+                dest,
+                src: Operand::Value(s),
+            } = inst
+            {
+                let (d, s) = (dest.0, s.0);
+                if d == s {
+                    continue;
+                }
+                if !f64_value_set.contains(&d)
+                    || !f64_value_set.contains(&s)
+                    || !real_use.contains(&d)
+                    || !real_use.contains(&s)
+                    || assignments.contains_key(&d)
+                    || assignments.contains_key(&s)
+                {
+                    continue;
+                }
+                parent.entry(d).or_insert(d);
+                parent.entry(s).or_insert(s);
+                let (rd, rs) = (find(&mut parent, d), find(&mut parent, s));
+                if rd != rs {
+                    // Keep the smallest id as root for determinism.
+                    let (lo, hi) = (rd.min(rs), rd.max(rs));
+                    parent.insert(hi, lo);
+                }
+            }
+        }
+    }
+    let mut groups: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let members: Vec<u32> = parent.keys().copied().collect();
+    for v in members {
+        let r = find(&mut parent, v);
+        groups.entry(r).or_default().push(v);
+    }
+    // INTERFERENCE VALIDATION (soundness, fp_copy_web_interference): a copy
+    // edge implies value equality only AT the copy — members of a web hold
+    // DIFFERENT values whenever their live ranges overlap beyond a copy
+    // boundary (fib swap a/b, newton prev/cur, lost_copy snapshot,
+    // rot3 rotation, dot_and_sum combine reused after the remainder loop).
+    // One register for overlapping members corrupts one of them.  Reject
+    // any group with a pair whose hole-aware segments overlap on an
+    // INTERIOR point: closed segments touching at exactly the handoff/kill
+    // point (max(start) == min(end)) are the legal value-transfer shape
+    // (the p16/p23 combine→carry webs) and stay merged; everything else
+    // falls back to separate homes (the copies stay real moves).
+    let mut seg_of: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+    for seg in segments {
+        seg_of.entry(seg.value_id).or_default().push((seg.start, seg.end));
+    }
+    groups.retain(|_leader, members| {
+        for i in 0..members.len() {
+            // FAIL CLOSED on missing coverage. A member with no recorded
+            // segment is a member whose live range this validation cannot
+            // see; treating "no data" as "no interference" would merge
+            // exactly the webs the check exists to reject. The scan then
+            // keeps separate homes and the copies stay real moves — the
+            // pre-existing, always-correct behavior.
+            let Some(si) = seg_of.get(&members[i]) else {
+                return false;
+            };
+            for j in (i + 1)..members.len() {
+                let Some(sj) = seg_of.get(&members[j]) else {
+                    return false;
+                };
+                for &(a0, a1) in si {
+                    for &(b0, b1) in sj {
+                        if a0.max(b0) < a1.min(b1) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    });
+    for members in groups.values_mut() {
+        members.sort_unstable();
+    }
+    groups
 }
 
 /// Strip values used as operands of instructions whose codegen still goes
@@ -6837,6 +7041,81 @@ pub(crate) fn detect_phi_coalesce_groups(
     let label_to_idx = analysis::build_label_map(func);
     let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
 
+    // Address-side peel closure: dest values of chains the backend actually
+    // folds into a dereferenced access.  A constant-operand Shl/Mul/Add/Sub
+    // is only ever ABSORBED into a SIB operand when its chain FEEDS a
+    // GetElementPtr that a Load/Store dereferences; a materialized binop
+    // (`v3 = n1 * 2; return v3`) is emitted at its own point into its own
+    // register and its later uses carry no register dependency on the phi.
+    // Without this gate the peel arm vetoed every constant-operand binop
+    // derived from the phi — including the adler-style materialized shape
+    // (accepts_materialized_binop_escaping_source_block) — costing a copy
+    // per iteration in the hottest loops.  Backward walk from every
+    // Load/Store pointer through the peelable def links (Cast, Copy, GEP,
+    // constant-operand Shl/Mul/Add/Sub) collects exactly the foldable
+    // chain members; the syntactic veto below consults it for binops.
+    // (The Cast/GEP arms keep their unconditional behavior: pointers and
+    // widened indices are deferred as a whole, and upstream's accepted
+    // contract and tests are built on that.)
+    let mut all_defs: FxHashMap<u32, Vec<&Instruction>> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                all_defs.entry(d.0).or_default().push(inst);
+            }
+        }
+    }
+    let is_peelable_def = |inst: &Instruction| -> bool {
+        match inst {
+            Instruction::Cast { .. }
+            | Instruction::Copy { .. }
+            | Instruction::GetElementPtr { .. } => true,
+            Instruction::BinOp {
+                op: IrBinOp::Shl | IrBinOp::Mul | IrBinOp::Add | IrBinOp::Sub,
+                ..
+            } => {
+                let mut has_const = false;
+                for_each_operand_in_instruction(inst, |op| {
+                    if matches!(op, Operand::Const(_)) {
+                        has_const = true;
+                    }
+                });
+                has_const
+            }
+            _ => false,
+        }
+    };
+    let mut addr_fed: FxHashSet<u32> = FxHashSet::default();
+    {
+        let mut stack: Vec<u32> = Vec::new();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+                        stack.push(ptr.0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        while let Some(v) = stack.pop() {
+            if !addr_fed.insert(v) {
+                continue;
+            }
+            if let Some(defs) = all_defs.get(&v) {
+                for def in defs {
+                    if is_peelable_def(def) {
+                        for_each_operand_in_instruction(def, |op| {
+                            if let Operand::Value(w) = op {
+                                stack.push(w.0);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let debug = env_on("CCC_DEBUG_PHI_COALESCE");
     let mut candidates = Vec::new();
 
@@ -6887,7 +7166,9 @@ pub(crate) fn detect_phi_coalesce_groups(
                     }
                 });
                 has_const
-            };
+            } && earlier
+                .dest()
+                .is_some_and(|d| addr_fed.contains(&d.0));
             if !matches!(
                 earlier,
                 Instruction::Cast { .. } | Instruction::GetElementPtr { .. }
@@ -7070,46 +7351,57 @@ pub(crate) fn detect_phi_coalesce_groups(
                         )
                 })
             });
-            // Liveness-model veto (the authoritative one): the source's
-            // definition overwrites the phi's home, so the phi may not be
-            // live at ANY program point strictly inside the update window
-            // (after the source def, before the latch copy). The hole-aware
-            // segments consulted here already include every RA-invisible
-            // read the backend performs at a later position — folded SIB
-            // index/base reads and replayed compare operands are stretched
-            // into the segment union by the folded-index extension in
-            // allocate_registers — so a read the syntactic window walk
-            // cannot see (a Store whose address chain was peeled through
-            // `Shl`/`Add` arithmetic) still shows up as a covering segment.
-            // The syntactic closure above remains as a cheap first filter
-            // and as coverage for the CCC_NO_FOLDED_INDEX_LIVENESS debug
-            // configuration, where the extension is off.
-            let phi_live_in_window = {
-                let def_point = liveness.block_starts[source_block] + source_def_idx as u32;
-                let copy_point = liveness.block_starts[block_idx] + copy_idx as u32;
-                // Closed point ranges that make up the window.
-                let mut windows: [(u32, u32); 2] = [(1, 0), (1, 0)];
-                if same_block {
-                    if copy_point > def_point + 1 {
-                        windows[0] = (def_point + 1, copy_point - 1);
-                    }
-                } else {
-                    let src_end = liveness.block_ends[source_block];
-                    if src_end > def_point {
-                        windows[0] = (def_point + 1, src_end);
-                    }
-                    let latch_start = liveness.block_starts[block_idx];
-                    if copy_point > latch_start {
-                        windows[1] = (latch_start, copy_point - 1);
-                    }
+            // Liveness-model veto: the source's definition overwrites the
+            // phi's home, so the phi's OLD value may not be read at ANY
+            // program point strictly inside the update window (after the
+            // source def, before the latch copy).
+            // Hidden SIB reads are the RA-invisible class: the backend folds
+            // GEP chains into the access's addressing and re-reads the
+            // base/index register at the Load/Store with no IR operand.
+            // The exact read points come from the liveness folded-index walk
+            // (`folded_read_points` below).  The syntactic closure above
+            // remains as a cheap first filter and as coverage for the
+            // CCC_NO_FOLDED_INDEX_LIVENESS debug configuration, where the
+            // extension is off.
+            // Update-window points (closed ranges) between the source
+            // definition and the latch copy.
+            let def_point = liveness.block_starts[source_block] + source_def_idx as u32;
+            let copy_point = liveness.block_starts[block_idx] + copy_idx as u32;
+            let mut windows: [(u32, u32); 2] = [(1, 0), (1, 0)];
+            if same_block {
+                if copy_point > def_point + 1 {
+                    windows[0] = (def_point + 1, copy_point - 1);
                 }
-                liveness.segments.iter().any(|seg| {
-                    seg.value_id == dest.0
-                        && windows
-                            .iter()
-                            .any(|&(lo, hi)| lo <= hi && seg.start <= hi && lo <= seg.end)
-                })
-            };
+            } else {
+                let src_end = liveness.block_ends[source_block];
+                if src_end > def_point {
+                    windows[0] = (def_point + 1, src_end);
+                }
+                let latch_start = liveness.block_starts[block_idx];
+                if copy_point > latch_start {
+                    windows[1] = (latch_start, copy_point - 1);
+                }
+            }
+            // Hidden SIB reads only: the IR-visible window uses are already
+            // covered exactly by `phi_used_in_window` above.  A folded access
+            // (GEP absorbed into the addressing) re-reads the base/index
+            // register at its OWN point with no IR operand; the liveness walk
+            // records those points exactly (`folded_read_points`), so test
+            // them directly instead of the block-granular segment cover — a
+            // same-block latch phi that is live-in (used early in the block)
+            // AND live-out (redefined by the latch copy) gets a whole-block
+            // segment that overlaps every interior window, which vetoed all
+            // tight-loop accumulator webs even though the old value's last
+            // read is BEFORE the source definition (double_reduction's four
+            // accumulators lost their homes; got [] regression).
+            let phi_live_in_window = liveness
+                .folded_read_points
+                .get(&dest.0)
+                .is_some_and(|pts| {
+                    windows.iter().any(|&(lo, hi)| {
+                        lo <= hi && pts.iter().any(|&p| lo <= p && p <= hi)
+                    })
+                });
             let source_used_before_copy = !same_block
                 && block.instructions[..copy_idx]
                     .iter()
@@ -7656,6 +7948,92 @@ mod phi_coalesce_tests {
                 .iter()
                 .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
             "materialized (non-address) derived values must not veto coalescing: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_const_binop_chain_folding_into_dereferenced_gep() {
+        // Mirror of accepts_materialized_binop_escaping_source_block: the SAME
+        // constant-operand binop shape, but here the derived value feeds a
+        // GetElementPtr that a Load/Store dereferences on the escape path.
+        // The backend may absorb the whole chain into the access's SIB
+        // operand and re-read the phi's register there, so the destructive
+        // coalesce MUST stay vetoed (the addr_fed gate narrows the binop
+        // peel to address-fed chains, it does not remove it).
+        let mut func =
+            IrFunction::new("folded_binop_index_escape".to_string(), IrType::I32, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I32(10)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Mul,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(2)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(4),
+                        name: "xs".to_string(),
+                    },
+                    Instruction::GetElementPtr {
+                        dest: Value(5),
+                        base: Value(4),
+                        offset: Operand::Value(Value(3)),
+                        ty: IrType::Ptr,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Sub,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I32(1)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                3,
+                vec![Instruction::Store {
+                    volatile: false,
+                    val: Operand::Const(IrConst::I8(7)),
+                    ptr: Value(5),
+                    ty: IrType::I8,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                }],
+                Terminator::Return(None),
+            ),
+        ];
+        func.next_value_id = 6;
+
+        let liveness = compute_live_intervals(&func);
+        let candidates = detect_phi_coalesce_groups(&func, &liveness);
+        assert!(
+            !candidates
+                .iter()
+                .any(|c| c.phi_dest == 1 && c.backedge_src == 2),
+            "address-fed const-binop chain must still veto coalescing: {candidates:?}"
         );
     }
 

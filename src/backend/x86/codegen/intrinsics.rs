@@ -4164,12 +4164,59 @@ impl X86Codegen {
                 // The generic loader handles both a protected stack home and
                 // a width-aware register assignment.
                 self.avx_load_arg(&args[0]);
-                self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
-                self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
-                self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1");
-                self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0");
-                if let Some(d) = dest {
-                    self.store_xmm_to(d, "xmm0", IrType::F64);
+                // Follow-up #3: when the scalar result is register-homed
+                // (the XMM scan gives the horizontal combine the same
+                // register as the remainder loop's carry web), emit the
+                // reduction steps directly into the destination register
+                // with 3-operand VEX so no store/copy move is needed at
+                // the loop entry.  The scratch for the cross-lane halves
+                // is %xmm1.  SOUNDNESS (red-team audit): %xmm2 is IN the
+                // F64/XMM scan pool (regalloc_helpers keeps xmm2-xmm7 unless
+                // the function contains the listed xmm2-clobbering emitters),
+                // so a different value can be register-homed in %xmm2 and
+                // live across this intrinsic — clobbering it as scratch
+                // would corrupt that value, and the dest==%xmm1 case is only
+                // knowable AFTER allocation (the function-level clobbers_xmm2
+                // gate cannot cover it).  dest==%xmm1 therefore routes through
+                // the legacy sequence below (compute in %xmm0 with %xmm1
+                // scratch, then one store_xmm_to move — %xmm1 is scratch-only
+                // and never in any pool, so the legacy shape is always safe).
+                // vaddpd writes all 128 bits of the dest, so the final
+                // vaddsd sees no stale upper bits and the sequence has no
+                // false dependency on anything older.
+                let direct_dest = dest
+                    .and_then(|d| self.reg_assignments.get(&d.0).copied())
+                    .filter(|&r| is_xmm_reg(r))
+                    .map(phys_reg_name)
+                    .filter(|&name| name != "xmm1");
+                if let Some(name) = direct_dest {
+                    // phys_reg_name yields the bare mnemonic ("xmm9").
+                    let scratch = "%xmm1";
+                    self.state.emit_fmt(format_args!(
+                        "    vextractf128 $1, %ymm0, {}",
+                        scratch
+                    ));
+                    self.state
+                        .emit_fmt(format_args!("    vaddpd {}, %xmm0, %{}", scratch, name));
+                    // CRITICAL: unpack the SUMMED halves (the vaddpd
+                    // result), not the pre-sum input — the high lane of
+                    // the sum (b+d) is what the final scalar add needs.
+                    self.state.emit_fmt(format_args!(
+                        "    vunpckhpd %{}, %{}, {}",
+                        name, name, scratch
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vaddsd {}, %{}, %{}",
+                        scratch, name, name
+                    ));
+                } else {
+                    self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+                    self.state.emit("    vaddpd %xmm1, %xmm0, %xmm0");
+                    self.state.emit("    vunpckhpd %xmm0, %xmm0, %xmm1");
+                    self.state.emit("    vaddsd %xmm1, %xmm0, %xmm0");
+                    if let Some(d) = dest {
+                        self.store_xmm_to(d, "xmm0", IrType::F64);
+                    }
                 }
             }
             IntrinsicOp::VecHorizontalAddF64x2 => {
@@ -4363,14 +4410,59 @@ impl X86Codegen {
                 self.state.invalidate_vec_peephole();
                 // 8×F32 → F32: cross-lane-safe halving reduction.
                 self.avx_load_arg(&args[0]);
-                self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
-                self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0 s1 s2 s3]
-                self.state.emit("    vmovshdup %xmm0, %xmm1"); // [s1 s1 s3 s3]
-                self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0+s1, .., s2+s3, ..]
-                self.state.emit("    vshufps $0xAA, %xmm0, %xmm0, %xmm1"); // lanes {2,2,2,2}
-                self.state.emit("    vaddss %xmm1, %xmm0, %xmm0"); // (s0+s1)+(s2+s3)
-                if let Some(d) = dest {
-                    self.store_xmm_to(d, "xmm0", IrType::F32);
+                // Follow-up #3: when the scalar result is register-homed
+                // (XMM scan + FP copy web), emit the reduction directly
+                // into the destination register with 3-operand VEX so no
+                // store/copy move is needed at the remainder-loop entry.
+                // Scratch is %xmm1.  SOUNDNESS (red-team audit): %xmm2 is IN
+                // the F64/XMM scan pool (see the F64x4 arm above), so a value
+                // homed in %xmm2 and live across this intrinsic would be
+                // corrupted by using it as scratch; dest==%xmm1 is only
+                // knowable after allocation, so it routes through the legacy
+                // sequence below (always safe — %xmm1 is never in a pool).
+                // vaddps writes all 128 bits of the dest, so the later steps
+                // see no stale upper bits.
+                let direct_dest = dest
+                    .and_then(|d| self.reg_assignments.get(&d.0).copied())
+                    .filter(|&r| is_xmm_reg(r))
+                    .map(phys_reg_name)
+                    .filter(|&name| name != "xmm1");
+                if let Some(name) = direct_dest {
+                    let scratch = "%xmm1";
+                    self.state.emit_fmt(format_args!(
+                        "    vextractf128 $1, %ymm0, {}",
+                        scratch
+                    ));
+                    self.state.emit_fmt(format_args!(
+                        "    vaddps {}, %xmm0, %{}",
+                        scratch, name
+                    )); // [s0 s1 s2 s3]
+                    self.state.emit_fmt(format_args!(
+                        "    vmovshdup %{}, {}",
+                        name, scratch
+                    )); // [s1 s1 s3 s3]
+                    self.state.emit_fmt(format_args!(
+                        "    vaddps {}, %{}, %{}",
+                        scratch, name, name
+                    )); // [s0+s1, .., s2+s3, ..]
+                    self.state.emit_fmt(format_args!(
+                        "    vshufps $0xAA, %{}, %{}, {}",
+                        name, name, scratch
+                    )); // lanes {2,2,2,2}
+                    self.state.emit_fmt(format_args!(
+                        "    vaddss {}, %{}, %{}",
+                        scratch, name, name
+                    )); // (s0+s1)+(s2+s3)
+                } else {
+                    self.state.emit("    vextractf128 $1, %ymm0, %xmm1");
+                    self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0 s1 s2 s3]
+                    self.state.emit("    vmovshdup %xmm0, %xmm1"); // [s1 s1 s3 s3]
+                    self.state.emit("    vaddps %xmm1, %xmm0, %xmm0"); // [s0+s1, .., s2+s3, ..]
+                    self.state.emit("    vshufps $0xAA, %xmm0, %xmm0, %xmm1"); // lanes {2,2,2,2}
+                    self.state.emit("    vaddss %xmm1, %xmm0, %xmm0"); // (s0+s1)+(s2+s3)
+                    if let Some(d) = dest {
+                        self.store_xmm_to(d, "xmm0", IrType::F32);
+                    }
                 }
             }
             IntrinsicOp::VecHorizontalAddF32x4 => {
@@ -4919,8 +5011,17 @@ impl X86Codegen {
                 (m, "%ymm1".to_string())
             }
             (None, Some(t)) => {
-                self.avx_load_arg(&args[0]);
+                // Resolve the MASK first (same rationale as the (None, None)
+                // arm): when the mask is the deferred cmp result still held
+                // in %ymm0, moving it aside now keeps the cache hit —
+                // loading the false vector first would flush the deferred
+                // mask to its (never-written) slot and re-read it: one dead
+                // store + one stack load per iteration.  Both orders are
+                // sound (the false load flushes whatever the mask move did
+                // not commit); mask-first is simply the order the canonical
+                // cmp→blendv chain needs.
                 self.avx_load_arg_to(&args[2], "ymm1");
+                self.avx_load_arg(&args[0]);
                 ("%ymm1".to_string(), t)
             }
             (None, None) => {

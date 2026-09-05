@@ -67,6 +67,14 @@ pub struct LivenessResult {
     /// far more often than the raw operand walk records; the allocator must
     /// not rank them by that under-count (see regalloc's priority boost).
     pub gep_base_values: FxHashSet<u32>,
+    /// Exact program points at which a folded Load/Store re-reads a value's
+    /// register with NO IR operand (the GEP chain was absorbed into the
+    /// addressing). Map of value id → the access points. This is the exact
+    /// hidden-read table the phi-coalesce destructive-update veto consults:
+    /// the block-granular segments cannot distinguish a same-block latch
+    /// phi's live-in/live-out whole-block cover from a real read inside the
+    /// update window (every tight-loop accumulator web was vetoed).
+    pub folded_read_points: FxHashMap<u32, Vec<u32>>,
     id_to_dense: FxHashMap<u32, usize>,
     live_in: Vec<BitSet>,
     live_out: Vec<BitSet>,
@@ -274,6 +282,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
             block_ends: Vec::new(),
             num_points: 0,
             gep_base_values: FxHashSet::default(),
+            folded_read_points: FxHashMap::default(),
             id_to_dense: FxHashMap::default(),
             live_in: Vec::new(),
             live_out: Vec::new(),
@@ -285,6 +294,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
 
     let mut ps = assign_program_points(func, num_blocks, num_values, &alloca_set, &id_to_dense);
 
+    let mut folded_read_points: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let gep_base_values = extend_gep_base_liveness(
         func,
         &alloca_set,
@@ -295,6 +305,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &ps.block_end_points,
         &mut ps.last_use_points,
         &mut ps.block_gen,
+        &mut folded_read_points,
     );
 
     apply_f128_source_gen(
@@ -393,6 +404,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         block_ends: ps.block_end_points,
         num_points: ps.num_points,
         gep_base_values,
+        folded_read_points,
         id_to_dense,
         live_in,
         live_out,
@@ -707,6 +719,7 @@ fn extend_gep_base_liveness(
     block_end_points: &[u32],
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
+    folded_read_points: &mut FxHashMap<u32, Vec<u32>>,
 ) -> FxHashSet<u32> {
     let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default();
 
@@ -947,6 +960,7 @@ fn extend_gep_base_liveness(
                                 copy_src,
                                 last_use_points,
                                 block_gen,
+                                folded_read_points,
                             );
                             folded_bases.insert(idx_id);
                         } else if let GepOffset::Const(off) = *offset {
@@ -968,6 +982,7 @@ fn extend_gep_base_liveness(
                             copy_src,
                             last_use_points,
                             block_gen,
+                            folded_read_points,
                         );
                         folded_bases.insert(base_id);
                         hops += 1;
@@ -1009,6 +1024,7 @@ fn extend_use_following_copies(
     copy_src: &FxHashMap<u32, Vec<u32>>,
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
+    read_points: &mut FxHashMap<u32, Vec<u32>>,
 ) {
     let mut stack = vec![start_id];
     let mut seen: FxHashSet<u32> = FxHashSet::default();
@@ -1024,6 +1040,10 @@ fn extend_use_following_copies(
             if *entry == u32::MAX || point > *entry {
                 *entry = point;
             }
+            // The folded access re-reads this value's register at `point`
+            // with no IR operand — record the exact point for the
+            // phi-coalesce destructive-update veto (phi_live_in_window).
+            read_points.entry(id).or_default().push(point);
             // Only values whose def is NOT inside the consuming block are
             // live at its entry. SSA dominance guarantees a same-block def
             // precedes the use, so the fat interval already covers it.

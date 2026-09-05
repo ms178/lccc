@@ -323,6 +323,10 @@ pub struct Driver {
     /// semantics, turning `extern __always_inline` into an external definition
     /// and causing "multiple definition" errors at partial-link time.
     pub(super) gnu89_inline_explicit: Option<bool>,
+    /// `__STDC_VERSION__` override selected by `-std=`.
+    /// `None` = keep the built-in default; `Some(None)` = the dialect defines
+    /// no `__STDC_VERSION__` (C89/C90); `Some(Some(v))` = define it as `v`.
+    pub(super) stdc_version: Option<Option<&'static str>>,
     /// Whether -fexceptions is in effect (defines __EXCEPTIONS like GCC).
     pub(super) exceptions: bool,
     /// Whether to dump preprocessor defines instead of preprocessed output (-dM).
@@ -503,6 +507,7 @@ impl Driver {
             data_sections: false,
             gnu89_inline: false,
             gnu89_inline_explicit: None,
+            stdc_version: None,
             exceptions: false,
             dump_defines: false,
             color_mode: ColorMode::Auto,
@@ -1160,6 +1165,15 @@ impl Driver {
         // to verify that pthread support is properly configured.
         if self.pthread {
             preprocessor.define_macro("_REENTRANT", "1");
+        }
+        // Dialect-selected `__STDC_VERSION__`, applied BEFORE the user's
+        // `-D`s so an explicit `-D__STDC_VERSION__=...` still wins.
+        if let Some(v) = self.stdc_version {
+            match v {
+                Some(val) => preprocessor.define_macro("__STDC_VERSION__", val),
+                // C89/C90 predate the macro; GCC defines nothing there.
+                None => preprocessor.undefine_macro("__STDC_VERSION__"),
+            }
         }
         for def in &self.defines {
             preprocessor.define_macro(&def.name, &def.value);
