@@ -809,15 +809,39 @@ pub(crate) fn compute_i686_divrem_pairs(
             if used[i] {
                 continue;
             }
-            let (_, _, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
+            let (_, op_i, lhs_i, rhs_i, signed_i, dest_i) = &cands[i];
             // Nearest unused compatible partner ahead in this block.
             let mut mate: Option<usize> = None;
             for j in (i + 1)..cands.len() {
                 if used[j] {
                     continue;
                 }
-                let (_, _, lhs_j, rhs_j, signed_j, _) = &cands[j];
-                if signed_i == signed_j && lhs_i == lhs_j && rhs_i == rhs_j {
+                let (_, op_j, lhs_j, rhs_j, signed_j, _) = &cands[j];
+                // OPPOSITE flavours only: one quotient, one remainder.
+                //
+                // A single `idivl`/`divl` produces the quotient in %eax and
+                // the remainder in %edx, so a pair is only meaningful when the
+                // two consumers want DIFFERENT halves. Every emitter derives
+                // the register split from the HEAD's flavour alone
+                // (`div_dest = if self_is_div { dest } else { partner }`,
+                // i686 `emit_divrem_pair_head`; the AArch64 map does not even
+                // carry the tail's flavour), i.e. they all *assume* the
+                // flavours differ — but nothing enforced it.
+                //
+                // Two same-flavour div-likes with identical operands compute
+                // the SAME value; that is a CSE miss, not a fusion
+                // opportunity. Pairing them handed the tail the wrong half:
+                // `x[n % 1000] = 2` read the quotient, so the index grew to
+                // 999 against a `n % 1000 + 1`-element VLA and scribbled off
+                // the stack (gcc.c-torture i686 `20040811-1.c`,
+                // `vla-dealloc-1.c`, `pr43220.c`; `981001-1.c` and
+                // `20000511-1.c` are the same defect through repeated
+                // `n / 2` / `b % c`).
+                if signed_i == signed_j
+                    && lhs_i == lhs_j
+                    && rhs_i == rhs_j
+                    && div_flavor(*op_i) != div_flavor(*op_j)
+                {
                     mate = Some(j);
                     break;
                 }
@@ -1441,7 +1465,12 @@ fn bump_coalesce_group_priority(
                 .map(|m| use_count.get(m).copied().unwrap_or(0))
                 .sum();
             if total > r.priority {
+                // The cost model needs the same information: a coalesce
+                // leader is really read by every member of its web, not
+                // just through its own IR use chain.
+                let boost = total / r.priority.max(1);
                 r.priority = total;
+                r.boost_cost(boost);
                 r.calculate_spill_weight();
             }
         }
@@ -1568,7 +1597,12 @@ fn bump_folded_index_priority(
             .saturating_mul(consumers.len().max(1) as u64)
             .saturating_mul(64);
         if weight > range.priority {
+            // Folded index reads are invisible in the IR use chain; scale
+            // the position-relative cost by the same structural factor so
+            // mode 6 prices them like the multi-read values they are.
+            let boost = weight / range.priority.max(1);
             range.priority = weight;
+            range.boost_cost(boost);
             range.calculate_spill_weight();
         }
     }
@@ -1590,7 +1624,11 @@ fn bump_gep_base_priority(
         let weight = crate::backend::live_range::loop_depth_weight(r.loop_depth);
         let boosted = r.priority.max(weight);
         if boosted > r.priority {
+            // A GEP base folded into addressing is read at every folded
+            // access, not only at the GEP instructions the IR shows.
+            let boost = boosted / r.priority.max(1);
             r.priority = boosted;
+            r.boost_cost(boost);
             r.calculate_spill_weight();
         }
     }

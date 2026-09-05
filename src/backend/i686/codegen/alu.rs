@@ -1087,7 +1087,15 @@ impl I686Codegen {
         } else {
             *dest
         };
-        let _ = partner_from_eax; // flavour already encoded in the dest split above
+        // `compute_i686_divrem_pairs` only pairs OPPOSITE flavours, so the
+        // partner's half is exactly the complement of the head's. Assert the
+        // invariant rather than silently trusting it: when it was violated
+        // (two `SRem`s of the same operands) the tail's dest was stored from
+        // %eax and received the QUOTIENT.
+        debug_assert_eq!(
+            partner_from_eax, !self_is_div,
+            "divrem pair must have opposite flavours (head self_is_div={self_is_div})"
+        );
 
         let rem_home = self.dest_reg(&rem_dest).map(|p| p.0);
         let div_home = self.dest_reg(&div_dest).map(|p| p.0);
