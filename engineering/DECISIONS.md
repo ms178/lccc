@@ -941,3 +941,71 @@ The remaining `arith_loop` gap (62 vs 50) is small and no longer obviously a
 splitting problem. Re-measure before resuming RA-06; the two negative results
 recorded above were both chasing a cause that turned out to be a width-class
 bug in slot assignment.
+
+## RA (2026-09-05, session 6) — post-RA-33 verification sweep; two negative results
+
+RA-33 (copy/phi web slot-width unification) changed the baseline enough that
+every open RA item needed re-measuring before more code was written. Three
+measurements, two of which close items and one of which is a negative result.
+
+### 1. Slot coalescing is now fully resolved — no headroom left there
+
+Corpus-wide (`CCC_DEBUG_SLOT_COALESCE=1` over
+`tests/benchmark/{programs,kernel_corpus}`):
+
+```
+requested=41  resolved=41  blocked_overlap=0  blocked_missing_root=0  blocked_width_mismatch=0
+```
+
+100 % resolve rate. Before RA-33 the same sweep blocked 21 of 21 on
+`arith_loop` alone. This avenue is closed; further gains must come from the
+coalescer *finding* more candidates, not from unblocking them.
+
+### 2. RA-28 (eviction mode 6) re-measured — still not flippable, but much closer
+
+| | before RA-33 | after RA-33 |
+|---|---|---|
+| kernel stkref delta | +17 | **+10** |
+| kernel insns delta | +16 | +9 |
+| whole-corpus stkref | −9 | −23 (−3.5 %) |
+
+Mode 6 now wins clearly on the whole corpus but still regresses the hot
+kernels, which is the gate. Default stays 3. The trend says the remaining
+kernel penalty is small and may fall out of a future spill-model change
+rather than out of tuning.
+
+### 3. NEGATIVE — two-tier value typing (constants as a weak seed)
+
+`compute_value_type_map` merges instruction result types and constant operand
+types into one "widest wins" map. A literal is materialised at the target's
+storage width, so `int a = 1;` lowers to `Copy(a, Const(I64(1)))` on LP64 and
+types the whole web `I64`, which vetoes its 4-byte slot.
+
+A two-tier version was implemented — instruction `result_type()` authoritative
+(strong), constants advisory (weak), weak consulted only for values no
+instruction types — on the theory that it would narrow `arith_loop`'s 32 `int`
+accumulators from 8-byte to 4-byte slots.
+
+**Measured effect: none.** Byte-identical output on `arith_loop` (114 insns /
+62 refs / 11 `movq`, unchanged) and byte-identical census totals over 67
+functions. Some other seed already types those values wide; the literal is not
+the binding constraint. Reverted rather than shipped as unmeasured risk
+surface. Anyone retrying this must first find which seed actually sets the
+width — `Instruction::Phi { ty }` is a strong seed and is the next suspect.
+
+### Where lccc now stands against GCC 14.2 (67-function corpus, -O2)
+
+| bucket | lccc | GCC | |
+|---|---|---|---|
+| instructions | **2060** | 2107 | lccc ahead |
+| stack references | **148** | 219 | lccc ahead 32 % |
+| reg-reg moves | 317 | **272** | lccc behind |
+| callee-saved pushes | 47 | **38** | lccc behind |
+
+The two headline spill metrics are now in lccc's favour. The remaining
+outlier is `glibc_memcmp_common_alignment` at 225 insns vs 87 with 26 reg-reg
+moves vs 2 — inspection shows an inlining/unrolling difference around the
+inlined byte-compare helper, **not** a register-allocation problem, so it does
+not belong to any RA item. `rrmov` and `push` are the two buckets where RA
+work still has headroom (RA-07 callee-saved policy, RA-08 affinity
+coalescing).
