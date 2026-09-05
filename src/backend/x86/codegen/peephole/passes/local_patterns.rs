@@ -20,6 +20,7 @@ use super::helpers::{
     is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
     writes_family, writes_family_full,
 };
+use super::liveness::FileLiveness;
 
 /// Return which stack base register (`(%rsp)` vs `(%rbp)`) a line uses, if any.
 /// Used to ensure an adjacent store and load refer to the SAME slot (same base),
@@ -3627,6 +3628,8 @@ pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [L
     let len = store.len();
     let mut changed = false;
     let mut i = 0;
+    // Exact post-copy-back death queries (replaces the old bounded window).
+    let mut phi_lv = FileLiveness::new(store, infos);
 
     while i < len {
         if infos[i].is_nop() {
@@ -3815,51 +3818,19 @@ pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [L
 
             let cb = copy_back_pos.unwrap();
 
-            // Verify TMP (and chain TMP2 if present) are dead after the copy-back.
-            let check_bits = tmp_bit | chain_bit;
-            let mut tmp_dead = false;
-            let mut n = cb + 1;
-            let mut chk_count = 0;
-            while n < len && chk_count < 8 {
-                if infos[n].is_nop() {
-                    n += 1;
-                    continue;
-                }
-                if infos[n].is_barrier() {
-                    // A branch/label/call is a control-flow barrier: the temp may
-                    // be LIVE on another edge (e.g. a loop-carried value via a
-                    // back-edge). We cannot prove it is dead here, so conservatively
-                    // abort the coalesce (leave tmp_dead=false).
-                    break;
-                }
-                if infos[n].reg_refs & check_bits != 0 {
-                    // Check each referenced temp
-                    let mut is_write = false;
-                    match infos[n].kind {
-                        LineKind::Other { dest_reg }
-                            if dest_reg == tmp_family || dest_reg == chain_family =>
-                        {
-                            is_write = true;
-                        }
-                        LineKind::LoadRbp { reg, .. }
-                            if reg == tmp_family || reg == chain_family =>
-                        {
-                            is_write = true;
-                        }
-                        _ => {}
-                    }
-                    if !is_write {
-                        break; // TMP or chain reg read after copy-back → can't coalesce
-                    }
-                }
-                chk_count += 1;
-                n += 1;
+            // SOUNDNESS: TMP (and chain TMP2) must be dead after the copy-back.
+            // The copy-out is deleted, so after coalescing TMP holds its PRE-copy-out
+            // value; any later READ of that stale value must not exist. The old
+            // check scanned only 8 instructions and treated window exhaustion as
+            // proof of death — a use 10 lines later kept reading the deleted
+            // copy's value (narrow_36: `movq %rsi,%r10; movq %r10,%rsi` adjacent
+            // pair coalesced away while `addq %r10, %r8` still read %r10).
+            // Ask the exact dataflow question instead.
+            if phi_lv.live_after(cb, tmp_family) != Some(false) {
+                i += 1;
+                continue;
             }
-            if chk_count >= 8 {
-                tmp_dead = true;
-            }
-
-            if !tmp_dead {
+            if chain_family != REG_NONE && phi_lv.live_after(cb, chain_family) != Some(false) {
                 i += 1;
                 continue;
             }
@@ -3897,6 +3868,7 @@ pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [L
             }
             mark_nop(&mut infos[cb]);
 
+            phi_lv.refresh_at(store, infos, cb);
             changed = true;
             i = cb + 1;
             continue;
@@ -4447,6 +4419,13 @@ pub(super) fn hoist_loop_invariant_fp_broadcast(
 
 pub(super) fn collapse_increment_chain(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    // Per-line liveness oracle (same rationale as fold_cascaded_shifts): the
+    // rewrite retires both staging temporaries, which is sound ONLY if their
+    // old values are dead after the pattern.  The previous hand-rolled
+    // 8-line forward scan proved "death" from window exhaustion — unsound
+    // (a use at line 9+ is invisible) — and would have miscompiled the same
+    // peephole_families narrow_66 shape the cascaded-shift scan did.
+    let live_out = compute_gpr_live_out(store, infos);
     let mut changed = false;
     let mut i = 0;
 
@@ -4575,43 +4554,13 @@ pub(super) fn collapse_increment_chain(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
 
-        // Check TMPs dead after k
+        // Check TMPs dead after k: neither old staging value may be live at
+        // the pattern's last line (exact per-line liveness oracle — the
+        // previous 8-line window scan proved death from window exhaustion,
+        // which is an inversion of soundness).
         let tmp1_bit = 1u16 << tmp1_family;
         let tmp2_bit = 1u16 << tmp2_family;
-        let mut tmps_dead = false;
-        let mut n = k + 1;
-        let mut chk = 0;
-        while n < len && chk < 8 {
-            if infos[n].is_nop() {
-                n += 1;
-                continue;
-            }
-            if infos[n].is_barrier() {
-                // Control-flow barrier: temps may be live on another edge.
-                // Cannot prove dead → abort (leave tmps_dead=false).
-                break;
-            }
-            if infos[n].reg_refs & tmp1_bit != 0 {
-                match infos[n].kind {
-                    LineKind::Other { dest_reg } if dest_reg == tmp1_family => {}
-                    LineKind::LoadRbp { reg, .. } if reg == tmp1_family => {}
-                    _ => break,
-                }
-            }
-            if tmp2_family != tmp1_family && infos[n].reg_refs & tmp2_bit != 0 {
-                match infos[n].kind {
-                    LineKind::Other { dest_reg } if dest_reg == tmp2_family => {}
-                    LineKind::LoadRbp { reg, .. } if reg == tmp2_family => {}
-                    _ => break,
-                }
-            }
-            chk += 1;
-            n += 1;
-        }
-        if chk >= 8 {
-            tmps_dead = true;
-        }
-        if !tmps_dead {
+        if live_out[k] & (tmp1_bit | tmp2_bit) != 0 {
             i += 1;
             continue;
         }
@@ -4671,6 +4620,17 @@ pub(super) fn collapse_increment_chain(store: &mut LineStore, infos: &mut [LineI
 
 pub(super) fn fold_cascaded_shifts(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    // Per-line liveness oracle: the soundness of this pass (deleting %TMP's
+    // producer chain) rests on proving the OLD %TMP value dead after the
+    // pattern.  compute_gpr_live_out answers exactly that — including for
+    // reads far beyond any fixed lookahead window and through redefinitions
+    // — whereas the previous hand-rolled 8-line scan treated "no read found
+    // within 8 lines" as proof of death (an inversion of soundness) and
+    // counted read-modify-writes as redefinitions.  Both holes let it delete
+    // `shlq $17, %r11` while `addq %r11, %rdi` further down the same block
+    // still read %r11 — observed as peephole_families narrow_66 @O1+
+    // reading an undefined register (sum got garbage instead of 0).
+    let live_out = compute_gpr_live_out(store, infos);
     let mut changed = false;
     let mut i = 0;
 
@@ -4769,41 +4729,15 @@ pub(super) fn fold_cascaded_shifts(store: &mut LineStore, infos: &mut [LineInfo]
                 continue;
             }
 
-            // Check TMP is dead after this sequence
+            // Check TMP is dead after this sequence: the old %TMP value must
+            // not be live at the pattern's last line.  The per-line liveness
+            // oracle is exact (block-local AND cross-block via its CFG
+            // dataflow); any live read — however far down the block — refuses
+            // the transform.  (The previous 8-line window scan inverted this:
+            // window exhaustion proved death, and RMW lines like
+            // `addq %rsi, %r11` were accepted as "redefinitions".)
             let tmp_bit = 1u16 << tmp_fam;
-            let mut tmp_dead = false;
-            let mut n = m + 1;
-            let mut chk = 0;
-            while n < len && chk < 8 {
-                if infos[n].is_nop() {
-                    n += 1;
-                    continue;
-                }
-                if infos[n].is_barrier() {
-                    // Control-flow barrier: temp may be live on another edge.
-                    // Cannot prove dead → abort (leave tmp_dead=false).
-                    break;
-                }
-                if infos[n].reg_refs & tmp_bit != 0 {
-                    match infos[n].kind {
-                        LineKind::Other { dest_reg } if dest_reg == tmp_fam => {
-                            tmp_dead = true;
-                            break;
-                        }
-                        LineKind::LoadRbp { reg, .. } if reg == tmp_fam => {
-                            tmp_dead = true;
-                            break;
-                        }
-                        _ => break, // TMP read → not dead
-                    }
-                }
-                chk += 1;
-                n += 1;
-            }
-            if chk >= 8 {
-                tmp_dead = true;
-            }
-            if !tmp_dead {
+            if live_out[m] & tmp_bit != 0 {
                 i += 1;
                 continue;
             }
@@ -5343,11 +5277,36 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
         .fold(0, |m, r| m | (1u16 << r));
     for i in 0..n {
         let refs = infos[i].reg_refs;
+        // PARTIAL-WIDTH DEF GUARD.  A destination spelled in a 16-bit or
+        // 8-bit form (movw/movb family) preserves the family's upper bits,
+        // so the family's PREVIOUS value stays (partially) live through the
+        // line.  Recording such a line as a full def would let death proofs
+        // (dead-producer deletions) retire producers whose bits a later
+        // wide read still consumes.  Adding the family to `uses` keeps the
+        // value live through the line: `inn = uses | (out & !defs)` retains
+        // the bit regardless of the def.  The dest SPELLING is
+        // authoritative — zero/sign-extending loads (`movzbl off(%rbp),
+        // %r10d`, `movslq ...`) carry a wide dest spelling and fully
+        // redefine the family even though their memory operand is narrow.
+        let partial_def = |t: &str, fam: u16, uses: &mut u16| {
+            let tt = t.trim_end();
+            if tt.ends_with(REG_NAMES[2][fam as usize])
+                || tt.ends_with(REG_NAMES[3][fam as usize])
+            {
+                *uses |= 1u16 << fam;
+            }
+        };
         match infos[i].kind {
-            LineKind::LoadRbp { reg, .. } if is_valid_gp_reg(reg) => defs[i] = 1u16 << reg,
+            LineKind::LoadRbp { reg, .. } if is_valid_gp_reg(reg) => {
+                defs[i] = 1u16 << reg;
+                partial_def(infos[i].trimmed(store.get(i)), reg as u16, &mut uses[i]);
+            }
             LineKind::StoreRbp { reg, .. } if is_valid_gp_reg(reg) => uses[i] = 1u16 << reg,
             LineKind::Push { reg } if is_valid_gp_reg(reg) => uses[i] = 1u16 << reg,
-            LineKind::Pop { reg } if is_valid_gp_reg(reg) => defs[i] = 1u16 << reg,
+            LineKind::Pop { reg } if is_valid_gp_reg(reg) => {
+                defs[i] = 1u16 << reg;
+                partial_def(infos[i].trimmed(store.get(i)), reg as u16, &mut uses[i]);
+            }
             LineKind::SetCC { reg } if is_valid_gp_reg(reg) => {
                 uses[i] = 1u16 << reg;
                 defs[i] = 1u16 << reg;
@@ -5367,6 +5326,10 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
                 } else {
                     refs & !bit
                 };
+                // Partial-width dest (movw/movb spelling): the old family
+                // value survives in the upper bits — keep it live (see the
+                // PARTIAL-WIDTH DEF GUARD above).
+                partial_def(t, dest_reg as u16, &mut uses[i]);
                 if has_implicit_reg_usage(t) {
                     uses[i] |= caller_saved;
                     defs[i] |= caller_saved;
@@ -5623,11 +5586,14 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
         }
 
         // The original XOR flags may differ in SF width; require them to be
-        // killed before any consumer.
+        // killed before any consumer.  Scan to the END OF THE BLOCK: a
+        // fixed-window scan that concluded death from window exhaustion was
+        // an inversion of soundness (a consumer past the window would read
+        // rewritten flags).  Barriers abort: flags may be live-out on any
+        // successor edge and this text-level pass cannot track that.
         let mut flags_dead = false;
         let mut q = m + 1;
-        let limit = (q + 24).min(len);
-        while q < limit {
+        while q < len {
             if infos[q].is_nop() {
                 q += 1;
                 continue;
@@ -5640,6 +5606,10 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
                 || t.starts_with("rcl")
                 || t.starts_with("rcr")
                 || t.starts_with("pushf")
+                // Explicit flag READERS the backend emits: cmpxchg compares
+                // against ZF; lahf captures SF/ZF/AF/PF/CF into %ah.
+                || t.starts_with("cmpxchg")
+                || t.starts_with("lahf")
             {
                 break;
             }
@@ -5665,9 +5635,6 @@ pub(super) fn fold_zero_extended_xor_moves(store: &mut LineStore, infos: &mut [L
                 break;
             }
             q += 1;
-        }
-        if q >= limit {
-            flags_dead = true;
         }
         if !flags_dead {
             i += 1;
@@ -5832,10 +5799,13 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
             continue;
         }
         // OR and rotate flags differ; require a kill before any consumer.
+        // Scan to the END OF THE BLOCK (window exhaustion is not death — a
+        // consumer past a fixed window would read the OR's flags while the
+        // rotate produces different ones).  Barriers abort: flags may be
+        // live-out on any successor edge.
         let mut fdead = false;
         let mut x = r + 1;
-        let lim = (x + 24).min(len);
-        while x < lim {
+        while x < len {
             if infos[x].is_nop() {
                 x += 1;
                 continue;
@@ -5845,6 +5815,13 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
                 || t.starts_with("cmov")
                 || t.starts_with("adc")
                 || t.starts_with("sbb")
+                // rcl/rcr consume the CF input; pushf/cmpxchg/lahf read
+                // flag state explicitly (all emitted by this backend).
+                || t.starts_with("rcl")
+                || t.starts_with("rcr")
+                || t.starts_with("pushf")
+                || t.starts_with("cmpxchg")
+                || t.starts_with("lahf")
             {
                 break;
             }
@@ -5870,9 +5847,6 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
                 break;
             }
             x += 1;
-        }
-        if x >= lim {
-            fdead = true;
         }
         if !fdead {
             i += 1;
@@ -6319,4 +6293,308 @@ fn binary_vex_scalar_mnemonic<'a>(line: &'a str, width: &str) -> Option<(&'stati
         }
     }
     None
+}
+
+#[cfg(test)]
+mod phi_coalesce_tests {
+    use super::*;
+    use crate::backend::x86::codegen::peephole::types::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    #[test]
+    fn adjacent_copy_roundtrip_with_far_reader_is_never_coalesced() {
+        // narrow_36 root cause: `movq %rsi, %r10` immediately followed by
+        // `movq %r10, %rsi` looks like a degenerate phi roundtrip, but the
+        // first half DEFINES %r10 and its reader sits 10 lines later — past
+        // the old 8-instruction "dead" proof window. The exact-liveness
+        // check must refuse the coalesce and keep both copies.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %r10\n",
+            "    movq %r10, %rsi\n",
+            "    movq %rsi, %rax\n",
+            "    movl %r11d, %edx\n",
+            "    movq %rsi, %rax\n",
+            "    movq %rdx, %rcx\n",
+            "    addq %rcx, %rax\n",
+            "    movq %rax, %r8\n",
+            "    movsbq %r9b, %r11\n",
+            "    movq %r8, %rax\n",
+            "    addq %r10, %r8\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        coalesce_phi_register_copies(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        assert!(
+            out.iter().any(|l| l.contains("movq %rsi, %r10")),
+            "the copy that defines %r10 must survive; got:\n{}",
+            out.join("\n")
+        );
+        assert!(
+            out.iter().any(|l| l.contains("addq %r10, %r8")),
+            "the reader must not be renamed"
+        );
+    }
+
+    #[test]
+    fn genuine_phi_shuffle_with_dead_tmp_still_coalesces() {
+        // TMP is written by the copy-out, renamed through the mid ops, and
+        // provably dead after the copy-back: the coalesce must fire.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r12\n",
+            "    addq $1, %r12\n",
+            "    movq %r12, %rdi\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        let _ = coalesce_phi_register_copies(&mut store, &mut infos);
+        // Soundness of the positive case is owned by the corpus; this test
+        // only guards that the new liveness gate did not disable the pass.
+        let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        assert!(
+            out.iter().any(|l| l.contains("addq")),
+            "pass must remain active"
+        );
+    }
+}
+
+#[cfg(test)]
+mod windowed_liveness_tests {
+    //! Regression tests for the "fixed-window death proof" bug family found
+    //! by scripts/peephole_families.py (narrow_66 @O1+):
+    //!
+    //! Hand-rolled forward scans that concluded death from *window
+    //! exhaustion* ("no read within N lines") inverted soundness — a use at
+    //! line N+1 is invisible to them — and their redefinition arms counted
+    //! read-modify-writes as kills.  All of them now go through the exact
+    //! per-line liveness oracle (`compute_gpr_live_out`), which is hardened
+    //! against partial-width def kills (movw/movb dest spellings preserve
+    //! the family's upper bits).
+
+    use super::*;
+    use crate::backend::x86::codegen::peephole::types::*;
+
+    fn build(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    fn text_of(store: &LineStore) -> String {
+        (0..store.len()).map(|i| store.get(i).to_string()).collect()
+    }
+
+    /// The narrow_66 miscompile, isolated: the cascaded-shift chain's
+    /// staging register (%r11) is read 13 lines below the pattern — beyond
+    /// the old 8-line window, which deleted `shlq $17, %r11` while
+    /// `addq %r11, %rdi` survived (the program then read an undefined
+    /// register).  The liveness oracle sees the read and must refuse.
+    #[test]
+    fn cascaded_shift_with_far_use_must_not_fold() {
+        let asm = concat!(
+            "narrow_66:\n",
+            ".cfi_startproc\n",
+            "    andl %edi, %esi\n",
+            "    movzwl %si, %r8d\n",
+            "    movl %r8d, %eax\n",
+            "    subl $2147483649, %eax\n",
+            "    movl %eax, %r9d\n",
+            "    movq %r9, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movq %r11, %r10\n",
+            "    shlq $8, %r10\n",
+            "    negq %r10\n",
+            "    movzwl %r10w, %esi\n",
+            "    movl %edi, %edx\n",
+            "    movl %r8d, %r10d\n",
+            "    movq %rdx, %rax\n",
+            "    addq %r10, %rax\n",
+            "    addq %r9, %rax\n",
+            "    movq %rax, %rdi\n",
+            "    addq %r11, %rdi\n",
+            "    movl %esi, %edx\n",
+            "    leaq (%rdi, %rdx, 1), %rdi\n",
+            "    movswl %di, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        let changed = fold_cascaded_shifts(&mut store, &mut infos);
+        assert!(
+            !changed,
+            "folding must be refused: %r11 is read far below the pattern"
+        );
+        let out = text_of(&store);
+        assert!(
+            out.contains("shlq $17, %r11"),
+            "the producer of the far-read value must survive"
+        );
+    }
+
+    /// The scan's redefinition arm also accepted read-modify-writes as
+    /// kills (`addq %rsi, %r11` is `Other { dest_reg: 11 }` but READS
+    /// %r11).  The oracle's RMW handling keeps the read live.
+    #[test]
+    fn cascaded_shift_rmw_read_of_tmp_must_not_fold() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movq %r11, %r10\n",
+            "    shlq $8, %r10\n",
+            "    addq %rsi, %r11\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        let changed = fold_cascaded_shifts(&mut store, &mut infos);
+        assert!(!changed, "RMW read of %TMP must refuse the fold");
+        assert!(text_of(&store).contains("shlq $17, %r11"));
+    }
+
+    /// Precision control: a genuinely dead staging register still folds
+    /// (17 + 8 compose into one 25-bit shift on the copy target).
+    #[test]
+    fn cascaded_shift_dead_tmp_still_folds() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movq %r11, %r10\n",
+            "    shlq $8, %r10\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        let changed = fold_cascaded_shifts(&mut store, &mut infos);
+        assert!(changed, "dead %TMP must fold");
+        let out = text_of(&store);
+        assert!(out.contains("shlq $25, %r10"), "shifts compose: {}", out);
+        // The old producer line is logically deleted (nop-marked in the
+        // LineInfo; the raw store text may remain for patch stability).
+        let nop_idx = (0..store.len())
+            .find(|i| store.get(*i).contains("shlq $17, %r11"))
+            .expect("producer line must still be addressable");
+        assert!(infos[nop_idx].is_nop(), "old producer must be nop'd");
+    }
+
+    /// compute_gpr_live_out must treat a 16-bit dest spelling as a PARTIAL
+    /// write: the family's upper bits (and therefore its previous value,
+    /// partially) stay live through the line.
+    #[test]
+    fn partial_width_dest_keeps_family_live() {
+        let partial = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movw $7, %r11w\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        // Lines: 0 label, 1 cfi, 2 movq, 3 shlq (producer), 4 movw, 5 read,
+        // 6 ret.  The full-width read AFTER the partial write consumes the
+        // producer's upper bits — the partial write must NOT kill them.
+        let (store, infos) = build(partial);
+        let live_out = compute_gpr_live_out(&store, &infos);
+        assert!(
+            live_out[3] & (1u16 << 11) != 0,
+            "movw %r11w preserves the upper bits: family 11 must stay live"
+        );
+
+        let full = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movl $7, %r11d\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        // Same layout; the read after `movl $7, %r11d` consumes the NEW
+        // (zero-extended) value — the producer's bits are dead at the write.
+        let (store, infos) = build(full);
+        let live_out = compute_gpr_live_out(&store, &infos);
+        assert!(
+            live_out[3] & (1u16 << 11) == 0,
+            "movl (zero-extending) fully redefines family 11: old value dead"
+        );
+
+        // Zero-extending LOAD with a narrow memory operand: the wide dest
+        // spelling proves a full redefinition.
+        let zext_load = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rdi, %r11\n",
+            "    shlq $17, %r11\n",
+            "    movzbl 8(%rbp), %r11d\n",
+            "    movq %r11, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, infos) = build(zext_load);
+        let live_out = compute_gpr_live_out(&store, &infos);
+        assert!(
+            live_out[3] & (1u16 << 11) == 0,
+            "movzbl into %r11d zero-extends: full redefinition"
+        );
+    }
+
+    /// The or->rotate fold's EFLAGS scan must treat `lahf` (reads
+    /// SF/ZF/AF/PF/CF; emitted by this backend) as a consumer, and a full
+    /// flag-writing ALU op as a kill.
+    #[test]
+    fn rotate_idiom_flags_reader_blocks_fold() {
+        let head = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rsi, %rax\n",
+            "    shlq $3, %rax\n",
+            "    movq %rsi, %rdx\n",
+            "    shrq $61, %rdx\n",
+            "    movq %rax, %rsi\n",
+            "    orq %rdx, %rsi\n",
+        );
+        // lahf sits between the orq and any full flag kill → refuse.
+        let with_lahf = format!(
+            "{}    movl %edx, %edx\n    lahf\n    movl %edx, %edx\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n",
+            head
+        );
+        let (mut store, mut infos) = build(&with_lahf);
+        let changed = fold_rotate_idiom(&mut store, &mut infos);
+        assert!(!changed, "lahf consumes the orq's flags: must refuse");
+
+        // The same shape with a plain flag-writing ALU op as the first
+        // flag event: the orq's flags are dead before anything reads them
+        // → the rotate synthesis still folds (precision control).
+        let with_kill = format!(
+            "{}    movl %edx, %edx\n    addl $1, %esi\n    movl %edx, %edx\n    movl %esi, %eax\n    ret\n.cfi_endproc\n",
+            head
+        );
+        let (mut store, mut infos) = build(&with_kill);
+        let changed = fold_rotate_idiom(&mut store, &mut infos);
+        assert!(changed, "flag kill before any reader must still fold");
+        assert!(text_of(&store).contains("rolq $3, %rsi"));
+    }
 }

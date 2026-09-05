@@ -5188,6 +5188,19 @@ impl ArchCodegen for X86Codegen {
         {
             return false;
         }
+        // TLS symbols must NOT take the MachInst LeaSym fast path: it lowers
+        // GlobalAddr to a plain `leaq sym(%rip)`, which for a __thread symbol
+        // computes the address of the .tdata TEMPLATE, not the calling
+        // thread's instance — `tls_var = 7;` then wrote the initializer image
+        // while the earlier %fs-based read still saw the old value
+        // (regression glibc_gottpoff, second read returned 42).  The text
+        // path (emit_tls_global_addr_impl) selects the right TLS model, so
+        // keep TLS addresses off the fast path.
+        if let crate::ir::reexports::Instruction::GlobalAddr { name, .. } = inst {
+            if self.state.tls_symbols.contains(name) {
+                return false;
+            }
+        }
         // PF-15 hazard closure: a Cast admitted to the MachInst queue never
         // runs the mature cast emitter, so it neither records a pending
         // widening move nor honours try_record_pending_widen's refusal

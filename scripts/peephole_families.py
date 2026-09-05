@@ -735,7 +735,7 @@ def gen_shiftchain(rng: random.Random, count: int) -> list[Case]:
         n = rng.randint(-70, 70)
         kind = rng.choice(["shl_shl", "shr_shr", "shl_shr", "shr_shl", "rot0", "inc_chain",
                            "mask_and", "mask_mod", "shl_var_var", "sar_chain", "shl_then_narrow",
-                           "byte_extract"])
+                           "byte_extract", "far_use"])
         av = convert(a, ut, pt)      # promoted value (signed int for narrow ut)
         ua = av & pt.mask            # its bit pattern
         m = pt.mask
@@ -785,13 +785,61 @@ def gen_shiftchain(rng: random.Random, count: int) -> list[Case]:
             nt = rng.choice([U8, U16, U32])
             k = rng.randrange(0, W)
             expr, v = f"((uint64_t)({nt.name})({src} << {k}))", ((ua << k) & m) & nt.mask
-        else:  # byte_extract
+        elif kind == "byte_extract":
             k = rng.randrange(0, W // 8) * 8
             expr, v = f"(({src} >> {k}) & 0xffu)", (ua >> k) & 0xff
-        rt = rng.choice([pt, U64, ut])
+        else:  # far_use — WINDOW-BUSTER (narrow_66 class)
+            # The shift-chain intermediate is consumed only AFTER a long
+            # independent filler chain, so its defining instruction lands
+            # far beyond any fixed lookahead window in the emitted asm:
+            # the (* K) fold emits `movq %A, %B; shl/mul`, and the final
+            # sum re-reads the shifted value many instructions later.
+            # fold_cascaded_shifts proved "%TMP dead" from an 8-line
+            # window and deleted the producer of that still-live register
+            # (narrow_66 read an undefined register).  Exact-liveness
+            # passes pass this shape; windowed death proofs cannot.
+            # All arithmetic is unsigned 64-bit: UB-free by construction.
+            k1 = rng.randrange(0, 64)
+            k2 = rng.choice([1, 3, 8])
+            neg = rng.random() < 0.5
+            x64 = ua & MASK64
+            av64 = (x64 << k1) & MASK64
+            if neg:
+                bv = (av64 * ((MASK64 - (1 << k2)) + 1)) & MASK64  # a * -2^k2
+                b_expr = f"(((((uint64_t)p0) << {k1})) * (uint64_t)(-{1 << k2}LL))"
+            else:
+                bv = (av64 * (1 << k2)) & MASK64
+                b_expr = f"(((((uint64_t)p0) << {k1})) * {1 << k2}u)"
+            f_val = n & MASK64
+            filler = "((uint64_t)p1)"
+            for _fi in range(rng.randint(4, 9)):
+                fkind = rng.choice(["mul", "xor_shr", "add", "rot"])
+                if fkind == "mul":
+                    c = rng.choice([3, 5, 7])
+                    f_val = (f_val * c) & MASK64
+                    filler = f"(({filler}) * {c}u)"
+                elif fkind == "xor_shr":
+                    sh = rng.randrange(1, 64)
+                    f_val = (f_val ^ (f_val >> sh)) & MASK64
+                    filler = f"(({filler}) ^ (({filler}) >> {sh}))"
+                elif fkind == "add":
+                    c = rng.randrange(1, 1 << 32)
+                    f_val = (f_val + c) & MASK64
+                    filler = f"(({filler}) + {c}u)"
+                else:
+                    sh = rng.randrange(1, 64)
+                    f_val = (((f_val << sh) | (f_val >> ((64 - sh) & 63)))) & MASK64
+                    filler = f"((({filler}) << {sh}) | (({filler}) >> {(64 - sh) & 63}))"
+            # Left-to-right evaluation: b first (creating the cascaded
+            # copy/shift chain), then the long filler, then the FAR read
+            # of the shifted intermediate.
+            expr = f"({b_expr} + {filler} + ((((uint64_t)p0) << {k1})))"
+            v = (bv + f_val + av64) & MASK64
+        rt = U64 if kind == "far_use" else rng.choice([pt, U64, ut])
         params = [Param(ut.name, ut.literal(a), raw=a), Param("int32_t", str(n), raw=n)]
         body = f"return ({rt.name}){expr};"
-        expected = convert(v & m, U64 if kind == "shl_then_narrow" else pt, rt)
+        expected = convert(v, U64, rt) if kind == "far_use" \
+            else convert(v & m, U64 if kind == "shl_then_narrow" else pt, rt)
         out.append(Case(f"shiftchain_{len(out)}", "shiftchain", rt, params, body, expected,
                         desc=f"{kind} {ut.name}"))
     return out

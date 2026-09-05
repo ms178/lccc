@@ -134,9 +134,27 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
     let mut changed = false;
 
     let mut i = 0usize;
+    // Inline-asm regions (`#APP` .. `#NO_APP`) are user-authored text: their
+    // bytes must reach the assembler untouched, and their flag effects are
+    // invisible to this textual scan (raw `.byte` encodings can clobber
+    // flags; a template-internal `popfq` is NOT the partner of an emitted
+    // `pushfq`).  A `pushfq`/`popfq` pair may therefore never be formed
+    // across — or inside — a region, and no line inside a region may be
+    // rewritten (the `xorl → movq $0` rewrite included).
+    let mut in_asm = false;
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        if trimmed != "pushfq" && trimmed != "pushf" {
+        if trimmed == "#APP" {
+            in_asm = true;
+            i += 1;
+            continue;
+        }
+        if trimmed == "#NO_APP" {
+            in_asm = false;
+            i += 1;
+            continue;
+        }
+        if in_asm || trimmed != "pushfq" && trimmed != "pushf" {
             i += 1;
             continue;
         }
@@ -154,6 +172,16 @@ pub(super) fn eliminate_redundant_pushfq(asm: &mut String) -> bool {
         let mut found_pop = false;
         while j < lines.len() {
             let t = lines[j].trim();
+            if t == "#APP" {
+                // The window would span into user asm: its flag effects are
+                // unanalyzable and its bytes untouchable. Abort the pair.
+                safe = false;
+                break;
+            }
+            if t == "#NO_APP" {
+                safe = false;
+                break;
+            }
             if t == "popfq" || t == "popf" {
                 found_pop = true;
                 break;
@@ -264,5 +292,56 @@ fn map_reg_32_to_64(reg: &str) -> &'static str {
         "r15" => "r15",
         // Unknown: default to rax (won't occur in generated self-xor zeroing).
         _ => "rax",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::eliminate_redundant_pushfq;
+
+    #[test]
+    fn pair_straddling_inline_asm_region_is_never_removed() {
+        // The window between the emitted pushfq and popfq contains a user
+        // region whose flag effects are unanalyzable (raw encodings); the
+        // pair must survive, and the template's own `popfq` must never be
+        // mistaken for the partner.
+        let input = concat!(
+            "f:\n",
+            "    pushfq\n",
+            "    #APP\n",
+            "    popfq\n",
+            "    #NO_APP\n",
+            "    popfq\n",
+            "    ret\n",
+        );
+        let mut asm = input.to_string();
+        let changed = eliminate_redundant_pushfq(&mut asm);
+        assert_eq!(asm, input, "user bytes are immutable and the pair is unverifiable");
+        assert!(!changed);
+    }
+
+    #[test]
+    fn template_internal_pushfq_is_not_a_candidate() {
+        let input = concat!(
+            "f:\n",
+            "    #APP\n",
+            "    pushfq\n",
+            "    nop\n",
+            "    popfq\n",
+            "    #NO_APP\n",
+            "    ret\n",
+        );
+        let mut asm = input.to_string();
+        let _ = eliminate_redundant_pushfq(&mut asm);
+        assert_eq!(asm, input, "nothing inside a region may be removed");
+    }
+
+    #[test]
+    fn plain_flag_neutral_pair_is_still_removed() {
+        let input = "f:\n    pushfq\n    movq %rbx, %rax\n    popfq\n    ret\n";
+        let mut asm = input.to_string();
+        assert!(eliminate_redundant_pushfq(&mut asm));
+        assert!(!asm.contains("pushfq"), "asm was:\n{asm}");
+        assert!(!asm.contains("popfq"), "asm was:\n{asm}");
     }
 }

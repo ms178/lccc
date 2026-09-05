@@ -208,6 +208,15 @@ fn eliminate_self_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         if t.is_empty() {
             continue;
         }
+        // Inline-asm region boundary: user bytes are immutable (a template
+        // may contain a deliberate `movq %rax, %rax` length placeholder —
+        // exactly the shape this pass deletes), and a template can redefine
+        // any register without naming it (raw `.byte` encodings), so no
+        // upper-32-zero fact may cross the region in either direction.
+        if infos[i].kind == LineKind::InlineAsm {
+            upper32_zero.iter_mut().for_each(|v| *v = false);
+            continue;
+        }
         // A label may be entered from anywhere: drop every fact.
         if t.ends_with(':') {
             upper32_zero.iter_mut().for_each(|v| *v = false);
@@ -341,6 +350,14 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             if infos[j].is_barrier() {
                 break;
             }
+            // SOUNDNESS: user inline asm is opaque. A template line can name
+            // the copied register in a use position (the acceptance rules
+            // below would then REWRITE the user's instruction — user bytes
+            // are immutable) and can redefine any register through raw
+            // encodings the write oracle cannot see. End the use range.
+            if infos[j].kind == LineKind::InlineAsm {
+                break;
+            }
             let line = infos[j].trimmed(store.get(j));
             // Rule 2: the source must still hold the copied value.  The
             // implicit second output of `cqto`/`idivq`/`cpuid`/`rep stos`...
@@ -412,3 +429,88 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
 #[cfg(test)]
 #[path = "narrow_copy_fold_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod inline_asm_tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn build_pinned(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut in_asm = false;
+        for i in 0..infos.len() {
+            let t = infos[i].trimmed(store.get(i)).to_string();
+            if t == "#APP" {
+                in_asm = true;
+                continue;
+            }
+            if t == "#NO_APP" {
+                in_asm = false;
+                continue;
+            }
+            if in_asm {
+                infos[i] = LineInfo {
+                    kind: LineKind::InlineAsm,
+                    ext_kind: ExtKind::None,
+                    trim_start: infos[i].trim_start,
+                    has_indirect_mem: true,
+                    rbp_offset: RBP_OFFSET_NONE,
+                    reg_refs: u16::MAX,
+                    pinned: true,
+                };
+            }
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn copy_use_range_ends_at_inline_asm() {
+        // A template line that names the copied register must not be
+        // rewritten, and the copy itself must survive (its use still reads
+        // it).
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movl %edi, %eax\n",
+            "    movq %rax, %r10\n",
+            "#APP\n",
+            "    movq %r10, %r11\n",
+            "#NO_APP\n",
+            "    addq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        fold_register_copies(&mut store, &mut infos);
+        let out: Vec<String> = (0..store.len()).map(|i| store.get(i).to_string()).collect();
+        assert!(
+            out.iter().any(|l| l.trim() == "movq %r10, %r11"),
+            "user asm bytes must be immutable; got:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn deliberate_self_move_inside_asm_region_survives() {
+        // Kernel ALTERNATIVE() length placeholder: `movq %rax, %rax` inside
+        // a region is deliberate padding, not a dead move.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "#APP\n",
+            "    movq %rax, %rax\n",
+            "#NO_APP\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        let _ = fold_register_copies(&mut store, &mut infos);
+        assert!(
+            (0..store.len()).any(|i| store.get(i).trim() == "movq %rax, %rax"),
+            "the placeholder must reach the assembler"
+        );
+    }
+}

@@ -687,6 +687,35 @@ The optimizer consistently errs on the side of correctness:
 - Division/modulo instructions are special-cased to invalidate rdx (implicit
   high result register).
 
+### Liveness-Oracle Death Proofs (no fixed windows)
+
+Every transform that deletes a producer (a copy, a shift, a relay) must prove
+the deleted value is DEAD. Death proofs come from the per-line liveness
+oracle `compute_gpr_live_out` (a backward dataflow over the label CFG) or
+from a scan to the END OF THE BLOCK — never from a fixed-size forward
+window. A window that concludes "no read within N lines, therefore dead"
+inverts soundness: the genuine read can sit at line N+1. This bug class
+miscompiled real programs twice before the doctrine was adopted (the
+cascaded-shift fold deleted `shlq $17, %r11` while `addq %r11, %rdi` read it
+13 lines later; the or->rotate EFLAGS scan had the same window inversion).
+Corollaries, all enforced:
+
+- **Redefinition proves death only if it covers the value**: a partial-width
+  write (`movw`/`movb` dest spelling) preserves the family's upper bits and
+  must NOT kill the family (the oracle's partial-def guard routes it through
+  `uses`). 32-bit writes zero-extend and do kill; the dest spelling is
+  authoritative, so `movzbl off(%rbp), %r10d` fully defines family 10.
+- **Read-modify-writes are reads**: `addq %rsi, %r11` keeps %r11 live; only
+  a pure write kills.
+- **EFLAGS death proofs** scan to the end of the block: a kill is a
+  fully-flag-writing ALU op, `call`, or `ret`; a consumer (`jcc`, `setcc`,
+  `cmov`, `adc`/`sbb`, `rcl`/`rcr`, `pushf`, and the explicit readers
+  `cmpxchg`/`lahf` the backend emits) or a barrier aborts the transform.
+- Unit-test the invariant, not just the fix: `windowed_liveness_tests` in
+  `local_patterns.rs` encodes the far-use refusals AND the positive
+  (fold-still-fires) controls; `scripts/peephole_families.py`'s shiftchain
+  `far_use` kind generates the shape at stress scale.
+
 ### Performance-Critical Formatting
 
 `write_rbp_pattern` formats `N(%rbp)` strings directly into a stack buffer

@@ -323,6 +323,19 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
                 break;
             }
 
+            // SOUNDNESS: user inline asm may read this slot through an "m"
+            // operand (`movq -16(%rbp), %rax` inside the template) that the
+            // line parsers never see — InlineAsm lines carry no parsed
+            // offset. Skipping the line would let the store be deleted as
+            // "overwritten, never read" while the asm still reads it (and
+            // vice versa: a later asm read keeps an earlier store alive).
+            // Treat any inline-asm line in the window as a potential reader
+            // of every slot.
+            if infos[j].kind == LineKind::InlineAsm {
+                slot_read = true;
+                break;
+            }
+
             // SOUNDNESS: an RSP-shifting line between the store and this
             // point makes the store's %rsp-relative address ambiguous (the
             // offsets inside the shifted window refer to different physical

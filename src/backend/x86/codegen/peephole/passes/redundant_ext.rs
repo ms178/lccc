@@ -264,10 +264,45 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     // differ. Only the two provable cases below establish the fact.
     let mut sext32 = vec![false; GP_FAMILIES];
 
+    // Inline-asm regions (`#APP` .. `#NO_APP`) are user-authored text that
+    // must reach the assembler byte-for-byte (kernel ALTERNATIVE() length
+    // placeholders, runtime-patched jump labels).  This pass runs BEFORE
+    // `pin_inline_asm_regions` (and again on the final text in phase 9,
+    // after pinning has been lowered back to plain text), so it must guard
+    // the region boundary itself:
+    //   * lines inside a region are never matched, rewritten or deleted;
+    //   * crossing the boundary clears every tracked fact — a template can
+    //     redefine any register without naming it in the emitted text
+    //     (`.byte` encodings, `%0`-substituted operands the pattern match
+    //     never sees).
+    let mut in_asm = false;
+
     for i in 0..lines.len() {
         let line = &lines[i];
         let t = line.trim();
         if t.is_empty() {
+            continue;
+        }
+
+        if t == "#APP" {
+            in_asm = true;
+            upper32_zero = vec![false; GP_FAMILIES];
+            is_byte = vec![false; GP_FAMILIES];
+            is_16 = vec![false; GP_FAMILIES];
+            sext32 = vec![false; GP_FAMILIES];
+            continue;
+        }
+        if t == "#NO_APP" {
+            in_asm = false;
+            upper32_zero = vec![false; GP_FAMILIES];
+            is_byte = vec![false; GP_FAMILIES];
+            is_16 = vec![false; GP_FAMILIES];
+            sext32 = vec![false; GP_FAMILIES];
+            continue;
+        }
+        if in_asm {
+            // Opaque user text: carry no facts in, take no facts out,
+            // change no bytes.
             continue;
         }
 
@@ -1020,6 +1055,38 @@ mod tests {
         let mut asm = input.to_string();
         let _ = eliminate_redundant_zero_extend(&mut asm);
         assert_eq!(asm, input, "cmpl must not create an upper-32-zero fact");
+    }
+
+    #[test]
+    fn facts_do_not_cross_inline_asm_region() {
+        // The template redefines %rax through a raw encoding the textual
+        // scan cannot see; the post-asm re-extension must survive.
+        let input = "f:\n\
+             \x20   movzbl (%rdi), %eax\n\
+             \x20   #APP\n\
+             \x20   .byte 0x31, 0xc0\n\
+             \x20   #NO_APP\n\
+             \x20   movzbl %al, %eax\n";
+        let mut asm = input.to_string();
+        let changed = eliminate_redundant_zero_extend(&mut asm);
+        // The trailing movzbl must survive; also nothing inside the region
+        // may be rewritten.
+        assert!(asm.contains("#APP") && asm.contains(".byte 0x31, 0xc0"));
+        assert!(asm.matches("movzbl").count() == 2, "asm was:\n{asm}");
+        let _ = changed;
+    }
+
+    #[test]
+    fn deliberate_redundancy_inside_asm_region_is_untouched() {
+        // Kernel ALTERNATIVE() length placeholder: a deliberate
+        // `movq %rax, %rax` inside a region must reach the assembler.
+        let input = "f:\n\
+             \x20   #APP\n\
+             \x20   movq %rax, %rax\n\
+             \x20   #NO_APP\n";
+        let mut asm = input.to_string();
+        let _ = eliminate_redundant_zero_extend(&mut asm);
+        assert_eq!(asm, input, "user bytes must be immutable");
     }
 
     #[test]

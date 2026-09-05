@@ -131,6 +131,16 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             let si = seq_indices[scan];
             let line = infos[si].trimmed(store.get(si));
 
+            // SOUNDNESS: user inline asm is opaque. A template line can
+            // textually mimic every accepted relay/extension shape here
+            // (`movzbq %al, %rax` is even a documented ALTERNATIVE()
+            // length-placeholder idiom) — fusing across it would then NOP
+            // user bytes and leave the template reading a %al that the
+            // deleted setCC no longer defines. Abort the fusion instead.
+            if infos[si].kind == LineKind::InlineAsm {
+                break;
+            }
+
             // Relay hop of the setcc result: `movzbq %al, %rax` /
             // `movzbl %al, %eax` (legacy rax carrier, corpus-validated) or a
             // register relay `movzbq %al, %rX` / `movzbl %al, %rXd` (RA-homed
@@ -311,6 +321,14 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
             if infos[g].is_nop() || matches!(infos[g].kind, LineKind::Directive | LineKind::Empty) {
                 continue;
             }
+            // Inline asm may read or write flags through raw encodings the
+            // textual flags_reader/flags_full_writer predicates cannot see
+            // (`.byte $0x83, $0xd0, $0x00` is an adc). Treat the region as a
+            // flags hazard.
+            if infos[g].kind == LineKind::InlineAsm {
+                flags_hazard = true;
+                break;
+            }
             let gt = infos[g].trimmed(store.get(g)).to_string();
             if flags_reader(&gt) {
                 flags_hazard = true;
@@ -354,6 +372,25 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
     let mut lines: Vec<String> = asm.lines().map(str::to_string).collect();
     let mut changed = false;
 
+    // Inline-asm regions are user-authored bytes; this pass runs on raw text
+    // (phase 9) where `LineKind::InlineAsm` pinning no longer exists, so it
+    // must exclude every line inside a `#APP`..`#NO_APP` span from matching,
+    // and the "slot occurs exactly 3 times" census below must ignore the
+    // possibility of template text mentioning the slot (an asm mention makes
+    // the count differ, which correctly suppresses the fusion).
+    let mut in_asm = vec![false; lines.len()];
+    let mut inside = false;
+    for (idx, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t == "#APP" {
+            inside = true;
+        } else if t == "#NO_APP" {
+            inside = false;
+        }
+        in_asm[idx] = inside;
+    }
+    let asm_free = |i: usize| !in_asm[i];
+
     // First collapse a constant-false predecessor of a spilled-boolean join.
     // This turns the remaining compare path into a single-predecessor fallthrough.
     let active0: Vec<usize> = (0..lines.len())
@@ -363,6 +400,9 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
         let a = active0[p];
         let b = active0[p + 1];
         let c = active0[p + 2];
+        if !asm_free(a) || !asm_free(b) || !asm_free(c) {
+            continue;
+        }
         if lines[a].trim() != "xorl %eax, %eax" {
             continue;
         }
@@ -386,7 +426,7 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
             .filter(|i| !lines[*i].trim().is_empty())
             .take(3)
             .collect();
-        if tail.len() != 3 {
+        if tail.len() != 3 || tail.iter().any(|&i| !asm_free(i)) {
             continue;
         }
         let load = lines[tail[0]].trim();
@@ -443,6 +483,12 @@ pub(super) fn fuse_late_compare_bool_spills(asm: &mut String) -> bool {
     let mut p = 0;
     while p + 6 < active.len() {
         let ix = &active[p..p + 7];
+        // User asm bytes are immutable: no fused rewrite may touch, NOP, or
+        // consume a line inside a `#APP`..`#NO_APP` region.
+        if ix.iter().any(|&i| !asm_free(i)) {
+            p += 1;
+            continue;
+        }
         let t: Vec<&str> = ix.iter().map(|i| lines[*i].trim()).collect();
         if !(t[0].starts_with("cmp") || t[0].starts_with("test")) {
             p += 1;
