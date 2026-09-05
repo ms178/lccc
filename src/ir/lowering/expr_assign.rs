@@ -363,9 +363,18 @@ impl Lowerer {
         sso: SsoMode,
     ) {
         if bit_width >= 64 && bit_offset == 0 {
-            // Ensure the value is widened to the storage type (e.g., I32 -> I64)
-            // so that on i686 the backend doesn't store a truncated 32-bit value
-            // into a 64-bit storage unit.
+            // Full-width field: the store covers the whole storage unit, so
+            // `val` can go straight into the Store.  Every caller passes a
+            // value already converted to `storage_ty` (plain assign converts
+            // the RHS; compound assign/inc-dec convert the arithmetic result;
+            // the initializer paths convert via `field_ty`), and the previous
+            // code here re-cast it "from the machine word type" —
+            // `widened_op_type(I32)` is I32, so on x86-64 a full-width
+            // unsigned field's U64 value was re-declared as I32 and the
+            // backend emitted a `cltq` sign-extend that wiped the upper half
+            // of every `s.f += x` on a `unsigned long long f:64` (stress lab
+            // bitfield_8/16 at -O0).  Only a narrower-typed CONSTANT needs
+            // normalizing, which is a compile-time width change.
             let widened = match &val {
                 Operand::Const(c) => {
                     if let Some(v64) = c.to_i64() {
@@ -374,17 +383,7 @@ impl Lowerer {
                         val
                     }
                 }
-                _ => {
-                    // For non-constant values, emit a cast from the machine word
-                    // type (I32 on i686, I64 on x86-64) to storage_ty.
-                    let from_ty = crate::common::types::widened_op_type(IrType::I32);
-                    if from_ty == storage_ty {
-                        val
-                    } else {
-                        let cast_dest = self.emit_cast_val(val, from_ty, storage_ty);
-                        Operand::Value(cast_dest)
-                    }
-                }
+                _ => val,
             };
             let stored = self.emit_sso_store_fixup(widened, storage_ty, sso);
             self.emit(Instruction::Store {

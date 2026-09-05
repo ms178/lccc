@@ -611,6 +611,30 @@ fn parse_inplace_op(t: &str) -> Option<(bool, RegId, &str, bool)> {
     if dst_text != REG_NAMES[width][dst as usize] {
         return None;
     }
+    // THREE-OPERAND FORM (`imulq $imm, %src, %dst`): split_two_operands
+    // splits at the last top-level comma, so `src` arrives as the two-operand
+    // group `"$imm, %src"`.  Accepting that group as an "immediate" (it
+    // starts with '$') made the caller retarget the destination register
+    // while keeping the separate source register — emitting
+    // `imulq $imm, %src, %A` where the original computed `dst = dst * imm`
+    // in place.  After the caller deletes the defining copy, `%src` holds a
+    // STALE value (peephole_families shiftchain far_use repro at -Os:
+    // `imulq $7, %rsi, %rax` multiplied by the pre-copy register).  Parse
+    // the form explicitly instead: it is in-place only when the real
+    // register source equals the destination, and the caller's retarget then
+    // drops to the equivalent 2-operand form (`imulq $imm, %A`).
+    if let Some(comma) = last_top_level_comma(src.as_bytes()) {
+        let imm = src[..comma].trim();
+        let reg = src[comma + 1..].trim();
+        if !imm.starts_with('$') || imm.contains(',') {
+            return None;
+        }
+        let reg_fam = plain_gp_operand(reg)?;
+        if reg != REG_NAMES[width][reg_fam as usize] || reg_fam != dst {
+            return None;
+        }
+        return Some((is_q, dst, imm, false));
+    }
     let src_ok = src.starts_with('$')
         || plain_gp_operand(src).is_some_and(|f| src == REG_NAMES[width][f as usize]);
     if !src_ok {
@@ -1177,6 +1201,48 @@ mod tests {
         // Then the load fuses because %r9 is no longer rewritten.
         let out2 = body(&run(&out.join("\n"), fuse_load_into_alu));
         assert!(has(&out2, "xorl (%r8,%r9,4), %ebx"), "{out2:?}");
+    }
+
+    /// THREE-OPERAND IMUL FORMS.  `imulq $imm, %Tm, %Tm` (src == dst) is a
+    /// true in-place update: the fold must drop to the 2-operand form on A
+    /// (`imulq $imm, %A`) — NOT retarget the destination while keeping the
+    /// separate source register, which reads the stale pre-copy register
+    /// once the defining copy is deleted (peephole_families shiftchain
+    /// far_use repro @-Os multiplied by garbage).
+    #[test]
+    fn recurrence_3op_imul_src_equals_dst_folds_to_2op() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq $7, %rsi, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "imulq $7, %rax"), "{out:?}");
+        assert!(has(&out, "addq %r8, %rax"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("imulq $7, %rsi, %rax")), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %rax, %rsi")), "{out:?}");
+    }
+
+    /// `imulq $imm, %X, %Tm` with X != Tm: the 3-operand form never reads
+    /// its destination, so retargeting the destination to A would CLOBBER
+    /// A_old before OP2 (which reads A) executes.  The fold must refuse.
+    #[test]
+    fn recurrence_refuses_3op_imul_distinct_src() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq $7, %rcx, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "movq %rax, %rsi"), "{out:?}");
+        assert!(has(&out, "imulq $7, %rcx, %rsi"), "{out:?}");
+    }
+
+    /// Precision control: the plain 2-operand register form still folds.
+    #[test]
+    fn recurrence_2op_reg_imul_still_folds() {
+        let asm = format!(
+            "{PRO}    movq %rax, %rsi\n    imulq %rcx, %rsi\n    movq %r8, %rax\n    addq %rsi, %rax\n    movq %rax, %rdi\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_recurrence_update));
+        assert!(has(&out, "imulq %rcx, %rax"), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("movq %rax, %rsi")), "{out:?}");
     }
 
     #[test]

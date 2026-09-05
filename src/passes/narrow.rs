@@ -220,13 +220,20 @@ pub(crate) fn narrow_function(func: &mut IrFunction) -> usize {
         &mut narrowed_map,
         &asm_pinned,
     );
-    changes += narrow_binops_without_cast(
-        func,
-        &use_counts,
-        &widen_map,
-        &mut narrowed_map,
-        &asm_pinned,
-    );
+    // Phase 5 (`narrow_binops_without_cast`) was REMOVED: it rewrote an
+    // I64 And/Or/Xor to 32 bits purely from its operands' widths and never
+    // verified what its single consumer did with the result.  Every consumer
+    // that reads the full 64 bits (a reinterpret `Cast{I64->U64}`, a 64-bit
+    // Cmp, a wider BinOp) then read a register whose upper half the 32-bit
+    // op had zeroed, while the true value's upper half is the sign
+    // replication of the (sign-extended) operands — observed as a wrong
+    // `(uint64_t)((int64_t)v ^ 7)` in the narrow-family stress lab
+    // (narrow_38: v2 lost its 0xFFFFFFFF high half; five-comparison chain
+    // miscounted).  A census over the whole tests/benchmark corpus showed
+    // the pass is worth net ZERO instructions (6097 with vs 6098 without
+    // across 39 programs), so the sound move is removal, not a consumer
+    // audit.  The profitable store/cast-consumer cases remain covered by
+    // `narrow_through_stores` below, which checks every use explicitly.
     changes += narrow_through_stores(func, &widen_map, &mut narrowed_map);
     changes += narrow_cmps(func, &widen_map);
 
@@ -667,6 +674,15 @@ fn narrow_binops_with_cast(
                 // the upper bits are just copies of the sign/zero bit, and the
                 // lower bits of the result are identical to doing the shift in
                 // the narrow type.
+                //
+                // The COUNT bound for all three shift ops is enforced below by
+                // `shift_count_class`: constants in [0, T.width) narrow as
+                // usual, constants >= width fold (LShr/Shl -> 0, AShr -> count
+                // width-1), and variable counts are refused unless provably
+                // masked below the width.  (`shift_count_class` subsumes the
+                // interim width-bound gate this file carried before upstream
+                // PR #407 landed the fold-to-zero form — kept as the single,
+                // more precise authority.)
                 let is_safe_op = matches!(
                     binop_info.op,
                     IrBinOp::Add
@@ -787,161 +803,6 @@ fn narrow_binops_with_cast(
                     if dest_id <= max_id {
                         narrowed_map[dest_id] = Some(narrow_ty);
                     }
-                }
-            }
-        }
-    }
-
-    changes
-}
-
-/// Phase 5: Narrow I64 BinOps whose operands are all sub-64-bit values,
-/// even without an explicit narrowing Cast. Only safe for bitwise ops
-/// (And/Or/Xor) and only on 64-bit targets (32-bit register ops don't
-/// implicitly zero-extend to 64-bit on i686).
-fn narrow_binops_without_cast(
-    func: &mut IrFunction,
-    use_counts: &[u32],
-    widen_map: &[Option<CastInfo>],
-    narrowed_map: &mut [Option<IrType>],
-    asm_pinned: &[bool],
-) -> usize {
-    if crate::common::types::target_is_32bit() {
-        return 0;
-    }
-
-    let max_id = narrowed_map.len() - 1;
-    let mut changes = 0;
-
-    // Build load_type_map: Value -> type for Load instructions
-    let mut load_type_map: Vec<Option<IrType>> = vec![None; max_id + 1];
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Load { dest, ty, .. } = inst {
-                let id = dest.0 as usize;
-                if id <= max_id && ty.is_integer() && ty.size() < 8 {
-                    load_type_map[id] = Some(*ty);
-                }
-            }
-        }
-    }
-
-    for block in &mut func.blocks {
-        for inst in &mut block.instructions {
-            if let Instruction::BinOp {
-                dest,
-                op,
-                lhs,
-                rhs,
-                ty,
-            } = inst
-            {
-                if !(*ty == IrType::I64 || *ty == IrType::U64) {
-                    continue;
-                }
-                let dest_id = dest.0 as usize;
-                if dest_id >= use_counts.len() || use_counts[dest_id] != 1 {
-                    continue;
-                }
-                // An `asm` operand's width is an ABI contract with hand-written
-                // assembly (see `asm_pinned` in `narrow_function`): the backend
-                // sizes the operand's home from `InlineAsm::operand_types`, so
-                // narrowing its producer makes the store and the asm's load
-                // disagree.  (kernel `____memcpy`: `movl` store vs `movq` load.)
-                if dest_id < asm_pinned.len() && asm_pinned[dest_id] {
-                    continue;
-                }
-                // Only bitwise ops are safe without an explicit narrowing Cast.
-                if !matches!(op, IrBinOp::And | IrBinOp::Or | IrBinOp::Xor) {
-                    continue;
-                }
-
-                let lhs_narrow_ty =
-                    operand_narrow_type(lhs, &load_type_map, widen_map, narrowed_map);
-                let rhs_narrow_ty =
-                    operand_narrow_type(rhs, &load_type_map, widen_map, narrowed_map);
-                // Keep the narrowed operand's signedness aligned with the
-                // original 64-bit BinOp type. Picking the "other" 32-bit
-                // signedness can change the value when widened back to 64 bits
-                // (sign-extend vs zero-extend) even when low bits match
-                // (Regehr yarpgen fix 4d9913e7).
-                let op_narrow_ty = if *ty == IrType::I64 {
-                    IrType::I32
-                } else {
-                    IrType::U32
-                };
-
-                let target_ty = match (lhs_narrow_ty, rhs_narrow_ty) {
-                    (Some(lt), Some(rt)) if lt == rt && lt == op_narrow_ty => lt,
-                    (Some(t), None) => {
-                        if t == op_narrow_ty && try_narrow_const_operand(rhs, t).is_some() {
-                            t
-                        } else {
-                            continue;
-                        }
-                    }
-                    (None, Some(t)) => {
-                        if t == op_narrow_ty && try_narrow_const_operand(lhs, t).is_some() {
-                            t
-                        } else {
-                            continue;
-                        }
-                    }
-                    _ => continue,
-                };
-
-                // Only narrow to I32/U32 (sub-int types are unsafe without
-                // an explicit Cast; see Phase 4 for sub-int handling).
-                if target_ty.size() < 4 {
-                    continue;
-                }
-
-                // For AND, don't narrow when the constant operand would become
-                // all-ones for the target type. Such an AND acts as a zero-extension
-                // mask (e.g., `uint32_val & 0xFFFFFFFFUL` zero-extends to 64 bits).
-                // Narrowing would make the AND a no-op (x & all_ones = x) which the
-                // simplify pass removes, losing the zero-extension. On RISC-V, this
-                // causes sign-extended 32-bit values to leak into 64-bit results.
-                if *op == IrBinOp::And {
-                    let const_becomes_all_ones = |operand: &Operand| -> bool {
-                        if let Some(narrowed_const) = try_narrow_const_operand(operand, target_ty) {
-                            let val = match narrowed_const {
-                                IrConst::I64(v) => v,
-                                IrConst::I32(v) => v as i64,
-                                IrConst::I16(v) => v as i64,
-                                IrConst::I8(v) => v as i64,
-                                _ => return false,
-                            };
-                            target_ty.truncate_i64(val) == target_ty.truncate_i64(-1)
-                        } else {
-                            false
-                        }
-                    };
-                    if const_becomes_all_ones(lhs) || const_becomes_all_ones(rhs) {
-                        continue;
-                    }
-                }
-
-                let new_lhs = try_narrow_operand(
-                    lhs,
-                    target_ty,
-                    Some(&load_type_map),
-                    widen_map,
-                    narrowed_map,
-                );
-                let new_rhs = try_narrow_operand(
-                    rhs,
-                    target_ty,
-                    Some(&load_type_map),
-                    widen_map,
-                    narrowed_map,
-                );
-                if let (Some(nl), Some(nr)) = (new_lhs, new_rhs) {
-                    *lhs = nl;
-                    *rhs = nr;
-                    *ty = target_ty;
-                    narrowed_map[dest_id] = Some(target_ty);
-                    changes += 1;
                 }
             }
         }

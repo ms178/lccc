@@ -520,6 +520,23 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                 invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
             }
 
+            // SOUNDNESS: user inline assembly is opaque — its template may
+            // write ANY register (the emitter substitutes operands for `%0`,
+            // `%1`, ... so a template output can overwrite a register whose
+            // slot→register equality this pass is holding) and may store
+            // through ANY pointer (an "m" operand, or a register the template
+            // dereferences). Both halves of every tracked mapping die here.
+            // Falling through to `_ => {}` instead forwarded a stale register
+            // across an asm block that redefined it: `movq %rcx, 32(%rsp)`
+            // followed by an asm block reusing %rcx as its output register,
+            // then `movq 32(%rsp), %r11` — rewritten to `movq %rcx, %r11`,
+            // feeding the asm's fresh output where the pre-asm value was
+            // required (observed as a framecall_1 miscompile from the
+            // peephole_families harness).
+            LineKind::InlineAsm => {
+                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
+            }
+
             // SOUNDNESS: push/pop shift RSP, so every %rsp-relative slot
             // offset in the shifted window refers to a different physical
             // slot. Any mapping recorded before the push is stale after it;
@@ -573,19 +590,97 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             // valid (a later GP reload of the same slot may still forward).
             LineKind::LoadXmmRbp { .. } => {}
 
-            // Inline asm is opaque: its outputs and clobbers may redefine any
-            // register and it may store through any pointer.  Every
-            // slot<->register mapping is stale afterwards.  (Stress-lab
-            // framecall family: `p2` spilled to 32(%rsp) from %rcx, a later
-            // `#APP` block wrote a different value into %rcx, and the reload
-            // was forwarded as `movq %rcx, %r11`.)
-            LineKind::InlineAsm => {
-                invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
-            }
-
             _ => {}
         }
     }
 
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    /// Build line infos with inline-asm regions pinned exactly like the
+    /// peephole driver's `pin_inline_asm_regions` does.
+    fn build_pinned(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut in_asm = false;
+        for i in 0..infos.len() {
+            let t = infos[i].trimmed(store.get(i)).to_string();
+            if t == "#APP" {
+                in_asm = true;
+                continue;
+            }
+            if t == "#NO_APP" {
+                in_asm = false;
+                continue;
+            }
+            if in_asm {
+                infos[i] = LineInfo {
+                    kind: LineKind::InlineAsm,
+                    ext_kind: ExtKind::None,
+                    trim_start: infos[i].trim_start,
+                    has_indirect_mem: true,
+                    rbp_offset: RBP_OFFSET_NONE,
+                    reg_refs: u16::MAX,
+                    pinned: true,
+                };
+            }
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn inline_asm_output_register_kills_slot_forwarding() {
+        // The exact framecall_1 shape: a spill of %rcx, an asm block whose
+        // output operand lands in %rcx, then a reload of the slot. The load
+        // must survive verbatim — forwarding it to %rcx would read the asm's
+        // fresh output where the pre-asm value is required.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rcx, 32(%rsp)\n",
+            "#APP\n",
+            "    movq %rdx, %rcx\n",
+            "    addq $3, %rcx\n",
+            "#NO_APP\n",
+            "    movq 32(%rsp), %r11\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        let _ = global_store_forwarding(&mut store, &mut infos);
+        let reload_idx = (0..store.len())
+            .find(|&i| store.get(i).contains("movq 32(%rsp), %r11"))
+            .expect("slot reload must survive");
+        assert!(
+            !infos[reload_idx].is_nop(),
+            "the slot reload must not be rewritten to the asm output register"
+        );
+    }
+
+    #[test]
+    fn forwarding_within_plain_straight_line_still_works() {
+        // Same shape without the asm region: the load IS forwardable.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rcx, 32(%rsp)\n",
+            "    movl %edx, %edx\n",
+            "    movq 32(%rsp), %r11\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        assert!(global_store_forwarding(&mut store, &mut infos));
+        assert!(
+            (0..store.len()).any(|i| store.get(i).contains("movq %rcx, %r11")),
+            "plain straight-line forwarding must still fire"
+        );
+    }
 }

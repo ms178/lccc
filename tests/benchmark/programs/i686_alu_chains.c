@@ -73,7 +73,12 @@ int main(int argc, char **argv) {
         u32 r = ks[k].fn(ks[k].seed, n);
         double t1 = now_ns();
         total = total * 31u + r;
-        printf("%-8s %08x %7.3f\n", ks[k].name, r, (t1 - t0) / n);
+        /* Checksums on stdout (the byte-compared regression signal);
+         * wall-clock per iteration on stderr — it differs on every run and
+         * across compilers, which used to flip every stdout comparison into
+         * a coin toss (regression suite + peephole A/B gate). */
+        fprintf(stderr, "%-8s %11.3f\n", ks[k].name, (t1 - t0) / n);
+        printf("%-8s %08x\n", ks[k].name, r);
     }
     printf("TOTAL %08x\n", total);
     return 0;

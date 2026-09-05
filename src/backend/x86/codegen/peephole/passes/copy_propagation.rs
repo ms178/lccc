@@ -49,6 +49,13 @@ fn try_propagate_into(
         return false;
     }
 
+    // Defense in depth: a line classified as inline asm must never be
+    // rewritten even if some future caller reaches here with a textually
+    // plausible template line — user bytes are immutable.
+    if infos[j].kind == LineKind::InlineAsm {
+        return false;
+    }
+
     // The instruction must reference the destination register
     if infos[j].reg_refs & (1u16 << dst_id) == 0 {
         return false;
@@ -164,6 +171,20 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
         }
 
         if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+
+        // User inline assembly is opaque: its template may redefine any
+        // register and its bytes must reach the assembler untouched.  Both
+        // propagation into the line (a template line can textually name a
+        // tracked copy's source — the `src == dest` reader-retargeting arm
+        // below would rewrite the user's own instruction) and copy state
+        // ACROSS the region (the emitter substitutes template operands the
+        // classifier cannot attribute) are forbidden.  Kill all identities.
+        if infos[i].kind == LineKind::InlineAsm {
+            copy_src = [REG_NONE; 16];
+            copy_src32 = [REG_NONE; 16];
             i += 1;
             continue;
         }
@@ -359,4 +380,87 @@ pub(super) fn propagate_register_copies(store: &mut LineStore, infos: &mut [Line
         i += 1;
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn build_pinned(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut in_asm = false;
+        for i in 0..infos.len() {
+            let t = infos[i].trimmed(store.get(i)).to_string();
+            if t == "#APP" {
+                in_asm = true;
+                continue;
+            }
+            if t == "#NO_APP" {
+                in_asm = false;
+                continue;
+            }
+            if in_asm {
+                infos[i] = LineInfo {
+                    kind: LineKind::InlineAsm,
+                    ext_kind: ExtKind::None,
+                    trim_start: infos[i].trim_start,
+                    has_indirect_mem: true,
+                    rbp_offset: RBP_OFFSET_NONE,
+                    reg_refs: u16::MAX,
+                    pinned: true,
+                };
+            }
+        }
+        (store, infos)
+    }
+
+    #[test]
+    fn copy_state_does_not_cross_inline_asm() {
+        // `movq %rax, %rcx` copies; the asm block redefines %rax (and %rcx)
+        // opaquely; the consumer must keep reading %rcx, never be renamed to
+        // %rax.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %rcx\n",
+            "#APP\n",
+            "    movq %rdx, %rcx\n",
+            "#NO_APP\n",
+            "    addq $1, %rcx\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        propagate_register_copies(&mut store, &mut infos);
+        assert!(
+            !(0..store.len()).any(|i| store.get(i).contains("addq $1, %rax")),
+            "consumer must not be renamed across the asm region"
+        );
+    }
+
+    #[test]
+    fn inline_asm_lines_are_never_rewritten() {
+        // A tracked copy whose source the template textually names must not
+        // leak into the user's asm bytes.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %rcx\n",
+            "#APP\n",
+            "    addq $1, %rax\n",
+            "#NO_APP\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build_pinned(asm);
+        propagate_register_copies(&mut store, &mut infos);
+        assert!(
+            (0..store.len()).any(|i| store.get(i).trim() == "addq $1, %rax"),
+            "user asm bytes are immutable"
+        );
+    }
 }

@@ -69,7 +69,12 @@ for src in "$REPO"/tests/benchmark/programs/*.c; do
            && ! "$GCC_BIN" "$lev" "$src" -o "$ref_bin" 2>/dev/null; then
             skip=$((skip+1)); continue
         fi
-        ref_out=$(timeout 300 "$ref_bin" 2>&1); ref_ec=$?
+        # STDOUT ONLY.  The benchmark programs log wall-clock timings to
+        # stderr (they differ on every run and across compilers); the
+        # byte-compared correctness signal is stdout.  Capturing 2>&1 here
+        # flipped every timing-logging program's comparison into a coin
+        # toss (i686_alu_chains failed 4/4 levels on identical checksums).
+        ref_out=$(timeout 300 "$ref_bin" 2>/dev/null); ref_ec=$?
         if [[ $ref_ec -eq 124 ]]; then skip=$((skip+1)); continue; fi
 
         bin="$WORK/$name$lev"
@@ -77,7 +82,7 @@ for src in "$REPO"/tests/benchmark/programs/*.c; do
             echo "FAIL  $name $lev (build: $(head -2 "$WORK/cc.err" | tr '\n' ' '))"
             fail=$((fail+1)); FAILED+=("$name$lev:build"); continue
         fi
-        out=$(timeout 300 "$bin" 2>&1); ec=$?
+        out=$(timeout 300 "$bin" 2>/dev/null); ec=$?
         if [[ $ec -eq 124 ]]; then
             echo "FAIL  $name $lev (timeout)"
             fail=$((fail+1)); FAILED+=("$name$lev:timeout"); continue

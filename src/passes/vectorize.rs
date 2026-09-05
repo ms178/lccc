@@ -5246,6 +5246,7 @@ fn transform_stencil_vector(
                 disp_max,
             }],
             elem_size * vec_width as i64,
+            elem_size as i64,
             rem_header_label,
             rem_iv_phi,
             Operand::Const(int_const(pattern.iv_start)),
@@ -11963,6 +11964,7 @@ fn transform_map_vector(
             0,
             &checks,
             elem_size as i64 * vec_width as i64,
+            elem_size as i64,
             rem_header_label,
             rem_iv_phi,
             Operand::Const(zero),
@@ -12044,6 +12046,7 @@ fn emit_alias_guards(
     dst_disp: i64,
     checks: &[AliasCheck],
     window_bytes: i64,
+    elem_bytes: i64,
     rem_header_label: BlockId,
     rem_iv_phi: Value,
     rem_start: Operand,
@@ -12087,9 +12090,30 @@ fn emit_alias_guards(
         d_raw
     };
 
+    // Pre-filter the checks by their element-granular overlap span; a check
+    // whose aligned-unsafe set is empty needs no versioning block at all.
+    let effective: Vec<(&AliasCheck, i64)> = checks
+        .iter()
+        .filter_map(|check| {
+            let spread = check.disp_max - check.disp_min;
+            let unsafe_hi = window_bytes + spread - 1;
+            if unsafe_hi < elem_bytes {
+                return None;
+            }
+            // Aligned unsafe distances are the multiples of `elem_bytes` in
+            // [1, unsafe_hi] = [e, floor(unsafe_hi/e)*e]; one unsigned
+            // compare covers them.
+            let span = (unsafe_hi / elem_bytes - 1) * elem_bytes + 1;
+            (span > 0).then_some((check, span))
+        })
+        .collect();
+    if effective.is_empty() {
+        return 0;
+    }
+
     let mut cur_idx = preheader_idx;
-    let n = checks.len();
-    for (i, check) in checks.iter().enumerate() {
+    let n = effective.len();
+    for (i, (check, span)) in effective.iter().enumerate() {
         let s_raw = fresh();
         pending.push(Instruction::Cast {
             dest: s_raw,
@@ -12118,20 +12142,30 @@ fn emit_alias_guards(
             rhs: Operand::Value(s),
             ty: IrType::I64,
         });
-        let distance_m1 = fresh();
+        // ELEMENT-GRANULAR OVERLAP WINDOW.  The streams are typed pointers,
+        // so a partial-element overlap (distance not a multiple of the
+        // element size) would mean a misaligned lvalue — undefined
+        // behaviour.  Every mainstream vectorizer (GCC/Clang/ICX) exploits
+        // that contract and only versions distances that are whole
+        // elements: GCC's guard is scalar iff  e <= d <= (W-1)*e.  The old
+        // byte-granular window here (1 <= d <= W*e - 1) additionally took
+        // the scalar path for distances like +2 bytes on float streams,
+        // diverging from the ecosystem on exactly the UB shapes the
+        // vec_alias_versioning regression exercises (`scale_f[+2B]`).
+        let distance_e = fresh();
         pending.push(Instruction::BinOp {
-            dest: distance_m1,
+            dest: distance_e,
             op: IrBinOp::Sub,
             lhs: Operand::Value(distance),
-            rhs: i64c(1),
+            rhs: i64c(elem_bytes),
             ty: IrType::I64,
         });
         let unsafe_overlap = fresh();
         pending.push(Instruction::Cmp {
             dest: unsafe_overlap,
             op: IrCmpOp::Ult,
-            lhs: Operand::Value(distance_m1),
-            rhs: i64c(window_bytes + (check.disp_max - check.disp_min) - 1),
+            lhs: Operand::Value(distance_e),
+            rhs: i64c(*span),
             ty: IrType::I64,
         });
         changes += pending.len();
