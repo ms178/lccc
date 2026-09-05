@@ -426,7 +426,15 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         reg_hints,
     };
     // Debug: CCC_NO_REGALLOC forces pure slot-based codegen (A/B experiments).
-    let alloc_result = if std::env::var("CCC_NO_REGALLOC").is_ok() {
+    // CCC_NO_REGALLOC_FUNC=<name,...> does the same for the listed functions
+    // only, so a whole-TU miscompile that disappears under CCC_NO_REGALLOC
+    // (the preboot ZSTD decoder was one) can be bisected to a single
+    // function without touching the source. Names are compared exactly.
+    let no_regalloc = std::env::var("CCC_NO_REGALLOC").is_ok()
+        || std::env::var("CCC_NO_REGALLOC_FUNC")
+            .map(|v| v.split(',').any(|n| n.trim() == func.name))
+            .unwrap_or(false);
+    let alloc_result = if no_regalloc {
         super::super::regalloc::RegAllocResult {
             assignments: Default::default(),
             accumulator_assignments: super::super::regalloc::analyze_accumulator_assignments(

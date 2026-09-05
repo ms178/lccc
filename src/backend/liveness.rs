@@ -249,6 +249,109 @@ impl BitSet {
     }
 }
 
+/// One value's def/use footprint inside one block.
+#[derive(Clone, Copy, Debug)]
+struct BlockTouch {
+    block: u32,
+    /// First program point in `block` that defines or reads the value.
+    first: u32,
+    /// Last program point in `block` that defines or reads the value.
+    last: u32,
+    /// `first` is a definition (the value is born there, not live-in).
+    first_is_def: bool,
+}
+
+/// Per-value, per-block def/use footprints — the local evidence
+/// [`build_segments`] needs in addition to the block-level `live_in` /
+/// `live_out` bits.
+///
+/// The global `def_points[d]` (FIRST def) and `last_use_points[d]` (LAST
+/// use) are enough for the fat `[def, last_use]` interval, but a hole-aware
+/// segment must be produced for EVERY block in which the value is defined
+/// or read, including blocks where it is neither live-in nor live-out.
+/// Phi-eliminated loop-carried values are the canonical shape: the latch
+/// re-defines the value (`Copy v_phi ← v_next`) and reads it (the rotated
+/// loop condition) with the value dead at both block boundaries. Deriving
+/// segments from live-in/live-out bits alone left that block as a hole, and
+/// the segment scan handed the value's register to a temporary between the
+/// latch copy and the condition (preboot ZSTD `HUF_decompress4X2` on the
+/// non-BMI2 path: `endSignal` was clobbered by the `op4 < oend` compare, the
+/// 4-stream Huffman loop exited early, and the kernel decompressor reported
+/// "ZSTD-compressed data is corrupt").
+///
+/// Every writer of `last_use_points` / `def_points` records the same event
+/// here, so `touch(d, b)` is exactly the set of points the fat interval was
+/// built from, split by block.
+struct BlockTouches {
+    per_value: Vec<Vec<BlockTouch>>,
+}
+
+impl BlockTouches {
+    fn new(num_values: usize) -> Self {
+        Self {
+            per_value: vec![Vec::new(); num_values],
+        }
+    }
+
+    /// Record that `dense` is defined (`is_def`) or read at `point` inside
+    /// `block`. The main walk visits blocks in layout order with increasing
+    /// points, so the common case is an update of the last entry; the
+    /// post-walk extensions (folded reads, phi-incoming copies, F128 source
+    /// pointers) may hit any earlier block and fall back to a search.
+    fn add(&mut self, dense: usize, block: usize, point: u32, is_def: bool) {
+        let block = block as u32;
+        let list = &mut self.per_value[dense];
+        let slot = match list.last_mut() {
+            Some(t) if t.block == block => Some(t),
+            _ => list.iter_mut().rev().find(|t| t.block == block),
+        };
+        match slot {
+            Some(t) => {
+                if point < t.first || (point == t.first && is_def) {
+                    t.first = point;
+                    t.first_is_def = is_def;
+                }
+                if point > t.last {
+                    t.last = point;
+                }
+            }
+            None => list.push(BlockTouch {
+                block,
+                first: point,
+                last: point,
+                first_is_def: is_def,
+            }),
+        }
+    }
+
+    fn get(&self, dense: usize, block: usize) -> Option<BlockTouch> {
+        let block = block as u32;
+        self.per_value[dense]
+            .iter()
+            .find(|t| t.block == block)
+            .copied()
+    }
+
+    /// `block -> dense values touched in it` (for the segment builder).
+    fn by_block(&self, num_blocks: usize) -> Vec<Vec<usize>> {
+        let mut out: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        for (dense, list) in self.per_value.iter().enumerate() {
+            for t in list {
+                out[t.block as usize].push(dense);
+            }
+        }
+        out
+    }
+}
+
+/// Block index containing program point `point` (`block_start_points` is
+/// sorted ascending and every point belongs to exactly one block).
+fn block_of_point(block_start_points: &[u32], point: u32) -> usize {
+    block_start_points
+        .partition_point(|&s| s <= point)
+        .saturating_sub(1)
+}
+
 /// Intermediate state from Phase 1 (program points + gen/kill).
 struct ProgramPointState {
     block_start_points: Vec<u32>,
@@ -264,6 +367,8 @@ struct ProgramPointState {
     copy_src: FxHashMap<u32, Vec<u32>>,
     call_points: Vec<u32>,
     num_points: u32,
+    /// Per-value, per-block def/use footprints (see [`BlockTouches`]).
+    touches: BlockTouches,
 }
 
 /// Compute live intervals for all non-alloca values in a function.
@@ -306,14 +411,17 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &mut ps.last_use_points,
         &mut ps.block_gen,
         &mut folded_read_points,
+        &mut ps.touches,
     );
 
     apply_f128_source_gen(
         func,
         &ps.f128_loads,
         &id_to_dense,
+        &ps.block_start_points,
         &mut ps.last_use_points,
         &mut ps.block_gen,
+        &mut ps.touches,
     );
 
     let successors = build_successor_lists(func, num_blocks, &ps.block_id_to_idx);
@@ -361,6 +469,7 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
         &value_ids,
         &raw_def,
         &raw_last,
+        &ps.touches,
         &live_in,
         &live_out,
         &ps.block_start_points,
@@ -369,11 +478,11 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     extend_segments_across_setjmp(&ps.setjmp_points, ps.num_points, &mut segments);
     resync_f128_segments(&ps.f128_loads, &mut segments);
 
-    if let Some(target) = debug_live_target() {
+    if let Some(target) = debug_live_target().filter(|_| debug_live_func_matches(&func.name)) {
         if let Some(&dense) = id_to_dense.get(&target) {
             eprintln!(
-                "[LIVE] v{} def={} last_use={}",
-                target, ps.def_points[dense], ps.last_use_points[dense]
+                "[LIVE] fn={} v{} def={} last_use={}",
+                func.name, target, ps.def_points[dense], ps.last_use_points[dense]
             );
             for (bi, b) in func.blocks.iter().enumerate() {
                 let li = live_in[bi].contains(dense);
@@ -411,6 +520,15 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
     }
 }
 
+/// `CCC_DEBUG_LIVE_FUNC=<name>` restricts the `CCC_DEBUG_LIVE` dump to one
+/// function (value ids are per-function, so a TU-wide dump is mostly noise).
+fn debug_live_func_matches(name: &str) -> bool {
+    static F: OnceLock<Option<String>> = OnceLock::new();
+    F.get_or_init(|| std::env::var("CCC_DEBUG_LIVE_FUNC").ok())
+        .as_deref()
+        .is_none_or(|f| f == name)
+}
+
 fn debug_live_target() -> Option<u32> {
     static T: OnceLock<Option<u32>> = OnceLock::new();
     *T.get_or_init(|| {
@@ -418,6 +536,13 @@ fn debug_live_target() -> Option<u32> {
             .ok()
             .and_then(|s| s.parse().ok())
     })
+}
+
+/// `CCC_DEBUG_LIVE_TRACE=1` (with `CCC_DEBUG_LIVE=<v>`): print each raw
+/// def/use event that touches the traced value, as it is recorded.
+fn debug_live_trace_enabled() -> bool {
+    static T: OnceLock<bool> = OnceLock::new();
+    *T.get_or_init(|| std::env::var_os("CCC_DEBUG_LIVE_TRACE").is_some())
 }
 
 /// Single IR walk: alloca set + dense remap of every non-alloca value.
@@ -493,6 +618,7 @@ fn assign_program_points(
     let mut f128_loads: Vec<(u32, u32)> = Vec::new();
     let mut copy_src: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut call_points: Vec<u32> = Vec::new();
+    let mut touches = BlockTouches::new(num_values);
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
         block_id_to_idx.insert(block.label.0, block_idx);
@@ -523,12 +649,28 @@ fn assign_program_points(
                 }
             }
 
+            if let Some(t) = debug_live_target()
+                .filter(|_| debug_live_trace_enabled() && debug_live_func_matches(&func.name))
+            {
+                let mut hit = false;
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        hit |= v.0 == t;
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| hit |= v.0 == t);
+                if hit || inst.dest().is_some_and(|d| d.0 == t) {
+                    eprintln!("[LIVE-TRACE] pt={} block={} {:?}", point, block_idx, inst);
+                }
+            }
             record_instruction_uses_dense(
                 inst,
                 point,
+                block_idx,
                 alloca_set,
                 id_to_dense,
                 &mut last_use_points,
+                &mut touches,
             );
 
             // Kill *promoted* InlineAsm outputs (first def here) before gen
@@ -543,6 +685,7 @@ fn assign_program_points(
                             if def_points[dense] == u32::MAX {
                                 def_points[dense] = point;
                                 kill.insert(dense);
+                                touches.add(dense, block_idx, point, true);
                             }
                         }
                     }
@@ -558,6 +701,7 @@ fn assign_program_points(
                             def_points[dense] = point;
                         }
                         kill.insert(dense);
+                        touches.add(dense, block_idx, point, true);
                     }
                 }
             }
@@ -568,9 +712,11 @@ fn assign_program_points(
         record_terminator_uses_dense(
             &block.terminator,
             point,
+            block_idx,
             alloca_set,
             id_to_dense,
             &mut last_use_points,
+            &mut touches,
         );
         collect_terminator_gen_dense(&block.terminator, alloca_set, id_to_dense, &kill, &mut gen);
         block_end_points.push(point);
@@ -600,6 +746,7 @@ fn assign_program_points(
                                     *entry = pred_end;
                                 }
                                 block_gen[pred_idx].insert(dense);
+                                touches.add(dense, pred_idx, pred_end, false);
                             }
                         }
                     }
@@ -621,6 +768,7 @@ fn assign_program_points(
         copy_src,
         call_points,
         num_points: point,
+        touches,
     }
 }
 
@@ -720,6 +868,7 @@ fn extend_gep_base_liveness(
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
     folded_read_points: &mut FxHashMap<u32, Vec<u32>>,
+    touches: &mut BlockTouches,
 ) -> FxHashSet<u32> {
     let mut gep_info: FxHashMap<u32, (u32, GepOffset)> = FxHashMap::default();
 
@@ -961,6 +1110,7 @@ fn extend_gep_base_liveness(
                                 last_use_points,
                                 block_gen,
                                 folded_read_points,
+                                touches,
                             );
                             folded_bases.insert(idx_id);
                         } else if let GepOffset::Const(off) = *offset {
@@ -983,6 +1133,7 @@ fn extend_gep_base_liveness(
                             last_use_points,
                             block_gen,
                             folded_read_points,
+                            touches,
                         );
                         folded_bases.insert(base_id);
                         hops += 1;
@@ -1025,6 +1176,7 @@ fn extend_use_following_copies(
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
     read_points: &mut FxHashMap<u32, Vec<u32>>,
+    touches: &mut BlockTouches,
 ) {
     let mut stack = vec![start_id];
     let mut seen: FxHashSet<u32> = FxHashSet::default();
@@ -1040,6 +1192,7 @@ fn extend_use_following_copies(
             if *entry == u32::MAX || point > *entry {
                 *entry = point;
             }
+            touches.add(dense, block_idx, point, false);
             // The folded access re-reads this value's register at `point`
             // with no IR operand — record the exact point for the
             // phi-coalesce destructive-update veto (phi_live_in_window).
@@ -1072,8 +1225,10 @@ fn apply_f128_source_gen(
     func: &IrFunction,
     f128_loads: &[(u32, u32)],
     id_to_dense: &FxHashMap<u32, usize>,
+    block_start_points: &[u32],
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
+    touches: &mut BlockTouches,
 ) {
     if f128_loads.is_empty() {
         return;
@@ -1089,6 +1244,7 @@ fn apply_f128_source_gen(
             if *ptr_entry == u32::MAX || dest_last > *ptr_entry {
                 *ptr_entry = dest_last;
             }
+            touches.add(pd, block_of_point(block_start_points, dest_last), dest_last, false);
         }
     }
 
@@ -1183,9 +1339,11 @@ fn resync_f128_segments(f128_loads: &[(u32, u32)], segments: &mut Vec<LiveInterv
 fn record_instruction_uses_dense(
     inst: &Instruction,
     point: u32,
+    block_idx: usize,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     last_use: &mut [u32],
+    touches: &mut BlockTouches,
 ) {
     let mut record = |vid: u32| {
         if alloca_set.contains(&vid) {
@@ -1196,6 +1354,7 @@ fn record_instruction_uses_dense(
             if *entry == u32::MAX || point > *entry {
                 *entry = point;
             }
+            touches.add(dense, block_idx, point, false);
         }
     };
     for_each_operand_in_instruction(inst, |op| {
@@ -1209,9 +1368,11 @@ fn record_instruction_uses_dense(
 fn record_terminator_uses_dense(
     term: &Terminator,
     point: u32,
+    block_idx: usize,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     last_use: &mut [u32],
+    touches: &mut BlockTouches,
 ) {
     for_each_operand_in_terminator(term, |op| {
         if let Operand::Value(v) = op {
@@ -1223,6 +1384,7 @@ fn record_terminator_uses_dense(
                 if *entry == u32::MAX || point > *entry {
                     *entry = point;
                 }
+                touches.add(dense, block_idx, point, false);
             }
         }
     });
@@ -1494,17 +1656,37 @@ fn extend_intervals_from_liveness(
     }
 }
 
-/// Hole-aware segments from raw def/use + block live_in/live_out.
+/// Hole-aware segments from per-block def/use footprints + block
+/// live_in/live_out.
 ///
-/// A block where the value is neither live-in nor live-out (and has no
-/// local def/use) is a **hole**. Adjacent covered blocks merge. Never
-/// under-approximates: unknown `!live_in && live_out` without a local def
-/// covers the whole block.
+/// A block where the value is neither live-in nor live-out and has no local
+/// def/use is a **hole**. Adjacent covered blocks merge. Never
+/// under-approximates:
+///
+/// * a block the value is live-in to is covered from its start, a block it
+///   is live-out of is covered to its end;
+/// * a block with a local footprint is covered from its first local def
+///   (or the block start when the first local event is a read — an
+///   upward-exposed read is live-in anyway, so this only over-approximates)
+///   to its last local def/use;
+/// * on top of that the historical envelope derived from the global
+///   `raw_def` / `raw_last` points is kept as a floor in every block the
+///   value is live-in to or live-out of, so no coverage this builder
+///   produced before the per-block footprints existed is ever removed
+///   (a `live_in && !live_out` block stays covered to its end where the
+///   last local read would do; tightening that is a separate, measurable
+///   change — see engineering notes).
+///
+/// The per-block footprints are what make multi-def (phi-eliminated) values
+/// correct: without them a latch block that re-defines and reads the value
+/// while it is dead at both boundaries was a hole (see [`BlockTouches`]).
+#[allow(clippy::too_many_arguments)]
 fn build_segments(
     num_blocks: usize,
     value_ids: &[u32],
     raw_def: &[u32],
     raw_last: &[u32],
+    touches: &BlockTouches,
     live_in: &[BitSet],
     live_out: &[BitSet],
     block_starts: &[u32],
@@ -1518,6 +1700,7 @@ fn build_segments(
     let mut cover: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nvals];
     let mut seen = vec![false; nvals];
     let mut touched: Vec<usize> = Vec::new();
+    let touched_by_block = touches.by_block(num_blocks);
 
     for b in 0..num_blocks {
         let bs = block_starts[b];
@@ -1532,57 +1715,74 @@ fn build_segments(
 
             let li = live_in[b].contains(dense);
             let lo = live_out[b].contains(dense);
+            let touch = touches.get(dense, b);
+
+            // Historical envelope from the global first-def / last-use
+            // points (kept as a floor, see the doc comment). Blocks that
+            // are neither live-in nor live-out were never considered by
+            // the boundary-only builder, so they carry no envelope: their
+            // coverage is exactly the local footprint.
             let def = raw_def[dense];
             let last = raw_last[dense];
             let def_in = def != u32::MAX && def >= bs && def <= be;
             let last_in = last != u32::MAX && last >= bs && last <= be;
-
-            if !li && !lo && !def_in && !last_in {
-                return;
-            }
-
-            let s = if li {
-                bs
-            } else if def_in {
-                def
+            let envelope = if li || lo {
+                let s = if li {
+                    bs
+                } else if def_in {
+                    def
+                } else {
+                    bs
+                };
+                let e = if lo {
+                    be
+                } else if last_in {
+                    last
+                } else if def_in {
+                    def
+                } else {
+                    be
+                };
+                Some((s, e))
             } else {
-                // use or live_out without a recorded local def: over-approx.
-                bs
+                None
             };
-            let e = if lo {
-                be
-            } else if last_in {
-                last
-            } else if def_in {
-                def
-            } else {
-                be
+
+            // Local footprint: born at the first local def (or live-in),
+            // dead after the last local event (or live-out).
+            let local = touch.map(|t| {
+                let s = if li {
+                    bs
+                } else if t.first_is_def {
+                    t.first
+                } else {
+                    bs
+                };
+                let e = if lo { be } else { t.last };
+                (s, e)
+            });
+
+            let piece = match (envelope, local) {
+                (Some((es, ee)), Some((ls, le))) => Some((es.min(ls), ee.max(le))),
+                (Some(p), None) | (None, Some(p)) => Some(p),
+                (None, None) => None,
             };
-            if e >= s {
-                cover[dense].push((s, e));
+            if let Some((s, e)) = piece {
+                if e >= s {
+                    cover[dense].push((s, e));
+                }
             }
         };
 
         live_in[b].for_each_set_bit(&mut consider);
         live_out[b].for_each_set_bit(&mut consider);
+        for &dense in &touched_by_block[b] {
+            consider(dense);
+        }
 
         for d in touched.drain(..) {
             seen[d] = false;
         }
-    }
-
-    // Same-block dead temps: never live_in/out, still need [def, last].
-    for d in 0..nvals {
-        if !cover[d].is_empty() {
-            continue;
-        }
-        let def = raw_def[d];
-        if def == u32::MAX {
-            continue;
-        }
-        let last = raw_last[d];
-        let last = if last == u32::MAX { def } else { last.max(def) };
-        cover[d].push((def, last));
     }
 
     let mut result: Vec<LiveInterval> = Vec::with_capacity(nvals);
@@ -2301,6 +2501,107 @@ mod tests {
         assert!(
             fat.0 <= b1_lo && fat.1 >= b1_lo,
             "fat interval must remain conservative: {fat:?}"
+        );
+    }
+
+    /// A phi-eliminated loop-carried value that is re-defined AND read in
+    /// the latch block while being live-in to and live-out of nothing there
+    /// (the rotated `while ((op < oend) & endSignal)` shape of zstd's
+    /// HUF_decompress4X2). The segment builder must cover [copy, read] in
+    /// that block; a hole there let the register allocator reuse the
+    /// value's register between the copy and the compare (preboot ZSTD
+    /// "compressed data is corrupt" on non-BMI2 CPUs).
+    #[test]
+    fn latch_block_redef_and_read_is_covered() {
+        // block 0: v0 = 1; br 1
+        // block 1: v1 = v0 & v9; condbr v1 -> 2 / 3        (header)
+        // block 2: v2 = call(); v0 = v2 (copy); v3 = v0 & v9; condbr v3 -> 2 / 3
+        // block 3: ret v9
+        let mut func = IrFunction::new("latch".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(9),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I32(1)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(1),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Value(Value(9)),
+                ty: IrType::I32,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::Call {
+                    func: "reload".to_string(),
+                    info: empty_call_info(Some(Value(2))),
+                },
+                Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Value(Value(2)),
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(9)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(3)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(9)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 10;
+
+        let result = compute_live_intervals(&func);
+        let b2_lo = result.block_starts[2];
+        // Points in block 2: call = b2_lo, copy = b2_lo+1, and = b2_lo+2.
+        let copy_pt = b2_lo + 1;
+        let read_pt = b2_lo + 2;
+        let segs: Vec<(u32, u32)> = result
+            .segments
+            .iter()
+            .filter(|iv| iv.value_id == 0)
+            .map(|iv| (iv.start, iv.end))
+            .collect();
+        assert!(
+            segs.iter().any(|&(s, e)| s <= copy_pt && read_pt <= e),
+            "v0 must be covered from the latch copy to the rotated read: segs={segs:?}"
+        );
+        // And the hole before the copy is real: v0 is dead across the call.
+        assert!(
+            !segs.iter().any(|&(s, e)| s <= b2_lo && b2_lo <= e),
+            "v0 must not be live at the latch call: segs={segs:?}"
         );
     }
 
