@@ -2564,6 +2564,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             candidate.copy_idx,
         ) > 0;
         if !phi_window_clobbers_caller_saved(func, candidate) && !src_has_other_consumers {
+            if env_on("CCC_DEBUG_PHI_COALESCE") {
+                eprintln!(
+                    "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
+                    func.name,
+                    candidate.backedge_src,
+                    candidate.phi_dest,
+                    candidate.block_idx,
+                    candidate.copy_idx
+                );
+            }
             eligible.remove(&candidate.backedge_src);
         }
     }
@@ -4509,6 +4519,26 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     use_count.get(&iv.value_id).copied().unwrap_or(0),
                     reason
                 );
+            }
+        }
+    }
+
+    // Bisect aid: CCC_RA_DROP=<vid,...> (scoped by CCC_RA_DROP_FUNC=<name>)
+    // demotes the listed values to stack slots after every allocation
+    // authority has run. Dropping a home is always sound, so a delta-debug
+    // over the home list isolates the one value whose register home the
+    // emitted code violates (used to localize the preboot-ZSTD failures).
+    if let Ok(list) = std::env::var("CCC_RA_DROP") {
+        let scoped = std::env::var("CCC_RA_DROP_FUNC").is_ok_and(|f| f != func.name);
+        if !scoped {
+            for tok in list.split(',') {
+                let tok = tok.trim();
+                let tok = tok.strip_prefix('v').unwrap_or(tok);
+                if let Ok(v) = tok.parse::<u32>() {
+                    if assignments.remove(&v).is_some() && env_on("CCC_DEBUG_RA") {
+                        eprintln!("[RA-DROP] fn={} v{} demoted to slot", func.name, v);
+                    }
+                }
             }
         }
     }
@@ -6963,8 +6993,42 @@ fn apply_phi_coalesce_assignments(
                 continue;
             }
         }
+        // Bisect aid: CCC_PHI_COALESCE_SKIP=<src-id,...> vetoes the
+        // destructive update for the listed backedge sources (optionally
+        // scoped with CCC_PHI_COALESCE_FUNC=<function name>).
+        if phi_coalesce_skip_listed(func, backedge_src) {
+            if env_on("CCC_DEBUG_PHI_COALESCE") {
+                eprintln!(
+                    "[PHI_COALESCE] fn={} SKIPPED (env) dest=v{} src=v{} r{}",
+                    func.name, phi_dest, backedge_src, reg.0
+                );
+            }
+            continue;
+        }
+        if env_on("CCC_DEBUG_PHI_COALESCE") {
+            eprintln!(
+                "[PHI_COALESCE] fn={} ASSIGN dest=v{} src=v{} r{}",
+                func.name, phi_dest, backedge_src, reg.0
+            );
+        }
         assignments.insert(backedge_src, reg);
     }
+}
+
+/// `CCC_PHI_COALESCE_SKIP` / `CCC_PHI_COALESCE_FUNC` bisect helper (see
+/// `apply_phi_coalesce_assignments`). Off unless the variable is set.
+fn phi_coalesce_skip_listed(func: &IrFunction, backedge_src: u32) -> bool {
+    let Ok(list) = std::env::var("CCC_PHI_COALESCE_SKIP") else {
+        return false;
+    };
+    if let Ok(f) = std::env::var("CCC_PHI_COALESCE_FUNC") {
+        if f != func.name {
+            return false;
+        }
+    }
+    list.split(',')
+        .filter_map(|t| t.trim().strip_prefix('v').unwrap_or(t.trim()).parse::<u32>().ok())
+        .any(|v| v == backedge_src)
 }
 
 /// Detect safe phi-coalesce candidates for loop-carried variables.

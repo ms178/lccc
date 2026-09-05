@@ -5115,56 +5115,32 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
     // no longer dominates the second.
     let mut rax_leaq_src: Option<(String, Vec<RegId>)> = None;
 
-    // Register families written by `line` (REG_NONE entries ignored).
-    // Returns an empty slice when the destination is memory or unknown.
-    fn written_families(line: &str) -> Vec<RegId> {
-        // %rsp writes are as real as any data-register write: every cached
-        // `leaq X(%rsp), %rax` bakes the CURRENT %rsp into the address.  A
-        // push/pop/leave/enter makes that address stale even when the textual
-        // displacement is identical.  Missing `push` let this peephole delete
-        // a second `leaq 80(%rsp), %rax` after four pushes had moved %rsp;
-        // sret calls passing a by-value struct then reused the argument address
-        // as the return buffer (gcc.c-torture/execute/20040709-{1,2,3}.c).
-        const RSP: RegId = 4;
-        const RBP: RegId = 5;
-        if line.starts_with("push") {
-            // push writes memory and decrements %rsp. It has no destination
-            // register operand, so the generic comma fallback would return
-            // nothing — handle it before that.
-            return vec![RSP];
-        }
-        if line.starts_with("pop") {
-            // popq %r12 / pop %r12 — writes the operand register AND %rsp.
-            let mut fams = Vec::with_capacity(2);
-            if let Some(sp) = line.find('%') {
-                let fam = register_family_fast(line[sp..].trim());
-                if fam != REG_NONE {
-                    fams.push(fam);
-                }
-            }
-            fams.push(RSP);
-            return fams;
-        }
-        match line {
-            "cltq" => return vec![0],
-            "cqto" | "cqo" => return vec![0, 2],
-            "cdq" => return vec![2],
-            "leave" => return vec![RSP, RBP],
-            "enter" => return vec![RSP, RBP],
-            _ => {}
-        }
-        // Generic: `... , %reg` — the trailing register is the destination.
-        if let Some(comma) = line.rfind(',') {
-            let dst = line[comma + 1..].trim();
-            if let Some(pct) = dst.find('%') {
-                let fam = register_family_fast(&dst[pct..]);
-                if fam != REG_NONE {
-                    return vec![fam];
-                }
-            }
-        }
-        Vec::new()
-    }
+    // Register families written by a line, as a MAY-write bitmask.
+    //
+    // This is a CACHE-INVALIDATION query, so it must over-approximate: a
+    // missed write keeps a stale `leaq X, %rax` in the cache and the next
+    // identical leaq is deleted while %rax no longer holds X. The first
+    // version enumerated writers by hand and missed every one-operand
+    // form whose operand is not preceded by a comma — `setcc %al` above
+    // all. In zstd's ZSTD_decompressSequences_body (-O1, non-BMI2 path):
+    //
+    //     leaq 352(%rsp), %rax      ; cached
+    //     ...
+    //     sete %al                  ; NOT seen as a write to %rax
+    //     movzbl %al, %edx
+    //     leaq 352(%rsp), %rax      ; deleted as "redundant"
+    //     movsbq %dl, %rdx
+    //     movq (%rax,%rdx,8), %rax  ; base = 0/1 -> wild load
+    //
+    // The sequence decoder read `bitD->bitContainer` from a garbage address
+    // and the kernel decompressor reported "ZSTD-compressed data is
+    // corrupt". The pass now asks the shared MAY-write oracle
+    // (`load_op_fuse::may_write_families`: classified destination,
+    // one-operand forms, the central implicit-operand table, opaque
+    // instructions → everything) instead of keeping a private list.
+    let written_mask = |line: &str, info: &LineInfo| -> u16 {
+        super::load_op_fuse::may_write_families(line, info)
+    };
 
     for i in 0..len {
         if infos[i].is_nop() {
@@ -5227,22 +5203,17 @@ pub(super) fn eliminate_redundant_leaq(store: &LineStore, infos: &mut [LineInfo]
         // Check if %rax or any cached source register is written (clobbered).
         // Any write to %rax invalidates; any write to a register whose value
         // is baked into the cached leaq's address invalidates as well.
-        let written = written_families(line);
-        let mut invalidate = false;
-        for fam in &written {
-            if *fam == 0 {
-                invalidate = true;
-                break;
-            }
-            if let Some((_, ref src_fams)) = rax_leaq_src {
-                if src_fams.contains(fam) {
-                    invalidate = true;
-                    break;
+        if let Some((_, ref src_fams)) = rax_leaq_src {
+            let written = written_mask(line, &infos[i]);
+            let mut baked = 1u16; // %rax itself
+            for fam in src_fams {
+                if *fam <= REG_GP_MAX {
+                    baked |= 1u16 << fam;
                 }
             }
-        }
-        if invalidate {
-            rax_leaq_src = None;
+            if written & baked != 0 {
+                rax_leaq_src = None;
+            }
         }
     }
     changed
@@ -5901,6 +5872,105 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod redundant_leaq_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        eliminate_redundant_leaq(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn setcc_al_invalidates_cached_rax_lea() {
+        // ZSTD_decompressSequences_body (-O1, non-BMI2): `sete %al` rewrote
+        // the low byte of the cached `leaq 352(%rsp), %rax`; the second
+        // identical leaq was deleted and `movq (%rax,%rdx,8)` used base 0/1.
+        let asm = "\
+.LBB4509:
+    leaq 352(%rsp), %rax
+    movq %rax, %r8
+    testl %r14d, %r14d
+    sete %al
+    movzbl %al, %edx
+    leaq 352(%rsp), %rax
+    movsbq %dl, %rdx
+    movq (%rax, %rdx, 8), %rax
+";
+        let out = run(asm);
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq 352(%rsp), %rax")).count(),
+            2,
+            "second leaq must survive a setcc into %al:\n{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn one_operand_writers_invalidate() {
+        for writer in ["notq %rax", "negl %eax", "incq %rax", "bswapl %eax", "shrq %rax", "popq %rax", "cltq", "rdtsc", "divq %r9", "mulq %r9", "xchgq %rcx, %rax"] {
+            let asm = format!(
+                ".L1:\n    leaq 16(%rsp), %rax\n    {}\n    leaq 16(%rsp), %rax\n",
+                writer
+            );
+            let out = run(&asm);
+            assert_eq!(
+                out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(),
+                2,
+                "`{}` must invalidate the cached %rax lea:\n{}",
+                writer,
+                out.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn rax_reader_does_not_invalidate() {
+        // `cqto` reads %rax and writes only %rdx: the cached address is
+        // still exact, so the elimination is expected to fire.
+        let asm = ".L1:\n    leaq 16(%rsp), %rax\n    cqto\n    leaq 16(%rsp), %rax\n";
+        let out = run(asm);
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(), 1);
+    }
+
+    #[test]
+    fn baked_source_register_write_invalidates() {
+        let asm = "\
+.L1:
+    leaq 8(%rbx, %rcx, 4), %rax
+    setb %cl
+    leaq 8(%rbx, %rcx, 4), %rax
+";
+        let out = run(asm);
+        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 8(%rbx")).count(), 2);
+    }
+
+    #[test]
+    fn unrelated_write_keeps_the_elimination() {
+        let asm = "\
+.L1:
+    leaq 16(%rsp), %rax
+    movq %rax, %r8
+    movl $3, %edx
+    addq $1, %r9
+    leaq 16(%rsp), %rax
+    movq (%rax), %rcx
+";
+        let out = run(asm);
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(),
+            1,
+            "the redundant leaq must still be removed when nothing baked changes:\n{}",
+            out.join("\n")
+        );
+    }
 }
 
 #[cfg(test)]
