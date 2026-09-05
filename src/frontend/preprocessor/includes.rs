@@ -871,13 +871,20 @@ impl Preprocessor {
                 // typedef text via pending_injections would break if stdarg.h is included
                 // from within a nested header, since the injected text gets emitted at
                 // the include boundary -- potentially in the middle of an initializer.
+                // C23 (N2975) made the second parameter optional, and a
+                // variadic function may now have NO named parameter at all
+                // (`void f(...)`), so `va_start(ap)` must work. The second
+                // argument is not evaluated in any C dialect, and
+                // `__builtin_va_start`'s lowering reads only `args.first()`,
+                // so one variadic macro serves every dialect: `va_start(ap)`
+                // and `va_start(ap, last)` both lower identically.
                 self.macros.define(MacroDef {
                     name: "va_start".to_string(),
                     is_function_like: true,
-                    params: vec!["ap".to_string(), "last".to_string()],
-                    is_variadic: false,
+                    params: vec!["ap".to_string()],
+                    is_variadic: true,
                     has_named_variadic: false,
-                    body: "__builtin_va_start(ap,last)".to_string(),
+                    body: "__builtin_va_start(ap)".to_string(),
                 });
                 self.macros.define(MacroDef {
                     name: "va_end".to_string(),

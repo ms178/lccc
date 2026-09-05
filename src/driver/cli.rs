@@ -910,6 +910,15 @@ impl Driver {
                             "gnu89" | "c89" | "gnu90" | "c90" | "iso9899:1990" | "iso9899:199409"
                         );
                     }
+                    // `__STDC_VERSION__` must track the selected dialect.
+                    // Leaving it pinned at the C17 default made every
+                    // C23-conditional header take its pre-C23 branch even
+                    // under `-std=c23`: GCC's own <stdarg.h> then kept the
+                    // two-parameter `va_start(v, l)` definition, so the C23
+                    // one-argument form `va_start(ap)` expanded to
+                    // `__builtin_va_start(ap,)` and failed to parse
+                    // (gcc.c-torture/execute/pr117432.c).
+                    self.stdc_version = std_version_macro(std_value);
                 }
 
                 // Machine/target flags
@@ -2252,4 +2261,25 @@ mod cli_tests {
         assert!(!d.no_sse);
         assert!(d.enable_avx);
     }
+}
+
+/// `__STDC_VERSION__` value for a `-std=` dialect name, mirroring GCC.
+///
+/// `Some(None)` means "the dialect defines no `__STDC_VERSION__` at all"
+/// (C89/C90 predate the macro); `None` means the name is unrecognized and the
+/// default is left untouched.
+pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
+    let v = match std_value {
+        "c89" | "c90" | "gnu89" | "gnu90" | "iso9899:1990" => None,
+        // The 1994 amendment is the first to define the macro.
+        "iso9899:199409" => Some("199409L"),
+        "c99" | "c9x" | "gnu99" | "gnu9x" | "iso9899:1999" | "iso9899:199x" => Some("199901L"),
+        "c11" | "c1x" | "gnu11" | "gnu1x" | "iso9899:2011" => Some("201112L"),
+        "c17" | "c18" | "gnu17" | "gnu18" | "iso9899:2017" | "iso9899:2018" => Some("201710L"),
+        "c23" | "c2x" | "gnu23" | "gnu2x" => Some("202311L"),
+        // C2y is still a draft; GCC 15 reports 202400L for it.
+        "c2y" | "gnu2y" => Some("202400L"),
+        _ => return None,
+    };
+    Some(v)
 }
