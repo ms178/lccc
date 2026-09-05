@@ -874,3 +874,70 @@ The earlier RA-28b hypothesis ("mode 6 loses only because of lifetime
 demotion; splitting will flip its sign") cannot be tested with this pass: with
 the pass on, mode 6's kernel deltas move in the same direction, because the
 pass does not remove the demotions it was meant to remove.
+
+## RA (2026-09-05, session 5) — the spill gap was slot-width classification, not splitting
+
+**Decision: unify the width class across a copy/phi web toward the root's
+wider slot. Measured −50 % hot-loop stack traffic on `arith_loop` and
+−14 % corpus-wide; shipped ON.**
+
+Two prior sessions attacked the `arith_loop` spill gap (lccc 123 hot-loop
+stack refs vs GCC's 50) as a live-range-splitting problem. Both were measured
+negative. This session measured the *shape* of the traffic instead of
+assuming its cause, and the assumption was wrong.
+
+### The measurement chain
+
+1. Restricting the census to the **hot loop body** (the previous census
+   weighted a benchmark's cold `main` equally): lccc 123 refs / 41 slots,
+   GCC 50 refs / 22 slots, **same 15 GPR families used by both**. So it was
+   never a register-count problem.
+2. 40 of lccc's 82 loop-body slot reads were re-reads of a slot with no
+   intervening write. A load→load reuse peephole was written for x86 (which,
+   unlike AArch64, has none) — and fired **zero** times corpus-wide, because
+   the slot's value is *consumed* by a folded ALU operand and never left in a
+   register. The pass was deleted rather than shipped dead.
+3. Reading the emitted loop body: `c += d*e` compiled to
+   `movl slot_old,%eax; imull; addl slot_other,%eax; movl %eax,slot_NEW` —
+   the phi and its incoming value occupy **different slots**, so every
+   loop-carried variable also needs a latch copy. GCC emits one in-place
+   `addl %r15d, slot`.
+4. `CCC_DEBUG_SLOT_COALESCE=1`: `requested=21 resolved=0
+   blocked_width_mismatch=21`. The CFG coalescer had already *proven* all 21
+   phi pairs non-interfering. A width guard rejected every one.
+
+### The defect
+
+`is_small` requires `!wide_typed`. A Copy/Phi dest is `wide_typed` (its
+emitter moves it with `movq`), while the BinOp feeding it has a narrow
+`result_type()` and is classified small. A web that carries exactly one C
+type therefore straddles the 4-byte and 8-byte classes, and the guard —
+correctly refusing to mix widths in one slot — rejected the whole web.
+
+### The fix
+
+When the root is the wide member, drop the dest from `small_slot_values`.
+Every access to the shared slot is then 8 bytes, so no stale upper half can
+survive; and a 32-bit x86-64 ALU result is zero-extended into the full
+register, so the `movq` store of the narrow value writes a well-defined
+image. The opposite direction (wide dest into a 4-byte root slot) would
+overrun the slot and is still refused.
+
+### Result
+
+| `arith_loop` hot loop body | before | after | GCC 14.2 |
+|---|---|---|---|
+| stack references | 123 | **62** | 50 |
+| instructions | 164 | **114** | 131 |
+| distinct slots | 41 | **21** | 22 |
+
+Corpus-wide (`ra_ab_census.py`, coalescing on vs off): **−61 kernel stack
+refs, −49 kernel instructions, −93 stack refs overall (−14 %)**.
+Instruction count is now *below* GCC's on this kernel.
+
+### Standing conclusion for RA-06
+
+The remaining `arith_loop` gap (62 vs 50) is small and no longer obviously a
+splitting problem. Re-measure before resuming RA-06; the two negative results
+recorded above were both chasing a cause that turned out to be a width-class
+bug in slot assignment.
