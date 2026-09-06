@@ -633,8 +633,9 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         // remainder AH, product AX) — the %edx family is never touched.
         "divb" | "idivb" | "mulb" | "imulb" => (EAX, EAX),
         // Word/long single-operand multiply/divide: edx:eax implicit.
-        "div" | "divw" | "divl" | "idiv" | "idivw" | "idivl" | "mul" | "mulw"
-        | "mull" => (EAX | EDX, EAX | EDX),
+        "div" | "divw" | "divl" | "idiv" | "idivw" | "idivl" | "mul" | "mulw" | "mull" => {
+            (EAX | EDX, EAX | EDX)
+        }
         // imul with a single operand is the widening form (edx:eax); the
         // two/three-operand forms name every register they touch.
         "imul" | "imulw" | "imull" if !has_comma => (EAX, EAX | EDX),
@@ -667,7 +668,10 @@ fn classify_implicit_operands(s: &str) -> (u8, u8) {
         "sysexit" => (EAX | ECX | EDX, EAX | ECX | EDX),
         // Software interrupt: the handler's register contract is unknown
         // (i386 `int $0x80` passes ebx/ecx/edx/esi/edi/ebp and returns eax).
-        "int" => (EAX | EBX | ECX | EDX | ESI | EDI | EBP, EAX | EBX | ECX | EDX | ESI | EDI | EBP),
+        "int" => (
+            EAX | EBX | ECX | EDX | ESI | EDI | EBP,
+            EAX | EBX | ECX | EDX | ESI | EDI | EBP,
+        ),
         // Atomics with an implicit accumulator: %eax holds the compare value
         // and is reloaded when the exchange fails.
         "cmpxchg" | "cmpxchgb" | "cmpxchgw" | "cmpxchgl" => (EAX, EAX),
@@ -2758,9 +2762,7 @@ fn line_writes_reg_implicitly(s: &str, reg: RegId) -> bool {
         // XCHG writes BOTH named operands; XADD writes the register
         // operand (it receives the old value).  classify_line only sees
         // the last operand as the destination.
-        "xchgl" | "xchgw" | "xchgb" | "xaddl" | "xaddw" | "xaddb" => {
-            line_references_reg(s, reg)
-        }
+        "xchgl" | "xchgw" | "xchgb" | "xaddl" | "xaddw" | "xaddb" => line_references_reg(s, reg),
         // Single-operand read-modify-write forms (`negl %eax`, `incl %ecx`,
         // `bswapl %eax`): classify_line derives the destination from the
         // operand AFTER the last comma — these have none, so they classify
@@ -3446,8 +3448,7 @@ impl GprLiveness {
         let extents = function_extents(store, infos);
         for &(start, end) in &extents {
             let return_uses_edx = (start..end).any(|i| {
-                !infos[i].is_nop()
-                    && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
+                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
             });
             let lo = compute_gpr_live_out(store, infos, start, end, return_uses_edx);
             for local in 0..(end - start) {
@@ -3464,8 +3465,7 @@ impl GprLiveness {
         // every fold would be refused on uncovered lines (conservative ALL).
         if extents.is_empty() && len > 0 {
             let return_uses_edx = (0..len).any(|i| {
-                !infos[i].is_nop()
-                    && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
+                !infos[i].is_nop() && trimmed(store, &infos[i], i) == "# lccc-i686-return-uses-edx"
             });
             let lo = compute_gpr_live_out(store, infos, 0, len, return_uses_edx);
             for i in 0..len {
@@ -5616,7 +5616,8 @@ fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 // of removing them, so indices stay aligned, and deleting a
                 // dead definition only makes that register's cached answer
                 // conservative — see `GprLiveness`.
-                let liveness = liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
+                let liveness =
+                    liveness_cache.get_or_insert_with(|| GprLiveness::compute(store, infos));
                 if !liveness.dead_after(j, load_reg) {
                     i += 1;
                     continue;
@@ -6125,9 +6126,7 @@ fn census_reg_reads(
         // exact read half — `cltd` mentions %edx but does not read it,
         // while `stosl` genuinely consumes %eax).
         let explicitly = line_references_reg_explicit(line, reg);
-        if (explicitly || line_implicitly_reads(line, reg))
-            && !line_writes_reg_purely(line, reg)
-        {
+        if (explicitly || line_implicitly_reads(line, reg)) && !line_writes_reg_purely(line, reg) {
             n += 1;
         }
         k += 1;
@@ -12845,14 +12844,22 @@ mod tests {
         // The heart of the i686 div/rem lowering: `cltd` rewrote %edx
         // while being invisible to any textual scan.
         for m in ["cwd", "cwtd", "cltd", "cdq", "cqo"] {
-            assert_eq!(classify_implicit_operands(m), (1 << REG_EAX, 1 << REG_EDX), "{m}");
+            assert_eq!(
+                classify_implicit_operands(m),
+                (1 << REG_EAX, 1 << REG_EDX),
+                "{m}"
+            );
         }
     }
 
     #[test]
     fn in_place_extensions_read_and_write_the_accumulator() {
         for m in ["cbw", "cbtw", "cwde", "cwtl"] {
-            assert_eq!(classify_implicit_operands(m), (1 << REG_EAX, 1 << REG_EAX), "{m}");
+            assert_eq!(
+                classify_implicit_operands(m),
+                (1 << REG_EAX, 1 << REG_EAX),
+                "{m}"
+            );
         }
     }
 
@@ -12864,8 +12871,14 @@ mod tests {
         assert_eq!(classify_implicit_operands("divw %cx"), (ax_dx, ax_dx));
         // Byte forms divide/multiply AX: quotient AL, remainder AH,
         // product AX — the %edx family is never touched.
-        assert_eq!(classify_implicit_operands("idivb %cl"), (1 << REG_EAX, 1 << REG_EAX));
-        assert_eq!(classify_implicit_operands("mulb %cl"), (1 << REG_EAX, 1 << REG_EAX));
+        assert_eq!(
+            classify_implicit_operands("idivb %cl"),
+            (1 << REG_EAX, 1 << REG_EAX)
+        );
+        assert_eq!(
+            classify_implicit_operands("mulb %cl"),
+            (1 << REG_EAX, 1 << REG_EAX)
+        );
         // SSE divides/multiplies have fully explicit operands: a prefix
         // match against "div"/"mul" would tax every FP loop with a
         // phantom accumulator pair.
@@ -12890,7 +12903,10 @@ mod tests {
         let eax = 1 << REG_EAX;
         assert_eq!(classify_implicit_operands("rdtsc").1, eax | 1 << REG_EDX);
         // rdtscp additionally returns the TSC_AUX in %ecx; rdtsc does not.
-        assert_eq!(classify_implicit_operands("rdtscp").1, eax | 1 << REG_ECX | 1 << REG_EDX);
+        assert_eq!(
+            classify_implicit_operands("rdtscp").1,
+            eax | 1 << REG_ECX | 1 << REG_EDX
+        );
         assert_eq!(
             classify_implicit_operands("cpuid").1,
             eax | 1 << REG_EBX | 1 << REG_ECX | 1 << REG_EDX
@@ -12904,14 +12920,20 @@ mod tests {
             | 1 << REG_ESI
             | 1 << REG_EDI
             | 1 << REG_EBP;
-        assert_eq!(classify_implicit_operands("int $0x80"), (all_args, all_args));
+        assert_eq!(
+            classify_implicit_operands("int $0x80"),
+            (all_args, all_args)
+        );
     }
 
     #[test]
     fn rep_prefixes_contribute_the_count_register() {
         let ecx_edi = 1 << REG_ECX | 1 << REG_EDI;
         let ecx = 1 << REG_ECX;
-        assert_eq!(classify_implicit_operands("rep stosb").0, ecx | 1 << REG_EAX | 1 << REG_EDI);
+        assert_eq!(
+            classify_implicit_operands("rep stosb").0,
+            ecx | 1 << REG_EAX | 1 << REG_EDI
+        );
         assert_eq!(classify_implicit_operands("rep stosb").1, ecx_edi);
         assert_eq!(classify_implicit_operands("repne scasl").1, ecx_edi);
         // `rep ret` / `rep nop` (pause) are branch-hint idioms, not
@@ -12930,18 +12952,30 @@ mod tests {
         assert_eq!(classify_implicit_operands("movsl"), (si_di, si_di));
         assert_eq!(classify_implicit_operands("movsb"), (si_di, si_di));
         assert_eq!(classify_implicit_operands("lodsl").0, 1 << REG_ESI);
-        assert_eq!(classify_implicit_operands("lodsl").1, 1 << REG_EAX | 1 << REG_ESI);
+        assert_eq!(
+            classify_implicit_operands("lodsl").1,
+            1 << REG_EAX | 1 << REG_ESI
+        );
         // stos consumes %eax (the stored data) and post-increments %edi;
         // %esi must NOT be blamed for it.
-        assert_eq!(classify_implicit_operands("stosl").0, 1 << REG_EAX | 1 << REG_EDI);
+        assert_eq!(
+            classify_implicit_operands("stosl").0,
+            1 << REG_EAX | 1 << REG_EDI
+        );
         assert_eq!(classify_implicit_operands("stosl").1, 1 << REG_EDI);
     }
 
     #[test]
     fn cmpxchg_reloads_the_accumulator_on_failure() {
         let eax = 1 << REG_EAX;
-        assert_eq!(classify_implicit_operands("cmpxchgl %ebx, (%edi)"), (eax, eax));
-        assert_eq!(classify_implicit_operands("lock cmpxchgl %ebx, (%edi)"), (eax, eax));
+        assert_eq!(
+            classify_implicit_operands("cmpxchgl %ebx, (%edi)"),
+            (eax, eax)
+        );
+        assert_eq!(
+            classify_implicit_operands("lock cmpxchgl %ebx, (%edi)"),
+            (eax, eax)
+        );
         // CMPXCHG8B compares edx:eax (reloaded on failure); ecx:ebx are
         // the read-only payload.
         let quad = eax | 1 << REG_EBX | 1 << REG_ECX | 1 << REG_EDX;
@@ -13003,7 +13037,10 @@ mod tests {
         // propagation must not rename across.
         assert!(line_writes_reg_implicitly("cmpxchgl %ebx, (%edi)", REG_EAX));
         // XADD's register operand receives the old value — even under lock.
-        assert!(line_writes_reg_implicitly("lock xaddl %ebx, (%eax)", REG_EBX));
+        assert!(line_writes_reg_implicitly(
+            "lock xaddl %ebx, (%eax)",
+            REG_EBX
+        ));
         assert!(line_writes_reg_implicitly("xaddl %ebx, %eax", REG_EBX));
         // The explicit RMW single-operand forms still count.
         assert!(line_writes_reg_implicitly("negl %eax", REG_EAX));

@@ -17,8 +17,8 @@ use super::super::types::*;
 use super::flag_peepholes::flags_dead_after;
 use super::helpers::{
     extract_jump_target, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
-    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family,
-    writes_family, writes_family_full,
+    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, replace_reg_family, writes_family,
+    writes_family_full,
 };
 use super::liveness::FileLiveness;
 
@@ -1684,8 +1684,7 @@ pub(super) fn fold_lea_all_uses_in_block(store: &mut LineStore, infos: &mut [Lin
             // overwrites %rdx without naming it) => the LEA's value is no
             // longer reproducible from them; stop (uses collected so far are
             // still valid only if we fold nothing after this point).
-            if writes_family(&infos[n], t, base_family)
-                || writes_family(&infos[n], t, index_family)
+            if writes_family(&infos[n], t, base_family) || writes_family(&infos[n], t, index_family)
             {
                 break;
             }
@@ -5261,8 +5260,7 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
         // redefine the family even though their memory operand is narrow.
         let partial_def = |t: &str, fam: u16, uses: &mut u16| {
             let tt = t.trim_end();
-            if tt.ends_with(REG_NAMES[2][fam as usize])
-                || tt.ends_with(REG_NAMES[3][fam as usize])
+            if tt.ends_with(REG_NAMES[2][fam as usize]) || tt.ends_with(REG_NAMES[3][fam as usize])
             {
                 *uses |= 1u16 << fam;
             }
@@ -5880,7 +5878,9 @@ mod redundant_leaq_tests {
 
     fn run(asm: &str) -> Vec<String> {
         let store = LineStore::new(asm.to_string());
-        let mut infos: Vec<LineInfo> = (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         eliminate_redundant_leaq(&store, &mut infos);
         (0..store.len())
             .filter(|&i| !infos[i].is_nop())
@@ -5906,7 +5906,9 @@ mod redundant_leaq_tests {
 ";
         let out = run(asm);
         assert_eq!(
-            out.iter().filter(|l| l.starts_with("leaq 352(%rsp), %rax")).count(),
+            out.iter()
+                .filter(|l| l.starts_with("leaq 352(%rsp), %rax"))
+                .count(),
             2,
             "second leaq must survive a setcc into %al:\n{}",
             out.join("\n")
@@ -5915,14 +5917,28 @@ mod redundant_leaq_tests {
 
     #[test]
     fn one_operand_writers_invalidate() {
-        for writer in ["notq %rax", "negl %eax", "incq %rax", "bswapl %eax", "shrq %rax", "popq %rax", "cltq", "rdtsc", "divq %r9", "mulq %r9", "xchgq %rcx, %rax"] {
+        for writer in [
+            "notq %rax",
+            "negl %eax",
+            "incq %rax",
+            "bswapl %eax",
+            "shrq %rax",
+            "popq %rax",
+            "cltq",
+            "rdtsc",
+            "divq %r9",
+            "mulq %r9",
+            "xchgq %rcx, %rax",
+        ] {
             let asm = format!(
                 ".L1:\n    leaq 16(%rsp), %rax\n    {}\n    leaq 16(%rsp), %rax\n",
                 writer
             );
             let out = run(&asm);
             assert_eq!(
-                out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(),
+                out.iter()
+                    .filter(|l| l.starts_with("leaq 16(%rsp), %rax"))
+                    .count(),
                 2,
                 "`{}` must invalidate the cached %rax lea:\n{}",
                 writer,
@@ -5937,7 +5953,12 @@ mod redundant_leaq_tests {
         // still exact, so the elimination is expected to fire.
         let asm = ".L1:\n    leaq 16(%rsp), %rax\n    cqto\n    leaq 16(%rsp), %rax\n";
         let out = run(asm);
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(), 1);
+        assert_eq!(
+            out.iter()
+                .filter(|l| l.starts_with("leaq 16(%rsp), %rax"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5949,7 +5970,10 @@ mod redundant_leaq_tests {
     leaq 8(%rbx, %rcx, 4), %rax
 ";
         let out = run(asm);
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 8(%rbx")).count(), 2);
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq 8(%rbx")).count(),
+            2
+        );
     }
 
     #[test]
@@ -5965,7 +5989,9 @@ mod redundant_leaq_tests {
 ";
         let out = run(asm);
         assert_eq!(
-            out.iter().filter(|l| l.starts_with("leaq 16(%rsp), %rax")).count(),
+            out.iter()
+                .filter(|l| l.starts_with("leaq 16(%rsp), %rax"))
+                .count(),
             1,
             "the redundant leaq must still be removed when nothing baked changes:\n{}",
             out.join("\n")

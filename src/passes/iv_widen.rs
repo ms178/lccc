@@ -1541,8 +1541,12 @@ fn prove_counted_bound(
 /// so the "same sign" test succeeded), after which `11.0f * (float) i` was
 /// retyped to `Mul(i:I64, I64(0))` — a silent hard zero.
 fn plan_is_integral(func: &IrFunction, plan: &WidenPlan) -> bool {
-    let integral_const =
-        |c: &IrConst| matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero);
+    let integral_const = |c: &IrConst| {
+        matches!(
+            c,
+            IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) | IrConst::Zero
+        )
+    };
     if !plan.phi_ty.is_integer() || !plan.wide_ty.is_integer() {
         return false;
     }

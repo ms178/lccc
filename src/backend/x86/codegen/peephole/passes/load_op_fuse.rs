@@ -246,7 +246,10 @@ fn is_reg_or_imm(op: &str) -> bool {
 /// True when `t` (an `Other`/`Cmp`/`SetCC` line) touches memory in any way.
 /// `lea` computes an address without accessing it and is allowed.
 fn accesses_memory(t: &str, info: &LineInfo) -> bool {
-    if matches!(info.kind, LineKind::LoadRbp { .. } | LineKind::StoreRbp { .. }) {
+    if matches!(
+        info.kind,
+        LineKind::LoadRbp { .. } | LineKind::StoreRbp { .. }
+    ) {
         return true;
     }
     let mnemonic = t.split_whitespace().next().unwrap_or("");
@@ -463,7 +466,8 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 && dst != t_fam
                 && lv.live_after(j, t_fam) == Some(false)
             {
-                let new_line = format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
+                let new_line =
+                    format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
                 mark_nop(&mut infos[i]);
                 replace_line(store, &mut infos[j], j, new_line);
                 lv.refresh_at(store, infos, j);
@@ -549,8 +553,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             continue;
         };
         let c_bit = 1u16 << c_fam;
-        if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0
-        {
+        if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
             i += 1;
             continue;
         }
@@ -562,7 +565,10 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             "    mov{suffix} {}, {}",
             REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
         );
-        let op_new = format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][b_fam as usize]);
+        let op_new = format!(
+            "    {op}{suffix} {mem}, {}",
+            REG_NAMES[width][b_fam as usize]
+        );
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, copy_line);
         replace_line(store, &mut infos[k], k, op_new);
@@ -1058,8 +1064,9 @@ mod tests {
 
     fn run<F: Fn(&mut LineStore, &mut [LineInfo]) -> bool>(asm: &str, f: F) -> String {
         let mut store = LineStore::new(asm.to_string());
-        let mut infos: Vec<LineInfo> =
-            (0..store.len()).map(|i| classify_line(store.get(i))).collect();
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
         f(&mut store, &mut infos);
         store.build_result(|i| infos[i].is_nop())
     }
@@ -1075,8 +1082,7 @@ mod tests {
         out.iter().any(|l| l == needle)
     }
 
-    const PRO: &str =
-        "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
+    const PRO: &str = "    .text\n    .globl f\n    .type f, @function\nf:\n    .cfi_startproc\n";
     const EPI: &str = "    ret\n    .cfi_endproc\n    .size f, .-f\n";
 
     #[test]
@@ -1121,10 +1127,12 @@ mod tests {
 
     #[test]
     fn refuses_across_store_or_address_write() {
-        let asm = format!("{PRO}    movl (%rdi), %ecx\n    movl $1, (%rsi)\n    addl %ecx, %eax\n{EPI}");
+        let asm =
+            format!("{PRO}    movl (%rdi), %ecx\n    movl $1, (%rsi)\n    addl %ecx, %eax\n{EPI}");
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
-        let asm = format!("{PRO}    movl (%rdi), %ecx\n    addq $4, %rdi\n    addl %ecx, %eax\n{EPI}");
+        let asm =
+            format!("{PRO}    movl (%rdi), %ecx\n    addq $4, %rdi\n    addl %ecx, %eax\n{EPI}");
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
         // Single-operand writer of the address register without a comma.
@@ -1197,7 +1205,10 @@ mod tests {
         let out = body(&run(&asm, fold_recurrence_update));
         assert!(has(&out, "shrl $8, %ebx"), "{out:?}");
         assert!(has(&out, "xorl %edi, %ebx"), "{out:?}");
-        assert!(!out.iter().any(|l| l.starts_with("movl %ebx, %r9d")), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movl %ebx, %r9d")),
+            "{out:?}"
+        );
         // Then the load fuses because %r9 is no longer rewritten.
         let out2 = body(&run(&out.join("\n"), fuse_load_into_alu));
         assert!(has(&out2, "xorl (%r8,%r9,4), %ebx"), "{out2:?}");
@@ -1217,8 +1228,14 @@ mod tests {
         let out = body(&run(&asm, fold_recurrence_update));
         assert!(has(&out, "imulq $7, %rax"), "{out:?}");
         assert!(has(&out, "addq %r8, %rax"), "{out:?}");
-        assert!(!out.iter().any(|l| l.contains("imulq $7, %rsi, %rax")), "{out:?}");
-        assert!(!out.iter().any(|l| l.starts_with("movq %rax, %rsi")), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.contains("imulq $7, %rsi, %rax")),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq %rax, %rsi")),
+            "{out:?}"
+        );
     }
 
     /// `imulq $imm, %X, %Tm` with X != Tm: the 3-operand form never reads
@@ -1242,7 +1259,10 @@ mod tests {
         );
         let out = body(&run(&asm, fold_recurrence_update));
         assert!(has(&out, "imulq %rcx, %rax"), "{out:?}");
-        assert!(!out.iter().any(|l| l.starts_with("movq %rax, %rsi")), "{out:?}");
+        assert!(
+            !out.iter().any(|l| l.starts_with("movq %rax, %rsi")),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -1322,16 +1342,35 @@ mod tests {
             "{PRO}    leaq tbl(%rip), %rcx\n    movl (%rcx,%rdx,4), %eax\n    leaq tbl(%rip), %rcx\n    movl (%rcx,%rsi,4), %edx\n    notq %rcx\n    leaq tbl(%rip), %rcx\n    xorl %ecx, %eax\n{EPI}"
         );
         let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
-        let asm = format!("{PRO}    leaq tbl(%rip), %r8\n.LBB1:\n    leaq tbl(%rip), %r8\n    jmp .LBB1\n{EPI}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
+        let asm = format!(
+            "{PRO}    leaq tbl(%rip), %r8\n.LBB1:\n    leaq tbl(%rip), %r8\n    jmp .LBB1\n{EPI}"
+        );
         let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
         let asm = format!("{PRO}    leaq 8(%rax), %rcx\n    leaq 8(%rax), %rcx\n{EPI}");
         let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq 8")).count(), 2, "{out:?}");
-        let asm = format!("{PRO}    leaq tbl(%rip), %rcx\n    call g\n    leaq tbl(%rip), %rcx\n{EPI}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq 8")).count(),
+            2,
+            "{out:?}"
+        );
+        let asm =
+            format!("{PRO}    leaq tbl(%rip), %rcx\n    call g\n    leaq tbl(%rip), %rcx\n{EPI}");
         let out = body(&run(&asm, |s, i| eliminate_redundant_symbol_lea(s, i)));
-        assert_eq!(out.iter().filter(|l| l.starts_with("leaq tbl")).count(), 2, "{out:?}");
+        assert_eq!(
+            out.iter().filter(|l| l.starts_with("leaq tbl")).count(),
+            2,
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -1356,7 +1395,10 @@ mod tests {
         let t = "    divl %ecx";
         assert_eq!(may_write_families(t.trim(), &li(t)), RAX | RDX);
         let t = "    rep stosq";
-        assert_eq!(may_write_families(t.trim(), &li(t)) & ALL_STRING_REGS, ALL_STRING_REGS);
+        assert_eq!(
+            may_write_families(t.trim(), &li(t)) & ALL_STRING_REGS,
+            ALL_STRING_REGS
+        );
         let t = "    cmpl %ecx, %eax";
         assert_eq!(may_write_families(t.trim(), &li(t)), 0);
         let t = "    addl %ecx, (%rax)";
@@ -1366,7 +1408,10 @@ mod tests {
         let t = "    vmovd %xmm0, %eax";
         assert_eq!(may_write_families(t.trim(), &li(t)), RAX);
         let t = "    cmpxchg16b (%rdi)";
-        assert_eq!(may_write_families(t.trim(), &li(t)) & (RAX | RDX), RAX | RDX);
+        assert_eq!(
+            may_write_families(t.trim(), &li(t)) & (RAX | RDX),
+            RAX | RDX
+        );
     }
     #[test]
     fn may_write_model_is_exact_for_implicit_operands() {

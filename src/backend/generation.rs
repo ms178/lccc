@@ -3412,7 +3412,11 @@ pub(crate) fn inline_memcpy_len(func: &str, args: &[Operand], is_variadic: bool)
 /// question so the x86 emitter and the MachInst typed-call gate agree on
 /// exactly the same set of calls.  `__memset_chk` is admitted only when the
 /// fortify `destlen` covers `n` (same rule as `inline_memcpy_len`).
-pub(crate) fn inline_memset_const_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+pub(crate) fn inline_memset_const_len(
+    func: &str,
+    args: &[Operand],
+    is_variadic: bool,
+) -> Option<usize> {
     if is_variadic || args.len() < 3 {
         return None;
     }
@@ -3457,7 +3461,11 @@ fn call_result_is_used(cg: &dyn ArchCodegen, v: &Value) -> bool {
 /// consulted by the x86 emitter *and* by the register allocator's
 /// parameter-home policy (`regalloc::x86_param_caller_homes_safe`), so the
 /// two can never disagree about whether a call instruction is a real call.
-pub(crate) fn x86_inline_memset_len(func: &str, args: &[Operand], is_variadic: bool) -> Option<usize> {
+pub(crate) fn x86_inline_memset_len(
+    func: &str,
+    args: &[Operand],
+    is_variadic: bool,
+) -> Option<usize> {
     use crate::backend::x86::cpu_model::{active, CopyStrategy};
     let n = inline_memset_const_len(func, args, is_variadic)?;
     match active().memset_strategy(n, 16) {

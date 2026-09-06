@@ -3566,7 +3566,10 @@ mod libc_alias_param_type_tests {
             libc_alias_param_types("strncmp"),
             Some(vec![IrType::Ptr, IrType::Ptr, size_t()])
         );
-        assert_eq!(libc_alias_param_types("strnlen"), Some(vec![IrType::Ptr, size_t()]));
+        assert_eq!(
+            libc_alias_param_types("strnlen"),
+            Some(vec![IrType::Ptr, size_t()])
+        );
         // Both _chk length parameters are size_t.
         assert_eq!(
             libc_alias_param_types("__memcpy_chk"),
@@ -3589,7 +3592,9 @@ mod libc_alias_param_type_tests {
     fn families_without_wide_parameters_are_absent() {
         // Everything here is int/double/pointer only: no conversion needed,
         // and listing them would be unreviewable noise.
-        for n in ["strlen", "strcmp", "strcpy", "abs", "sqrt", "abort", "printf"] {
+        for n in [
+            "strlen", "strcmp", "strcpy", "abs", "sqrt", "abort", "printf",
+        ] {
             assert_eq!(libc_alias_param_types(n), None, "{n} must not be listed");
         }
     }

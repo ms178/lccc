@@ -49,7 +49,9 @@
 //! immediately recycled by the next LEA).
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, writes_family};
+use super::helpers::{
+    get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, writes_family,
+};
 use super::liveness::FileLiveness;
 
 /// Widest window (in non-NOP instructions) searched for the consumer of a LEA.
@@ -537,8 +539,12 @@ fn parse_lea_address(lea: &str) -> Option<(&str, &str, Vec<RegId>)> {
     // slot in `fams` (it is not a family).
     let rip_base = fields.len() > 0 && fields[0] == "%rip";
     if rip_base && fields.len() == 1 {
-        if disp.contains(',') || disp.contains('(') || disp.contains(' ')
-            || !disp.chars().all(|c| c.is_ascii_alphanumeric() || ".$_+-@".contains(c))
+        if disp.contains(',')
+            || disp.contains('(')
+            || disp.contains(' ')
+            || !disp
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".$_+-@".contains(c))
         {
             return None;
         }

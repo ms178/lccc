@@ -74,9 +74,7 @@
 //! `%dxl` and the assembler rejected the function.
 
 use super::super::types::*;
-use super::helpers::{
-    get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family,
-};
+use super::helpers::{get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family};
 use super::liveness::FileLiveness;
 
 /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.

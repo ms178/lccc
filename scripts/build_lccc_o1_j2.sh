@@ -19,7 +19,7 @@ cd "$repo_root"
 if [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
   export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 fi
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
 
 # Cargo has no direct `-O1` CLI spelling.  This profile override is the Cargo/
 # rustc equivalent and is intentionally scoped to this invocation.

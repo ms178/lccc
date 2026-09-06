@@ -514,9 +514,21 @@ const fn cache(
 ) -> CacheModel {
     CacheModel {
         line_bytes: 64,
-        l1d: CacheLevel { kib: l1d_kib, ways: l1d_ways, latency: l1d_lat },
-        l2: CacheLevel { kib: l2_kib, ways: l2_ways, latency: l2_lat },
-        l3: CacheLevel { kib: l3_kib, ways: l3_ways, latency: l3_lat },
+        l1d: CacheLevel {
+            kib: l1d_kib,
+            ways: l1d_ways,
+            latency: l1d_lat,
+        },
+        l2: CacheLevel {
+            kib: l2_kib,
+            ways: l2_ways,
+            latency: l2_lat,
+        },
+        l3: CacheLevel {
+            kib: l3_kib,
+            ways: l3_ways,
+            latency: l3_lat,
+        },
         dram_latency_cycles: dram_cycles,
     }
 }
@@ -528,17 +540,17 @@ impl X86Cpu {
     pub fn from_name(name: &str) -> Option<X86Cpu> {
         use X86Cpu::*;
         Some(match name {
-            "generic" | "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "nocona"
-            | "core2" | "nehalem" | "westmere" | "silvermont" | "goldmont"
-            | "goldmont-plus" | "tremont" | "bonnell" | "atom" | "k8" | "opteron"
-            | "barcelona" | "bdver1" | "bdver2" | "bdver3" | "bdver4" | "btver1"
-            | "btver2" | "knl" | "knm" | "intel" => Generic,
+            "generic" | "x86-64" | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "nocona" | "core2"
+            | "nehalem" | "westmere" | "silvermont" | "goldmont" | "goldmont-plus" | "tremont"
+            | "bonnell" | "atom" | "k8" | "opteron" | "barcelona" | "bdver1" | "bdver2"
+            | "bdver3" | "bdver4" | "btver1" | "btver2" | "knl" | "knm" | "intel" => Generic,
             "sandybridge" | "corei7-avx" => SandyBridge,
             "ivybridge" | "core-avx-i" => IvyBridge,
             "haswell" | "core-avx2" => Haswell,
             "broadwell" => Broadwell,
-            "skylake" | "kabylake" | "coffeelake" | "cometlake" | "amberlake"
-            | "whiskeylake" => Skylake,
+            "skylake" | "kabylake" | "coffeelake" | "cometlake" | "amberlake" | "whiskeylake" => {
+                Skylake
+            }
             "skylake-avx512" | "cascadelake" | "cooperlake" | "cannonlake" => SkylakeAvx512,
             "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake" => IceLake,
             "alderlake" => AlderLake,
@@ -549,9 +561,7 @@ impl X86Cpu {
             "sapphirerapids" | "emeraldrapids" | "graniterapids" | "graniterapids-d" => {
                 SapphireRapids
             }
-            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake" => {
-                ArrowLake
-            }
+            "arrowlake" | "arrowlake-s" | "lunarlake" | "pantherlake" | "wildcatlake" => ArrowLake,
             "znver1" => Znver1,
             "znver2" => Znver2,
             "znver3" => Znver3,
@@ -1166,7 +1176,11 @@ impl MulPlan {
             arr[i] = steps[i];
             i += 1;
         }
-        MulPlan { steps: arr, len: steps.len() as u8, needs_distinct_src }
+        MulPlan {
+            steps: arr,
+            len: steps.len() as u8,
+            needs_distinct_src,
+        }
     }
     pub fn steps(&self) -> &[MulStep] {
         &self.steps[..self.len as usize]
@@ -1268,16 +1282,14 @@ impl X86Tune {
     /// 0 = no FMA.
     #[inline]
     pub fn fma_reduction_accumulators(&self) -> u8 {
-        (self.fma_latency as f64 * self.simd_pipes_for(self.fma_pipes, 256).max(1.0)).ceil()
-            as u8
+        (self.fma_latency as f64 * self.simd_pipes_for(self.fma_pipes, 256).max(1.0)).ceil() as u8
     }
 
     /// Independent accumulators for a 256-bit FADD reduction (latency ×
     /// effective adder pipes; one adder on SNB..BDW, two elsewhere).
     #[inline]
     pub fn fadd_reduction_accumulators(&self) -> u8 {
-        (self.fadd_latency as f64 * self.simd_pipes_for(self.fadd_pipes, 256).max(1.0)).ceil()
-            as u8
+        (self.fadd_latency as f64 * self.simd_pipes_for(self.fadd_pipes, 256).max(1.0)).ceil() as u8
     }
 
     /// Interleave factor (independent accumulator chains per reduction
@@ -1343,7 +1355,15 @@ impl X86Tune {
         };
         const REG_BUDGET: u32 = 8;
         let cap = (REG_BUDGET / accs).max(1);
-        let cap_pow2 = if cap >= 8 { 8 } else if cap >= 4 { 4 } else if cap >= 2 { 2 } else { 1 };
+        let cap_pow2 = if cap >= 8 {
+            8
+        } else if cap >= 4 {
+            4
+        } else if cap >= 2 {
+            2
+        } else {
+            1
+        };
         let best = t(cap_pow2) / cap_pow2 as f64;
         let mut chosen = cap_pow2;
         for k in [1u32, 2, 4] {
@@ -1436,7 +1456,8 @@ impl X86Tune {
             let better = match &best {
                 None => true,
                 Some(b) => {
-                    p.len() < b.len() || (p.len() == b.len() && b.needs_distinct_src && !p.needs_distinct_src)
+                    p.len() < b.len()
+                        || (p.len() == b.len() && b.needs_distinct_src && !p.needs_distinct_src)
                 }
             };
             if better {
@@ -1451,7 +1472,13 @@ impl X86Tune {
             base >>= 1;
             shift += 1;
         }
-        let tail = |p: MulPlan, shift: u8| if shift > 0 { p.push(MulStep::Shl(shift)) } else { p };
+        let tail = |p: MulPlan, shift: u8| {
+            if shift > 0 {
+                p.push(MulStep::Shl(shift))
+            } else {
+                p
+            }
+        };
         if base == 1 {
             // Pure power of two: `shl` (or `add acc,acc` — same cost).
             consider(MulPlan::new(&[MulStep::Shl(shift)], false));
@@ -1477,11 +1504,18 @@ impl X86Tune {
             let minus = (base + 1) as u64;
             if plus.is_power_of_two() && plus > 8 {
                 let s = plus.trailing_zeros() as u8;
-                consider(tail(MulPlan::new(&[MulStep::Shl(s), MulStep::AddSrc], true), shift));
+                consider(tail(
+                    MulPlan::new(&[MulStep::Shl(s), MulStep::AddSrc], true),
+                    shift,
+                ));
             }
             if minus.is_power_of_two() && minus >= 4 {
                 let s = minus.trailing_zeros() as u8;
-                let first = if minus <= 8 { MulStep::LeaScale(minus as u8) } else { MulStep::Shl(s) };
+                let first = if minus <= 8 {
+                    MulStep::LeaScale(minus as u8)
+                } else {
+                    MulStep::Shl(s)
+                };
                 consider(tail(MulPlan::new(&[first, MulStep::SubSrc], true), shift));
             }
         }
@@ -1584,8 +1618,7 @@ impl X86Tune {
         if size > self.libcall_above_bytes() {
             return CopyStrategy::LibCall;
         }
-        if self.erms && self.rep_stosb_threshold != 0 && size >= self.rep_stosb_threshold as usize
-        {
+        if self.erms && self.rep_stosb_threshold != 0 && size >= self.rep_stosb_threshold as usize {
             return CopyStrategy::RepMovsb;
         }
         CopyStrategy::InlineLoop
@@ -1629,14 +1662,20 @@ impl X86Tune {
         kv("uop_cache_uops", self.uop_cache_uops.to_string());
         kv("jcc_erratum", self.jcc_erratum.to_string());
         kv("popcnt_false_dep", self.popcnt_false_dep.to_string());
-        kv("lzcnt_tzcnt_false_dep", self.lzcnt_tzcnt_false_dep.to_string());
+        kv(
+            "lzcnt_tzcnt_false_dep",
+            self.lzcnt_tzcnt_false_dep.to_string(),
+        );
         kv("shift_cl_uops", self.shift_cl_uops.to_string());
         kv("fadd_pipes", self.fadd_pipes.to_string());
         kv("vec_int_alu_pipes", self.vec_int_alu_pipes.to_string());
         kv("simd_datapath_bits", self.simd_datapath_bits.to_string());
         kv("vec_load_ports", self.vec_load_ports.to_string());
         kv("vec_load_port_bits", self.vec_load_port_bits.to_string());
-        kv("derived.prefer_vector_bits", self.prefer_vector_bits().to_string());
+        kv(
+            "derived.prefer_vector_bits",
+            self.prefer_vector_bits().to_string(),
+        );
         kv(
             "derived.reduction_interleave_fma_dot_256",
             self.reduction_interleave(ReductionShape {
@@ -1687,7 +1726,10 @@ impl X86Tune {
         kv("fma_pipes", self.fma_pipes.to_string());
         kv("erms", self.erms.to_string());
         kv("fsrm", self.fsrm.to_string());
-        kv("avx256_unaligned_split", self.avx256_unaligned_split.to_string());
+        kv(
+            "avx256_unaligned_split",
+            self.avx256_unaligned_split.to_string(),
+        );
         kv("rep_movsb_threshold", self.rep_movsb_threshold.to_string());
         kv("rep_stosb_threshold", self.rep_stosb_threshold.to_string());
         kv("load_latency", self.load_latency.to_string());
@@ -1701,7 +1743,10 @@ impl X86Tune {
         kv("cache.l3_kib", self.cache.l3.kib.to_string());
         kv("cache.l3_ways", self.cache.l3.ways.to_string());
         kv("cache.l3_latency", self.cache.l3.latency.to_string());
-        kv("cache.dram_latency_cycles", self.cache.dram_latency_cycles.to_string());
+        kv(
+            "cache.dram_latency_cycles",
+            self.cache.dram_latency_cycles.to_string(),
+        );
         match self.ecore {
             Some(e) => {
                 kv("ecore", e.name.to_string());
@@ -1725,14 +1770,20 @@ impl X86Tune {
             "derived.fadd_reduction_accumulators",
             self.fadd_reduction_accumulators().to_string(),
         );
-        kv("derived.if_convert_arm_budget", self.if_convert_arm_budget().to_string());
+        kv(
+            "derived.if_convert_arm_budget",
+            self.if_convert_arm_budget().to_string(),
+        );
         kv("derived.issue_width", self.issue_width().to_string());
         kv("derived.prefer_shlx", self.prefer_shlx(true).to_string());
         kv(
             "derived.avoid_lea3_on_critical_path",
             self.avoid_lea3_on_critical_path().to_string(),
         );
-        kv("derived.mul_const_op_budget", self.mul_const_op_budget().to_string());
+        kv(
+            "derived.mul_const_op_budget",
+            self.mul_const_op_budget().to_string(),
+        );
         kv(
             "derived.mul_const_plan_100",
             match self.mul_const_plan(100) {
@@ -1740,7 +1791,10 @@ impl X86Tune {
                 None => "Imul".to_string(),
             },
         );
-        kv("derived.block_copy_vector_bytes_avx2", self.block_copy_vector_bytes(true).to_string());
+        kv(
+            "derived.block_copy_vector_bytes_avx2",
+            self.block_copy_vector_bytes(true).to_string(),
+        );
         kv(
             "derived.memcpy_4096_avx2",
             format!("{:?}", self.memcpy_strategy(4096, 32)),
@@ -1749,7 +1803,10 @@ impl X86Tune {
             "derived.memset_4096_avx2",
             format!("{:?}", self.memset_strategy(4096, 32)),
         );
-        kv("derived.libcall_above_bytes", self.libcall_above_bytes().to_string());
+        kv(
+            "derived.libcall_above_bytes",
+            self.libcall_above_bytes().to_string(),
+        );
         kv("derived.on_core_bytes", self.on_core_bytes().to_string());
         s
     }
@@ -1831,16 +1888,32 @@ mod tests {
     #[test]
     fn false_dependency_rows_match_uops_info() {
         use X86Cpu::*;
-        let popcnt_dep: &[X86Cpu] =
-            &[SandyBridge, IvyBridge, Haswell, Broadwell, Skylake, SkylakeAvx512];
+        let popcnt_dep: &[X86Cpu] = &[
+            SandyBridge,
+            IvyBridge,
+            Haswell,
+            Broadwell,
+            Skylake,
+            SkylakeAvx512,
+        ];
         let lzcnt_dep: &[X86Cpu] = &[SandyBridge, IvyBridge, Haswell, Broadwell];
         for cpu in X86Cpu::ALL {
             if cpu == Generic {
                 continue;
             }
             let t = cpu.tune();
-            assert_eq!(t.popcnt_false_dep, popcnt_dep.contains(&cpu), "popcnt {:?}", cpu);
-            assert_eq!(t.lzcnt_tzcnt_false_dep, lzcnt_dep.contains(&cpu), "lzcnt {:?}", cpu);
+            assert_eq!(
+                t.popcnt_false_dep,
+                popcnt_dep.contains(&cpu),
+                "popcnt {:?}",
+                cpu
+            );
+            assert_eq!(
+                t.lzcnt_tzcnt_false_dep,
+                lzcnt_dep.contains(&cpu),
+                "lzcnt {:?}",
+                cpu
+            );
         }
         assert!(Skylake.tune().popcnt_false_dep && !Skylake.tune().lzcnt_tzcnt_false_dep);
     }
@@ -1852,7 +1925,14 @@ mod tests {
             assert_eq!(cpu.tune().shift_cl_uops, 3, "{:?}", cpu);
         }
         // IVB is the one pre-Skylake core with a 2-µop SHL r,CL (2*p05).
-        for cpu in [IvyBridge, IceLake, AlderLake, RaptorLake, SapphireRapids, ArrowLake] {
+        for cpu in [
+            IvyBridge,
+            IceLake,
+            AlderLake,
+            RaptorLake,
+            SapphireRapids,
+            ArrowLake,
+        ] {
             assert_eq!(cpu.tune().shift_cl_uops, 2, "{:?}", cpu);
         }
         for cpu in [Gracemont, Znver1, Znver2, Znver3, Znver4, Znver5] {
@@ -2065,8 +2145,14 @@ mod tests {
         assert_eq!(rpl.memcpy_strategy(129, 16), CopyStrategy::InlineLoop);
         // Struct copies never libcall; calls do above L3/4.
         assert_eq!(rpl.memcpy_strategy(64 << 20, 32), CopyStrategy::RepMovsb);
-        assert_eq!(rpl.memcpy_call_strategy(64 << 20, 32), CopyStrategy::LibCall);
-        assert_eq!(rpl.memcpy_call_strategy(1 << 20, 32), CopyStrategy::RepMovsb);
+        assert_eq!(
+            rpl.memcpy_call_strategy(64 << 20, 32),
+            CopyStrategy::LibCall
+        );
+        assert_eq!(
+            rpl.memcpy_call_strategy(1 << 20, 32),
+            CopyStrategy::RepMovsb
+        );
         let skl = Skylake.tune();
         assert_eq!(skl.memcpy_strategy(4096, 32), CopyStrategy::InlineLoop);
         assert_eq!(skl.memcpy_strategy(8192, 32), CopyStrategy::RepMovsb);
@@ -2079,8 +2165,14 @@ mod tests {
         assert_eq!(snb.memcpy_call_strategy(8192, 16), CopyStrategy::InlineLoop);
         assert_eq!(Haswell.tune().block_copy_vector_bytes(true), 32);
         assert_eq!(Haswell.tune().block_copy_vector_bytes(false), 16);
-        assert_eq!(Znver3.tune().memcpy_strategy(8192, 32), CopyStrategy::RepMovsb);
-        assert_eq!(Znver4.tune().memcpy_strategy(2112, 32), CopyStrategy::RepMovsb);
+        assert_eq!(
+            Znver3.tune().memcpy_strategy(8192, 32),
+            CopyStrategy::RepMovsb
+        );
+        assert_eq!(
+            Znver4.tune().memcpy_strategy(2112, 32),
+            CopyStrategy::RepMovsb
+        );
     }
 
     #[test]
@@ -2094,12 +2186,21 @@ mod tests {
         assert_eq!(rpl.memset_strategy(4096, 32), CopyStrategy::RepMovsb);
         assert_eq!(rpl.memset_strategy(64 << 20, 32), CopyStrategy::LibCall);
         // Same 2048 on ERMS-only parts (glibc has no FSRM split for stores).
-        assert_eq!(Skylake.tune().memset_strategy(2048, 32), CopyStrategy::RepMovsb);
-        assert_eq!(Znver3.tune().memset_strategy(2048, 32), CopyStrategy::RepMovsb);
+        assert_eq!(
+            Skylake.tune().memset_strategy(2048, 32),
+            CopyStrategy::RepMovsb
+        );
+        assert_eq!(
+            Znver3.tune().memset_strategy(2048, 32),
+            CopyStrategy::RepMovsb
+        );
         let g = X86Tune::GENERIC;
         assert_eq!(g.memset_strategy(4096, 32), CopyStrategy::InlineLoop);
         assert_eq!(g.memset_strategy(8193, 32), CopyStrategy::LibCall);
-        assert_eq!(SandyBridge.tune().memset_strategy(4096, 16), CopyStrategy::InlineLoop);
+        assert_eq!(
+            SandyBridge.tune().memset_strategy(4096, 16),
+            CopyStrategy::InlineLoop
+        );
     }
 
     #[test]
@@ -2132,7 +2233,9 @@ mod tests {
         assert_eq!(steps(-3), Some(vec![LeaMul(2), Neg]));
         assert_eq!(steps(-8), Some(vec![Shl(3), Neg]));
         // 3-op shapes stay IMUL on a 3-cycle multiplier.
-        for k in [11, 13, 14, 19, 21, 22, 23, 26, 28, 29, 30, 50, 100, 1000, -7, -10, -100] {
+        for k in [
+            11, 13, 14, 19, 21, 22, 23, 26, 28, 29, 30, 50, 100, 1000, -7, -10, -100,
+        ] {
             assert_eq!(steps(k), None, "k={k}");
         }
         // Register constraint is reported.
@@ -2164,7 +2267,12 @@ mod tests {
             let t = cpu.tune();
             for k in -200i64..=200 {
                 if let Some(p) = t.mul_const_plan(k) {
-                    assert!(p.len() < t.imul64_latency as usize, "{:?} k={k} {:?}", cpu, p);
+                    assert!(
+                        p.len() < t.imul64_latency as usize,
+                        "{:?} k={k} {:?}",
+                        cpu,
+                        p
+                    );
                     assert!(p.len() <= 4);
                 }
             }
@@ -2192,13 +2300,32 @@ mod tests {
             }
             acc
         }
-        let inputs = [0i64, 1, -1, 2, 3, 7, 12345, -98765, i64::MAX, i64::MIN, 0x7fff_ffff, -0x8000_0000];
+        let inputs = [
+            0i64,
+            1,
+            -1,
+            2,
+            3,
+            7,
+            12345,
+            -98765,
+            i64::MAX,
+            i64::MIN,
+            0x7fff_ffff,
+            -0x8000_0000,
+        ];
         for cpu in X86Cpu::ALL {
             let t = cpu.tune();
             for k in (-1100i64..=1100).chain([i32::MAX as i64, i32::MIN as i64]) {
                 if let Some(p) = t.mul_const_plan(k) {
                     for &x in &inputs {
-                        assert_eq!(run(&p, x), x.wrapping_mul(k), "{:?} k={k} x={x} {:?}", cpu, p);
+                        assert_eq!(
+                            run(&p, x),
+                            x.wrapping_mul(k),
+                            "{:?} k={k} x={x} {:?}",
+                            cpu,
+                            p
+                        );
                     }
                 }
             }
@@ -2246,7 +2373,11 @@ mod tests {
         let n = resolve(None, Some("native"));
         assert!(X86Cpu::ALL.contains(&n.cpu));
         // Cache geometry from CPUID must be sane whenever it is reported.
-        assert!(n.cache.l1d.kib >= 8 && n.cache.l1d.kib <= 256, "{:?}", n.cache);
+        assert!(
+            n.cache.l1d.kib >= 8 && n.cache.l1d.kib <= 256,
+            "{:?}",
+            n.cache
+        );
         assert!(n.cache.line_bytes == 32 || n.cache.line_bytes == 64 || n.cache.line_bytes == 128);
         assert!(n.cache.l2.kib >= n.cache.l1d.kib);
     }
@@ -2314,7 +2445,11 @@ mod tests {
             assert!((2..=4).contains(&t.vec_int_alu_pipes), "{:?}", cpu);
             // A load port is never narrower than the datapath it feeds by
             // more than one halving (SNB: 256-bit FP, 128-bit load ports).
-            assert!(t.vec_load_port_bits * 2 >= t.simd_datapath_bits, "{:?}", cpu);
+            assert!(
+                t.vec_load_port_bits * 2 >= t.simd_datapath_bits,
+                "{:?}",
+                cpu
+            );
         }
         let rpl = X86Cpu::RaptorLake.tune();
         assert_eq!(rpl.vector_loads_per_cycle(256), 3.0);
@@ -2435,7 +2570,11 @@ mod tests {
             let c = cpu.tune().cache;
             assert_eq!(c.line_bytes, 64, "{:?}", cpu);
             assert!(c.l1d.kib < c.l2.kib && c.l2.kib < c.l3.kib, "{:?}", cpu);
-            assert!(c.l1d.latency < c.l2.latency && c.l2.latency < c.l3.latency, "{:?}", cpu);
+            assert!(
+                c.l1d.latency < c.l2.latency && c.l2.latency < c.l3.latency,
+                "{:?}",
+                cpu
+            );
             assert!(c.l3.latency < 128 && (c.dram_latency_cycles as u32) > c.l3.latency as u32 * 2);
             assert_eq!(cpu.tune().load_latency, c.l1d.latency, "{:?}", cpu);
         }

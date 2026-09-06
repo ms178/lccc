@@ -170,16 +170,15 @@ pub(crate) fn sink_vector_loads(func: &mut IrFunction) -> usize {
             let Some(uj) = block.instructions[i + 1..]
                 .iter()
                 .position(|inst| {
-                    matches!(inst, Instruction::Intrinsic { .. })
-                        && {
-                            let mut found = false;
-                            for_each_operand_in_instruction(inst, |op| {
-                                if matches!(op, Operand::Value(v) if v.0 == d) {
-                                    found = true;
-                                }
-                            });
-                            found
-                        }
+                    matches!(inst, Instruction::Intrinsic { .. }) && {
+                        let mut found = false;
+                        for_each_operand_in_instruction(inst, |op| {
+                            if matches!(op, Operand::Value(v) if v.0 == d) {
+                                found = true;
+                            }
+                        });
+                        found
+                    }
                 })
                 .map(|p| p + i + 1)
             else {
@@ -374,7 +373,12 @@ mod tests {
         assert_eq!(sink_locked(&mut f), 1);
         assert_eq!(
             ops(&f, 0),
-            vec!["VecLoadF32x8:41", "VecLoadF32x8:40", "VecAddI32x8:42", "VecStoreF32x8:-1"]
+            vec![
+                "VecLoadF32x8:41",
+                "VecLoadF32x8:40",
+                "VecAddI32x8:42",
+                "VecStoreF32x8:-1"
+            ]
         );
     }
 
@@ -503,7 +507,8 @@ mod tests {
             0,
             vec![vload(37, 4, 35), vbin(O::VecMulF32x8, 40, 38, 38)],
         ));
-        f.blocks.push(block(1, vec![vbin(O::VecAddF32x8, 41, 37, 40)]));
+        f.blocks
+            .push(block(1, vec![vbin(O::VecAddF32x8, 41, 37, 40)]));
         assert_eq!(sink_locked(&mut f), 0);
     }
 

@@ -1882,14 +1882,13 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecZeroI32x4
             | O::VecZeroI32x8
             | O::VecZeroF32x4
-            | O::VecZeroF32x8
-            // VecMin/VecMax/VecCmp/VecBlendv read their operands through the
-            // register cache (avx_load_arg / vec_home / mem_source_after_
-            // flush), never raw from a slot — classifying them as raw readers
-            // forces a needless flush of the deferred value at every consumer
-            // (a dead stack store + reload per iteration in min/max/select
-            // loops).  They must NOT be listed here; the cache-aware checks
-            // (VDEFER pos0/pos1/pos2, is_cache_aware_3op) cover them.
+            | O::VecZeroF32x8 // VecMin/VecMax/VecCmp/VecBlendv read their operands through the
+                              // register cache (avx_load_arg / vec_home / mem_source_after_
+                              // flush), never raw from a slot — classifying them as raw readers
+                              // forces a needless flush of the deferred value at every consumer
+                              // (a dead stack store + reload per iteration in min/max/select
+                              // loops).  They must NOT be listed here; the cache-aware checks
+                              // (VDEFER pos0/pos1/pos2, is_cache_aware_3op) cover them.
     )
 }
 
@@ -2399,7 +2398,10 @@ pub(super) fn compute_vector_memfold_values(func: &IrFunction) -> FxHashSet<u32>
             }
             if let Some(d) = pick {
                 if debug {
-                    eprintln!("[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}", func.name, bi, j, d, cop);
+                    eprintln!(
+                        "[VLFOLD-IR] {} b{} i{} fold load %{} into {:?}",
+                        func.name, bi, j, d, cop
+                    );
                 }
                 result.insert(d);
             }

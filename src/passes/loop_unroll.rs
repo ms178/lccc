@@ -713,7 +713,10 @@ fn normalize_to_type(v: i64, ty: IrType) -> Option<i64> {
 
 /// Ordering comparisons that read their operands as unsigned.
 fn cmp_is_unsigned(op: IrCmpOp) -> bool {
-    matches!(op, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge)
+    matches!(
+        op,
+        IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge
+    )
 }
 
 /// `a OP b`  ⇔  `b MIRROR(OP) a`.
@@ -985,7 +988,8 @@ fn body_contains_persisting_inner_loop(
             continue;
         }
         // Clean counted inner loop: IV, exit condition, and its initial value.
-        let Some((iv_phi, _ty, _step, _)) = find_iv_in_loop_ext(func, inner.header, latch, latch_label)
+        let Some((iv_phi, _ty, _step, _)) =
+            find_iv_in_loop_ext(func, inner.header, latch, latch_label)
         else {
             continue;
         };
@@ -1622,7 +1626,10 @@ fn try_complete_unroll_general(
     let empty_vmap: FxHashMap<u32, u32> = FxHashMap::default();
     let (env_fg, last_vmap) = match plans.last() {
         Some(last) => (model.env_next(trip, &last.env, &last.vmap), &last.vmap),
-        None => (model.env_next(trip, &model.env_entry(), &empty_vmap), &empty_vmap),
+        None => (
+            model.env_next(trip, &model.env_entry(), &empty_vmap),
+            &empty_vmap,
+        ),
     };
     if has_header_extra {
         let fg_label = BlockId(next_label);
@@ -1767,10 +1774,7 @@ fn try_complete_unroll_general(
     // the one-extra failing evaluation.
     let extra_out_ids: FxHashSet<u32> = extra_final.keys().copied().collect();
     let mut final_subst: FxHashMap<u32, Operand> = FxHashMap::default();
-    final_subst.insert(
-        iv_id,
-        Operand::Const(IrConst::from_i64(final_iv_n, iv_ty)),
-    );
+    final_subst.insert(iv_id, Operand::Const(IrConst::from_i64(final_iv_n, iv_ty)));
     for (&e, &fg) in &extra_final {
         final_subst.insert(e, Operand::Value(Value(fg)));
     }
@@ -1802,10 +1806,12 @@ fn try_complete_unroll_general(
     if let Some(exit_bi) = func.blocks.iter().position(|b| b.label == exit_target) {
         if exit_bi != header && !lp.body.contains(&exit_bi) {
             let new_pred = final_guard.unwrap_or_else(|| match plans.last() {
-                Some(last) => last.block_labels[body_blocks
-                    .iter()
-                    .position(|&b| b == latch)
-                    .expect("latch is a body block")],
+                Some(last) => {
+                    last.block_labels[body_blocks
+                        .iter()
+                        .position(|&b| b == latch)
+                        .expect("latch is a body block")]
+                }
                 // trip == 1: no clone; the latch itself branches to the exit.
                 None => latch_label,
             });
@@ -2478,7 +2484,6 @@ fn signed_step(c: IrConst, ty: IrType) -> Option<i64> {
         _ => None,
     }
 }
-
 
 /// STRICT induction-variable detector for the partial-unroll path.
 ///
@@ -3636,17 +3641,17 @@ mod tests {
         // fixture to the partial unroller instead.  Use the constant directly
         // so BOTH complete-unroll and partial-unroll paths are exercised.
         if const_iv_init {
-        if let Some(Instruction::Phi { incoming, .. }) = func.blocks[1]
-            .instructions
-            .iter_mut()
-            .find(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == 1))
-        {
-            for (op, lbl) in incoming.iter_mut() {
-                if *lbl == BlockId(0) {
-                    *op = Operand::Const(IrConst::I32(0));
+            if let Some(Instruction::Phi { incoming, .. }) = func.blocks[1]
+                .instructions
+                .iter_mut()
+                .find(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == 1))
+            {
+                for (op, lbl) in incoming.iter_mut() {
+                    if *lbl == BlockId(0) {
+                        *op = Operand::Const(IrConst::I32(0));
+                    }
                 }
             }
-        }
         }
 
         // B0 becomes a conditional dispatch into the loop or around it.
@@ -4392,14 +4397,8 @@ mod tests {
         // Sle at the top of the range: span/step + 1 would be MAX + 1.
         assert_eq!(trip_i64(0, i64::MAX, Sle, 1), None);
         // Extremes that stay in range must still unroll.
-        assert_eq!(
-            trip_i64(i64::MIN, i64::MIN + 8, Slt, 2),
-            Some(4)
-        );
-        assert_eq!(
-            trip_i64(i64::MAX, i64::MAX - 9, Sgt, -3),
-            Some(3)
-        );
+        assert_eq!(trip_i64(i64::MIN, i64::MIN + 8, Slt, 2), Some(4));
+        assert_eq!(trip_i64(i64::MAX, i64::MAX - 9, Sgt, -3), Some(3));
         // `i <= MAX` with stride 3 from MAX-6 executes for MAX-6, MAX-3,
         // MAX and then increments PAST the type: the exit test never sees
         // an in-range value, so the loop has no static trip (UB in C, an

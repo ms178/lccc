@@ -1287,7 +1287,10 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                     stack_offset = (stack_offset + a - 1) & !(a - 1);
                 }
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
-                    eprintln!("[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}", func.name, i, stack_offset);
+                    eprintln!(
+                        "[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}",
+                        func.name, i, stack_offset
+                    );
                 }
                 let off = stack_offset;
                 stack_offset += (size as i64 + slot_align_mask) & !slot_align_mask;
@@ -1346,7 +1349,10 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 func.params.get(i).and_then(|p| p.struct_align)
             );
         }
-        eprintln!("[STACK-ALIGN] fn={} total_stack_bytes={}", func.name, stack_offset);
+        eprintln!(
+            "[STACK-ALIGN] fn={} total_stack_bytes={}",
+            func.name, stack_offset
+        );
     }
 
     ParamClassification {

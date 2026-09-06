@@ -16,16 +16,17 @@ pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod backedge_pre;
 pub(crate) mod bit_idioms;
-pub(crate) mod cvp;
 pub(crate) mod block_layout;
 pub(crate) mod bool_thread;
 pub(crate) mod cfg_simplify;
 pub(crate) mod constant_fold;
 pub(crate) mod copy_prop;
+pub(crate) mod cvp;
 pub(crate) mod dce;
 mod dead_statics;
 pub(crate) mod div_by_const;
 pub(crate) mod dse;
+pub(crate) mod expr_sink;
 pub(crate) mod fortify_fold;
 pub(crate) mod fp_const_hoist;
 pub(crate) mod global_addr_cse;
@@ -39,11 +40,10 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod licm;
-pub(crate) mod expr_sink;
 pub(crate) mod load_forward;
 pub(crate) mod loop_analysis;
-pub(crate) mod loop_invert;
 pub(crate) mod loop_carried_forward;
+pub(crate) mod loop_invert;
 pub(crate) mod loop_memory_promote;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_unroll;
@@ -62,8 +62,8 @@ pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
 pub(crate) mod use_def;
-pub(crate) mod vec_load_sink;
 pub(crate) mod vec_interleave;
+pub(crate) mod vec_load_sink;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -1422,7 +1422,12 @@ pub(crate) fn run_passes(
                 let mut scratch = vec![false; module.functions.len()];
                 timed_pass!(
                     "vec_load_sink",
-                    run_on_visited(module, &dirty, &mut scratch, vec_load_sink::sink_vector_loads)
+                    run_on_visited(
+                        module,
+                        &dirty,
+                        &mut scratch,
+                        vec_load_sink::sink_vector_loads
+                    )
                 );
             }
 

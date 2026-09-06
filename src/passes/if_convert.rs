@@ -267,9 +267,8 @@ fn rewrite_covered_arm_loads(
         .flat_map(|b| b.instructions.iter())
         .filter_map(|i| i.dest().map(|d| (d.0, i.clone())))
         .collect();
-    let canonical_addr_key = |ptr: &Value| -> String {
-        canonical_addr_key_impl(&defs, &copy_of, ptr)
-    };
+    let canonical_addr_key =
+        |ptr: &Value| -> String { canonical_addr_key_impl(&defs, &copy_of, ptr) };
 
     for pred_idx in 0..func.blocks.len() {
         let (true_label, false_label) = match &func.blocks[pred_idx].terminator {
@@ -488,10 +487,7 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
             continue;
         }
         let ty = cands[0].ty;
-        if !cands
-            .iter()
-            .all(|c| c.ty == ty && c.key == cands[0].key)
-        {
+        if !cands.iter().all(|c| c.ty == ty && c.key == cands[0].key) {
             continue;
         }
         // Rebuild ONE address chain inside M (fresh dests): the store GEP
@@ -520,9 +516,14 @@ fn sink_conditional_stores(func: &mut IrFunction) -> usize {
             .position(|i| !matches!(i, Instruction::Phi { .. }))
             .unwrap_or(func.blocks[merge_idx].instructions.len());
         let mut insert_at = pos;
-        func.blocks[merge_idx]
-            .instructions
-            .insert(insert_at, Instruction::Phi { dest: phi_dest, ty, incoming });
+        func.blocks[merge_idx].instructions.insert(
+            insert_at,
+            Instruction::Phi {
+                dest: phi_dest,
+                ty,
+                incoming,
+            },
+        );
         insert_at += 1;
         let chain_len = chain_insts.len();
         for inst in chain_insts {
@@ -624,7 +625,10 @@ fn clone_addr_chain_into_merge(
                 emitted.push(Instruction::Copy { dest: nv, src: ns });
             }
             Instruction::Cast {
-                src, to_ty, from_ty, ..
+                src,
+                to_ty,
+                from_ty,
+                ..
             } => {
                 let ns = clone_operand(src, defs, copy_of, memo, emitted, next_val)?;
                 *next_val += 1;
@@ -645,9 +649,17 @@ fn clone_addr_chain_into_merge(
                 let nl = clone_operand(lhs, defs, copy_of, memo, emitted, next_val)?;
                 let nr = clone_operand(rhs, defs, copy_of, memo, emitted, next_val)?;
                 *next_val += 1;
-                emitted.push(Instruction::BinOp { dest: nv, op: *op, lhs: nl, rhs: nr, ty: *ty });
+                emitted.push(Instruction::BinOp {
+                    dest: nv,
+                    op: *op,
+                    lhs: nl,
+                    rhs: nr,
+                    ty: *ty,
+                });
             }
-            Instruction::Phi { .. } | Instruction::GlobalAddr { .. } | Instruction::ParamRef { .. } => {
+            Instruction::Phi { .. }
+            | Instruction::GlobalAddr { .. }
+            | Instruction::ParamRef { .. } => {
                 // Dominating leaves: keep the original value.
                 memo.insert(v, resolved);
                 return Some(resolved);
@@ -669,7 +681,14 @@ fn clone_addr_chain_into_merge(
         return None;
     };
     let nb = clone_value(*base, defs, copy_of, &mut memo, &mut emitted, &mut next_val)?;
-    let noff = clone_operand(offset, defs, copy_of, &mut memo, &mut emitted, &mut next_val)?;
+    let noff = clone_operand(
+        offset,
+        defs,
+        copy_of,
+        &mut memo,
+        &mut emitted,
+        &mut next_val,
+    )?;
     let gep_val = Value(next_val);
     next_val += 1;
     emitted.push(Instruction::GetElementPtr {
@@ -2247,21 +2266,23 @@ mod tests {
         // b1: header — iv phi, exit test, CondBranch(body, exit).
         f.blocks.push(block(
             1,
-            vec![Instruction::Phi {
-                dest: Value(10),
-                ty: IrType::U64,
-                incoming: vec![
-                    (Operand::Const(IrConst::I64(0)), BlockId(0)),
-                    (Operand::Value(Value(11)), BlockId(5)),
-                ],
-            },
-            Instruction::Cmp {
-                dest: Value(12),
-                op: IrCmpOp::Ult,
-                lhs: Operand::Value(Value(10)),
-                rhs: Operand::Value(Value(4)),
-                ty: IrType::U64,
-            }],
+            vec![
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U64,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                        (Operand::Value(Value(11)), BlockId(5)),
+                    ],
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Value(Value(4)),
+                    ty: IrType::U64,
+                },
+            ],
             Terminator::CondBranch {
                 cond: Operand::Value(Value(12)),
                 true_label: BlockId(2),
@@ -2340,7 +2361,8 @@ mod tests {
             ));
             Operand::Value(Value(35))
         } else {
-            f.blocks.push(block(4, vec![], Terminator::Branch(BlockId(5))));
+            f.blocks
+                .push(block(4, vec![], Terminator::Branch(BlockId(5))));
             Operand::Value(Value(25))
         };
         // b5: merge — phi for d[i], store d[i], iv increment, backedge.
@@ -2396,8 +2418,7 @@ mod tests {
         );
         assert!(f.blocks[3].instructions.is_empty());
         assert!(f.blocks[4].instructions.is_empty());
-        assert!(!f
-            .blocks[5]
+        assert!(!f.blocks[5]
             .instructions
             .iter()
             .any(|i| matches!(i, Instruction::Phi { dest: d, .. } if d.0 == 40)));
@@ -2483,10 +2504,7 @@ mod tests {
         let k_i = canonical_addr_key_impl(&defs, &copy_of, &Value(20));
         let k_2i = canonical_addr_key_impl(&defs, &copy_of, &Value(21));
         let k_i_again = canonical_addr_key_impl(&defs, &copy_of, &Value(22));
-        assert_ne!(
-            k_i, k_2i,
-            "d[i] and d[2*i] must NOT share a canonical key"
-        );
+        assert_ne!(k_i, k_2i, "d[i] and d[2*i] must NOT share a canonical key");
         assert_eq!(
             k_i, k_i_again,
             "two arms' d[i] GEPs (fresh Shl SSAs, same scale) must share the key"
@@ -2524,7 +2542,8 @@ mod tests {
             },
         ));
         // b2: outer true arm — 0.0.
-        f.blocks.push(block(2, vec![], Terminator::Branch(BlockId(6))));
+        f.blocks
+            .push(block(2, vec![], Terminator::Branch(BlockId(6))));
         // b3: inner pred — cmp a>1; triangle: true arm b4, false edge direct.
         f.blocks.push(block(
             3,
@@ -2542,7 +2561,8 @@ mod tests {
             },
         ));
         // b4: inner true arm — 1.0.
-        f.blocks.push(block(4, vec![], Terminator::Branch(BlockId(6))));
+        f.blocks
+            .push(block(4, vec![], Terminator::Branch(BlockId(6))));
         // b5: unused intermediate (keeps label ids realistic).
         // b6: merge — phi with THREE incoming, return it.
         f.blocks.push(block(

@@ -564,9 +564,8 @@ fn reserve_static_chain_reg(
     let Some(chain) = static_chain_phys_reg() else {
         return (available, caller_saved, call_arg, indirect_target);
     };
-    let drop = |v: Vec<PhysReg>| -> Vec<PhysReg> {
-        v.into_iter().filter(|r| r.0 != chain.0).collect()
-    };
+    let drop =
+        |v: Vec<PhysReg>| -> Vec<PhysReg> { v.into_iter().filter(|r| r.0 != chain.0).collect() };
     (
         drop(available),
         drop(caller_saved),
@@ -612,13 +611,8 @@ mod static_chain_reservation_tests {
         let f = func_with(vec![Instruction::SetStaticChain {
             src: Operand::Value(Value(1)),
         }]);
-        let (a, c, ca, it) = reserve_static_chain_reg(
-            &f,
-            pool.clone(),
-            pool.clone(),
-            pool.clone(),
-            pool.clone(),
-        );
+        let (a, c, ca, it) =
+            reserve_static_chain_reg(&f, pool.clone(), pool.clone(), pool.clone(), pool.clone());
         for (name, v) in [
             ("available", &a),
             ("caller_saved", &c),

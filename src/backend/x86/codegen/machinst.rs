@@ -25,8 +25,10 @@ pub enum MachReg {
     Vreg(u32),
 }
 
-/// Operand size for instruction encoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Operand size for instruction encoding. Ordered S8 < S16 < S32 < S64 —
+/// the extending-move emitters compare widths to enforce their
+/// strict-widening legality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpSize {
     S8,  // byte (al, bl, r12b, ...)
     S16, // word (ax, bx, r12w, ...)
@@ -308,6 +310,22 @@ pub enum MachInst {
     /// hole in MachInst coverage.
     LeaSym {
         sym: String,
+        dst: MachReg,
+    },
+
+    /// `leaq slot(%rbp), dst` — the address of a stack slot, in the current
+    /// frame-addressing mode (rbp- or rsp-relative, chosen by the emitter like
+    /// every [`MachOperand::StackSlot`] access).
+    ///
+    /// This is the typed replacement for the resolve-time `Raw("leaq …")`
+    /// text hack the `AllocaAddr` lowering used to emit: typed operands keep
+    /// the window register allocator's def/use scan exact (a `Raw` escape
+    /// hatch conservatively blocks the entire scratch pool) and make the
+    /// shape golden-testable and assembler-differentiable like every other
+    /// variant. The slot is the resolved frame offset; the dst may still be a
+    /// vreg (the window allocator rewrites it).
+    LeaSlot {
+        slot: i64,
         dst: MachReg,
     },
 

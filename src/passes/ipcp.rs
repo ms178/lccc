@@ -313,9 +313,7 @@ fn eval_const_function(
                         let value = eval_const_operand(src, &values)?;
                         values.insert(
                             dest.0,
-                            crate::passes::constant_fold::eval_cast_const(
-                                value, *from_ty, *to_ty,
-                            )?,
+                            crate::passes::constant_fold::eval_cast_const(value, *from_ty, *to_ty)?,
                         );
                     }
                     Instruction::UnaryOp { dest, op, src, ty } => {

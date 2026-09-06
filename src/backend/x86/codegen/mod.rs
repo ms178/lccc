@@ -14,6 +14,7 @@ mod intrinsics;
 mod intrinsics_simd;
 pub(crate) mod isel;
 pub(crate) mod machinst;
+pub(crate) mod machinst_alloc;
 pub(crate) mod machinst_emit;
 #[cfg(test)]
 mod machinst_tests;

@@ -397,7 +397,12 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
         if eliminated > 0 {
             if let Some((k, old)) = cfa_directive {
                 let new = old - 8 * eliminated as i64;
-                replace_line(store, &mut infos[k], k, format!("    .cfi_def_cfa_offset {}", new));
+                replace_line(
+                    store,
+                    &mut infos[k],
+                    k,
+                    format!("    .cfi_def_cfa_offset {}", new),
+                );
             }
         }
         i = func_end.max(i + 1);

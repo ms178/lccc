@@ -271,16 +271,39 @@ impl I686Codegen {
                     if k == 1 {
                         emit!(self.state, "    leal (%{}, %{}), %{}", src, src, dest)
                     } else {
-                        emit!(self.state, "    leal (%{}, %{}, {}), %{}", src, src, k, dest)
+                        emit!(
+                            self.state,
+                            "    leal (%{}, %{}, {}), %{}",
+                            src,
+                            src,
+                            k,
+                            dest
+                        )
                     }
                 }
-                MulStep::LeaScaleSrc(k) => emit!(self.state, "    leal (, %{}, {}), %{}", src, k, dest),
-                MulStep::LeaSelf(k) => emit!(self.state, "    leal (%{}, %{}, {}), %{}", dest, dest, k, dest),
+                MulStep::LeaScaleSrc(k) => {
+                    emit!(self.state, "    leal (, %{}, {}), %{}", src, k, dest)
+                }
+                MulStep::LeaSelf(k) => emit!(
+                    self.state,
+                    "    leal (%{}, %{}, {}), %{}",
+                    dest,
+                    dest,
+                    k,
+                    dest
+                ),
                 MulStep::LeaSrcPlus(k) => {
                     if k == 1 {
                         emit!(self.state, "    leal (%{}, %{}), %{}", src, dest, dest)
                     } else {
-                        emit!(self.state, "    leal (%{}, %{}, {}), %{}", src, dest, k, dest)
+                        emit!(
+                            self.state,
+                            "    leal (%{}, %{}, {}), %{}",
+                            src,
+                            dest,
+                            k,
+                            dest
+                        )
                     }
                 }
                 MulStep::Shl(k) => emit!(self.state, "    shll ${}, %{}", k, dest),
@@ -471,7 +494,9 @@ impl I686Codegen {
     /// plain `divl`/`idivl` pair head).
     fn emit_divrem_const_in_eax_edx(&mut self, signed: bool, d: i64) -> bool {
         if !signed {
-            let Ok(d) = u32::try_from(d) else { return false };
+            let Ok(d) = u32::try_from(d) else {
+                return false;
+            };
             match d {
                 0 => return false,
                 1 => {
@@ -497,7 +522,9 @@ impl I686Codegen {
                 }
             }
         }
-        let Ok(d) = i32::try_from(d) else { return false };
+        let Ok(d) = i32::try_from(d) else {
+            return false;
+        };
         match d {
             0 => false,
             1 | -1 => {
@@ -1046,7 +1073,9 @@ impl I686Codegen {
         // (imm == 0 is UB and traps there too, matching C).
         let folded = if !self.optimize_for_size {
             match Self::const_as_imm32(rhs) {
-                Some(d) if d != 0 && (signed || d > 0) => self.emit_divrem_const_in_eax_edx(signed, d),
+                Some(d) if d != 0 && (signed || d > 0) => {
+                    self.emit_divrem_const_in_eax_edx(signed, d)
+                }
                 _ => false,
             }
         } else {
@@ -1186,7 +1215,10 @@ impl MulStep {
     fn bytes(self) -> u32 {
         match self {
             MulStep::Mov | MulStep::AddSelf | MulStep::AddSrc | MulStep::SubSrc | MulStep::Neg => 2,
-            MulStep::LeaSrcSrc(_) | MulStep::LeaSelf(_) | MulStep::LeaSrcPlus(_) | MulStep::Shl(_) => 3,
+            MulStep::LeaSrcSrc(_)
+            | MulStep::LeaSelf(_)
+            | MulStep::LeaSrcPlus(_)
+            | MulStep::Shl(_) => 3,
             MulStep::LeaScaleSrc(_) => 7,
         }
     }
@@ -1208,7 +1240,12 @@ impl MulStep {
 /// tiny (≤ ~20k nodes for budget 3) and results are memoised per
 /// (imm, same, budget, allow_scale_lea), so the cost per multiply is a hash
 /// lookup after the first occurrence.
-pub(super) fn synth_mul(imm: u32, same: bool, budget: usize, allow_scale_lea: bool) -> Option<Vec<MulStep>> {
+pub(super) fn synth_mul(
+    imm: u32,
+    same: bool,
+    budget: usize,
+    allow_scale_lea: bool,
+) -> Option<Vec<MulStep>> {
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {
@@ -1224,7 +1261,12 @@ pub(super) fn synth_mul(imm: u32, same: bool, budget: usize, allow_scale_lea: bo
     result
 }
 
-fn synth_mul_uncached(imm: u32, same: bool, budget: usize, allow_scale_lea: bool) -> Option<Vec<MulStep>> {
+fn synth_mul_uncached(
+    imm: u32,
+    same: bool,
+    budget: usize,
+    allow_scale_lea: bool,
+) -> Option<Vec<MulStep>> {
     if imm == 0 {
         return None; // caller emits xorl
     }
@@ -1288,7 +1330,11 @@ fn synth_mul_uncached(imm: u32, same: bool, budget: usize, allow_scale_lea: bool
                     step(self, MulStep::Neg, c.wrapping_neg());
                     if !self.same {
                         for k in [1u8, 2, 4, 8] {
-                            step(self, MulStep::LeaSrcPlus(k), c.wrapping_mul(k as u32).wrapping_add(1));
+                            step(
+                                self,
+                                MulStep::LeaSrcPlus(k),
+                                c.wrapping_mul(k as u32).wrapping_add(1),
+                            );
                         }
                         step(self, MulStep::AddSrc, c.wrapping_add(1));
                         step(self, MulStep::SubSrc, c.wrapping_sub(1));
@@ -1351,7 +1397,15 @@ mod synth_mul_tests {
     #[test]
     fn every_admitted_chain_is_correct_and_within_budget() {
         let mut consts: Vec<i64> = (-300..=1100).collect();
-        consts.extend([0x7FFF_FFFF, -0x8000_0000, 0x1_0000, 0x1_0001, 0xFFFF, 0x0101_0101, 16777619]);
+        consts.extend([
+            0x7FFF_FFFF,
+            -0x8000_0000,
+            0x1_0000,
+            0x1_0001,
+            0xFFFF,
+            0x0101_0101,
+            16777619,
+        ]);
         for &c in &consts {
             let imm = c as u32;
             for same in [false, true] {
@@ -1360,10 +1414,16 @@ mod synth_mul_tests {
                         if let Some(chain) = synth_mul(imm, same, budget, scale) {
                             assert!(chain.len() <= budget, "{c}: {chain:?}");
                             if chain.len() == 3 {
-                                assert_eq!(chain[0], MulStep::Mov, "{c}: 3-step chain must start with mov");
+                                assert_eq!(
+                                    chain[0],
+                                    MulStep::Mov,
+                                    "{c}: 3-step chain must start with mov"
+                                );
                             }
                             if !scale {
-                                assert!(!chain.iter().any(|s| matches!(s, MulStep::LeaScaleSrc(_))));
+                                assert!(!chain
+                                    .iter()
+                                    .any(|s| matches!(s, MulStep::LeaScaleSrc(_))));
                             }
                             assert_eq!(eval(&chain, same), imm, "{c} same={same} chain={chain:?}");
                         }
@@ -1429,7 +1489,10 @@ mod synth_mul_tests {
         // -Os: single instruction, no 7-byte LEA.
         assert_eq!(synth_mul(4, false, 1, false), None);
         assert_eq!(synth_mul(4, true, 1, false), Some(vec![MulStep::Shl(2)]));
-        assert_eq!(synth_mul(3, false, 1, false), Some(vec![MulStep::LeaSrcSrc(2)]));
+        assert_eq!(
+            synth_mul(3, false, 1, false),
+            Some(vec![MulStep::LeaSrcSrc(2)])
+        );
         assert_eq!(synth_mul(6, true, 1, false), None);
     }
 }

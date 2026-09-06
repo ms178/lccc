@@ -583,7 +583,12 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                 if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
                     invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
                 } else {
-                    invalidate_slots_at(&mut slot_entries, &mut reg_offsets, offset, size.byte_size());
+                    invalidate_slots_at(
+                        &mut slot_entries,
+                        &mut reg_offsets,
+                        offset,
+                        size.byte_size(),
+                    );
                 }
             }
             // An XMM load writes no GP register and no memory: mappings stay

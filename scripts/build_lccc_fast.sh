@@ -20,12 +20,14 @@ cd "$repo_root"
 "$repo_root/scripts/ensure_swap.sh"
 
 # Prefer the persisted rustup installation after an Arena restore.  The
-# system-image Cargo is intentionally not the research baseline: it was 1.85
-# while this repository now pins Rust/Cargo 1.98.0 in rust-toolchain.toml.
+# system-image Cargo is intentionally not the research baseline: it lags the
+# moving stable channel this repository tracks (rust-toolchain.toml pins the
+# CHANNEL "stable", never a version — stable-only regressions are fixed at
+# the source instead of freezing the toolchain).
 if [[ -x "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" ]]; then
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 fi
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.98.0}
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 
 # Honour the repo's clang+mold preference (.cargo/config.toml) when both are

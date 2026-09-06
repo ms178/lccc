@@ -1685,9 +1685,8 @@ impl Driver {
                     .unwrap_or(64);
                 for func in &mut module.functions {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_high_pressure_ranges(
-                            func, pmax,
-                        );
+                        let n =
+                            crate::backend::split_ranges::split_high_pressure_ranges(func, pmax);
                         if n > 0 {
                             did_split = true;
                         }

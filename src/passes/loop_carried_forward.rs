@@ -420,9 +420,7 @@ impl<'a> Ctx<'a> {
                     rhs: Operand::Const(c),
                     ty,
                     ..
-                } if *v == phi && self.is_ptr_width_int(*ty) => {
-                    return const_i64(c)?.checked_neg()
-                }
+                } if *v == phi && self.is_ptr_width_int(*ty) => return const_i64(c)?.checked_neg(),
                 Instruction::GetElementPtr {
                     base,
                     offset: Operand::Const(c),
@@ -538,13 +536,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Is a preheader load of `addr_L(0)` guaranteed not to fault?
-    fn preheader_load_safe(
-        &self,
-        sh: &LoopShape,
-        l: &Lin,
-        size: usize,
-        load_block: usize,
-    ) -> bool {
+    fn preheader_load_safe(&self, sh: &LoopShape, l: &Lin, size: usize, load_block: usize) -> bool {
         // (a) in-bounds access of an object with statically known size.
         if l.terms.is_empty() {
             let obj_size = match &l.root {
@@ -566,7 +558,10 @@ impl<'a> Ctx<'a> {
         }
         // (b) the load executes before any exit whenever the loop is entered.
         if self.dom.dominates(load_block, sh.latch)
-            && sh.exiting.iter().all(|&e| self.dom.dominates(load_block, e))
+            && sh
+                .exiting
+                .iter()
+                .all(|&e| self.dom.dominates(load_block, e))
         {
             return true;
         }
@@ -614,7 +609,9 @@ impl<'a> Ctx<'a> {
                 if vol || seg != AddressSpace::Default || ty.size() < size {
                     continue;
                 }
-                let Some(al) = self.invariant(ptr) else { continue };
+                let Some(al) = self.invariant(ptr) else {
+                    continue;
+                };
                 if al.root == l.root && al.terms == l.terms && al.stride == 0 && al.base == l.base {
                     return true;
                 }
@@ -638,11 +635,16 @@ impl<'a> Ctx<'a> {
         else {
             return false;
         };
-        let Some((cb, ci)) = self.defs.get(*cv) else { return false };
+        let Some((cb, ci)) = self.defs.get(*cv) else {
+            return false;
+        };
         if cb != sh.header {
             return false;
         }
-        let Instruction::Cmp { op, lhs, rhs, ty, .. } = self.inst(cb, ci) else {
+        let Instruction::Cmp {
+            op, lhs, rhs, ty, ..
+        } = self.inst(cb, ci)
+        else {
             return false;
         };
         if !ty.is_integer() {
@@ -873,7 +875,16 @@ fn plan_loop(cx: &Ctx, sh: &LoopShape, out: &mut Vec<Rewrite>) {
                     eprintln!(
                         "[lcfwd] {}: loop@{} pair (load b{}i{}, store b{}i{}) rejected: \
                          store b{}i{} may alias (load {:?}, store {:?})",
-                        cx.func.name, sh.header, l.block, l.idx, s.block, s.idx, t.block, t.idx, ll, t.lin
+                        cx.func.name,
+                        sh.header,
+                        l.block,
+                        l.idx,
+                        s.block,
+                        s.idx,
+                        t.block,
+                        t.idx,
+                        ll,
+                        t.lin
                     );
                 }
                 continue;
