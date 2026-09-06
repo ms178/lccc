@@ -569,8 +569,7 @@ impl ArmCodegen {
 
                     for (constraint, _, _) in outputs {
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
-                        if c.starts_with('{') && c.ends_with('}') {
-                            let reg_name = &c[1..c.len() - 1];
+                        if let Some(reg_name) = c.strip_circumfix('{', '}') {
                             // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);
@@ -623,8 +622,7 @@ impl ArmCodegen {
                             continue;
                         }
                         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
-                        if c.starts_with('{') && c.ends_with('}') {
-                            let reg_name = &c[1..c.len() - 1];
+                        if let Some(reg_name) = c.strip_circumfix('{', '}') {
                             // Normalize rN -> xN (GCC AArch64 alias)
                             let normalized =
                                 super::asm_emitter::normalize_aarch64_register(reg_name);

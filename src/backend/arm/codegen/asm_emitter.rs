@@ -50,8 +50,7 @@ impl InlineAsmEmitter for ArmCodegen {
     fn classify_constraint(&self, constraint: &str) -> AsmOperandKind {
         let c = constraint.trim_start_matches(['=', '+', '&', '%']);
         // Explicit register constraint from register variable: {regname}
-        if c.starts_with('{') && c.ends_with('}') {
-            let reg_name = &c[1..c.len() - 1];
+        if let Some(reg_name) = c.strip_circumfix('{', '}') {
             // On AArch64, GCC treats r0-r30 as aliases for x0-x30.
             // The Linux kernel uses `register ... asm("r0")` extensively
             // (e.g., arm-smccc.h). Normalize to the canonical x-register name.

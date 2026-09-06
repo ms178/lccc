@@ -522,8 +522,7 @@ fn parse_sp_offset(addr: &str) -> Option<i32> {
         return Some(0);
     }
     // [sp, #N] or [sp, #-N]
-    if addr.starts_with("[sp, #") && addr.ends_with(']') {
-        let inner = &addr[6..addr.len() - 1]; // strip "[sp, #" and "]"
+    if let Some(inner) = addr.strip_circumfix("[sp, #", "]") {
         return inner.parse::<i32>().ok();
     }
     // [sp, #N]! (pre-index) — not a simple stack slot access
@@ -1341,8 +1340,10 @@ fn parse_fp_mem(line: &str) -> Option<(bool, u8, FpAddr, u8)> {
     if let Some(off) = parse_sp_offset(addr) {
         return Some((is_store, reg, FpAddr::Sp(off), width));
     }
-    if addr.starts_with("[x") && addr.ends_with(']') && !addr.contains('!') {
-        let inner = &addr[1..addr.len() - 1];
+    if let Some(inner) = addr.strip_circumfix('[', ']')
+        && inner.starts_with('x')
+        && !addr.contains('!')
+    {
         let (base, off) = match inner.split_once(", ") {
             Some((b, o)) => (b.trim(), o.trim().strip_prefix('#')?.parse::<i32>().ok()?),
             None => (inner.trim(), 0),

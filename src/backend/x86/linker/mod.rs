@@ -30,7 +30,6 @@ mod plt_got;
 pub mod types;
 pub use icf::parse_icf_mode;
 
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_builtin;
 
 /// Self-contained input loader for the standalone `lccc-ld` driver.
@@ -118,5 +117,4 @@ pub fn load_inputs_for_ld(
     }
     Ok(())
 }
-#[cfg(not(feature = "gcc_linker"))]
 pub use link::link_shared;
